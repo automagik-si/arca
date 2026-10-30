@@ -1,14 +1,14 @@
 //! The node config file: one JSON document in camelCase. Every key is named and every unknown key is refused. The rules
-//! the kernel depends on are checked here, before any command reads Incus: the tailnet address, the project names the
-//! kernel may never write in, and the scratch prefix.
+//! the kernel depends on are checked here, before any command reads Incus: the tailnet and proxy addresses, the project
+//! names the kernel may never write in, and the scratch prefix.
 
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use arca_mcp::tailnet_addr_ok;
+use arca_mcp::{proxy_addr_ok, tailnet_addr_ok};
 use serde::Deserialize;
 use serde_json::error::Category;
 
@@ -45,13 +45,24 @@ pub struct IncusConfig {
     pub pools: Vec<String>,
 }
 
-/// The two listeners: the unix socket, and one tailnet address when one is named.
+/// The listeners: the unix socket, one tailnet address when one is named, and one proxy address when one is named.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListenConfig {
     pub unix: PathBuf,
     #[serde(default)]
     pub tailnet: Option<SocketAddr>,
+    #[serde(default)]
+    pub proxy: Option<ProxyListen>,
+}
+
+/// The proxy listener: one fixed address outside the tailnet ranges, served to the single peer address `peer`, which is a
+/// reverse proxy on the same host. Any other peer is closed with no bytes sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProxyListen {
+    pub addr: SocketAddr,
+    pub peer: IpAddr,
 }
 
 /// The directory of the hash files the server reads.
@@ -84,6 +95,8 @@ pub enum ConfigError {
     Parse(String),
     /// The tailnet address fails the tailnet rules.
     TailnetAddr(String),
+    /// The proxy address fails the proxy rules, or its peer is not one address.
+    ProxyAddr(String),
     /// A kernel project is a name the kernel may never write in.
     ProjectForbidden(String),
     /// A scratch run names a project outside the scratch prefix.
@@ -100,6 +113,7 @@ impl fmt::Display for ConfigError {
             Self::Io { path, why } => write!(f, "cannot read the config file {path}: {why}"),
             Self::Parse(why) => write!(f, "the config file is refused: {why}"),
             Self::TailnetAddr(why) => write!(f, "listen.tailnet is refused: {why}"),
+            Self::ProxyAddr(why) => write!(f, "listen.proxy is refused: {why}"),
             Self::ProjectForbidden(name) => write!(
                 f,
                 "kernel project {name} is reserved: it is the host's default or bench project, or a droidd project"
@@ -138,6 +152,14 @@ pub fn load(path: &Path) -> Result<NodeConfig, ConfigError> {
 pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     if let Some(addr) = config.listen.tailnet {
         tailnet_addr_ok(&addr).map_err(ConfigError::TailnetAddr)?;
+    }
+    if let Some(proxy) = &config.listen.proxy {
+        proxy_addr_ok(&proxy.addr).map_err(ConfigError::ProxyAddr)?;
+        if proxy.peer.to_canonical().is_unspecified() {
+            return Err(ConfigError::ProxyAddr(
+                "the peer must be one address, not a wildcard".to_string(),
+            ));
+        }
     }
     let kernel = &config.kernel;
     for name in &kernel.projects {

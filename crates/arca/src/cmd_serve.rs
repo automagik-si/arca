@@ -1,4 +1,5 @@
-//! `serve --config <file>`: the Arca MCP server on the unix socket, and on the tailnet address when the config names one.
+//! `serve --config <file>`: the Arca MCP server on the unix socket, and on the tailnet and proxy addresses when the config
+//! names them.
 //! The server runs until SIGTERM or SIGINT, then removes its own socket and exits 0.
 
 use std::collections::BTreeSet;
@@ -20,7 +21,7 @@ use arca_incus::UnixIncus;
 use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
-use arca_mcp::{Server, TokenStore, TokenStoreError, serve_tailnet, serve_unix};
+use arca_mcp::{Server, TokenStore, TokenStoreError, serve_proxy, serve_tailnet, serve_unix};
 use arca_metrics::Sampler;
 use arca_providers::ReadOnlyIncusProvider;
 use arca_providers::incus::{Family, IncusProvider, RetainedSet};
@@ -98,10 +99,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .handle("node_metrics", Arc::new(MetricsHandler { published }))
         .handle(
             "watch_report",
-            Arc::new(WatchHandler {
-                socket: cfg.incus.socket.clone(),
-                phones,
-            }),
+            Arc::new(WatchHandler::new(cfg.incus.socket.clone(), phones)),
         )
         .handle("token_list", Arc::new(TokenListHandler { ids }));
     let clock: Clock = Arc::new(now_ms);
@@ -124,20 +122,25 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 _ = interrupt.recv() => {}
             }
         };
-        match cfg.listen.tailnet {
-            Some(addr) => {
-                tokio::select! {
-                    result = serve_unix(router.clone(), &unix_path) => result,
-                    result = serve_tailnet(router, addr) => result,
-                    () = stop => Ok(()),
-                }
+        // A listener the config does not name is a future that never ends, so the first listener to fail, or the first
+        // signal, stops them all.
+        let tailnet = async {
+            match cfg.listen.tailnet {
+                Some(addr) => serve_tailnet(router.clone(), addr).await,
+                None => std::future::pending().await,
             }
-            None => {
-                tokio::select! {
-                    result = serve_unix(router, &unix_path) => result,
-                    () = stop => Ok(()),
-                }
+        };
+        let proxy = async {
+            match cfg.listen.proxy {
+                Some(proxy) => serve_proxy(router.clone(), proxy.addr, proxy.peer).await,
+                None => std::future::pending().await,
             }
+        };
+        tokio::select! {
+            result = serve_unix(router.clone(), &unix_path) => result,
+            result = tailnet => result,
+            result = proxy => result,
+            () = stop => Ok(()),
         }
     });
     match outcome {

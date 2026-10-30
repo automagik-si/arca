@@ -1,0 +1,26 @@
+# The Arca node server as a systemd user unit, read-only: its config names no kernel project, and it reaches Incus only
+# through arca-shim.service. Install: see docs/OPERATING.md, "Running as a user service".
+
+[Unit]
+Description=Arca node server (read-only, through the recording shim)
+Requires=arca-shim.service
+After=arca-shim.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/arca serve --config %h/.config/arca/node.json
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=arca
+RuntimeDirectoryMode=0700
+StateDirectory=arca
+StateDirectoryMode=0700
+UMask=0077
+MemoryHigh=192M
+MemoryMax=256M
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

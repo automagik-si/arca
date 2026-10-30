@@ -1,11 +1,13 @@
-//! The HTTP surface: the `POST /mcp` route, the unix socket listener and the tailnet listener with its peer filter.
+//! The HTTP surface: the `POST /mcp` route, the unix socket listener, the tailnet listener with its peer filter, and the
+//! proxy listener with its exact-peer filter.
 //!
 //! A request carrying any `Origin` header is refused `403` before its body is read, whatever its method or path: a browser
 //! page is never a client. The unix socket is bound inside a fresh private directory, chmodded 0600 and renamed into place,
 //! so no other user ever reaches it at a wider mode, and it serves only peers of this process's own uid. The tailnet
 //! listener binds one address that lies in the tailnet ranges, and every TCP peer is checked against the same ranges; a
-//! peer outside them is dropped before any byte is read or written. Each listener serves at most [`MAX_CONNECTIONS`]
-//! connections at once.
+//! peer outside them is dropped before any byte is read or written. The proxy listener binds one fixed address outside the
+//! tailnet ranges for a reverse proxy on the same host, and serves exactly one peer address; any other peer is dropped the
+//! same way. Each listener serves at most [`MAX_CONNECTIONS`] connections at once.
 
 use std::collections::HashMap;
 use std::fs;
@@ -40,7 +42,7 @@ use crate::tools::{CallError, ToolHandler};
 const MAX_BODY_BYTES: usize = 64 * 1024;
 /// The most connections one listener serves at once. A connection past the cap waits in the kernel's backlog.
 const MAX_CONNECTIONS: usize = 64;
-/// The ports a tailnet listener may never take: the ones other services of the node use.
+/// The ports a tailnet or proxy listener may never take: the ones other services of the node use.
 const RESERVED_PORTS: [u16; 4] = [80, 443, 7443, 9443];
 /// How long a listener waits after a failed accept before it tries again.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
@@ -213,16 +215,30 @@ pub async fn serve_tailnet(router: Router, addr: SocketAddr) -> io::Result<()> {
     serve_filtered(router, listener, peer_allowed).await
 }
 
+/// Serves `router` on one proxy address, to the single peer address `peer` only. The address must pass
+/// [`proxy_addr_ok`]. A peer is compared as its IPv4 address when it arrives IPv4-mapped, and every other peer is closed at
+/// accept with no bytes sent. The bearer rules are the same as on every listener.
+pub async fn serve_proxy(router: Router, addr: SocketAddr, peer: IpAddr) -> io::Result<()> {
+    proxy_addr_ok(&addr).map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
+    let listener = TcpListener::bind(addr).await?;
+    let peer = peer.to_canonical();
+    serve_filtered(router, listener, move |ip: &IpAddr| {
+        ip.to_canonical() == peer
+    })
+    .await
+}
+
 /// Serves `router` on an already bound TCP listener, admitting only the peers `allow` accepts, and at most
 /// [`MAX_CONNECTIONS`] at once. A refused peer's connection is dropped at accept, so it receives no bytes.
-/// [`serve_tailnet`] is this with [`peer_allowed`] and the tailnet check.
+/// [`serve_tailnet`] is this with [`peer_allowed`] and the tailnet check, and [`serve_proxy`] is this with one exact peer.
 ///
-/// Test seam: a test passes its own `allow` to reach the filter from loopback. Production code calls [`serve_tailnet`].
+/// Test seam: a test passes its own `allow` to reach the filter from loopback. Production code calls [`serve_tailnet`] or
+/// [`serve_proxy`].
 #[doc(hidden)]
 pub async fn serve_filtered(
     router: Router,
     listener: TcpListener,
-    allow: fn(&IpAddr) -> bool,
+    allow: impl Fn(&IpAddr) -> bool + Send + Sync + 'static,
 ) -> io::Result<()> {
     let listener = Filtered {
         listener,
@@ -293,13 +309,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Permitted<S> {
 }
 
 /// The listener behind [`serve_filtered`]: it accepts, drops a refused peer and returns only an admitted one.
-struct Filtered {
+struct Filtered<F> {
     listener: TcpListener,
-    allow: fn(&IpAddr) -> bool,
+    allow: F,
     permits: Arc<Semaphore>,
 }
 
-impl axum::serve::Listener for Filtered {
+impl<F> axum::serve::Listener for Filtered<F>
+where
+    F: Fn(&IpAddr) -> bool + Send + Sync + 'static,
+{
     type Io = Permitted<TcpStream>;
     type Addr = SocketAddr;
 
@@ -398,13 +417,31 @@ pub fn tailnet_addr_ok(addr: &SocketAddr) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `addr` may be the proxy listener: a fixed, unreserved port, not a wildcard, and an address outside the tailnet
+/// ranges, IPv4-mapped tailnet addresses included. A tailnet address is the tailnet listener's, never the proxy's.
+pub fn proxy_addr_ok(addr: &SocketAddr) -> Result<(), String> {
+    let port = addr.port();
+    if port == 0 {
+        return Err("the proxy port must be a fixed number".into());
+    }
+    if RESERVED_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is reserved and never a proxy listener"
+        ));
+    }
+    let ip = addr.ip().to_canonical();
+    if ip.is_unspecified() {
+        return Err("a wildcard address is never a proxy listener".into());
+    }
+    if in_tailnet(&ip) {
+        return Err("a tailnet address is never a proxy listener".into());
+    }
+    Ok(())
+}
+
 /// Whether a TCP peer at `ip` may talk to the tailnet listener. An IPv4-mapped IPv6 peer is judged as its IPv4 address.
 pub fn peer_allowed(ip: &IpAddr) -> bool {
-    let judged = match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(*ip, IpAddr::V4),
-        IpAddr::V4(_) => *ip,
-    };
-    in_tailnet(&judged)
+    in_tailnet(&ip.to_canonical())
 }
 
 fn in_tailnet(ip: &IpAddr) -> bool {

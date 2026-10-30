@@ -1,5 +1,6 @@
-//! The two listeners: the unix socket at mode 0600, the tailnet address and its peer filter. Only loopback and temporary
-//! unix sockets are used. The tailnet ranges are checked as addresses; no test binds a tailnet address.
+//! The three listeners: the unix socket at mode 0600, the tailnet address and its peer filter, and the proxy address and its
+//! exact peer. Only loopback and temporary unix sockets are used. The tailnet ranges are checked as addresses; no test binds
+//! a tailnet address.
 
 mod common;
 
@@ -14,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use arca_api::Scope;
 use arca_mcp::{
-    Server, TokenStore, peer_allowed, serve_filtered, serve_tailnet, serve_unix, tailnet_addr_ok,
+    Server, TokenStore, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy, serve_tailnet,
+    serve_unix, tailnet_addr_ok,
 };
 use common::{
     Scratch, bearer, connect_tcp, connect_unix, mint_into, own_uid, post, post_bytes, rpc,
@@ -531,4 +533,170 @@ fn the_real_peer_filter_gives_a_loopback_peer_no_bytes() {
         received.is_empty(),
         "the real filter sends a loopback peer no bytes"
     );
+}
+
+// Proxy address: a fixed, unreserved port, never a wildcard and never a tailnet address.
+
+#[test]
+fn proxy_addr_ok_refuses_the_wildcards_tailnet_addresses_and_reserved_ports() {
+    for text in [
+        "0.0.0.0:7460",
+        "[::]:7460",
+        "[::ffff:0.0.0.0]:7460",
+        "100.64.0.1:7460",
+        "100.127.255.254:7460",
+        "[::ffff:100.64.0.1]:7460",
+        "[fd7a:115c:a1e0::1]:7460",
+        "192.0.2.1:80",
+        "192.0.2.1:443",
+        "192.0.2.1:7443",
+        "192.0.2.1:9443",
+        "192.0.2.1:0",
+    ] {
+        assert!(
+            proxy_addr_ok(&addr(text)).is_err(),
+            "a proxy address must be refused: {text}"
+        );
+    }
+}
+
+#[test]
+fn proxy_addr_ok_accepts_a_fixed_address_outside_the_tailnet() {
+    for text in [
+        "192.0.2.1:7460",
+        "198.51.100.7:7460",
+        "127.0.0.1:7460",
+        "[2001:db8::1]:7460",
+    ] {
+        assert_eq!(proxy_addr_ok(&addr(text)), Ok(()), "accepted: {text}");
+    }
+}
+
+#[test]
+fn serve_proxy_refuses_a_refused_address_before_it_binds() {
+    let rt = Runtime::new().expect("runtime");
+    for text in [
+        "0.0.0.0:7460",
+        "[::]:7460",
+        "100.64.0.1:7460",
+        "127.0.0.1:0",
+        "127.0.0.1:80",
+        "127.0.0.1:443",
+        "127.0.0.1:7443",
+        "127.0.0.1:9443",
+    ] {
+        let err = rt
+            .block_on(serve_proxy(
+                empty_router("proxy-refuse"),
+                addr(text),
+                ip("127.0.0.2"),
+            ))
+            .expect_err("a refused address is never bound");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "refused before bind: {text}"
+        );
+    }
+}
+
+/// A free loopback port: bound once, read, and released for the listener under test.
+fn free_loopback_port() -> SocketAddr {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe");
+    probe.local_addr().expect("the probe's address")
+}
+
+/// A TCP connection to `to` whose source address is `from`, with read and write deadlines. Loopback takes every address in
+/// 127.0.0.0/8 as a source, so a test can stand for two peers on one host.
+fn connect_from(rt: &Runtime, from: &str, to: SocketAddr) -> std::io::Result<std::net::TcpStream> {
+    let stream = rt.block_on(async {
+        let socket = tokio::net::TcpSocket::new_v4()?;
+        socket.bind(addr(&format!("{from}:0")))?;
+        socket.connect(to).await
+    })?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(stream)
+}
+
+/// Starts `serve_proxy` on a free loopback port for `peer`, and waits until it accepts a connection from `peer`.
+fn start_proxy(rt: &Runtime, router: axum::Router, peer: &str) -> SocketAddr {
+    let at = free_loopback_port();
+    rt.spawn(serve_proxy(router, at, ip(peer)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while connect_from(rt, peer, at).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "the proxy listener never came up"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    at
+}
+
+#[test]
+fn the_proxy_peer_gets_the_same_answers_as_the_unix_socket() {
+    let scratch = Scratch::new("proxy-peer");
+    let viewer = mint_into(scratch.path(), "proxy-viewer", Scope::Viewer);
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let router = Server::new(arca_api::verbs(), tokens).router();
+    let rt = Runtime::new().expect("runtime");
+    let at = start_proxy(&rt, router, "127.0.0.2");
+    let initialize = rpc(
+        json!(1),
+        "initialize",
+        json!({ "protocolVersion": "2025-11-25" }),
+    );
+
+    let mut stream = connect_from(&rt, "127.0.0.2", at).expect("the peer connects");
+    let reply = post(&mut stream, &[], &initialize);
+    assert_eq!(reply.status, 401, "no bearer is 401");
+
+    let mut stream = connect_from(&rt, "127.0.0.2", at).expect("the peer connects");
+    let reply = post(
+        &mut stream,
+        &[
+            bearer(&viewer),
+            ("Origin".into(), "https://example.com".into()),
+        ],
+        &initialize,
+    );
+    assert_eq!(reply.status, 403, "an Origin is 403");
+
+    let mut stream = connect_from(&rt, "127.0.0.2", at).expect("the peer connects");
+    let reply = post(&mut stream, &[bearer(&viewer)], &initialize);
+    assert_eq!(reply.status, 200, "a viewer's initialize is 200");
+    assert_eq!(reply.json()["result"]["protocolVersion"], "2025-11-25");
+}
+
+#[test]
+fn a_proxy_peer_other_than_the_configured_one_is_closed_with_no_bytes() {
+    let scratch = Scratch::new("proxy-other");
+    let viewer = mint_into(scratch.path(), "proxy-viewer", Scope::Viewer);
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let router = Server::new(arca_api::verbs(), tokens).router();
+    let rt = Runtime::new().expect("runtime");
+    let at = start_proxy(&rt, router, "127.0.0.2");
+
+    for other in ["127.0.0.1", "127.0.0.3"] {
+        let mut stream = connect_from(&rt, other, at).expect("the TCP connect itself succeeds");
+        let _ = stream.write_all(&post_bytes(
+            &[bearer(&viewer)],
+            &rpc(json!(1), "tools/list", json!({})),
+        ));
+        let mut received = Vec::new();
+        match stream.read_to_end(&mut received) {
+            Ok(_) => {}
+            Err(err) => assert!(
+                !matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+                "a peer other than the configured one must be closed, not left open: {err}"
+            ),
+        }
+        assert!(
+            received.is_empty(),
+            "a peer other than the configured one receives no bytes: {other}"
+        );
+    }
 }

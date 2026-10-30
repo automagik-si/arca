@@ -193,6 +193,28 @@ fn usage_errors_exit_2_and_say_what_was_wrong() {
             "y",
         ],
         vec!["shim", "--upstream", "a", "--listen", "b"],
+        vec![
+            "shim",
+            "--upstream",
+            "a",
+            "--listen",
+            "b",
+            "--log",
+            "c",
+            "--log-max-bytes",
+            "0",
+        ],
+        vec![
+            "shim",
+            "--upstream",
+            "a",
+            "--listen",
+            "b",
+            "--log",
+            "c",
+            "--log-max-bytes",
+            "lots",
+        ],
     ];
     for args in cases {
         let out = arca().args(&args).output().expect("run the binary");
@@ -264,6 +286,57 @@ fn a_config_the_kernel_must_not_start_with_is_refused_before_any_read() {
             with(&|v| v["listen"]["tailnet"] = json!("198.51.100.7:7450")),
         ),
         (
+            "a proxy address of 0.0.0.0",
+            with(&|v| {
+                v["listen"]["proxy"] = json!({ "addr": "0.0.0.0:7460", "peer": "192.0.2.20" })
+            }),
+        ),
+        (
+            "a proxy address of [::]",
+            with(&|v| v["listen"]["proxy"] = json!({ "addr": "[::]:7460", "peer": "192.0.2.20" })),
+        ),
+        (
+            "a proxy address in the tailnet ranges",
+            with(&|v| {
+                v["listen"]["proxy"] = json!({ "addr": "100.64.0.1:7460", "peer": "192.0.2.20" })
+            }),
+        ),
+        (
+            "a proxy address on port 443",
+            with(&|v| {
+                v["listen"]["proxy"] = json!({ "addr": "192.0.2.1:443", "peer": "192.0.2.20" })
+            }),
+        ),
+        (
+            "a proxy address on port 7443",
+            with(&|v| {
+                v["listen"]["proxy"] = json!({ "addr": "192.0.2.1:7443", "peer": "192.0.2.20" })
+            }),
+        ),
+        (
+            "a proxy address on port 0",
+            with(&|v| {
+                v["listen"]["proxy"] = json!({ "addr": "192.0.2.1:0", "peer": "192.0.2.20" })
+            }),
+        ),
+        (
+            "a proxy peer that is a wildcard",
+            with(&|v| {
+                v["listen"]["proxy"] = json!({ "addr": "192.0.2.1:7460", "peer": "0.0.0.0" })
+            }),
+        ),
+        (
+            "a proxy with no peer",
+            with(&|v| v["listen"]["proxy"] = json!({ "addr": "192.0.2.1:7460" })),
+        ),
+        (
+            "a proxy with an unknown key",
+            with(&|v| {
+                v["listen"]["proxy"] =
+                    json!({ "addr": "192.0.2.1:7460", "peer": "192.0.2.20", "tls": true });
+            }),
+        ),
+        (
             "a kernel project named default",
             with(&|v| v["kernel"]["projects"] = json!(["default"])),
         ),
@@ -317,12 +390,13 @@ fn a_config_the_kernel_must_not_start_with_is_refused_before_any_read() {
 }
 
 #[test]
-fn a_valid_config_with_a_kernel_project_and_a_tailnet_address_is_accepted() {
+fn a_valid_config_with_a_kernel_project_a_tailnet_and_a_proxy_address_is_accepted() {
     // The control for the refusals above: the same shape, made valid, runs to a result.
     let scratch = Scratch::new("accept");
     let rig = rig(&scratch);
     let mut value = config(&scratch, rig.shim.socket());
     value["listen"]["tailnet"] = json!("100.64.0.1:7450");
+    value["listen"]["proxy"] = json!({ "addr": "192.0.2.1:7460", "peer": "192.0.2.20" });
     value["kernel"]["projects"] = json!(["arcak-svc", "arcak-scratch-probe"]);
     value["kernel"]["scratch"] = json!(false);
     let path = write_config(&scratch, "node.json", &value);
@@ -826,4 +900,149 @@ fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn the_shim_command_prints_a_live_summary_on_sigusr1_and_keeps_serving_with_a_capped_log() {
+    use std::io::{BufRead, BufReader};
+
+    let scratch = Scratch::new("shim-usr1");
+    let state = FakeState::load(Path::new(FIXTURE)).expect("load the fixture");
+    let fake = FakeIncus::start(&scratch.0, state).expect("start the fake");
+    let listen = scratch.at("shim.sock");
+    let log = scratch.at("shim.log");
+    let mut child = arca()
+        .args(["shim", "--upstream"])
+        .arg(fake.socket())
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--log")
+        .arg(&log)
+        .args(["--log-max-bytes", "120"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the shim command");
+    assert!(wait_for_socket(&listen), "the shim listens");
+    let get = "GET /1.0 HTTP/1.1\r\nHost: arca\r\nConnection: close\r\n\r\n";
+    for _ in 0..4 {
+        assert_eq!(raw_http(&listen, get).0, 200);
+    }
+
+    let usr1 = Command::new("kill")
+        .args(["-USR1", &child.id().to_string()])
+        .status()
+        .expect("send SIGUSR1");
+    assert!(usr1.success(), "SIGUSR1 was delivered");
+    let mut stderr = BufReader::new(child.stderr.take().expect("stderr"));
+    let mut line = String::new();
+    stderr.read_line(&mut line).expect("read the live summary");
+    let live: Value = serde_json::from_str(line.trim()).expect("the live summary is JSON");
+    assert_eq!(live, json!({ "get": 4, "refused": 0 }));
+    assert_eq!(
+        raw_http(&listen, get).0,
+        200,
+        "the shim keeps serving after SIGUSR1"
+    );
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(wait_exit(&mut child).code(), Some(0));
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .expect("stdout")
+        .read_to_string(&mut stdout)
+        .expect("read stdout");
+    let summary: Value = serde_json::from_str(stdout.trim()).expect("the summary is JSON");
+    assert_eq!(summary, json!({ "get": 5, "refused": 0 }));
+    assert!(
+        scratch.at("shim.log.1").exists(),
+        "the capped log was rotated"
+    );
+    assert!(
+        !scratch.at("shim.log.2").exists(),
+        "one rotated file is kept"
+    );
+}
+
+/// A free loopback TCP port, bound once and released for the server under test.
+fn free_loopback_port() -> std::net::SocketAddr {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe");
+    probe.local_addr().expect("the probe's address")
+}
+
+#[test]
+fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
+    let scratch = Scratch::new("serve-proxy");
+    let rig = rig(&scratch);
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let tokens = scratch.at("tokens");
+    fs::create_dir_all(&tokens).expect("create the token directory");
+    fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let at = free_loopback_port();
+    let mut value = config(&scratch, rig.shim.socket());
+    value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
+    let path = write_config(&scratch, "node.json", &value);
+    let mut child = arca()
+        .args(["serve", "--config"])
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start arca serve");
+
+    let deadline = Instant::now() + WAIT;
+    let mut stream = loop {
+        if let Ok(stream) = std::net::TcpStream::connect(at) {
+            break stream;
+        }
+        if let Some(status) = child.try_wait().expect("poll the server") {
+            panic!("the server exited before listening: {status}");
+        }
+        assert!(Instant::now() < deadline, "the proxy listener comes up");
+        thread::sleep(Duration::from_millis(20));
+    };
+    stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: arca\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("send the request");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("read the reply");
+    assert!(
+        reply.starts_with("HTTP/1.1 401"),
+        "the configured peer reaches the router, which wants a bearer: {reply}"
+    );
+
+    let kill = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill.success(), "SIGTERM was delivered");
+    assert_eq!(
+        wait_exit(&mut child).code(),
+        Some(0),
+        "serve exits 0 on SIGTERM"
+    );
+    assert!(
+        std::net::TcpStream::connect(at).is_err(),
+        "the proxy listener is closed once serve stops"
+    );
+    assert!(
+        !scratch.at("arca.sock").exists(),
+        "the unix socket is removed"
+    );
+    let summary = rig.shim.stop().expect("stop the shim");
+    assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
 }

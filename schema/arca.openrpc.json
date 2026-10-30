@@ -544,6 +544,9 @@
         "name": "result",
         "schema": {
           "properties": {
+            "ageMs": {
+              "type": "integer"
+            },
             "at": {
               "type": "integer"
             },

@@ -10,8 +10,12 @@ desired state with its own key. It talks to Incus over the local unix socket.
 - **Writes** are tested live, one object kind at a time, in a scratch project: network, project, ACL, profile, volume,
   forward, instance and bucket are created, marked, and removed again, leaving the host as it was. Network zones are
   not yet created in a kernel project (Incus refuses them in a restricted project without a zone grant).
-- **Deletes of class B objects** (networks, projects, volumes) need a signed owner approval. No owner verifier ships
-  yet, so these deletes fail closed outside the test signer.
+- **Deletes of class B objects** (networks, projects, volumes) need a signed owner approval. The owner verifier for
+  hardware-backed (`-sk`) SSH signatures ships, but no owner key is installed on a new node, so these deletes fail closed
+  with `NoVerifier`.
+- **As a service:** `deploy/systemd/` holds two user units that run `arca serve` read-only, reaching Incus only through
+  the GET-only shim, with restart and memory limits. See "Running as a user service" in
+  [`docs/OPERATING.md`](docs/OPERATING.md).
 - **Known gap:** a restart while an Incus operation is still running can leave a marked object the journal does not
   know about.
 
