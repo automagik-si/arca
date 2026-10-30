@@ -12,6 +12,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use arca_kernel::ownership::{ObjectRef, OwnerClass};
 use serde_json::Value;
 
 /// The largest response body the client accepts, in bytes.
@@ -39,9 +40,21 @@ pub enum IncusError {
     Timeout,
     /// The answer is over [`MAX_BODY`].
     TooLarge,
-    /// The writer refused a write before it sent anything, because the object is not the caller's to change or the
-    /// request is not a plain one. The text names the reason and never a value of the object.
+    /// The writer refused before it sent any write, because the object is not the caller's to change, the target is outside
+    /// the kernel's project family, or the request is not a plain one. A read may have been made. The text names the reason
+    /// and never a value of the object.
     Refused(String),
+    /// The write was accepted and applied, but reading the object back did not confirm it. Boxed, so the error stays small.
+    AppliedUnconfirmed(Box<Unconfirmed>),
+}
+
+/// A write that Incus accepted whose read-back did not confirm it: the object is not this entry's own, or it does not show the
+/// change. `owner` is the class the read found, when it found one. Nothing is retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unconfirmed {
+    pub object: ObjectRef,
+    pub owner: Option<OwnerClass>,
+    pub reason: String,
 }
 
 impl fmt::Display for IncusError {
@@ -52,7 +65,12 @@ impl fmt::Display for IncusError {
             Self::Decode(message) => write!(f, "could not read the Incus answer: {message}"),
             Self::Timeout => f.write_str("Incus did not answer by the deadline"),
             Self::TooLarge => f.write_str("the Incus answer is over the size cap"),
-            Self::Refused(reason) => write!(f, "refused before any write: {reason}"),
+            Self::Refused(reason) => write!(f, "refused before any write was sent: {reason}"),
+            Self::AppliedUnconfirmed(unconfirmed) => write!(
+                f,
+                "the write landed, but its read-back is not confirmed: {}",
+                unconfirmed.reason
+            ),
         }
     }
 }
@@ -110,12 +128,15 @@ impl IncusRead for UnixIncus {
 pub(crate) struct Framed {
     pub(crate) status: u16,
     pub(crate) reason: String,
+    /// The headers, kept for the writer's ETags. Only the writer reads them.
+    #[cfg(feature = "write")]
     headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
 }
 
 impl Framed {
     /// The first value of a header whose lower-case name is `name`.
+    #[cfg(feature = "write")]
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -264,6 +285,7 @@ fn read_framed<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Framed, In
     Ok(Framed {
         status,
         reason,
+        #[cfg(feature = "write")]
         headers,
         body,
     })

@@ -6,10 +6,12 @@
 //! its `/wait`. Any other GET is 404.
 //!
 //! Writes: a POST to a collection creates an object, a PATCH or DELETE changes or removes one. These cover projects and the
-//! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). Each object carries a uuid,
-//! and its ETag is a digest of its JSON. A PATCH whose `If-Match` is not the current ETag is 412 and changes nothing. A DELETE
-//! ignores `If-Match`, as Incus does. Every write creates an operation and answers 202 with its URL, which the caller waits
-//! on. A failed operation waits as a status error. A method a route does not take is 405 with an `Allow` header.
+//! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance and a volume
+//! get a uuid, in their `volatile.uuid` key; no other kind has one. Each object's ETag is a digest of its JSON. A PATCH whose
+//! `If-Match` is not the current ETag is 412 and changes nothing. A DELETE ignores `If-Match`, as Incus does. An instance's or
+//! a volume's create and delete are answered 202 with an operation, whose URL the caller waits on. Every other write, and
+//! every PATCH, is answered sync: 201 for a create and 200 otherwise. A failed operation waits as a status error. A method a
+//! route does not take is 405 with an `Allow` header.
 //!
 //! The fake records each request, and each write with the names of the config keys it carried. It never records a value.
 
@@ -686,7 +688,12 @@ fn create(
         body.insert("project".to_string(), Value::String(project.clone()));
     }
     body.entry("config").or_insert_with(|| json!({}));
-    body.insert("uuid".to_string(), Value::String(shared.next_id()));
+    if matches!(kind, "instance" | "volume") {
+        // Incus gives an instance and a volume a uuid, in its `volatile.uuid` config key. No other kind has one.
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
+            config.insert("volatile.uuid".to_string(), Value::String(shared.next_id()));
+        }
+    }
     match kind {
         "instance" => {
             body.entry("status")
@@ -706,7 +713,7 @@ fn create(
         parent,
         body: Value::Object(body),
     });
-    accepted(shared, store, Ok(()))
+    answered(shared, store, kind, "POST", Ok(()))
 }
 
 /// Changes an object from a PATCH. A stale `If-Match` is 412 and changes nothing. An empty string in `config` removes its key.
@@ -745,7 +752,8 @@ fn patch(
     if let Err(message) = merge(object, &changes) {
         return (400, String::new(), error_envelope(400, message));
     }
-    accepted(shared, store, Ok(()))
+    let kind = store.objects[index].kind.clone();
+    answered(shared, store, &kind, "PATCH", Ok(()))
 }
 
 /// Applies a PATCH body to an object. Top-level keys replace; `config` keys merge, and an empty or null value removes a key.
@@ -803,22 +811,40 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
         );
     }
     if kind == "instance" && store.objects[index].body.get("status") == Some(&json!("Running")) {
-        return accepted(
+        return answered(
             shared,
             store,
+            &kind,
+            "DELETE",
             Err((400, "The instance is running".to_string())),
         );
     }
     store.objects.remove(index);
-    accepted(shared, store, Ok(()))
+    answered(shared, store, &kind, "DELETE", Ok(()))
 }
 
-/// Records an operation for a write and answers 202 with its URL. The operation's own status carries the outcome.
-fn accepted(
+/// Whether Incus answers a write to this kind and method with an operation. An instance's and a volume's create and delete
+/// are. Their config update is sync, as every other write is.
+fn is_async(kind: &str, method: &str) -> bool {
+    matches!(kind, "instance" | "volume") && method != "PATCH"
+}
+
+/// Answers a write. An async write records its operation and answers 202 with the operation's URL; the operation's own status
+/// carries the outcome. A sync write answers with its result: 201 for a create, 200 for a change or a delete.
+fn answered(
     shared: &Shared,
     store: &mut Store,
+    kind: &str,
+    method: &str,
     outcome: Result<(), (u16, String)>,
 ) -> (u16, String, Value) {
+    if !is_async(kind, method) {
+        return match outcome {
+            Ok(()) if method == "POST" => (201, String::new(), sync_envelope(Value::Null)),
+            Ok(()) => (200, String::new(), sync_envelope(Value::Null)),
+            Err((code, message)) => (code, String::new(), error_envelope(code, &message)),
+        };
+    }
     let id = shared.next_id();
     let operation = match outcome {
         Ok(()) => json!({
@@ -890,6 +916,7 @@ fn error_envelope(status: u16, message: &str) -> Value {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
         202 => "Accepted",
         404 => "Not Found",
         405 => "Method Not Allowed",

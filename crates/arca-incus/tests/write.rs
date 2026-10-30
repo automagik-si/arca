@@ -1,23 +1,35 @@
-//! The Incus writer, tested against the fake Incus only. Every server is bound under a fresh temporary directory, and no test
-//! connects to a real Incus socket. Each refusal is checked twice: the writer returns `IncusError::Refused`, and the fake
-//! receives no write.
+#![cfg(feature = "write")]
+//! The Incus writer, tested against the fake Incus and against small canned servers that answer a scripted sequence. Every
+//! server is bound under a fresh temporary directory, and no test connects to a real Incus socket. Each refusal is checked
+//! twice: the writer returns `IncusError::Refused`, and the server sees no write.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arca_incus::{FakeIncus, FakeState, IncusError, Owned, Target, UnixIncusWriter};
+use arca_incus::{
+    FakeIncus, FakeState, IncusError, Owned, ProjectFamily, Target, Unconfirmed, UnixIncusWriter,
+};
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
-use arca_kernel::ownership::{IncusKind, ObjectRef};
+use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass};
 use serde_json::{Value, json};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state.json");
 const MARK: &str = "user.arcakernel.entry";
 const RETIRING: &str = "user.arcakernel.retiring";
+/// The projects the kernel's family names in these tests. `droid` is the other system's project and is never listed.
+const FAMILY: [&str; 4] = ["svc", "kproj1", "kfull", "kcan"];
+const NONE: [&str; 0] = [];
+const UUID: &str = "00000000-0000-4000-8000-0000000000cc";
+const OTHER_UUID: &str = "00000000-0000-4000-8000-00000000ffff";
+const OP: &str = "00000000-0000-4000-8000-0000000000aa";
 
 /// A fresh temporary directory, removed when the test ends.
 struct Scratch(PathBuf);
@@ -51,11 +63,16 @@ fn start(tag: &str) -> (Scratch, FakeIncus) {
     (dir, fake)
 }
 
+fn family() -> ProjectFamily {
+    ProjectFamily::new(FAMILY, ["droid"]).expect("the family")
+}
+
 fn writer(fake: &FakeIncus, entry: &str) -> UnixIncusWriter {
     UnixIncusWriter::new(
         fake.socket().to_path_buf(),
         EntryId(entry.to_string()),
         BTreeMap::new(),
+        family(),
     )
 }
 
@@ -69,6 +86,15 @@ fn target(kind: IncusKind, project: &str, name: &str, parent: Option<&str>) -> T
         },
         parent: parent.map(str::to_string),
     }
+}
+
+fn project_target(name: &str) -> Target {
+    target(IncusKind::Project, name, name, None)
+}
+
+/// Whether Incus gives an object of this kind a uuid: instances and volumes do, through their `volatile.uuid` key.
+fn has_uuid(kind: IncusKind) -> bool {
+    matches!(kind, IncusKind::Instance | IncusKind::Volume)
 }
 
 /// A create body that marks the object as the entry `toy`.
@@ -90,6 +116,14 @@ fn plan() -> Digest {
 fn status_of(error: &IncusError) -> Option<u16> {
     match error {
         IncusError::Status { code, .. } => Some(*code),
+        _ => None,
+    }
+}
+
+/// The owner class an unconfirmed write reports, or `None` when the result is not an unconfirmed write.
+fn owner_of(result: &Result<Owned, IncusError>) -> Option<OwnerClass> {
+    match result {
+        Err(IncusError::AppliedUnconfirmed(unconfirmed)) => unconfirmed.owner.clone(),
         _ => None,
     }
 }
@@ -126,6 +160,233 @@ fn write_count(fake: &FakeIncus) -> usize {
     fake.writes().len()
 }
 
+/// A server on its own socket that answers each connection with `answer(method, target)`. The requests it has seen are kept
+/// in order, so a test can see what was sent.
+struct Canned {
+    _dir: Scratch,
+    socket: PathBuf,
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Canned {
+    fn start(tag: &str, mut answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static) -> Canned {
+        let dir = Scratch::new(tag);
+        let socket = dir.0.join("canned.sock");
+        let listener = UnixListener::bind(&socket).expect("bind the canned socket");
+        listener
+            .set_nonblocking(true)
+            .expect("a non-blocking accept");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let seen = Arc::clone(&seen);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_once(stream, &mut answer, &seen),
+                        Err(_) => thread::sleep(Duration::from_millis(2)),
+                    }
+                }
+            })
+        };
+        Canned {
+            _dir: dir,
+            socket,
+            seen,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// A writer for `toy` over this server, with a short operation deadline so a wait that never ends is quick to see.
+    fn writer(&self) -> UnixIncusWriter {
+        UnixIncusWriter::new(
+            self.socket.clone(),
+            EntryId("toy".to_string()),
+            BTreeMap::new(),
+            family(),
+        )
+        .with_operation_deadline(Duration::from_millis(300))
+    }
+
+    /// Every request seen so far, as (method, target).
+    fn seen(&self) -> Vec<(String, String)> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn count(&self, method: &str) -> usize {
+        self.seen().iter().filter(|(m, _)| m == method).count()
+    }
+
+    fn waits(&self) -> usize {
+        self.seen()
+            .iter()
+            .filter(|(_, t)| t.contains("/wait"))
+            .count()
+    }
+}
+
+impl Drop for Canned {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Reads one request, records its method and target, and writes the reply `answer` gives.
+fn serve_once(
+    mut stream: UnixStream,
+    answer: &mut impl FnMut(&str, &str) -> Vec<u8>,
+    seen: &Mutex<Vec<(String, String)>>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return,
+        }
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut parts = text.lines().next().unwrap_or("").split(' ');
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+    let length = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if stream.read_exact(&mut body).is_err() {
+        return;
+    }
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((method.clone(), target.clone()));
+    let reply = answer(&method, &target);
+    let _ = stream.write_all(&reply);
+}
+
+/// A complete HTTP answer with a JSON body and any extra header lines.
+fn reply(status: u16, extra: &str, body: &Value) -> Vec<u8> {
+    let text = body.to_string();
+    format!(
+        "HTTP/1.1 {status} Reply\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    )
+    .into_bytes()
+}
+
+/// A sync answer whose metadata is `body`, with its ETag.
+fn object_reply(body: &Value) -> Vec<u8> {
+    reply(
+        200,
+        "ETag: \"e1\"\r\n",
+        &json!({"type": "sync", "status": "Success", "status_code": 200, "operation": "", "error_code": 0, "error": "", "metadata": body}),
+    )
+}
+
+fn not_found() -> Vec<u8> {
+    reply(
+        404,
+        "",
+        &json!({"type": "error", "status": "Not Found", "status_code": 404, "operation": "", "error_code": 404, "error": "not found", "metadata": null}),
+    )
+}
+
+/// A sync answer with the given status and metadata.
+fn sync_reply(status: u16, metadata: Value) -> Vec<u8> {
+    reply(
+        status,
+        "",
+        &json!({"type": "sync", "status": "Success", "status_code": 200, "operation": "", "error_code": 0, "error": "", "metadata": metadata}),
+    )
+}
+
+/// An operation as Incus shows it: its id, its status code and status, and its error text.
+fn operation(id: &str, code: u64, status: &str, err: &str) -> Value {
+    json!({"id": id, "class": "task", "status": status, "status_code": code, "err": err, "resources": {}, "metadata": null})
+}
+
+/// The answer to a wait: the operation, as a sync answer.
+fn wait_reply(op: Value) -> Vec<u8> {
+    sync_reply(200, op)
+}
+
+/// The envelope of a write that starts operation [`OP`].
+fn accepted_post() -> Value {
+    json!({"type": "async", "status": "Operation created", "status_code": 100, "operation": format!("/1.0/operations/{OP}"), "error_code": 0, "error": "", "metadata": operation(OP, 100, "Running", "")})
+}
+
+/// An instance as the canned servers serve it.
+fn instance(name: &str, config: Value) -> Value {
+    json!({"name": name, "project": "svc", "status": "Stopped", "config": config})
+}
+
+/// The config of an instance the entry `toy` owns, with the `volatile.uuid` Incus gives an instance when given one.
+fn owned_config(uuid: Option<&str>) -> Value {
+    let mut config = json!({ MARK: "toy" });
+    if let Some(uuid) = uuid {
+        config["volatile.uuid"] = json!(uuid);
+    }
+    config
+}
+
+/// A create's server. The instance `cn*` is missing until its POST, which is answered `post`. Each wait pops the next
+/// operation, and the last one repeats. The object reads back as `read_back`.
+fn create_server(
+    post: Value,
+    waits: Vec<Value>,
+    read_back: Value,
+) -> impl FnMut(&str, &str) -> Vec<u8> + Send + 'static {
+    let mut posted = false;
+    let mut waits = VecDeque::from(waits);
+    move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return reply(202, "", &post);
+        }
+        if target.contains("/wait") {
+            let next = if waits.len() > 1 {
+                waits.pop_front()
+            } else {
+                waits.front().cloned()
+            };
+            return wait_reply(next.unwrap_or_else(|| operation(OP, 200, "Success", "")));
+        }
+        if method == "GET" && target.starts_with("/1.0/instances/cn") {
+            return if posted {
+                object_reply(&read_back)
+            } else {
+                not_found()
+            };
+        }
+        not_found()
+    }
+}
+
+/// Creates `cn1` over a server whose waits answer `waits`, and returns the result with the number of waits seen.
+fn create_with_waits(waits: Vec<Value>) -> (Result<Owned, IncusError>, usize) {
+    let canned = Canned::start(
+        "waits",
+        create_server(accepted_post(), waits, instance("cn1", owned_config(None))),
+    );
+    let result = canned
+        .writer()
+        .create(&target(IncusKind::Instance, "svc", "cn1", None), &marked());
+    (result, canned.waits())
+}
+
 #[test]
 fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     let (_dir, fake) = start("roundtrip");
@@ -154,7 +415,17 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
         let target = target(kind, project, name, parent);
         let created = writer.create(&target, &marked()).expect("create");
         assert_eq!(created.entry(), &EntryId("toy".to_string()), "{kind:?}");
-        assert!(created.uuid().is_some(), "{kind:?} has a uuid after create");
+        assert_eq!(
+            created.uuid().is_some(),
+            has_uuid(kind),
+            "{kind:?} has a uuid exactly when Incus gives one"
+        );
+        if has_uuid(kind) {
+            assert!(
+                created.config().contains_key("volatile.uuid"),
+                "{kind:?} carries volatile.uuid"
+            );
+        }
 
         let set = writer
             .patch(&created, &changes(&[("user.note", Some("first"))]))
@@ -184,15 +455,132 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
             .all(|w| matches!(w.method.as_str(), "POST" | "PATCH" | "DELETE")),
         "only POST, PATCH and DELETE are sent: {writes:?}"
     );
-    assert!(writes.iter().all(|w| w.status == 202), "{writes:?}");
+    // Instances and volumes create and delete through an operation (202). Every other write, and every PATCH, is sync.
+    for write in &writes {
+        let accepted_late = (write.path.starts_with("/1.0/instances")
+            || write.path.contains("/volumes/custom"))
+            && write.method != "PATCH";
+        let expected = if accepted_late {
+            202
+        } else if write.method == "POST" {
+            201
+        } else {
+            200
+        };
+        assert_eq!(write.status, expected, "{write:?}");
+    }
+    let accepted = writes.iter().filter(|w| w.status == 202).count();
     let waits = fake
         .requests()
         .iter()
         .filter(|r| {
-            r.method == "GET" && r.path.contains("/operations/") && r.path.ends_with("/wait")
+            r.method == "GET" && r.path.starts_with("/1.0/operations/") && r.path.contains("/wait")
         })
         .count();
-    assert_eq!(waits, writes.len(), "every write waits on its operation");
+    assert_eq!(
+        waits, accepted,
+        "every accepted write, and only those, is waited on"
+    );
+}
+
+#[test]
+fn a_sync_answer_is_done_at_once_and_an_async_one_is_waited_on() {
+    let (_dir, fake) = start("sync-async");
+    let writer = writer(&fake, "toy");
+    writer
+        .create(&project_target("kproj1"), &marked())
+        .expect("a project is answered sync");
+    assert!(
+        fake.requests().iter().all(|r| !r.path.contains("/wait")),
+        "a sync write has no operation to wait on"
+    );
+    writer
+        .create(&target(IncusKind::Instance, "svc", "sa1", None), &marked())
+        .expect("an instance is answered async");
+    let waits: Vec<_> = fake
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.contains("/wait"))
+        .collect();
+    assert_eq!(waits.len(), 1, "the async create is waited on once");
+    assert!(
+        waits[0].path.contains("?timeout="),
+        "the wait carries its timeout: {}",
+        waits[0].path
+    );
+}
+
+#[test]
+fn an_answer_with_an_empty_or_absent_operation_is_done_without_a_wait() {
+    let replies = [
+        json!({"type": "async", "status_code": 100, "operation": "", "error_code": 0, "error": "", "metadata": null}),
+        json!({"type": "async", "status_code": 100, "error_code": 0, "error": "", "metadata": null}),
+    ];
+    for (n, post) in replies.into_iter().enumerate() {
+        let canned = Canned::start(
+            "empty-operation",
+            create_server(post, vec![], instance("cn1", owned_config(None))),
+        );
+        let created = canned
+            .writer()
+            .create(&target(IncusKind::Instance, "svc", "cn1", None), &marked())
+            .expect("an answer that names no operation is done");
+        assert_eq!(created.entry(), &EntryId("toy".to_string()), "case {n}");
+        assert_eq!(canned.waits(), 0, "case {n}: nothing was waited on");
+    }
+}
+
+#[test]
+fn the_operation_wait_follows_running_and_accepts_only_status_200_success() {
+    let running = operation(OP, 103, "Running", "");
+    let success = operation(OP, 200, "Success", "");
+
+    let (result, waits) = create_with_waits(vec![running.clone(), running.clone(), success]);
+    assert!(result.is_ok(), "running, then success: {result:?}");
+    assert_eq!(waits, 3, "each running answer is waited on again");
+
+    let (result, _) = create_with_waits(vec![running]);
+    assert!(
+        matches!(result, Err(IncusError::Timeout)),
+        "an operation that runs past the deadline times out: {result:?}"
+    );
+
+    let (result, _) = create_with_waits(vec![operation(OP, 400, "Failure", "boom")]);
+    assert_eq!(
+        result.err(),
+        Some(IncusError::Status {
+            code: 400,
+            message: "boom".to_string()
+        })
+    );
+
+    let (result, _) = create_with_waits(vec![operation(OP, 401, "Cancelled", "stopped")]);
+    assert_eq!(
+        result.err(),
+        Some(IncusError::Status {
+            code: 401,
+            message: "stopped".to_string()
+        })
+    );
+
+    for odd in [
+        operation(OP, 200, "Running", ""),
+        operation(OP, 201, "Created", ""),
+        operation(OP, 300, "Multiple", ""),
+    ] {
+        let (result, _) = create_with_waits(vec![odd.clone()]);
+        assert!(
+            matches!(result, Err(IncusError::Decode(_))),
+            "{odd}: {result:?}"
+        );
+    }
+
+    let other = "00000000-0000-4000-8000-0000000000bb";
+    let (result, _) = create_with_waits(vec![operation(other, 200, "Success", "")]);
+    assert!(
+        matches!(result, Err(IncusError::Decode(_))),
+        "an answer for another operation is not this one's: {result:?}"
+    );
 }
 
 #[test]
@@ -229,6 +617,64 @@ fn a_read_is_owned_only_for_this_entrys_own_kernel_object() {
 }
 
 #[test]
+fn a_target_outside_the_kernel_family_is_refused_before_any_request() {
+    let (_dir, fake) = start("family");
+    let writer = writer(&fake, "toy");
+    let requests = fake.requests().len();
+    let before = write_count(&fake);
+
+    for (project, name) in [
+        ("default", "kd1"),
+        ("bench", "kb1"),
+        ("droid", "kd2"),
+        ("svc-other", "kx1"),
+    ] {
+        let refused = writer
+            .create(&target(IncusKind::Instance, project, name, None), &marked())
+            .expect_err("a project outside the family");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{project}: {refused:?}"
+        );
+    }
+    for name in ["default", "bench"] {
+        let refused = writer
+            .create(&project_target(name), &marked())
+            .expect_err("a reserved project");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{name}: {refused:?}"
+        );
+    }
+    let read = writer.read_owned(&target(IncusKind::Instance, "default", "guest1", None));
+    assert!(matches!(read, Err(IncusError::Refused(_))), "{read:?}");
+
+    assert_eq!(write_count(&fake), before, "no write reached the fake");
+    assert_eq!(
+        fake.requests().len(),
+        requests,
+        "not even a read was sent for a target outside the family"
+    );
+}
+
+#[test]
+fn the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_project() {
+    assert!(ProjectFamily::new(["bench"], NONE).is_err());
+    assert!(ProjectFamily::new(["default"], NONE).is_err());
+    assert!(ProjectFamily::new(["svc", "default"], NONE).is_err());
+    assert!(ProjectFamily::new(["droid"], ["droid"]).is_err());
+    assert!(
+        ProjectFamily::new(["s vc"], NONE).is_err(),
+        "a name that is not a plain segment"
+    );
+    let family = ProjectFamily::new(["svc"], ["droid"]).expect("a family");
+    assert!(family.allows("svc"));
+    assert!(!family.allows("droid"));
+    assert!(!family.allows("default"));
+    assert!(!family.allows("bench"));
+}
+
+#[test]
 fn a_retained_object_is_never_owned_by_its_entry() {
     let (_dir, fake) = start("retained");
     let mut retained = BTreeMap::new();
@@ -240,6 +686,7 @@ fn a_retained_object_is_never_owned_by_its_entry() {
         fake.socket().to_path_buf(),
         EntryId("toy".to_string()),
         retained,
+        family(),
     );
     let before = write_count(&fake);
 
@@ -289,6 +736,70 @@ fn a_create_is_refused_unless_its_config_classes_as_the_entrys_own() {
 }
 
 #[test]
+fn a_create_takes_only_an_image_source_and_sends_nothing_else() {
+    let (_dir, fake) = start("sources");
+    let writer = writer(&fake, "toy");
+    let before = write_count(&fake);
+    let refused_sources = [
+        json!({"type": "copy", "source": "svc/k1"}),
+        json!({"type": "migration", "mode": "pull"}),
+        json!({"type": "image", "alias": "base", "refresh": true}),
+        json!({"type": "image", "alias": "base", "server": "https://192.0.2.1:8443", "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "base", "remote": "elsewhere"}),
+        json!({"type": "none"}),
+        json!({"type": "image", "alias": 7}),
+        json!("image"),
+    ];
+    for (n, source) in refused_sources.into_iter().enumerate() {
+        let mut body = marked();
+        body["source"] = source.clone();
+        let name = format!("src{n}");
+        let refused = writer
+            .create(&target(IncusKind::Instance, "svc", &name, None), &body)
+            .expect_err("a source that is not an image");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{source}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        write_count(&fake),
+        before,
+        "no refused source reached the fake"
+    );
+
+    let mut body = marked();
+    body["source"] = json!({"type": "image", "alias": "base", "fingerprint": "abc123", "properties": {"os": "linux"}});
+    writer
+        .create(&target(IncusKind::Instance, "svc", "img1", None), &body)
+        .expect("an image source is sent");
+    assert_eq!(write_count(&fake), before + 1);
+}
+
+#[test]
+fn a_create_whose_name_is_taken_is_refused_and_nothing_is_written() {
+    let (_dir, fake) = start("taken");
+    let writer = writer(&fake, "toy");
+    let before = write_count(&fake);
+    for (project, name) in [("svc", "k1"), ("svc", "db1")] {
+        let refused = writer
+            .create(&target(IncusKind::Instance, project, name, None), &marked())
+            .expect_err("the name is taken");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{name}: {refused:?}"
+        );
+    }
+    assert_eq!(write_count(&fake), before, "a taken name sends no POST");
+    assert!(
+        fake.requests()
+            .iter()
+            .any(|r| r.method == "GET" && r.path.starts_with("/1.0/instances/k1")),
+        "the name was read before the create"
+    );
+}
+
+#[test]
 fn a_patch_that_would_leave_the_object_owned_by_another_owner_is_refused() {
     let (_dir, fake) = start("patch-refusals");
     let writer = writer(&fake, "toy");
@@ -317,11 +828,11 @@ fn a_patch_that_would_leave_the_object_owned_by_another_owner_is_refused() {
 }
 
 #[test]
-fn a_tombstone_needs_a_uuid_and_a_delete_needs_its_tombstone() {
+fn a_tombstone_needs_a_uuid_where_incus_gives_one_and_a_delete_needs_its_tombstone() {
     let (_dir, fake) = start("delete-refusals");
     let writer = writer(&fake, "toy");
 
-    // The fixture's kernel object has no uuid, so it can be neither retired nor deleted.
+    // The fixture's kernel instance has no volatile.uuid, so it can be neither retired nor deleted.
     let k1 = writer
         .read_owned(&target(IncusKind::Instance, "svc", "k1", None))
         .expect("read");
@@ -354,6 +865,166 @@ fn a_tombstone_needs_a_uuid_and_a_delete_needs_its_tombstone() {
 }
 
 #[test]
+fn a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid() {
+    let (_dir, fake) = start("uuid-target");
+    let writer = writer(&fake, "toy");
+    let created = writer
+        .create(&target(IncusKind::Instance, "svc", "m1", None), &marked())
+        .expect("create");
+    let uuid = created.uuid().expect("an instance has a uuid").to_string();
+
+    let mut named = target(IncusKind::Instance, "svc", "m1", None);
+    named.object.uuid = Some(uuid.clone());
+    writer.read_owned(&named).expect("the named uuid reads");
+    named.object.uuid = Some(OTHER_UUID.to_string());
+    assert!(
+        matches!(writer.read_owned(&named), Err(IncusError::Refused(_))),
+        "another uuid is refused"
+    );
+
+    // A network has no uuid, so a target that names one never reads as that network.
+    writer
+        .create(&target(IncusKind::Network, "svc", "mn1", None), &marked())
+        .expect("a network");
+    let mut named_network = target(IncusKind::Network, "svc", "mn1", None);
+    named_network.object.uuid = Some(uuid);
+    assert!(matches!(
+        writer.read_owned(&named_network),
+        Err(IncusError::Refused(_))
+    ));
+
+    // A create names no uuid yet, so a target that does is refused before anything is sent.
+    let before = write_count(&fake);
+    let mut creating = target(IncusKind::Instance, "svc", "m2", None);
+    creating.object.uuid = Some(OTHER_UUID.to_string());
+    assert!(matches!(
+        writer.create(&creating, &marked()),
+        Err(IncusError::Refused(_))
+    ));
+    assert_eq!(write_count(&fake), before);
+}
+
+#[test]
+fn a_tombstone_that_reads_back_without_the_tombstone_is_applied_unconfirmed() {
+    let canned = Canned::start("tombstone-readback", |method, target| {
+        if method == "GET" && target.starts_with("/1.0/instances/tb1") {
+            return object_reply(&instance("tb1", owned_config(Some(UUID))));
+        }
+        if method == "PATCH" {
+            return sync_reply(200, Value::Null);
+        }
+        not_found()
+    });
+    let writer = canned.writer();
+    let owned = writer
+        .read_owned(&target(IncusKind::Instance, "svc", "tb1", None))
+        .expect("read");
+    let result = writer.tombstone(&owned, &plan());
+    assert!(
+        matches!(owner_of(&result), Some(OwnerClass::Kernel { .. })),
+        "the tombstone landed, and its read-back shows none: {result:?}"
+    );
+    assert_eq!(canned.count("PATCH"), 1, "the tombstone was sent once");
+}
+
+#[test]
+fn a_tombstone_that_reads_back_on_another_uuid_is_applied_unconfirmed() {
+    let mut patched = false;
+    let canned = Canned::start("uuid-readback", move |method, target| {
+        if method == "PATCH" {
+            patched = true;
+            return sync_reply(200, Value::Null);
+        }
+        if method == "GET" && target.starts_with("/1.0/instances/ub1") {
+            let mut config = owned_config(Some(if patched { OTHER_UUID } else { UUID }));
+            if patched {
+                config[RETIRING] = json!(plan().to_hex());
+            }
+            return object_reply(&instance("ub1", config));
+        }
+        not_found()
+    });
+    let writer = canned.writer();
+    let owned = writer
+        .read_owned(&target(IncusKind::Instance, "svc", "ub1", None))
+        .expect("read");
+    let result = writer.tombstone(&owned, &plan());
+    assert!(
+        matches!(owner_of(&result), Some(OwnerClass::Kernel { .. })),
+        "the read-back names another uuid: {result:?}"
+    );
+}
+
+#[test]
+fn a_patch_that_reads_back_without_its_change_is_applied_unconfirmed() {
+    let canned = Canned::start("unconfirmed-patch", |method, target| {
+        if method == "GET" && target.starts_with("/1.0/instances/pc1") {
+            return object_reply(&instance("pc1", owned_config(None)));
+        }
+        if method == "PATCH" {
+            return sync_reply(200, Value::Null);
+        }
+        not_found()
+    });
+    let writer = canned.writer();
+    let owned = writer
+        .read_owned(&target(IncusKind::Instance, "svc", "pc1", None))
+        .expect("read");
+    let result = writer.patch(&owned, &changes(&[("user.note", Some("first"))]));
+    assert!(
+        matches!(owner_of(&result), Some(OwnerClass::Kernel { .. })),
+        "the change landed, and the read-back does not show it: {result:?}"
+    );
+}
+
+#[test]
+fn a_create_that_lands_and_reads_back_foreign_is_applied_unconfirmed() {
+    let mut posted = false;
+    let canned = Canned::start("unconfirmed-create", move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return sync_reply(201, Value::Null);
+        }
+        if method == "GET" && target.starts_with("/1.0/projects/kcan") {
+            return if posted {
+                object_reply(&json!({"name": "kcan", "config": {}}))
+            } else {
+                not_found()
+            };
+        }
+        not_found()
+    });
+    let result = canned.writer().create(&project_target("kcan"), &marked());
+    match result {
+        Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
+            assert_eq!(unconfirmed.object.name, "kcan");
+            assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
+            assert!(!unconfirmed.reason.is_empty());
+        }
+        other => panic!("expected AppliedUnconfirmed: {other:?}"),
+    }
+    assert_eq!(canned.count("POST"), 1, "the create was sent once");
+}
+
+#[test]
+fn the_refused_and_unconfirmed_errors_say_whether_a_write_was_sent() {
+    let refused = IncusError::Refused("the name is taken".to_string()).to_string();
+    assert!(refused.contains("before any write was sent"), "{refused}");
+    let landed = IncusError::AppliedUnconfirmed(Box::new(Unconfirmed {
+        object: ObjectRef {
+            kind: IncusKind::Instance,
+            project: "svc".to_string(),
+            name: "x".to_string(),
+            uuid: None,
+        },
+        owner: None,
+        reason: "the object is not this entry's".to_string(),
+    }))
+    .to_string();
+    assert!(landed.contains("landed"), "{landed}");
+}
+
+#[test]
 fn a_delete_is_refused_when_the_tombstone_was_removed_after_it_was_set() {
     let (_dir, fake) = start("tombstone-gone");
     let writer = writer(&fake, "toy");
@@ -369,7 +1040,7 @@ fn a_delete_is_refused_when_the_tombstone_was_removed_after_it_was_set() {
         None,
         &json!({ "config": { RETIRING: "" } }),
     );
-    assert!(reply.starts_with("HTTP/1.1 202"), "{reply}");
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
 
     let refused = writer.delete(&retiring).expect_err("the tombstone is gone");
     assert!(matches!(refused, IncusError::Refused(_)), "{refused:?}");
@@ -414,7 +1085,7 @@ fn a_tombstone_with_a_stale_etag_is_412_and_sets_nothing() {
         None,
         &json!({ "config": { "user.other": "1" } }),
     );
-    assert!(raced.starts_with("HTTP/1.1 202"), "{raced}");
+    assert!(raced.starts_with("HTTP/1.1 200"), "{raced}");
 
     let stale = writer
         .tombstone(&first, &plan())
@@ -454,7 +1125,7 @@ fn a_failed_operation_is_a_status_error_and_the_object_stays() {
 fn a_non_empty_project_is_not_deleted() {
     let (_dir, fake) = start("project");
     let writer = writer(&fake, "toy");
-    let project = target(IncusKind::Project, "kfull", "kfull", None);
+    let project = project_target("kfull");
     let owned = writer
         .create(&project, &marked())
         .expect("create the project");
@@ -594,4 +1265,22 @@ fn the_ownership_document_exists_and_every_rule_cites_its_source() {
         .count();
     assert!(rules >= 12, "the document states its rules: {rules}");
     assert_eq!(rules, sources, "every rule is followed by its Source line");
+}
+
+#[test]
+fn the_ownership_document_carries_no_plan_cross_reference() {
+    // A plan's cross-references (a letter and a number, such as a review item) live in the plan's own record, not here.
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/OWNERSHIP.md");
+    let text = fs::read_to_string(path).expect("docs/OWNERSHIP.md exists");
+    for word in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let bytes = word.as_bytes();
+        let plan_ref = bytes.len() >= 2
+            && bytes.len() <= 3
+            && matches!(bytes[0], b'P' | b'C')
+            && bytes[1..].iter().all(u8::is_ascii_digit);
+        assert!(
+            !plan_ref,
+            "the public document carries the reference {word:?}"
+        );
+    }
 }
