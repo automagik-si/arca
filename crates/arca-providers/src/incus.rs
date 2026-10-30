@@ -28,7 +28,9 @@ use arca_kernel::ownership::{
     IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify, kernel_may_write,
 };
 pub use arca_kernel::plugin::Retirement;
-use arca_kernel::plugin::{EffectOp, EffectRefusal, Observe, Planned, Provider, op_digest};
+use arca_kernel::plugin::{
+    EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, op_digest,
+};
 use serde_json::{Map, Value, json};
 
 /// The two projects the kernel never writes, whatever its family names. Incus gives them to nobody else, and droidd and the
@@ -722,6 +724,10 @@ impl IncusProvider {
         let writer = self.writer(entry)?;
         let owned = match writer.read_owned(object) {
             Ok(owned) => owned,
+            // Gone already, so there is nothing for the delete to remove. The caller settles the create the delete undid.
+            Err(IncusError::Status { code: 404, .. }) => {
+                return Ok(Retirement::Deleted(object.clone()));
+            }
             Err(IncusError::Refused(reason)) => {
                 return match writer.read_class(object) {
                     Ok(reading) if kernel_may_write(&reading.class, entry) => {
@@ -907,6 +913,35 @@ impl Provider for IncusProvider {
             // A delete runs only through `retire`, after an approved plan. The kernel's own path refuses it.
             EffectOp::IncusDelete { .. } => Err(EffectRefusal::NotDeclared),
         }
+    }
+
+    /// Reads the object an unresolved intent names, with one GET. A target outside the family is refused before any request, and so
+    /// is a target whose project does not enable its kind's feature, as a write to it is: Incus would answer for the default project
+    /// instead. An object that answers 404 is absent. Any other answer that is not a read of the object is an error, so the intent
+    /// stays open.
+    fn read_back(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&BTreeMap<String, Option<String>>>,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.check_family(&target.project)?;
+        self.check_features(entry, target.kind, &target.project)?;
+        let reading = match self.writer(entry)?.read_class(target) {
+            Ok(reading) => reading,
+            Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
+            Err(error) => return Err(incus_refusal(error)),
+        };
+        let holds_pre_image =
+            pre_image.is_some_and(|pre| self.shows_pre_image(&reading.config, pre));
+        Ok(ReadBack::Present {
+            object: ObjectRef {
+                uuid: reading.uuid.clone(),
+                ..target.clone()
+            },
+            owned: kernel_may_write(&reading.class, entry),
+            holds_pre_image,
+        })
     }
 
     /// The reconciler's delete, through [`IncusProvider::retire`]: the tombstone, the read-back and the delete, in that order.

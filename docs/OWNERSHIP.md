@@ -166,7 +166,8 @@ Source: `arca_kernel::plugin::Ctx::effect` refuses `IncusDelete` (`NotDeclared`)
 `a_plugin_cannot_delete_through_ctx_and_no_provider_call_runs` in `crates/arca-kernel/tests/plugin.rs`.
 
 **Rule 22.** A lost outcome suspends and never retires. An intent with no recorded outcome is unresolved. Removal reports it
-and does not revert it, and the plugin stops serving while its objects stay.
+and does not revert it. The reconciler settles such an intent from a read-back when it opens (Rule 39); one that cannot be
+settled keeps the reconciler from opening, so the plugin stops serving while its objects stay.
 Source: `arca_kernel::journal::{Journal::unresolved, removal}` report unresolved intents; test
 `an_intent_with_no_outcome_is_unresolved_and_live_for_its_entry_only` in `crates/arca-kernel/tests/journal.rs`.
 
@@ -309,7 +310,8 @@ own with the plan's uuid. The writer tombstones it under its ETag and reads it b
 only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
 `Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
 `Drift`, and the object stays tombstoned. The writer accepts a tombstone with the same plan again, so a later retirement under that
-plan can continue. A DELETE the writer refuses is drift; any other failure of the DELETE is `Unresolved`.
+plan can continue. A DELETE the writer refuses is drift; any other failure of the DELETE is `Unresolved`. An object that answers 404
+when it is first read is already gone: the retirement is `Deleted`, and no DELETE is sent.
 Source: `IncusProvider::retire` in `crates/arca-providers/src/incus.rs`; tests
 `retire_tombstones_then_deletes_an_owned_instance_in_order`,
 `retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request`,
@@ -338,19 +340,35 @@ or a plan whose live objects are not all named in it (a new step, or a new uuid)
 deletes only the live objects the plan names. A partial run keeps its plan, and a retry under the same approval is refused as
 replayed. A declined plan's objects are retained: no run and no removal writes them again, and a later document that carries the
 entry does not adopt them. An unresolved intent blocks every new effect, including every run. A suspended (disabled) entry keeps
-its objects. A class-C emission is never reverted.
+its objects. A class-C emission is never reverted. A removal reads each class-B object before it asks for approval: one that reads absent
+is settled without a plan, and a pending plan with no class-B object left is withdrawn.
 Source: `arca_reconcile::Reconciler::{reconcile, run_plan, decline}`; tests `removal_leaves_zero_objects_with_the_entry_mark_and_an_empty_journal`,
+`a_plan_whose_instance_is_gone_before_the_next_removal_is_withdrawn_and_nothing_is_pending`,
 `the_container_delete_waits_for_an_approval_over_the_plan_digest`,
 `an_object_changed_between_plan_and_run_survives_is_drift_and_a_retry_without_approval_is_refused`,
 `a_plan_older_than_fifteen_minutes_needs_a_new_approval` and `a_declined_plan_retains_its_objects_and_cannot_run` in
 `crates/arca-reconcile/tests/`, and the unit tests in `crates/arca-reconcile/src/tests.rs`.
 
 **Rule 38.** A class-A patch's undo (`IncusRestoreConfig`) runs through the plugin's own manifest, as a `Ctx::effect` of the
-restore, and then settles the restore and the record it undoes. A removal needs the plugin that applied the entry. The applied map
-is held by one process, so after a restart a removal that needs a plugin fails closed as "plugin not known" until applied state is
-persisted.
-Source: `arca_reconcile::Reconciler::{restore, plan_removal}`; test `a_live_class_b_record_without_an_applied_entry_fails_closed`
-in `crates/arca-reconcile/src/tests.rs`.
+restore, and then settles the restore and the record it undoes. A removal needs the plugin that applied the entry. Every intent a
+plugin's apply makes names that plugin (`EffectRecord.plugin`), and `open` rebuilds the entry-to-plugin map from the live records,
+so a removal after a restart finds the plugin. A journal whose entries carry no plugin name fails closed as "plugin not known".
+Source: `arca_reconcile::Reconciler::{restore, plan_removal, rebuild_applied_by}`; tests
+`a_class_b_plan_after_a_restart_with_the_plugin_missing_fails_closed_and_deletes_nothing` and
+`a_kill_inside_a_removal_during_a_patch_restore_is_settled_and_the_removal_completes` in `crates/arca-reconcile/tests/restart.rs`,
+and `a_live_class_b_record_without_an_applied_entry_fails_closed` in `crates/arca-reconcile/src/tests.rs`.
+
+**Rule 39.** Before any effect runs, `open` settles each unresolved intent from a GET of its place. A create whose object the entry
+owns is adopted, with an `IncusDelete` inverse; a create with nothing there is reverted; any other object is failed and reported
+as drift. A patch's entry is held, so nothing is written for it until a document is accepted again. A patch whose object shows its
+pre-image is failed; any other value settles the patch with its pre-image as the inverse, which a later removal restores. A delete
+whose object is still the entry's is failed, so the next removal retries it; one whose object is gone is reverted, with the create
+it undid. An object that is not the entry's, or whose uuid differs from the intent's, is failed and reported, and no delete or
+patch is sent. A target outside the family, or in a project that does not enable its kind's feature, is not read. A read that cannot
+be answered leaves its intent open, and `open` refuses.
+Source: `arca_reconcile::Reconciler::{resolve, open}` in `crates/arca-reconcile/src/restart.rs` and
+`arca_providers::incus::IncusProvider::read_back`; tests in `crates/arca-reconcile/tests/restart.rs` and
+`a_read_back_in_a_project_without_the_feature_is_refused_and_sends_only_gets` in `crates/arca-providers/tests/incus_provider.rs`.
 
 ## Out of scope
 
@@ -385,3 +403,4 @@ must run before any live write.
 - Incus accepts `ipv4.nat` on a bridge create, and reports a network's config with the keys that were set on it and no others.
   A key Incus adds on read would refuse a patch of that network, which fails closed (Rule 31).
 - Incus accepts `features.networks.zones` on a project create and reports it in the project's config (Rule 30).
+- Incus answers a GET of an object that is gone with 404, which is how Rule 39 reads an absent object.

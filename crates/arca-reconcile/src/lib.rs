@@ -3,12 +3,15 @@
 //! deleted only by [`Reconciler::run_plan`], after an approval over the plan's digest; a declined plan's objects are retained,
 //! and nothing deletes them afterwards. Every effect is journalled as an intent before it runs and as its outcome after.
 //!
-//! An unresolved intent blocks every new effect. [`Reconciler::open`] refuses a journal that holds one, and a run that leaves one
-//! open stops at once. A plugin's own writes pass through a gate that refuses its next intent while one is open, so a plugin
-//! that swallows the refusal still cannot write past it.
+//! An unresolved intent blocks every new effect. [`Reconciler::open`] settles the intents a restart left open before it returns,
+//! and refuses a journal whose intent it cannot settle. A run that leaves an intent open stops at once. A plugin's own writes pass
+//! through a gate that refuses its next intent while one is open, so a plugin that swallows the refusal still cannot write past it.
 
+mod restart;
 #[cfg(feature = "toy")]
 pub mod toy;
+
+pub use restart::Resolution;
 
 use arca_approval::{ApprovalRefusal, ApprovalVerifier, ArcaAction, NonceStore, SignatureVerifier};
 use arca_kernel::KernelError;
@@ -17,13 +20,13 @@ use arca_kernel::desired::{
     DesiredStateGate, DocRefusal, Entry, EntryId, PluginId, SignedDocument, Target,
 };
 use arca_kernel::journal::{
-    DeletePlan, EffectClass, EffectRecord, EffectState, Inverse, Journal, JournalSink,
-    JournalStore, removal,
+    DeletePlan, EffectClass, EffectRecord, EffectState, IntentFields, Inverse, Journal,
+    JournalSink, JournalStore, removal,
 };
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::{
-    Ctx, EffectOp, EffectRefusal, Erased, ErasedPlugin, Manifest, Plugin, Provider, Retirement,
-    op_digest,
+    Ctx, EffectOp, EffectRefusal, Erased, ErasedPlugin, Manifest, Plugin, Provider, ReadBack,
+    Retirement, op_digest,
 };
 use arca_providers::incus::RetainedSet;
 use serde_json::json;
@@ -126,12 +129,16 @@ pub struct Reconciler<S: JournalStore> {
     /// removal takes the entry out, and a failed apply never puts it in, so the same config is retried.
     converged: BTreeMap<EntryId, Entry>,
     pending: Vec<Pending>,
+    /// What the last resolution settled.
+    resolution: Resolution,
 }
 
 /// The journal as a plugin's context writes to it. An intent is refused while an earlier intent has no outcome, or while the
 /// journal has stopped, so a plugin that swallows an unknown outcome cannot write past it. Outcomes pass through unchanged.
 struct Gate<'a, S: JournalStore> {
     journal: &'a mut Journal<S>,
+    /// The plugin whose apply this gate serves. Every intent it records names the plugin.
+    plugin: PluginId,
 }
 
 impl<S: JournalStore> JournalSink for Gate<'_, S> {
@@ -153,8 +160,17 @@ impl<S: JournalStore> JournalSink for Gate<'_, S> {
                 ids: unresolved.iter().map(|record| record.id).collect(),
             });
         }
-        self.journal
-            .intend(entry, class, op_digest, target, pre_image, now_ms)
+        self.journal.intend_by(
+            &self.plugin,
+            IntentFields {
+                entry,
+                class,
+                op_digest,
+                target,
+                pre_image,
+                now_ms,
+            },
+        )
     }
 
     fn applied(&mut self, id: u64, object: ObjectRef, inverse: Inverse) -> Result<(), KernelError> {
@@ -172,25 +188,21 @@ fn same_place(a: &ObjectRef, b: &ObjectRef) -> bool {
 }
 
 impl<S: JournalStore> Reconciler<S> {
-    /// Opens the reconciler over `journal`. Refused with [`KernelError::Unresolved`] when the journal holds an intent with no
-    /// outcome, and then nothing runs and no request is sent.
+    /// Opens the reconciler over `journal`. Before it returns, every intent a restart left open is settled from what the host
+    /// shows (see [`Reconciler::resolve`]), and each entry's plugin is read back from the journal. Refused with
+    /// [`KernelError::Unresolved`] when an intent cannot be settled, and then nothing runs and no effect is sent.
     pub fn open(
         gate: DesiredStateGate,
         journal: Journal<S>,
         plugins: PluginSet,
         provider: Box<dyn Provider>,
         retained: RetainedSet,
+        now_ms: u64,
     ) -> Result<Self, KernelError> {
         if let Some(error) = journal.poisoned() {
             return Err(error.clone());
         }
-        let unresolved = journal.unresolved();
-        if !unresolved.is_empty() {
-            return Err(KernelError::Unresolved {
-                ids: unresolved.iter().map(|record| record.id).collect(),
-            });
-        }
-        Ok(Reconciler {
+        let mut reconciler = Reconciler {
             gate,
             journal,
             plugins,
@@ -199,7 +211,17 @@ impl<S: JournalStore> Reconciler<S> {
             applied_by: BTreeMap::new(),
             converged: BTreeMap::new(),
             pending: Vec::new(),
-        })
+            resolution: Resolution::default(),
+        };
+        reconciler.rebuild_applied_by();
+        reconciler.resolve(now_ms)?;
+        Ok(reconciler)
+    }
+
+    /// What the last resolution settled: the intents it adopted, reverted or left failed, the entries it held, and the objects
+    /// whose live state differs from what their intent left.
+    pub fn resolution(&self) -> &Resolution {
+        &self.resolution
     }
 
     /// The journal, read only.
@@ -442,6 +464,7 @@ impl<S: JournalStore> Reconciler<S> {
         let result = {
             let mut gate = Gate {
                 journal: &mut self.journal,
+                plugin: manifest.id.clone(),
             };
             let mut ctx = Ctx::new(
                 id.clone(),
@@ -474,6 +497,9 @@ impl<S: JournalStore> Reconciler<S> {
     fn remove_entry(&mut self, id: &EntryId, now_ms: u64, outcomes: &mut Vec<Outcome>) {
         // A removed entry has not converged: a document that carries it again applies it again.
         self.converged.remove(id);
+        if !self.blocked() {
+            self.settle_gone(id);
+        }
         let split = removal(&self.journal, id, now_ms);
         let mut reverted = 0;
         let mut stopped = false;
@@ -503,8 +529,10 @@ impl<S: JournalStore> Reconciler<S> {
             });
             return;
         }
-        if let Some(plan) = split.plan {
-            self.plan_removal(id, plan, outcomes);
+        match split.plan {
+            Some(plan) => self.plan_removal(id, plan, outcomes),
+            // Nothing of the entry is left to delete, so a plan queued for it asks about objects that are gone.
+            None => self.pending.retain(|pending| &pending.plan.entry != id),
         }
         if self.revertible_live(id) == 0 {
             self.applied_by.remove(id);
@@ -604,6 +632,7 @@ impl<S: JournalStore> Reconciler<S> {
         {
             let mut gate = Gate {
                 journal: &mut self.journal,
+                plugin: manifest.id.clone(),
             };
             let mut ctx = Ctx::new(
                 record.entry.clone(),
@@ -659,6 +688,25 @@ impl<S: JournalStore> Reconciler<S> {
                 self.journal.failed(delete, &why)?;
                 Ok(Retired::Kept(why))
             }
+        }
+    }
+
+    /// Settles the entry's class-B objects that read back absent, before a plan asks the owner about them. Nothing is left to delete
+    /// for such an object, so it is not put in a plan, and its records are settled as an absent create is at restart. An object
+    /// whose read cannot be answered is left as it is, so the plan still asks about it.
+    fn settle_gone(&mut self, entry: &EntryId) {
+        let gone: Vec<ObjectRef> = self
+            .live_deletes(entry)
+            .into_iter()
+            .filter(|object| {
+                matches!(
+                    self.provider.read_back(entry, object, None),
+                    Ok(ReadBack::Absent)
+                )
+            })
+            .collect();
+        for object in &gone {
+            self.settle_deleted(entry, object);
         }
     }
 

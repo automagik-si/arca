@@ -10,10 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
-use arca_kernel::desired::EntryId;
+use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::journal::{
-    EffectClass, EffectRecord, EffectState, FileJournal, Inverse, Journal, JournalSink,
-    JournalStore, MemJournal, removal,
+    EffectClass, EffectRecord, EffectState, FileJournal, IntentFields, Inverse, Journal,
+    JournalSink, JournalStore, MemJournal, removal,
 };
 use arca_kernel::ownership::{IncusKind, ObjectRef};
 use serde_json::json;
@@ -123,6 +123,7 @@ fn record(
         target: instance("p", "n", None),
         pre_image: None,
         intent: None,
+        plugin: None,
         object,
         inverse,
         state,
@@ -1344,5 +1345,71 @@ fn an_unmarked_record_keeps_its_bytes_and_a_delete_marker_round_trips() {
         serde_json::to_value(&back).expect("a record serializes"),
         marked,
         "the marker survives a round trip"
+    );
+}
+
+#[test]
+fn an_intent_named_for_its_plugin_keeps_the_plugin_on_every_record_of_the_effect() {
+    let dir = Scratch::new("plugin-named");
+    let path = dir.path("journal.jsonl");
+    let plugin = PluginId("watch.plugin".to_string());
+    let made = instance("arcak-svc", "web1", None);
+    let made_with_uuid = instance("arcak-svc", "web1", Some("u-web1"));
+    let plain = instance("arcak-svc", "db1", None);
+    {
+        let mut journal = Journal::open(FileJournal::open(&path).expect("opens")).expect("folds");
+        let named = journal
+            .intend_by(
+                &plugin,
+                IntentFields {
+                    entry: &entry("watch"),
+                    class: EffectClass::A,
+                    op_digest: digest("create"),
+                    target: made.clone(),
+                    pre_image: None,
+                    now_ms: 1,
+                },
+            )
+            .expect("the named intent is journalled");
+        journal
+            .applied(
+                named,
+                made_with_uuid.clone(),
+                Inverse::IncusDelete {
+                    object: made_with_uuid.clone(),
+                },
+            )
+            .expect("the outcome is journalled");
+        journal
+            .intend(
+                &entry("watch"),
+                EffectClass::A,
+                digest("plain"),
+                plain,
+                None,
+                2,
+            )
+            .expect("the unnamed intent is journalled");
+    }
+    let (records, _) = FileJournal::open(&path)
+        .expect("reopens")
+        .load()
+        .expect("loads");
+    let named: Vec<&EffectRecord> = records.iter().filter(|r| r.id == 1).collect();
+    assert_eq!(named.len(), 2, "the intent and its outcome");
+    assert!(
+        named.iter().all(|r| r.plugin == Some(plugin.clone())),
+        "every record of a named effect names the plugin: {named:?}"
+    );
+    let unnamed = records
+        .iter()
+        .find(|r| r.id == 2)
+        .expect("the second effect");
+    assert_eq!(unnamed.plugin, None, "an unnamed intent names no plugin");
+    let text = fs::read_to_string(&path).expect("the file reads");
+    let second_line = text.lines().nth(2).expect("a third line");
+    assert!(
+        !second_line.contains("\"plugin\""),
+        "an unnamed record keeps its bytes: {second_line}"
     );
 }

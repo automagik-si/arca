@@ -170,6 +170,7 @@ fn open(stub: &Stub, key: &NodeKey) -> Reconciler<MemJournal> {
         plugins,
         Box::new(stub.clone()),
         RetainedSet::empty(),
+        NOW,
     )
     .expect("an empty journal opens the reconciler")
 }
