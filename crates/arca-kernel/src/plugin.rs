@@ -11,6 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::KernelError;
 use crate::canon::{Digest, canonical_json};
 use crate::desired::{EntryId, PluginId};
 use crate::journal::{EffectClass, Inverse, JournalSink};
@@ -62,7 +63,8 @@ pub enum EffectOp {
         object: ObjectRef,
         config: BTreeMap<String, Option<String>>,
     },
-    /// Deletes an object, under the approved delete plan named by `plan`.
+    /// Deletes an object, under the approved delete plan named by `plan`. Only the reconciler runs one; [`Ctx::effect`]
+    /// refuses it.
     IncusDelete { object: ObjectRef, plan: Digest },
 }
 
@@ -165,8 +167,14 @@ impl std::error::Error for PluginError {}
 /// The host side a [`Ctx`] calls. `plan` and `observe` read only; `effect` is the one call that writes, and it runs only
 /// after the intent is journalled.
 pub trait Provider {
-    /// Answers a read the manifest allows.
-    fn observe(&self, query: &Observe) -> Result<Value, EffectRefusal>;
+    /// Answers a read the manifest allows. `projects` are the projects the manifest names, so a provider can scope its reads
+    /// to them.
+    fn observe(
+        &self,
+        entry: &EntryId,
+        projects: &[String],
+        query: &Observe,
+    ) -> Result<Value, EffectRefusal>;
     /// Plans an op without writing. A refusal here leaves no journal record.
     fn plan(&self, entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal>;
     /// Applies a planned op and returns the object it touched with the inverse that undoes it. The inverse is built now, at
@@ -218,25 +226,32 @@ impl<'a> Ctx<'a> {
         if !self.manifest.observes {
             return Err(EffectRefusal::NotDeclared);
         }
-        self.provider.observe(&query)
+        self.provider
+            .observe(&self.entry, &self.manifest.projects, &query)
     }
 
     /// Asks for one write. The checks run in this order, and a refusal before the intent leaves no record:
     ///
     /// 1. A manifest with no effects refuses with `WatchOnly`.
-    /// 2. The op's kind must be declared, and its project must be named.
-    /// 3. The provider plans the op read-only. A plan that names another op, or a class the manifest does not declare for
-    ///    the kind, is refused.
-    /// 4. The intent is journalled, and only then does the provider apply the op.
-    /// 5. The applied object and its inverse are journalled. A provider that refuses has its refusal journalled as `Failed`.
+    /// 2. A delete is refused with `NotDeclared`: it runs only through the reconciler's approved plan.
+    /// 3. The op's kind must be declared, and its project must be named.
+    /// 4. The provider plans the op read-only. A plan that names another op, a class the manifest does not declare for the
+    ///    kind, or a pre-image that does not fit the op (none for a create; one entry per patched key for a patch), is refused.
+    /// 5. The intent is journalled with the op's target and the planned pre-image, and only then does the provider apply it.
+    /// 6. The applied object and its inverse are journalled. The inverse must be the one the op requires: a create's delete of
+    ///    the object it made, with its uuid, or a patch's restore of the planned pre-image. A provider that refuses has its
+    ///    refusal journalled as `Failed`.
     ///
-    /// If the provider answers for another object, the intent is left open, since the effect may have happened. A journal
-    /// failure is refused as `Provider`, because the enum has no journal variant, and the effect is not run when the intent
-    /// could not be written.
+    /// If the provider answers for another object, or with another inverse, the intent is left open, since the effect may
+    /// have happened. A journal failure is refused as `Provider`, because the enum has no journal variant, and the effect is
+    /// not run when the intent could not be written.
     pub fn effect(&mut self, op: EffectOp) -> Result<ObjectRef, EffectRefusal> {
         let (kind, project, name) = op.target();
         if self.manifest.effects.is_empty() {
             return Err(EffectRefusal::WatchOnly);
+        }
+        if matches!(op, EffectOp::IncusDelete { .. }) {
+            return Err(EffectRefusal::NotDeclared);
         }
         if !self
             .manifest
@@ -269,9 +284,38 @@ impl<'a> Ctx<'a> {
         if !self.manifest.effects.contains(&(kind, planned.class)) {
             return Err(EffectRefusal::NotDeclared);
         }
+        if !plan_has_op_shape(&op, &planned) {
+            return Err(EffectRefusal::Provider(
+                "the plan's pre-image does not fit the op".to_string(),
+            ));
+        }
+        // The intent names the object the op addresses, and a patch's pre-image, before the provider applies anything.
+        let target = match &op {
+            EffectOp::IncusCreate {
+                kind,
+                project,
+                name,
+                ..
+            } => ObjectRef {
+                kind: *kind,
+                project: project.clone(),
+                name: name.clone(),
+                uuid: None,
+            },
+            EffectOp::IncusPatchConfig { object, .. } | EffectOp::IncusDelete { object, .. } => {
+                object.clone()
+            }
+        };
         let id = self
             .journal
-            .intend(&self.entry, planned.class, digest, self.now_ms)
+            .intend(
+                &self.entry,
+                planned.class,
+                digest,
+                target,
+                planned.pre_image.clone(),
+                self.now_ms,
+            )
             .map_err(journal_refusal)?;
         match self.provider.effect(&self.entry, &op, &planned) {
             Ok((object, inverse)) => {
@@ -280,6 +324,12 @@ impl<'a> Ctx<'a> {
                 {
                     return Err(EffectRefusal::Provider(
                         "the provider answered for another object; the intent stays open"
+                            .to_string(),
+                    ));
+                }
+                if required_inverse(&op, &object, &planned).as_ref() != Some(&inverse) {
+                    return Err(EffectRefusal::Provider(
+                        "the provider's inverse is not the one the op requires; the intent stays open"
                             .to_string(),
                     ));
                 }
@@ -317,6 +367,32 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// The inverse an op's effect must return, given the object it applied to. A create's must be the delete of the object it
+/// made, with its uuid. A patch's must restore the planned pre-image on the object the op names. `None` when no inverse can
+/// be right: a create that returned no uuid, a patch with no pre-image, or a delete, which a plugin never runs.
+fn required_inverse(op: &EffectOp, object: &ObjectRef, planned: &Planned) -> Option<Inverse> {
+    match op {
+        EffectOp::IncusCreate { .. } => object.uuid.is_some().then(|| Inverse::IncusDelete {
+            object: object.clone(),
+        }),
+        EffectOp::IncusPatchConfig { object: named, .. } => Some(Inverse::IncusRestoreConfig {
+            object: named.clone(),
+            config: planned.pre_image.clone()?,
+        }),
+        EffectOp::IncusDelete { .. } => None,
+    }
+}
+
+/// Whether a plan's pre-image has the shape its op needs: none for a create, and for a patch exactly one entry for each key
+/// the patch sets or removes, so the restore it implies covers the patch and nothing else.
+fn plan_has_op_shape(op: &EffectOp, planned: &Planned) -> bool {
+    match (op, &planned.pre_image) {
+        (EffectOp::IncusCreate { .. }, None) => true,
+        (EffectOp::IncusPatchConfig { config, .. }, Some(pre)) => pre.keys().eq(config.keys()),
+        _ => false,
+    }
+}
+
 fn journal_refusal(e: crate::KernelError) -> EffectRefusal {
     EffectRefusal::Provider(format!("the journal refused the write: {e}"))
 }
@@ -345,14 +421,20 @@ pub trait ErasedPlugin: Send + Sync {
 pub struct Erased<P: Plugin>(PhantomData<fn() -> P>);
 
 impl<P: Plugin> Erased<P> {
-    pub fn new() -> Self {
-        Erased(PhantomData)
-    }
-}
-
-impl<P: Plugin> Default for Erased<P> {
-    fn default() -> Self {
-        Self::new()
+    /// The erased form of `P`, refused unless `P::ID` is a valid plugin id and equals the id its manifest names. A plugin's
+    /// name is then one value everywhere the reconciler sees it.
+    pub fn new() -> Result<Self, KernelError> {
+        if PluginId::parse(P::ID).is_none() {
+            return Err(KernelError::Plugin(
+                "its id is not a valid plugin id".to_string(),
+            ));
+        }
+        if P::manifest().id.0 != P::ID {
+            return Err(KernelError::Plugin(
+                "its id is not the id its manifest names".to_string(),
+            ));
+        }
+        Ok(Erased(PhantomData))
     }
 }
 

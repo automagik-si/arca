@@ -1,6 +1,7 @@
 //! The effect journal: the closed inverse vocabulary, the intent-then-outcome fold, the removal partition, and the file
 //! format's crash and damage boundaries.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
@@ -73,7 +74,13 @@ fn restore(object: &ObjectRef, pairs: &[(&str, Option<&str>)]) -> Inverse {
     }
 }
 
-/// Records one whole effect through the sink: intent, then applied.
+/// The object an intent names in tests that do not care which one it is.
+fn target() -> ObjectRef {
+    instance("p", "n", None)
+}
+
+/// Records one whole effect through the sink: intent, then applied. A restore's intent carries its config as the pre-image,
+/// as a plan would, and any other effect carries none.
 fn apply_one(
     journal: &mut impl JournalSink,
     entry_id: &str,
@@ -81,8 +88,19 @@ fn apply_one(
     object: ObjectRef,
     inverse: Inverse,
 ) -> u64 {
+    let pre_image = match &inverse {
+        Inverse::IncusRestoreConfig { config, .. } => Some(config.clone()),
+        _ => None,
+    };
     let id = journal
-        .intend(&entry(entry_id), class, digest(entry_id), 1_000)
+        .intend(
+            &entry(entry_id),
+            class,
+            digest(entry_id),
+            object.clone(),
+            pre_image,
+            1_000,
+        )
         .expect("the intent is journalled");
     journal
         .applied(id, object, inverse)
@@ -101,6 +119,8 @@ fn record(
         entry: entry("watch"),
         class: EffectClass::A,
         op_digest: digest("watch"),
+        target: instance("p", "n", None),
+        pre_image: None,
         object,
         inverse,
         state,
@@ -244,10 +264,24 @@ fn an_applied_then_confirmed_effect_is_one_live_record_with_its_inverse() {
 fn an_intent_with_no_outcome_is_unresolved_and_live_for_its_entry_only() {
     let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let id = journal
-        .intend(&entry("watch"), EffectClass::A, digest("w"), 5)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("w"),
+            target(),
+            None,
+            5,
+        )
         .expect("intent");
     let other = journal
-        .intend(&entry("other"), EffectClass::A, digest("o"), 6)
+        .intend(
+            &entry("other"),
+            EffectClass::A,
+            digest("o"),
+            target(),
+            None,
+            6,
+        )
         .expect("intent");
     assert_ne!(id, other, "ids are unique across entries");
     let unresolved = journal.unresolved();
@@ -263,7 +297,14 @@ fn an_intent_with_no_outcome_is_unresolved_and_live_for_its_entry_only() {
 fn a_failed_effect_is_neither_live_nor_unresolved() {
     let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let id = journal
-        .intend(&entry("watch"), EffectClass::A, digest("w"), 5)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("w"),
+            target(),
+            None,
+            5,
+        )
         .expect("intent");
     journal
         .failed(id, "refused by the provider")
@@ -306,7 +347,14 @@ fn a_second_outcome_for_one_intent_is_refused() {
     let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let object = instance("p", "n", None);
     let id = journal
-        .intend(&entry("watch"), EffectClass::A, digest("w"), 5)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("w"),
+            target(),
+            None,
+            5,
+        )
         .expect("intent");
     journal
         .applied(id, object.clone(), Inverse::Emission)
@@ -324,7 +372,14 @@ fn a_second_outcome_for_one_intent_is_refused() {
 fn an_illegal_void_transition_poisons_the_journal() {
     let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let id = journal
-        .intend(&entry("watch"), EffectClass::A, digest("w"), 5)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("w"),
+            target(),
+            None,
+            5,
+        )
         .expect("intent");
     // Confirming an intent that never applied is not a legal move. The void method cannot return it, so the journal stops.
     journal.confirmed(id);
@@ -332,7 +387,14 @@ fn an_illegal_void_transition_poisons_the_journal() {
         journal.poisoned().is_some(),
         "the illegal move poisons the journal"
     );
-    let refused = journal.intend(&entry("watch"), EffectClass::A, digest("x"), 6);
+    let refused = journal.intend(
+        &entry("watch"),
+        EffectClass::A,
+        digest("x"),
+        target(),
+        None,
+        6,
+    );
     assert!(
         matches!(refused, Err(KernelError::Journal(_))),
         "a poisoned journal refuses every later write"
@@ -374,10 +436,24 @@ fn a_store_write_failure_poisons_the_journal_even_when_the_store_recovers() {
         fail_at: 0,
     };
     let mut journal = Journal::open(store).expect("opens");
-    let first = journal.intend(&entry("watch"), EffectClass::A, digest("w"), 5);
+    let first = journal.intend(
+        &entry("watch"),
+        EffectClass::A,
+        digest("w"),
+        target(),
+        None,
+        5,
+    );
     assert!(matches!(first, Err(KernelError::Io { .. })));
     // The store accepts writes again, but the journal stopped at the failure and writes nothing more.
-    let second = journal.intend(&entry("watch"), EffectClass::A, digest("w"), 6);
+    let second = journal.intend(
+        &entry("watch"),
+        EffectClass::A,
+        digest("w"),
+        target(),
+        None,
+        6,
+    );
     assert!(matches!(second, Err(KernelError::Journal(_))));
     assert!(journal.poisoned().is_some());
     assert!(
@@ -396,7 +472,14 @@ fn a_failed_outcome_write_leaves_the_intent_unresolved_for_recovery() {
     };
     let mut journal = Journal::open(store).expect("opens");
     let id = journal
-        .intend(&entry("watch"), EffectClass::A, digest("w"), 5)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("w"),
+            target(),
+            None,
+            5,
+        )
         .expect("the intent is written");
     let object = instance("p", "n", None);
     let outcome = journal.applied(id, object.clone(), Inverse::IncusDelete { object });
@@ -493,7 +576,14 @@ fn opening_folds_a_legal_history_and_continues_its_ids() {
     let mut journal = Journal::open(store).expect("a legal history opens");
     assert_eq!(journal.live(&entry("watch")).len(), 1);
     let next = journal
-        .intend(&entry("watch"), EffectClass::A, digest("n"), 9)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("n"),
+            target(),
+            None,
+            9,
+        )
         .expect("intent");
     assert_eq!(next, 2, "the next id follows the newest id on disk");
 }
@@ -529,7 +619,14 @@ fn removal_partitions_each_live_effect_into_exactly_one_part() {
         Inverse::Emission,
     );
     let intent = journal
-        .intend(&entry("watch"), EffectClass::A, digest("pending"), 7)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("pending"),
+            target(),
+            None,
+            7,
+        )
         .expect("intent");
 
     // Reverted, failed and other-entry effects must not appear in any part.
@@ -542,7 +639,14 @@ fn removal_partitions_each_live_effect_into_exactly_one_part() {
     );
     journal.reverted(reverted);
     let failed = journal
-        .intend(&entry("watch"), EffectClass::B, digest("gone"), 8)
+        .intend(
+            &entry("watch"),
+            EffectClass::B,
+            digest("gone"),
+            target(),
+            None,
+            8,
+        )
         .expect("intent");
     journal.failed(failed, "refused").expect("failure");
     apply_one(
@@ -751,7 +855,14 @@ fn records_survive_a_reopen_and_the_next_id_continues() {
     );
     assert!(journal.torn_note().is_none());
     let next = journal
-        .intend(&entry("watch"), EffectClass::A, digest("n"), 2)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("n"),
+            target(),
+            None,
+            2,
+        )
         .expect("intent");
     assert_eq!(next, 2);
 }
@@ -799,7 +910,14 @@ fn a_torn_last_line_is_dropped_reported_and_cut_before_the_next_append() {
         "already cut, so not reported again"
     );
     let next = journal
-        .intend(&entry("watch"), EffectClass::A, digest("n"), 3)
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("n"),
+            target(),
+            None,
+            3,
+        )
         .expect("the append after a cut succeeds");
     assert_eq!(next, 2, "the torn record's id is free again: it never ran");
     drop(journal);
@@ -865,6 +983,8 @@ fn a_record_on_disk_with_an_unknown_field_refuses_the_journal() {
         "entry": "watch",
         "class": "A",
         "op_digest": digest("watch").to_hex(),
+        "target": {"kind": "instance", "project": "p", "name": "n", "uuid": null},
+        "pre_image": null,
         "object": null,
         "inverse": null,
         "state": "Intent",
@@ -905,6 +1025,292 @@ fn the_journal_error_text_names_no_record_content() {
         !text.contains(secret),
         "the error must not echo the record: {text}"
     );
+}
+
+// A reverted intent, the id space, the applied outcome's object, and the delete plan's source.
+
+#[test]
+fn an_intent_that_never_applied_can_be_reverted_without_poisoning_the_journal() {
+    // A create the reconciler finds absent is reverted with no outcome ever written.
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let id = journal
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("w"),
+            target(),
+            None,
+            5,
+        )
+        .expect("intent");
+    journal.reverted(id);
+    assert!(
+        journal.poisoned().is_none(),
+        "an intent with no outcome may be reverted"
+    );
+    assert!(journal.unresolved().is_empty());
+    assert!(journal.live(&entry("watch")).is_empty());
+    let next = journal
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("n"),
+            target(),
+            None,
+            6,
+        )
+        .expect("writes continue after the revert");
+    assert_eq!(next, 2);
+}
+
+#[test]
+fn an_effect_id_at_the_top_of_the_range_is_refused_on_open_without_a_panic() {
+    let mut store = MemJournal::new();
+    store
+        .append(&record(u64::MAX, EffectState::Intent, None, None))
+        .expect("append");
+    assert!(
+        matches!(Journal::open(store), Err(KernelError::Journal(_))),
+        "a journal that names the last id has no id to continue from"
+    );
+}
+
+#[test]
+fn a_hostile_file_journal_with_the_top_id_is_refused_without_a_panic() {
+    let dir = Scratch::new("top-id");
+    let path = dir.path("journal.jsonl");
+    {
+        let mut journal = Journal::open(FileJournal::open(&path).expect("opens")).expect("folds");
+        journal
+            .intend(
+                &entry("watch"),
+                EffectClass::A,
+                digest("x"),
+                target(),
+                None,
+                1,
+            )
+            .expect("intent");
+    }
+    let text = fs::read_to_string(&path).expect("read");
+    let hostile = text.replacen("\"id\":1,", &format!("\"id\":{},", u64::MAX), 1);
+    fs::write(&path, hostile).expect("written");
+    let refused = Journal::open(FileJournal::open(&path).expect("opens"));
+    assert!(matches!(refused, Err(KernelError::Journal(_))));
+}
+
+#[test]
+fn an_intent_is_refused_when_the_last_id_is_taken_and_writes_nothing() {
+    let mut store = MemJournal::new();
+    store
+        .append(&record(u64::MAX - 1, EffectState::Intent, None, None))
+        .expect("append");
+    let mut journal = Journal::open(store).expect("opens: the last id is not the top id");
+    let refused = journal.intend(
+        &entry("watch"),
+        EffectClass::A,
+        digest("n"),
+        target(),
+        None,
+        2,
+    );
+    assert!(
+        matches!(refused, Err(KernelError::Journal(_))),
+        "the top id is never written"
+    );
+    assert!(
+        journal.poisoned().is_none(),
+        "a refusal before the write does not poison"
+    );
+    assert_eq!(journal.unresolved().len(), 1, "no record was written");
+}
+
+#[test]
+fn an_inverse_naming_another_object_is_refused_and_writes_no_outcome() {
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let object = instance("arcak-svc", "web1", Some("u-1"));
+    let other = instance("arcak-svc", "web2", Some("u-2"));
+    let id = journal
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("c"),
+            object.clone(),
+            None,
+            5,
+        )
+        .expect("intent");
+    let refused = journal.applied(id, object, Inverse::IncusDelete { object: other });
+    assert!(matches!(refused, Err(KernelError::Journal(_))));
+    assert_eq!(
+        journal.unresolved().len(),
+        1,
+        "the intent stays open and no outcome is written"
+    );
+    assert!(journal.poisoned().is_none());
+}
+
+#[test]
+fn a_create_and_a_patch_of_one_instance_make_one_delete_plan_object() {
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let made = instance("arcak-svc", "db1", Some("u-db"));
+    apply_one(
+        &mut journal,
+        "watch",
+        EffectClass::B,
+        made.clone(),
+        Inverse::IncusDelete {
+            object: made.clone(),
+        },
+    );
+    apply_one(
+        &mut journal,
+        "watch",
+        EffectClass::B,
+        made.clone(),
+        restore(&made, &[("k", None)]),
+    );
+    let plan = removal(&journal, &entry("watch"), 1)
+        .plan
+        .expect("one class-B object");
+    assert_eq!(plan.objects, vec![made], "the object is listed once");
+}
+
+#[test]
+fn a_patch_alone_makes_no_delete_plan() {
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let object = instance("arcak-svc", "db1", Some("u-db"));
+    apply_one(
+        &mut journal,
+        "watch",
+        EffectClass::B,
+        object.clone(),
+        restore(&object, &[("k", None)]),
+    );
+    assert!(
+        removal(&journal, &entry("watch"), 1).plan.is_none(),
+        "only a delete inverse names an object a plan may remove"
+    );
+}
+
+// The intent names its target and, for a patch, the pre-image, durably, before the effect runs.
+
+#[test]
+fn an_intent_keeps_its_target_and_pre_image_across_a_reopen_so_recovery_can_tell_create_from_patch()
+{
+    let dir = Scratch::new("intent-fields");
+    let path = dir.path("journal.jsonl");
+    let made = instance("arcak-svc", "web1", None);
+    let patched = instance("arcak-svc", "db1", Some("u-db"));
+    let pre_image = BTreeMap::from([
+        ("a".to_string(), Some("old".to_string())),
+        ("b".to_string(), None),
+    ]);
+    {
+        let mut journal = Journal::open(FileJournal::open(&path).expect("opens")).expect("folds");
+        journal
+            .intend(
+                &entry("watch"),
+                EffectClass::A,
+                digest("create"),
+                made.clone(),
+                None,
+                1,
+            )
+            .expect("the create's intent");
+        journal
+            .intend(
+                &entry("watch"),
+                EffectClass::A,
+                digest("patch"),
+                patched.clone(),
+                Some(pre_image.clone()),
+                2,
+            )
+            .expect("the patch's intent");
+    }
+    let journal = Journal::open(FileJournal::open(&path).expect("reopens")).expect("folds");
+    let open = journal.unresolved();
+    assert_eq!(open.len(), 2);
+    assert_eq!(open[0].target, made);
+    assert_eq!(open[0].pre_image, None, "a create has no pre-image");
+    assert_eq!(open[1].target, patched);
+    assert_eq!(
+        open[1].pre_image,
+        Some(pre_image),
+        "a patch's pre-image is durable before its effect"
+    );
+    assert!(
+        open.iter()
+            .all(|r| r.object.is_none() && r.inverse.is_none())
+    );
+}
+
+#[test]
+fn an_applied_object_that_is_not_the_intent_target_is_refused_and_writes_nothing() {
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let target = instance("arcak-svc", "web1", None);
+    let id = journal
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("c"),
+            target,
+            None,
+            5,
+        )
+        .expect("intent");
+    let other = instance("arcak-svc", "web2", Some("u-2"));
+    let refused = journal.applied(id, other.clone(), Inverse::IncusDelete { object: other });
+    assert!(matches!(refused, Err(KernelError::Journal(_))));
+    assert_eq!(journal.unresolved().len(), 1);
+    assert!(journal.poisoned().is_none());
+}
+
+#[test]
+fn an_applied_object_with_another_uuid_than_the_target_names_is_refused() {
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let target = instance("arcak-svc", "db1", Some("u-1"));
+    let id = journal
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("p"),
+            target,
+            None,
+            5,
+        )
+        .expect("intent");
+    let other = instance("arcak-svc", "db1", Some("u-2"));
+    let refused = journal.applied(id, other.clone(), Inverse::IncusDelete { object: other });
+    assert!(matches!(refused, Err(KernelError::Journal(_))));
+}
+
+#[test]
+fn a_create_may_learn_its_uuid_when_it_applies() {
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let target = instance("arcak-svc", "web1", None);
+    let id = journal
+        .intend(
+            &entry("watch"),
+            EffectClass::A,
+            digest("c"),
+            target,
+            None,
+            5,
+        )
+        .expect("intent");
+    let made = instance("arcak-svc", "web1", Some("u-new"));
+    journal
+        .applied(
+            id,
+            made.clone(),
+            Inverse::IncusDelete {
+                object: made.clone(),
+            },
+        )
+        .expect("a create's uuid is known only once it applies");
+    assert_eq!(journal.live(&entry("watch"))[0].object, Some(made));
 }
 
 fn mode_of(path: &Path) -> u32 {

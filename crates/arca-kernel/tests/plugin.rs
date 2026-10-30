@@ -72,7 +72,9 @@ struct Host {
     refuse_plan: Option<EffectRefusal>,
     refuse_effect: Option<EffectRefusal>,
     answer_object: Option<ObjectRef>,
+    answer_inverse: Option<Inverse>,
     observed: Value,
+    observed_scope: RefCell<Option<(EntryId, Vec<String>)>>,
 }
 
 impl Host {
@@ -87,13 +89,21 @@ impl Host {
             refuse_plan: None,
             refuse_effect: None,
             answer_object: None,
+            answer_inverse: None,
             observed: json!({"instances": []}),
+            observed_scope: RefCell::new(None),
         }
     }
 }
 
 impl Provider for Host {
-    fn observe(&self, _query: &Observe) -> Result<Value, EffectRefusal> {
+    fn observe(
+        &self,
+        entry: &EntryId,
+        projects: &[String],
+        _query: &Observe,
+    ) -> Result<Value, EffectRefusal> {
+        *self.observed_scope.borrow_mut() = Some((entry.clone(), projects.to_vec()));
         Ok(self.observed.clone())
     }
 
@@ -141,7 +151,7 @@ impl Provider for Host {
             (None, EffectOp::IncusPatchConfig { object, .. })
             | (None, EffectOp::IncusDelete { object, .. }) => object.clone(),
         };
-        let inverse = match op {
+        let inverse = self.answer_inverse.clone().unwrap_or(match op {
             EffectOp::IncusCreate { .. } => Inverse::IncusDelete {
                 object: object.clone(),
             },
@@ -150,7 +160,7 @@ impl Provider for Host {
                 config: planned.pre_image.clone().unwrap_or_default(),
             },
             EffectOp::IncusDelete { .. } => Inverse::Emission,
-        };
+        });
         Ok((object, inverse))
     }
 }
@@ -178,6 +188,8 @@ impl JournalSink for Sink {
         entry: &EntryId,
         class: EffectClass,
         op_digest: Digest,
+        target: ObjectRef,
+        pre_image: Option<BTreeMap<String, Option<String>>>,
         now_ms: u64,
     ) -> Result<u64, KernelError> {
         self.log.borrow_mut().push("intend");
@@ -187,7 +199,8 @@ impl JournalSink for Sink {
                 why: "the write was refused".to_string(),
             });
         }
-        self.journal.intend(entry, class, op_digest, now_ms)
+        self.journal
+            .intend(entry, class, op_digest, target, pre_image, now_ms)
     }
 
     fn applied(&mut self, id: u64, object: ObjectRef, inverse: Inverse) -> Result<(), KernelError> {
@@ -552,9 +565,11 @@ fn an_outcome_the_journal_refuses_is_returned_as_a_refusal() {
             e: &EntryId,
             c: EffectClass,
             d: Digest,
+            target: ObjectRef,
+            pre: Option<BTreeMap<String, Option<String>>>,
             now: u64,
         ) -> Result<u64, KernelError> {
-            self.0.intend(e, c, d, now)
+            self.0.intend(e, c, d, target, pre, now)
         }
         fn applied(&mut self, _id: u64, _o: ObjectRef, _i: Inverse) -> Result<(), KernelError> {
             Err(KernelError::Journal(
@@ -671,7 +686,8 @@ fn a_config_that_does_not_deserialize_never_reaches_apply_and_its_value_is_not_i
     let log = new_log();
     let mut host = Host::new(&log);
     let mut sink = Sink::new(&log);
-    let plugin: Box<dyn ErasedPlugin> = Box::new(Erased::<Web>::new());
+    let plugin: Box<dyn ErasedPlugin> =
+        Box::new(Erased::<Web>::new().expect("the plugin registers"));
     let result = {
         let web = Web::manifest();
         let mut ctx = Ctx::new(entry(), &web, &mut host, &mut sink, 1);
@@ -696,7 +712,7 @@ fn a_rejected_boolean_value_is_redacted_too() {
     let log = new_log();
     let mut host = Host::new(&log);
     let mut sink = Sink::new(&log);
-    let plugin = Erased::<Web>::new();
+    let plugin = Erased::<Web>::new().expect("the plugin registers");
     let result = {
         let web = Web::manifest();
         let mut ctx = Ctx::new(entry(), &web, &mut host, &mut sink, 1);
@@ -716,7 +732,7 @@ fn a_missing_field_names_the_field_and_nothing_else() {
     let log = new_log();
     let mut host = Host::new(&log);
     let mut sink = Sink::new(&log);
-    let plugin = Erased::<Web>::new();
+    let plugin = Erased::<Web>::new().expect("the plugin registers");
     let result = {
         let web = Web::manifest();
         let mut ctx = Ctx::new(entry(), &web, &mut host, &mut sink, 1);
@@ -734,7 +750,7 @@ fn a_valid_config_applies_through_ctx_and_journals_each_effect() {
     let log = new_log();
     let mut host = Host::new(&log);
     let mut sink = Sink::new(&log);
-    let plugin = Erased::<Web>::new();
+    let plugin = Erased::<Web>::new().expect("the plugin registers");
     {
         let web = Web::manifest();
         let mut ctx = Ctx::new(entry(), &web, &mut host, &mut sink, 1);
@@ -750,7 +766,8 @@ fn a_valid_config_applies_through_ctx_and_journals_each_effect() {
 fn an_erased_plugin_is_object_safe_and_reports_its_id_and_manifest() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Box<dyn ErasedPlugin>>();
-    let boxed: Box<dyn ErasedPlugin> = Box::new(Erased::<Web>::default());
+    let boxed: Box<dyn ErasedPlugin> =
+        Box::new(Erased::<Web>::new().expect("the plugin registers"));
     assert_eq!(boxed.id(), Web::ID);
     assert_eq!(
         boxed.manifest().id.0,
@@ -761,4 +778,224 @@ fn an_erased_plugin_is_object_safe_and_reports_its_id_and_manifest() {
         PluginId::parse(Web::ID).is_some(),
         "a plugin id is a valid id"
     );
+}
+
+#[test]
+fn observe_hands_the_provider_the_entry_and_the_manifests_projects() {
+    // A provider can scope its reads to the projects the manifest names, so it is told which those are.
+    let log = new_log();
+    let watching = manifest(Vec::new(), &["arcak-svc", "arcak-vm"], true);
+    let mut host = Host::new(&log);
+    let mut sink = Sink::new(&log);
+    let ctx = Ctx::new(entry(), &watching, &mut host, &mut sink, 1);
+    ctx.observe(Observe::IncusGet {
+        path: "/1.0/instances".to_string(),
+    })
+    .expect("an observing plugin reads");
+    assert_eq!(
+        *host.observed_scope.borrow(),
+        Some((
+            entry(),
+            vec!["arcak-svc".to_string(), "arcak-vm".to_string()]
+        ))
+    );
+}
+
+struct Renamed;
+
+impl Plugin for Renamed {
+    const ID: &'static str = "arca.one";
+    type Config = Cfg;
+
+    fn manifest() -> Manifest {
+        manifest(Vec::new(), &["arcak-svc"], false)
+    }
+
+    fn apply(_ctx: &mut Ctx<'_>, _cfg: &Cfg) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_plugin_whose_id_is_not_its_manifest_id_is_refused_at_registration() {
+    // The manifest names "arca.test"; the plugin's own id says "arca.one". The reconciler would hold two names for one plugin.
+    let refused = Erased::<Renamed>::new();
+    assert!(matches!(refused, Err(KernelError::Plugin(_))));
+}
+
+struct BadId;
+
+impl Plugin for BadId {
+    const ID: &'static str = "Bad_ID";
+    type Config = Cfg;
+
+    fn manifest() -> Manifest {
+        Manifest {
+            id: PluginId("Bad_ID".to_string()),
+            ..manifest(Vec::new(), &["arcak-svc"], false)
+        }
+    }
+
+    fn apply(_ctx: &mut Ctx<'_>, _cfg: &Cfg) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_plugin_id_that_is_not_a_valid_plugin_id_is_refused_at_registration() {
+    let refused = Erased::<BadId>::new();
+    assert!(matches!(refused, Err(KernelError::Plugin(_))));
+}
+
+// Deletes, inverses and plan shapes: each refusal writes nothing it should not.
+
+fn delete_of(object: ObjectRef) -> EffectOp {
+    EffectOp::IncusDelete {
+        object,
+        plan: Digest::of(b"an approved plan"),
+    }
+}
+
+#[test]
+fn a_plugin_cannot_delete_through_ctx_and_no_provider_call_runs() {
+    // Deletes run only through the reconciler's approved plan. A plugin that asks for one is refused before any call.
+    let log = new_log();
+    let manifest = manifest(
+        vec![(IncusKind::Instance, EffectClass::B)],
+        &["arcak-svc"],
+        false,
+    );
+    let mut host = Host::new(&log);
+    host.plan_class = EffectClass::B;
+    let mut sink = Sink::new(&log);
+    let refusal = {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
+        ctx.effect(delete_of(ObjectRef {
+            kind: IncusKind::Instance,
+            project: "arcak-svc".to_string(),
+            name: "web1".to_string(),
+            uuid: Some("u-1".to_string()),
+        }))
+    };
+    assert_eq!(refusal, Err(EffectRefusal::NotDeclared));
+    assert_eq!(host.plans.get(), 0, "no plan was asked for");
+    assert_eq!(host.effects, 0, "the provider never deleted anything");
+    assert!(log.borrow().is_empty());
+    assert!(sink.journal.live(&entry()).is_empty());
+}
+
+#[test]
+fn a_create_whose_inverse_is_not_the_delete_of_the_created_object_is_refused_and_left_open() {
+    let log = new_log();
+    let manifest = manifest(
+        vec![(IncusKind::Instance, EffectClass::A)],
+        &["arcak-svc"],
+        false,
+    );
+    let mut host = Host::new(&log);
+    host.answer_inverse = Some(Inverse::Emission);
+    let mut sink = Sink::new(&log);
+    let refusal = {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
+        ctx.effect(create("arcak-svc", "web1"))
+    };
+    assert!(matches!(refusal, Err(EffectRefusal::Provider(_))));
+    assert_eq!(
+        *log.borrow(),
+        vec!["plan", "intend", "effect"],
+        "neither an outcome nor a failure: the effect may have happened"
+    );
+    assert_eq!(sink.journal.unresolved().len(), 1);
+}
+
+#[test]
+fn a_create_that_returns_no_uuid_is_refused_because_no_delete_can_name_it() {
+    let log = new_log();
+    let manifest = manifest(
+        vec![(IncusKind::Instance, EffectClass::A)],
+        &["arcak-svc"],
+        false,
+    );
+    let mut host = Host::new(&log);
+    host.answer_object = Some(ObjectRef {
+        kind: IncusKind::Instance,
+        project: "arcak-svc".to_string(),
+        name: "web1".to_string(),
+        uuid: None,
+    });
+    let mut sink = Sink::new(&log);
+    let refusal = {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
+        ctx.effect(create("arcak-svc", "web1"))
+    };
+    assert!(matches!(refusal, Err(EffectRefusal::Provider(_))));
+    assert_eq!(sink.journal.unresolved().len(), 1);
+}
+
+#[test]
+fn a_patch_whose_inverse_is_not_the_restore_of_the_planned_pre_image_is_refused_and_left_open() {
+    let log = new_log();
+    let manifest = manifest(
+        vec![(IncusKind::Instance, EffectClass::A)],
+        &["arcak-svc"],
+        false,
+    );
+    let mut host = Host::new(&log);
+    host.pre_image = Some(BTreeMap::from([("a".to_string(), Some("old".to_string()))]));
+    host.answer_inverse = Some(Inverse::IncusRestoreConfig {
+        object: ObjectRef {
+            kind: IncusKind::Instance,
+            project: "arcak-svc".to_string(),
+            name: "web1".to_string(),
+            uuid: Some("u-9".to_string()),
+        },
+        config: BTreeMap::from([("a".to_string(), Some("other".to_string()))]),
+    });
+    let mut sink = Sink::new(&log);
+    let refusal = {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
+        ctx.effect(patch("arcak-svc", "web1", &[("a", Some("new"))]))
+    };
+    assert!(matches!(refusal, Err(EffectRefusal::Provider(_))));
+    assert_eq!(sink.journal.unresolved().len(), 1);
+}
+
+#[test]
+fn a_patch_plan_whose_pre_image_does_not_cover_the_patched_keys_is_refused_with_no_intent() {
+    let log = new_log();
+    let manifest = manifest(
+        vec![(IncusKind::Instance, EffectClass::A)],
+        &["arcak-svc"],
+        false,
+    );
+    let mut host = Host::new(&log);
+    host.pre_image = Some(BTreeMap::from([("other".to_string(), None)]));
+    let mut sink = Sink::new(&log);
+    let refusal = {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
+        ctx.effect(patch("arcak-svc", "web1", &[("a", Some("new"))]))
+    };
+    assert!(matches!(refusal, Err(EffectRefusal::Provider(_))));
+    assert_eq!(*log.borrow(), vec!["plan"]);
+    assert_eq!(host.effects, 0);
+}
+
+#[test]
+fn a_create_plan_that_carries_a_pre_image_is_refused_with_no_intent() {
+    let log = new_log();
+    let manifest = manifest(
+        vec![(IncusKind::Instance, EffectClass::A)],
+        &["arcak-svc"],
+        false,
+    );
+    let mut host = Host::new(&log);
+    host.pre_image = Some(BTreeMap::new());
+    let mut sink = Sink::new(&log);
+    let refusal = {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
+        ctx.effect(create("arcak-svc", "web1"))
+    };
+    assert!(matches!(refusal, Err(EffectRefusal::Provider(_))));
+    assert_eq!(*log.borrow(), vec!["plan"]);
+    assert_eq!(host.effects, 0);
 }

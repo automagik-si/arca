@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -108,8 +108,8 @@ pub enum EffectState {
 }
 
 /// One journal record. A record names its effect by `id`; each state change writes a full copy of the record, so the newest
-/// record for an id is the effect's state. An `Intent` has no object and no inverse; every later state of an applied effect
-/// carries both.
+/// record for an id is the effect's state. The intent fields (`target`, `pre_image`) are copied unchanged to every later
+/// record of the effect. An `Intent` has no object and no inverse; every later state of an applied effect carries both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectRecord {
@@ -117,6 +117,12 @@ pub struct EffectRecord {
     pub entry: EntryId,
     pub class: EffectClass,
     pub op_digest: Digest,
+    /// The object the intent names. A create names the object it will make, which has no uuid until it applies.
+    #[serde(deserialize_with = "closed::object")]
+    pub target: ObjectRef,
+    /// For a patch, the values its keys held when the plan was made, with `None` for a key that was absent. `None` for a
+    /// create, so recovery can tell the two apart from the intent alone.
+    pub pre_image: Option<BTreeMap<String, Option<String>>>,
     #[serde(default, deserialize_with = "closed::optional")]
     pub object: Option<ObjectRef>,
     pub inverse: Option<Inverse>,
@@ -134,12 +140,15 @@ pub trait JournalStore {
 
 /// The write side the reconciler and [`crate::plugin::Ctx`] use. A plan's effect is intended, then applied, then recorded.
 pub trait JournalSink {
-    /// Records the intent of an effect before it runs, and returns the id that names it.
+    /// Records the intent of an effect before it runs, and returns the id that names it. `target` is the object the effect
+    /// names, and `pre_image` is the planned pre-image of a patch (`None` for a create). Both are durable before the effect.
     fn intend(
         &mut self,
         entry: &EntryId,
         class: EffectClass,
         op_digest: Digest,
+        target: ObjectRef,
+        pre_image: Option<BTreeMap<String, Option<String>>>,
         now_ms: u64,
     ) -> Result<u64, KernelError>;
     /// Records that the effect applied, with the object it touched and the inverse that undoes it.
@@ -168,10 +177,15 @@ impl FileJournal {
     /// to report.
     pub fn open(path: &Path) -> Result<FileJournal, KernelError> {
         let shown = path.display().to_string();
+        // The path's own metadata is read before anything is opened, so a symbolic link or any other non-file is refused
+        // before open can follow the link or touch the object.
         let created = match fs::symlink_metadata(path) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     return Err(io_reason(&shown, "a symbolic link; refused"));
+                }
+                if !meta.is_file() {
+                    return Err(io_reason(&shown, "not a regular file; refused"));
                 }
                 false
             }
@@ -201,7 +215,7 @@ impl FileJournal {
             }
             TryLockError::Error(e) => io_error(&shown, &e),
         })?;
-        let bytes = fs::read(path).map_err(|e| io_error(&shown, &e))?;
+        let bytes = read_all(&file).map_err(|e| io_error(&shown, &e))?;
         let decoded = decode(&bytes)?;
         if decoded.torn.is_some() {
             file.set_len(decoded.keep as u64)
@@ -248,7 +262,7 @@ impl JournalStore for FileJournal {
     }
 
     fn load(&self) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
-        let bytes = fs::read(&self.path).map_err(|e| io_error(&self.shown(), &e))?;
+        let bytes = read_all(&self.file).map_err(|e| io_error(&self.shown(), &e))?;
         let decoded = decode(&bytes)?;
         Ok((decoded.records, self.torn.clone().or(decoded.torn)))
     }
@@ -304,14 +318,23 @@ impl<S: JournalStore> Journal<S> {
             match latest.get(&record.id) {
                 None if record.state == EffectState::Intent => {}
                 None => return Err(corrupt(record.id, "has no intent")),
-                Some(prev) if !is_successor(prev, &record) => {
-                    return Err(corrupt(record.id, "does not follow its last record"));
+                Some(prev) => {
+                    if let Some(why) = refusal_to_follow(prev, &record) {
+                        return Err(corrupt(record.id, why));
+                    }
                 }
-                Some(_) => {}
             }
             latest.insert(record.id, record);
         }
-        let next_id = latest.keys().next_back().map_or(1, |last| last + 1);
+        // The journal never writes the top id, so a journal that holds it has no id left to continue from.
+        let next_id = match latest.keys().next_back() {
+            None => 1,
+            Some(last) => last.checked_add(1).ok_or_else(|| {
+                KernelError::Journal(format!(
+                    "effect {last} is the last id; none is left to continue from"
+                ))
+            })?,
+        };
         Ok(Journal {
             store,
             latest,
@@ -395,16 +418,15 @@ impl<S: JournalStore> Journal<S> {
             entry: prev.entry.clone(),
             class: prev.class,
             op_digest: prev.op_digest.clone(),
+            target: prev.target.clone(),
+            pre_image: prev.pre_image.clone(),
             object,
             inverse,
             state: to,
             at_ms: prev.at_ms,
         };
-        if !is_successor(&prev, &next) {
-            return Err(corrupt(
-                id,
-                &format!("cannot move from {:?} to {:?}", prev.state, to),
-            ));
+        if let Some(why) = refusal_to_follow(&prev, &next) {
+            return Err(corrupt(id, why));
         }
         self.write(next)
     }
@@ -423,20 +445,33 @@ impl<S: JournalStore> JournalSink for Journal<S> {
         entry: &EntryId,
         class: EffectClass,
         op_digest: Digest,
+        target: ObjectRef,
+        pre_image: Option<BTreeMap<String, Option<String>>>,
         now_ms: u64,
     ) -> Result<u64, KernelError> {
         let id = self.next_id;
+        // The top id is never written, so the next id always exists. Both checks refuse before any record is written.
+        let following = id
+            .checked_add(1)
+            .ok_or_else(|| KernelError::Journal("the effect ids are used up".to_string()))?;
+        if self.latest.contains_key(&id) {
+            return Err(KernelError::Journal(format!(
+                "effect {id} is already in the journal"
+            )));
+        }
         self.write(EffectRecord {
             id,
             entry: entry.clone(),
             class,
             op_digest,
+            target,
+            pre_image,
             object: None,
             inverse: None,
             state: EffectState::Intent,
             at_ms: now_ms,
         })?;
-        self.next_id += 1;
+        self.next_id = following;
         Ok(id)
     }
 
@@ -466,7 +501,7 @@ pub struct DeletePlan {
 pub struct Removal {
     /// Class-A effects, most recent first, so each undo runs before the effect it depends on.
     pub revert_now: Vec<EffectRecord>,
-    /// One plan for every class-B object, or `None` when there are none.
+    /// One plan over the class-B objects that a delete inverse names, each listed once, or `None` when there are none.
     pub plan: Option<DeletePlan>,
     /// Class-C emissions. They are never reverted automatically.
     pub never: Vec<EffectRecord>,
@@ -488,8 +523,11 @@ pub fn removal(journal: &Journal<impl JournalStore>, entry: &EntryId, now_ms: u6
         match record.class {
             EffectClass::A => revert_now.push(record),
             EffectClass::B => {
-                if let Some(object) = record.object {
-                    objects.push(object);
+                // Only a delete inverse names an object a plan may remove. A patch's restore names an object that stays.
+                if let Some(Inverse::IncusDelete { object }) = &record.inverse
+                    && !objects.contains(object)
+                {
+                    objects.push(object.clone());
                 }
             }
             EffectClass::C => never.push(record),
@@ -520,33 +558,90 @@ fn plan_digest(entry: &EntryId, objects: &[ObjectRef]) -> Digest {
     Digest::of(text.as_bytes())
 }
 
-/// Whether `next` may follow `prev` for the same effect: a legal state move, with the same entry, class, digest and time.
-fn is_successor(prev: &EffectRecord, next: &EffectRecord) -> bool {
+/// Why `next` may not follow `prev` for the same effect, or `None` when it may: a legal state move, with the same entry, class,
+/// digest, time, target and pre-image. A later record keeps the outcome its predecessor carries. An intent that never applied
+/// may be reverted with no outcome at all. An applied outcome names the intent's object, and its inverse names that object.
+fn refusal_to_follow(prev: &EffectRecord, next: &EffectRecord) -> Option<&'static str> {
+    if prev.id != next.id
+        || prev.entry != next.entry
+        || prev.class != next.class
+        || prev.op_digest != next.op_digest
+        || prev.at_ms != next.at_ms
+        || prev.target != next.target
+        || prev.pre_image != next.pre_image
+    {
+        return Some("changes what its intent says");
+    }
     let legal = matches!(
         (prev.state, next.state),
         (
             EffectState::Intent,
-            EffectState::Applied | EffectState::Failed
+            EffectState::Applied | EffectState::Failed | EffectState::Reverted
         ) | (
             EffectState::Applied,
             EffectState::Confirmed | EffectState::Reverted
         ) | (EffectState::Confirmed, EffectState::Reverted)
     );
-    legal
-        && prev.id == next.id
-        && prev.entry == next.entry
-        && prev.class == next.class
-        && prev.op_digest == next.op_digest
-        && prev.at_ms == next.at_ms
+    if !legal {
+        return Some("moves to a state its last record does not allow");
+    }
+    if prev.state != EffectState::Intent {
+        if next.object != prev.object || next.inverse != prev.inverse {
+            return Some("changes the outcome it applied");
+        }
+        return None;
+    }
+    match next.state {
+        EffectState::Applied => applied_names_intent_target(next),
+        EffectState::Failed | EffectState::Reverted
+            if next.object.is_some() || next.inverse.is_some() =>
+        {
+            Some("carries an outcome its intent never had")
+        }
+        _ => None,
+    }
 }
 
-/// Only an intent carries no outcome; every state after it carries an object and an inverse, except a failure.
+/// An applied outcome names the object its intent names: the same kind, project and name, and the same uuid when the intent
+/// carries one. A create's intent carries no uuid, since the uuid is learned only as the create applies.
+fn applied_names_intent_target(record: &EffectRecord) -> Option<&'static str> {
+    let object = record.object.as_ref()?;
+    let same_place = record.target.kind == object.kind
+        && record.target.project == object.project
+        && record.target.name == object.name;
+    let same_uuid = record.target.uuid.is_none() || record.target.uuid == object.uuid;
+    if !same_place || !same_uuid {
+        return Some("applies to an object its intent does not name");
+    }
+    inverse_names_other_object(record)
+}
+
+/// Refuses an applied outcome whose inverse names an object other than the one the outcome names. Only the object
+/// references are compared, by kind, project and name, since a create's uuid is learned by the time it applies.
+fn inverse_names_other_object(record: &EffectRecord) -> Option<&'static str> {
+    let (Some(object), Some(inverse)) = (&record.object, &record.inverse) else {
+        return None;
+    };
+    let named = match inverse {
+        Inverse::IncusDelete { object } | Inverse::IncusRestoreConfig { object, .. } => object,
+        Inverse::AclRuleRemove { .. } | Inverse::FileRemove { .. } | Inverse::Emission => {
+            return None;
+        }
+    };
+    let same_place =
+        named.kind == object.kind && named.project == object.project && named.name == object.name;
+    (!same_place).then_some("has an inverse for another object")
+}
+
+/// Only an intent, a failure, and a revert of an intent that never applied carry no outcome. Every other state carries the
+/// object and its inverse together.
 fn check_outcome(record: &EffectRecord) -> Result<(), KernelError> {
     let bare = record.object.is_none() && record.inverse.is_none();
     let whole = record.object.is_some() && record.inverse.is_some();
     let fits = match record.state {
         EffectState::Intent | EffectState::Failed => bare,
-        EffectState::Applied | EffectState::Confirmed | EffectState::Reverted => whole,
+        EffectState::Reverted => bare || whole,
+        EffectState::Applied | EffectState::Confirmed => whole,
     };
     if fits {
         Ok(())
@@ -598,6 +693,21 @@ fn decode(bytes: &[u8]) -> Result<Decoded, KernelError> {
         keep: start,
         torn: None,
     })
+}
+
+/// Reads the whole journal through `file`, the handle this journal holds locked, so the bytes read are the bytes the lock
+/// covers. Positional reads leave the handle's offset alone, and appends always go to the end.
+fn read_all(file: &File) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match file.read_at(&mut chunk, bytes.len() as u64) {
+            Ok(0) => return Ok(bytes),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<(), KernelError> {

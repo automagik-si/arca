@@ -38,6 +38,8 @@ pub enum KernelError {
     Locked { path: String },
     /// A proposed desired-state document was refused by the acceptance gate.
     Refused(DocRefusal),
+    /// A plugin was refused at registration: its id is not a valid plugin id, or it is not the id its manifest names.
+    Plugin(String),
 }
 
 impl fmt::Display for KernelError {
@@ -60,6 +62,7 @@ impl fmt::Display for KernelError {
                 write!(f, "desired-state store {path} is locked by another process")
             }
             Self::Refused(reason) => write!(f, "document refused: {reason}"),
+            Self::Plugin(why) => write!(f, "plugin refused: {why}"),
         }
     }
 }
