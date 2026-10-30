@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 
 use arca::Failure;
 use arca::adoptions::{AdoptionPlan, AdoptionRecord, Phase, release_steps, resume_steps};
-use arca::cmd_adopt::{Kill, adopt_halting, http_probe, verify_until, verify_with};
+use arca::cmd_adopt::{
+    HttpUrl, Kill, adopt_halting, http_probe, url_probe, verify_until, verify_url_until,
+    verify_url_with, verify_with,
+};
 use arca::cmd_serve::watch_handler;
 use arca::config;
 use arca::desired_store::lock_state_dir;
@@ -1705,4 +1708,325 @@ fn a_rooted_release_whose_profile_root_or_own_root_changed_is_refused_before_any
     );
     assert_released(&run, "rooted-changed", true, true);
     assert_writes_in_table(&run, "rooted-changed");
+}
+
+/// The URL the URL tests check through: a reverse proxy in front of the adopted service.
+const PROXY_URL: &str = "http://proxy.example:8443/health";
+
+fn proxy_url() -> HttpUrl {
+    HttpUrl::parse(PROXY_URL).expect("a plain http URL")
+}
+
+/// A URL probe that checks it was asked for `PROXY_URL` and answers `answer`.
+fn url_answering(
+    answer: Result<u16, String>,
+) -> impl Fn(&HttpUrl, Duration) -> Result<u16, String> {
+    move |url, timeout| {
+        assert_eq!(url.to_string(), PROXY_URL);
+        assert_eq!(timeout, Duration::from_secs(10));
+        answer.clone()
+    }
+}
+
+#[test]
+fn a_url_is_plain_http_with_a_host_an_optional_port_and_a_plain_path() {
+    let url = HttpUrl::parse("HTTP://Proxy.example:8443/x?y=1").expect("parsed");
+    assert_eq!(
+        (url.host.as_str(), url.port, url.path.as_str()),
+        ("Proxy.example", 8443, "/x?y=1")
+    );
+    assert_eq!(url.to_string(), "http://Proxy.example:8443/x?y=1");
+    let url = HttpUrl::parse("http://192.0.2.10").expect("parsed");
+    assert_eq!(
+        (url.host.as_str(), url.port, url.path.as_str()),
+        ("192.0.2.10", 80, "/")
+    );
+    assert_eq!(url.to_string(), "http://192.0.2.10/");
+    let url = HttpUrl::parse("http://proxy.example?q=1").expect("parsed");
+    assert_eq!(url.path, "/?q=1");
+    let url = HttpUrl::parse("http://[2001:db8::1]:8080/h").expect("parsed");
+    assert_eq!((url.host.as_str(), url.port), ("[2001:db8::1]", 8080));
+
+    let refused = |text: &str, why: &str| {
+        let result = HttpUrl::parse(text);
+        assert!(
+            matches!(&result, Err(failure @ Failure::Usage(message)) if message.contains(why) && failure.code() == 2),
+            "{text:?}: {result:?}"
+        );
+        if let Err(Failure::Usage(message)) = &result {
+            assert!(
+                !message.contains("secret"),
+                "the URL is not echoed: {message}"
+            );
+        }
+    };
+    refused("https://proxy.example/", "https");
+    for text in [
+        "ftp://proxy.example/",
+        "proxy.example/",
+        "http://",
+        "http:///x",
+        "http://user:secret@proxy.example/",
+        "http://proxy.example:0/",
+        "http://proxy.example:70000/",
+        "http://proxy.example:/",
+        "http://proxy.example:8x/",
+        "http://pro xy.example/",
+        "http://proxy_example/",
+        "http://proxy.example/a b",
+        "http://proxy.example/a#secret",
+        "http://proxy.example/a\r\nHost: x",
+        "http://[2001:db8::1/",
+        "http://[secret]/",
+    ] {
+        refused(text, "--url");
+    }
+    let long = format!("http://proxy.example/{}", "a".repeat(1100));
+    refused(&long, "--url");
+}
+
+#[test]
+fn verify_through_a_url_passes_on_2xx_or_3xx_and_fails_on_any_other_answer() {
+    let run = Run::new("verify-url");
+    run.apply().expect("the adoption").expect("a result");
+    let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
+    let read = UnixIncus::new(run.fake.socket().to_path_buf());
+    let url = proxy_url();
+    for code in [200, 204, 301, 302, 399] {
+        let verified = verify_url_with(
+            &read,
+            &plan,
+            &uuid,
+            ADOPT_TO,
+            &url,
+            &url_answering(Ok(code)),
+        )
+        .expect("verified");
+        assert_eq!(verified.mac, ADOPT_MAC);
+        assert_eq!(
+            verified.ipv4,
+            ADOPT_IP.parse::<Ipv4Addr>().expect("an address")
+        );
+        assert_eq!(verified.http_status, code);
+    }
+    for code in [100, 400, 401, 404, 500, 503] {
+        let failed = verify_url_with(
+            &read,
+            &plan,
+            &uuid,
+            ADOPT_TO,
+            &url,
+            &url_answering(Ok(code)),
+        );
+        assert!(
+            matches!(&failed, Err(failure @ Failure::Runtime(why)) if why.contains(&format!("answered {code}")) && failure.code() == 1),
+            "{code}: {failed:?}"
+        );
+    }
+    let silent = verify_url_with(
+        &read,
+        &plan,
+        &uuid,
+        ADOPT_TO,
+        &url,
+        &url_answering(Err(
+            "the TCP connect failed (connection refused)".to_string()
+        )),
+    );
+    assert!(
+        matches!(&silent, Err(Failure::Runtime(why)) if why.contains("did not answer") && why.contains(PROXY_URL)),
+        "{silent:?}"
+    );
+
+    // The instance checks still come first: a stale uuid, the wrong project or a moved MAC fails before any probe.
+    let never = |_: &HttpUrl, _: Duration| -> Result<u16, String> { panic!("no probe") };
+    let stale = verify_url_with(&read, &plan, ADOPT_UUID, ADOPT_TO, &url, &never);
+    assert!(
+        matches!(&stale, Err(Failure::Runtime(why)) if why.contains("recorded")),
+        "{stale:?}"
+    );
+    let elsewhere = verify_url_with(&read, &plan, &uuid, "default", &url, &never);
+    assert!(
+        matches!(&elsewhere, Err(Failure::Runtime(why)) if why.contains("not in project")),
+        "{elsewhere:?}"
+    );
+    let path = format!("/1.0/instances/svc1?project={ADOPT_TO}");
+    let mut moved_mac = pin();
+    moved_mac["hwaddr"] = json!("10:66:6a:00:00:02");
+    let devices = json!({ "devices": { "eth0": moved_mac, "root": { "type": "disk", "path": "/", "pool": "pool1", "size": "60GiB" } } });
+    let writes = run.fake.writes().len();
+    assert_eq!(run.raw("PATCH", &path, &devices), 200);
+    let moved = verify_url_with(&read, &plan, &uuid, ADOPT_TO, &url, &never);
+    assert!(
+        matches!(&moved, Err(Failure::Runtime(why)) if why.contains("MAC")),
+        "{moved:?}"
+    );
+    assert_eq!(run.fake.writes().len(), writes + 1, "verify sends no write");
+}
+
+#[test]
+fn verify_through_a_url_waits_for_a_slow_start_and_retries_a_refused_status() {
+    let run = Run::killed("verify-url-wait", AdoptStep::Mark, Kill::AfterOutcome);
+    let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
+    let read = UnixIncus::new(run.fake.socket().to_path_buf());
+    let socket = run.fake.socket().to_path_buf();
+    let starter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        let start = json!({ "action": "start" });
+        raw_at(
+            &socket,
+            "PUT",
+            &format!("/1.0/instances/svc1/state?project={ADOPT_TO}"),
+            &start,
+        )
+    });
+    // Once the instance runs, the proxy first cannot reach it and then answers.
+    let calls = AtomicUsize::new(0);
+    let slow = |_: &HttpUrl, _: Duration| -> Result<u16, String> {
+        match calls.fetch_add(1, Ordering::SeqCst) {
+            0 => Err("no answer (timed out)".to_string()),
+            1 => Ok(502),
+            _ => Ok(200),
+        }
+    };
+    let url = proxy_url();
+    let waited = verify_url_until(
+        &read,
+        &plan,
+        &uuid,
+        ADOPT_TO,
+        &url,
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        &slow,
+    );
+    assert_eq!(starter.join().expect("the starter"), 202);
+    assert_eq!(waited.expect("verified").http_status, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    // With no wait, one attempt, and its failure is the report.
+    let calls = AtomicUsize::new(0);
+    let refusing = |_: &HttpUrl, _: Duration| -> Result<u16, String> {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(403)
+    };
+    let once = verify_url_until(
+        &read,
+        &plan,
+        &uuid,
+        ADOPT_TO,
+        &url,
+        Duration::ZERO,
+        Duration::from_millis(10),
+        &refusing,
+    );
+    assert!(
+        matches!(&once, Err(Failure::Runtime(why)) if why.contains("answered 403")),
+        "{once:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_url_probe_gets_the_urls_path_with_its_host_and_fails_on_a_closed_port() {
+    let (port, server) = answer_once("204 No Content");
+    let url = HttpUrl::parse(&format!("http://127.0.0.1:{port}/health?deep=1")).expect("a URL");
+    assert_eq!(url_probe(&url, Duration::from_secs(10)), Ok(204));
+    let head = server.join().expect("the server");
+    assert!(
+        head.starts_with("GET /health?deep=1 HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.contains(&format!("\r\nHost: 127.0.0.1:{port}\r\n")),
+        "{head}"
+    );
+
+    // A host name is resolved, and each of its addresses is tried in turn.
+    let (port, server) = answer_once("302 Found");
+    let url = HttpUrl::parse(&format!("http://localhost:{port}")).expect("a URL");
+    assert_eq!(url_probe(&url, Duration::from_secs(10)), Ok(302));
+    let head = server.join().expect("the server");
+    assert!(head.starts_with("GET / HTTP/1.1\r\n"), "{head}");
+    assert!(
+        head.contains(&format!("\r\nHost: localhost:{port}\r\n")),
+        "{head}"
+    );
+
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let url = HttpUrl::parse(&format!("http://127.0.0.1:{closed}/")).expect("a URL");
+    assert!(
+        url_probe(&url, Duration::from_secs(2)).is_err(),
+        "a closed port"
+    );
+}
+
+#[test]
+fn verify_takes_exactly_one_of_port_and_url() {
+    let run = Run::killed("verify-url-flags", AdoptStep::Mark, Kill::AfterOutcome);
+    let verify = |args: &[&str]| {
+        let mut all = vec!["verify", "--instance", "svc1"];
+        all.extend_from_slice(args);
+        adopt_run(&run.config, &all)
+    };
+    // A URL is taken in place of the port: the incomplete adoption is what refuses.
+    let open = verify(&["--url", PROXY_URL]);
+    assert!(
+        matches!(&open, Err(Failure::Refused(why)) if why.contains("not complete")),
+        "{open:?}"
+    );
+    for (args, why) in [
+        (vec![], "--url"),
+        (vec!["--port", "8080", "--url", PROXY_URL], "--url"),
+        (vec!["--url", "https://proxy.example/"], "https"),
+        (vec!["--url", "proxy.example"], "--url"),
+        (vec!["--url", PROXY_URL, "--http-path", "/"], "--http-path"),
+        (vec!["--url", PROXY_URL, "--wait", "x"], "--wait"),
+    ] {
+        let refused = verify(&args);
+        assert!(
+            matches!(&refused, Err(failure @ Failure::Usage(text)) if text.contains(why) && failure.code() == 2),
+            "{args:?}: {refused:?}"
+        );
+    }
+    assert_eq!(run.writes().len(), 6, "verify sent no write");
+}
+
+#[test]
+fn verify_through_a_url_reports_the_url_and_the_status_it_answered() {
+    let run = Run::new("verify-url-run");
+    run.apply().expect("the adoption").expect("a result");
+    let (port, server) = answer_once("200 OK");
+    let url = format!("http://127.0.0.1:{port}/health");
+    let verified = adopt_run(
+        &run.config,
+        &["verify", "--instance", "svc1", "--url", &url, "--wait", "0"],
+    )
+    .expect("verified")
+    .expect("a result");
+    server.join().expect("the server");
+    assert_eq!(
+        verified,
+        json!({
+            "instance": "svc1", "project": ADOPT_TO, "mac": ADOPT_MAC, "ipv4": ADOPT_IP,
+            "url": url, "httpStatus": 200, "verified": true,
+        })
+    );
+    let (port, server) = answer_once("404 Not Found");
+    let url = format!("http://127.0.0.1:{port}/health");
+    let failed = adopt_run(
+        &run.config,
+        &["verify", "--instance", "svc1", "--url", &url, "--wait", "0"],
+    );
+    server.join().expect("the server");
+    assert!(
+        matches!(&failed, Err(failure @ Failure::Runtime(why)) if why.contains("answered 404") && failure.code() == 1),
+        "{failed:?}"
+    );
 }
