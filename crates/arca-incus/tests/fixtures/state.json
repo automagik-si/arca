@@ -1,0 +1,85 @@
+{
+  "server": {
+    "api_version": "1.0",
+    "api_status": "stable",
+    "auth": "trusted",
+    "environment": {
+      "kernel": "Linux",
+      "server": "incus",
+      "server_name": "node1",
+      "server_version": "6.0.0"
+    }
+  },
+  "projects": [
+    { "name": "default", "description": "", "config": {} },
+    { "name": "droid", "description": "", "config": {} },
+    { "name": "bench", "description": "", "config": {} },
+    { "name": "svc", "description": "", "config": {} }
+  ],
+  "instances": [
+    {
+      "name": "db1",
+      "project": "svc",
+      "type": "container",
+      "status": "Running",
+      "config": { "user.arca.template": "postgres" },
+      "expanded_config": { "user.arca.template": "postgres" }
+    },
+    {
+      "name": "phone1",
+      "project": "droid",
+      "type": "container",
+      "status": "Running",
+      "config": { "user.droid.lease": "1" },
+      "expanded_config": { "user.droid.lease": "1", "security.privileged": "true" }
+    },
+    {
+      "name": "desk1",
+      "project": "droid",
+      "type": "container",
+      "status": "Stopped",
+      "config": { "user.tactu.desktop": "1" },
+      "expanded_config": { "user.tactu.desktop": "1" }
+    },
+    {
+      "name": "guest1",
+      "project": "default",
+      "type": "virtual-machine",
+      "status": "Running",
+      "config": {},
+      "expanded_config": {}
+    },
+    {
+      "name": "k1",
+      "project": "svc",
+      "type": "container",
+      "status": "Running",
+      "config": { "user.arcakernel.entry": "toy" },
+      "expanded_config": { "user.arcakernel.entry": "toy" }
+    },
+    {
+      "name": "x1",
+      "project": "svc",
+      "type": "container",
+      "status": "Running",
+      "config": { "user.droid.lease": "1", "user.arcakernel.entry": "toy" },
+      "expanded_config": { "user.droid.lease": "1", "user.arcakernel.entry": "toy" }
+    }
+  ],
+  "pools": [
+    {
+      "name": "default",
+      "resources": {
+        "space": { "used": 1073741824, "total": 10737418240 },
+        "inodes": { "used": 1200, "total": 1048576 }
+      }
+    },
+    {
+      "name": "fast",
+      "resources": {
+        "space": { "used": 536870912, "total": 2147483648 },
+        "inodes": { "used": 300, "total": 524288 }
+      }
+    }
+  ]
+}
