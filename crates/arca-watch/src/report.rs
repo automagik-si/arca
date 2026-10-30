@@ -52,7 +52,7 @@ pub enum Drift {
         #[serde(with = "entry_or_empty")]
         entry: Option<EntryId>,
     },
-    /// A live entry has no object carrying its mark.
+    /// A live entry has no object carrying its mark. Only a complete watch, one that covers every project, reports it.
     EntryWithoutObject { entry: EntryId },
 }
 

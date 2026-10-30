@@ -1,4 +1,4 @@
-//! The plugin boundary (P1). A plugin crate is one whose `[package.metadata.arca]` table sets `kind = "plugin"`. Such a crate
+//! The plugin boundary. A plugin crate is one whose `[package.metadata.arca]` table sets `kind = "plugin"`. Such a crate
 //! may not name the Incus client, the providers or the approval verifier under `[dependencies]`, and it may not carry a build
 //! table or a target table at all. `[dev-dependencies]` may name them, so tests can use the fakes. A kernel-side crate is not
 //! bound by this test.
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// The crates a plugin may never name in its normal dependencies.
 const FORBIDDEN: [&str; 3] = ["arca-incus", "arca-providers", "arca-approval"];
 
-/// The only crates that may declare `kind = "plugin"` (Decision 3).
+/// The only crates that may declare `kind = "plugin"`.
 const PLUGIN_CRATES: [&str; 4] = ["arca-watch", "arca-netproject", "arca-postgres", "arca-vm"];
 
 /// What a manifest declares, read line by line. Only the shapes this workspace uses are read: table headers, `key = value`
@@ -316,6 +316,6 @@ fn arca_metrics_is_not_a_plugin_crate() {
         .expect("arca-metrics is a workspace crate");
     assert!(
         !is_plugin(&text),
-        "arca-metrics is a kernel-side sampler (Decision 3)"
+        "arca-metrics is a kernel-side sampler, not a plugin"
     );
 }

@@ -19,8 +19,8 @@ use serde_json::Value;
 
 pub use report::{Drift, InstanceRow, ProjectRows, WatchReport, config_hash};
 
-/// The one read the watch makes: every instance in every project, recursed. A provider answers it only for the projects the
-/// watch covers.
+/// The one read the watch makes: every instance in every project, recursed. A provider answers it with the rows of the projects
+/// the watch covers only.
 pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=1";
 
 /// The key the report is provided under.
@@ -45,9 +45,14 @@ pub struct WatchConfig {
     pub retained: BTreeMap<EntryId, (PluginId, Digest)>,
     #[serde(default)]
     pub live_entries: BTreeSet<EntryId>,
-    /// The projects the watch covers. Every read is scoped to them, and the report names only them.
+    /// The projects the watch covers. Every row a plugin sees is scoped to them, and the report names only them. The one read
+    /// is all-projects, and the provider drops the rows of every other project.
     #[serde(default)]
     pub projects: BTreeSet<String>,
+    /// True only when `projects` covers every project the host has. The caller sets it from the provider's project index. Only
+    /// a complete watch reports a live entry with no object, since a scoped watch cannot see the objects it leaves out.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 impl Plugin for Watch {
@@ -168,12 +173,25 @@ fn string_map(value: Option<&Value>) -> Result<BTreeMap<String, String>, PluginE
         .collect())
 }
 
-/// Builds the report from the listing. Rows outside the covered projects are dropped, a listed instance twice is refused, and
-/// the drift is the marks against the live entries.
+/// The project a row names. A row with no project cannot be placed in or out of the scope, so it is refused.
+fn row_project(row: &Value) -> Result<&str, PluginError> {
+    row.get("project")
+        .and_then(Value::as_str)
+        .filter(|project| !project.is_empty())
+        .ok_or_else(shape_error)
+}
+
+/// Builds the report from the listing. Rows outside the covered projects are dropped before they are read, a listed instance
+/// twice is refused, and the drift is the marks against the live entries. A live entry with no object is drift only for a
+/// complete watch.
 fn assemble(listing: &Value, cfg: &WatchConfig) -> Result<WatchReport, PluginError> {
     let rows = listing.as_array().ok_or_else(shape_error)?;
-    let mut facts = rows.iter().map(read_row).collect::<Result<Vec<_>, _>>()?;
-    facts.retain(|fact| cfg.projects.contains(&fact.project));
+    let mut facts = Vec::new();
+    for row in rows {
+        if cfg.projects.contains(row_project(row)?) {
+            facts.push(read_row(row)?);
+        }
+    }
     facts.sort_by(|a, b| (&a.project, &a.name).cmp(&(&b.project, &b.name)));
     if facts
         .windows(2)
@@ -193,18 +211,19 @@ fn assemble(listing: &Value, cfg: &WatchConfig) -> Result<WatchReport, PluginErr
         .collect();
     for fact in &facts {
         let owner = classify(&fact.own, &cfg.retained);
-        if let Some(mark) = fact.own.get(KERNEL_ENTRY_KEY)
-            && let Some(entry) = EntryId::parse(mark)
-        {
-            observed.insert(entry);
-        }
         match &owner {
-            OwnerClass::Kernel { entry } if !cfg.live_entries.contains(entry) => {
-                drift.push(Drift::MarkedWithoutEntry {
-                    project: fact.project.clone(),
-                    name: fact.name.clone(),
-                    entry: Some(entry.clone()),
-                });
+            OwnerClass::Kernel { entry } => {
+                observed.insert(entry.clone());
+                if !cfg.live_entries.contains(entry) {
+                    drift.push(Drift::MarkedWithoutEntry {
+                        project: fact.project.clone(),
+                        name: fact.name.clone(),
+                        entry: Some(entry.clone()),
+                    });
+                }
+            }
+            OwnerClass::Retained { entry, .. } => {
+                observed.insert(entry.clone());
             }
             // A foreign object with a tombstone, or with a kernel mark that names no valid entry, is drift that names no entry.
             OwnerClass::Foreign
@@ -217,7 +236,11 @@ fn assemble(listing: &Value, cfg: &WatchConfig) -> Result<WatchReport, PluginErr
                     entry: None,
                 });
             }
-            _ => {}
+            // A contested object does not satisfy a live entry, so its mark is not observed. No drift kind names a contested
+            // object; the live entry it marks is reported as EntryWithoutObject by a complete watch.
+            OwnerClass::Contested => {}
+            OwnerClass::Droidd => {}
+            OwnerClass::Foreign => {}
         }
         if let Some(rows) = by_project.get_mut(fact.project.as_str()) {
             rows.push(InstanceRow {
@@ -231,11 +254,14 @@ fn assemble(listing: &Value, cfg: &WatchConfig) -> Result<WatchReport, PluginErr
             });
         }
     }
-    for entry in &cfg.live_entries {
-        if !observed.contains(entry) {
-            drift.push(Drift::EntryWithoutObject {
-                entry: entry.clone(),
-            });
+    // A scoped watch cannot see the objects of the projects it leaves out, so it cannot say a live entry has none.
+    if cfg.complete {
+        for entry in &cfg.live_entries {
+            if !observed.contains(entry) {
+                drift.push(Drift::EntryWithoutObject {
+                    entry: entry.clone(),
+                });
+            }
         }
     }
     let projects = by_project
