@@ -185,7 +185,8 @@ impl Needed {
 ///
 /// It refuses, naming the reason, what no allowance the adoption grants would admit: `security.privileged` true; a NIC other
 /// than eth0, whose MAC the move would reset; eth0 without a network; a disk on a pool other than the root, which stays in
-/// `default`; a host path that a comma-separated list cannot hold exactly; and any other device type.
+/// `default`; a host path that a comma-separated list cannot hold exactly, or that sets `shift`, which Incus refuses once the
+/// paths are listed; and any other device type.
 pub fn needed_allowances(
     config: &BTreeMap<String, String>,
     devices: &Devices,
@@ -243,6 +244,13 @@ pub fn needed_allowances(
                 if !listable(source) {
                     return Err(format!(
                         "the instance's {name} disk has the host path {source:?}, which restricted.devices.disk.paths cannot list exactly"
+                    ));
+                }
+                // Incus refuses `shift` on a host-path disk while `restricted.devices.disk.paths` is set (`disk.go`, Incus
+                // 7.5), and the adoption always sets it: the move would fail only after the stop.
+                if is_true(field("shift")) {
+                    return Err(format!(
+                        "the instance's {name} disk sets shift on a host path, which Incus refuses in a project that lists restricted.devices.disk.paths"
                     ));
                 }
                 needed.add(DISK, ALLOW, &because);

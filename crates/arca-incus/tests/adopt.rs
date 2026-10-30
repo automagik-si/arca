@@ -1528,11 +1528,59 @@ fn what_no_allowance_admits_is_refused_with_its_reason() {
             with_device("tpm0", &[("type", "tpm"), ("path", "/dev/tpm0")]),
             "of type",
         ),
+        // Incus refuses `shift` on a host-path disk once `restricted.devices.disk.paths` is set, which the adoption sets.
+        (
+            "shifted",
+            none.clone(),
+            with_device(
+                "data",
+                &[
+                    ("type", "disk"),
+                    ("source", "/srv/data"),
+                    ("path", "/d"),
+                    ("shift", "true"),
+                ],
+            ),
+            "shift",
+        ),
+        (
+            "shifted-on",
+            none.clone(),
+            with_device(
+                "data",
+                &[
+                    ("type", "disk"),
+                    ("source", "/srv/data"),
+                    ("path", "/d"),
+                    ("shift", "On"),
+                ],
+            ),
+            "shift",
+        ),
     ];
     for (tag, config, devices, needle) in cases {
         let why = needed_allowances(&config, &devices).expect_err(tag);
         assert!(why.contains(needle), "{tag}: {why}");
     }
+    // A shift that is off is no shift.
+    let unshifted = with_device(
+        "data",
+        &[
+            ("type", "disk"),
+            ("source", "/srv/data"),
+            ("path", "/d"),
+            ("shift", "false"),
+        ],
+    );
+    assert_eq!(
+        needed_allowances(&none, &unshifted)
+            .expect("an unshifted host disk maps")
+            .project,
+        nested_allowances()
+            .into_iter()
+            .filter(|(key, _)| key.starts_with("restricted.devices"))
+            .collect::<BTreeMap<_, _>>()
+    );
     for source in [
         "/srv/a,b",
         "/srv/data/",

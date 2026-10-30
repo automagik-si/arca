@@ -537,7 +537,8 @@ for an adoption project, and no `restricted.*` key governs an ACL. The preflight
 `security.privileged` true (the adoption never grants `restricted.containers.privilege`), a NIC other than `eth0`, an `eth0`
 with no managed network, an `eth0` key other than `type`, `name`, `network`, `hwaddr`, `ipv4.address` and the
 `security.acls*` keys, a `hwaddr` or `ipv4.address` other than the running MAC and IPv4, a disk on a pool other than the
-root, a host path a comma-separated list cannot hold exactly, any other device type, and any device or config key but
+root, a host path a comma-separated list cannot hold exactly, a host-path disk with `shift` set (Incus refuses it once
+`restricted.devices.disk.paths` is set), any other device type, and any device or config key but
 `eth0` and the root that a profile gives.
 
 **The pin.** PinNic sets `devices.eth0` on the instance itself: the network, the pre-image MAC as `hwaddr` and the pre-image

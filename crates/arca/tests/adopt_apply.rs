@@ -379,6 +379,14 @@ fn what_a_move_would_drop_or_no_allowance_admits_is_refused_before_the_stop() {
             "cannot list exactly",
         ),
         (
+            "host-path-shift",
+            device(
+                "data",
+                json!({ "type": "disk", "source": "/srv/data", "path": "/data", "shift": "true" }),
+            ),
+            "shift",
+        ),
+        (
             "tpm",
             device("tpm0", json!({ "type": "tpm", "path": "/dev/tpm0" })),
             "of type",
