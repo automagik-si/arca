@@ -43,8 +43,8 @@
 //! or stops the instance as an operation. A graceful stop can be made to outlast its timeout ([`FakeIncus::hang_stop`]), and
 //! then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`, else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
-//! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). Snapshots are served under
-//! `/1.0/instances/<i>/snapshots`. A POST to an instance moves it to the project its body names: it must be stopped, the target
+//! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). Snapshots and backups are
+//! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`. A POST to an instance moves it to the project its body names: it must be stopped, the target
 //! project must exist, and its `volatile.uuid` stays. When a PATCH or a move takes a device out of the expanded devices, or
 //! changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
 //! does: every one when the device goes or changes type, and otherwise each one whose key the new device sets. A restricted
@@ -294,7 +294,7 @@ impl Route {
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
             Route::InstanceSnapshots(_) => &["GET", "POST"],
-            Route::InstanceBackups(_) => &["POST"],
+            Route::InstanceBackups(_) => &["GET", "POST"],
             _ => &["GET"],
         }
     }
@@ -1059,18 +1059,20 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         )),
         ("GET", Route::InstanceState(address)) => instance_state(store, &address),
         ("PUT", Route::InstanceState(address)) => change_state(shared, store, request, &address),
-        ("GET", Route::InstanceSnapshots(address)) => sync(Value::Array(
-            store
-                .objects
-                .iter()
-                .filter(|object| {
-                    object.kind == "snapshot"
-                        && object.project == address.project
-                        && object.parent == address.parent
-                })
-                .map(|object| object.body.clone())
-                .collect(),
-        )),
+        ("GET", Route::InstanceSnapshots(address) | Route::InstanceBackups(address)) => {
+            sync(Value::Array(
+                store
+                    .objects
+                    .iter()
+                    .filter(|object| {
+                        object.kind == address.kind
+                            && object.project == address.project
+                            && object.parent == address.parent
+                    })
+                    .map(|object| object.body.clone())
+                    .collect(),
+            ))
+        }
         ("POST", Route::InstanceSnapshots(address)) => {
             snapshot_or_backup(shared, store, request, &address, "snapshot")
         }
@@ -2163,9 +2165,6 @@ fn snapshot_or_backup(
             error_envelope(403, &format!("Project restricted: {kind}s are forbidden")),
         );
     }
-    if kind == "backup" {
-        return answered(shared, store, kind, "POST", Ok(()));
-    }
     let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
         return (
             400,
@@ -2173,7 +2172,20 @@ fn snapshot_or_backup(
             error_envelope(400, "the body is not a JSON object"),
         );
     };
-    let name = text_in(&sent, "name");
+    let mut name = text_in(&sent, "name");
+    if kind == "backup" && name.is_empty() {
+        // Incus names an unnamed backup after the count of the instance's backups.
+        let count = store
+            .objects
+            .iter()
+            .filter(|object| {
+                object.kind == kind
+                    && object.project == address.project
+                    && object.parent == address.parent
+            })
+            .count();
+        name = format!("backup{count}");
+    }
     if name.is_empty() || name.contains('/') {
         return (
             400,

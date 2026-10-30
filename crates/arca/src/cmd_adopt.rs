@@ -16,7 +16,7 @@ use std::path::Path;
 
 use arca_incus::adopt::{
     ADOPT_ENTRY_PREFIX, AdoptStep, AdoptTarget, AdoptWriter, NIC, PreImage, SOURCE_PROJECT,
-    devices_of, mac_ok,
+    adoption_project_body, devices_of, mac_ok,
 };
 use arca_incus::{IncusError, IncusRead, UnixIncus, running_on};
 use arca_kernel::KernelError;
@@ -30,8 +30,20 @@ use crate::{Failure, Flags, parse_flags, usage_failure};
 
 /// The kernel's config namespace: a key in it is a kernel mark or a tombstone.
 const KERNEL_NAMESPACE: &str = "user.arcakernel.";
-/// Config keys a restricted project refuses when they are set to `"true"`.
-const RESTRICTED_SWITCHES: [&str; 2] = ["security.privileged", "security.nesting"];
+/// Container keys Incus counts as low level: a restricted project refuses each unless `restricted.containers.lowlevel` is
+/// `allow`, as it refuses every `raw.*` key.
+const LOW_LEVEL_KEYS: [&str; 5] = [
+    "boot.host_shutdown_timeout",
+    "linux.kernel_modules",
+    "security.devlxd.images",
+    "security.idmap.base",
+    "security.idmap.size",
+];
+/// The instance key whose expiry Incus gives each new snapshot, the adoption's own among them.
+const SNAPSHOT_EXPIRY: &str = "snapshots.expiry";
+
+/// Devices by name, each with its keys.
+type Devices = BTreeMap<String, BTreeMap<String, String>>;
 
 /// Runs one `adopt` action.
 pub fn adopt(argv: &[String]) -> Result<Option<Value>, Failure> {
@@ -239,8 +251,8 @@ fn lock_failure(error: KernelError) -> Failure {
 /// project that the config lists and does not name as an identity phone; that has other than one NIC, `eth0`, on an attach
 /// network, with no key the pin would drop; whose `volatile.eth0.hwaddr` is missing or is not the running MAC; whose IPv4 is not
 /// `expect_ip` (when one is given) or is claimed by another lease or another device's `ipv4.address`; that names a profile
-/// other than `default` or has no root of its own; that sets a key a restricted project refuses; that an operation is running
-/// on; or whose adoption project exists but is not empty and marked for it.
+/// other than `default` or has no root of its own; that the move would refuse or change ([`moved_intact`]); that has a
+/// backup; that an operation is running on; or whose adoption project exists but is not empty and marked for it.
 pub fn preflight(
     read: &dyn IncusRead,
     cfg: &NodeConfig,
@@ -311,13 +323,16 @@ pub fn preflight(
         })
         .ok_or_else(|| refuse("the instance's root is not its own device"))?;
     let expanded_config = text_map(&body["expanded_config"]).unwrap_or_else(|| own.clone());
-    let switched = RESTRICTED_SWITCHES
-        .iter()
-        .any(|key| expanded_config.get(*key).map(String::as_str) == Some("true"));
-    if switched || expanded_config.keys().any(|key| key.starts_with("raw.")) {
-        return Err(refuse(
-            "the instance sets a key a restricted project refuses",
-        ));
+    let project = adoption_project_body(target, &cfg.kernel.attach_networks);
+    let restrictions = text_map(&project["config"]).unwrap_or_default();
+    moved_intact(&restrictions, &own, &expanded_config, &local, &expanded)?;
+    let backups = read
+        .get(&format!(
+            "/1.0/instances/{i}/backups?project={SOURCE_PROJECT}"
+        ))
+        .map_err(read_failure)?;
+    if !backups.as_array().is_some_and(Vec::is_empty) {
+        return Err(refuse("the instance has backups, which a move refuses"));
     }
 
     let mac = own
@@ -397,6 +412,101 @@ pub fn preflight(
     })
 }
 
+/// Refuses what Incus would refuse or drop only at the move, after the stop. A stopped move copies the instance into the
+/// adoption project under that project's restrictions, then deletes the source, and carries only its own devices and
+/// config: a profile's device or key would be gone, and only the pinned `eth0` may come from a profile. A key or device the
+/// restrictions refuse is refused here, the restrictions read from `restrictions`, the config of the project's create body,
+/// so the two stay in step; a restriction the body leaves unset holds Incus's restricted default. `snapshots.expiry` is
+/// refused because it would expire the adoption snapshot.
+fn moved_intact(
+    restrictions: &BTreeMap<String, String>,
+    own: &BTreeMap<String, String>,
+    expanded_config: &BTreeMap<String, String>,
+    local: &Devices,
+    expanded: &Devices,
+) -> Result<(), Failure> {
+    if own.contains_key(SNAPSHOT_EXPIRY) || expanded_config.contains_key(SNAPSHOT_EXPIRY) {
+        return Err(refuse(
+            "the instance sets snapshots.expiry, which could expire the adoption snapshot",
+        ));
+    }
+    if let Some(name) = expanded
+        .keys()
+        .find(|name| name.as_str() != NIC && !local.contains_key(*name))
+    {
+        return Err(refuse(format!(
+            "the instance's {name} device comes from a profile, and the move would drop it"
+        )));
+    }
+    if let Some(key) = expanded_config.keys().find(|key| !own.contains_key(*key)) {
+        return Err(refuse(format!(
+            "the instance's {key} key comes from a profile, and the move would drop it"
+        )));
+    }
+    if restrictions.get("restricted").map(String::as_str) != Some("true") {
+        return Ok(());
+    }
+    let restriction = |key: &str| -> &str {
+        restrictions.get(key).map_or(
+            match key {
+                "restricted.containers.privilege" => "unprivileged",
+                "restricted.devices.nic" | "restricted.devices.disk" => "managed",
+                _ => "block",
+            },
+            String::as_str,
+        )
+    };
+    for (name, device) in expanded {
+        let kind = device.get("type").map_or("", String::as_str);
+        let field = |key: &str| device.get(key).map_or("", String::as_str);
+        let allowed = match kind {
+            "nic" => {
+                !field("network").is_empty() && restriction("restricted.devices.nic") != "block"
+            }
+            // Incus always allows a pool-backed root. A host path needs `restricted.devices.disk` past its managed default,
+            // and a custom volume stays in the default project, whose volumes the adoption project does not share.
+            "disk" if field("path") == "/" && !field("pool").is_empty() => true,
+            "disk" if field("pool").is_empty() => restriction("restricted.devices.disk") == "allow",
+            "disk" => {
+                return Err(refuse(format!(
+                    "the instance's {name} device is a disk other than its root, on a volume the move cannot reach"
+                )));
+            }
+            "none" => true,
+            other => restriction(&format!("restricted.devices.{other}")) == "allow",
+        };
+        if !allowed {
+            return Err(refuse(format!(
+                "the adoption project's restrictions refuse the instance's {name} device ({kind})"
+            )));
+        }
+    }
+    for (key, value) in expanded_config {
+        let on = !matches!(value.as_str(), "" | "false" | "0" | "off" | "no");
+        let refused = match key.as_str() {
+            "security.privileged" => {
+                on && restriction("restricted.containers.privilege") != "allow"
+            }
+            "security.nesting" => on && restriction("restricted.containers.nesting") == "block",
+            // Interception needs its own restriction lifted, and some of its keys count as low level: any is refused.
+            intercept if intercept.starts_with("security.syscalls.intercept.") => {
+                restriction("restricted.containers.interception") != "allow"
+                    || restriction("restricted.containers.lowlevel") != "allow"
+            }
+            low if low.starts_with("raw.") || LOW_LEVEL_KEYS.contains(&low) => {
+                restriction("restricted.containers.lowlevel") != "allow"
+            }
+            _ => false,
+        };
+        if refused {
+            return Err(refuse(format!(
+                "the adoption project's restrictions refuse the instance's {key} key"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Refuses an IPv4 that another MAC's lease, or another instance's device, claims.
 fn claimed(
     read: &dyn IncusRead,
@@ -470,5 +580,58 @@ fn text_map(value: &Value) -> Option<BTreeMap<String, String>> {
             .map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_string())))
             .collect(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_move_checks_follow_the_restrictions_the_project_body_sets() {
+        let none = BTreeMap::new();
+        let no_devices = Devices::new();
+        let proxy: Devices = [("web".to_string(), map(&[("type", "proxy")]))].into();
+        let nesting = map(&[("security.nesting", "true")]);
+        let restricted = |extra: &[(&str, &str)]| {
+            let mut config = map(&[("restricted", "true")]);
+            config.extend(map(extra));
+            config
+        };
+        assert!(moved_intact(&restricted(&[]), &none, &none, &proxy, &proxy).is_err());
+        let allowed = restricted(&[("restricted.devices.proxy", "allow")]);
+        assert!(moved_intact(&allowed, &none, &none, &proxy, &proxy).is_ok());
+        assert!(
+            moved_intact(&map(&[]), &nesting, &nesting, &proxy, &proxy).is_ok(),
+            "an unrestricted project"
+        );
+        assert!(
+            moved_intact(
+                &restricted(&[]),
+                &nesting,
+                &nesting,
+                &no_devices,
+                &no_devices
+            )
+            .is_err()
+        );
+        let nest = restricted(&[("restricted.containers.nesting", "allow")]);
+        assert!(moved_intact(&nest, &nesting, &nesting, &no_devices, &no_devices).is_ok());
+
+        // The body the adoption sends leaves both at their restricted defaults.
+        let target: AdoptTarget =
+            serde_json::from_value(json!({ "instance": "svc1", "to": "arcak-adopt-svc1" }))
+                .expect("a target");
+        let sent = text_map(&adoption_project_body(&target, &["br1".to_string()])["config"])
+            .expect("the config");
+        assert!(moved_intact(&sent, &none, &none, &proxy, &proxy).is_err());
+        assert!(moved_intact(&sent, &nesting, &nesting, &no_devices, &no_devices).is_err());
     }
 }

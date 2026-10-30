@@ -197,17 +197,17 @@ fn every_other_preflight_refusal_names_its_reason_and_sends_no_write() {
         (
             "privileged",
             svc1_with(|i| i["config"]["security.privileged"] = json!("true")),
-            "restricted project refuses",
+            "restrictions refuse",
         ),
         (
             "nesting",
             svc1_with(|i| i["config"]["security.nesting"] = json!("true")),
-            "restricted project refuses",
+            "restrictions refuse",
         ),
         (
             "raw",
             svc1_with(|i| i["config"]["raw.lxc"] = json!("lxc.x=1")),
-            "restricted project refuses",
+            "restrictions refuse",
         ),
         (
             "no-uuid",
@@ -331,6 +331,132 @@ fn every_other_preflight_refusal_names_its_reason_and_sends_no_write() {
         fake.requests().is_empty(),
         "nothing was read: {:?}",
         fake.requests()
+    );
+}
+
+/// The default profile with `eth0` and `extra`, which the fake expands into `svc1`.
+fn default_profile(fake: &FakeIncus, devices: Value, config: Value) {
+    let mut all = json!({ "eth0": { "type": "nic", "name": "eth0", "network": "br1" } });
+    all.as_object_mut()
+        .expect("devices")
+        .extend(devices.as_object().cloned().unwrap_or_default());
+    fake.add_profile(
+        "default",
+        json!({ "name": "default", "config": config, "devices": all }),
+    );
+}
+
+#[test]
+fn what_a_move_would_drop_or_its_project_would_refuse_is_refused_before_the_stop() {
+    let device =
+        |name: &'static str, body: Value| svc1_with(move |i| i["devices"][name] = body.clone());
+    let key = |name: &'static str, value: &'static str| {
+        svc1_with(move |i| i["config"][name] = json!(value))
+    };
+    let cases: Vec<(&str, Vec<Value>, &str)> = vec![
+        (
+            "proxy",
+            device(
+                "web",
+                json!({ "type": "proxy", "listen": "tcp:0.0.0.0:80", "connect": "tcp:127.0.0.1:80" }),
+            ),
+            "restrictions refuse",
+        ),
+        (
+            "unix-char",
+            device("tty", json!({ "type": "unix-char", "path": "/dev/ttyS0" })),
+            "restrictions refuse",
+        ),
+        (
+            "unix-block",
+            device("blk", json!({ "type": "unix-block", "path": "/dev/sdb" })),
+            "restrictions refuse",
+        ),
+        (
+            "gpu",
+            device("gpu0", json!({ "type": "gpu" })),
+            "restrictions refuse",
+        ),
+        (
+            "host-disk",
+            device(
+                "data",
+                json!({ "type": "disk", "source": "/srv/data", "path": "/data" }),
+            ),
+            "restrictions refuse",
+        ),
+        (
+            "volume-disk",
+            device(
+                "data",
+                json!({ "type": "disk", "pool": "pool1", "source": "vol1", "path": "/data" }),
+            ),
+            "a disk other than its root",
+        ),
+        (
+            "kernel-modules",
+            key("linux.kernel_modules", "overlay"),
+            "restrictions refuse",
+        ),
+        (
+            "intercept",
+            key("security.syscalls.intercept.mknod", "true"),
+            "restrictions refuse",
+        ),
+        (
+            "idmap",
+            key("security.idmap.base", "100000"),
+            "restrictions refuse",
+        ),
+        ("expiry", key("snapshots.expiry", "1d"), "snapshots.expiry"),
+    ];
+    for (tag, instances, reason) in cases {
+        refused_with_no_write(tag, instances, reason);
+    }
+    let svc1 = || vec![adopt_instance("default", json!({}))];
+    refused_after(
+        "profile-device",
+        svc1(),
+        &|fake, _| {
+            default_profile(
+                fake,
+                json!({ "data": { "type": "disk", "pool": "pool1", "path": "/data" } }),
+                json!({}),
+            );
+        },
+        &[],
+        "comes from a profile",
+    );
+    refused_after(
+        "profile-config",
+        svc1(),
+        &|fake, _| default_profile(fake, json!({}), json!({ "limits.cpu": "2" })),
+        &[],
+        "comes from a profile",
+    );
+    refused_after(
+        "profile-expiry",
+        svc1(),
+        &|fake, _| default_profile(fake, json!({}), json!({ "snapshots.expiry": "1w" })),
+        &[],
+        "snapshots.expiry",
+    );
+    refused_after(
+        "backup",
+        svc1(),
+        &|fake, _| {
+            assert_eq!(
+                raw(
+                    fake,
+                    "POST",
+                    "/1.0/instances/svc1/backups?project=default",
+                    &json!({})
+                ),
+                202
+            );
+        },
+        &[],
+        "backups",
     );
 }
 
