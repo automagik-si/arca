@@ -1,10 +1,11 @@
-//! `arca call`, run as the binary against a served node: the exit codes 0, 2, 3 and 4 of Decision 19, the scope and token checks, and
-//! the refusal of an approval named on the command line. The node reads its owner signers only from a scratch injection, so no
+//! `arca call`, run as the binary against a served node: the exit codes 0 to 4, the scope and token checks, and the refusal of an
+//! approval named on the command line. The node reads its owner signers only from a scratch injection, so no
 //! test reads a host's owner file. No test prints a token or an approval.
 
 mod common;
 
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,19 @@ struct Node {
     owner: SkKey,
 }
 
+impl Node {
+    /// Stops the server and returns what it wrote to stderr. The pipe is read here, so a line the server logged is seen.
+    fn stop(&mut self) -> String {
+        let _ = self.serve.kill();
+        let _ = self.serve.wait();
+        let mut text = String::new();
+        if let Some(mut stderr) = self.serve.stderr.take() {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
+    }
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.serve.kill();
@@ -63,11 +77,17 @@ fn mint(scratch: &Scratch, hash_dir: &Path, scope: &str, id: &str) -> PathBuf {
 }
 
 fn start_node(tag: &str) -> Node {
+    let owner = SkKey::from_seed(1);
+    start_node_with(tag, &format!("{}\n", owner.line(NAMESPACE)))
+}
+
+/// A served node whose owner signers file holds exactly `signers`.
+fn start_node_with(tag: &str, signers: &str) -> Node {
     let scratch = Scratch::new(tag);
     let fake = start_fake(&scratch);
     let owner = SkKey::from_seed(1);
-    let signers = scratch.path("owner-signers");
-    write_mode(&signers, &format!("{}\n", owner.line(NAMESPACE)), 0o600);
+    let signers_path = scratch.path("owner-signers");
+    write_mode(&signers_path, signers, 0o600);
 
     let state = scratch.path("state");
     fs::create_dir(&state).expect("the state directory");
@@ -99,7 +119,7 @@ fn start_node(tag: &str) -> Node {
     let serve = arca()
         .args(["serve", "--config"])
         .arg(&config)
-        .env("ARCA_TEST_OWNER_SIGNERS", &signers)
+        .env("ARCA_TEST_OWNER_SIGNERS", &signers_path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -172,6 +192,26 @@ fn statement_for(plan: &str, nonce: &str) -> String {
         "target": format!("plan-{plan}"),
     }))
     .expect("the statement canonicalizes")
+}
+
+#[test]
+fn the_server_logs_the_count_of_the_keys_it_trusts_after_it_drops_the_other_lines() {
+    // Two lines are not the Arca hardware key the verifier trusts: a key for another namespace and an ed25519 key. The count
+    // logged at start is the one the verifier keeps.
+    let owner = SkKey::from_seed(1);
+    let other = SkKey::from_seed(2);
+    let ed25519 = "owner namespaces=\"arca-kernel-approve\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let text = format!(
+        "# the owner's keys\n{}\n{}\n{ed25519}\n",
+        owner.line(NAMESPACE),
+        other.line("another-namespace"),
+    );
+    let mut node = start_node_with("serve-count", &text);
+    let served = node.stop();
+    assert!(
+        served.contains("arca: 1 owner signing key(s) kept"),
+        "the count is the one the verifier keeps: {served}"
+    );
 }
 
 #[test]
@@ -300,7 +340,7 @@ fn a_viewer_submitting_an_approval_is_refused_403_before_the_approval_is_checked
 fn an_approval_for_no_waiting_plan_is_spent_once_then_refused_replayed_and_never_echoed() {
     // The approval is well formed and signed by the owner's scratch key. No plan waits, so the first use is refused as no such
     // plan (its nonce is spent), and the replay is refused as replayed. Neither result carries the approval.
-    let node = start_node("approval-replay");
+    let mut node = start_node("approval-replay");
     let plan = zeros();
     let statement = statement_for(&plan, &"c".repeat(32));
     let approval = approve_statement(&node.owner, &statement);
@@ -348,4 +388,64 @@ fn an_approval_for_no_waiting_plan_is_spent_once_then_refused_replayed_and_never
         );
         assert!(!shown.contains(&approval), "the approval is never echoed");
     }
+    let served = node.stop();
+    assert!(
+        served.contains("owner signing key(s) kept"),
+        "the server's stderr is read: {served}"
+    );
+    assert!(
+        !served.contains(&approval),
+        "the server never logs the approval"
+    );
+}
+
+#[test]
+fn a_token_file_refused_for_its_mode_names_no_path_in_its_message() {
+    let node = start_node("token-mode-path");
+    let loose = node.scratch.path("loose.secret");
+    let secret = fs::read_to_string(&node.doctor).expect("the minted secret");
+    write_mode(&loose, &secret, 0o640);
+    let out = call(&node, &loose, "arca_status", &[]);
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(&loose.display().to_string()),
+        "the message does not name the file: {stderr}"
+    );
+}
+
+#[test]
+fn a_token_file_that_holds_no_token_names_no_path_in_its_message() {
+    let node = start_node("token-shape-path");
+    let not_a_token = node.scratch.path("not-a-token.secret");
+    write_mode(&not_a_token, "this is not a token\n", 0o600);
+    let out = call(&node, &not_a_token, "arca_status", &[]);
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(&not_a_token.display().to_string()),
+        "the message does not name the file: {stderr}"
+    );
+}
+
+#[test]
+fn an_args_file_refused_for_its_mode_names_no_path_in_its_message() {
+    let node = start_node("args-mode-path");
+    let args = node.scratch.path("args.json");
+    write_mode(&args, "{}", 0o604);
+    let out = arca()
+        .args(["call", "plan_list", "--config"])
+        .arg(&node.config)
+        .arg("--token-file")
+        .arg(&node.viewer)
+        .arg("--args-file")
+        .arg(&args)
+        .output()
+        .expect("run arca call");
+    assert_eq!(code(&out), 2, "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains(&args.display().to_string()),
+        "the message does not name the file: {stderr}"
+    );
 }

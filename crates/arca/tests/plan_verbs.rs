@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
@@ -291,8 +292,144 @@ fn a_plan_older_than_fifteen_minutes_is_refused_expired_even_with_a_fresh_approv
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     assert_eq!(
         rig.plan_list()["plans"].as_array().map(Vec::len),
-        Some(1),
-        "the plan still waits"
+        Some(0),
+        "a lapsed plan is left out of the listing"
+    );
+    assert_eq!(
+        rig.kernel
+            .lock()
+            .expect("the kernel lock")
+            .pending_plans()
+            .len(),
+        1,
+        "the kernel still holds the lapsed plan until a proposal or a restart replaces it"
+    );
+}
+
+#[test]
+fn a_proposal_after_a_plan_lapses_lists_a_fresh_plan_that_can_run() {
+    let owner = SkKey::from_seed(1);
+    let rig = Rig::new("lapsed-fresh", &[&owner]);
+    rig.removed_toy("t1");
+    let (digest, _) = rig.first_plan();
+    let lapsed_at = NOW + 1_000 + 16 * 60 * 1000;
+    rig.at(lapsed_at);
+    assert_eq!(
+        rig.plan_list()["plans"],
+        json!([]),
+        "a lapsed plan is not listed"
+    );
+
+    rig.propose(
+        vec![arca::desired_store::EntryChange::Put(second_toy_entry(
+            "t2",
+        ))],
+        lapsed_at,
+    );
+    let list = rig.plan_list();
+    let plan = &list["plans"][0];
+    assert_eq!(
+        plan["plan"],
+        json!(digest),
+        "the same objects give the same digest"
+    );
+    assert_eq!(
+        plan["createdAt"],
+        json!(lapsed_at),
+        "the plan is made again now"
+    );
+    let statement = plan["statement"].as_str().expect("a statement").to_string();
+    let approval = approve_statement(&owner, &statement);
+    submit(&rig, &digest, &approval).expect("the fresh plan runs under a fresh approval");
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 1);
+}
+
+#[test]
+fn a_restart_after_a_plan_lapses_lists_a_fresh_plan_made_at_the_restart() {
+    let owner = SkKey::from_seed(1);
+    let scratch = Scratch::new("lapsed-restart");
+    let fake = start_fake(&scratch);
+    {
+        let live = kernel(
+            &scratch,
+            &fake,
+            verifier_for(&scratch, &[&owner], "r1"),
+            NOW,
+        )
+        .expect("opens");
+        let live = Arc::new(Mutex::new(live));
+        let mut guard = live.lock().expect("the kernel lock");
+        guard
+            .propose(
+                vec![arca::desired_store::EntryChange::Put(toy_entry("t1"))],
+                NOW,
+            )
+            .expect("applied");
+        guard
+            .propose(
+                vec![arca::desired_store::EntryChange::Remove(EntryId(
+                    "toy-scratch".to_string(),
+                ))],
+                NOW + 1_000,
+            )
+            .expect("removed");
+    }
+    let restart_at = NOW + 16 * 60 * 1000;
+    let restarted = Arc::new(Mutex::new(
+        kernel(
+            &scratch,
+            &fake,
+            verifier_for(&scratch, &[&owner], "r2"),
+            restart_at,
+        )
+        .expect("reopens"),
+    ));
+    let clock = Arc::new(AtomicU64::new(restart_at + 1_000));
+    let handlers = plan_verbs(Arc::clone(&restarted), clock);
+    let list = call_verb(&handlers, "plan_list", json!({})).expect("plan_list answers");
+    assert_eq!(list["plans"][0]["createdAt"], json!(restart_at));
+    assert_eq!(list["plans"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn a_waiting_plan_is_dropped_by_a_restart_after_the_document_ttl() {
+    // The document is valid for thirty days from its issue. Past that, the gate holds the applied state and makes no plan.
+    let owner = SkKey::from_seed(1);
+    let scratch = Scratch::new("doc-ttl");
+    let fake = start_fake(&scratch);
+    {
+        let mut live = kernel(
+            &scratch,
+            &fake,
+            verifier_for(&scratch, &[&owner], "t1"),
+            NOW,
+        )
+        .expect("opens");
+        live.propose(
+            vec![arca::desired_store::EntryChange::Put(toy_entry("t1"))],
+            NOW,
+        )
+        .expect("applied");
+        live.propose(
+            vec![arca::desired_store::EntryChange::Remove(EntryId(
+                "toy-scratch".to_string(),
+            ))],
+            NOW + 1_000,
+        )
+        .expect("removed");
+        assert_eq!(live.pending_plans().len(), 1);
+    }
+    let thirty_one_days = NOW + 31 * 24 * 60 * 60 * 1000;
+    let restarted = kernel(
+        &scratch,
+        &fake,
+        verifier_for(&scratch, &[&owner], "t2"),
+        thirty_one_days,
+    )
+    .expect("reopens");
+    assert!(
+        restarted.pending_plans().is_empty(),
+        "a restart after the document's thirty days drops the waiting plan"
     );
 }
 
@@ -458,13 +595,43 @@ fn the_approval_string_is_never_in_a_result_or_in_any_file_the_kernel_writes() {
     let signature_body = approval.split('.').nth(1).expect("the armoured part");
     assert!(!result.to_string().contains(&approval));
     assert!(!result.to_string().contains(signature_body));
-    for name in ["desired.json", "journal.jsonl", "approval-nonces.jsonl"] {
-        if let Ok(bytes) = std::fs::read(rig.scratch.path(name)) {
-            let text = String::from_utf8_lossy(&bytes);
-            assert!(!text.contains(&approval), "{name} holds the approval");
-            assert!(!text.contains(signature_body), "{name} holds the signature");
+    // Every file under the state directory is read, so a file the kernel adds later is covered too. The nonce file is named
+    // for the verifier that opened it, which is why a fixed list of names missed it.
+    let files = files_under(&rig.scratch.dir);
+    assert!(
+        files
+            .iter()
+            .any(|path| path.ends_with("nonces-secret.jsonl")),
+        "the scan reaches the nonce file: {files:?}"
+    );
+    for path in files {
+        let bytes = std::fs::read(&path).expect("the file reads");
+        let text = String::from_utf8_lossy(&bytes);
+        let shown = path.display();
+        assert!(!text.contains(&approval), "{shown} holds the approval");
+        assert!(
+            !text.contains(signature_body),
+            "{shown} holds the signature"
+        );
+    }
+}
+
+/// Every regular file under `dir`, at any depth. A socket or another file that is not regular is not read.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("the directory reads") {
+            let path = entry.expect("the entry reads").path();
+            let meta = std::fs::symlink_metadata(&path).expect("the entry's metadata reads");
+            if meta.is_dir() {
+                pending.push(path);
+            } else if meta.is_file() {
+                found.push(path);
+            }
         }
     }
+    found
 }
 
 #[test]

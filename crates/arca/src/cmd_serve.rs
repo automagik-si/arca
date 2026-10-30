@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -63,9 +63,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The kernel opens before anything listens, so a state directory that is held, or whose document is not this node's, stops
     // the start with nothing served.
     let host = approval_host(&cfg)?;
-    let lines = owner_signers(&cfg)?;
+    let trusted = SshSigVerifier::new(owner_signers(&cfg)?);
+    eprintln!("arca: {} owner signing key(s) kept", trusted.key_count());
     let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
-    let verifier = ApprovalVerifier::new(host.clone(), SshSigVerifier::new(lines), nonces);
+    let verifier = ApprovalVerifier::new(host.clone(), trusted, nonces);
     let kernel = Kernel::open(
         &cfg.state_dir,
         key,
@@ -148,15 +149,27 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
 }
 
-/// The state directory must be a real directory, not a link, and private to its owner (mode 0700). It is checked before the node
-/// key is created in it, so a key is never written into a directory another user can read.
+/// The state directory must be a real directory, not a link, owned by this user, and private to its owner (mode 0700). It is
+/// checked before the node key is created in it, so a key is never written into a directory another user can read.
 fn check_state_dir(dir: &Path) -> Result<(), Failure> {
+    let uid = arca_approval::effective_uid().map_err(approval_failure)?;
+    check_state_dir_owned_by(dir, uid)
+}
+
+/// [`check_state_dir`] for a directory that must be owned by `uid`.
+fn check_state_dir_owned_by(dir: &Path, uid: u32) -> Result<(), Failure> {
     let meta = fs::symlink_metadata(dir).map_err(|_| {
         Failure::Config(format!("the state directory {} is missing", dir.display()))
     })?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(Failure::Config(format!(
             "the state directory {} is not a directory",
+            dir.display()
+        )));
+    }
+    if meta.uid() != uid {
+        return Err(Failure::Config(format!(
+            "the state directory {} is not owned by this user",
             dir.display()
         )));
     }
@@ -170,17 +183,15 @@ fn check_state_dir(dir: &Path) -> Result<(), Failure> {
 }
 
 /// The owner signing keys this kernel trusts for the approval namespace. A signers file that is not there is no key at all, so
-/// every approval is refused. The count of kept keys is logged, never the keys.
+/// every approval is refused. Only the count of kept keys is ever logged, by the caller, never the keys.
 fn owner_signers(cfg: &NodeConfig) -> Result<Vec<SignerLine>, Failure> {
     let test: Option<PathBuf> = std::env::var_os(TEST_SIGNERS_ENV).map(PathBuf::from);
     let (path, trust) =
         signers_trust(cfg.kernel.scratch, &cfg.kernel.projects, test).map_err(approval_failure)?;
-    let lines = match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        _ => load_signers(&path, &trust).map_err(approval_failure)?,
-    };
-    eprintln!("arca: {} owner signing key(s) kept", lines.len());
-    Ok(lines)
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        _ => load_signers(&path, &trust).map_err(approval_failure),
+    }
 }
 
 /// The host name the approval statements name: the config's approval host when one is set, else the system's host name.
@@ -279,5 +290,43 @@ fn remove_own_socket(path: &Path) {
     );
     if is_socket && refused {
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A directory under the default temporary directory, mode 0700, removed on drop.
+    struct StateDir(PathBuf);
+
+    impl StateDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("arca-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir(&dir).expect("the directory is created");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+            Self(dir)
+        }
+    }
+
+    impl Drop for StateDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_state_dir_owned_by_another_uid_is_refused_and_one_this_user_owns_passes() {
+        // Only root can give a directory to another uid, so the check is run against a uid the directory does not carry.
+        let dir = StateDir::new("state-owner");
+        let me = arca_approval::effective_uid().expect("the effective uid is read");
+        let refused = check_state_dir_owned_by(&dir.0, me.wrapping_add(1));
+        assert!(
+            matches!(refused, Err(Failure::Config(_))),
+            "a directory another uid owns is refused: {refused:?}"
+        );
+        check_state_dir_owned_by(&dir.0, me).expect("a directory this user owns passes");
     }
 }

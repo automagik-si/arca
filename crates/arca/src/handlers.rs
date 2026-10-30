@@ -308,8 +308,8 @@ pub fn plan_handlers(
     ]
 }
 
-/// `plan_list`: each waiting delete plan, with the statement the owner signs for it. Every listing draws a new nonce, so each
-/// statement is built fresh.
+/// `plan_list`: each waiting delete plan that has not lapsed, with the statement the owner signs for it. Every listing draws a
+/// new nonce, so each statement is built fresh. A lapsed plan is left out, since its run is refused as expired.
 struct PlanList {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -322,6 +322,7 @@ impl ToolHandler for PlanList {
         let plans = kernel
             .pending_plans()
             .iter()
+            .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
             .map(|plan| plan_json(kernel.host(), plan, now))
             .collect::<Result<Vec<Value>, CallError>>()?;
         Ok(json!({ "plans": plans }))

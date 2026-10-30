@@ -7,9 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, ErrorKind, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use arca_approval::effective_uid;
 use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{
@@ -320,9 +321,24 @@ fn records(retained: &Retained) -> Vec<RetainedRecord> {
         .collect()
 }
 
-/// Opens `path` for reading and writing, creating it at mode 0600 when it is missing. The mode is set again on an open file,
-/// so a file that existed with other bits is made private.
+/// Opens `path` for reading and writing, creating it at mode 0600 when it is missing. A link is refused before anything is
+/// opened, so a dangling link creates nothing and a live one is never chmodded through. The file that was opened must be the
+/// one the path names, a regular file owned by this user. The mode is set again on that file, so a file that existed with
+/// other bits is made private.
 fn open_private(path: &Path) -> Result<File, KernelError> {
+    let refuse = |why: &str| KernelError::Io {
+        path: path.display().to_string(),
+        why: why.to_string(),
+    };
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(refuse("the lock file is a symbolic link"));
+        }
+        Ok(meta) if !meta.is_file() => return Err(refuse("the lock file is not a regular file")),
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(path, &error)),
+    }
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -331,6 +347,20 @@ fn open_private(path: &Path) -> Result<File, KernelError> {
         .mode(0o600)
         .open(path)
         .map_err(|error| io_error(path, &error))?;
+    let opened = file.metadata().map_err(|error| io_error(path, &error))?;
+    let linked = fs::symlink_metadata(path).map_err(|error| io_error(path, &error))?;
+    if linked.file_type().is_symlink()
+        || (linked.dev(), linked.ino()) != (opened.dev(), opened.ino())
+    {
+        return Err(refuse("the lock file changed while it was opened"));
+    }
+    if !opened.is_file() {
+        return Err(refuse("the lock file is not a regular file"));
+    }
+    let uid = effective_uid().map_err(|_| refuse("the effective uid cannot be read"))?;
+    if opened.uid() != uid {
+        return Err(refuse("the lock file is not owned by this user"));
+    }
     file.set_permissions(fs::Permissions::from_mode(0o600))
         .map_err(|error| io_error(path, &error))?;
     Ok(file)

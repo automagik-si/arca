@@ -192,16 +192,21 @@ A call sends `initialize` and then `tools/call`, each on its own connection. Its
 | `approval-nonces.jsonl` | the approval nonces that were spent |
 | `secrets/` | the secret files the writer reads, if any |
 
-`serve` refuses a state directory that is not mode 0700 before it creates the node key, and a state file that is a link, is not
-mode 0600, does not parse, or is not signed by this node's key. Each refusal is a config or runtime failure, and nothing is
-served.
+`serve` refuses a state directory that is not mode 0700, or not owned by the user that runs it, before it creates the node key.
+It refuses a state file that is a link, is not mode 0600, does not parse, or is not signed by this node's key. It refuses a lock
+file that is a link or is not owned by that user. Each refusal is a config or runtime failure, and nothing is served.
 
 A removal of a desired entry whose objects are class B (deleted by an Incus delete) does not delete them. It waits as a delete
-plan until an owner approves it. A plan lapses fifteen minutes after it was made.
+plan until an owner approves it. A plan lapses fifteen minutes after it was made. `plan_list` leaves a lapsed plan out, and an
+approval for it is refused as `Expired`. A restart, or a new proposal while the removal still waits, makes a fresh plan with a new
+creation time and fifteen new minutes.
 
-`plan_list` returns each waiting plan with `plan` (its digest), `entry`, `createdAt`, `expiresAt`, `objects`, `paramsDigest`, and
-`statement`. The statement is the exact text the owner signs, built fresh for each listing. Its keys are sorted, it has no
-spaces, and it ends without a newline:
+The desired-state document expires thirty days after it is issued. A document past its expiry holds the applied state, and the
+reconciler makes no plan from it. So a restart after the thirty days drops every waiting plan, and `plan_list` lists none.
+
+`plan_list` returns each waiting plan that has not lapsed, with `plan` (its digest), `entry`, `createdAt`, `expiresAt`,
+`objects`, `paramsDigest`, and `statement`. The statement is the exact text the owner signs, built fresh for each listing. Its
+keys are sorted, it has no spaces, and it ends without a newline:
 
 ```
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}

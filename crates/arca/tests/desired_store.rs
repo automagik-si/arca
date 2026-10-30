@@ -5,7 +5,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use arca::desired_store::{DesiredStore, EntryChange};
 use arca_kernel::KernelError;
@@ -223,4 +223,45 @@ fn the_converged_set_and_the_retained_set_survive_a_reopen() {
     assert_eq!(reopened.converged(), &[toy_entry("t1")][..]);
     assert_eq!(reopened.retained(), &retained);
     assert!(reopened.current().is_none(), "no document was proposed");
+}
+
+#[test]
+fn a_lock_that_is_a_link_to_a_private_file_is_refused_and_the_target_is_left_alone() {
+    // Opening the lock must not follow the link: a chmod on the target would change a file the store does not own.
+    let scratch = Scratch::new("lock-link");
+    let victim = scratch.path("victim.txt");
+    fs::write(&victim, "keep").expect("the target is written");
+    fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).expect("mode 0644");
+    symlink(&victim, scratch.path("desired.lock")).expect("the link is made");
+    let refused = DesiredStore::open(&scratch.dir, node_key_at(&scratch.dir));
+    assert!(
+        matches!(refused, Err(KernelError::Io { .. })),
+        "a link is refused: {refused:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&victim).expect("the target reads"),
+        "keep"
+    );
+    assert_eq!(
+        fs::metadata(&victim)
+            .expect("the target exists")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644,
+        "the target keeps its mode"
+    );
+}
+
+#[test]
+fn a_dangling_lock_link_is_refused_and_creates_no_target() {
+    let scratch = Scratch::new("lock-dangling");
+    let target = scratch.path("created-by-lock");
+    symlink(&target, scratch.path("desired.lock")).expect("the link is made");
+    let refused = DesiredStore::open(&scratch.dir, node_key_at(&scratch.dir));
+    assert!(
+        matches!(refused, Err(KernelError::Io { .. })),
+        "a dangling link is refused: {refused:?}"
+    );
+    assert!(!target.exists(), "opening the lock creates no target");
 }

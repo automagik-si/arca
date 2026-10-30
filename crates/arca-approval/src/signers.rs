@@ -108,7 +108,7 @@ pub fn load_signers(path: &Path, trust: &TrustRoot) -> Result<Vec<SignerLine>, A
 }
 
 /// The uid that runs this process, from its status. Used to name the owner of a scratch test's files.
-pub(crate) fn effective_uid() -> Result<u32, ApprovalRefusal> {
+pub fn effective_uid() -> Result<u32, ApprovalRefusal> {
     let unreadable = || untrusted("the effective uid cannot be read".to_string());
     let status = fs::read_to_string("/proc/self/status").map_err(|_| unreadable())?;
     status

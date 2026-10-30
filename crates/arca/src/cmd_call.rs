@@ -59,7 +59,7 @@ fn call_arguments(flags: &Flags) -> Result<Value, Failure> {
             }
             Ok(value)
         }
-        (None, Some(path)) => object(&read_private(Path::new(path))?),
+        (None, Some(path)) => object(&read_private(Path::new(path), "the arguments file")?),
         (None, None) => Ok(json!({})),
     }
 }
@@ -75,7 +75,7 @@ fn object(text: &str) -> Result<Value, Failure> {
 
 /// The token in its file, with the trailing newline removed. Its shape is checked; its text never leaves this function.
 fn read_token(path: &Path) -> Result<String, Failure> {
-    let text = read_private(path)?;
+    let text = read_private(path, "the token file")?;
     let token = text.trim_end();
     let secret = token.strip_prefix(TOKEN_PREFIX).unwrap_or_default();
     let shaped = secret.len() == TOKEN_SECRET_LEN
@@ -83,20 +83,19 @@ fn read_token(path: &Path) -> Result<String, Failure> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
     if !shaped {
-        return Err(Failure::Usage(format!(
-            "{} does not hold a token",
-            path.display()
-        )));
+        return Err(Failure::Usage(
+            "the token file does not hold a token".to_string(),
+        ));
     }
     Ok(token.to_string())
 }
 
 /// The text of a file only its owner may read: a regular file with no group or other permission bit. The text is never echoed.
-fn read_private(path: &Path) -> Result<String, Failure> {
+/// `role` names the file in a refusal (the token file or the arguments file), so the message names no path.
+fn read_private(path: &Path, role: &str) -> Result<String, Failure> {
     let refused = || {
         Failure::Usage(format!(
-            "{} must be a regular file with no group or other permission bit",
-            path.display()
+            "{role} must be a regular file with no group or other permission bit"
         ))
     };
     let meta = fs::symlink_metadata(path).map_err(|_| refused())?;
