@@ -52,11 +52,18 @@ pub enum IncusError {
     AppliedUnconfirmed(Box<Unconfirmed>),
 }
 
+/// The object a write names: its kind, project, parent and name, and the uuid only for a kind that has one. A create names no
+/// uuid, since it learns one only as it applies. The writer checks every name before a request uses it.
+pub type Target = ObjectRef;
+
 /// A write that Incus accepted whose read-back did not confirm it: the object is not this entry's own, or it does not show the
-/// change. `owner` is the class the read found, when it found one. Nothing is retried.
+/// change. `target` is the full target the write named, pool or network included. `uuid` is the uuid the read-back showed, when
+/// it showed one, so a caller can tell what landed without a second read. `owner` is the class the read found, when it found
+/// one. Nothing is retried.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unconfirmed {
-    pub object: ObjectRef,
+    pub target: Target,
+    pub uuid: Option<String>,
     pub owner: Option<OwnerClass>,
     pub reason: String,
 }

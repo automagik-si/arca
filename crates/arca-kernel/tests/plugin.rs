@@ -39,6 +39,7 @@ fn manifest(effects: Vec<(IncusKind, EffectClass)>, projects: &[&str], observes:
 
 fn create(project: &str, name: &str) -> EffectOp {
     EffectOp::IncusCreate {
+        parent: None,
         kind: IncusKind::Instance,
         project: project.to_string(),
         name: name.to_string(),
@@ -49,6 +50,7 @@ fn create(project: &str, name: &str) -> EffectOp {
 fn patch(project: &str, name: &str, pairs: &[(&str, Option<&str>)]) -> EffectOp {
     EffectOp::IncusPatchConfig {
         object: ObjectRef {
+            parent: None,
             kind: IncusKind::Instance,
             project: project.to_string(),
             name: name.to_string(),
@@ -143,6 +145,7 @@ impl Provider for Host {
                     ..
                 },
             ) => ObjectRef {
+                parent: None,
                 kind: *kind,
                 project: project.clone(),
                 name: name.clone(),
@@ -310,6 +313,7 @@ fn a_patch_records_the_pre_image_as_its_inverse() {
         live[0].inverse,
         Some(Inverse::IncusRestoreConfig {
             object: ObjectRef {
+                parent: None,
                 kind: IncusKind::Instance,
                 project: "arcak-svc".to_string(),
                 name: "web1".to_string(),
@@ -338,6 +342,7 @@ fn an_undeclared_kind_is_refused_before_any_plan_and_writes_nothing() {
     let refusal = {
         let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
         ctx.effect(EffectOp::IncusCreate {
+            parent: None,
             kind: IncusKind::Network,
             project: "arcak-svc".to_string(),
             name: "net1".to_string(),
@@ -467,6 +472,7 @@ fn a_project_kind_whose_name_is_not_its_project_is_refused() {
     let refusal = {
         let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
         ctx.effect(EffectOp::IncusCreate {
+            parent: None,
             kind: IncusKind::Project,
             project: "arcak-svc".to_string(),
             name: "arcak-other".to_string(),
@@ -536,6 +542,7 @@ fn a_provider_answer_for_another_object_leaves_the_intent_open_for_recovery() {
     );
     let mut host = Host::new(&log);
     host.answer_object = Some(ObjectRef {
+        parent: None,
         kind: IncusKind::Instance,
         project: "arcak-svc".to_string(),
         name: "someone-else".to_string(),
@@ -871,6 +878,7 @@ fn a_plugin_cannot_delete_through_ctx_and_no_provider_call_runs() {
     let refusal = {
         let mut ctx = Ctx::new(entry(), &manifest, &mut host, &mut sink, 1);
         ctx.effect(delete_of(ObjectRef {
+            parent: None,
             kind: IncusKind::Instance,
             project: "arcak-svc".to_string(),
             name: "web1".to_string(),
@@ -918,6 +926,7 @@ fn a_create_that_returns_no_uuid_is_refused_because_no_delete_can_name_it() {
     );
     let mut host = Host::new(&log);
     host.answer_object = Some(ObjectRef {
+        parent: None,
         kind: IncusKind::Instance,
         project: "arcak-svc".to_string(),
         name: "web1".to_string(),
@@ -944,6 +953,7 @@ fn a_patch_whose_inverse_is_not_the_restore_of_the_planned_pre_image_is_refused_
     host.pre_image = Some(BTreeMap::from([("a".to_string(), Some("old".to_string()))]));
     host.answer_inverse = Some(Inverse::IncusRestoreConfig {
         object: ObjectRef {
+            parent: None,
             kind: IncusKind::Instance,
             project: "arcak-svc".to_string(),
             name: "web1".to_string(),

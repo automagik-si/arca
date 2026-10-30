@@ -51,10 +51,13 @@ pub enum Observe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "op")]
 pub enum EffectOp {
-    /// Creates an object. A project is created with `kind` `Project` and `project` equal to `name`.
+    /// Creates an object. A project is created with `kind` `Project` and `project` equal to `name`. `parent` is the storage
+    /// pool of a volume or a bucket and the network of a forward, and the op's JSON omits it for every other kind.
     IncusCreate {
         kind: IncusKind,
         project: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
         name: String,
         body: Value,
     },
@@ -118,6 +121,8 @@ pub enum EffectRefusal {
     Stale,
     /// A reason the provider or the kernel gives, as text.
     Provider(String),
+    /// The provider cannot tell whether its write landed. The intent stays open and is not journalled as failed.
+    Unresolved,
 }
 
 impl fmt::Display for EffectRefusal {
@@ -129,6 +134,7 @@ impl fmt::Display for EffectRefusal {
             Self::NotOwned(_) => f.write_str("the object belongs to another owner"),
             Self::Stale => f.write_str("the object changed after it was planned"),
             Self::Provider(why) => f.write_str(why),
+            Self::Unresolved => f.write_str("the outcome is not known; the intent stays open"),
         }
     }
 }
@@ -294,11 +300,13 @@ impl<'a> Ctx<'a> {
             EffectOp::IncusCreate {
                 kind,
                 project,
+                parent,
                 name,
                 ..
             } => ObjectRef {
                 kind: *kind,
                 project: project.clone(),
+                parent: parent.clone(),
                 name: name.clone(),
                 uuid: None,
             },
@@ -312,16 +320,14 @@ impl<'a> Ctx<'a> {
                 &self.entry,
                 planned.class,
                 digest,
-                target,
+                target.clone(),
                 planned.pre_image.clone(),
                 self.now_ms,
             )
             .map_err(journal_refusal)?;
         match self.provider.effect(&self.entry, &op, &planned) {
             Ok((object, inverse)) => {
-                if (object.kind, object.project.as_str(), object.name.as_str())
-                    != (kind, project, name)
-                {
+                if !same_place(&object, &target) {
                     return Err(EffectRefusal::Provider(
                         "the provider answered for another object; the intent stays open"
                             .to_string(),
@@ -339,9 +345,12 @@ impl<'a> Ctx<'a> {
                 Ok(object)
             }
             Err(refusal) => {
-                // A journal that cannot record this refusal is poisoned and refuses every later write, so the refusal is
-                // returned either way.
-                let _ = self.journal.failed(id, &refusal.to_string());
+                // A refusal that says the outcome is not known leaves the intent open: the write may have landed, and a
+                // failed record would retire an effect that still exists. Any other refusal is recorded as failed. A journal
+                // that cannot record it is poisoned and refuses every later write, so the refusal is returned either way.
+                if refusal != EffectRefusal::Unresolved {
+                    let _ = self.journal.failed(id, &refusal.to_string());
+                }
                 Err(refusal)
             }
         }
@@ -367,14 +376,27 @@ impl<'a> Ctx<'a> {
     }
 }
 
+/// Whether an answer names the object an intent names: the same kind, project, parent and name. The uuid is not compared,
+/// since a create learns it only as it applies.
+fn same_place(object: &ObjectRef, target: &ObjectRef) -> bool {
+    object.kind == target.kind
+        && object.project == target.project
+        && object.parent == target.parent
+        && object.name == target.name
+}
+
 /// The inverse an op's effect must return, given the object it applied to. A create's must be the delete of the object it
-/// made, with its uuid. A patch's must restore the planned pre-image on the object the op names. `None` when no inverse can
-/// be right: a create that returned no uuid, a patch with no pre-image, or a delete, which a plugin never runs.
+/// made. A kind with a uuid is deleted by it, so the object must carry one; a kind without one is deleted by its kind,
+/// project, parent and name, so the object must carry none. A patch's must restore the planned pre-image on the object the op
+/// names. `None` when no inverse can be right: a create whose uuid does not fit its kind, a patch with no pre-image, or a
+/// delete, which a plugin never runs.
 fn required_inverse(op: &EffectOp, object: &ObjectRef, planned: &Planned) -> Option<Inverse> {
     match op {
-        EffectOp::IncusCreate { .. } => object.uuid.is_some().then(|| Inverse::IncusDelete {
-            object: object.clone(),
-        }),
+        EffectOp::IncusCreate { .. } => {
+            (object.uuid.is_some() == object.kind.has_uuid()).then(|| Inverse::IncusDelete {
+                object: object.clone(),
+            })
+        }
         EffectOp::IncusPatchConfig { object: named, .. } => Some(Inverse::IncusRestoreConfig {
             object: named.clone(),
             config: planned.pre_image.clone()?,

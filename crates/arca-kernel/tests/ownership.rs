@@ -233,6 +233,7 @@ fn incus_kinds_serialize_lowercase_and_object_refs_keep_their_names() {
         json!("acl")
     );
     let object = ObjectRef {
+        parent: None,
         kind: IncusKind::Project,
         project: "arcak-scratch-p3".to_string(),
         name: "arcak-scratch-p3".to_string(),

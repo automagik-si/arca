@@ -1,0 +1,1468 @@
+//! The kernel's Incus write provider, tested against the fake Incus and against small servers that answer a scripted sequence.
+//! Every refusal is checked twice: the provider returns the refusal, and the server sees no write. No test touches a real Incus
+//! socket, and every scratch directory is under the default temporary directory.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::IpAddr;
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arca_incus::{FakeIncus, FakeState, IncusRead, UnixIncus};
+use arca_kernel::canon::Digest;
+use arca_kernel::desired::{EntryId, PluginId};
+use arca_kernel::journal::{EffectClass, EffectState, FileJournal, Inverse, Journal, MemJournal};
+use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass};
+use arca_kernel::plugin::{
+    Ctx, EffectOp, EffectRefusal, Manifest, Observe, Planned, Provider, op_digest,
+};
+use arca_providers::incus::{
+    DROIDD_PROJECTS_FIXED, Family, IncusProvider, Retirement, SECRET_PREFIX, host_addresses,
+    kind_path,
+};
+use serde_json::{Value, json};
+
+const MARK: &str = "user.arcakernel.entry";
+const RETIRING: &str = "user.arcakernel.retiring";
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../arca-incus/tests/fixtures/state.json"
+);
+const SECRET_VALUE: &str = "SECRET-VALUE-7731";
+const READ_UUID: &str = "00000000-0000-4000-8000-0000000000e1";
+const OTHER_UUID: &str = "00000000-0000-4000-8000-0000000000e2";
+
+/// A fresh directory under the default temporary directory, removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .subsec_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("arca-prov-{}-{nanos}-{tag}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create the scratch directory");
+        Scratch(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn entry(name: &str) -> EntryId {
+    EntryId(name.to_string())
+}
+
+fn family() -> Family {
+    Family {
+        projects: vec!["svc".into(), "kfam".into(), "kbare".into()],
+        scratch: false,
+        droidd_projects: vec!["droid".into()],
+        reserved_cidrs: vec!["198.51.100.0/24".into()],
+    }
+}
+
+fn features(values: &[(&str, &str)]) -> Value {
+    let mut map = serde_json::Map::new();
+    for (key, value) in values {
+        map.insert((*key).to_string(), json!(value));
+    }
+    Value::Object(map)
+}
+
+/// The fixture the provider tests run against. `svc` has every feature the kernel needs; `kbare` has networks but no volumes.
+/// `guest1` is a foreign object, moved into `svc` so the family reaches it. `k1` is the kernel's, for entry `toy`.
+fn state() -> FakeState {
+    let mut state = FakeState::load(Path::new(FIXTURE)).expect("load the fixture");
+    for project in &mut state.projects {
+        if project["name"].as_str() == Some("svc") {
+            project["config"] = features(&[
+                ("features.networks", "true"),
+                ("features.profiles", "true"),
+                ("features.storage.volumes", "true"),
+                ("features.storage.buckets", "true"),
+            ]);
+        }
+    }
+    state.projects.push(json!({
+        "name": "kbare", "description": "", "config": features(&[
+            ("features.networks", "true"),
+            ("features.profiles", "true"),
+            ("features.storage.volumes", "false"),
+            ("features.storage.buckets", "true"),
+        ])
+    }));
+    for instance in &mut state.instances {
+        if instance["name"] == "guest1" {
+            instance["project"] = json!("svc");
+        }
+    }
+    state
+}
+
+fn start(tag: &str) -> (Scratch, FakeIncus) {
+    let dir = Scratch::new(tag);
+    let fake = FakeIncus::start(&dir.0, state()).expect("start the fake");
+    (dir, fake)
+}
+
+fn provider(fake: &FakeIncus, secrets: &Path) -> IncusProvider {
+    IncusProvider::new(fake.socket().to_path_buf(), family(), secrets.to_path_buf())
+        .expect("a valid family")
+}
+
+fn object(kind: IncusKind, project: &str, parent: Option<&str>, name: &str) -> ObjectRef {
+    ObjectRef {
+        kind,
+        project: project.to_string(),
+        parent: parent.map(str::to_string),
+        name: name.to_string(),
+        uuid: None,
+    }
+}
+
+fn create(
+    kind: IncusKind,
+    project: &str,
+    parent: Option<&str>,
+    name: &str,
+    body: Value,
+) -> EffectOp {
+    EffectOp::IncusCreate {
+        kind,
+        project: project.to_string(),
+        parent: parent.map(str::to_string),
+        name: name.to_string(),
+        body,
+    }
+}
+
+fn patch(object: ObjectRef, pairs: &[(&str, Option<&str>)]) -> EffectOp {
+    EffectOp::IncusPatchConfig {
+        object,
+        config: pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+            .collect(),
+    }
+}
+
+fn changes(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), value.map(str::to_string)))
+        .collect()
+}
+
+/// The planned answer a provider's `plan` gives for `op`, for a test that calls `effect` without a plan of its own.
+fn forged(op: &EffectOp, class: EffectClass, etag: Option<String>) -> Planned {
+    Planned {
+        class,
+        op_digest: op_digest(op),
+        pre_image: None,
+        etag,
+    }
+}
+
+fn manifest() -> Manifest {
+    Manifest {
+        id: PluginId("arca.test".to_string()),
+        version: "0.1.0".to_string(),
+        provides: Vec::new(),
+        effects: vec![
+            (IncusKind::Project, EffectClass::B),
+            (IncusKind::Instance, EffectClass::B),
+            (IncusKind::Volume, EffectClass::B),
+            (IncusKind::Bucket, EffectClass::B),
+            (IncusKind::Network, EffectClass::A),
+            (IncusKind::Acl, EffectClass::A),
+            (IncusKind::Profile, EffectClass::A),
+            (IncusKind::Zone, EffectClass::A),
+            (IncusKind::Forward, EffectClass::A),
+        ],
+        projects: vec!["svc".into(), "kfam".into(), "kbare".into()],
+        observes: false,
+    }
+}
+
+fn writes(fake: &FakeIncus) -> Vec<(String, String)> {
+    fake.writes()
+        .into_iter()
+        .map(|w| (w.method, w.path))
+        .collect()
+}
+
+fn only_gets(fake: &FakeIncus) -> bool {
+    fake.requests().iter().all(|r| r.method == "GET")
+}
+
+/// Reads an object's metadata through the GET-only client.
+fn read(fake: &FakeIncus, path: &str) -> Value {
+    UnixIncus::new(fake.socket().to_path_buf())
+        .get(path)
+        .expect("a GET of the object")
+}
+
+fn secrets_dir(scratch: &Scratch) -> PathBuf {
+    let dir = scratch.0.join("secrets");
+    fs::create_dir_all(&dir).expect("create the secrets directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    dir
+}
+
+/// Writes a secret file with mode 0600, as the provider requires.
+fn write_secret(dir: &Path, name: &str, value: &str) {
+    let path = dir.join(name);
+    fs::write(&path, value).expect("write the secret");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_family_that_names_bench_or_default_is_refused_at_construction() {
+    for reserved in DROIDD_PROJECTS_FIXED {
+        let mut bad = family();
+        bad.projects.push(reserved.to_string());
+        let result = IncusProvider::new(
+            PathBuf::from("/nonexistent/incus.sock"),
+            bad,
+            PathBuf::from("/nonexistent"),
+        );
+        assert!(
+            matches!(result, Err(EffectRefusal::Provider(_))),
+            "{reserved}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn a_family_that_names_a_droidd_project_is_refused_at_construction() {
+    let mut bad = family();
+    bad.projects.push("droid".into());
+    let result = IncusProvider::new(
+        PathBuf::from("/nonexistent/incus.sock"),
+        bad,
+        PathBuf::from("/nonexistent"),
+    );
+    assert!(
+        matches!(result, Err(EffectRefusal::Provider(_))),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_scratch_family_names_only_scratch_projects_and_a_bad_reserved_range_is_refused() {
+    let mut scratch = family();
+    scratch.scratch = true;
+    let result = IncusProvider::new(
+        PathBuf::from("/nonexistent/incus.sock"),
+        scratch.clone(),
+        PathBuf::from("/nonexistent"),
+    );
+    assert!(
+        matches!(result, Err(EffectRefusal::Provider(_))),
+        "a project without the prefix: {result:?}"
+    );
+
+    scratch.projects = vec!["arcak-scratch-1".into()];
+    IncusProvider::new(
+        PathBuf::from("/nonexistent/incus.sock"),
+        scratch.clone(),
+        PathBuf::from("/nonexistent"),
+    )
+    .expect("a scratch family of scratch projects is accepted");
+
+    scratch.reserved_cidrs = vec!["not-a-range".into()];
+    let result = IncusProvider::new(
+        PathBuf::from("/nonexistent/incus.sock"),
+        scratch,
+        PathBuf::from("/nonexistent"),
+    );
+    assert!(
+        matches!(result, Err(EffectRefusal::Provider(_))),
+        "{result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// The family and ownership, checked in plan
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_create_outside_the_family_is_refused_before_any_request() {
+    let (scratch, fake) = start("family");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    for project in ["bench", "default", "droid", "other"] {
+        let op = create(IncusKind::Instance, project, None, "i9", json!({}));
+        assert_eq!(
+            provider.plan(&entry("toy"), &op),
+            Err(EffectRefusal::ProjectNotAllowed),
+            "{project}"
+        );
+    }
+    let op = create(IncusKind::Project, "bench", None, "bench", json!({}));
+    assert_eq!(
+        provider.plan(&entry("toy"), &op),
+        Err(EffectRefusal::ProjectNotAllowed)
+    );
+    assert!(
+        fake.requests().is_empty(),
+        "no request was made: {:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn a_patch_or_delete_of_an_object_not_owned_by_the_entry_is_refused_and_only_read() {
+    let (scratch, fake) = start("not-owned");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    // db1 is droidd's, guest1 is foreign, x1 is contested, and k1 belongs to entry `toy`, not `other`.
+    let cases = [
+        ("db1", OwnerClass::Droidd),
+        ("guest1", OwnerClass::Foreign),
+        ("x1", OwnerClass::Contested),
+        (
+            "k1",
+            OwnerClass::Kernel {
+                entry: entry("toy"),
+            },
+        ),
+    ];
+    for (name, class) in cases {
+        let target = object(IncusKind::Instance, "svc", None, name);
+        let op = patch(target.clone(), &[("user.note", Some("x"))]);
+        assert_eq!(
+            provider.plan(&entry("other"), &op),
+            Err(EffectRefusal::NotOwned(class.clone())),
+            "patch of {name}"
+        );
+        let delete = EffectOp::IncusDelete {
+            object: target,
+            plan: Digest::of(b"plan"),
+        };
+        assert_eq!(
+            provider.plan(&entry("other"), &delete),
+            Err(EffectRefusal::NotOwned(class)),
+            "delete of {name}"
+        );
+    }
+    assert!(
+        writes(&fake).is_empty(),
+        "nothing was written: {:?}",
+        writes(&fake)
+    );
+    assert!(
+        only_gets(&fake),
+        "only GET reached the fake: {:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn a_create_naming_another_entrys_mark_is_refused_before_any_write() {
+    let (scratch, fake) = start("mark-conflict");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "i9",
+        json!({"config": {MARK: "other"}}),
+    );
+    // The plan refuses the body, so no intent is journalled for it. The effect refuses it again if it is reached.
+    assert!(matches!(
+        provider.plan(&entry("toy"), &op),
+        Err(EffectRefusal::Provider(_))
+    ));
+    let planned = forged(&op, EffectClass::B, None);
+    assert!(matches!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Provider(_))
+    ));
+    assert!(writes(&fake).is_empty(), "nothing was written");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Plans and effects through the kernel's Ctx
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_patch_journals_the_pre_image_read_at_plan_and_an_absent_key_restores_as_absent() {
+    // The object holds a=old and no b. The patch sets a=new and b=x, so the inverse restores a to old and removes b.
+    let (scratch, fake) = start("pre-image");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "p1",
+            json!({"config": {MARK: "toy", "a": "old"}}),
+        ))
+        .expect("create");
+    let target = ObjectRef {
+        uuid: made.uuid.clone(),
+        ..made
+    };
+    let op = patch(target.clone(), &[("a", Some("new")), ("b", Some("x"))]);
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(op)
+        .expect("the patch applies");
+    let patched = journal
+        .live(&entry("toy"))
+        .into_iter()
+        .find(|r| matches!(r.inverse, Some(Inverse::IncusRestoreConfig { .. })))
+        .expect("the patch is journalled");
+    assert_eq!(patched.state, EffectState::Applied);
+    assert_eq!(
+        patched.inverse,
+        Some(Inverse::IncusRestoreConfig {
+            object: target,
+            config: changes(&[("a", Some("old")), ("b", None)]),
+        })
+    );
+}
+
+#[test]
+fn an_etag_that_changes_between_plan_and_effect_is_stale_and_writes_nothing() {
+    let (scratch, fake) = start("stale");
+    let secrets = secrets_dir(&scratch);
+    let mut provider = provider(&fake, &secrets);
+    let target = object(IncusKind::Instance, "svc", None, "k1");
+    let op = patch(target.clone(), &[("user.note", Some("planned"))]);
+    let planned = provider
+        .plan(&entry("toy"), &op)
+        .expect("the plan reads the object");
+    // Another write from the entry changes the object, so the ETag the plan read is out of date.
+    let writer = arca_incus::UnixIncusWriter::new(
+        fake.socket().to_path_buf(),
+        entry("toy"),
+        BTreeMap::new(),
+        arca_incus::ProjectFamily::new(["svc"], ["droid"]).expect("family"),
+    );
+    writer
+        .patch(
+            &writer.read_owned(&target).expect("read"),
+            &changes(&[("user.other", Some("1"))]),
+        )
+        .expect("the other write lands");
+    let before = writes(&fake).len();
+    let result = provider.effect(&entry("toy"), &op, &planned);
+    assert_eq!(result, Err(EffectRefusal::Stale));
+    assert_eq!(writes(&fake).len(), before, "the stale patch sent no write");
+}
+
+#[test]
+fn every_create_carries_the_entry_mark_in_its_post_body() {
+    let (scratch, fake) = start("mark-in-body");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "m5",
+            json!({"config": {"user.note": "n"}}),
+        ))
+        .expect("create");
+    let post = fake
+        .writes()
+        .into_iter()
+        .find(|w| w.method == "POST")
+        .expect("one POST");
+    assert!(
+        post.config_keys.contains(&MARK.to_string()),
+        "{:?}",
+        post.config_keys
+    );
+    assert!(post.config_keys.contains(&"user.note".to_string()));
+}
+
+#[test]
+fn a_project_create_carries_the_mark_the_features_restricted_and_the_op_config() {
+    let (scratch, fake) = start("project-create");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Project,
+            "kfam",
+            None,
+            "kfam",
+            json!({"config": {"limits.virtual-machines": "4"}}),
+        ))
+        .expect("the project is created");
+    assert_eq!(made.uuid, None, "a project has no uuid");
+    let config = read(&fake, "/1.0/projects/kfam")["config"].clone();
+    assert_eq!(config[MARK], json!("toy"));
+    assert_eq!(config["features.networks"], json!("true"));
+    assert_eq!(config["features.profiles"], json!("true"));
+    assert_eq!(config["features.storage.volumes"], json!("true"));
+    assert_eq!(config["features.storage.buckets"], json!("true"));
+    assert_eq!(config["restricted"], json!("true"));
+    assert_eq!(config["limits.virtual-machines"], json!("4"));
+}
+
+#[test]
+fn a_project_create_that_sets_a_kernel_key_another_way_is_refused() {
+    let (scratch, fake) = start("project-conflict");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(
+        IncusKind::Project,
+        "kfam",
+        None,
+        "kfam",
+        json!({"config": {"features.networks": "false"}}),
+    );
+    let planned = forged(&op, EffectClass::B, None);
+    let mut provider = provider;
+    assert!(matches!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Provider(_))
+    ));
+    assert!(writes(&fake).is_empty());
+}
+
+#[test]
+fn a_project_create_gets_a_delete_by_name_inverse_through_the_kernel() {
+    let (scratch, fake) = start("project-inverse");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(IncusKind::Project, "kfam", None, "kfam", json!({})))
+        .expect("the project is created");
+    let live = journal.live(&entry("toy"));
+    assert_eq!(live[0].state, EffectState::Applied);
+    assert_eq!(
+        live[0].inverse,
+        Some(Inverse::IncusDelete {
+            object: object(IncusKind::Project, "kfam", None, "kfam"),
+        })
+    );
+}
+
+#[test]
+fn a_volume_create_names_its_pool_and_its_inverse_names_the_same_pool() {
+    let (scratch, fake) = start("volume");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Volume,
+            "svc",
+            Some("fast"),
+            "vol1",
+            json!({"config": {}}),
+        ))
+        .expect("the volume is created");
+    let live = journal.live(&entry("toy"));
+    let Some(Inverse::IncusDelete { object: named }) = live[0].inverse.clone() else {
+        panic!("a delete inverse: {:?}", live[0].inverse);
+    };
+    assert_eq!(named.parent.as_deref(), Some("fast"));
+    assert!(named.uuid.is_some(), "a volume's inverse carries its uuid");
+}
+
+#[test]
+fn a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserved_range() {
+    let (scratch, fake) = start("bridge");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let bridge = |config: Value| json!({"type": "bridge", "config": config});
+    let bad = [
+        (
+            "no ipv6 setting",
+            bridge(json!({"ipv4.address": "10.20.30.1/24"})),
+        ),
+        (
+            "ipv6 not none",
+            bridge(json!({"ipv4.address": "10.20.30.1/24", "ipv6.address": "auto"})),
+        ),
+        (
+            "inside the reserved range",
+            bridge(json!({"ipv4.address": "198.51.100.1/24", "ipv6.address": "none"})),
+        ),
+        (
+            "overlapping the reserved range",
+            bridge(json!({"ipv4.address": "198.51.0.0/16", "ipv6.address": "none"})),
+        ),
+        ("no ipv4", bridge(json!({"ipv6.address": "none"}))),
+        (
+            "not a bridge",
+            json!({"type": "macvlan", "config": {"ipv6.address": "none"}}),
+        ),
+    ];
+    for (why, body) in bad {
+        let op = create(IncusKind::Network, "svc", None, "br1", body);
+        let result = provider.plan(&entry("toy"), &op);
+        assert!(
+            matches!(result, Err(EffectRefusal::Provider(_))),
+            "{why}: {result:?}"
+        );
+    }
+    assert!(
+        writes(&fake).is_empty(),
+        "no bridge was created: {:?}",
+        writes(&fake)
+    );
+
+    let good = create(
+        IncusKind::Network,
+        "svc",
+        None,
+        "br2",
+        bridge(json!({"ipv4.address": "10.20.30.1/24", "ipv6.address": "none"})),
+    );
+    let planned = provider
+        .plan(&entry("toy"), &good)
+        .expect("a bridge outside the reserved range plans");
+    let mut provider = provider;
+    provider
+        .effect(&entry("toy"), &good, &planned)
+        .expect("the bridge is created");
+    assert_eq!(
+        writes(&fake),
+        vec![("POST".to_string(), "/1.0/networks?project=svc".to_string())]
+    );
+}
+
+#[test]
+fn a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature() {
+    // `kbare` has networks but its storage volumes feature is off, so a volume there would route to the default project.
+    let (scratch, fake) = start("features");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let volume = create(IncusKind::Volume, "kbare", Some("default"), "v9", json!({}));
+    assert!(matches!(
+        provider.plan(&entry("toy"), &volume),
+        Err(EffectRefusal::Provider(_))
+    ));
+    let network = create(
+        IncusKind::Network,
+        "kbare",
+        None,
+        "br9",
+        json!({"type": "bridge", "config": {"ipv6.address": "none", "ipv4.address": "10.9.9.1/24"}}),
+    );
+    provider
+        .plan(&entry("toy"), &network)
+        .expect("networks are enabled there");
+    assert!(writes(&fake).is_empty());
+    assert!(only_gets(&fake));
+}
+
+#[test]
+fn an_effect_rechecks_the_family_for_a_plan_the_caller_made_by_hand() {
+    // `Planned` has public fields, so a caller can hand the provider an effect for a project outside the family. The effect
+    // checks the family again and sends nothing.
+    let (scratch, fake) = start("forged");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    for project in ["bench", "default", "droid"] {
+        let op = create(IncusKind::Instance, project, None, "i9", json!({}));
+        let planned = forged(&op, EffectClass::B, None);
+        assert_eq!(
+            provider.effect(&entry("toy"), &op, &planned),
+            Err(EffectRefusal::ProjectNotAllowed),
+            "{project}"
+        );
+    }
+    assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+}
+
+#[test]
+fn an_effect_whose_plan_names_another_op_is_refused_before_any_write() {
+    let (scratch, fake) = start("other-op");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(IncusKind::Instance, "svc", None, "i8", json!({}));
+    let other = create(IncusKind::Instance, "svc", None, "i7", json!({}));
+    let planned = forged(&other, EffectClass::B, None);
+    assert!(matches!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Provider(_))
+    ));
+    assert!(writes(&fake).is_empty());
+}
+
+#[test]
+fn an_incus_get_observation_is_refused_and_host_addresses_is_answered_only_by_listings() {
+    let (scratch, fake) = start("observe");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let refused = provider.observe(
+        &entry("toy"),
+        &["svc".into()],
+        &Observe::IncusGet {
+            path: "/1.0/instances".into(),
+        },
+    );
+    assert_eq!(refused, Err(EffectRefusal::NotDeclared));
+    assert!(
+        fake.requests().is_empty(),
+        "the refused read reached nothing"
+    );
+}
+
+#[test]
+fn host_addresses_collects_inet_and_inet6_and_reads_only_the_listing_and_each_state() {
+    let (_scratch, fake) = start("host-addresses");
+    fake.set_host_interfaces(vec![
+        (
+            "eth0".to_string(),
+            vec![
+                "10.0.0.5".parse::<IpAddr>().unwrap(),
+                "fd00::5".parse().unwrap(),
+            ],
+        ),
+        ("br0".to_string(), vec!["192.0.2.1".parse().unwrap()]),
+    ]);
+    let read = UnixIncus::new(fake.socket().to_path_buf());
+    let mut found = host_addresses(&read).expect("the host's addresses");
+    found.sort();
+    let mut expected: Vec<IpAddr> = vec![
+        "10.0.0.5".parse().unwrap(),
+        "fd00::5".parse().unwrap(),
+        "192.0.2.1".parse().unwrap(),
+    ];
+    expected.sort();
+    assert_eq!(found, expected);
+    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(
+        paths,
+        vec![
+            "/1.0/networks?recursion=1".to_string(),
+            "/1.0/networks/eth0/state".to_string(),
+            "/1.0/networks/br0/state".to_string(),
+        ]
+    );
+    assert!(only_gets(&fake));
+}
+
+#[test]
+fn host_addresses_through_the_kernel_needs_the_plugin_to_declare_observes() {
+    let (scratch, fake) = start("observes");
+    fake.set_host_interfaces(vec![(
+        "eth0".to_string(),
+        vec!["10.0.0.5".parse().unwrap()],
+    )]);
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let mut declared = manifest();
+    declared.observes = true;
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let answer = Ctx::new(entry("toy"), &declared, &mut provider, &mut journal, 1)
+        .observe(Observe::HostAddresses);
+    let answer = answer.expect("an observing plugin reads the host");
+    assert_eq!(answer, json!(["10.0.0.5"]));
+
+    let undeclared = manifest();
+    let refused = Ctx::new(entry("toy"), &undeclared, &mut provider, &mut journal, 1)
+        .observe(Observe::HostAddresses);
+    assert_eq!(refused, Err(EffectRefusal::NotDeclared));
+}
+
+#[test]
+fn kind_path_names_each_kind_and_has_no_path_for_a_kind_that_needs_its_parent() {
+    assert_eq!(
+        kind_path(IncusKind::Project, "kfam", Some("kfam")).as_deref(),
+        Some("/1.0/projects/kfam")
+    );
+    assert_eq!(
+        kind_path(IncusKind::Project, "kfam", None).as_deref(),
+        Some("/1.0/projects")
+    );
+    assert_eq!(
+        kind_path(IncusKind::Instance, "svc", Some("db1")).as_deref(),
+        Some("/1.0/instances/db1?project=svc")
+    );
+    assert_eq!(
+        kind_path(IncusKind::Network, "svc", Some("br0")).as_deref(),
+        Some("/1.0/networks/br0?project=svc")
+    );
+    assert_eq!(
+        kind_path(IncusKind::Acl, "svc", None).as_deref(),
+        Some("/1.0/network-acls?project=svc")
+    );
+    assert_eq!(
+        kind_path(IncusKind::Profile, "svc", Some("p")).as_deref(),
+        Some("/1.0/profiles/p?project=svc")
+    );
+    assert_eq!(
+        kind_path(IncusKind::Zone, "svc", None).as_deref(),
+        Some("/1.0/network-zones?project=svc")
+    );
+    for kind in [IncusKind::Volume, IncusKind::Bucket, IncusKind::Forward] {
+        assert_eq!(
+            kind_path(kind, "svc", Some("x")),
+            None,
+            "{kind:?} is addressed with its parent"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Secrets
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journalled() {
+    let (scratch, fake) = start("secret-create");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "t1", SECRET_VALUE);
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let journal_path = scratch.0.join("journal.jsonl");
+    let mut journal =
+        Journal::open(FileJournal::open(&journal_path).expect("open the journal")).expect("folds");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "s1",
+            json!({"config": {"user.key": format!("{SECRET_PREFIX}t1")}}),
+        ))
+        .expect("the create applies");
+    let sent = read(&fake, &format!("/1.0/instances/{}?project=svc", made.name));
+    assert_eq!(
+        sent["config"]["user.key"],
+        json!(SECRET_VALUE),
+        "the request carried the file's content"
+    );
+    let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
+    assert!(
+        !on_disk.contains(SECRET_VALUE),
+        "the journal holds no secret value"
+    );
+    assert!(
+        !format!("{:?}", fake.writes()).contains(SECRET_VALUE),
+        "the fake records no value"
+    );
+}
+
+#[test]
+fn a_patch_that_clears_a_key_holding_a_secret_journals_the_reference_as_its_pre_image() {
+    let (scratch, fake) = start("secret-clear");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "t1", SECRET_VALUE);
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let journal_path = scratch.0.join("journal.jsonl");
+    let mut journal =
+        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "s2",
+            json!({"config": {"user.key": format!("{SECRET_PREFIX}t1")}}),
+        ))
+        .expect("create");
+    let target = ObjectRef {
+        uuid: made.uuid.clone(),
+        ..made
+    };
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(target.clone(), &[("user.key", None)]))
+        .expect("the clear applies");
+    let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
+    assert!(
+        !on_disk.contains(SECRET_VALUE),
+        "the journal holds no secret value"
+    );
+    let restore = journal
+        .live(&entry("toy"))
+        .into_iter()
+        .find_map(|r| match r.inverse {
+            Some(Inverse::IncusRestoreConfig { config, .. }) => Some(config),
+            _ => None,
+        })
+        .expect("the clear is journalled with its restore");
+    assert_eq!(
+        restore,
+        changes(&[("user.key", Some(&format!("{SECRET_PREFIX}t1")))])
+    );
+}
+
+#[test]
+fn a_secret_reference_that_is_not_a_valid_name_or_has_no_file_is_refused_at_plan() {
+    let (scratch, fake) = start("secret-bad");
+    let secrets = secrets_dir(&scratch);
+    // Decoys: a usable 0600 file the traversal reference reaches, and one under a name that is not a valid secret name. Only
+    // the name check refuses them, so a name check that is missing lets them through and the test fails.
+    write_secret(&scratch.0, "escape", SECRET_VALUE);
+    write_secret(&secrets, "Bad_Name", SECRET_VALUE);
+    let provider = provider(&fake, &secrets);
+    for reference in [
+        format!("{SECRET_PREFIX}../escape"),
+        format!("{SECRET_PREFIX}Bad_Name"),
+        format!("{SECRET_PREFIX}missing"),
+    ] {
+        let op = create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "s3",
+            json!({"config": {"user.key": reference}}),
+        );
+        assert!(matches!(
+            provider.plan(&entry("toy"), &op),
+            Err(EffectRefusal::Provider(_))
+        ));
+    }
+    assert!(writes(&fake).is_empty());
+}
+
+#[test]
+fn a_secret_file_that_is_a_symlink_or_is_not_mode_0600_is_refused_at_plan() {
+    let (scratch, fake) = start("secret-mode");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "loose", SECRET_VALUE);
+    fs::set_permissions(secrets.join("loose"), fs::Permissions::from_mode(0o644))
+        .expect("mode 0644");
+    symlink(secrets.join("loose"), secrets.join("linked")).expect("make the symlink");
+    let provider = provider(&fake, &secrets);
+    for name in ["loose", "linked"] {
+        let op = create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "s4",
+            json!({"config": {"user.key": format!("{SECRET_PREFIX}{name}")}}),
+        );
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{name}"
+        );
+    }
+    assert!(writes(&fake).is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Outcomes that are not known: a write that answered with an error, or timed out, may have landed
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// Answers scripted replies in order, records each request's method and target, and stops when dropped.
+struct Script {
+    _dir: Scratch,
+    socket: PathBuf,
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Script {
+    fn start(tag: &str, mut answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static) -> Script {
+        let dir = Scratch::new(tag);
+        let socket = dir.0.join("script.sock");
+        let listener = UnixListener::bind(&socket).expect("bind");
+        listener.set_nonblocking(true).expect("non-blocking");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let seen = Arc::clone(&seen);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve_one(stream, &mut answer, &seen),
+                        Err(_) => thread::sleep(Duration::from_millis(2)),
+                    }
+                }
+            })
+        };
+        Script {
+            _dir: dir,
+            socket,
+            seen,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn provider(&self, secrets: &Path) -> IncusProvider {
+        IncusProvider::new(self.socket.clone(), family(), secrets.to_path_buf())
+            .expect("a valid family")
+    }
+
+    fn seen(&self) -> Vec<(String, String)> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn count(&self, method: &str) -> usize {
+        self.seen().iter().filter(|(m, _)| m == method).count()
+    }
+}
+
+impl Drop for Script {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn serve_one(
+    mut stream: UnixStream,
+    answer: &mut impl FnMut(&str, &str) -> Vec<u8>,
+    seen: &Mutex<Vec<(String, String)>>,
+) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return,
+        }
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut parts = text.lines().next().unwrap_or("").split(' ');
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+    let length = text
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    if stream.read_exact(&mut body).is_err() {
+        return;
+    }
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((method.clone(), target.clone()));
+    let reply = answer(&method, &target);
+    let _ = stream.write_all(&reply);
+}
+
+fn http(status: u16, etag: Option<&str>, envelope: &Value) -> Vec<u8> {
+    let text = envelope.to_string();
+    let tag = etag.map(|t| format!("ETag: {t}\r\n")).unwrap_or_default();
+    format!(
+        "HTTP/1.1 {status} Reply\r\n{tag}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    )
+    .into_bytes()
+}
+
+fn sync_env(metadata: Value) -> Value {
+    json!({"type": "sync", "status": "Success", "status_code": 200, "operation": "", "error_code": 0, "error": "", "metadata": metadata})
+}
+
+fn error_env(status: u16) -> Value {
+    json!({"type": "error", "status": "Failure", "status_code": status, "operation": "", "error_code": status, "error": "refused", "metadata": null})
+}
+
+/// An object's answer to a GET: its metadata with the ETag the object carries.
+fn object_reply(metadata: &Value, etag: &str) -> Vec<u8> {
+    http(200, Some(etag), &sync_env(metadata.clone()))
+}
+
+fn ok_reply() -> Vec<u8> {
+    http(200, None, &sync_env(Value::Null))
+}
+
+fn not_found() -> Vec<u8> {
+    http(404, None, &error_env(404))
+}
+
+fn instance_meta(config: Value) -> Value {
+    json!({"name": "c1", "project": "svc", "config": config})
+}
+
+#[test]
+fn a_create_whose_answer_is_an_error_and_whose_read_back_finds_nothing_is_a_failed_effect() {
+    let script = Script::start("create-failed", move |method, _| {
+        if method == "POST" {
+            return http(500, None, &error_env(500));
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("secrets-failed");
+    let mut provider = script.provider(&secrets.0);
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "c1",
+        json!({"config": {MARK: "toy"}}),
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    let result = provider.effect(&entry("toy"), &op, &planned);
+    assert!(
+        matches!(result, Err(EffectRefusal::Provider(_))),
+        "the create did not land: {result:?}"
+    );
+    assert_eq!(script.count("POST"), 1);
+}
+
+#[test]
+fn a_create_that_timed_out_stays_open_even_when_the_read_back_finds_nothing() {
+    // A timed-out wait says nothing about the object: a create still in progress can land after the read.
+    let script = Script::start("create-timeout", move |method, target| {
+        if method == "POST" {
+            return http(
+                202,
+                None,
+                &json!({"type": "async", "status": "Operation created", "status_code": 100, "operation": "/1.0/operations/00000000-0000-4000-8000-0000000000ab", "error_code": 0, "error": "", "metadata": null}),
+            );
+        }
+        if target.contains("/wait") {
+            return http(
+                200,
+                None,
+                &json!({"type": "sync", "status": "Success", "status_code": 200, "operation": "", "error_code": 0, "error": "", "metadata": {"id": "00000000-0000-4000-8000-0000000000ab", "status_code": 103, "status": "Running", "err": ""}}),
+            );
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("secrets-timeout");
+    let mut provider = script
+        .provider(&secrets.0)
+        .with_operation_deadline(Duration::from_millis(300));
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "c2",
+        json!({"config": {MARK: "toy"}}),
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    let result = provider.effect(&entry("toy"), &op, &planned);
+    assert_eq!(
+        result,
+        Err(EffectRefusal::Unresolved),
+        "a timed-out create is not known"
+    );
+}
+
+#[test]
+fn a_create_whose_read_back_finds_an_object_is_unresolved_not_failed() {
+    let mut posted = false;
+    let script = Script::start("create-landed", move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return http(500, None, &error_env(500));
+        }
+        if method == "GET" && target.starts_with("/1.0/instances/c3") {
+            return if posted {
+                object_reply(
+                    &instance_meta(json!({MARK: "toy", "volatile.uuid": READ_UUID})),
+                    "\"e9\"",
+                )
+            } else {
+                not_found()
+            };
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("secrets-landed");
+    let mut provider = script.provider(&secrets.0);
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "c3",
+        json!({"config": {MARK: "toy"}}),
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    assert_eq!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Unresolved)
+    );
+}
+
+#[test]
+fn a_patch_answered_412_is_stale_and_not_unresolved() {
+    let script = Script::start("patch-412", move |method, target| {
+        if method == "GET" && target.starts_with("/1.0/instances/p9") {
+            return object_reply(&instance_meta(json!({MARK: "toy"})), "\"e1\"");
+        }
+        if method == "PATCH" {
+            return http(412, None, &error_env(412));
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("secrets-412");
+    let mut provider = script.provider(&secrets.0);
+    let op = patch(
+        object(IncusKind::Instance, "svc", None, "p9"),
+        &[("user.note", Some("x"))],
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    assert_eq!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Stale)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Retirement: the tombstone and the delete, in order, with drift and staleness stopping the delete
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn retire_tombstones_then_deletes_an_owned_instance_in_order() {
+    let (scratch, fake) = start("retire");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let writer = arca_incus::UnixIncusWriter::new(
+        fake.socket().to_path_buf(),
+        entry("toy"),
+        BTreeMap::new(),
+        arca_incus::ProjectFamily::new(["svc"], ["droid"]).expect("family"),
+    );
+    let made = writer
+        .create(
+            &object(IncusKind::Instance, "svc", None, "r1"),
+            &json!({"config": {MARK: "toy"}}),
+        )
+        .expect("create");
+    let uuid = made.uuid().map(str::to_string);
+    assert!(uuid.is_some(), "an instance has a uuid");
+    let plan = Digest::of(b"the approved plan");
+    let outcome = provider.retire(&entry("toy"), made.target(), &plan);
+    assert_eq!(
+        outcome,
+        Ok(Retirement::Deleted(ObjectRef {
+            uuid,
+            ..object(IncusKind::Instance, "svc", None, "r1")
+        }))
+    );
+    let methods: Vec<String> = writes(&fake).into_iter().map(|(m, _)| m).collect();
+    assert_eq!(
+        methods,
+        vec![
+            "POST".to_string(),
+            "PATCH".to_string(),
+            "DELETE".to_string()
+        ]
+    );
+    let gone = UnixIncus::new(fake.socket().to_path_buf()).get("/1.0/instances/r1?project=svc");
+    assert!(
+        matches!(gone, Err(arca_incus::IncusError::Status { code: 404, .. })),
+        "{gone:?}"
+    );
+}
+
+/// The instance `r2` as a read sees it, owned by `toy` with the given uuid and tombstone.
+fn r2(uuid: &str, tombstone: Option<&str>) -> Value {
+    let mut config = json!({MARK: "toy", "volatile.uuid": uuid});
+    if let Some(plan) = tombstone {
+        config[RETIRING] = json!(plan);
+    }
+    instance_meta(config)
+}
+
+#[test]
+fn retire_skips_the_delete_as_drift_when_the_delete_read_back_shows_another_uuid() {
+    let plan = Digest::of(b"the approved plan");
+    let plan_hex = plan.to_hex();
+    let mut step = 0;
+    let script = Script::start("drift-uuid", move |method, _| {
+        step += 1;
+        match (method, step) {
+            ("GET", 1) => object_reply(&r2(READ_UUID, None), "\"e1\""),
+            ("PATCH", 2) => ok_reply(),
+            ("GET", 3) => object_reply(&r2(READ_UUID, Some(&plan_hex)), "\"e2\""),
+            ("GET", 4) => object_reply(&r2(OTHER_UUID, Some(&plan_hex)), "\"e3\""),
+            _ => not_found(),
+        }
+    });
+    let secrets = Scratch::new("secrets-drift");
+    let provider = script.provider(&secrets.0);
+    let target = ObjectRef {
+        uuid: Some(READ_UUID.to_string()),
+        ..object(IncusKind::Instance, "svc", None, "r2")
+    };
+    let outcome = provider
+        .retire(&entry("toy"), &target, &plan)
+        .expect("the retirement reports drift");
+    assert!(matches!(outcome, Retirement::Drift(_)), "{outcome:?}");
+    assert_eq!(script.count("DELETE"), 0, "no DELETE was sent");
+}
+
+#[test]
+fn retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete() {
+    let plan = Digest::of(b"the approved plan");
+    let plan_hex = plan.to_hex();
+    let mut step = 0;
+    let script = Script::start("drift-tombstone", move |method, _| {
+        step += 1;
+        match (method, step) {
+            ("GET", 1) => object_reply(&r2(READ_UUID, None), "\"e1\""),
+            ("PATCH", 2) => ok_reply(),
+            ("GET", 3) => object_reply(&r2(READ_UUID, Some(&plan_hex)), "\"e2\""),
+            ("GET", 4) => object_reply(&r2(READ_UUID, None), "\"e4\""),
+            _ => not_found(),
+        }
+    });
+    let secrets = Scratch::new("secrets-drift2");
+    let provider = script.provider(&secrets.0);
+    let target = object(IncusKind::Instance, "svc", None, "r2");
+    let outcome = provider
+        .retire(&entry("toy"), &target, &plan)
+        .expect("the retirement reports drift");
+    assert!(matches!(outcome, Retirement::Drift(_)), "{outcome:?}");
+    assert_eq!(script.count("DELETE"), 0);
+}
+
+#[test]
+fn retire_stops_on_a_stale_etag_and_sends_no_delete() {
+    let plan = Digest::of(b"the approved plan");
+    let script = Script::start("retire-412", move |method, _| match method {
+        "GET" => object_reply(&r2(READ_UUID, None), "\"e1\""),
+        "PATCH" => http(412, None, &error_env(412)),
+        _ => not_found(),
+    });
+    let secrets = Scratch::new("secrets-412b");
+    let provider = script.provider(&secrets.0);
+    let target = object(IncusKind::Instance, "svc", None, "r2");
+    assert_eq!(
+        provider.retire(&entry("toy"), &target, &plan),
+        Err(EffectRefusal::Stale)
+    );
+    assert_eq!(script.count("DELETE"), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// The fixtures a test relies on must hold: the object families, and the fixture the provider tests build on
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_retained_entrys_object_is_refused_for_a_patch_and_a_retirement_and_nothing_is_written() {
+    let (scratch, fake) = start("retained");
+    let retained = BTreeMap::from([(
+        entry("toy"),
+        (PluginId("toy-plugin".to_string()), Digest::of(b"declined")),
+    )]);
+    let provider = provider(&fake, &secrets_dir(&scratch)).with_retained(retained);
+    let k1 = object(IncusKind::Instance, "svc", None, "k1");
+    let op = patch(k1.clone(), &[("user.note", Some("x"))]);
+    let planned = provider.plan(&entry("toy"), &op);
+    assert!(
+        matches!(
+            planned,
+            Err(EffectRefusal::NotOwned(OwnerClass::Retained { .. }))
+        ),
+        "{planned:?}"
+    );
+    let retired = provider.retire(&entry("toy"), &k1, &Digest::of(b"approved"));
+    assert!(
+        matches!(
+            retired,
+            Err(EffectRefusal::NotOwned(OwnerClass::Retained { .. }))
+        ),
+        "{retired:?}"
+    );
+    assert!(writes(&fake).is_empty(), "nothing was written");
+}
+
+#[test]
+fn a_patch_that_sets_the_tombstone_a_volatile_key_or_another_owners_mark_is_refused_at_plan() {
+    let (scratch, fake) = start("patch-keys");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let k1 = object(IncusKind::Instance, "svc", None, "k1");
+    for key in [RETIRING, "volatile.uuid", "user.droid.x"] {
+        let op = patch(k1.clone(), &[(key, Some("1"))]);
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{key}"
+        );
+    }
+    assert!(writes(&fake).is_empty(), "nothing was written");
+}
+
+#[test]
+fn a_create_whose_body_carries_a_retiring_tombstone_is_refused_at_plan_and_sends_nothing() {
+    let (scratch, fake) = start("create-tombstone");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "i10",
+        json!({"config": {MARK: "toy", RETIRING: "abc"}}),
+    );
+    assert!(matches!(
+        provider.plan(&entry("toy"), &op),
+        Err(EffectRefusal::Provider(_))
+    ));
+    assert!(writes(&fake).is_empty(), "nothing was written");
+}
+
+#[test]
+fn a_create_whose_body_is_not_an_object_or_holds_a_config_value_that_is_not_text_is_refused_at_plan()
+ {
+    let (scratch, fake) = start("create-shape");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    for body in [
+        json!("not an object"),
+        json!({"config": "text"}),
+        json!({"config": {"user.n": 3}}),
+    ] {
+        let op = create(IncusKind::Instance, "svc", None, "i11", body.clone());
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{body}"
+        );
+    }
+    assert!(writes(&fake).is_empty(), "nothing was written");
+}
+
+#[test]
+fn the_fixture_gives_the_objects_the_tests_name_their_owners() {
+    let (scratch, fake) = start("fixture-owners");
+    let writer = arca_incus::UnixIncusWriter::new(
+        fake.socket().to_path_buf(),
+        entry("toy"),
+        BTreeMap::new(),
+        arca_incus::ProjectFamily::new(["svc"], ["droid"]).expect("family"),
+    );
+    let read_class = |name: &str| {
+        writer
+            .read_class(&object(IncusKind::Instance, "svc", None, name))
+            .expect("a read")
+            .class
+    };
+    assert_eq!(read_class("db1"), OwnerClass::Droidd);
+    assert_eq!(read_class("guest1"), OwnerClass::Foreign);
+    assert_eq!(read_class("x1"), OwnerClass::Contested);
+    assert_eq!(
+        read_class("k1"),
+        OwnerClass::Kernel {
+            entry: entry("toy")
+        }
+    );
+    let _ = scratch;
+}
