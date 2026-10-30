@@ -2,7 +2,8 @@
 //! sends a PUT only for a project's config. It is compiled only with the `write` feature, and every write it sends is gated by the
 //! project family and the ownership classifier.
 //! The adoption writer (`adopt`, also behind `write`) is the one path that writes outside that family: it moves one allowlisted
-//! container from the default project into its own adoption project and back, through a closed step table.
+//! container from the default project into its own adoption project and back, through a closed step table. Its one PUT of an
+//! instance gives back a root disk it localized, and its one DELETE removes the adoption project it emptied.
 //! The recording shim answers any method other than GET with 405 without forwarding it. The fake Incus serves a fixture and
 //! accepts the writer's requests in memory.
 
@@ -16,8 +17,9 @@ pub mod write;
 
 #[cfg(feature = "write")]
 pub use adopt::{
-    ADOPT_ENTRY_PREFIX, AdoptRequest, AdoptStep, AdoptTarget, AdoptWriter, Expect, ExpectClass,
-    Pin, PreImage, Side, StepOutcome, adoption_project_body, pin_patch,
+    ADOPT_ENTRY_PREFIX, AdoptRequest, AdoptStep, AdoptTarget, AdoptWriter, Allowances, Device,
+    Devices, Expect, ExpectClass, NETWORKS_ACCESS, NIC_KEPT_KEYS, Needed, PIN_KEYS, Pin, PreImage,
+    Side, StepOutcome, adoption_project_body, needed_allowances, pin_patch,
 };
 pub use fake::{Appears, OpId};
 pub use fake::{FakeIncus, FakeState, RecordedRequest, WriteRecord};

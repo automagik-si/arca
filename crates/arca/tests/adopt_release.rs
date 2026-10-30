@@ -21,7 +21,7 @@ use arca::cmd_serve::watch_handler;
 use arca::config;
 use arca::desired_store::lock_state_dir;
 use arca_api::Scope;
-use arca_incus::adopt::{AdoptStep, AdoptTarget};
+use arca_incus::adopt::{AdoptStep, AdoptTarget, Allowances};
 use arca_incus::{FakeIncus, UnixIncus};
 use arca_kernel::ownership::{IncusKind, ObjectRef};
 use arca_mcp::{Caller, ToolHandler};
@@ -34,31 +34,64 @@ use serde_json::{Value, json};
 const KILLS: [Kill; 3] = [Kill::AfterIntent, Kill::BeforeOutcome, Kill::AfterOutcome];
 const MARK: &str = "user.arcakernel.entry";
 
-/// One adoption's fake, config and plan digest. The fake is dropped before its scratch directory.
+/// One adoption's fake, config and plan digest. The fake is dropped before its scratch directory. A rooted run's instance has
+/// no root of its own: the default profile gives it, so the plan localizes it.
 struct Run {
     fake: FakeIncus,
     config: PathBuf,
     digest: String,
+    rooted: bool,
     scratch: Scratch,
+}
+
+/// The root disk the instance has, of its own or from the default profile.
+fn root() -> Value {
+    json!({ "type": "disk", "path": "/", "pool": "pool1", "size": "60GiB" })
 }
 
 impl Run {
     fn new(tag: &str) -> Run {
+        Run::of(tag, false)
+    }
+
+    /// A run whose root the default profile gives.
+    fn rooted(tag: &str) -> Run {
+        Run::of(tag, true)
+    }
+
+    fn of(tag: &str, rooted: bool) -> Run {
         let scratch = Scratch::new(tag);
-        let fake = adopt_fake(&scratch, vec![adopt_instance("default", json!({}))]);
+        let mut instance = adopt_instance("default", json!({}));
+        if rooted {
+            instance["devices"] = json!({});
+        }
+        let fake = adopt_fake(&scratch, vec![instance]);
+        if rooted {
+            fake.add_profile(
+                "default",
+                json!({ "name": "default", "config": {}, "devices": {
+                    "eth0": { "type": "nic", "name": "eth0", "network": "br1" }, "root": root() } }),
+            );
+        }
         let config = adopt_config(&scratch, &fake);
         let digest = adopt_digest(&config);
         Run {
             fake,
             config,
             digest,
+            rooted,
             scratch,
         }
     }
 
     /// A run whose apply was killed at `kill` of `step`.
     fn killed(tag: &str, step: AdoptStep, kill: Kill) -> Run {
-        let run = Run::new(tag);
+        Run::new(tag).halted(tag, step, kill)
+    }
+
+    /// This run with its apply killed at `kill` of `step`.
+    fn halted(self, tag: &str, step: AdoptStep, kill: Kill) -> Run {
+        let run = self;
         let halted = run.apply_halting(&mut |at, point| at == step && point == kill);
         assert!(
             matches!(&halted, Err(Failure::Runtime(why)) if why.contains("halted")),
@@ -195,8 +228,13 @@ fn pin() -> Value {
 
 /// The seven writes of a whole adoption, each once, in order.
 fn adoption_writes() -> Vec<(String, String)> {
+    adoption_writes_of(false)
+}
+
+/// The writes of a whole adoption, each once, in order: seven, and LocalizeRoot's PATCH after the pin's when `rooted`.
+fn adoption_writes_of(rooted: bool) -> Vec<(String, String)> {
     let at = |path: &str, project: &str| format!("{path}?project={project}");
-    [
+    let mut writes = vec![
         ("POST", "/1.0/projects".to_string()),
         ("PUT", at("/1.0/instances/svc1/state", "default")),
         ("POST", at("/1.0/instances/svc1/snapshots", "default")),
@@ -204,10 +242,14 @@ fn adoption_writes() -> Vec<(String, String)> {
         ("POST", at("/1.0/instances/svc1", "default")),
         ("PATCH", at("/1.0/instances/svc1", ADOPT_TO)),
         ("PUT", at("/1.0/instances/svc1/state", ADOPT_TO)),
-    ]
-    .into_iter()
-    .map(|(method, path)| (method.to_string(), path))
-    .collect()
+    ];
+    if rooted {
+        writes.insert(4, ("PATCH", at("/1.0/instances/svc1", "default")));
+    }
+    writes
+        .into_iter()
+        .map(|(method, path)| (method.to_string(), path))
+        .collect()
 }
 
 /// Whether the request `step` sends was sent before the kill.
@@ -243,6 +285,11 @@ fn assert_adopted(run: &Run, tag: &str) {
         "{tag}: the local eth0 is the pin"
     );
     assert_eq!(
+        body["devices"]["root"],
+        root(),
+        "{tag}: the root is the instance's own"
+    );
+    assert_eq!(
         run.nic(ADOPT_TO),
         (ADOPT_MAC.to_string(), ADOPT_IP.to_string()),
         "{tag}"
@@ -255,8 +302,8 @@ fn assert_adopted(run: &Run, tag: &str) {
     );
 }
 
-/// The instance is back in `default`, running and unmarked, with the pre-image MAC and IPv4. The pin and the snapshot are
-/// there when their steps ran before the kill.
+/// The instance is back in `default`, running and unmarked, with the pre-image MAC and IPv4, and its adoption project is gone.
+/// The pin and the snapshot are there when their steps ran before the kill. A rooted run's root is the profile's again.
 fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
     assert!(
         run.instance(ADOPT_TO).is_none(),
@@ -292,6 +339,19 @@ fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
         snapshotted,
         "{tag}: the snapshot"
     );
+    assert_eq!(body["expanded_devices"]["root"], root(), "{tag}: the root");
+    if run.rooted {
+        assert!(
+            body["devices"].get("root").is_none(),
+            "{tag}: the localized root is taken back off"
+        );
+    } else {
+        assert_eq!(body["devices"]["root"], root(), "{tag}: the own root stays");
+    }
+    assert!(
+        get(&run.fake, &format!("/1.0/projects/{ADOPT_TO}")).is_none(),
+        "{tag}: the adoption project is deleted"
+    );
     assert_eq!(
         run.fake.leases(),
         vec![(
@@ -304,9 +364,10 @@ fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
     let record = run.record();
     assert_eq!(
         record.last("svc1"),
-        Some((AdoptStep::ReleaseStart, Phase::Done)),
+        Some((AdoptStep::DeleteProject, Phase::Done)),
         "{tag}"
     );
+    assert!(record.released("svc1"), "{tag}");
     assert!(record.incomplete().is_empty(), "{tag}");
     assert!(
         record.adopted().is_empty(),
@@ -314,10 +375,19 @@ fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
     );
 }
 
-/// No write deleted anything, touched a network or a profile, or patched a project.
+/// No write deleted anything but the adoption project, touched a network or a profile, or patched a project, and the only
+/// instance PUT is a rooted run's RestoreRoot, in `default`.
 fn assert_writes_in_table(run: &Run, tag: &str) {
     for (method, path) in run.writes() {
-        assert_ne!(method, "DELETE", "{tag}: {path}");
+        if method == "DELETE" {
+            assert_eq!(path, format!("/1.0/projects/{ADOPT_TO}"), "{tag}");
+        }
+        if method == "PUT" && !path.contains("/state") {
+            assert!(
+                run.rooted && path == "/1.0/instances/svc1?project=default",
+                "{tag}: {path}"
+            );
+        }
         assert!(
             !path.starts_with("/1.0/networks") && !path.starts_with("/1.0/profiles"),
             "{tag}: {method} {path}"
@@ -345,8 +415,10 @@ fn the_steps_left_follow_the_recorded_last_step() {
         instance: "svc1".to_string(),
         to: ADOPT_TO.to_string(),
     };
-    let plan = AdoptionPlan::new(&target, pre_image()).expect("a plan");
-    assert_eq!(resume_steps(&plan, None), S::ADOPT.to_vec());
+    let plan = AdoptionPlan::new(&target, pre_image(), Allowances::default()).expect("a plan");
+    let all = S::adopt_steps(false);
+    assert_eq!(plan.steps, all);
+    assert_eq!(resume_steps(&plan, None), all);
     assert_eq!(
         resume_steps(&plan, Some((S::Move, Phase::Intent))),
         vec![S::Move, S::Mark, S::Start]
@@ -354,6 +426,11 @@ fn the_steps_left_follow_the_recorded_last_step() {
     assert_eq!(
         resume_steps(&plan, Some((S::Move, Phase::Failed))),
         vec![S::Move, S::Mark, S::Start]
+    );
+    assert_eq!(
+        resume_steps(&plan, Some((S::PinNic, Phase::Done))),
+        vec![S::Move, S::Mark, S::Start],
+        "no LocalizeRoot for a plan that localizes nothing"
     );
     assert_eq!(
         resume_steps(&plan, Some((S::Move, Phase::Done))),
@@ -368,60 +445,98 @@ fn the_steps_left_follow_the_recorded_last_step() {
         Vec::<S>::new()
     );
 
-    let start_only = vec![S::ReleaseStart];
+    let left = |last: Option<(S, Phase)>| release_steps(&plan, last);
+    let tail = vec![S::ReleaseStart, S::DeleteProject];
     for step in [S::CreateProject, S::Stop, S::Snapshot, S::PinNic] {
         for phase in [Phase::Intent, Phase::Done, Phase::Failed] {
-            assert_eq!(
-                release_steps(Some((step, phase))),
-                start_only,
-                "{step:?} {phase:?}"
-            );
+            assert_eq!(left(Some((step, phase))), tail, "{step:?} {phase:?}");
         }
     }
-    assert_eq!(release_steps(None), start_only);
+    assert_eq!(left(None), tail);
     for phase in [Phase::Intent, Phase::Done, Phase::Failed] {
         assert_eq!(
-            release_steps(Some((S::Move, phase))),
-            vec![S::MoveBack, S::ReleaseStart]
+            left(Some((S::Move, phase))),
+            vec![S::MoveBack, S::ReleaseStart, S::DeleteProject]
         );
         assert_eq!(
-            release_steps(Some((S::Mark, phase))),
-            vec![S::Unmark, S::MoveBack, S::ReleaseStart]
+            left(Some((S::Mark, phase))),
+            vec![S::Unmark, S::MoveBack, S::ReleaseStart, S::DeleteProject]
         );
-        assert_eq!(release_steps(Some((S::Start, phase))), S::RELEASE.to_vec());
+        assert_eq!(left(Some((S::Start, phase))), S::release_steps(false));
     }
     assert_eq!(
-        release_steps(Some((S::ReleaseStop, Phase::Intent))),
-        S::RELEASE.to_vec()
+        left(Some((S::ReleaseStop, Phase::Intent))),
+        S::release_steps(false)
+    );
+    let from_unmark = vec![S::Unmark, S::MoveBack, S::ReleaseStart, S::DeleteProject];
+    assert_eq!(left(Some((S::ReleaseStop, Phase::Done))), from_unmark);
+    assert_eq!(left(Some((S::Unmark, Phase::Failed))), from_unmark);
+    let from_move_back = vec![S::MoveBack, S::ReleaseStart, S::DeleteProject];
+    assert_eq!(left(Some((S::Unmark, Phase::Done))), from_move_back);
+    assert_eq!(left(Some((S::MoveBack, Phase::Intent))), from_move_back);
+    assert_eq!(left(Some((S::MoveBack, Phase::Done))), tail);
+    assert_eq!(left(Some((S::ReleaseStart, Phase::Intent))), tail);
+    assert_eq!(
+        left(Some((S::ReleaseStart, Phase::Done))),
+        vec![S::DeleteProject],
+        "a release recorded before releases deleted the project finishes with DeleteProject"
     );
     assert_eq!(
-        release_steps(Some((S::ReleaseStop, Phase::Done))),
-        vec![S::Unmark, S::MoveBack, S::ReleaseStart]
+        left(Some((S::DeleteProject, Phase::Failed))),
+        vec![S::DeleteProject]
+    );
+    assert_eq!(left(Some((S::DeleteProject, Phase::Done))), Vec::<S>::new());
+
+    // A plan that localizes the root runs LocalizeRoot before the move and RestoreRoot after MoveBack, and a release from
+    // before the move restores a root LocalizeRoot may have made the instance's own.
+    let mut allowances = Allowances::default();
+    allowances.localize.insert(
+        "root".to_string(),
+        serde_json::from_value(root()).expect("a device"),
+    );
+    let rooted = AdoptionPlan::new(&target, pre_image(), allowances).expect("a rooted plan");
+    assert_eq!(rooted.steps, S::ADOPT.to_vec());
+    assert_eq!(resume_steps(&rooted, None), S::ADOPT.to_vec());
+    assert_eq!(
+        resume_steps(&rooted, Some((S::PinNic, Phase::Done))),
+        vec![S::LocalizeRoot, S::Move, S::Mark, S::Start]
     );
     assert_eq!(
-        release_steps(Some((S::Unmark, Phase::Failed))),
-        vec![S::Unmark, S::MoveBack, S::ReleaseStart]
+        resume_steps(&rooted, Some((S::LocalizeRoot, Phase::Intent))),
+        vec![S::LocalizeRoot, S::Move, S::Mark, S::Start]
     );
+    let left = |last: Option<(S, Phase)>| release_steps(&rooted, last);
+    let restore = vec![S::RestoreRoot, S::ReleaseStart, S::DeleteProject];
+    for step in [
+        S::CreateProject,
+        S::Stop,
+        S::Snapshot,
+        S::PinNic,
+        S::LocalizeRoot,
+    ] {
+        for phase in [Phase::Intent, Phase::Done, Phase::Failed] {
+            assert_eq!(left(Some((step, phase))), restore, "{step:?} {phase:?}");
+        }
+    }
+    assert_eq!(left(None), restore);
     assert_eq!(
-        release_steps(Some((S::Unmark, Phase::Done))),
-        vec![S::MoveBack, S::ReleaseStart]
+        left(Some((S::Move, Phase::Done))),
+        vec![
+            S::MoveBack,
+            S::RestoreRoot,
+            S::ReleaseStart,
+            S::DeleteProject
+        ]
     );
-    assert_eq!(
-        release_steps(Some((S::MoveBack, Phase::Intent))),
-        vec![S::MoveBack, S::ReleaseStart]
-    );
-    assert_eq!(
-        release_steps(Some((S::MoveBack, Phase::Done))),
-        vec![S::ReleaseStart]
-    );
-    assert_eq!(
-        release_steps(Some((S::ReleaseStart, Phase::Intent))),
-        vec![S::ReleaseStart]
-    );
-    assert_eq!(
-        release_steps(Some((S::ReleaseStart, Phase::Done))),
-        Vec::<S>::new()
-    );
+    assert_eq!(left(Some((S::Start, Phase::Done))), S::RELEASE.to_vec());
+    assert_eq!(left(Some((S::MoveBack, Phase::Done))), restore);
+    assert_eq!(left(Some((S::RestoreRoot, Phase::Failed))), restore);
+    assert_eq!(left(Some((S::RestoreRoot, Phase::Done))), tail);
+
+    // A plan whose steps are not the ones its allowances give resumes nothing.
+    let mut bent = rooted.clone();
+    bent.steps = S::adopt_steps(false);
+    assert_eq!(resume_steps(&bent, None), Vec::<S>::new());
 }
 
 fn pre_image() -> arca_incus::adopt::PreImage {
@@ -434,10 +549,10 @@ fn pre_image() -> arca_incus::adopt::PreImage {
 
 #[test]
 fn every_kill_point_of_an_apply_resumes_to_a_complete_adoption_with_no_step_sent_twice() {
-    for step in AdoptStep::ADOPT {
+    for (rooted, step) in kill_steps() {
         for kill in KILLS {
-            let tag = format!("resume-{step:?}-{kill:?}");
-            let run = Run::killed(&tag, step, kill);
+            let tag = format!("resume-{rooted}-{step:?}-{kill:?}");
+            let run = Run::of(&tag, rooted).halted(&tag, step, kill);
             let from = run.fake.requests().len();
             let resumed = run
                 .apply()
@@ -448,7 +563,7 @@ fn every_kill_point_of_an_apply_resumes_to_a_complete_adoption_with_no_step_sent
             assert_adopted(&run, &tag);
             assert_eq!(
                 run.writes(),
-                adoption_writes(),
+                adoption_writes_of(rooted),
                 "{tag}: every step's request is sent once, in order"
             );
             assert!(
@@ -460,12 +575,24 @@ fn every_kill_point_of_an_apply_resumes_to_a_complete_adoption_with_no_step_sent
     }
 }
 
+/// Each adoption step of each fixture's plan: the instance's own root, and a root the default profile gives.
+fn kill_steps() -> Vec<(bool, AdoptStep)> {
+    [false, true]
+        .into_iter()
+        .flat_map(|rooted| {
+            AdoptStep::adopt_steps(rooted)
+                .into_iter()
+                .map(move |step| (rooted, step))
+        })
+        .collect()
+}
+
 #[test]
 fn every_kill_point_of_an_apply_releases_to_the_pre_image_location_class_mac_and_ipv4() {
-    for step in AdoptStep::ADOPT {
+    for (rooted, step) in kill_steps() {
         for kill in KILLS {
-            let tag = format!("release-{step:?}-{kill:?}");
-            let run = Run::killed(&tag, step, kill);
+            let tag = format!("release-{rooted}-{step:?}-{kill:?}");
+            let run = Run::of(&tag, rooted).halted(&tag, step, kill);
             let before = run.writes().len();
             let released = run
                 .release()
@@ -653,9 +780,9 @@ fn release_refuses_with_no_record_or_while_another_adoption_is_open_and_sends_no
         to: "arcak-adopt-svc2".to_string(),
     };
     record
-        .begin(&AdoptionPlan::new(&svc2, pre_image()).expect("a plan"))
+        .begin(&AdoptionPlan::new(&svc2, pre_image(), Allowances::default()).expect("a plan"))
         .expect("begin");
-    for step in AdoptStep::ADOPT {
+    for step in AdoptStep::adopt_steps(false) {
         record.intend(step).expect("intent");
         record.done(step).expect("done");
     }
@@ -664,7 +791,7 @@ fn release_refuses_with_no_record_or_while_another_adoption_is_open_and_sends_no
         to: ADOPT_TO.to_string(),
     };
     record
-        .begin(&AdoptionPlan::new(&svc1, pre_image()).expect("a plan"))
+        .begin(&AdoptionPlan::new(&svc1, pre_image(), Allowances::default()).expect("a plan"))
         .expect("begin");
     record.intend(AdoptStep::CreateProject).expect("intent");
     let other = adopt_run(&run.config, &["release", "--instance", "svc2"]);
@@ -687,16 +814,30 @@ fn release_dry_run_lists_the_inverse_takes_no_lock_and_sends_nothing() {
     assert_eq!(dry["dryRun"], json!(true));
     assert_eq!(
         dry["steps"],
-        json!(["releaseStop", "unmark", "moveBack", "releaseStart"])
+        json!([
+            "releaseStop",
+            "unmark",
+            "moveBack",
+            "releaseStart",
+            "deleteProject"
+        ])
+    );
+    assert_eq!(
+        dry["allowances"],
+        json!({ "project": {}, "localize": {}, "nic": {}, "why": {} }),
+        "the dry run shows that the plan allows nothing past the base"
     );
     let requests = dry["requests"].as_array().expect("requests");
     assert_eq!(
         requests.len(),
-        5,
+        6,
         "the stop, the forced stop under its condition, and one request per other step"
     );
     for request in requests {
-        assert_ne!(request["method"], "DELETE");
+        if request["method"] == "DELETE" {
+            assert_eq!(request["path"], json!(format!("/1.0/projects/{ADOPT_TO}")));
+            assert_eq!(request["step"], json!("deleteProject"));
+        }
         assert!(
             request["body"].get("devices").is_none(),
             "no release request touches eth0: {request}"
@@ -722,7 +863,10 @@ fn release_dry_run_lists_the_inverse_takes_no_lock_and_sends_nothing() {
     )
     .expect("the dry run")
     .expect("a result");
-    assert_eq!(dry["steps"], json!(["moveBack", "releaseStart"]));
+    assert_eq!(
+        dry["steps"],
+        json!(["moveBack", "releaseStart", "deleteProject"])
+    );
 }
 
 #[test]
@@ -764,7 +908,13 @@ fn a_completed_release_is_released_again_with_no_write() {
 
 #[test]
 fn a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled() {
-    let run = Run::new("full");
+    for rooted in [false, true] {
+        full_adopt_then_release(rooted);
+    }
+}
+
+fn full_adopt_then_release(rooted: bool) {
+    let run = Run::of(&format!("full-{rooted}"), rooted);
     let mut seen = Vec::new();
     let mut observe = |step: AdoptStep, kill: Kill| {
         if kill == Kill::AfterOutcome {
@@ -782,6 +932,11 @@ fn a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled() {
                 json!(ADOPT_MAC),
                 "{step:?} lost the MAC"
             );
+            assert_eq!(
+                body["expanded_devices"]["root"],
+                root(),
+                "{step:?} changed the root"
+            );
             seen.push(step);
         }
         false
@@ -792,10 +947,11 @@ fn a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled() {
     run.adopt(&["release", "--instance", "svc1"], &mut observe)
         .expect("the release")
         .expect("a result");
-    let mut all = AdoptStep::ADOPT.to_vec();
-    all.extend(AdoptStep::RELEASE);
+    let mut all = AdoptStep::adopt_steps(rooted);
+    all.extend(AdoptStep::release_steps(rooted));
     assert_eq!(seen, all);
     assert_released(&run, "full", true, true);
+    assert_writes_in_table(&run, "full");
 }
 
 #[test]
@@ -1459,4 +1615,94 @@ fn a_resume_of_an_unconfirmed_copy_whose_pin_differs_is_refused_with_no_write() 
         run.record().last("svc1"),
         Some((AdoptStep::Move, Phase::Failed))
     );
+}
+
+#[test]
+fn a_rooted_release_whose_profile_root_or_own_root_changed_is_refused_before_any_write() {
+    let run = Run::rooted("rooted-changed");
+    run.apply().expect("the adoption").expect("a result");
+    assert_eq!(run.writes(), adoption_writes_of(true));
+    let refused_with = |run: &Run, needle: &str| {
+        let before = run.writes().len();
+        for dry in [true, false] {
+            let mut args = vec!["release", "--instance", "svc1"];
+            if dry {
+                args.push("--dry-run");
+            }
+            let released = adopt_run(&run.config, &args);
+            assert!(
+                matches!(&released, Err(failure @ Failure::Refused(why)) if why.contains(needle) && why.contains("before ReleaseStop") && failure.code() == 2),
+                "dry run {dry}: {released:?}"
+            );
+        }
+        assert_eq!(run.writes().len(), before, "the release sent no write");
+        let body = run.instance(ADOPT_TO).expect("still adopted");
+        assert_eq!(body["status"], json!("Running"), "it was not stopped");
+        assert_eq!(body["config"][MARK], json!("adopt-svc1"), "nor unmarked");
+        assert_eq!(
+            run.record().last("svc1"),
+            Some((AdoptStep::Start, Phase::Done)),
+            "nothing was recorded"
+        );
+    };
+
+    // The default profile no longer gives the root the adoption localized: taking the instance's own off would change it.
+    let mut smaller = root();
+    smaller["size"] = json!("10GiB");
+    let profile = |root: Value| {
+        json!({ "name": "default", "config": {}, "devices": {
+            "eth0": { "type": "nic", "name": "eth0", "network": "br1" }, "root": root } })
+    };
+    run.fake.add_profile("default", profile(smaller));
+    refused_with(&run, "no longer give");
+    run.fake.add_profile("default", profile(root()));
+
+    // The instance's own root changed while adopted: the release would keep it, so it does not begin.
+    let path = format!("/1.0/instances/svc1?project={ADOPT_TO}");
+    let mut bigger = root();
+    bigger["size"] = json!("80GiB");
+    assert_eq!(
+        run.raw("PATCH", &path, &json!({ "devices": { "root": bigger } })),
+        200
+    );
+    refused_with(&run, "changed since the adoption");
+    assert_eq!(
+        run.raw("PATCH", &path, &json!({ "devices": { "root": root() } })),
+        200
+    );
+
+    // Put back, the release runs and takes the localized root off with one PUT of the instance in default.
+    let before = run.writes().len();
+    let released = run.release().expect("the release").expect("a result");
+    let steps: Vec<Value> = released["steps"]
+        .as_array()
+        .expect("the steps")
+        .iter()
+        .map(|step| step["step"].clone())
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            json!("releaseStop"),
+            json!("unmark"),
+            json!("moveBack"),
+            json!("restoreRoot"),
+            json!("releaseStart"),
+            json!("deleteProject")
+        ]
+    );
+    let puts: Vec<(String, String)> = run.writes()[before..]
+        .iter()
+        .filter(|(method, path)| method == "PUT" && !path.contains("/state"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        puts,
+        [(
+            "PUT".to_string(),
+            "/1.0/instances/svc1?project=default".to_string()
+        )]
+    );
+    assert_released(&run, "rooted-changed", true, true);
+    assert_writes_in_table(&run, "rooted-changed");
 }
