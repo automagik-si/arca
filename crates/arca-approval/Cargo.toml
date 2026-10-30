@@ -1,0 +1,15 @@
+[package]
+name = "arca-approval"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arca's owner approvals: the signed statement, its canonical form, and the checks that spend each one once"
+
+[dependencies]
+arca-kernel.workspace = true
+base64.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
