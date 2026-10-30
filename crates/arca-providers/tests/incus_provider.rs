@@ -2442,3 +2442,18 @@ fn a_write_is_refused_once_the_retained_set_is_updated_through_a_handle_the_boxe
     );
     assert!(writes(&fake).is_empty(), "nothing was written");
 }
+
+#[test]
+fn a_read_back_in_a_project_without_the_feature_is_refused_and_sends_only_gets() {
+    // `kbare` has no storage volumes feature, so a read there would route to the default project, as a write does.
+    let (scratch, fake) = start("read-back-features");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let volume = object(IncusKind::Volume, "kbare", Some("default"), "v9");
+    let answer = Provider::read_back(&provider, &entry("toy"), &volume, None);
+    assert!(
+        matches!(&answer, Err(EffectRefusal::Provider(reason)) if reason.contains("features.storage.volumes")),
+        "{answer:?}"
+    );
+    assert!(writes(&fake).is_empty());
+    assert!(only_gets(&fake));
+}

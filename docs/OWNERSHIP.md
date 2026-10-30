@@ -310,7 +310,8 @@ own with the plan's uuid. The writer tombstones it under its ETag and reads it b
 only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
 `Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
 `Drift`, and the object stays tombstoned. The writer accepts a tombstone with the same plan again, so a later retirement under that
-plan can continue. A DELETE the writer refuses is drift; any other failure of the DELETE is `Unresolved`.
+plan can continue. A DELETE the writer refuses is drift; any other failure of the DELETE is `Unresolved`. An object that answers 404
+when it is first read is already gone: the retirement is `Deleted`, and no DELETE is sent.
 Source: `IncusProvider::retire` in `crates/arca-providers/src/incus.rs`; tests
 `retire_tombstones_then_deletes_an_owned_instance_in_order`,
 `retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request`,
@@ -339,8 +340,10 @@ or a plan whose live objects are not all named in it (a new step, or a new uuid)
 deletes only the live objects the plan names. A partial run keeps its plan, and a retry under the same approval is refused as
 replayed. A declined plan's objects are retained: no run and no removal writes them again, and a later document that carries the
 entry does not adopt them. An unresolved intent blocks every new effect, including every run. A suspended (disabled) entry keeps
-its objects. A class-C emission is never reverted.
+its objects. A class-C emission is never reverted. A removal reads each class-B object before it asks for approval: one that reads absent
+is settled without a plan, and a pending plan with no class-B object left is withdrawn.
 Source: `arca_reconcile::Reconciler::{reconcile, run_plan, decline}`; tests `removal_leaves_zero_objects_with_the_entry_mark_and_an_empty_journal`,
+`a_plan_whose_instance_is_gone_before_the_next_removal_is_withdrawn_and_nothing_is_pending`,
 `the_container_delete_waits_for_an_approval_over_the_plan_digest`,
 `an_object_changed_between_plan_and_run_survives_is_drift_and_a_retry_without_approval_is_refused`,
 `a_plan_older_than_fifteen_minutes_needs_a_new_approval` and `a_declined_plan_retains_its_objects_and_cannot_run` in
@@ -361,9 +364,11 @@ as drift. A patch's entry is held, so nothing is written for it until a document
 pre-image is failed; any other value settles the patch with its pre-image as the inverse, which a later removal restores. A delete
 whose object is still the entry's is failed, so the next removal retries it; one whose object is gone is reverted, with the create
 it undid. An object that is not the entry's, or whose uuid differs from the intent's, is failed and reported, and no delete or
-patch is sent. A target outside the family is not read. A read that cannot be answered leaves its intent open, and `open` refuses.
+patch is sent. A target outside the family, or in a project that does not enable its kind's feature, is not read. A read that cannot
+be answered leaves its intent open, and `open` refuses.
 Source: `arca_reconcile::Reconciler::{resolve, open}` in `crates/arca-reconcile/src/restart.rs` and
-`arca_providers::incus::IncusProvider::read_back`; tests in `crates/arca-reconcile/tests/restart.rs`.
+`arca_providers::incus::IncusProvider::read_back`; tests in `crates/arca-reconcile/tests/restart.rs` and
+`a_read_back_in_a_project_without_the_feature_is_refused_and_sends_only_gets` in `crates/arca-providers/tests/incus_provider.rs`.
 
 ## Out of scope
 

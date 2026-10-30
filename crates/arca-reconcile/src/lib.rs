@@ -25,8 +25,8 @@ use arca_kernel::journal::{
 };
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::{
-    Ctx, EffectOp, EffectRefusal, Erased, ErasedPlugin, Manifest, Plugin, Provider, Retirement,
-    op_digest,
+    Ctx, EffectOp, EffectRefusal, Erased, ErasedPlugin, Manifest, Plugin, Provider, ReadBack,
+    Retirement, op_digest,
 };
 use arca_providers::incus::RetainedSet;
 use serde_json::json;
@@ -497,6 +497,9 @@ impl<S: JournalStore> Reconciler<S> {
     fn remove_entry(&mut self, id: &EntryId, now_ms: u64, outcomes: &mut Vec<Outcome>) {
         // A removed entry has not converged: a document that carries it again applies it again.
         self.converged.remove(id);
+        if !self.blocked() {
+            self.settle_gone(id);
+        }
         let split = removal(&self.journal, id, now_ms);
         let mut reverted = 0;
         let mut stopped = false;
@@ -526,8 +529,10 @@ impl<S: JournalStore> Reconciler<S> {
             });
             return;
         }
-        if let Some(plan) = split.plan {
-            self.plan_removal(id, plan, outcomes);
+        match split.plan {
+            Some(plan) => self.plan_removal(id, plan, outcomes),
+            // Nothing of the entry is left to delete, so a plan queued for it asks about objects that are gone.
+            None => self.pending.retain(|pending| &pending.plan.entry != id),
         }
         if self.revertible_live(id) == 0 {
             self.applied_by.remove(id);
@@ -683,6 +688,25 @@ impl<S: JournalStore> Reconciler<S> {
                 self.journal.failed(delete, &why)?;
                 Ok(Retired::Kept(why))
             }
+        }
+    }
+
+    /// Settles the entry's class-B objects that read back absent, before a plan asks the owner about them. Nothing is left to delete
+    /// for such an object, so it is not put in a plan, and its records are settled as an absent create is at restart. An object
+    /// whose read cannot be answered is left as it is, so the plan still asks about it.
+    fn settle_gone(&mut self, entry: &EntryId) {
+        let gone: Vec<ObjectRef> = self
+            .live_deletes(entry)
+            .into_iter()
+            .filter(|object| {
+                matches!(
+                    self.provider.read_back(entry, object, None),
+                    Ok(ReadBack::Absent)
+                )
+            })
+            .collect();
+        for object in &gone {
+            self.settle_deleted(entry, object);
         }
     }
 

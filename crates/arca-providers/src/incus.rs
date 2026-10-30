@@ -724,6 +724,10 @@ impl IncusProvider {
         let writer = self.writer(entry)?;
         let owned = match writer.read_owned(object) {
             Ok(owned) => owned,
+            // Gone already, so there is nothing for the delete to remove. The caller settles the create the delete undid.
+            Err(IncusError::Status { code: 404, .. }) => {
+                return Ok(Retirement::Deleted(object.clone()));
+            }
             Err(IncusError::Refused(reason)) => {
                 return match writer.read_class(object) {
                     Ok(reading) if kernel_may_write(&reading.class, entry) => {
@@ -911,8 +915,10 @@ impl Provider for IncusProvider {
         }
     }
 
-    /// Reads the object an unresolved intent names, with one GET. A target outside the family is refused before any request. An
-    /// object that answers 404 is absent. Any other answer that is not a read of the object is an error, so the intent stays open.
+    /// Reads the object an unresolved intent names, with one GET. A target outside the family is refused before any request, and so
+    /// is a target whose project does not enable its kind's feature, as a write to it is: Incus would answer for the default project
+    /// instead. An object that answers 404 is absent. Any other answer that is not a read of the object is an error, so the intent
+    /// stays open.
     fn read_back(
         &self,
         entry: &EntryId,
@@ -920,6 +926,7 @@ impl Provider for IncusProvider {
         pre_image: Option<&BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
         self.check_family(&target.project)?;
+        self.check_features(entry, target.kind, &target.project)?;
         let reading = match self.writer(entry)?.read_class(target) {
             Ok(reading) => reading,
             Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),

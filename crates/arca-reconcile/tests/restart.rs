@@ -1378,3 +1378,450 @@ impl Provider for Silent {
         Err(EffectRefusal::NotDeclared)
     }
 }
+
+// Kill points between a delete's outcome and the settlement of the create it undid.
+
+/// Leaves the state a kill between the delete intent's `reverted` append and `settle_deleted`'s append leaves: the delete landed,
+/// its intent is settled, and the create it undid is still live.
+fn half_settled_delete(scratch: &Scratch, entry: &EntryId, class: EffectClass, object: ObjectRef) {
+    let mut journal = Journal::open(
+        FileJournal::open(&scratch.path("journal.jsonl")).expect("the journal opens"),
+    )
+    .expect("the journal folds");
+    let op = op_digest(&EffectOp::IncusDelete {
+        object: object.clone(),
+        plan: Digest::of(b"a plan"),
+    });
+    let id = journal
+        .intend_delete(entry, class, op, object, NOW)
+        .expect("the delete intent is journalled");
+    journal.reverted(id);
+    assert!(journal.poisoned().is_none());
+}
+
+/// The delete plans an outcome list asks the owner to approve.
+fn asked(outcomes: &[Outcome]) -> Vec<DeletePlan> {
+    outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            Outcome::AwaitingApproval { plan } => Some(plan.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The names of the objects a plan asks about.
+fn names(objects: &[ObjectRef]) -> Vec<&str> {
+    objects.iter().map(|object| object.name.as_str()).collect()
+}
+
+/// The `volatile.uuid` the fake gave the toy instance.
+fn toy_instance_uuid(fake: &FakeIncus) -> String {
+    let real = get(fake, &instance_path("toy-box-t1")).expect("the instance exists");
+    real["config"]["volatile.uuid"]
+        .as_str()
+        .expect("the instance has a uuid")
+        .to_string()
+}
+
+#[test]
+fn a_kill_between_a_class_a_delete_settled_and_its_create_settled_does_not_wedge_the_removal() {
+    let scratch = Scratch::new("atk-a");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    {
+        let mut r = restarted(
+            &scratch,
+            &key,
+            plain(&scratch, &fake, &retained),
+            plugins(),
+            &retained,
+            None,
+        )
+        .expect("opens");
+        assert_eq!(
+            r.reconcile(&first, NOW),
+            vec![Outcome::Applied { entry: toy_id() }]
+        );
+    }
+    // The ACL's class-A delete landed, its intent was settled, and the process died before the create was settled.
+    half_settled_delete(&scratch, &toy_id(), EffectClass::A, acl("toy-acl-t1"));
+    let (status, _) = raw(&fake, "DELETE", &acl_path("toy-acl-t1"), None);
+    assert!(status < 300, "the ACL is gone: {status}");
+
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("opens");
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let removal = r.reconcile(&second, NOW);
+    assert!(
+        removal.contains(&Outcome::Reverted {
+            entry: toy_id(),
+            effects: 1
+        }),
+        "the gone ACL's create is settled without a delete: {removal:?}"
+    );
+    let plans = asked(&removal);
+    assert_eq!(
+        plans.len(),
+        1,
+        "only the instance waits for the owner: {removal:?}"
+    );
+    assert_eq!(names(&plans[0].objects), vec!["toy-box-t1"]);
+
+    let run = approve_and_run(&mut r, &scratch, &plans[0], "atk-a");
+    assert!(
+        !run.partial && run.drift.is_empty(),
+        "the approved run completes: {run:?}"
+    );
+    let third = signed(&key, 3, Some(second.document.digest()), vec![]);
+    let again = r.reconcile(&third, NOW);
+    assert!(again.is_empty(), "nothing is asked again: {again:?}");
+    assert!(r.pending_plans().is_empty(), "no plan is pending");
+    assert!(
+        r.journal().live_entries().is_empty(),
+        "the live journal empties after the removal"
+    );
+    nothing_left(&fake);
+    assert_eq!(
+        deletes_for(&fake, "toy-acl-t1"),
+        1,
+        "the reconciler sent no delete for the gone ACL"
+    );
+}
+
+#[test]
+fn a_kill_between_a_class_b_delete_settled_and_its_create_settled_asks_nothing_about_the_gone_instance()
+ {
+    let scratch = Scratch::new("atk-b");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let uuid;
+    {
+        let mut r = restarted(
+            &scratch,
+            &key,
+            plain(&scratch, &fake, &retained),
+            plugins(),
+            &retained,
+            None,
+        )
+        .expect("opens");
+        r.reconcile(&first, NOW);
+        let removal = r.reconcile(&second, NOW);
+        assert_eq!(
+            asked(&removal).len(),
+            1,
+            "the instance waits for the owner: {removal:?}"
+        );
+        uuid = toy_instance_uuid(&fake);
+    }
+    // The approved class-B delete landed, its intent was settled, and the process died before the create was settled.
+    half_settled_delete(
+        &scratch,
+        &toy_id(),
+        EffectClass::B,
+        instance_object("toy-box-t1", Some(&uuid)),
+    );
+    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
+    assert!(status < 300, "the instance is gone: {status}");
+
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&second),
+    )
+    .expect("opens");
+    let third = signed(&key, 3, Some(second.document.digest()), vec![]);
+    let removal = r.reconcile(&third, NOW);
+    assert!(
+        asked(&removal).is_empty(),
+        "nothing is asked of the owner for a gone object: {removal:?}"
+    );
+    assert!(r.pending_plans().is_empty(), "no plan is pending");
+    assert!(
+        r.journal().live_entries().is_empty(),
+        "the live journal empties after the removal"
+    );
+    nothing_left(&fake);
+    assert_eq!(
+        deletes_for(&fake, "toy-box-t1"),
+        1,
+        "the reconciler sent no delete for the gone instance"
+    );
+}
+
+#[test]
+fn an_async_class_b_delete_that_completes_after_its_read_back_kept_the_object_settles_on_retry() {
+    let scratch = Scratch::new("atk-async");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    {
+        let mut r = restarted(
+            &scratch,
+            &key,
+            plain(&scratch, &fake, &retained),
+            plugins(),
+            &retained,
+            None,
+        )
+        .expect("opens");
+        assert_eq!(
+            r.reconcile(&first, NOW),
+            vec![Outcome::Applied { entry: toy_id() }]
+        );
+    }
+    let uuid = toy_instance_uuid(&fake);
+    // The approved delete was sent, and the process died before its outcome was journalled.
+    intend_delete_by_hand(
+        &scratch,
+        &toy_id(),
+        EffectClass::B,
+        instance_object("toy-box-t1", Some(&uuid)),
+    );
+    // The restart reads the instance back, finds it still there, and fails the delete intent as kept.
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("opens");
+    assert!(r.journal().unresolved().is_empty(), "the intent is settled");
+    assert!(
+        get(&fake, &instance_path("toy-box-t1")).is_some(),
+        "the read-back saw the instance"
+    );
+    // The async delete completes after the read-back.
+    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
+    assert!(status < 300, "the instance is gone: {status}");
+
+    // The retry removes the entry. The instance is gone, so the owner is not asked about it.
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let removal = r.reconcile(&second, NOW);
+    assert!(
+        asked(&removal).is_empty(),
+        "nothing is asked of the owner for a gone object: {removal:?}"
+    );
+    assert!(r.pending_plans().is_empty(), "no plan is pending");
+    assert!(
+        r.journal().live_entries().is_empty(),
+        "the live journal empties after the removal"
+    );
+    nothing_left(&fake);
+    assert_eq!(
+        deletes_for(&fake, "toy-box-t1"),
+        1,
+        "the reconciler sent no delete for the gone instance"
+    );
+}
+
+#[test]
+fn an_instance_deleted_after_the_owner_was_asked_is_settled_by_the_approved_run() {
+    let scratch = Scratch::new("atk-run");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        None,
+    )
+    .expect("opens");
+    r.reconcile(&first, NOW);
+    let removal = r.reconcile(&second, NOW);
+    let plans = asked(&removal);
+    assert_eq!(
+        plans.len(),
+        1,
+        "the instance waits for the owner: {removal:?}"
+    );
+    // The delete completes before the owner approves, so the approved run finds the instance gone.
+    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
+    assert!(status < 300, "the instance is gone: {status}");
+
+    let run = approve_and_run(&mut r, &scratch, &plans[0], "atk-run");
+    assert!(
+        !run.partial && run.drift.is_empty(),
+        "the run settles the gone instance and completes: {run:?}"
+    );
+    let third = signed(&key, 3, Some(second.document.digest()), vec![]);
+    assert!(r.reconcile(&third, NOW).is_empty());
+    assert!(r.pending_plans().is_empty(), "no plan is pending");
+    assert!(r.journal().live_entries().is_empty());
+    nothing_left(&fake);
+    assert_eq!(deletes_for(&fake, "toy-box-t1"), 1);
+}
+
+// A patch whose object is another object.
+
+#[test]
+fn a_patch_whose_object_shows_another_uuid_is_failed_with_no_inverse_and_no_write_is_sent() {
+    let scratch = Scratch::new("patch-uuid");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    {
+        let mut r = restarted(
+            &scratch,
+            &key,
+            plain(&scratch, &fake, &retained),
+            plugins(),
+            &retained,
+            None,
+        )
+        .expect("opens");
+        r.reconcile(&first, NOW);
+    }
+    let uuid = toy_instance_uuid(&fake);
+    // The intent names an instance with another uuid at the same place. Its pre-image is not held, so a settlement that ignored
+    // the uuid would call the patch landed and journal an inverse.
+    intend_by_hand(
+        &scratch,
+        &toy_id(),
+        EffectClass::B,
+        Digest::of(b"a patch"),
+        instance_object("toy-box-t1", Some("u-other")),
+        Some(BTreeMap::from([(
+            "user.env".to_string(),
+            Some("before".to_string()),
+        )])),
+    );
+    let writes = fake.writes().len();
+
+    let r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("the journal opens");
+    assert_eq!(
+        r.resolution().drift,
+        vec![instance_object("toy-box-t1", Some(&uuid))],
+        "the object that is there is reported"
+    );
+    assert_eq!(r.resolution().held, vec![toy_id()]);
+    assert!(
+        r.journal()
+            .live(&toy_id())
+            .iter()
+            .all(|record| record.target.uuid.as_deref() != Some("u-other")),
+        "the patch is failed, so no record of it stays live"
+    );
+    assert!(r.journal().unresolved().is_empty());
+    assert_eq!(fake.writes().len(), writes, "no patch or delete was sent");
+    assert!(
+        get(&fake, &instance_path("toy-box-t1"))
+            .is_some_and(|real| { real["config"].get("user.env").is_none() })
+    );
+}
+
+// Another writer after a patch's kill.
+
+#[test]
+fn attack_other_writer_value_after_patch_kill_is_reverted() {
+    let scratch = Scratch::new("atk-p");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![patcher_entry("v1")]);
+    run_killed(
+        &scratch,
+        &fake,
+        &key,
+        &retained,
+        None,
+        Kill::EffectAfter(3),
+        &first,
+    );
+    // Another writer sets the key after the kill.
+    let (status, _) = raw(
+        &fake,
+        "PATCH",
+        &acl_path("p-acl-q"),
+        Some(&json!({ "config": { "user.k": "z" } })),
+    );
+    assert_eq!(status, 200);
+    let r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("opens");
+    eprintln!("RESOLUTION: {:?}", r.resolution());
+    eprintln!(
+        "LIVE: {:?}",
+        r.journal()
+            .live(&pe_id())
+            .iter()
+            .map(|x| (&x.id, &x.state, &x.inverse))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_plan_whose_instance_is_gone_before_the_next_removal_is_withdrawn_and_nothing_is_pending() {
+    let scratch = Scratch::new("stale-plan");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let third = signed(&key, 3, Some(second.document.digest()), vec![]);
+    let mut r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        None,
+    )
+    .expect("opens");
+    r.reconcile(&first, NOW);
+    let removal = r.reconcile(&second, NOW);
+    assert_eq!(asked(&removal).len(), 1, "the instance waits: {removal:?}");
+    // The instance's delete completes while the owner has not answered.
+    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
+    assert!(status < 300, "the instance is gone: {status}");
+
+    let again = r.reconcile(&third, NOW);
+    assert!(asked(&again).is_empty(), "nothing is asked: {again:?}");
+    assert!(
+        r.pending_plans().is_empty(),
+        "a plan for a gone instance is withdrawn: {:?}",
+        r.pending_plans()
+    );
+    assert!(r.journal().live_entries().is_empty());
+    nothing_left(&fake);
+    assert_eq!(deletes_for(&fake, "toy-box-t1"), 1);
+}
