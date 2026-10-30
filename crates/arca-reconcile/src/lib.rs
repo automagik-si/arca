@@ -7,6 +7,7 @@
 //! and refuses a journal whose intent it cannot settle. A run that leaves an intent open stops at once. A plugin's own writes pass
 //! through a gate that refuses its next intent while one is open, so a plugin that swallows the refusal still cannot write past it.
 
+pub mod probe;
 mod restart;
 #[cfg(feature = "toy")]
 pub mod toy;
