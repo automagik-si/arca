@@ -104,6 +104,7 @@ fn fake_state() -> FakeState {
             json!({ "name": "a2", "project": "apps", "status": "Stopped" }),
             json!({ "name": "b1", "project": "svc", "status": "Running" }),
         ],
+        networks: Vec::new(),
         pools: vec![(
             "default".to_string(),
             json!({

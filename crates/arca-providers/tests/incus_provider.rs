@@ -116,6 +116,15 @@ fn state() -> FakeState {
             instance["project"] = json!("svc");
         }
     }
+    // The bridges the host keeps in `default`: `kbr` is the entry `toy`'s, `plainbr` carries no mark, and `droidbr` is droidd's.
+    state.networks = vec![
+        json!({"name": "kbr", "project": "default", "type": "bridge", "config": {
+            "ipv4.address": "192.0.2.1/24", "ipv6.address": "none", MARK: "toy"}}),
+        json!({"name": "plainbr", "project": "default", "type": "bridge", "config": {
+            "ipv4.address": "192.0.2.2/24", "ipv6.address": "none"}}),
+        json!({"name": "droidbr", "project": "default", "type": "bridge", "config": {
+            "ipv4.address": "192.0.2.3/24", "ipv6.address": "none", "user.droid.lease": "1"}}),
+    ];
     state
 }
 
@@ -198,7 +207,7 @@ fn manifest() -> Manifest {
             (IncusKind::Instance, EffectClass::B),
             (IncusKind::Volume, EffectClass::B),
             (IncusKind::Bucket, EffectClass::B),
-            (IncusKind::Network, EffectClass::A),
+            (IncusKind::Network, EffectClass::B),
             (IncusKind::Acl, EffectClass::A),
             (IncusKind::Profile, EffectClass::A),
             (IncusKind::Zone, EffectClass::A),
@@ -587,7 +596,10 @@ fn a_project_create_carries_the_mark_the_features_restricted_and_the_op_config()
     assert_eq!(made.uuid, None, "a project has no uuid");
     let config = read(&fake, "/1.0/projects/kfam")["config"].clone();
     assert_eq!(config[MARK], json!("toy"));
-    assert_eq!(config["features.networks"], json!("true"));
+    assert!(
+        config.get("features.networks").is_none(),
+        "networks live in default, so the kernel project does not set features.networks: {config}"
+    );
     assert_eq!(config["features.profiles"], json!("true"));
     assert_eq!(config["features.storage.volumes"], json!("true"));
     assert_eq!(config["features.storage.buckets"], json!("true"));
@@ -686,7 +698,7 @@ fn a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserv
         ),
     ];
     for (why, body) in bad {
-        let op = create(IncusKind::Network, "svc", None, "br1", body);
+        let op = create(IncusKind::Network, "default", None, "br1", body);
         let result = provider.plan(&entry("toy"), &op);
         assert!(
             matches!(result, Err(EffectRefusal::Provider(_))),
@@ -701,7 +713,7 @@ fn a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserv
 
     let good = create(
         IncusKind::Network,
-        "svc",
+        "default",
         None,
         "br2",
         bridge(json!({"ipv4.address": "192.0.2.1/24", "ipv6.address": "none"})),
@@ -715,13 +727,16 @@ fn a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserv
         .expect("the bridge is created");
     assert_eq!(
         writes(&fake),
-        vec![("POST".to_string(), "/1.0/networks?project=svc".to_string())]
+        vec![(
+            "POST".to_string(),
+            "/1.0/networks?project=default".to_string()
+        )]
     );
 }
 
 #[test]
 fn a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature() {
-    // `kbare` has networks but its storage volumes feature is off, so a volume there would route to the default project.
+    // `kbare` has its storage volumes feature off, so a volume there would route to the default project.
     let (scratch, fake) = start("features");
     let provider = provider(&fake, &secrets_dir(&scratch));
     let volume = create(IncusKind::Volume, "kbare", Some("default"), "v9", json!({}));
@@ -731,14 +746,14 @@ fn a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_f
     ));
     let network = create(
         IncusKind::Network,
-        "kbare",
+        "default",
         None,
         "br9",
         json!({"type": "bridge", "config": {"ipv6.address": "none", "ipv4.address": "203.0.113.1/24"}}),
     );
     provider
         .plan(&entry("toy"), &network)
-        .expect("networks are enabled there");
+        .expect("a network is held by default, which needs no feature in the kernel project");
     assert!(writes(&fake).is_empty());
     assert!(only_gets(&fake));
 }
@@ -1685,7 +1700,7 @@ fn a_project_create_refuses_a_restricted_or_features_key_that_loosens_the_pinned
         "kfam",
         None,
         "kfam",
-        json!({"config": {"restricted": "true", "features.networks": "true", "features.networks.zones": "true"}}),
+        json!({"config": {"restricted": "true", "features.networks.zones": "true"}}),
     );
     provider
         .plan(&entry("toy"), &pinned)
@@ -1990,7 +2005,7 @@ fn a_bridge_key_outside_the_allowlist_or_a_route_external_interface_or_raw_key_i
         config[key] = json!(value);
         create(
             IncusKind::Network,
-            "svc",
+            "default",
             None,
             "br-x",
             json!({"type": "bridge", "config": config}),
@@ -2028,7 +2043,7 @@ fn a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch() 
     let mut provider = provider(&fake, &secrets_dir(&scratch));
     let bridge = create(
         IncusKind::Network,
-        "svc",
+        "default",
         None,
         "br-p",
         json!({"type": "bridge", "config": {"ipv4.address": "192.0.2.1/24", "ipv6.address": "none"}}),
@@ -2040,7 +2055,7 @@ fn a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch() 
         .effect(&entry("toy"), &bridge, &planned)
         .expect("the bridge is created");
     let move_into_reserved = patch(
-        object(IncusKind::Network, "svc", None, "br-p"),
+        object(IncusKind::Network, "default", None, "br-p"),
         &[("ipv4.address", Some("198.51.100.1/24"))],
     );
     match provider.plan(&entry("toy"), &move_into_reserved) {
@@ -2054,7 +2069,10 @@ fn a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch() 
     }
     assert_eq!(
         writes(&fake),
-        vec![("POST".to_string(), "/1.0/networks?project=svc".to_string())],
+        vec![(
+            "POST".to_string(),
+            "/1.0/networks?project=default".to_string()
+        )],
         "only the create was sent"
     );
 }
@@ -2456,4 +2474,259 @@ fn a_read_back_in_a_project_without_the_feature_is_refused_and_sends_only_gets()
     );
     assert!(writes(&fake).is_empty());
     assert!(only_gets(&fake));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Bridges in default: a network is addressed there, and only a bridge the entry marked is written
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// The manifest of a plugin whose networks and forwards are addressed in `default`, as the probe's is.
+fn manifest_with_default() -> Manifest {
+    let mut manifest = manifest();
+    manifest.projects.push("default".into());
+    manifest
+}
+
+/// A bridge body with an IPv4 range and no IPv6, as a kernel bridge sets it.
+fn bridge_body(cidr: &str) -> Value {
+    json!({"type": "bridge", "config": {"ipv4.address": cidr, "ipv6.address": "none"}})
+}
+
+fn method_path(method: &str, path: &str) -> (String, String) {
+    (method.to_string(), path.to_string())
+}
+
+#[test]
+fn a_marked_bridge_in_default_is_created_patched_and_removed() {
+    let (scratch, fake) = start("bridge-life");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest_with_default();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let bridge = object(IncusKind::Network, "default", None, "br-life");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Network,
+            "default",
+            None,
+            "br-life",
+            bridge_body("192.0.2.9/24"),
+        ))
+        .expect("the bridge is created in default");
+    let stored = read(&fake, "/1.0/networks/br-life?project=default");
+    assert_eq!(
+        stored["config"][MARK],
+        json!("toy"),
+        "the create stamps the entry's mark: {stored}"
+    );
+
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(bridge.clone(), &[("ipv4.nat", Some("true"))]))
+        .expect("the marked bridge is patched");
+    assert_eq!(
+        read(&fake, "/1.0/networks/br-life?project=default")["config"]["ipv4.nat"],
+        json!("true")
+    );
+
+    let plan = Digest::of(b"the approved plan");
+    assert_eq!(
+        provider.retire(&entry("toy"), &bridge, &plan),
+        Ok(Retirement::Deleted(bridge.clone()))
+    );
+    let gone =
+        UnixIncus::new(fake.socket().to_path_buf()).get("/1.0/networks/br-life?project=default");
+    assert!(
+        matches!(gone, Err(arca_incus::IncusError::Status { code: 404, .. })),
+        "{gone:?}"
+    );
+    assert_eq!(
+        writes(&fake),
+        vec![
+            method_path("POST", "/1.0/networks?project=default"),
+            method_path("PATCH", "/1.0/networks/br-life?project=default"),
+            method_path("PATCH", "/1.0/networks/br-life?project=default"),
+            method_path("DELETE", "/1.0/networks/br-life?project=default"),
+        ],
+        "a set, a tombstone and a delete, in that order"
+    );
+}
+
+#[test]
+fn an_unmarked_bridge_in_default_is_refused_for_patch_and_delete_and_no_write_is_sent() {
+    let (scratch, fake) = start("bridge-foreign");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let plan = Digest::of(b"the approved plan");
+    for (name, class) in [
+        ("plainbr", OwnerClass::Foreign),
+        ("droidbr", OwnerClass::Droidd),
+    ] {
+        let target = object(IncusKind::Network, "default", None, name);
+        let op = patch(target.clone(), &[("ipv4.nat", Some("true"))]);
+        assert_eq!(
+            provider.plan(&entry("toy"), &op),
+            Err(EffectRefusal::NotOwned(class.clone())),
+            "a patch of {name}"
+        );
+        assert_eq!(
+            provider.retire(&entry("toy"), &target, &plan),
+            Err(EffectRefusal::NotOwned(class)),
+            "a delete of {name}"
+        );
+    }
+    assert!(
+        writes(&fake).is_empty(),
+        "no write reached an unmarked bridge: {:?}",
+        writes(&fake)
+    );
+    assert!(
+        only_gets(&fake),
+        "only reads were sent: {:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn a_non_network_create_in_default_is_still_refused_before_any_request() {
+    let (scratch, fake) = start("default-kinds");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    for (kind, parent, name) in [
+        (IncusKind::Project, None, "default"),
+        (IncusKind::Instance, None, "i9"),
+        (IncusKind::Acl, None, "a9"),
+        (IncusKind::Profile, None, "p9"),
+        (IncusKind::Zone, None, "z9"),
+        (IncusKind::Volume, Some("default"), "v9"),
+        (IncusKind::Bucket, Some("default"), "b9"),
+    ] {
+        let op = create(kind, "default", parent, name, json!({}));
+        assert_eq!(
+            provider.plan(&entry("toy"), &op),
+            Err(EffectRefusal::ProjectNotAllowed),
+            "a {kind:?} in default"
+        );
+    }
+    let network_in_kernel = create(
+        IncusKind::Network,
+        "svc",
+        None,
+        "br-s",
+        bridge_body("192.0.2.9/24"),
+    );
+    assert_eq!(
+        provider.plan(&entry("toy"), &network_in_kernel),
+        Err(EffectRefusal::ProjectNotAllowed),
+        "a network is addressed in default and nowhere else"
+    );
+    let forward_in_kernel = create(
+        IncusKind::Forward,
+        "svc",
+        Some("kbr"),
+        "192.0.2.10",
+        json!({"config": {}}),
+    );
+    assert_eq!(
+        provider.plan(&entry("toy"), &forward_in_kernel),
+        Err(EffectRefusal::ProjectNotAllowed),
+        "a forward is addressed in default and nowhere else"
+    );
+    assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+}
+
+#[test]
+fn a_project_create_may_grant_only_bridges_the_entry_holds_in_default() {
+    let (scratch, fake) = start("access-list");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let granting = |list: &str| {
+        create(
+            IncusKind::Project,
+            "kfam",
+            None,
+            "kfam",
+            json!({"config": {"restricted.networks.access": list}}),
+        )
+    };
+    provider
+        .plan(&entry("toy"), &granting("kbr"))
+        .expect("the entry's own bridge is granted");
+    assert_eq!(
+        provider.plan(&entry("toy"), &granting("plainbr")),
+        Err(EffectRefusal::NotOwned(OwnerClass::Foreign)),
+        "an unmarked bridge is not granted"
+    );
+    assert_eq!(
+        provider.plan(&entry("toy"), &granting("kbr,droidbr")),
+        Err(EffectRefusal::NotOwned(OwnerClass::Droidd)),
+        "one unmarked name refuses the whole list"
+    );
+    for list in ["", "kbr,", "bad name", "missing"] {
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &granting(list)),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{list:?} is refused"
+        );
+    }
+    assert!(
+        only_gets(&fake),
+        "only reads were sent: {:?}",
+        fake.requests()
+    );
+
+    let mut provider = provider;
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(granting("kbr"))
+        .expect("the project is created with the grant");
+    let config = read(&fake, "/1.0/projects/kfam")["config"].clone();
+    assert_eq!(
+        config["restricted.networks.access"],
+        json!("kbr"),
+        "{config}"
+    );
+    assert_eq!(config["restricted"], json!("true"), "{config}");
+    assert!(
+        config.get("features.networks").is_none(),
+        "the kernel project does not set features.networks: {config}"
+    );
+}
+
+#[test]
+fn a_forward_is_made_only_on_a_network_the_entry_holds_in_default() {
+    let (scratch, fake) = start("forward-parent");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let on_foreign = create(
+        IncusKind::Forward,
+        "default",
+        Some("plainbr"),
+        "192.0.2.10",
+        json!({"config": {}}),
+    );
+    assert_eq!(
+        provider.plan(&entry("toy"), &on_foreign),
+        Err(EffectRefusal::NotOwned(OwnerClass::Foreign)),
+        "a forward on an unmarked bridge"
+    );
+    assert!(writes(&fake).is_empty());
+
+    let on_own = create(
+        IncusKind::Forward,
+        "default",
+        Some("kbr"),
+        "192.0.2.10",
+        json!({"config": {}}),
+    );
+    let planned = provider
+        .plan(&entry("toy"), &on_own)
+        .expect("a forward on the entry's own bridge plans");
+    provider
+        .effect(&entry("toy"), &on_own, &planned)
+        .expect("the forward is made under the entry's bridge");
+    assert_eq!(
+        writes(&fake),
+        vec![method_path(
+            "POST",
+            "/1.0/networks/kbr/forwards?project=default"
+        )]
+    );
 }

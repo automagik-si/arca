@@ -6,6 +6,9 @@
 //! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path, and
 //! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
 //!
+//! A network and a forward are served from the default project unless their project enables `features.networks`, as Incus serves
+//! them. A restricted project refuses an instance whose NIC names a network that its `restricted.networks.access` does not list.
+//!
 //! Writes: a POST to a collection creates an object, a PATCH or DELETE changes or removes one. These cover projects and the
 //! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance and a volume
 //! get a uuid, in their `volatile.uuid` key; no other kind has one. Each object's ETag is a digest of its JSON. A PATCH whose
@@ -47,6 +50,8 @@ pub struct FakeState {
     pub projects: Vec<Value>,
     pub instances: Vec<Value>,
     pub pools: Vec<(String, Value)>,
+    /// The networks Incus holds. Each names its project, which is `default` for a bridge the host keeps there.
+    pub networks: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +61,8 @@ struct StateFile {
     projects: Vec<Value>,
     instances: Vec<Value>,
     pools: Vec<PoolFile>,
+    #[serde(default)]
+    networks: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -66,7 +73,7 @@ struct PoolFile {
 }
 
 impl FakeState {
-    /// Reads a state file: `server`, `projects`, `instances`, and `pools` as `{name, resources}` objects.
+    /// Reads a state file: `server`, `projects`, `instances`, `pools` as `{name, resources}` objects, and the optional `networks`.
     pub fn load(path: &Path) -> io::Result<FakeState> {
         let bytes = fs::read(path)?;
         let file: StateFile = serde_json::from_slice(&bytes).map_err(|_| {
@@ -84,6 +91,7 @@ impl FakeState {
                 .into_iter()
                 .map(|pool| (pool.name, pool.resources))
                 .collect(),
+            networks: file.networks,
         })
     }
 }
@@ -196,6 +204,20 @@ impl Shared {
             let name = text_of(&body, "name");
             objects.push(Stored {
                 kind: "instance".to_string(),
+                project,
+                name,
+                parent: String::new(),
+                body,
+            });
+        }
+        for body in state.networks {
+            let project = match text_of(&body, "project") {
+                project if project.is_empty() => DEFAULT_PROJECT.to_string(),
+                project => project,
+            };
+            let name = text_of(&body, "name");
+            objects.push(Stored {
+                kind: "network".to_string(),
                 project,
                 name,
                 parent: String::new(),
@@ -555,6 +577,11 @@ fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, Value) {
     let mut guard = lock(&shared.store);
     let store: &mut Store = &mut guard;
+    let route = match route {
+        Route::Collection(address) => Route::Collection(store.served_from(address)),
+        Route::Object(address) => Route::Object(store.served_from(address)),
+        other => other,
+    };
     match (request.method.as_str(), route) {
         ("GET", Route::Server) => sync(store.server.clone()),
         ("GET", Route::ListProjects) => sync(Value::Array(store.bodies("project"))),
@@ -620,6 +647,65 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
 }
 
 impl Store {
+    /// The address a network or a forward is served at. Incus serves a project that does not enable `features.networks` the
+    /// networks of the default project, so such an address is moved there. An address whose project does not exist is kept, and
+    /// answers as Incus answers a missing project.
+    fn served_from(&self, mut address: Address) -> Address {
+        if !matches!(address.kind, "network" | "forward") || address.project == DEFAULT_PROJECT {
+            return address;
+        }
+        let Some(project) = self
+            .objects
+            .iter()
+            .find(|object| object.kind == "project" && object.project == address.project)
+        else {
+            return address;
+        };
+        let enables = project
+            .body
+            .get("config")
+            .and_then(|config| config.get("features.networks"))
+            .and_then(Value::as_str)
+            == Some("true");
+        if !enables {
+            address.project = DEFAULT_PROJECT.to_string();
+        }
+        address
+    }
+
+    /// The project's own config, when the project exists.
+    fn project_config(&self, name: &str) -> Option<&Map<String, Value>> {
+        self.objects
+            .iter()
+            .find(|object| object.kind == "project" && object.project == name)
+            .and_then(|object| object.body.get("config"))
+            .and_then(Value::as_object)
+    }
+
+    /// The reason an instance body is refused by its project's restriction, when a NIC names a network the project does not
+    /// list in `restricted.networks.access`. A project that is not restricted lists nothing and refuses nothing.
+    fn restricted_nic(&self, project: &str, body: &Map<String, Value>) -> Option<&'static str> {
+        let config = self.project_config(project)?;
+        if config.get("restricted").and_then(Value::as_str) != Some("true") {
+            return None;
+        }
+        let granted: Vec<&str> = config
+            .get("restricted.networks.access")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .split(',')
+            .collect();
+        let devices = body.get("devices").and_then(Value::as_object)?;
+        let refused = devices.values().any(|device| {
+            device.get("type").and_then(Value::as_str) == Some("nic")
+                && device
+                    .get("network")
+                    .and_then(Value::as_str)
+                    .is_some_and(|network| !granted.contains(&network))
+        });
+        refused.then_some("the project may not use the network")
+    }
+
     fn find(&self, address: &Address) -> Option<usize> {
         self.objects.iter().position(|object| {
             object.kind == address.kind
@@ -690,6 +776,11 @@ fn create(
     } else {
         address.project.clone()
     };
+    if kind == "instance"
+        && let Some(reason) = store.restricted_nic(&project, &body)
+    {
+        return (403, String::new(), error_envelope(403, reason));
+    }
     let parent = address.parent.clone();
     if matches!(kind, "volume" | "bucket") && !store.pools.iter().any(|(pool, _)| *pool == parent) {
         return (
@@ -961,6 +1052,7 @@ fn reason(status: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         202 => "Accepted",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
