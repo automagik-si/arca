@@ -278,7 +278,7 @@ pub(crate) fn valid_target(text: &str) -> bool {
 }
 
 /// Whether `text` is between `min` and `max` lowercase hex digits.
-fn valid_hex(text: &str, min: usize, max: usize) -> bool {
+pub(crate) fn valid_hex(text: &str, min: usize, max: usize) -> bool {
     (min..=max).contains(&text.len())
         && text
             .bytes()
