@@ -183,8 +183,8 @@ of the object the read-back showed. For a kind that carries a uuid (an instance 
 other kind it names the object by kind, project, parent and name, with no uuid: a delete by name. The kernel accepts a create's
 inverse only when the uuid it names is present exactly for the kinds that carry one (`required_inverse`). A create whose
 read-back does not fit its kind is refused by the kernel, and its intent stays open. A patch's inverse is an `IncusRestoreConfig`
-built from the pre-image read at plan time, where a key that was absent restores as absent. The pre-image holds a secret
-reference where the value is a secret's content (Rule 32). The inverse names the object exactly as the op named it, so a by-name
+built from the pre-image read at plan time, where a key that was absent restores as absent, and a key Rule 32 redacts restores as absent. The pre-image
+holds a secret reference where the value is a secret's content (Rule 32). The inverse names the object exactly as the op named it, so a by-name
 patch gets a by-name restore that the kernel's check accepts. The uuid the read-back showed guards the write only and is not
 carried into the inverse.
 Source: `arca_kernel::journal::Inverse`; `required_inverse` in `crates/arca-kernel/src/plugin.rs`; test
@@ -253,33 +253,52 @@ file must be a regular file, not a symlink, mode `0600`, owned by the provider's
 fails a rule is refused at plan. While the secrets directory fails the rule, nothing is read from it and no secret is known. The
 plan and the effect each read the file, so a file that changed between them is read again at the effect. The request carries the
 content.
-The journal never holds a secret's content. A pre-image value equal to a current secret's content is journalled as its reference.
-A patch that replaces a value which is no current secret is refused at plan, and again at the effect, since the journal would
-otherwise hold that value in plain text. No plan names a redacted pre-image that could hold it instead. The cost: a patch cannot
-replace a plain config value, and a patch that set a plain value cannot be reverted by its own inverse, because the restore
-replaces that value. Patches that link or unlink a secret are not affected.
-Source: `IncusProvider::{read_secret, secrets_root_private, secrets_by_value, pre_image_of}` and `secret_reference` in
-`crates/arca-providers/src/incus.rs`; tests `a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journalled`,
+
+The journal's pre-image is chosen key by key. For each changed key that the object holds a value for:
+
+- A value equal to a current secret's content is journalled as that secret's reference, for a plain key and a secret key alike.
+- A key the patch sets to a secret reference, whose value is no current secret, is journalled as `None`, a redacted marker. Its
+  inverse removes the key. Undoing a rotated secret therefore removes the key; it does not restore the old value. This is the
+  cost of the rule. A failed patch of such a key settles as `Unresolved`, since the marker cannot show the old value.
+- Any other value, on a plain key (the new value is not a secret reference, and a removal counts as plain), is journalled as it
+  is, so its inverse restores it. A value that starts with the reference prefix and matches no current secret is refused at plan
+  and again at the effect, since an inverse that restored it would read it as a reference.
+
+Residual, LOW: if a secret has been rotated away, and a plain patch or a removal lands on a key that still holds the old content,
+that content is journalled raw, because no current secret matches it. The journal never holds it as a reference in that case.
+Source: `IncusProvider::{read_secret, secrets_root_private, secrets_by_value, pre_image_of}`, `secret_reference` and `is_reference`
+in `crates/arca-providers/src/incus.rs`; tests `a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journalled`,
 `a_patch_that_clears_a_key_holding_a_secret_journals_the_reference_as_its_pre_image`,
-`a_patch_that_replaces_a_secret_whose_file_was_rotated_is_refused_and_the_old_value_is_not_journalled`,
-`a_patch_that_replaces_a_plain_value_is_refused_and_the_value_is_not_journalled`,
+`a_patch_that_rotates_a_secret_journals_no_value_and_its_inverse_removes_the_key`,
+`a_patch_that_sets_a_key_holding_a_current_secret_to_a_plain_value_journals_the_reference`,
+`a_plain_patch_journals_a_removal_inverse_that_runs_as_a_patch`,
+`a_plain_value_that_a_patch_replaces_is_journalled_as_it_is_and_its_inverse_restores_it`,
+`a_landed_plain_patch_can_be_planned_again`,
+`a_plain_patch_over_a_reference_shaped_value_that_no_secret_matches_is_refused_and_nothing_is_written`,
 `a_secret_reference_that_is_not_a_valid_name_or_has_no_file_is_refused_at_plan`,
 `a_secret_file_that_is_a_symlink_or_is_not_mode_0600_is_refused_at_plan` and
-`a_secrets_directory_that_is_a_symlink_or_is_readable_by_others_is_refused_at_plan`.
+`a_secrets_directory_that_is_a_symlink_or_is_readable_by_others_is_refused_at_plan`, all in
+`crates/arca-providers/tests/incus_provider.rs`.
 
 **Rule 33.** A write that may have landed is settled by reading the object, and the outcome says which way it went. A refusal
 before any write (`IncusError::Refused`) fails the effect. A create is recorded as failed only when Incus answered with a status
 error and a GET of its name then answers 404. Any other failure of a create, namely a transport error, an undecodable answer, a
-timeout, an oversized answer, or a failed wait without a status, is `EffectRefusal::Unresolved`, and the intent stays open. A
-patch answered 412 is `Stale` and changes nothing. A patch that Incus answered with another error is settled by a read-back: a read
-that shows the change has landed, a read that shows the pre-image has not, and anything else is `Unresolved`. A timeout or an
-unconfirmed write is `Unresolved` without a read, since the writer has already read back.
-Source: `IncusProvider::{settle_create, settle_patch}` in `crates/arca-providers/src/incus.rs`; tests
-`a_create_whose_answer_is_an_error_and_whose_read_back_finds_nothing_is_a_failed_effect`,
+timeout, an oversized answer, or a wait whose answer is not the operation's status (including an HTTP error answer to the wait
+request itself), is `EffectRefusal::Unresolved`, and the intent stays open. A patch answered 412 is `Stale` and changes nothing.
+A patch that Incus answered with another status error is settled by a read-back: a read that shows the change has landed, a
+read that shows the pre-image has not, and anything else is `Unresolved`. A patch whose answer could not be read (an I/O or a
+decode error), a timeout and an unconfirmed write are `Unresolved` without a read, since a read taken while an operation still
+runs proves nothing.
+Source: `IncusProvider::{settle_create, settle_patch}` in `crates/arca-providers/src/incus.rs` and `UnixIncusWriter::wait_on` in
+`crates/arca-incus/src/write.rs`; tests `a_create_whose_answer_is_an_error_and_whose_read_back_finds_nothing_is_a_failed_effect`,
 `a_create_that_timed_out_stays_open_even_when_the_read_back_finds_nothing`,
 `a_create_whose_wait_fails_without_an_answer_stays_unresolved_when_the_name_is_free`,
+`a_create_whose_wait_answers_an_error_stays_unresolved_when_the_name_is_free`,
 `a_create_whose_answer_is_garbled_stays_unresolved_when_the_name_is_free`,
-`a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` and `a_patch_answered_412_is_stale_and_not_unresolved`.
+`a_create_whose_read_back_finds_an_object_is_unresolved_not_failed`,
+`a_patch_whose_answer_is_an_io_error_is_unresolved_and_is_not_read_back` and `a_patch_answered_412_is_stale_and_not_unresolved`
+in `crates/arca-providers/tests/incus_provider.rs`, and
+`a_wait_whose_own_answer_is_an_http_error_is_not_the_operations_status` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 34.** A retirement runs only through `IncusProvider::retire`, under an approved plan digest. An instance or a volume is
 named by its uuid, so a retirement that names none is refused before any request. The object is read, and it must be the entry's

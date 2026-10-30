@@ -4,7 +4,8 @@
 //! family, the features, the ownership and the plan again before it applies anything. `docs/OWNERSHIP.md` states the rules.
 //!
 //! A write that Incus answered with an error, or that did not finish, may still have landed. The provider reads the object back
-//! before it decides the outcome. It reports a failure only when the object shows the write did not happen, and reports
+//! before it decides the outcome, unless the answer could not be read at all: then it makes no read, since a read after a write
+//! still running proves nothing. It reports a failure only when the object shows the write did not happen, and reports
 //! [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
 
 use std::collections::BTreeMap;
@@ -13,6 +14,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -462,9 +464,11 @@ impl IncusProvider {
         })
     }
 
-    /// The pre-image of a patch: for each changed key, the value the object holds now, as a secret reference where the value is a
-    /// current secret's content, and `None` where the object holds no value. A value that is no current secret is refused. The
-    /// journal would hold it in plain text, and no plan names a redacted pre-image to hold it by.
+    /// The pre-image of a patch, as the journal holds it. For each changed key the object holds a value, that value is journalled
+    /// as a current secret's reference when its content is one, and otherwise as the value itself, which the inverse restores.
+    /// A key the patch sets to a secret reference, and whose value is no current secret, is journalled as `None`: a redacted
+    /// marker whose inverse removes the key. A key the object does not hold is `None`. A value that starts with the reference
+    /// prefix and matches no current secret is refused, since an inverse that restored it would read it as a reference.
     fn pre_image_of(
         &self,
         changes: &BTreeMap<String, Option<String>>,
@@ -472,15 +476,20 @@ impl IncusProvider {
     ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
         let secrets = self.secrets_by_value();
         let mut pre_image = BTreeMap::new();
-        for key in changes.keys() {
+        for (key, new) in changes {
             let value = match current.get(key) {
                 None => None,
-                Some(text) => Some(secret_reference(text, &secrets).ok_or_else(|| {
-                    EffectRefusal::Provider(
-                        "the patch replaces a value that is not a current secret; the journal would hold that value in plain text"
-                            .to_string(),
-                    )
-                })?),
+                Some(text) => match secret_reference(text, &secrets) {
+                    Some(reference) => Some(reference),
+                    None if new.as_deref().is_some_and(is_reference) => None,
+                    None if is_reference(text) => {
+                        return Err(EffectRefusal::Provider(
+                            "the patch replaces a value that names a secret which no current secret matches; the journal could not restore it"
+                                .to_string(),
+                        ));
+                    }
+                    None => Some(text.clone()),
+                },
             };
             pre_image.insert(key.clone(), value);
         }
@@ -654,8 +663,10 @@ impl IncusProvider {
     }
 
     /// The settled outcome of a patch whose request failed. A refusal before the write is final. A 412 is a stale plan, and changes
-    /// nothing. A patch the read-back shows is landed; a patch the read-back shows without its change did not land; anything else
-    /// is unresolved. The read-back's uuid is used only for the writer's own checks, so the answer names the object as the op did.
+    /// nothing. An answer that could not be read, an unconfirmed write and a timeout are unresolved with no read-back: an operation
+    /// still running can apply after a read that shows the pre-image. Any other error is settled by a read-back. A patch the
+    /// read-back shows is landed; a patch the read-back shows without its change did not land; anything else is unresolved. The
+    /// read-back's uuid is used only for the writer's own checks, so the answer names the object as the op did.
     fn settle_patch(
         &self,
         entry: &EntryId,
@@ -668,9 +679,10 @@ impl IncusProvider {
         match error {
             IncusError::Refused(reason) => Err(EffectRefusal::Provider(reason)),
             IncusError::Status { code: 412, .. } => Err(EffectRefusal::Stale),
-            IncusError::AppliedUnconfirmed(_) | IncusError::Timeout => {
-                Err(EffectRefusal::Unresolved)
-            }
+            IncusError::AppliedUnconfirmed(_)
+            | IncusError::Timeout
+            | IncusError::Io(_)
+            | IncusError::Decode(_) => Err(EffectRefusal::Unresolved),
             _ => {
                 let Ok(reading) = writer.read_class(object) else {
                     return Err(EffectRefusal::Unresolved);
@@ -1160,12 +1172,18 @@ fn plain_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
 }
 
-/// The reference of the current secret whose content is `value`, when one is.
+/// The reference of the current secret whose content is `value`, when one is. A match is equal content: equal bytes have equal
+/// sha256 digests, and the provider already holds the content it compares against.
 fn secret_reference(value: &str, secrets: &[(String, String)]) -> Option<String> {
     secrets
         .iter()
         .find(|(_, content)| content == value)
         .map(|(reference, _)| reference.clone())
+}
+
+/// Whether a config value names a secret file rather than being the value itself.
+fn is_reference(text: &str) -> bool {
+    text.starts_with(SECRET_PREFIX)
 }
 
 /// Why a bridge config key is refused. The text names the rule and never a value.
@@ -1214,13 +1232,20 @@ fn incus_refusal(error: IncusError) -> EffectRefusal {
     }
 }
 
+/// The sequence every uid probe's directory name carries. Two probes that read the same clock value still name different directories.
+static UID_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// The uid this process runs as, read from the owner of a file it creates now in a fresh directory. No libc call is needed.
 fn process_uid() -> Result<u32, EffectRefusal> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.subsec_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("arca-uid-{}-{nanos}", std::process::id()));
+    let sequence = UID_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "arca-uid-{}-{nanos}-{sequence}",
+        std::process::id()
+    ));
     fs::create_dir(&dir)
         .map_err(|_| EffectRefusal::Provider("the uid probe failed".to_string()))?;
     let made = File::create_new(dir.join("uid")).and_then(|file| file.metadata());

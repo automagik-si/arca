@@ -1258,6 +1258,23 @@ fn every_error_after_a_sent_write_is_something_other_than_refused() {
 }
 
 #[test]
+fn a_wait_whose_own_answer_is_an_http_error_is_not_the_operations_status() {
+    // The operation's status is read from the wait's metadata. An HTTP error on the wait request is not that status, so it is
+    // not reported as one.
+    let canned = Canned::start("wait-http-500", |method, target| {
+        if method == "POST" {
+            return reply(202, "", &accepted_post());
+        }
+        if target.contains("/wait") {
+            return error_reply(500, "the wait failed");
+        }
+        not_found()
+    });
+    let error = error_after_sent_post(&canned, "wh5");
+    assert!(matches!(error, IncusError::Decode(_)), "{error:?}");
+}
+
+#[test]
 fn a_delete_is_refused_when_the_tombstone_was_removed_after_it_was_set() {
     let (_dir, fake) = start("tombstone-gone");
     let writer = writer(&fake, "toy");

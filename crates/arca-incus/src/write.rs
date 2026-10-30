@@ -511,8 +511,9 @@ impl UnixIncusWriter {
     }
 
     /// Waits on operation `id` until it ends or the writer's deadline passes. Only status code 200 with the status `Success`
-    /// is done. A running code (1xx) is waited on again. A 4xx or 5xx is the operation's own failure, and any other code is
-    /// a failure too.
+    /// is done. A running code (1xx) is waited on again. A 4xx or 5xx in the operation's metadata is the operation's own failure,
+    /// and any other code is a failure too. An error answer to the wait request itself is not the operation's status: it is a
+    /// decode failure, so the outcome of the write stays unknown.
     fn wait_on(&self, id: &str) -> Result<(), IncusError> {
         let started = Instant::now();
         loop {
@@ -521,7 +522,12 @@ impl UnixIncusWriter {
             }
             let path = format!("/1.0/operations/{id}/wait?timeout={WAIT_SECONDS}");
             let framed = self.send_within("GET", &path, None, None, WAIT_TIMEOUT)?;
-            let answer = checked_envelope(&framed.into_raw())?;
+            let answer = checked_envelope(&framed.into_raw()).map_err(|error| match error {
+                IncusError::Status { .. } => {
+                    decode("the wait answered without the operation's status")
+                }
+                other => other,
+            })?;
             let operation = answer
                 .get("metadata")
                 .and_then(Value::as_object)

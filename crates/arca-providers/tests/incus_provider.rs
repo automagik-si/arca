@@ -2,14 +2,14 @@
 //! Every refusal is checked twice: the provider returns the refusal, and the server sees no write. No test touches a real Incus
 //! socket, and every scratch directory is under the default temporary directory.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +17,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arca_incus::{FakeIncus, FakeState, IncusRead, UnixIncus};
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
-use arca_kernel::journal::{EffectClass, EffectState, FileJournal, Inverse, Journal, MemJournal};
+use arca_kernel::journal::{
+    EffectClass, EffectState, FileJournal, Inverse, Journal, JournalStore, MemJournal,
+};
 use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass};
 use arca_kernel::plugin::{
     Ctx, EffectOp, EffectRefusal, Manifest, Observe, Planned, Provider, op_digest,
@@ -38,6 +40,9 @@ const SECRET_VALUE: &str = "SECRET-VALUE-7731";
 const READ_UUID: &str = "00000000-0000-4000-8000-0000000000e1";
 const OTHER_UUID: &str = "00000000-0000-4000-8000-0000000000e2";
 
+/// The process-wide sequence every scratch directory name carries. Two directories made in one clock tick still differ.
+static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// A fresh directory under the default temporary directory, removed when the test ends.
 struct Scratch(PathBuf);
 
@@ -47,8 +52,11 @@ impl Scratch {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .subsec_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("arca-prov-{}-{nanos}-{tag}", std::process::id()));
+        let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "arca-prov-{}-{nanos}-{seq}-{tag}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).expect("create the scratch directory");
         Scratch(dir)
     }
@@ -236,6 +244,57 @@ fn write_secret(dir: &Path, name: &str, value: &str) {
 // ---------------------------------------------------------------------------------------------------------------------------
 // Construction
 // ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn concurrent_constructions_never_collide_on_the_uid_probe() {
+    // The uid probe names its directory from the pid and the clock. Two constructions that read the same clock value would name
+    // the same directory, and the second would be refused. The name carries a process-wide sequence, so no two probes share it.
+    let failures = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<JoinHandle<()>> = (0..32)
+        .map(|_| {
+            let failures = Arc::clone(&failures);
+            thread::spawn(move || {
+                for _ in 0..200 {
+                    let built = IncusProvider::new(
+                        PathBuf::from("/nonexistent/probe.sock"),
+                        family(),
+                        PathBuf::from("/nonexistent/secrets"),
+                        RetainedSet::empty(),
+                    );
+                    if built.is_err() {
+                        failures.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("a construction thread");
+    }
+    let refused = failures.load(Ordering::SeqCst);
+    assert_eq!(
+        refused, 0,
+        "constructions the uid probe refused: {refused} of 6400"
+    );
+}
+
+#[test]
+fn concurrent_scratch_directories_are_distinct() {
+    // Two scratch directories with one tag, made in one clock tick, would be one directory, and dropping either would remove both.
+    let threads: Vec<JoinHandle<Vec<Scratch>>> = (0..32)
+        .map(|_| thread::spawn(move || (0..200).map(|_| Scratch::new("same-tag")).collect()))
+        .collect();
+    let mut made: Vec<Scratch> = Vec::new();
+    for thread in threads {
+        made.extend(thread.join().expect("a scratch thread"));
+    }
+    let distinct: BTreeSet<&PathBuf> = made.iter().map(|scratch| &scratch.0).collect();
+    assert_eq!(
+        distinct.len(),
+        made.len(),
+        "scratch directories share a name"
+    );
+}
 
 #[test]
 fn a_family_that_names_bench_or_default_is_refused_at_construction() {
@@ -742,7 +801,7 @@ fn host_addresses_collects_inet_and_inet6_and_reads_only_the_listing_and_each_st
             "eth0".to_string(),
             vec![
                 "203.0.113.5".parse::<IpAddr>().unwrap(),
-                "fd00::5".parse().unwrap(),
+                "2001:db8::5".parse().unwrap(),
             ],
         ),
         ("br0".to_string(), vec!["192.0.2.1".parse().unwrap()]),
@@ -752,7 +811,7 @@ fn host_addresses_collects_inet_and_inet6_and_reads_only_the_listing_and_each_st
     found.sort();
     let mut expected: Vec<IpAddr> = vec![
         "203.0.113.5".parse().unwrap(),
-        "fd00::5".parse().unwrap(),
+        "2001:db8::5".parse().unwrap(),
         "192.0.2.1".parse().unwrap(),
     ];
     expected.sort();
@@ -1809,6 +1868,114 @@ fn a_create_whose_answer_is_garbled_stays_unresolved_when_the_name_is_free() {
     );
 }
 
+#[test]
+fn a_create_whose_wait_answers_an_error_stays_unresolved_when_the_name_is_free() {
+    // The wait request itself is answered 500, so the operation's status is unknown. The name is free, but that says nothing
+    // about a create that may still be running.
+    let script = Script::start("create-wait-500", move |method, target| {
+        if method == "POST" {
+            return http(
+                202,
+                None,
+                &json!({"type": "async", "status": "Operation created", "status_code": 100, "operation": "/1.0/operations/00000000-0000-4000-8000-0000000000ad", "error_code": 0, "error": "", "metadata": null}),
+            );
+        }
+        if target.contains("/wait") {
+            return http(500, None, &error_env(500));
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("secrets-wait-500");
+    let mut provider = script.provider(&secrets.0);
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "c6",
+        json!({"config": {MARK: "toy"}}),
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    assert_eq!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Unresolved)
+    );
+    assert_eq!(script.count("POST"), 1);
+}
+
+/// Answers one connection of a patch test. A GET of the object is answered with the object as it stands. A PATCH's head is read
+/// and then the connection is dropped with its body unread, so the client's read of the answer fails with a reset.
+fn serve_patch_then_drop(mut stream: UnixStream, seen: &Mutex<Vec<(String, String)>>) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return,
+        }
+    }
+    let text = String::from_utf8_lossy(&head).into_owned();
+    let mut parts = text.lines().next().unwrap_or("").split(' ');
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("").to_string();
+    seen.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((method.clone(), target.clone()));
+    if method == "PATCH" {
+        return;
+    }
+    let reply = if method == "GET" && target == "/1.0/instances/io1?project=svc" {
+        object_reply(&instance_meta(json!({MARK: "toy"})), "\"e1\"")
+    } else {
+        not_found()
+    };
+    let _ = stream.write_all(&reply);
+}
+
+#[test]
+fn a_patch_whose_answer_is_an_io_error_is_unresolved_and_is_not_read_back() {
+    // The object still shows its pre-image, which a read-back would report as "did not land". An I/O error says nothing about the
+    // write, since an operation still running can apply after such a read, so the outcome is unresolved and no read follows.
+    let dir = Scratch::new("patch-io");
+    let socket = dir.0.join("patch-io.sock");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    listener.set_nonblocking(true).expect("non-blocking");
+    let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let seen = Arc::clone(&seen);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => serve_patch_then_drop(stream, &seen),
+                    Err(_) => thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        })
+    };
+    let secrets = Scratch::new("secrets-patch-io");
+    let mut provider =
+        IncusProvider::new(socket, family(), secrets.0.clone(), RetainedSet::empty())
+            .expect("a valid family");
+    let op = patch(
+        object(IncusKind::Instance, "svc", None, "io1"),
+        &[("user.note", Some("x"))],
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    let result = provider.effect(&entry("toy"), &op, &planned);
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("the server thread");
+    assert_eq!(result, Err(EffectRefusal::Unresolved));
+    let seen = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert_eq!(
+        seen.last().map(|(method, _)| method.as_str()),
+        Some("PATCH"),
+        "no read-back followed the I/O error: {seen:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------------------------------------
 // Bridges: only the keys the plan's bridges set, and no reserved route, external interface or raw key
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -1893,63 +2060,92 @@ fn a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch() 
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
-// Secret rotation and plain values: the journal never holds a replaced value that is not a current secret
+// Plain patches and secret rotation: a plain value is journalled as it is, a secret's content never is, and an inverse is a patch
 // ---------------------------------------------------------------------------------------------------------------------------
 
+/// The restore a journal holds for the object's patch: the first restore record in the entry's live records.
+fn journalled_restore<S: JournalStore>(
+    journal: &Journal<S>,
+    entry_name: &str,
+) -> BTreeMap<String, Option<String>> {
+    journal
+        .live(&entry(entry_name))
+        .into_iter()
+        .find_map(|r| match r.inverse {
+            Some(Inverse::IncusRestoreConfig { config, .. }) => Some(config),
+            _ => None,
+        })
+        .expect("the patch is journalled with its restore")
+}
+
 #[test]
-fn a_patch_that_replaces_a_secret_whose_file_was_rotated_is_refused_and_the_old_value_is_not_journalled()
- {
-    let (scratch, fake) = start("rotation");
+fn a_plain_patch_journals_a_removal_inverse_that_runs_as_a_patch() {
+    let (scratch, fake) = start("plain-add");
     let secrets = secrets_dir(&scratch);
-    write_secret(&secrets, "t1", SECRET_VALUE);
     let mut provider = provider(&fake, &secrets);
     let manifest = manifest();
-    let journal_path = scratch.0.join("journal.jsonl");
-    let mut journal =
-        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
         .effect(create(
             IncusKind::Instance,
             "svc",
             None,
-            "rot1",
-            json!({"config": {MARK: "toy", "user.key": format!("{SECRET_PREFIX}t1")}}),
+            "pa1",
+            json!({"config": {MARK: "toy"}}),
         ))
         .expect("the create applies");
-    // The file is rotated. The object still holds the old content, which no current secret file holds.
-    write_secret(&secrets, "t1", "SECRET-VALUE-ROTATED");
     let target = ObjectRef {
         uuid: made.uuid.clone(),
         ..made
     };
-    let refused = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
-        .effect(patch(target, &[("user.key", None)]));
-    assert!(
-        matches!(refused, Err(EffectRefusal::Provider(_))),
-        "{refused:?}"
-    );
-    let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
-    assert!(
-        !on_disk.contains(SECRET_VALUE),
-        "the replaced value is not in the journal"
-    );
-    assert!(
-        writes(&fake).iter().all(|(method, _)| method != "PATCH"),
-        "no patch was sent: {:?}",
-        writes(&fake)
-    );
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(target.clone(), &[("user.note", Some("plain"))]))
+        .expect("the plain patch lands");
+    let restore = journalled_restore(&journal, "toy");
+    assert_eq!(restore, changes(&[("user.note", None)]));
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 3)
+        .effect(EffectOp::IncusPatchConfig {
+            object: target.clone(),
+            config: restore,
+        })
+        .expect("the inverse runs as a patch");
+    let path = format!("/1.0/instances/{}?project=svc", target.name);
+    assert!(read(&fake, &path)["config"]["user.note"].is_null());
 }
 
 #[test]
-fn a_patch_that_replaces_a_plain_value_is_refused_and_the_value_is_not_journalled() {
+fn a_landed_plain_patch_can_be_planned_again() {
+    let (scratch, fake) = start("plain-replan");
+    let secrets = secrets_dir(&scratch);
+    let mut provider = provider(&fake, &secrets);
+    let op = patch(
+        object(IncusKind::Instance, "svc", None, "k1"),
+        &[("user.note", Some("plain"))],
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("the first plan");
+    provider
+        .effect(&entry("toy"), &op, &planned)
+        .expect("the patch lands");
+    let replanned = provider
+        .plan(&entry("toy"), &op)
+        .expect("a patch that already landed plans again");
+    assert_eq!(
+        replanned.pre_image,
+        Some(changes(&[("user.note", Some("plain"))]))
+    );
+    provider
+        .effect(&entry("toy"), &op, &replanned)
+        .expect("and applies again");
+}
+
+#[test]
+fn a_plain_value_that_a_patch_replaces_is_journalled_as_it_is_and_its_inverse_restores_it() {
     const OLD: &str = "PLAIN-OLD-VALUE-7713";
     let (scratch, fake) = start("plain-old");
     let secrets = secrets_dir(&scratch);
     let mut provider = provider(&fake, &secrets);
     let manifest = manifest();
-    let journal_path = scratch.0.join("journal.jsonl");
-    let mut journal =
-        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
         .effect(create(
             IncusKind::Instance,
@@ -1963,21 +2159,142 @@ fn a_patch_that_replaces_a_plain_value_is_refused_and_the_value_is_not_journalle
         uuid: made.uuid.clone(),
         ..made
     };
-    let refused = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
-        .effect(patch(target, &[("user.note", Some("new"))]));
-    assert!(
-        matches!(refused, Err(EffectRefusal::Provider(_))),
-        "{refused:?}"
-    );
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(target.clone(), &[("user.note", Some("new"))]))
+        .expect("the replacement lands");
+    let restore = journalled_restore(&journal, "toy");
+    assert_eq!(restore, changes(&[("user.note", Some(OLD))]));
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 3)
+        .effect(EffectOp::IncusPatchConfig {
+            object: target.clone(),
+            config: restore,
+        })
+        .expect("the inverse restores the old value");
+    let path = format!("/1.0/instances/{}?project=svc", target.name);
+    assert_eq!(read(&fake, &path)["config"]["user.note"], json!(OLD));
+}
+
+#[test]
+fn a_patch_that_rotates_a_secret_journals_no_value_and_its_inverse_removes_the_key() {
+    const ROTATED: &str = "SECRET-VALUE-ROTATED-4409";
+    let (scratch, fake) = start("rotation");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "t1", SECRET_VALUE);
+    let reference = format!("{SECRET_PREFIX}t1");
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let journal_path = scratch.0.join("journal.jsonl");
+    let mut journal =
+        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "rot1",
+            json!({"config": {MARK: "toy", "user.key": reference}}),
+        ))
+        .expect("the create applies");
+    // The file is rotated, and the entry sets the key to the reference again. The object holds the old content, which no
+    // secret file holds now.
+    write_secret(&secrets, "t1", ROTATED);
+    let target = ObjectRef {
+        uuid: made.uuid.clone(),
+        ..made
+    };
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(
+            target.clone(),
+            &[("user.key", Some(reference.as_str()))],
+        ))
+        .expect("the rotation applies");
     let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
     assert!(
-        !on_disk.contains(OLD),
-        "the replaced value is not journalled"
+        !on_disk.contains(SECRET_VALUE) && !on_disk.contains(ROTATED),
+        "the journal holds no secret value"
+    );
+    let restore = journalled_restore(&journal, "toy");
+    assert_eq!(
+        restore,
+        changes(&[("user.key", None)]),
+        "a redacted key restores as absent"
+    );
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 3)
+        .effect(EffectOp::IncusPatchConfig {
+            object: target.clone(),
+            config: restore,
+        })
+        .expect("the inverse runs as a patch");
+    let path = format!("/1.0/instances/{}?project=svc", target.name);
+    assert!(read(&fake, &path)["config"]["user.key"].is_null());
+}
+
+#[test]
+fn a_patch_that_sets_a_key_holding_a_current_secret_to_a_plain_value_journals_the_reference() {
+    const PLAIN: &str = "plain-after-7702";
+    let (scratch, fake) = start("secret-to-plain");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "t1", SECRET_VALUE);
+    let reference = format!("{SECRET_PREFIX}t1");
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let journal_path = scratch.0.join("journal.jsonl");
+    let mut journal =
+        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "sp1",
+            json!({"config": {MARK: "toy", "user.key": reference}}),
+        ))
+        .expect("the create applies");
+    let target = ObjectRef {
+        uuid: made.uuid.clone(),
+        ..made
+    };
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(target, &[("user.key", Some(PLAIN))]))
+        .expect("the plain value lands");
+    let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
+    assert!(
+        !on_disk.contains(SECRET_VALUE),
+        "the journal holds no secret value"
+    );
+    assert_eq!(
+        journalled_restore(&journal, "toy"),
+        changes(&[("user.key", Some(reference.as_str()))]),
+        "the old content is journalled as its reference"
+    );
+}
+
+#[test]
+fn a_plain_patch_over_a_reference_shaped_value_that_no_secret_matches_is_refused_and_nothing_is_written()
+ {
+    // A value that starts with the reference prefix and matches no secret would restore as a reference, so it is refused.
+    let mut state = state();
+    for instance in &mut state.instances {
+        if instance["name"] == "k1" {
+            instance["config"]["user.raw"] = json!(format!("{SECRET_PREFIX}absent"));
+        }
+    }
+    let scratch = Scratch::new("reference-shaped");
+    let fake = FakeIncus::start(&scratch.0, state).expect("start the fake");
+    let secrets = secrets_dir(&scratch);
+    let provider = provider(&fake, &secrets);
+    let op = patch(
+        object(IncusKind::Instance, "svc", None, "k1"),
+        &[("user.raw", Some("plain"))],
     );
     assert!(
-        writes(&fake).iter().all(|(method, _)| method != "PATCH"),
-        "no patch was sent"
+        matches!(
+            provider.plan(&entry("toy"), &op),
+            Err(EffectRefusal::Provider(_))
+        ),
+        "a reference-shaped value is not journalled as it is"
     );
+    assert!(writes(&fake).is_empty(), "nothing was written");
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
