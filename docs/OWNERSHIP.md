@@ -184,10 +184,13 @@ other kind it names the object by kind, project, parent and name, with no uuid: 
 inverse only when the uuid it names is present exactly for the kinds that carry one (`required_inverse`). A create whose
 read-back does not fit its kind is refused by the kernel, and its intent stays open. A patch's inverse is an `IncusRestoreConfig`
 built from the pre-image read at plan time, where a key that was absent restores as absent. The pre-image holds a secret
-reference where the value is a secret's content (Rule 32).
+reference where the value is a secret's content (Rule 32). The inverse names the object exactly as the op named it, so a by-name
+patch gets a by-name restore that the kernel's check accepts. The uuid the read-back showed guards the write only and is not
+carried into the inverse.
 Source: `arca_kernel::journal::Inverse`; `required_inverse` in `crates/arca-kernel/src/plugin.rs`; test
-`a_patch_records_the_pre_image_as_its_inverse` in `crates/arca-kernel/tests/plugin.rs`, and the name-keyed inverse tests in
-`crates/arca-kernel/tests/inverse_by_name.rs`.
+`a_patch_records_the_pre_image_as_its_inverse` in `crates/arca-kernel/tests/plugin.rs`, the name-keyed inverse tests in
+`crates/arca-kernel/tests/inverse_by_name.rs`, and `a_by_name_patch_of_an_instance_with_a_read_back_uuid_lands_and_its_inverse_names_the_op_object`
+in `crates/arca-providers/tests/incus_provider.rs`.
 
 **Rule 25.** Reads are open to every owner, and a read changes nothing. The watch report may read any class.
 Source: `UnixIncusWriter::get_etag` does not classify; the GET-only client `arca_incus::UnixIncus` sends only GET.
@@ -212,71 +215,107 @@ Source: `crates/arca-incus/Cargo.toml`, the `write` feature; `#[cfg(feature = "w
 ## Provider
 
 **Rule 29.** A write to an object that is not an instance or a project lands only in a project that enables the feature its kind
-needs: `features.networks` for a network, ACL, zone or forward; `features.profiles` for a profile; `features.storage.volumes` for
-a volume; `features.storage.buckets` for a bucket. The provider reads the project's config and refuses the write before any
-request when the key is not `"true"`. Without the key, Incus sends the write to the default project. The check runs for a
-create, a patch and a delete.
-Source: `IncusProvider::check_features` in `crates/arca-providers/src/incus.rs`; test
-`a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature` in
-`crates/arca-providers/tests/incus_provider.rs`.
+needs: `features.networks` for a network, ACL or forward; `features.networks.zones` for a network zone; `features.profiles` for a
+profile; `features.storage.volumes` for a volume; `features.storage.buckets` for a bucket. The provider reads the project's config
+and refuses the write when the key is not `"true"`. Without the key, Incus sends the write to the default project. The check runs
+for a create, a patch and a delete, and it is made before any write is sent. Reading the project's config is a GET.
+Source: `IncusProvider::check_features` in `crates/arca-providers/src/incus.rs`; tests
+`a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature` and
+`a_zone_write_is_refused_before_any_write_in_a_project_without_the_zones_key`, in `crates/arca-providers/tests/incus_provider.rs`.
 
-**Rule 30.** Every kernel project is created with `features.networks`, `features.profiles`, `features.storage.volumes` and
-`features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's mark. A project create that
-sets one of those keys another way is refused. A project is named by its own name.
-Source: `IncusProvider::prepared_create` (`PROJECT_KEYS`, `RESTRICTED_KEY`); tests
-`a_project_create_carries_the_mark_the_features_restricted_and_the_op_config` and
-`a_project_create_that_sets_a_kernel_key_another_way_is_refused`.
+**Rule 30.** Every kernel project is created with `features.networks`, `features.networks.zones`, `features.profiles`,
+`features.storage.volumes` and `features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's
+mark. A plugin may set a `restricted`, `restricted.*` or `features.*` key on a project create only to the value the kernel pins
+it at. Any other value is refused, and so is a key the kernel does not pin, whatever its value, so `restricted.containers.privilege`
+set to `allow` and `features.images` set to `false` are both refused. A project patch may not change any such key, whatever its
+value, and the refusal is made before any request. A project is named by its own name.
+Source: `IncusProvider::prepared_create` (`PROJECT_KEYS`, `RESTRICTED_KEY`, `guarded_project_key`) and `check_patch_keys`; tests
+`a_project_create_carries_the_mark_the_features_restricted_and_the_op_config`,
+`a_project_create_refuses_a_restricted_or_features_key_that_loosens_the_pinned_project`,
+`a_project_patch_refuses_every_restricted_or_features_key_before_any_request`,
+`a_project_create_that_sets_a_kernel_key_another_way_is_refused` and `a_project_create_carries_the_zones_key_pinned_to_true`.
 
 **Rule 31.** A kernel network is a bridge. Its `ipv6.address` is `none`, its `ipv4.address` is an IPv4 CIDR, and that range
-overlaps no reserved range. The test is overlap, not containment. A network patch meets the same rule for the config it leaves
-behind, so a patch cannot move a network into a reserved range.
-Source: `check_bridge_create` and `check_bridge_config` in `crates/arca-providers/src/incus.rs`; test
-`a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserved_range`.
+overlaps no reserved range. The test is overlap, not containment. The config keys a bridge may hold are an allowlist: the three
+that the plans' bridges set, `ipv4.address`, `ipv4.nat` and `ipv6.address`. Any other key is refused. That includes a route
+(`ipv4.routes` or `ipv6.routes`, whatever its range), `bridge.external_interfaces`, a `raw.*` key and the DNS keys, which no plan
+sets. The kernel's own mark is not a setting, so it is allowed. A network patch meets the same rules for the config it leaves
+behind, so a patch cannot move a network into a reserved range or add a refused key.
+Source: `check_bridge_create`, `check_bridge_config` and `BRIDGE_KEYS` in `crates/arca-providers/src/incus.rs`; tests
+`a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserved_range`,
+`a_bridge_key_outside_the_allowlist_or_a_route_external_interface_or_raw_key_is_refused_at_plan` and
+`a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch`.
 
 **Rule 32.** A config value that starts with `arca-secret:` names a secret file, and the value is never sent as the reference.
-The name must match `^[a-z0-9][a-z0-9/-]{0,127}$`. The file must be a regular file, not a symlink and not under a symlinked
-directory, mode `0600`, owned by the provider's own user, and at most 64 KiB. A reference that fails a rule is refused at plan.
-The plan and the effect each read the file, so a file that changed between them is read again at the effect. The request carries
-the content. The journal carries the reference, and a pre-image value equal to a secret's content is journalled as its
-reference. Residual risk: a pre-image value that equals no current secret file is journalled as the value, because the provider
-cannot name it by a reference. A value an object held before a patch can therefore reach the journal when no secret file holds it.
-Source: `IncusProvider::{read_secret, secrets_by_value, reference_for}` in `crates/arca-providers/src/incus.rs`; tests
-`a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journalled`,
+The name must match `^[a-z0-9][a-z0-9/-]{0,127}$`. The secrets directory must be a real directory, not a symlink, owned by the
+provider's own user, with no group or other permission bits. Each directory a name passes through must meet the same rule. The
+file must be a regular file, not a symlink, mode `0600`, owned by the provider's own user, and at most 64 KiB. A reference that
+fails a rule is refused at plan. While the secrets directory fails the rule, nothing is read from it and no secret is known. The
+plan and the effect each read the file, so a file that changed between them is read again at the effect. The request carries the
+content.
+The journal never holds a secret's content. A pre-image value equal to a current secret's content is journalled as its reference.
+A patch that replaces a value which is no current secret is refused at plan, and again at the effect, since the journal would
+otherwise hold that value in plain text. No plan names a redacted pre-image that could hold it instead. The cost: a patch cannot
+replace a plain config value, and a patch that set a plain value cannot be reverted by its own inverse, because the restore
+replaces that value. Patches that link or unlink a secret are not affected.
+Source: `IncusProvider::{read_secret, secrets_root_private, secrets_by_value, pre_image_of}` and `secret_reference` in
+`crates/arca-providers/src/incus.rs`; tests `a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journalled`,
 `a_patch_that_clears_a_key_holding_a_secret_journals_the_reference_as_its_pre_image`,
-`a_secret_reference_that_is_not_a_valid_name_or_has_no_file_is_refused_at_plan` and
-`a_secret_file_that_is_a_symlink_or_is_not_mode_0600_is_refused_at_plan`.
+`a_patch_that_replaces_a_secret_whose_file_was_rotated_is_refused_and_the_old_value_is_not_journalled`,
+`a_patch_that_replaces_a_plain_value_is_refused_and_the_value_is_not_journalled`,
+`a_secret_reference_that_is_not_a_valid_name_or_has_no_file_is_refused_at_plan`,
+`a_secret_file_that_is_a_symlink_or_is_not_mode_0600_is_refused_at_plan` and
+`a_secrets_directory_that_is_a_symlink_or_is_readable_by_others_is_refused_at_plan`.
 
 **Rule 33.** A write that may have landed is settled by reading the object, and the outcome says which way it went. A refusal
-before any write (`IncusError::Refused`) fails the effect. A create whose answer is an error fails only when a GET of its name
-answers 404. A timeout, an unconfirmed write, or a read that cannot settle the outcome is `EffectRefusal::Unresolved`, and the
-intent stays open. A patch answered 412 is `Stale` and changes nothing. A patch that Incus answered with another error is settled
-by a read-back: a read that shows the change has landed, a read that shows the pre-image has not, and anything else is
-`Unresolved`. A timeout or an unconfirmed write is `Unresolved` without a read, since the writer has already read back.
+before any write (`IncusError::Refused`) fails the effect. A create is recorded as failed only when Incus answered with a status
+error and a GET of its name then answers 404. Any other failure of a create, namely a transport error, an undecodable answer, a
+timeout, an oversized answer, or a failed wait without a status, is `EffectRefusal::Unresolved`, and the intent stays open. A
+patch answered 412 is `Stale` and changes nothing. A patch that Incus answered with another error is settled by a read-back: a read
+that shows the change has landed, a read that shows the pre-image has not, and anything else is `Unresolved`. A timeout or an
+unconfirmed write is `Unresolved` without a read, since the writer has already read back.
 Source: `IncusProvider::{settle_create, settle_patch}` in `crates/arca-providers/src/incus.rs`; tests
 `a_create_whose_answer_is_an_error_and_whose_read_back_finds_nothing_is_a_failed_effect`,
 `a_create_that_timed_out_stays_open_even_when_the_read_back_finds_nothing`,
+`a_create_whose_wait_fails_without_an_answer_stays_unresolved_when_the_name_is_free`,
+`a_create_whose_answer_is_garbled_stays_unresolved_when_the_name_is_free`,
 `a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` and `a_patch_answered_412_is_stale_and_not_unresolved`.
 
-**Rule 34.** A retirement runs only through `IncusProvider::retire`, under an approved plan digest. The object is read, and it must
-be the entry's own with the plan's uuid. The writer tombstones it under its ETag and reads it back. The object is read again, and
-it is deleted only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses,
-is `Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
+**Rule 34.** A retirement runs only through `IncusProvider::retire`, under an approved plan digest. An instance or a volume is
+named by its uuid, so a retirement that names none is refused before any request. The object is read, and it must be the entry's
+own with the plan's uuid. The writer tombstones it under its ETag and reads it back. The object is read again, and it is deleted
+only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
+`Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
 `Drift`, and the object stays tombstoned. The writer accepts a tombstone with the same plan again, so a later retirement under that
 plan can continue. A DELETE the writer refuses is drift; any other failure of the DELETE is `Unresolved`.
 Source: `IncusProvider::retire` in `crates/arca-providers/src/incus.rs`; tests
 `retire_tombstones_then_deletes_an_owned_instance_in_order`,
+`retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request`,
 `retire_skips_the_delete_as_drift_when_the_delete_read_back_shows_another_uuid`,
 `retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete` and `retire_stops_on_a_stale_etag_and_sends_no_delete`,
 all in `crates/arca-providers/tests/incus_provider.rs`.
+
+**Rule 35.** `effect` checks the plan again before it writes, since a plan may be made by hand. The plan's class must be the class
+its kind gives. A create's plan has no pre-image. A patch's pre-image is derived again from the object's config as the effect reads
+it, and must equal the plan's. A plan that names another class or another pre-image is refused with no write.
+Source: `IncusProvider::effect` and `pre_image_of`; test `an_effect_rechecks_the_class_and_the_pre_image_of_a_plan_made_by_hand`.
+
+**Rule 36.** The retained set is a required argument of `IncusProvider::new`, so a provider is never built without one. The
+empty set is written out as `RetainedSet::empty`. `RetainedSet` is a shared handle: every clone sees the same entries, and the
+provider reads the set at each plan, effect and retirement. An entry retained through any clone refuses that entry's writes from
+the next plan on, including after the provider has been boxed. A set whose lock is poisoned refuses every write. It is never read
+as empty.
+Source: `RetainedSet` and `IncusProvider::{new, writer}` in `crates/arca-providers/src/incus.rs`; tests
+`a_write_is_refused_once_the_retained_set_is_updated_through_a_handle_the_boxed_provider_shares` and
+`a_retained_entrys_object_is_refused_for_a_patch_and_a_retirement_and_nothing_is_written`.
 
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
 a separate rule set for the providers that own them.
 
-The retained set is supplied to the provider by a reconciler. Until a reconciler supplies it, the set is empty: an entry whose
-plan was declined is not known to the provider, and its objects classify as kernel-owned. The reconciler must supply the set
-before the provider writes for any entry.
+The retained set is a shared handle that a reconciler updates through a clone of it (Rule 36). A provider built with no set is not
+possible.
 
 ## Assumptions to confirm
 
@@ -300,3 +339,6 @@ must run before any live write.
   `"true"` first (Rule 29).
 - Incus accepts `restricted` and the four `features.*` keys on a project create (Rule 30).
 - Incus accepts `ipv6.address` set to `none` on a bridge create (Rule 31).
+- Incus accepts `ipv4.nat` on a bridge create, and reports a network's config with the keys that were set on it and no others.
+  A key Incus adds on read would refuse a patch of that network, which fails closed (Rule 31).
+- Incus accepts `features.networks.zones` on a project create and reports it in the project's config (Rule 30).

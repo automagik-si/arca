@@ -23,8 +23,8 @@ use arca_kernel::plugin::{
     Ctx, EffectOp, EffectRefusal, Manifest, Observe, Planned, Provider, op_digest,
 };
 use arca_providers::incus::{
-    DROIDD_PROJECTS_FIXED, Family, IncusProvider, Retirement, SECRET_PREFIX, host_addresses,
-    kind_path,
+    DROIDD_PROJECTS_FIXED, Family, IncusProvider, RetainedSet, Retirement, SECRET_PREFIX,
+    host_addresses, kind_path,
 };
 use serde_json::{Value, json};
 
@@ -118,8 +118,13 @@ fn start(tag: &str) -> (Scratch, FakeIncus) {
 }
 
 fn provider(fake: &FakeIncus, secrets: &Path) -> IncusProvider {
-    IncusProvider::new(fake.socket().to_path_buf(), family(), secrets.to_path_buf())
-        .expect("a valid family")
+    IncusProvider::new(
+        fake.socket().to_path_buf(),
+        family(),
+        secrets.to_path_buf(),
+        RetainedSet::empty(),
+    )
+    .expect("a valid family")
 }
 
 fn object(kind: IncusKind, project: &str, parent: Option<&str>, name: &str) -> ObjectRef {
@@ -241,6 +246,7 @@ fn a_family_that_names_bench_or_default_is_refused_at_construction() {
             PathBuf::from("/nonexistent/incus.sock"),
             bad,
             PathBuf::from("/nonexistent"),
+            RetainedSet::empty(),
         );
         assert!(
             matches!(result, Err(EffectRefusal::Provider(_))),
@@ -257,6 +263,7 @@ fn a_family_that_names_a_droidd_project_is_refused_at_construction() {
         PathBuf::from("/nonexistent/incus.sock"),
         bad,
         PathBuf::from("/nonexistent"),
+        RetainedSet::empty(),
     );
     assert!(
         matches!(result, Err(EffectRefusal::Provider(_))),
@@ -272,6 +279,7 @@ fn a_scratch_family_names_only_scratch_projects_and_a_bad_reserved_range_is_refu
         PathBuf::from("/nonexistent/incus.sock"),
         scratch.clone(),
         PathBuf::from("/nonexistent"),
+        RetainedSet::empty(),
     );
     assert!(
         matches!(result, Err(EffectRefusal::Provider(_))),
@@ -283,6 +291,7 @@ fn a_scratch_family_names_only_scratch_projects_and_a_bad_reserved_range_is_refu
         PathBuf::from("/nonexistent/incus.sock"),
         scratch.clone(),
         PathBuf::from("/nonexistent"),
+        RetainedSet::empty(),
     )
     .expect("a scratch family of scratch projects is accepted");
 
@@ -291,6 +300,7 @@ fn a_scratch_family_names_only_scratch_projects_and_a_bad_reserved_range_is_refu
         PathBuf::from("/nonexistent/incus.sock"),
         scratch,
         PathBuf::from("/nonexistent"),
+        RetainedSet::empty(),
     );
     assert!(
         matches!(result, Err(EffectRefusal::Provider(_))),
@@ -402,9 +412,13 @@ fn a_create_naming_another_entrys_mark_is_refused_before_any_write() {
 
 #[test]
 fn a_patch_journals_the_pre_image_read_at_plan_and_an_absent_key_restores_as_absent() {
-    // The object holds a=old and no b. The patch sets a=new and b=x, so the inverse restores a to old and removes b.
+    // The object holds a secret reference at a and no b. The patch sets a=new and b=x, so the inverse restores a to the reference
+    // and removes b. A value that is no secret cannot be replaced by a patch, so the old value is a secret.
     let (scratch, fake) = start("pre-image");
-    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "t1", SECRET_VALUE);
+    let reference = format!("{SECRET_PREFIX}t1");
+    let mut provider = provider(&fake, &secrets);
     let manifest = manifest();
     let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
@@ -413,7 +427,7 @@ fn a_patch_journals_the_pre_image_read_at_plan_and_an_absent_key_restores_as_abs
             "svc",
             None,
             "p1",
-            json!({"config": {MARK: "toy", "a": "old"}}),
+            json!({"config": {MARK: "toy", "a": reference}}),
         ))
         .expect("create");
     let target = ObjectRef {
@@ -434,7 +448,7 @@ fn a_patch_journals_the_pre_image_read_at_plan_and_an_absent_key_restores_as_abs
         patched.inverse,
         Some(Inverse::IncusRestoreConfig {
             object: target,
-            config: changes(&[("a", Some("old")), ("b", None)]),
+            config: changes(&[("a", Some(reference.as_str())), ("b", None)]),
         })
     );
 }
@@ -592,11 +606,11 @@ fn a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserv
     let bad = [
         (
             "no ipv6 setting",
-            bridge(json!({"ipv4.address": "10.20.30.1/24"})),
+            bridge(json!({"ipv4.address": "192.0.2.1/24"})),
         ),
         (
             "ipv6 not none",
-            bridge(json!({"ipv4.address": "10.20.30.1/24", "ipv6.address": "auto"})),
+            bridge(json!({"ipv4.address": "192.0.2.1/24", "ipv6.address": "auto"})),
         ),
         (
             "inside the reserved range",
@@ -631,7 +645,7 @@ fn a_bridge_network_is_refused_without_ipv6_none_outside_ipv4_or_inside_a_reserv
         "svc",
         None,
         "br2",
-        bridge(json!({"ipv4.address": "10.20.30.1/24", "ipv6.address": "none"})),
+        bridge(json!({"ipv4.address": "192.0.2.1/24", "ipv6.address": "none"})),
     );
     let planned = provider
         .plan(&entry("toy"), &good)
@@ -661,7 +675,7 @@ fn a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_f
         "kbare",
         None,
         "br9",
-        json!({"type": "bridge", "config": {"ipv6.address": "none", "ipv4.address": "10.9.9.1/24"}}),
+        json!({"type": "bridge", "config": {"ipv6.address": "none", "ipv4.address": "203.0.113.1/24"}}),
     );
     provider
         .plan(&entry("toy"), &network)
@@ -727,7 +741,7 @@ fn host_addresses_collects_inet_and_inet6_and_reads_only_the_listing_and_each_st
         (
             "eth0".to_string(),
             vec![
-                "10.0.0.5".parse::<IpAddr>().unwrap(),
+                "203.0.113.5".parse::<IpAddr>().unwrap(),
                 "fd00::5".parse().unwrap(),
             ],
         ),
@@ -737,7 +751,7 @@ fn host_addresses_collects_inet_and_inet6_and_reads_only_the_listing_and_each_st
     let mut found = host_addresses(&read).expect("the host's addresses");
     found.sort();
     let mut expected: Vec<IpAddr> = vec![
-        "10.0.0.5".parse().unwrap(),
+        "203.0.113.5".parse().unwrap(),
         "fd00::5".parse().unwrap(),
         "192.0.2.1".parse().unwrap(),
     ];
@@ -760,7 +774,7 @@ fn host_addresses_through_the_kernel_needs_the_plugin_to_declare_observes() {
     let (scratch, fake) = start("observes");
     fake.set_host_interfaces(vec![(
         "eth0".to_string(),
-        vec!["10.0.0.5".parse().unwrap()],
+        vec!["203.0.113.5".parse().unwrap()],
     )]);
     let mut provider = provider(&fake, &secrets_dir(&scratch));
     let mut declared = manifest();
@@ -769,7 +783,7 @@ fn host_addresses_through_the_kernel_needs_the_plugin_to_declare_observes() {
     let answer = Ctx::new(entry("toy"), &declared, &mut provider, &mut journal, 1)
         .observe(Observe::HostAddresses);
     let answer = answer.expect("an observing plugin reads the host");
-    assert_eq!(answer, json!(["10.0.0.5"]));
+    assert_eq!(answer, json!(["203.0.113.5"]));
 
     let undeclared = manifest();
     let refused = Ctx::new(entry("toy"), &undeclared, &mut provider, &mut journal, 1)
@@ -1001,8 +1015,13 @@ impl Script {
     }
 
     fn provider(&self, secrets: &Path) -> IncusProvider {
-        IncusProvider::new(self.socket.clone(), family(), secrets.to_path_buf())
-            .expect("a valid family")
+        IncusProvider::new(
+            self.socket.clone(),
+            family(),
+            secrets.to_path_buf(),
+            RetainedSet::empty(),
+        )
+        .expect("a valid family")
     }
 
     fn seen(&self) -> Vec<(String, String)> {
@@ -1245,7 +1264,12 @@ fn retire_tombstones_then_deletes_an_owned_instance_in_order() {
     let uuid = made.uuid().map(str::to_string);
     assert!(uuid.is_some(), "an instance has a uuid");
     let plan = Digest::of(b"the approved plan");
-    let outcome = provider.retire(&entry("toy"), made.target(), &plan);
+    // The approved plan names the instance by its uuid, so the retirement names it too.
+    let named = ObjectRef {
+        uuid: uuid.clone(),
+        ..made.target().clone()
+    };
+    let outcome = provider.retire(&entry("toy"), &named, &plan);
     assert_eq!(
         outcome,
         Ok(Retirement::Deleted(ObjectRef {
@@ -1323,7 +1347,10 @@ fn retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete() {
     });
     let secrets = Scratch::new("secrets-drift2");
     let provider = script.provider(&secrets.0);
-    let target = object(IncusKind::Instance, "svc", None, "r2");
+    let target = ObjectRef {
+        uuid: Some(READ_UUID.to_string()),
+        ..object(IncusKind::Instance, "svc", None, "r2")
+    };
     let outcome = provider
         .retire(&entry("toy"), &target, &plan)
         .expect("the retirement reports drift");
@@ -1341,7 +1368,10 @@ fn retire_stops_on_a_stale_etag_and_sends_no_delete() {
     });
     let secrets = Scratch::new("secrets-412b");
     let provider = script.provider(&secrets.0);
-    let target = object(IncusKind::Instance, "svc", None, "r2");
+    let target = ObjectRef {
+        uuid: Some(READ_UUID.to_string()),
+        ..object(IncusKind::Instance, "svc", None, "r2")
+    };
     assert_eq!(
         provider.retire(&entry("toy"), &target, &plan),
         Err(EffectRefusal::Stale)
@@ -1356,13 +1386,33 @@ fn retire_stops_on_a_stale_etag_and_sends_no_delete() {
 #[test]
 fn a_retained_entrys_object_is_refused_for_a_patch_and_a_retirement_and_nothing_is_written() {
     let (scratch, fake) = start("retained");
+    // The object is made while nothing is retained, so it carries a uuid for the retirement to name.
+    let writer = arca_incus::UnixIncusWriter::new(
+        fake.socket().to_path_buf(),
+        entry("toy"),
+        BTreeMap::new(),
+        arca_incus::ProjectFamily::new(["svc"], ["droid"]).expect("family"),
+    );
+    let made = writer
+        .create(
+            &object(IncusKind::Instance, "svc", None, "rk1"),
+            &json!({"config": {MARK: "toy"}}),
+        )
+        .expect("create");
+    let before = writes(&fake).len();
     let retained = BTreeMap::from([(
         entry("toy"),
         (PluginId("toy-plugin".to_string()), Digest::of(b"declined")),
     )]);
-    let provider = provider(&fake, &secrets_dir(&scratch)).with_retained(retained);
-    let k1 = object(IncusKind::Instance, "svc", None, "k1");
-    let op = patch(k1.clone(), &[("user.note", Some("x"))]);
+    let provider = IncusProvider::new(
+        fake.socket().to_path_buf(),
+        family(),
+        secrets_dir(&scratch),
+        RetainedSet::new(retained),
+    )
+    .expect("a valid family");
+    let rk1 = object(IncusKind::Instance, "svc", None, "rk1");
+    let op = patch(rk1.clone(), &[("user.note", Some("x"))]);
     let planned = provider.plan(&entry("toy"), &op);
     assert!(
         matches!(
@@ -1371,7 +1421,11 @@ fn a_retained_entrys_object_is_refused_for_a_patch_and_a_retirement_and_nothing_
         ),
         "{planned:?}"
     );
-    let retired = provider.retire(&entry("toy"), &k1, &Digest::of(b"approved"));
+    let named = ObjectRef {
+        uuid: made.uuid().map(str::to_string),
+        ..rk1
+    };
+    let retired = provider.retire(&entry("toy"), &named, &Digest::of(b"approved"));
     assert!(
         matches!(
             retired,
@@ -1379,7 +1433,11 @@ fn a_retained_entrys_object_is_refused_for_a_patch_and_a_retirement_and_nothing_
         ),
         "{retired:?}"
     );
-    assert!(writes(&fake).is_empty(), "nothing was written");
+    assert_eq!(
+        writes(&fake).len(),
+        before,
+        "nothing was written after the create"
+    );
 }
 
 #[test]
@@ -1465,4 +1523,605 @@ fn the_fixture_gives_the_objects_the_tests_name_their_owners() {
         }
     );
     let _ = scratch;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Project keys: the zones feature, and no plugin key that loosens the pinned project
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// The fixture with one more kernel project, `kzone`, that enables network zones as well as networks.
+fn zone_fixture() -> FakeState {
+    let mut state = state();
+    state.projects.push(json!({
+        "name": "kzone", "description": "", "config": features(&[
+            ("features.networks", "true"),
+            ("features.networks.zones", "true"),
+            ("features.profiles", "true"),
+            ("features.storage.volumes", "true"),
+            ("features.storage.buckets", "true"),
+        ])
+    }));
+    state
+}
+
+#[test]
+fn a_zone_write_is_refused_before_any_write_in_a_project_without_the_zones_key() {
+    let dir = Scratch::new("zones");
+    let fake = FakeIncus::start(&dir.0, zone_fixture()).expect("start the fake");
+    let secrets = secrets_dir(&dir);
+    let fam = Family {
+        projects: vec!["svc".into(), "kzone".into()],
+        ..family()
+    };
+    let provider = IncusProvider::new(
+        fake.socket().to_path_buf(),
+        fam,
+        secrets,
+        RetainedSet::empty(),
+    )
+    .expect("a valid family");
+    // `svc` enables networks but not network zones, so a zone there would route to the default project.
+    let in_svc = create(IncusKind::Zone, "svc", None, "z1", json!({}));
+    assert!(
+        matches!(
+            provider.plan(&entry("toy"), &in_svc),
+            Err(EffectRefusal::Provider(_))
+        ),
+        "a zone without the zones key is refused"
+    );
+    assert!(
+        writes(&fake).is_empty(),
+        "no zone was written: {:?}",
+        writes(&fake)
+    );
+    // `kzone` enables the zones key, so the same zone plans and is created there.
+    let in_kzone = create(IncusKind::Zone, "kzone", None, "z1", json!({}));
+    let planned = provider
+        .plan(&entry("toy"), &in_kzone)
+        .expect("a zone in a project with the zones key plans");
+    let mut provider = provider;
+    provider
+        .effect(&entry("toy"), &in_kzone, &planned)
+        .expect("the zone is created");
+    assert_eq!(
+        writes(&fake),
+        vec![(
+            "POST".to_string(),
+            "/1.0/network-zones?project=kzone".to_string()
+        )]
+    );
+}
+
+#[test]
+fn a_project_create_refuses_a_restricted_or_features_key_that_loosens_the_pinned_project() {
+    let (scratch, fake) = start("project-loosen");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    for (key, value) in [
+        ("restricted", "false"),
+        ("restricted.containers.privilege", "allow"),
+        ("restricted.devices.disk", "allow"),
+        ("restricted.containers.lowlevel", "allow"),
+        ("features.images", "false"),
+        ("features.networks", "false"),
+        ("features.networks.zones", "false"),
+    ] {
+        let op = create(
+            IncusKind::Project,
+            "kfam",
+            None,
+            "kfam",
+            json!({"config": {key: value}}),
+        );
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{key}={value} is refused"
+        );
+    }
+    // The pinned values are accepted, and none of these requests reaches the fake.
+    let pinned = create(
+        IncusKind::Project,
+        "kfam",
+        None,
+        "kfam",
+        json!({"config": {"restricted": "true", "features.networks": "true", "features.networks.zones": "true"}}),
+    );
+    provider
+        .plan(&entry("toy"), &pinned)
+        .expect("the pinned values plan");
+    assert!(
+        fake.requests().is_empty(),
+        "no request was made: {:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn a_project_patch_refuses_every_restricted_or_features_key_before_any_request() {
+    let (scratch, fake) = start("project-patch");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let project = object(IncusKind::Project, "svc", None, "svc");
+    for (key, value) in [
+        ("restricted", Some("false")),
+        ("restricted.containers.privilege", Some("allow")),
+        ("features.images", Some("false")),
+        ("features.networks", Some("true")),
+        ("features.networks.zones", None),
+        ("restricted", None),
+    ] {
+        let op = patch(project.clone(), &[(key, value)]);
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{key} is refused on a project patch"
+        );
+    }
+    assert!(
+        fake.requests().is_empty(),
+        "no request was made: {:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn a_project_create_carries_the_zones_key_pinned_to_true() {
+    let (scratch, fake) = start("project-zones");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Project,
+            "kfam",
+            None,
+            "kfam",
+            json!({"config": {}}),
+        ))
+        .expect("the project is created");
+    let config = read(&fake, "/1.0/projects/kfam")["config"].clone();
+    assert_eq!(config["features.networks.zones"], json!("true"), "{config}");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// By-name patches: the answer and the inverse name the object as the op did
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_by_name_patch_of_an_instance_with_a_read_back_uuid_lands_and_its_inverse_names_the_op_object()
+{
+    let (scratch, fake) = start("by-name");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "n1", SECRET_VALUE);
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "bn1",
+            json!({"config": {MARK: "toy"}}),
+        ))
+        .expect("the instance is created");
+    // The instance now carries a uuid the read-back shows. The op names it by name only. The value is a secret reference, so
+    // the reverse patch may replace it.
+    let by_name = object(IncusKind::Instance, "svc", None, "bn1");
+    let reference = format!("{SECRET_PREFIX}n1");
+    let answered = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(
+            by_name.clone(),
+            &[("user.note", Some(reference.as_str()))],
+        ))
+        .expect("the by-name patch applies");
+    assert_eq!(
+        answered, by_name,
+        "the answer names the object as the op did"
+    );
+    assert!(journal.unresolved().is_empty(), "no intent stays open");
+    let restore = journal
+        .live(&entry("toy"))
+        .into_iter()
+        .find_map(|record| match record.inverse {
+            Some(Inverse::IncusRestoreConfig { object, config }) if object.name == "bn1" => {
+                Some((object, config))
+            }
+            _ => None,
+        })
+        .expect("the patch is journalled with its restore");
+    assert_eq!(restore, (by_name, changes(&[("user.note", None)])));
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 3)
+        .effect(patch(restore.0, &[("user.note", None)]))
+        .expect("the reverse patch applies");
+    let config = read(&fake, "/1.0/instances/bn1?project=svc")["config"].clone();
+    assert!(config.get("user.note").is_none(), "{config}");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Failed creates: only a status error that a GET settles as absent is recorded as failed
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_create_whose_wait_fails_without_an_answer_stays_unresolved_when_the_name_is_free() {
+    // The request was accepted and named an operation. The wait then gives no answer the writer can read. The name is still
+    // free, but a transport or decode failure says nothing about whether the create landed.
+    let waits: [(&str, Vec<u8>); 2] = [
+        ("a garbled wait", b"not an http answer\r\n\r\n".to_vec()),
+        ("a wait the server drops", Vec::new()),
+    ];
+    for (why, wait_reply) in waits {
+        let script = Script::start("create-wait", move |method, target| {
+            if method == "POST" {
+                return http(
+                    202,
+                    None,
+                    &json!({"type": "async", "status": "Operation created", "status_code": 100, "operation": "/1.0/operations/00000000-0000-4000-8000-0000000000ac", "error_code": 0, "error": "", "metadata": null}),
+                );
+            }
+            if target.contains("/wait") {
+                return wait_reply.clone();
+            }
+            not_found()
+        });
+        let secrets = Scratch::new("secrets-wait");
+        let mut provider = script.provider(&secrets.0);
+        let op = create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "c4",
+            json!({"config": {MARK: "toy"}}),
+        );
+        let planned = provider.plan(&entry("toy"), &op).expect("plan");
+        assert_eq!(
+            provider.effect(&entry("toy"), &op, &planned),
+            Err(EffectRefusal::Unresolved),
+            "{why}"
+        );
+    }
+}
+
+#[test]
+fn a_create_whose_answer_is_garbled_stays_unresolved_when_the_name_is_free() {
+    let script = Script::start("create-garbled", move |method, _| {
+        if method == "POST" {
+            return b"not an http answer\r\n\r\n".to_vec();
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("secrets-garbled");
+    let mut provider = script.provider(&secrets.0);
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "c5",
+        json!({"config": {MARK: "toy"}}),
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("plan");
+    assert_eq!(
+        provider.effect(&entry("toy"), &op, &planned),
+        Err(EffectRefusal::Unresolved)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Bridges: only the keys the plan's bridges set, and no reserved route, external interface or raw key
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_bridge_key_outside_the_allowlist_or_a_route_external_interface_or_raw_key_is_refused_at_plan()
+{
+    let (scratch, fake) = start("bridge-keys");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let bridge_with = |key: &str, value: &str| {
+        let mut config = json!({"ipv4.address": "192.0.2.1/24", "ipv6.address": "none"});
+        config[key] = json!(value);
+        create(
+            IncusKind::Network,
+            "svc",
+            None,
+            "br-x",
+            json!({"type": "bridge", "config": config}),
+        )
+    };
+    for (key, value) in [
+        ("ipv4.routes", "198.51.100.0/24"),
+        ("ipv4.routes", "203.0.113.0/24"),
+        ("ipv6.routes", "2001:db8::/32"),
+        ("bridge.external_interfaces", "eth9"),
+        ("raw.dnsmasq", "dhcp-option=6,192.0.2.53"),
+        ("raw.anything", "x"),
+        ("dns.mode", "none"),
+        ("dns.domain", "arca.test"),
+        ("ipv6.nat", "true"),
+        ("ipv4.dhcp", "true"),
+    ] {
+        assert!(
+            matches!(
+                provider.plan(&entry("toy"), &bridge_with(key, value)),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{key}={value} is refused"
+        );
+    }
+    provider
+        .plan(&entry("toy"), &bridge_with("ipv4.nat", "true"))
+        .expect("ipv4.nat is on the allowlist");
+    assert!(writes(&fake).is_empty(), "no bridge was created");
+}
+
+#[test]
+fn a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch() {
+    let (scratch, fake) = start("bridge-patch");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let bridge = create(
+        IncusKind::Network,
+        "svc",
+        None,
+        "br-p",
+        json!({"type": "bridge", "config": {"ipv4.address": "192.0.2.1/24", "ipv6.address": "none"}}),
+    );
+    let planned = provider
+        .plan(&entry("toy"), &bridge)
+        .expect("the bridge plans");
+    provider
+        .effect(&entry("toy"), &bridge, &planned)
+        .expect("the bridge is created");
+    let move_into_reserved = patch(
+        object(IncusKind::Network, "svc", None, "br-p"),
+        &[("ipv4.address", Some("198.51.100.1/24"))],
+    );
+    match provider.plan(&entry("toy"), &move_into_reserved) {
+        Err(EffectRefusal::Provider(reason)) => {
+            assert!(
+                reason.contains("reserved"),
+                "the refusal names the range: {reason}"
+            )
+        }
+        other => panic!("a patch into a reserved range is refused: {other:?}"),
+    }
+    assert_eq!(
+        writes(&fake),
+        vec![("POST".to_string(), "/1.0/networks?project=svc".to_string())],
+        "only the create was sent"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Secret rotation and plain values: the journal never holds a replaced value that is not a current secret
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_patch_that_replaces_a_secret_whose_file_was_rotated_is_refused_and_the_old_value_is_not_journalled()
+ {
+    let (scratch, fake) = start("rotation");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "t1", SECRET_VALUE);
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let journal_path = scratch.0.join("journal.jsonl");
+    let mut journal =
+        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "rot1",
+            json!({"config": {MARK: "toy", "user.key": format!("{SECRET_PREFIX}t1")}}),
+        ))
+        .expect("the create applies");
+    // The file is rotated. The object still holds the old content, which no current secret file holds.
+    write_secret(&secrets, "t1", "SECRET-VALUE-ROTATED");
+    let target = ObjectRef {
+        uuid: made.uuid.clone(),
+        ..made
+    };
+    let refused = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(target, &[("user.key", None)]));
+    assert!(
+        matches!(refused, Err(EffectRefusal::Provider(_))),
+        "{refused:?}"
+    );
+    let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
+    assert!(
+        !on_disk.contains(SECRET_VALUE),
+        "the replaced value is not in the journal"
+    );
+    assert!(
+        writes(&fake).iter().all(|(method, _)| method != "PATCH"),
+        "no patch was sent: {:?}",
+        writes(&fake)
+    );
+}
+
+#[test]
+fn a_patch_that_replaces_a_plain_value_is_refused_and_the_value_is_not_journalled() {
+    const OLD: &str = "PLAIN-OLD-VALUE-7713";
+    let (scratch, fake) = start("plain-old");
+    let secrets = secrets_dir(&scratch);
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let journal_path = scratch.0.join("journal.jsonl");
+    let mut journal =
+        Journal::open(FileJournal::open(&journal_path).expect("open")).expect("folds");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "pl1",
+            json!({"config": {MARK: "toy", "user.note": OLD}}),
+        ))
+        .expect("the create applies");
+    let target = ObjectRef {
+        uuid: made.uuid.clone(),
+        ..made
+    };
+    let refused = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(target, &[("user.note", Some("new"))]));
+    assert!(
+        matches!(refused, Err(EffectRefusal::Provider(_))),
+        "{refused:?}"
+    );
+    let on_disk = fs::read_to_string(&journal_path).expect("the journal file");
+    assert!(
+        !on_disk.contains(OLD),
+        "the replaced value is not journalled"
+    );
+    assert!(
+        writes(&fake).iter().all(|(method, _)| method != "PATCH"),
+        "no patch was sent"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Retirement needs the uuid; an effect checks the class and the pre-image it is given
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request() {
+    let (scratch, fake) = start("retire-no-uuid");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    let plan = Digest::of(b"approved");
+    for target in [
+        object(IncusKind::Instance, "svc", None, "k1"),
+        object(IncusKind::Volume, "svc", Some("fast"), "v1"),
+    ] {
+        assert!(
+            matches!(
+                provider.retire(&entry("toy"), &target, &plan),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{:?} without a uuid",
+            target.kind
+        );
+    }
+    assert!(
+        fake.requests().is_empty(),
+        "no request was made: {:?}",
+        fake.requests()
+    );
+}
+
+#[test]
+fn an_effect_rechecks_the_class_and_the_pre_image_of_a_plan_made_by_hand() {
+    let (scratch, fake) = start("forged-plan");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let op = patch(
+        object(IncusKind::Instance, "svc", None, "k1"),
+        &[("user.note", Some("x"))],
+    );
+    let planned = provider.plan(&entry("toy"), &op).expect("the plan is real");
+    assert_eq!(planned.class, EffectClass::B);
+    let wrong_class = Planned {
+        class: EffectClass::A,
+        ..planned.clone()
+    };
+    assert!(
+        matches!(
+            provider.effect(&entry("toy"), &op, &wrong_class),
+            Err(EffectRefusal::Provider(_))
+        ),
+        "a class the kind does not give is refused"
+    );
+    let wrong_pre_image = Planned {
+        pre_image: Some(changes(&[("user.note", Some("forged"))])),
+        ..planned
+    };
+    assert!(
+        matches!(
+            provider.effect(&entry("toy"), &op, &wrong_pre_image),
+            Err(EffectRefusal::Provider(_))
+        ),
+        "a pre-image the object does not hold is refused"
+    );
+    assert!(
+        writes(&fake).is_empty(),
+        "no patch was sent: {:?}",
+        writes(&fake)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// The secrets directory itself: not a symlink, and private
+// ---------------------------------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_secrets_directory_that_is_a_symlink_or_is_readable_by_others_is_refused_at_plan() {
+    let scratch = Scratch::new("secrets-dir");
+    let (_fake_dir, fake) = start("secrets-dir-fake");
+    let real = scratch.0.join("real");
+    fs::create_dir_all(&real).expect("the private directory");
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    write_secret(&real, "t1", SECRET_VALUE);
+    let linked = scratch.0.join("linked");
+    symlink(&real, &linked).expect("the symlink");
+    let loose = scratch.0.join("loose");
+    fs::create_dir_all(&loose).expect("the loose directory");
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+    write_secret(&loose, "t1", SECRET_VALUE);
+    let op = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "s5",
+        json!({"config": {"user.key": format!("{SECRET_PREFIX}t1")}}),
+    );
+    // The private directory resolves the reference, so the refusals below are about the directories and nothing else.
+    provider(&fake, &real)
+        .plan(&entry("toy"), &op)
+        .expect("the private directory resolves the reference");
+    for (why, dir) in [("a symlink", &linked), ("readable by others", &loose)] {
+        assert!(
+            matches!(
+                provider(&fake, dir).plan(&entry("toy"), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{why} is refused"
+        );
+    }
+    assert!(writes(&fake).is_empty(), "nothing was written");
+}
+
+#[test]
+fn a_write_is_refused_once_the_retained_set_is_updated_through_a_handle_the_boxed_provider_shares()
+{
+    // A reconciler boxes the provider and keeps a clone of the set. A plan declined after the boxing must reach the provider.
+    let (scratch, fake) = start("retained-handle");
+    let retained = RetainedSet::empty();
+    let provider = IncusProvider::new(
+        fake.socket().to_path_buf(),
+        family(),
+        secrets_dir(&scratch),
+        retained.clone(),
+    )
+    .expect("a valid family");
+    let boxed: Box<dyn Provider> = Box::new(provider);
+    let k1 = object(IncusKind::Instance, "svc", None, "k1");
+    let op = patch(k1, &[("user.note", Some("x"))]);
+    boxed
+        .plan(&entry("toy"), &op)
+        .expect("before the update, the entry's object is writable");
+    retained
+        .retain(
+            entry("toy"),
+            PluginId("toy-plugin".to_string()),
+            Digest::of(b"declined"),
+        )
+        .expect("the set is writable");
+    let refused = boxed.plan(&entry("toy"), &op);
+    assert!(
+        matches!(
+            refused,
+            Err(EffectRefusal::NotOwned(OwnerClass::Retained { .. }))
+        ),
+        "{refused:?}"
+    );
+    assert!(writes(&fake).is_empty(), "nothing was written");
 }
