@@ -7,7 +7,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-/// The class of a verb. Every wave-1 verb is `L`: it runs on one node and needs no second node or vote.
+/// The class of a verb. Every initial verb is `L`: it runs on one node and needs no second node or vote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VerbClass {
     L,

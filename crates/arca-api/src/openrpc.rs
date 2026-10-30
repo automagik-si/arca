@@ -96,12 +96,10 @@ pub fn check_document(doc: &Value) -> Result<(), String> {
         if m.get("x-arca-writes").and_then(Value::as_bool).is_none() {
             return Err(format!("method {name} has no x-arca-writes flag"));
         }
-        if m.get("x-arca-additional-properties")
-            .and_then(Value::as_bool)
-            .is_none()
-        {
+        // The flag records that the params object is closed: `true` is the only legal value.
+        if m.get("x-arca-additional-properties") != Some(&Value::Bool(true)) {
             return Err(format!(
-                "method {name} has no x-arca-additional-properties flag"
+                "method {name} is open: x-arca-additional-properties must be true"
             ));
         }
         if !m.get("params").is_some_and(Value::is_array) {

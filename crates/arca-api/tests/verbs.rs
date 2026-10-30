@@ -4,6 +4,7 @@
 use arca_api::openrpc::{check_document, openrpc};
 use arca_api::{API_VERSION, Scope, VerbClass, conforms, may_call, verb, verbs};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const CURRENT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -13,6 +14,8 @@ const RELEASED: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../schema/released/0.1.0.openrpc.json"
 );
+/// The SHA-256 of the released 0.1.0 file, byte for byte. A change to the file is a new release, not an edit.
+const RELEASED_SHA256: &str = "2afb4621ced2dd06cd744b2c883671ba2e76dca52deee54162cf8f4779221ca7";
 
 fn pretty(doc: &Value) -> String {
     let mut text = serde_json::to_string_pretty(doc).expect("the document serializes");
@@ -25,7 +28,7 @@ fn names() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_table_holds_the_four_wave_verbs_in_order() {
+fn the_table_holds_the_four_initial_verbs_in_order() {
     assert_eq!(
         names(),
         ["arca_status", "node_metrics", "watch_report", "token_list"]
@@ -285,6 +288,20 @@ fn a_document_with_an_illegal_class_fails_the_check() {
 }
 
 #[test]
+fn a_method_whose_params_object_is_open_fails_the_check() {
+    // The flag records that the params object is closed, so `true` is the only legal value. A bool of `false` is
+    // a bool too, so a bare type check would let an open params object through.
+    for open in [json!(false), json!("true"), json!(1)] {
+        let mut doc = openrpc();
+        doc["methods"][0]["x-arca-additional-properties"] = open.clone();
+        assert!(
+            check_document(&doc).is_err(),
+            "x-arca-additional-properties {open} is refused"
+        );
+    }
+}
+
+#[test]
 fn the_document_is_the_generated_schema_file() {
     let text = pretty(&openrpc());
     if std::env::var_os("ARCA_UPDATE_SCHEMA").is_some() {
@@ -298,9 +315,17 @@ fn the_document_is_the_generated_schema_file() {
 }
 
 #[test]
-fn the_released_0_1_0_document_holds_the_four_wave_verbs() {
-    let text = std::fs::read_to_string(RELEASED).expect("the released schema exists");
-    let doc: Value = serde_json::from_str(&text).expect("the released schema is JSON");
+fn the_released_0_1_0_document_holds_the_four_initial_verbs() {
+    let bytes = std::fs::read(RELEASED).expect("the released schema exists");
+    let hex: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        hex, RELEASED_SHA256,
+        "the released 0.1.0 file is byte-pinned"
+    );
+    let doc: Value = serde_json::from_slice(&bytes).expect("the released schema is JSON");
     assert_eq!(check_document(&doc), Ok(()));
     assert_eq!(doc["info"]["version"], json!("0.1.0"));
     let released: Vec<&str> = doc["methods"]
