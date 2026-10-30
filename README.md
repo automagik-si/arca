@@ -4,15 +4,15 @@ Arca is a Rust kernel for a node's own infrastructure. The kernel reads what it 
 change only after the node's owner has approved it and the change is written to a journal. Each node signs its own
 desired state with its own key. It talks to Incus over the local unix socket.
 
-**Status: `0.1.0-alpha.1`, for private single-host use.**
+**Status: `0.1.0-alpha.2`, for private single-host use.**
 
-- **Reads** run against a real Incus 7.3 host: every project and instance is classed by owner, and drift is reported.
+- **Reads** run against a real Incus host (7.3, now 7.5.1): every project and instance is classed by owner, and drift is reported.
 - **Writes** are tested live, one object kind at a time, in a scratch project: network, project, ACL, profile, volume,
   forward, instance and bucket are created, marked, and removed again, leaving the host as it was. Network zones are
   not yet created in a kernel project (Incus refuses them in a restricted project without a zone grant).
 - **Deletes of class B objects** (networks, projects, volumes) need a signed owner approval. The owner verifier for
-  hardware-backed (`-sk`) SSH signatures ships, but no owner key is installed on a new node, so these deletes fail closed
-  with `NoVerifier`.
+  hardware-backed (`-sk`) SSH signatures and a WebAuthn ES256 passkey verifier both ship, but no owner key is installed
+  on a new node, so these deletes fail closed with `NoVerifier`.
 - **As a service:** `deploy/systemd/` holds two user units that run `arca serve` read-only, reaching Incus only through
   the GET-only shim, with restart and memory limits. See "Running as a user service" in
   [`docs/OPERATING.md`](docs/OPERATING.md).
@@ -21,7 +21,8 @@ desired state with its own key. It talks to Incus over the local unix socket.
   [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md)).
 - **Adoption:** `arca adopt` takes one listed container from the default project into a kernel project of its own and
   back, keeping its MAC and IPv4 by pinning them on its NIC. It resumes from its record after a crash at any step, and
-  `arca adopt verify` checks that the service answers. Tested on the fake Incus. See "Adopting a container" in
+  `arca adopt verify` checks that the service answers. Done live on Incus 7.5.1 for one real service, where a project
+  move runs as a copy with a new uuid; adoption accepts that copy only when its pin and adoption snapshot match. See "Adopting a container" in
   [`docs/OPERATING.md`](docs/OPERATING.md).
 
 Hardening for shared or distributed hosts comes later.
