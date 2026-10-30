@@ -9,7 +9,7 @@ use arca_approval::{
 };
 use arca_kernel::canon::{canonical_json, params_digest};
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use serde_json::{Value, json};
 
 /// Droidd's approval vectors, byte for byte as the kernel crate carries them.
@@ -21,7 +21,11 @@ const NONCE: &str = "0123456789abcdef0123456789abcdef";
 /// 2026-10-30T12:00:00.000Z in epoch milliseconds (`date -u -d '2026-10-30T12:00:00Z' +%s`, times 1000).
 const NOW: u64 = 1_793_361_600_000;
 const KEY: &str = "SHA256:test-key";
-const SIG: &[u8] = b"test signature bytes";
+/// An armoured SSH signature, shaped as `ssh-keygen -Y sign` writes one. The body is test bytes, not a real signature.
+const SIG: &[u8] =
+    b"-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAAAAAAAAAAAAAAA==\n-----END SSH SIGNATURE-----\n";
+/// An armoured signature the test verifier does not accept.
+const FORGED: &[u8] = b"-----BEGIN SSH SIGNATURE-----\nZm9yZ2Vk\n-----END SSH SIGNATURE-----\n";
 
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).expect("the vectors fixture is JSON")
@@ -403,6 +407,146 @@ fn split_trims_the_outer_whitespace_as_droidd_does() {
     assert!(split_approval(&padded).is_ok());
 }
 
+#[test]
+fn split_refuses_a_signature_that_is_not_armoured_ssh() {
+    let text = text_of(&fields(json!({})));
+    for signature in [
+        "test signature bytes",
+        "{\"passkey\":true}",
+        "-----BEGIN SSH SIGNATURE-----\nAAAA\n",
+        "-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n",
+        "-----BEGIN SSH SIGNATURE-----\nAA*A\n-----END SSH SIGNATURE-----\n",
+        "-----BEGIN SSH SIGNATURE-----\n-----END SSH SIGNATURE-----\n",
+        "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\ntrailing text\n",
+        "-----BEGIN SSH SIGNATURE-----\r\r\nAAAA\n-----END SSH SIGNATURE-----\n",
+        " -----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n",
+    ] {
+        let refusal = split_approval(&approval_signed(&text, signature.as_bytes()))
+            .expect_err("a signature that is not armoured is refused");
+        assert_malformed(&refusal);
+    }
+}
+
+#[test]
+fn a_signature_that_is_not_armoured_is_refused_before_the_verifier_runs() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut v = ApprovalVerifier::new(
+        HOST.to_string(),
+        Recorder {
+            seen: Arc::clone(&seen),
+        },
+        MemNonces::default(),
+    );
+    let text = text_of(&fields(json!({})));
+    let refusal = check_call(
+        &mut v,
+        ArcaAction::Delete,
+        &target(),
+        &args(),
+        &approval_signed(&text, b"test signature bytes"),
+    )
+    .expect_err("a signature that is not armoured is refused");
+    assert_malformed(&refusal);
+    assert!(
+        seen.lock().expect("not poisoned").is_empty(),
+        "the verifier is not asked about an unarmoured signature"
+    );
+}
+
+#[test]
+fn an_armoured_signature_reads_with_either_line_ending() {
+    let text = text_of(&fields(json!({})));
+    for signature in [
+        "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n",
+        "-----BEGIN SSH SIGNATURE-----\r\nAAAA\r\nBBBB\r\n-----END SSH SIGNATURE-----\r\n",
+        "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----",
+    ] {
+        let (_, bytes) = split_approval(&approval_signed(&text, signature.as_bytes()))
+            .expect("an armoured signature is read");
+        assert_eq!(bytes, signature.as_bytes());
+    }
+}
+
+#[test]
+fn an_unpadded_base64_part_is_read_as_droidd_reads_it() {
+    let text = text_of(&fields(json!({})));
+    assert_ne!(
+        text.len() % 3,
+        0,
+        "the statement needs padding in its padded form"
+    );
+    let unpadded = format!(
+        "{}.{}",
+        STANDARD_NO_PAD.encode(&text),
+        STANDARD_NO_PAD.encode(SIG)
+    );
+    let (statement, signature) = split_approval(&unpadded).expect("unpadded parts are read");
+    assert_eq!(statement, text.as_bytes());
+    assert_eq!(signature, SIG);
+}
+
+/// Sets the lowest bit of a padded base64 string's last data character. That bit is a trailing bit, which a canonical
+/// encoder leaves zero.
+fn with_trailing_bits(encoded: &str) -> String {
+    let alphabet = base64::alphabet::STANDARD.as_str().as_bytes();
+    let pad = encoded.len() - encoded.trim_end_matches('=').len();
+    assert!(pad > 0, "only a padded encoding has trailing bits");
+    let at = encoded.len() - pad - 1;
+    let mut bytes = encoded.as_bytes().to_vec();
+    let value = alphabet
+        .iter()
+        .position(|c| *c == bytes[at])
+        .expect("a standard base64 character");
+    bytes[at] = alphabet[value ^ 1];
+    String::from_utf8(bytes).expect("base64 is ASCII")
+}
+
+#[test]
+fn non_zero_trailing_bits_are_read_as_droidd_reads_them() {
+    let text = text_of(&fields(json!({})));
+    assert_ne!(
+        text.len() % 3,
+        0,
+        "the statement needs padding for trailing bits"
+    );
+    let tampered = with_trailing_bits(&STANDARD.encode(&text));
+    assert!(
+        STANDARD.decode(&tampered).is_err(),
+        "the strict decoder refuses trailing bits, so this encoding is not canonical"
+    );
+    let approval_text = format!("{tampered}.{}", STANDARD.encode(SIG));
+    let spent = check_call(
+        &mut verifier(),
+        ArcaAction::Delete,
+        &target(),
+        &args(),
+        &approval_text,
+    )
+    .expect("droidd reads trailing bits, so the approval is read");
+    assert_eq!(spent.nonce, NONCE);
+}
+
+#[test]
+fn a_non_string_field_is_refused_as_malformed() {
+    for key in [
+        "host",
+        "action",
+        "target",
+        "paramsDigest",
+        "issuedAt",
+        "expiresAt",
+        "nonce",
+    ] {
+        let mut f = fields(json!({}));
+        f[key] = json!(1);
+        let refusal = refusal_of(&f);
+        assert!(
+            matches!(&refusal, ApprovalRefusal::Malformed(why) if why.contains(key)),
+            "a number in {key} is refused by name: {refusal:?}"
+        );
+    }
+}
+
 // ---- the checks, in droidd's order ---------------------------------------------------------------------------------
 
 #[test]
@@ -463,7 +607,7 @@ fn a_bad_signature_is_refused_before_any_bound_field_or_nonce() {
         ArcaAction::Delete,
         &target(),
         &args(),
-        &approval_signed(&text, b"forged"),
+        &approval_signed(&text, FORGED),
     )
     .expect_err("a forged signature is refused");
     assert_eq!(refusal, ApprovalRefusal::BadSignature);

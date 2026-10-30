@@ -19,7 +19,7 @@ pub trait SignatureVerifier: Send + Sync {
     ) -> Result<String, ApprovalRefusal>;
 }
 
-/// The verifier until one is installed: every approval is refused with [`ApprovalRefusal::NoVerifier`].
+/// The verifier until one is installed: every well-formed approval is refused with [`ApprovalRefusal::NoVerifier`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RefuseAll;
 

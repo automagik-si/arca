@@ -2,8 +2,9 @@
 //! is that statement with its signature. This crate reads the approval as droidd's `owner-approvals.ts` reads one, checks it
 //! in droidd's order, and spends its nonce once.
 //!
-//! Until a signature verifier is installed, [`RefuseAll`] refuses every approval with [`ApprovalRefusal::NoVerifier`], before
-//! any nonce is read.
+//! Until a signature verifier is installed, [`RefuseAll`] refuses every well-formed approval with
+//! [`ApprovalRefusal::NoVerifier`], before any nonce is read. A malformed approval is refused as malformed before the
+//! verifier is reached.
 
 pub mod statement;
 pub mod verifier;

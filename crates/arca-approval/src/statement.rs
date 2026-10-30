@@ -66,8 +66,10 @@ const APPROVAL_MAX_CHARS: usize = 16_384;
 const STATEMENT_MAX_BYTES: usize = 4_096;
 const SIGNATURE_MAX_BYTES: usize = 8_192;
 
-/// Node's base64 reader, which droidd's approvals are decoded with: the standard alphabet, padding optional, and trailing
-/// bits that a canonical encoder leaves zero tolerated. Node reads both, so a string droidd reads is read here too.
+/// The base64 reader for droidd's approval parts: the standard alphabet, padding optional, and trailing bits tolerated as
+/// Node tolerates them (`YR==` reads as `YQ==`). It is stricter than Node, which also decodes `QUJD=`, `QUJD==`, `QUJDR`
+/// and `QUJ==`. This reader refuses those as malformed, so an approval droidd reads can be refused here, and never the
+/// other way round.
 const NODE_BASE64: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
     PAD_INDIFFERENT.with_decode_allow_trailing_bits(true),
@@ -78,7 +80,8 @@ fn malformed(why: impl Into<String>) -> ApprovalRefusal {
 }
 
 /// Reads an approval string, `<base64 statement>.<base64 signature>`, into its statement bytes and its signature bytes.
-/// Surrounding whitespace is trimmed, as droidd trims it. The signature's armour is the verifier's to read.
+/// Surrounding whitespace is trimmed, as droidd trims it. The signature must be an armoured SSH signature, as droidd's
+/// `armoredOf` requires, so anything else is refused before a verifier is asked about it.
 pub fn split_approval(approval: &str) -> Result<(Vec<u8>, Vec<u8>), ApprovalRefusal> {
     if approval.is_empty() {
         return Err(malformed("this call needs the owner's signed approval"));
@@ -105,6 +108,11 @@ pub fn split_approval(approval: &str) -> Result<(Vec<u8>, Vec<u8>), ApprovalRefu
             "the signature is empty or longer than 8192 bytes",
         ));
     }
+    if !is_armoured_ssh_signature(&signature) {
+        return Err(malformed(
+            "the signature is not an armoured SSH signature (ssh-keygen -Y sign)",
+        ));
+    }
     Ok((statement, signature))
 }
 
@@ -123,6 +131,37 @@ fn decode_part(part: &str) -> Result<Vec<u8>, ApprovalRefusal> {
     NODE_BASE64
         .decode(part)
         .map_err(|_| malformed("an approval part is not base64"))
+}
+
+/// The lines `ssh-keygen -Y sign` writes around a signature's body.
+const ARMOUR_BEGIN: &[u8] = b"-----BEGIN SSH SIGNATURE-----";
+const ARMOUR_END: &[u8] = b"-----END SSH SIGNATURE-----";
+
+/// Whether `bytes` is an armoured SSH signature: the BEGIN line, a body of base64 characters and line breaks, the END line,
+/// then at most one line break. This is droidd's `armoredOf` pattern, matched by hand.
+fn is_armoured_ssh_signature(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(ARMOUR_BEGIN) else {
+        return false;
+    };
+    let Some(rest) = rest
+        .strip_prefix(b"\r\n")
+        .or_else(|| rest.strip_prefix(b"\n"))
+    else {
+        return false;
+    };
+    // The body holds no dash, so the END line starts at the first dash after the BEGIN line.
+    let Some(end) = rest.iter().position(|b| *b == b'-') else {
+        return false;
+    };
+    let (body, tail) = rest.split_at(end);
+    let Some(tail) = tail.strip_prefix(ARMOUR_END) else {
+        return false;
+    };
+    !body.is_empty()
+        && body
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(*b, b'+' | b'/' | b'=' | b'\r' | b'\n'))
+        && matches!(tail, b"" | b"\r" | b"\n" | b"\r\n")
 }
 
 /// The characters `String.prototype.trim` removes in JavaScript, which droidd's approval trim uses. Rust's own `trim`
