@@ -120,7 +120,7 @@ pub struct Reconciler<S: JournalStore> {
     gate: DesiredStateGate,
     journal: Journal<S>,
     plugins: PluginSet,
-    provider: Box<dyn Provider>,
+    provider: Box<dyn Provider + Send>,
     retained: RetainedSet,
     /// The plugin that applied each entry the journal still holds effects for. A removal needs it. An entry is recorded here before
     /// its apply runs, so a failed apply that made partial effects can still be removed.
@@ -195,13 +195,46 @@ impl<S: JournalStore> Reconciler<S> {
         gate: DesiredStateGate,
         journal: Journal<S>,
         plugins: PluginSet,
-        provider: Box<dyn Provider>,
+        provider: Box<dyn Provider + Send>,
         retained: RetainedSet,
+        now_ms: u64,
+    ) -> Result<Self, KernelError> {
+        Self::open_resuming(
+            gate,
+            journal,
+            plugins,
+            provider,
+            retained,
+            Vec::new(),
+            now_ms,
+        )
+    }
+
+    /// As [`Reconciler::open`], resumed from `converged`: the entries that applied with their current config before the restart,
+    /// as [`Reconciler::converged`] reported them. An entry with an intent the journal still holds unresolved is not resumed as
+    /// converged, so the resolution decides what it is. Nothing is applied by this call.
+    pub fn open_resuming(
+        gate: DesiredStateGate,
+        journal: Journal<S>,
+        plugins: PluginSet,
+        provider: Box<dyn Provider + Send>,
+        retained: RetainedSet,
+        converged: Vec<Entry>,
         now_ms: u64,
     ) -> Result<Self, KernelError> {
         if let Some(error) = journal.poisoned() {
             return Err(error.clone());
         }
+        let unsettled: BTreeSet<EntryId> = journal
+            .unresolved()
+            .into_iter()
+            .map(|record| record.entry)
+            .collect();
+        let converged = converged
+            .into_iter()
+            .filter(|entry| !unsettled.contains(&entry.id))
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
         let mut reconciler = Reconciler {
             gate,
             journal,
@@ -209,13 +242,19 @@ impl<S: JournalStore> Reconciler<S> {
             provider,
             retained,
             applied_by: BTreeMap::new(),
-            converged: BTreeMap::new(),
+            converged,
             pending: Vec::new(),
             resolution: Resolution::default(),
         };
         reconciler.rebuild_applied_by();
         reconciler.resolve(now_ms)?;
         Ok(reconciler)
+    }
+
+    /// The entries that applied with their current config and have not been removed since, in id order. A caller persists
+    /// this and passes it to [`Reconciler::open_resuming`] after a restart.
+    pub fn converged(&self) -> Vec<Entry> {
+        self.converged.values().cloned().collect()
     }
 
     /// What the last resolution settled: the intents it adopted, reverted or left failed, the entries it held, and the objects

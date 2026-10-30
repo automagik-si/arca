@@ -28,10 +28,18 @@ fn names() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_table_holds_the_four_initial_verbs_in_order() {
+fn the_table_holds_the_four_initial_verbs_then_the_three_plan_verbs_in_order() {
     assert_eq!(
         names(),
-        ["arca_status", "node_metrics", "watch_report", "token_list"]
+        [
+            "arca_status",
+            "node_metrics",
+            "watch_report",
+            "token_list",
+            "plan_list",
+            "plan_decline",
+            "approval_submit",
+        ]
     );
     assert_eq!(API_VERSION, "0.1.0");
 }
@@ -39,18 +47,107 @@ fn the_table_holds_the_four_initial_verbs_in_order() {
 #[test]
 fn each_verb_has_its_table_row_for_class_scope_and_writes() {
     let rows = [
-        ("arca_status", Scope::Viewer),
-        ("node_metrics", Scope::Viewer),
-        ("watch_report", Scope::Viewer),
-        ("token_list", Scope::Operator),
+        ("arca_status", Scope::Viewer, false, false),
+        ("node_metrics", Scope::Viewer, false, false),
+        ("watch_report", Scope::Viewer, false, false),
+        ("token_list", Scope::Operator, false, false),
+        ("plan_list", Scope::Viewer, false, false),
+        ("plan_decline", Scope::Doctor, true, false),
+        ("approval_submit", Scope::Doctor, true, true),
     ];
-    for (name, scope) in rows {
+    for (name, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
         assert_eq!(v.class, VerbClass::L, "{name} is class L");
         assert_eq!(v.min_scope, scope, "{name} minimum scope");
-        assert!(!v.writes, "{name} writes nothing");
-        assert!(!v.destructive, "{name} is not destructive");
+        assert_eq!(v.writes, writes, "{name} writes");
+        assert_eq!(v.destructive, destructive, "{name} destructive");
     }
+}
+
+#[test]
+fn plan_verb_schemas_equal_their_table_rows() {
+    let kinds = [
+        "project", "instance", "network", "acl", "profile", "volume", "zone", "forward", "bucket",
+    ];
+    let obj = open(
+        json!({
+            "kind": { "type": "string", "enum": kinds },
+            "project": { "type": "string" },
+            "name": { "type": "string" },
+            "uuid": { "type": ["string", "null"] },
+        }),
+        &["kind", "project", "name", "uuid"],
+    );
+    let plan = open(
+        json!({
+            "plan": hex64(),
+            "entry": { "type": "string" },
+            "createdAt": { "type": "integer" },
+            "expiresAt": { "type": "integer" },
+            "objects": { "type": "array", "items": obj.clone() },
+            "paramsDigest": hex64(),
+            "statement": { "type": "string" },
+        }),
+        &[
+            "plan",
+            "entry",
+            "createdAt",
+            "expiresAt",
+            "objects",
+            "paramsDigest",
+            "statement",
+        ],
+    );
+
+    let list = verb("plan_list").expect("present");
+    assert_eq!((list.params)(), closed(json!({})));
+    assert_eq!(
+        (list.result)(),
+        open(
+            json!({ "plans": { "type": "array", "items": plan } }),
+            &["plans"]
+        )
+    );
+
+    let decline = verb("plan_decline").expect("present");
+    assert_eq!(
+        (decline.params)(),
+        closed_with(json!({ "plan": hex64() }), &["plan"])
+    );
+    assert_eq!(
+        (decline.result)(),
+        open(
+            json!({
+                "plan": hex64(),
+                "retained": { "type": "array", "items": obj.clone() },
+            }),
+            &["plan", "retained"]
+        )
+    );
+
+    let submit = verb("approval_submit").expect("present");
+    assert_eq!(
+        (submit.params)(),
+        closed_with(
+            json!({
+                "plan": hex64(),
+                "approval": { "type": "string", "maxLength": 16384 },
+            }),
+            &["plan", "approval"]
+        )
+    );
+    assert_eq!(
+        (submit.result)(),
+        open(
+            json!({
+                "plan": hex64(),
+                "deleted": { "type": "array", "items": obj.clone() },
+                "drift": { "type": "array", "items": obj },
+                "partial": { "type": "boolean" },
+            }),
+            &["plan", "deleted", "drift", "partial"]
+        )
+    );
 }
 
 #[test]
@@ -315,7 +412,7 @@ fn the_document_is_the_generated_schema_file() {
 }
 
 #[test]
-fn the_released_0_1_0_document_holds_the_four_initial_verbs() {
+fn the_released_0_1_0_document_holds_exactly_the_four_initial_verbs() {
     let bytes = std::fs::read(RELEASED).expect("the released schema exists");
     let hex: String = Sha256::digest(&bytes)
         .iter()
@@ -334,7 +431,7 @@ fn the_released_0_1_0_document_holds_the_four_initial_verbs() {
         .iter()
         .filter_map(|m| m["name"].as_str())
         .collect();
-    assert_eq!(released, names());
+    assert_eq!(released, names()[..4]);
 }
 
 #[test]

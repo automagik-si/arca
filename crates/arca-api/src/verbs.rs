@@ -61,7 +61,7 @@ pub struct Verb {
     pub result: fn() -> Value,
 }
 
-static VERBS: [Verb; 4] = [
+static VERBS: [Verb; 7] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -101,6 +101,36 @@ static VERBS: [Verb; 4] = [
         destructive: false,
         params: token_list_params,
         result: token_list_result,
+    },
+    Verb {
+        name: "plan_list",
+        summary: "The delete plans waiting for an owner's approval, each with the exact statement the owner signs.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        params: plan_list_params,
+        result: plan_list_result,
+    },
+    Verb {
+        name: "plan_decline",
+        summary: "Declines a waiting delete plan. Its objects are retained, and the decline is final.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        params: plan_decline_params,
+        result: plan_decline_result,
+    },
+    Verb {
+        name: "approval_submit",
+        summary: "Submits an owner's approval for a waiting delete plan, which deletes the plan's objects once. The approval is never echoed.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        params: approval_submit_params,
+        result: approval_submit_result,
     },
 ];
 
@@ -144,6 +174,11 @@ fn boolean() -> Value {
 /// A 64-character string. The format (lowercase hex) is checked by the handlers, not by the schema.
 fn hex64() -> Value {
     json!({ "type": "string", "minLength": 64, "maxLength": 64 })
+}
+
+/// A string of at most `max` characters.
+fn string_max(max: i64) -> Value {
+    json!({ "type": "string", "maxLength": max })
 }
 
 fn one_of(values: &[&str]) -> Value {
@@ -378,4 +413,70 @@ fn token_list_result() -> Value {
             ("scope", true, one_of(&["viewer", "doctor", "operator"])),
         ])),
     )])
+}
+
+fn plan_list_params() -> Value {
+    params(vec![])
+}
+
+fn plan_list_result() -> Value {
+    result(vec![("plans", true, array(plan()))])
+}
+
+/// A delete plan: its digest, its entry, its times, the objects it deletes, the digest of its arguments and the exact
+/// statement the owner signs.
+fn plan() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("entry", true, string()),
+        ("createdAt", true, int()),
+        ("expiresAt", true, int()),
+        ("objects", true, array(object_ref())),
+        ("paramsDigest", true, hex64()),
+        ("statement", true, string()),
+    ])
+}
+
+/// One Incus object a plan names. `uuid` is null for a kind that has none.
+fn object_ref() -> Value {
+    result(vec![
+        (
+            "kind",
+            true,
+            one_of(&[
+                "project", "instance", "network", "acl", "profile", "volume", "zone", "forward",
+                "bucket",
+            ]),
+        ),
+        ("project", true, string()),
+        ("name", true, string()),
+        ("uuid", true, nullable(string())),
+    ])
+}
+
+fn plan_decline_params() -> Value {
+    params(vec![("plan", true, hex64())])
+}
+
+fn plan_decline_result() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("retained", true, array(object_ref())),
+    ])
+}
+
+fn approval_submit_params() -> Value {
+    params(vec![
+        ("plan", true, hex64()),
+        ("approval", true, string_max(16_384)),
+    ])
+}
+
+fn approval_submit_result() -> Value {
+    result(vec![
+        ("plan", true, hex64()),
+        ("deleted", true, array(object_ref())),
+        ("drift", true, array(object_ref())),
+        ("partial", true, boolean()),
+    ])
 }

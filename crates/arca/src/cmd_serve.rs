@@ -4,46 +4,79 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use arca_api::verbs;
+use arca_approval::{
+    ApprovalRefusal, ApprovalVerifier, FileNonces, SignerLine, SshSigVerifier, load_signers,
+    signers_trust,
+};
 use arca_incus::UnixIncus;
+use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
+use arca_kernel::plugin::Provider;
 use arca_mcp::{Server, TokenStore, TokenStoreError, serve_tailnet, serve_unix};
 use arca_metrics::Sampler;
+use arca_providers::ReadOnlyIncusProvider;
+use arca_providers::incus::{Family, IncusProvider, RetainedSet};
+use arca_reconcile::PluginSet;
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::config;
+use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    MetricsHandler, Published, SAMPLE_INTERVAL, StatusHandler, TokenListHandler, WatchHandler,
-    new_sampler, sample_and_publish,
+    Clock, MetricsHandler, Published, SAMPLE_INTERVAL, StatusHandler, TokenListHandler,
+    WatchHandler, new_sampler, now_ms, plan_handlers, sample_and_publish,
 };
+use crate::kernel::Kernel;
 use crate::{Failure, Flags};
 
 /// The file that holds the node's ed25519 key, in the state directory.
 const NODE_KEY_FILE: &str = "node.key";
+/// The file the approval nonces are spent in, in the state directory.
+const NONCE_FILE: &str = "approval-nonces.jsonl";
+/// The directory secret files are read from, in the state directory.
+const SECRETS_DIR: &str = "secrets";
+/// The scratch-only owner signers injection. The server reads its owner keys from this file only in a scratch kernel, and only in
+/// a build that honours the injection.
+const TEST_SIGNERS_ENV: &str = "ARCA_TEST_OWNER_SIGNERS";
+/// The system's host name, which an approval statement names when the config names no approval host.
+const SYSTEM_HOSTNAME: &str = "/proc/sys/kernel/hostname";
 
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let cfg = config::load(Path::new(flags.required("config")?))?;
     let started = Instant::now();
-    if !cfg.state_dir.is_dir() {
-        return Err(Failure::Config(format!(
-            "the state directory {} is missing",
-            cfg.state_dir.display()
-        )));
-    }
+    check_state_dir(&cfg.state_dir)?;
 
     // The token store is read before anything listens. Its ids are copied out first, because the server takes the store.
     let tokens = TokenStore::load(&cfg.tokens.hash_dir).map_err(token_failure)?;
     let ids = tokens.ids();
     let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
+    let node = key.id().to_hex();
+
+    // The kernel opens before anything listens, so a state directory that is held, or whose document is not this node's, stops
+    // the start with nothing served.
+    let host = approval_host(&cfg)?;
+    let lines = owner_signers(&cfg)?;
+    let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
+    let verifier = ApprovalVerifier::new(host.clone(), SshSigVerifier::new(lines), nonces);
+    let kernel = Kernel::open(
+        &cfg.state_dir,
+        key,
+        PluginSet::new(),
+        verifier,
+        host,
+        write_provider(&cfg),
+        now_ms(),
+    )
+    .map_err(kernel_failure)?;
+    let kernel = Arc::new(Mutex::new(kernel));
 
     // The sampler takes its first sample on its own thread, so the listeners start without waiting on Incus. The handlers read
     // the samples it publishes and never take part in a read.
@@ -52,11 +85,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
-    let server = Server::new(verbs(), tokens)
+    let mut server = Server::new(verbs(), tokens)
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
-                node: key.id().to_hex(),
+                node,
                 started,
                 socket: cfg.incus.socket.clone(),
             }),
@@ -70,6 +103,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .handle("token_list", Arc::new(TokenListHandler { ids }));
+    let clock: Clock = Arc::new(now_ms);
+    for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock) {
+        server = server.handle(verb, handler);
+    }
     let router = server.router();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -108,6 +145,101 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Ok(None)
         }
         Err(e) => Err(Failure::Runtime(format!("the server stopped: {e}"))),
+    }
+}
+
+/// The state directory must be a real directory, not a link, and private to its owner (mode 0700). It is checked before the node
+/// key is created in it, so a key is never written into a directory another user can read.
+fn check_state_dir(dir: &Path) -> Result<(), Failure> {
+    let meta = fs::symlink_metadata(dir).map_err(|_| {
+        Failure::Config(format!("the state directory {} is missing", dir.display()))
+    })?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(Failure::Config(format!(
+            "the state directory {} is not a directory",
+            dir.display()
+        )));
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        return Err(Failure::Config(format!(
+            "the state directory {} must be mode 0700",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The owner signing keys this kernel trusts for the approval namespace. A signers file that is not there is no key at all, so
+/// every approval is refused. The count of kept keys is logged, never the keys.
+fn owner_signers(cfg: &NodeConfig) -> Result<Vec<SignerLine>, Failure> {
+    let test: Option<PathBuf> = std::env::var_os(TEST_SIGNERS_ENV).map(PathBuf::from);
+    let (path, trust) =
+        signers_trust(cfg.kernel.scratch, &cfg.kernel.projects, test).map_err(approval_failure)?;
+    let lines = match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        _ => load_signers(&path, &trust).map_err(approval_failure)?,
+    };
+    eprintln!("arca: {} owner signing key(s) kept", lines.len());
+    Ok(lines)
+}
+
+/// The host name the approval statements name: the config's approval host when one is set, else the system's host name.
+fn approval_host(cfg: &NodeConfig) -> Result<String, Failure> {
+    if let Some(host) = &cfg.approval_host {
+        return Ok(host.clone());
+    }
+    let text = fs::read_to_string(SYSTEM_HOSTNAME)
+        .map_err(|_| Failure::Runtime("the system host name cannot be read".to_string()))?;
+    let host = text.trim().to_string();
+    if !config::host_name_ok(&host) {
+        return Err(Failure::Config(
+            "the system host name is not a host name; set approvalHost in the config".to_string(),
+        ));
+    }
+    Ok(host)
+}
+
+/// The provider the reconciler writes through. A node with kernel projects writes through the Incus writer, which serves only
+/// those projects. A node with none reads only, so no removal can reach Incus.
+fn write_provider(
+    cfg: &NodeConfig,
+) -> impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError> {
+    let socket = cfg.incus.socket.clone();
+    let secrets = cfg.state_dir.join(SECRETS_DIR);
+    let writes = !cfg.kernel.projects.is_empty();
+    let family = Family {
+        projects: cfg.kernel.projects.clone(),
+        scratch: cfg.kernel.scratch,
+        droidd_projects: cfg.kernel.droidd_projects.clone(),
+        reserved_cidrs: cfg.kernel.reserved_cidrs.clone(),
+    };
+    move |retained| {
+        if writes {
+            let provider = IncusProvider::new(socket, family, secrets, retained)
+                .map_err(|refusal| KernelError::Plugin(refusal.to_string()))?;
+            return Ok(Box::new(provider));
+        }
+        Ok(Box::new(ReadOnlyIncusProvider::new(UnixIncus::new(socket))))
+    }
+}
+
+/// A kernel that will not open, as a start's failure. A provider the family refuses is a config failure; a held state directory
+/// or a state that does not verify is a runtime failure.
+fn kernel_failure(error: KernelError) -> Failure {
+    match error {
+        KernelError::Plugin(text) => Failure::Config(text),
+        KernelError::Locked { .. } => {
+            Failure::Runtime("the state directory is held by another arca process".to_string())
+        }
+        other => Failure::Runtime(other.to_string()),
+    }
+}
+
+/// An approval refusal at start, as a failure of start. A file that cannot be trusted is a config failure.
+fn approval_failure(error: ApprovalRefusal) -> Failure {
+    match error {
+        ApprovalRefusal::Untrusted(_) => Failure::Config(error.to_string()),
+        other => Failure::Runtime(other.to_string()),
     }
 }
 

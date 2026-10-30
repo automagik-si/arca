@@ -34,14 +34,20 @@ name = "arca"
 version = "0.1.0"
 dependencies = [
  "arca-api",
+ "arca-approval",
  "arca-incus",
  "arca-kernel",
  "arca-mcp",
  "arca-metrics",
  "arca-providers",
+ "arca-reconcile",
  "arca-watch",
+ "base64",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
 ]
 
