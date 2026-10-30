@@ -62,7 +62,7 @@ refused without the value being echoed back.
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
-| `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. |
+| `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 
 The config is refused, with exit 2, when:
@@ -500,11 +500,13 @@ second file that names the service's `stateDir`, the adoption project in `kernel
 ```
 
 1. `arca adopt plan --instance svc1 --expect-ip 192.0.2.131 --json --config adopt.json` runs the preflight with GET alone
-   and prints the plan, its digest and every request. The preflight refuses, naming the reason, any container a project
-   move would refuse or change (see `cmd_adopt::preflight`).
+   and prints the plan, its digest, its allowances and every request. The preflight refuses, naming the reason, any
+   container the move would change or that needs what no allowance admits (see `cmd_adopt::preflight`).
 2. `arca adopt apply --instance svc1 --plan-digest <digest> --dry-run --config adopt.json` takes no lock and sends no write.
+   It prints the same allowances.
 3. Stop the service that holds the state directory (`systemctl --user stop arca-watch.service`), then run `apply` without
-   `--dry-run`. It takes `desired.lock` and runs CreateProject, Stop, Snapshot, PinNic, Move, Mark and Start. Each step
+   `--dry-run`. It takes `desired.lock` and runs CreateProject, Stop, Snapshot, PinNic, LocalizeRoot (only when the plan
+   localizes the root), Move, Mark and Start. Each step
    writes an intent line before its request and an outcome line after it to `<stateDir>/adoptions.jsonl` (mode 0600,
    synced). A fresh plan's digest must be the one given.
 4. `arca adopt verify --instance svc1 --port 8080 [--http-path /] [--wait <s>] --config adopt.json` checks that the instance
@@ -514,11 +516,44 @@ second file that names the service's `stateDir`, the adoption project in `kernel
 5. Start the service again. `watch_report` and `arca watch --once --json` count each adoption that is not released in full as
    a live entry, so the instance shows in its adoption project as kernel-owned (`adopt-svc1`) with no drift.
 
+**Allowances.** The adoption project is restricted. It grants `eth0`'s network, allows snapshots and backups, and past
+those sets exactly the `restricted.*` keys that what the container already uses needs, as Incus 7.5 checks a moved-in
+container. Nothing else is allowed, and the container's own config is not changed. The plan holds them under
+`allowances.project`, so the digest the owner approves covers them, and `plan` and the dry run print them under
+`allowances` with, for each key, the config keys and devices that need it (`why`):
+
+| The container has | The allowance |
+|---|---|
+| `security.nesting` true | `restricted.containers.nesting=allow` |
+| an interception key Incus admits (`security.syscalls.intercept.{bpf,bpf.devices,mknod,mount,mount.fuse,setxattr,sysinfo}`), not false | `restricted.containers.interception=allow` |
+| another `security.syscalls.intercept*` key, any `raw.*` key, `security.bpffs*`, `linux.kernel_modules`, `limits.memory.swap`, `limits.memory.oom_priority`, `security.idmap.*`, `security.selinux.*`, `security.guestapi.images`, `security.devlxd.images` or `boot.host_shutdown_*` | `restricted.containers.lowlevel=allow` |
+| a host-path disk | `restricted.devices.disk=allow` and `restricted.devices.disk.paths=<its sources, comma-separated>` |
+| a `unix-char`, `unix-block`, `unix-hotplug`, `infiniband`, `gpu`, `usb`, `pci` or `proxy` device | `restricted.devices.<type>=allow` |
+| `eth0` on a bridge `kernel.attachNetworks` does not list | `restricted.networks.access=<that bridge>` |
+| `eth0` on a listed bridge, its `security.acls*` keys, a pool-backed root, a `none` device | nothing |
+
+An `eth0` ACL needs no allowance: a bridged NIC looks its ACLs up in the project that serves its network, which is `default`
+for an adoption project, and no `restricted.*` key governs an ACL. The preflight refuses, naming the reason,
+`security.privileged` true (the adoption never grants `restricted.containers.privilege`), a NIC other than `eth0`, an `eth0`
+with no managed network, an `eth0` key other than `type`, `name`, `network`, `hwaddr`, `ipv4.address` and the
+`security.acls*` keys, a `hwaddr` or `ipv4.address` other than the running MAC and IPv4, a disk on a pool other than the
+root, a host path a comma-separated list cannot hold exactly, any other device type, and any device or config key but
+`eth0` and the root that a profile gives.
+
 **The pin.** PinNic sets `devices.eth0` on the instance itself: the network, the pre-image MAC as `hwaddr` and the pre-image
-IPv4 as `ipv4.address`. It is set before Move and never removed, and Move and MoveBack refuse an unpinned instance. Because
+IPv4 as `ipv4.address`, with the `security.acls*` keys the instance's `eth0` sets kept as they are. It is set before Move and
+never removed, and Move and MoveBack refuse an unpinned instance. Because
 the pin sets `hwaddr`, Incus drops `volatile.eth0.hwaddr` at PinNic (`deviceVolatileReset`), and from then on the MAC is the
 device's own, in both projects and after a release. The snapshot `arca-adopt-<digest[0..12]>` is taken after Stop and before
 PinNic: restore it only after a release, never in the adoption project, where it would drop `eth0`.
+
+**The localized root.** A root disk the default profile gives would not reach the adoption project, whose own default
+profile is empty. The plan then records it under `allowances.localize`, and LocalizeRoot, after PinNic, sets it on the
+instance itself, as the profile gives it, with one PATCH under the ETag of the read its checks were made on. It refuses a
+root the profile changed since the plan, and Move refuses an instance whose root is not yet its own. The release takes it
+back off at RestoreRoot, after MoveBack, only when the instance's own root is still the one LocalizeRoot set and the default
+profile still gives the same one: one full PUT of the instance as read, under its ETag, less that device. A root that
+changed meanwhile is kept, and the release refuses before ReleaseStop.
 
 **Resume.** When `apply` stops at any point, whether a kill, a crash or a failed step, run the same `apply` with the same
 digest again. It goes on from the plan in the record, never from a fresh preflight, which would refuse an instance that has
@@ -537,17 +572,22 @@ sends nothing. Resume it with `apply` before any `release`: a release from that 
 instance runs, and records the failure, so only `release` can finish it after that.
 
 **Release.** `arca adopt release --instance svc1 [--dry-run] --config adopt.json` takes the lock, except for `--dry-run`, and
-returns the instance to `default`, running and unmarked, from wherever its record stands. Before Move, only ReleaseStart is
-left; after Move, MoveBack comes first; after Mark, Unmark comes before it; after Start, ReleaseStop, Unmark, MoveBack and
-ReleaseStart all run. An adopt step left at its intent is closed as failed first, and each release step reads before it
-sends. When the instance is in its adoption project without the pin, the release, and its dry run, refuse before any write,
-since MoveBack would refuse it only after the instance was stopped and unmarked. The pin and the snapshot are kept, and nothing is deleted, the empty adoption project included. Once a release has
-begun, `apply` refuses to resume and `release` finishes it. A release done in full, run again, sends nothing. `verify` then
-checks the instance in `default`.
+returns the instance to `default`, running and unmarked, from wherever its record stands, then deletes the adoption project.
+Before Move, RestoreRoot (when the plan localizes the root), ReleaseStart and DeleteProject are left; after Move, MoveBack
+comes first; after Mark, Unmark comes before it; after Start, ReleaseStop, Unmark, MoveBack, RestoreRoot, ReleaseStart and
+DeleteProject all run. An adopt step left at its intent is closed as failed first, and each release step reads before it
+sends. When the instance is in its adoption project without the pin, or with a localized root that RestoreRoot would not
+take off, the release, and its dry run, refuse before any write, since those steps would refuse only after the instance was
+stopped and unmarked. The pin and the snapshot are kept. DeleteProject is the adoption's one DELETE: it deletes the adoption
+project only when it carries this adoption's mark and holds no instance, and a project already gone is the step done. A
+release recorded before releases deleted the project ends at ReleaseStart, and `release` finishes it with DeleteProject.
+Once a release has begun, `apply` refuses to resume and `release` finishes it. A release done in full, run again, sends
+nothing. `verify` then checks the instance in `default`.
 
 Exit codes: `2` for a refusal before any write: an instance the config does not list, a preflight check, a stale digest, a
 digest that is not the recorded plan's, a record that holds no such adoption, another open adoption, a resume after a
-release has begun, a release of an instance that lost its pin, a verify before the adoption or release completed, or a bad
+release has begun, a release of an instance that lost its pin or whose localized root RestoreRoot would keep, a verify before
+the adoption or release completed, or a bad
 `--port`, `--http-path` or `--wait`. `1` for a held
 lock, a failed step (the record names it) or a failed verify.
 

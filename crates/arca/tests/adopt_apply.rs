@@ -155,9 +155,12 @@ fn every_other_preflight_refusal_names_its_reason_and_sends_no_write() {
             "exactly one NIC",
         ),
         (
-            "other-network",
-            svc1_with(nic(json!({ "network": "br2" }))),
-            "kernel.attachNetworks",
+            "unmanaged-nic",
+            svc1_with(|i| {
+                i["devices"]["eth0"] =
+                    json!({ "type": "nic", "name": "eth0", "nictype": "bridged", "parent": "br0" })
+            }),
+            "no managed network",
         ),
         (
             "nic-key",
@@ -192,22 +195,19 @@ fn every_other_preflight_refusal_names_its_reason_and_sends_no_write() {
         (
             "root",
             svc1_with(|i| i["devices"] = json!({})),
-            "root is not its own device",
+            "has no root disk",
+        ),
+        (
+            "root-off-pool",
+            svc1_with(|i| {
+                i["devices"]["root"] = json!({ "type": "disk", "path": "/", "source": "/srv/root" })
+            }),
+            "not on a storage pool",
         ),
         (
             "privileged",
             svc1_with(|i| i["config"]["security.privileged"] = json!("true")),
-            "restrictions refuse",
-        ),
-        (
-            "nesting",
-            svc1_with(|i| i["config"]["security.nesting"] = json!("true")),
-            "restrictions refuse",
-        ),
-        (
-            "raw",
-            svc1_with(|i| i["config"]["raw.lxc"] = json!("lxc.x=1")),
-            "restrictions refuse",
+            "security.privileged",
         ),
         (
             "no-uuid",
@@ -228,6 +228,14 @@ fn every_other_preflight_refusal_names_its_reason_and_sends_no_write() {
         "config": {}, "devices": { "eth0": { "type": "nic", "network": "br1", "ipv4.address": ADOPT_IP } } }));
     refused_with_no_write("device-claim", pinned, "claimed by another lease or device");
     let svc1 = || vec![adopt_instance("default", json!({}))];
+    // eth0 sets a hwaddr that runs, and is leased, but is not the volatile MAC the instance had: the two disagree.
+    refused_after(
+        "nic-hwaddr",
+        svc1_with(nic(json!({ "hwaddr": "10:66:6a:00:00:02" }))),
+        &|fake, _| fake.set_lease("br1", "10:66:6a:00:00:02", ADOPT_IP),
+        &[],
+        "other than its running MAC",
+    );
     refused_after(
         "lease-claim",
         svc1(),
@@ -347,44 +355,13 @@ fn default_profile(fake: &FakeIncus, devices: Value, config: Value) {
 }
 
 #[test]
-fn what_a_move_would_drop_or_its_project_would_refuse_is_refused_before_the_stop() {
+fn what_a_move_would_drop_or_no_allowance_admits_is_refused_before_the_stop() {
     let device =
         |name: &'static str, body: Value| svc1_with(move |i| i["devices"][name] = body.clone());
     let key = |name: &'static str, value: &'static str| {
         svc1_with(move |i| i["config"][name] = json!(value))
     };
     let cases: Vec<(&str, Vec<Value>, &str)> = vec![
-        (
-            "proxy",
-            device(
-                "web",
-                json!({ "type": "proxy", "listen": "tcp:0.0.0.0:80", "connect": "tcp:127.0.0.1:80" }),
-            ),
-            "restrictions refuse",
-        ),
-        (
-            "unix-char",
-            device("tty", json!({ "type": "unix-char", "path": "/dev/ttyS0" })),
-            "restrictions refuse",
-        ),
-        (
-            "unix-block",
-            device("blk", json!({ "type": "unix-block", "path": "/dev/sdb" })),
-            "restrictions refuse",
-        ),
-        (
-            "gpu",
-            device("gpu0", json!({ "type": "gpu" })),
-            "restrictions refuse",
-        ),
-        (
-            "host-disk",
-            device(
-                "data",
-                json!({ "type": "disk", "source": "/srv/data", "path": "/data" }),
-            ),
-            "restrictions refuse",
-        ),
         (
             "volume-disk",
             device(
@@ -394,19 +371,22 @@ fn what_a_move_would_drop_or_its_project_would_refuse_is_refused_before_the_stop
             "a disk other than its root",
         ),
         (
-            "kernel-modules",
-            key("linux.kernel_modules", "overlay"),
-            "restrictions refuse",
+            "host-path-comma",
+            device(
+                "data",
+                json!({ "type": "disk", "source": "/srv/a,b", "path": "/data" }),
+            ),
+            "cannot list exactly",
         ),
         (
-            "intercept",
-            key("security.syscalls.intercept.mknod", "true"),
-            "restrictions refuse",
+            "tpm",
+            device("tpm0", json!({ "type": "tpm", "path": "/dev/tpm0" })),
+            "of type",
         ),
         (
-            "idmap",
-            key("security.idmap.base", "100000"),
-            "restrictions refuse",
+            "privileged-1",
+            key("security.privileged", "1"),
+            "security.privileged",
         ),
         ("expiry", key("snapshots.expiry", "1d"), "snapshots.expiry"),
     ];
@@ -526,6 +506,11 @@ fn apply_refuses_while_another_process_holds_the_state_lock_and_sends_no_write()
         ]
     );
     assert!(requests.iter().all(|r| r["method"] != "DELETE"));
+    assert_eq!(
+        dry["allowances"],
+        json!({ "project": {}, "localize": {}, "nic": {}, "why": {} }),
+        "the dry run shows the plan allows nothing past the base"
+    );
     assert!(
         fake.writes().is_empty(),
         "the dry run sent no write: {:?}",
@@ -716,4 +701,411 @@ fn serve_exits_2_for_a_config_that_lists_an_adoption() {
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("kernel.adopt"));
     assert!(fake.requests().is_empty(), "serve read nothing");
+}
+
+/// The adoption project's config: eth0's network granted, snapshots and backups allowed, nothing else allowed, then `extra`.
+fn base_config(network: &str, extra: &Value) -> Value {
+    let mut config = json!({
+        "user.arcakernel.entry": "adopt-svc1", "restricted": "true",
+        "restricted.networks.access": network, "restricted.snapshots": "allow",
+        "restricted.backups": "allow", "features.networks": "false", "features.profiles": "true",
+        "features.storage.volumes": "true", "features.images": "true",
+    });
+    if let (Some(config), Some(extra)) = (config.as_object_mut(), extra.as_object()) {
+        config.extend(extra.clone());
+    }
+    config
+}
+
+/// `arca adopt plan` for `svc1`.
+fn plan_of(config: &Path) -> Value {
+    adopt_run(
+        config,
+        &[
+            "plan",
+            "--instance",
+            "svc1",
+            "--expect-ip",
+            ADOPT_IP,
+            "--json",
+        ],
+    )
+    .expect("the plan")
+    .expect("a result")
+}
+
+/// The body of the request `step` sends, from a plan's or a dry run's request list.
+fn request_body(planned: &Value, step: &str) -> Value {
+    planned["requests"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|request| request["step"] == step)
+        .map(|request| request["body"].clone())
+        .unwrap_or(Value::Null)
+}
+
+/// An edit of the fixture instance.
+type Edit = Box<dyn Fn(&mut Value)>;
+
+#[test]
+fn each_thing_the_instance_already_uses_is_planned_as_exactly_its_allowance_and_the_adoption_runs()
+{
+    let device = |name: &'static str, body: Value| {
+        Box::new(move |i: &mut Value| i["devices"][name] = body.clone()) as Edit
+    };
+    let key = |name: &'static str, value: &'static str| {
+        Box::new(move |i: &mut Value| i["config"][name] = json!(value)) as Edit
+    };
+    let data = json!({ "type": "disk", "source": "/srv/data", "path": "/data" });
+    let low = |key: &str| {
+        (
+            json!({ "restricted.containers.lowlevel": "allow" }),
+            json!({ "restricted.containers.lowlevel": [key] }),
+        )
+    };
+    let one = |key: &str, because: &str| (json!({ key: "allow" }), json!({ key: [because] }));
+    let cases: Vec<(&str, Edit, (Value, Value))> = vec![
+        (
+            "nothing",
+            Box::new(|_: &mut Value| {}),
+            (json!({}), json!({})),
+        ),
+        (
+            "nesting",
+            key("security.nesting", "true"),
+            one("restricted.containers.nesting", "security.nesting"),
+        ),
+        ("raw", key("raw.lxc", "lxc.x=1"), low("raw.lxc")),
+        (
+            "kernel-modules",
+            key("linux.kernel_modules", "overlay"),
+            low("linux.kernel_modules"),
+        ),
+        (
+            "idmap",
+            key("security.idmap.base", "100000"),
+            low("security.idmap.base"),
+        ),
+        (
+            "intercept",
+            key("security.syscalls.intercept.mknod", "true"),
+            one(
+                "restricted.containers.interception",
+                "security.syscalls.intercept.mknod",
+            ),
+        ),
+        (
+            "proxy",
+            device(
+                "web",
+                json!({ "type": "proxy", "listen": "tcp:0.0.0.0:80", "connect": "tcp:127.0.0.1:80" }),
+            ),
+            one("restricted.devices.proxy", "devices.web"),
+        ),
+        (
+            "unix-char",
+            device("tty", json!({ "type": "unix-char", "path": "/dev/ttyS0" })),
+            one("restricted.devices.unix-char", "devices.tty"),
+        ),
+        (
+            "unix-block",
+            device("blk", json!({ "type": "unix-block", "path": "/dev/sdb" })),
+            one("restricted.devices.unix-block", "devices.blk"),
+        ),
+        (
+            "gpu",
+            device("gpu0", json!({ "type": "gpu" })),
+            one("restricted.devices.gpu", "devices.gpu0"),
+        ),
+        (
+            "host-disk",
+            device("data", data.clone()),
+            (
+                json!({ "restricted.devices.disk": "allow", "restricted.devices.disk.paths": "/srv/data" }),
+                json!({ "restricted.devices.disk": ["devices.data"], "restricted.devices.disk.paths": ["devices.data"] }),
+            ),
+        ),
+        (
+            "nested-host-disk",
+            Box::new({
+                let data = data.clone();
+                move |i: &mut Value| {
+                    i["config"]["security.nesting"] = json!("true");
+                    i["devices"]["data"] = data.clone();
+                    i["devices"]["logs"] =
+                        json!({ "type": "disk", "source": "/var/log/svc", "path": "/logs" });
+                }
+            }),
+            (
+                json!({ "restricted.containers.nesting": "allow", "restricted.devices.disk": "allow",
+                    "restricted.devices.disk.paths": "/srv/data,/var/log/svc" }),
+                json!({ "restricted.containers.nesting": ["security.nesting"],
+                    "restricted.devices.disk": ["devices.data", "devices.logs"],
+                    "restricted.devices.disk.paths": ["devices.data", "devices.logs"] }),
+            ),
+        ),
+    ];
+    for (tag, edit, (project, why)) in cases {
+        let scratch = Scratch::new(&format!("allow-{tag}"));
+        let fake = adopt_fake(&scratch, svc1_with(&*edit));
+        let config = adopt_config(&scratch, &fake);
+        let planned = plan_of(&config);
+        assert_eq!(planned["allowances"]["project"], project, "{tag}");
+        assert_eq!(planned["allowances"]["why"], why, "{tag}");
+        assert_eq!(planned["allowances"]["localize"], json!({}), "{tag}");
+        let recorded = planned["plan"]
+            .get("allowances")
+            .map_or(json!({}), |allowances| allowances["project"].clone());
+        assert_eq!(
+            recorded, project,
+            "{tag}: the plan, which the digest covers"
+        );
+        assert_eq!(
+            request_body(&planned, "createProject")["config"],
+            base_config("br1", &project),
+            "{tag}: the project sets exactly these allowances"
+        );
+        let digest = planned["digest"].as_str().expect("a digest").to_string();
+        let dry = apply(&config, &digest, &["--dry-run"])
+            .expect("the dry run")
+            .expect("a result");
+        assert_eq!(dry["allowances"], planned["allowances"], "{tag}");
+        apply(&config, &digest, &[])
+            .unwrap_or_else(|failure| panic!("{tag}: {failure:?}"))
+            .expect("a result");
+        let made = get(&fake, &format!("/1.0/projects/{ADOPT_TO}")).expect("the project");
+        assert_eq!(made["config"], base_config("br1", &project), "{tag}");
+        let after =
+            get(&fake, &format!("/1.0/instances/svc1?project={ADOPT_TO}")).expect("adopted");
+        assert_eq!(after["status"], json!("Running"), "{tag}");
+    }
+}
+
+#[test]
+fn a_nic_on_a_network_attach_networks_does_not_list_is_planned_as_its_grant() {
+    let scratch = Scratch::new("allow-network");
+    let instances = svc1_with(|i| {
+        i["devices"]["eth0"] = json!({ "type": "nic", "name": "eth0", "network": "br2" })
+    });
+    let fake = adopt_fake(&scratch, instances);
+    fake.set_lease("br2", ADOPT_MAC, ADOPT_IP);
+    let config = adopt_config(&scratch, &fake);
+    let planned = plan_of(&config);
+    assert_eq!(
+        planned["allowances"]["project"],
+        json!({ "restricted.networks.access": "br2" })
+    );
+    assert_eq!(
+        planned["allowances"]["why"],
+        json!({ "restricted.networks.access": ["devices.eth0"] })
+    );
+    assert_eq!(
+        request_body(&planned, "createProject")["config"],
+        base_config("br2", &json!({})),
+        "the grant names eth0's network alone, not the attach networks"
+    );
+    let digest = planned["digest"].as_str().expect("a digest").to_string();
+    apply(&config, &digest, &[])
+        .expect("the adoption")
+        .expect("a result");
+    let made = get(&fake, &format!("/1.0/projects/{ADOPT_TO}")).expect("the project");
+    assert_eq!(made["config"], base_config("br2", &json!({})));
+}
+
+/// The first fixture's own `eth0`: on the attach network, with its IPv4 and two ACL keys set.
+fn acl_nic() -> Value {
+    json!({ "type": "nic", "name": "eth0", "network": "br1", "ipv4.address": ADOPT_IP,
+        "security.acls": "web", "security.acls.default.egress.action": "allow",
+        "security.acls.default.ingress.action": "drop" })
+}
+
+fn root() -> Value {
+    json!({ "type": "disk", "path": "/", "pool": "pool1", "size": "60GiB" })
+}
+
+#[test]
+fn an_instance_whose_nic_sets_its_ip_and_acls_and_whose_root_a_profile_gives_is_adopted_verified_and_released()
+ {
+    let scratch = Scratch::new("acl-root");
+    let instances = svc1_with(|i| i["devices"] = json!({ "eth0": acl_nic() }));
+    let fake = adopt_fake(&scratch, instances);
+    fake.add_profile(
+        "default",
+        json!({ "name": "default", "config": {}, "devices": {
+            "eth0": { "type": "nic", "name": "eth0", "network": "br1" }, "root": root() } }),
+    );
+    let acl = json!({ "name": "web", "config": {} });
+    assert_eq!(raw(&fake, "POST", "/1.0/network-acls", &acl), 201);
+    let config = adopt_config(&scratch, &fake);
+    let before = get(&fake, "/1.0/instances/svc1?project=default").expect("the instance");
+    let writes_before = fake.writes().len();
+
+    // The plan allows nothing past the base, localizes the root, and shows the eth0 keys the pin keeps.
+    let planned = plan_of(&config);
+    assert_eq!(
+        planned["allowances"],
+        json!({
+            "project": {}, "localize": { "root": root() }, "why": {},
+            "nic": { "ipv4.address": ADOPT_IP, "security.acls": "web",
+                "security.acls.default.egress.action": "allow",
+                "security.acls.default.ingress.action": "drop" },
+        })
+    );
+    assert_eq!(
+        planned["plan"]["allowances"],
+        json!({ "localize": { "root": root() } }),
+        "the localized root is in the plan the digest covers"
+    );
+    assert_eq!(
+        planned["plan"]["steps"],
+        json!([
+            "createProject",
+            "stop",
+            "snapshot",
+            "pinNic",
+            "localizeRoot",
+            "move",
+            "mark",
+            "start"
+        ])
+    );
+    assert_eq!(
+        request_body(&planned, "localizeRoot"),
+        json!({ "devices": { "root": root() } })
+    );
+    assert_eq!(
+        request_body(&planned, "createProject")["config"],
+        base_config("br1", &json!({}))
+    );
+    let mut pinned = acl_nic();
+    pinned["hwaddr"] = json!(ADOPT_MAC);
+    assert_eq!(
+        request_body(&planned, "pinNic"),
+        json!({ "devices": { "eth0": pinned } }),
+        "the pin keeps the ACL keys"
+    );
+    let digest = planned["digest"].as_str().expect("a digest").to_string();
+    let dry = apply(&config, &digest, &["--dry-run"])
+        .expect("the dry run")
+        .expect("a result");
+    assert_eq!(dry["allowances"], planned["allowances"]);
+    assert_eq!(
+        fake.writes().len(),
+        writes_before,
+        "plan and dry run send nothing"
+    );
+
+    apply(&config, &digest, &[])
+        .expect("the adoption")
+        .expect("a result");
+    let made = get(&fake, &format!("/1.0/projects/{ADOPT_TO}")).expect("the project");
+    assert_eq!(made["config"], base_config("br1", &json!({})));
+    let after = get(&fake, &format!("/1.0/instances/svc1?project={ADOPT_TO}")).expect("adopted");
+    assert_eq!(after["status"], json!("Running"));
+    assert_eq!(after["devices"]["eth0"], pinned);
+    assert_eq!(after["devices"]["root"], root());
+    let own = |body: &Value| -> Vec<(String, Value)> {
+        body["config"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| {
+                !key.starts_with("volatile.") && key.as_str() != "user.arcakernel.entry"
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    };
+    assert_eq!(
+        own(&after),
+        own(&before),
+        "the instance's config is unchanged"
+    );
+    let verified = adopt_run(
+        &config,
+        &[
+            "verify",
+            "--instance",
+            "svc1",
+            "--port",
+            "8080",
+            "--wait",
+            "0",
+        ],
+    );
+    // Nothing listens on the documentation address, so the port check fails after the MAC and IPv4 checks passed.
+    assert!(
+        matches!(&verified, Err(Failure::Runtime(why)) if why.contains("port 8080")),
+        "{verified:?}"
+    );
+
+    let released = adopt_run(&config, &["release", "--instance", "svc1"])
+        .expect("the release")
+        .expect("a result");
+    assert_eq!(released["released"], json!(true));
+    assert!(
+        get(&fake, &format!("/1.0/projects/{ADOPT_TO}")).is_none(),
+        "the project is deleted"
+    );
+    let back = get(&fake, "/1.0/instances/svc1?project=default").expect("released");
+    assert_eq!(back["status"], json!("Running"));
+    assert!(
+        back["devices"].get("root").is_none(),
+        "the root is the profile's again"
+    );
+    assert_eq!(back["expanded_devices"]["root"], root());
+    assert_eq!(back["devices"]["eth0"], pinned, "the pin stays");
+    assert_eq!(own(&back), own(&before));
+    let deletes: Vec<String> = fake
+        .writes()
+        .into_iter()
+        .filter(|write| write.method == "DELETE")
+        .map(|write| write.path)
+        .collect();
+    assert_eq!(deletes, [format!("/1.0/projects/{ADOPT_TO}")]);
+    let verified = adopt_run(
+        &config,
+        &[
+            "verify",
+            "--instance",
+            "svc1",
+            "--port",
+            "8080",
+            "--wait",
+            "0",
+        ],
+    );
+    assert!(
+        matches!(&verified, Err(Failure::Runtime(why)) if why.contains("port 8080")),
+        "verify reads the released instance in default: {verified:?}"
+    );
+}
+
+#[test]
+fn an_eth0_hwaddr_that_agrees_with_the_running_mac_is_kept_and_the_adoption_runs() {
+    // Incus keeps no volatile key for a NIC whose hwaddr is set, so the MAC is the device's own.
+    let scratch = Scratch::new("hwaddr");
+    let instances = svc1_with(|i| {
+        i["devices"]["eth0"] =
+            json!({ "type": "nic", "name": "eth0", "network": "br1", "hwaddr": ADOPT_MAC });
+        i["config"]
+            .as_object_mut()
+            .expect("config")
+            .remove("volatile.eth0.hwaddr");
+    });
+    let fake = adopt_fake(&scratch, instances);
+    let config = adopt_config(&scratch, &fake);
+    let planned = plan_of(&config);
+    assert_eq!(planned["plan"]["preImage"]["mac"], json!(ADOPT_MAC));
+    assert_eq!(planned["allowances"]["nic"], json!({ "hwaddr": ADOPT_MAC }));
+    let digest = planned["digest"].as_str().expect("a digest").to_string();
+    apply(&config, &digest, &[])
+        .expect("the adoption")
+        .expect("a result");
+    let state = get(
+        &fake,
+        &format!("/1.0/instances/svc1/state?project={ADOPT_TO}"),
+    )
+    .expect("the state");
+    assert_eq!(state["network"]["eth0"]["hwaddr"], json!(ADOPT_MAC));
 }

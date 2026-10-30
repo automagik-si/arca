@@ -6,17 +6,24 @@
 //! each request the writer reads the instance there and refuses unless it is a container whose `volatile.uuid` is the one the
 //! writer expects (the recorded pre-image's, or the one a confirmed copy gave it), in that class and that status; Mark also
 //! takes the instance running. A step whose outcome already reads true sends nothing. Every request is one of the table's
-//! ([`AdoptWriter::requests`]): no DELETE, no write to a network, a profile or an ACL, and no project write but the one create.
-//! Every request passes `exchange`, whose guard refuses a project PATCH.
+//! ([`AdoptWriter::requests`]): no write to a network, a profile or an ACL; no project write but the one create and the one
+//! delete of the emptied adoption project; and no other DELETE. Every request passes `exchange`, whose guard refuses a
+//! project PATCH.
 //!
 //! The NIC is pinned on the device itself before the move and never unpinned: `devices.eth0` names the network, the pre-image
-//! MAC and the pre-image IPv4 ([`pin_patch`]). No step removes or renames `eth0`, so Incus's `deviceVolatileReset` never clears a
-//! key the instance's MAC depends on.
+//! MAC and the pre-image IPv4, and keeps the NIC's ACL keys ([`pin_patch`], [`NIC_KEPT_KEYS`]). No step removes or renames
+//! `eth0`, so Incus's `deviceVolatileReset` never clears a key the instance's MAC depends on.
+//!
+//! The adoption project allows exactly what the instance already uses ([`Allowances`]): the plan derives each `restricted.*`
+//! key from the instance's config and devices ([`needed_allowances`]), the owner approves them with the plan's digest, and the
+//! project is created with those keys and no other. A root disk that a profile gives is made the instance's own before the
+//! move (LocalizeRoot), since the adoption project has its own profiles, and a release takes it back off (RestoreRoot) once
+//! the instance is in `default` again and its profiles give the same root.
 //!
 //! Incus 7.5 runs a stopped instance's project move as a copy, which gets a new `volatile.uuid`. A move is confirmed under a
 //! new uuid only by the copy rule ([`AdoptWriter::uuid`]), and the writer then follows the new uuid.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -47,6 +54,264 @@ pub const NIC: &str = "eth0";
 pub const STOP_TIMEOUT_SECONDS: u64 = 60;
 /// The kernel's own config namespace. A Foreign instance carries no key in it.
 const KERNEL_NAMESPACE: &str = "user.arcakernel.";
+/// The grant: the networks a restricted project's NICs may name.
+pub const NETWORKS_ACCESS: &str = "restricted.networks.access";
+/// The keys `eth0` may set beside [`NIC_KEPT_KEYS`]: the three that name it, and the two the pin sets, which must already agree
+/// with the pin when the instance sets them.
+pub const PIN_KEYS: [&str; 5] = ["type", "name", "network", "hwaddr", "ipv4.address"];
+/// The `eth0` keys the pin keeps as they are: the NIC's ACLs and their default actions. A bridged NIC looks its ACLs up in the
+/// project that serves its network, which is `default` for a project whose `features.networks` is off, as an adoption
+/// project's is; and no `restricted.*` key governs an ACL. So they need no allowance.
+pub const NIC_KEPT_KEYS: [&str; 5] = [
+    "security.acls",
+    "security.acls.default.egress.action",
+    "security.acls.default.egress.logged",
+    "security.acls.default.ingress.action",
+    "security.acls.default.ingress.logged",
+];
+/// The value every allowance but the disk paths and the grant is set to.
+const ALLOW: &str = "allow";
+const NESTING: &str = "restricted.containers.nesting";
+const INTERCEPTION: &str = "restricted.containers.interception";
+const LOW_LEVEL: &str = "restricted.containers.lowlevel";
+const DISK: &str = "restricted.devices.disk";
+const DISK_PATHS: &str = "restricted.devices.disk.paths";
+/// The device types a restricted project refuses unless `restricted.devices.<type>` is `allow` (Incus 7.5,
+/// `checkRestrictions` in `internal/server/project/permissions.go`).
+const ALLOW_DEVICE_TYPES: [&str; 8] = [
+    "unix-char",
+    "unix-block",
+    "unix-hotplug",
+    "infiniband",
+    "gpu",
+    "usb",
+    "pci",
+    "proxy",
+];
+/// The interception keys `restricted.containers.interception=allow` admits (Incus's `allowableIntercept`). Every other
+/// `security.syscalls.intercept*` key counts as low level.
+const INTERCEPT_KEYS: [&str; 7] = [
+    "security.syscalls.intercept.bpf",
+    "security.syscalls.intercept.bpf.devices",
+    "security.syscalls.intercept.mknod",
+    "security.syscalls.intercept.mount",
+    "security.syscalls.intercept.mount.fuse",
+    "security.syscalls.intercept.setxattr",
+    "security.syscalls.intercept.sysinfo",
+];
+/// The container keys Incus counts as low level (`isContainerLowLevelOptionForbidden`), which a restricted project refuses
+/// unless `restricted.containers.lowlevel` is `allow`, whatever their value. `security.devlxd.images` is the older name of
+/// `security.guestapi.images`.
+const LOW_LEVEL_KEYS: [&str; 17] = [
+    "boot.host_shutdown_action",
+    "boot.host_shutdown_timeout",
+    "linux.kernel_modules",
+    "limits.memory.swap",
+    "limits.memory.oom_priority",
+    "raw.apparmor",
+    "raw.idmap",
+    "raw.lxc",
+    "raw.seccomp",
+    "security.devlxd.images",
+    "security.guestapi.images",
+    "security.idmap.base",
+    "security.idmap.size",
+    "security.selinux.domain",
+    "security.selinux.label_rootfs",
+    "security.selinux.level",
+    "security.selinux.type",
+];
+/// The prefixes of low-level keys: every `raw.*` key, and `security.bpffs*`.
+const LOW_LEVEL_PREFIXES: [&str; 2] = ["raw.", "security.bpffs"];
+
+/// A device: its keys and their values.
+pub type Device = BTreeMap<String, String>;
+/// Devices by name.
+pub type Devices = BTreeMap<String, Device>;
+
+/// What an adoption's plan allows and changes past the pin. The owner approves both with the plan's digest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Allowances {
+    /// The `restricted.*` keys the adoption project sets past the kernel's own, each to the value that allows what the
+    /// instance already uses ([`needed_allowances`]). The grant is here only when it names a network `kernel.attachNetworks`
+    /// does not list.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project: BTreeMap<String, String>,
+    /// The devices a profile gives that the adoption makes the instance's own before the move, by name: its root disk, when
+    /// a profile gives it. A release takes each back off.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub localize: Devices,
+}
+
+impl Allowances {
+    /// Whether the plan allows and localizes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.project.is_empty() && self.localize.is_empty()
+    }
+}
+
+/// The allowances an instance needs: each `restricted.*` key with the value that allows it, and, for each key, the config
+/// keys and the devices (`devices.<name>`) that need it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Needed {
+    pub project: BTreeMap<String, String>,
+    pub why: BTreeMap<String, Vec<String>>,
+}
+
+impl Needed {
+    fn add(&mut self, key: &str, value: &str, because: &str) {
+        self.project.insert(key.to_string(), value.to_string());
+        self.why
+            .entry(key.to_string())
+            .or_default()
+            .push(because.to_string());
+    }
+}
+
+/// The `restricted.*` keys a restricted project needs set to take a container with this config and these devices, as Incus
+/// 7.5 checks them on a moved-in instance (`checkRestrictions`). `config` and `devices` are what the instance will hold after
+/// the move: its own config, and its devices with `eth0` pinned and its root its own. `volatile.*` keys are left to Incus,
+/// which drops them on the copy. The network grant is not here: it always names eth0's network.
+///
+/// | The instance has | The allowance |
+/// |---|---|
+/// | `security.nesting` true | `restricted.containers.nesting=allow` |
+/// | an interception key Incus admits, not false | `restricted.containers.interception=allow` |
+/// | another `security.syscalls.intercept*` key, a `raw.*` key or another low-level key | `restricted.containers.lowlevel=allow` |
+/// | a host-path disk | `restricted.devices.disk=allow` and `restricted.devices.disk.paths=<its sources>` |
+/// | a `unix-char`, `unix-block`, `unix-hotplug`, `infiniband`, `gpu`, `usb`, `pci` or `proxy` device | `restricted.devices.<type>=allow` |
+/// | eth0 on a managed network, its ACLs, a pool-backed root, a `none` device | nothing |
+///
+/// It refuses, naming the reason, what no allowance the adoption grants would admit: `security.privileged` true; a NIC other
+/// than eth0, whose MAC the move would reset; eth0 without a network; a disk on a pool other than the root, which stays in
+/// `default`; a host path that a comma-separated list cannot hold exactly; and any other device type.
+pub fn needed_allowances(
+    config: &BTreeMap<String, String>,
+    devices: &Devices,
+) -> Result<Needed, String> {
+    let mut needed = Needed::default();
+    for (key, value) in config {
+        if key.starts_with("volatile.") {
+            continue;
+        }
+        let restriction = match key.as_str() {
+            "security.privileged" if is_true(value) => {
+                return Err(
+                    "the instance sets security.privileged: the adoption project's restrictions refuse a privileged container, and the adoption does not grant restricted.containers.privilege"
+                        .to_string(),
+                );
+            }
+            "security.nesting" => is_true(value).then_some(NESTING),
+            intercept if INTERCEPT_KEYS.contains(&intercept) => {
+                (!is_false_or_empty(value)).then_some(INTERCEPTION)
+            }
+            low if low.starts_with("security.syscalls.intercept")
+                || LOW_LEVEL_KEYS.contains(&low)
+                || LOW_LEVEL_PREFIXES
+                    .iter()
+                    .any(|prefix| low.starts_with(prefix)) =>
+            {
+                Some(LOW_LEVEL)
+            }
+            _ => None,
+        };
+        if let Some(restriction) = restriction {
+            needed.add(restriction, ALLOW, key);
+        }
+    }
+    let mut paths = BTreeSet::new();
+    for (name, device) in devices {
+        let field = |key: &str| device.get(key).map_or("", String::as_str);
+        let because = format!("devices.{name}");
+        match field("type") {
+            "nic" if name != NIC => {
+                return Err(format!(
+                    "the instance's {name} device is a NIC other than eth0: only eth0 is pinned, and the move would give {name} a new MAC"
+                ));
+            }
+            "nic" if field("network").is_empty() => {
+                return Err(
+                    "the instance's eth0 names no managed network, which a restricted project refuses"
+                        .to_string(),
+                );
+            }
+            "nic" => {}
+            "disk" if field("path") == "/" && !field("pool").is_empty() => {}
+            "disk" if field("pool").is_empty() && !field("source").is_empty() => {
+                let source = field("source");
+                if !listable(source) {
+                    return Err(format!(
+                        "the instance's {name} disk has the host path {source:?}, which restricted.devices.disk.paths cannot list exactly"
+                    ));
+                }
+                needed.add(DISK, ALLOW, &because);
+                needed.add(DISK_PATHS, "", &because);
+                paths.insert(source.to_string());
+            }
+            "disk" if !field("pool").is_empty() => {
+                return Err(format!(
+                    "the instance's {name} device is a disk other than its root, on a volume the move cannot reach"
+                ));
+            }
+            "disk" => {
+                return Err(format!(
+                    "the instance's {name} disk names neither a pool nor a host path"
+                ));
+            }
+            kind if ALLOW_DEVICE_TYPES.contains(&kind) => {
+                needed.add(&format!("restricted.devices.{kind}"), ALLOW, &because);
+            }
+            "none" => {}
+            kind => {
+                return Err(format!(
+                    "the instance's {name} device is of type {kind:?}, which no restricted key the adoption maps allows"
+                ));
+            }
+        }
+    }
+    if !paths.is_empty() {
+        let list: Vec<String> = paths.into_iter().collect();
+        needed
+            .project
+            .insert(DISK_PATHS.to_string(), list.join(","));
+    }
+    Ok(needed)
+}
+
+/// Incus's `IsTrue`: `true`, `1`, `yes` or `on`, in any case.
+fn is_true(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+/// Incus's `IsFalseOrEmpty`: empty, or `false`, `0`, `no` or `off`, in any case.
+fn is_false_or_empty(value: &str) -> bool {
+    value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        )
+}
+
+/// A host path `restricted.devices.disk.paths` can list exactly: absolute and already clean, as Incus cleans it, with no comma,
+/// which separates the list, and no space at either end, which Incus trims.
+fn listable(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    path.starts_with('/')
+        && path.len() <= 4096
+        && path.trim() == path
+        && path
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) && b != b',')
+        && path[1..]
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
 
 /// One allowlisted adoption: the instance in the default project and the adoption project it moves to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,34 +363,45 @@ pub struct PreImage {
 }
 
 impl PreImage {
-    /// The pin of this pre-image: its MAC and IPv4, on the network its `eth0` names.
+    /// The pin of this pre-image: its MAC and IPv4, on the network its `eth0` names, with the ACL keys its `eth0` sets.
     pub fn pin(&self) -> Option<Pin> {
-        let network = self.devices.get(NIC)?.get("network")?.clone();
+        let eth0 = self.devices.get(NIC)?;
+        let network = eth0.get("network")?.clone();
+        let kept = eth0
+            .iter()
+            .filter(|(key, _)| NIC_KEPT_KEYS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         Some(Pin {
             mac: self.mac.clone(),
             ipv4: self.ipv4,
             network,
+            kept,
         })
     }
 }
 
-/// The NIC pin: the MAC and the IPv4 set on `eth0` itself, on its network.
+/// The NIC pin: the MAC and the IPv4 set on `eth0` itself, on its network, with the NIC's own ACL keys kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pin {
     pub mac: String,
     pub ipv4: Ipv4Addr,
     pub network: String,
+    /// The [`NIC_KEPT_KEYS`] the instance's `eth0` sets, as it sets them.
+    pub kept: BTreeMap<String, String>,
 }
 
 /// The pinned `eth0` device, key by key.
 pub fn pin_device(pin: &Pin) -> BTreeMap<String, String> {
-    BTreeMap::from([
+    let mut device = pin.kept.clone();
+    device.extend([
         ("type".to_string(), "nic".to_string()),
         ("name".to_string(), NIC.to_string()),
         ("network".to_string(), pin.network.clone()),
         ("hwaddr".to_string(), pin.mac.clone()),
         ("ipv4.address".to_string(), pin.ipv4.to_string()),
-    ])
+    ]);
+    device
 }
 
 /// The PATCH body that pins the NIC: `devices.eth0` alone, which Incus replaces whole and which overrides the profile's.
@@ -133,25 +409,46 @@ pub fn pin_patch(pin: &Pin) -> Value {
     json!({ "devices": { NIC: pin_device(pin) } })
 }
 
-/// The create body of the adoption project. It is marked `adopt-<instance>` from the moment it exists. It is restricted, and
-/// its grant names the attach networks and nothing else; it allows snapshots and backups. It reads the default project's
-/// networks, and has its own profiles, volumes and images.
-pub fn adoption_project_body(target: &AdoptTarget, attach: &[String]) -> Value {
+/// The create body of the adoption project. It is marked `adopt-<instance>` from the moment it exists. It is restricted, its
+/// grant names `network`, eth0's, and nothing else, and it allows snapshots and backups. Past those it sets exactly the
+/// plan's `allowances`, and no other `restricted.*` key. It reads the default project's networks and ACLs, and has its own
+/// profiles, volumes and images.
+pub fn adoption_project_body(
+    target: &AdoptTarget,
+    network: &str,
+    allowances: &BTreeMap<String, String>,
+) -> Value {
+    let mut config = json!({
+        KERNEL_ENTRY_KEY: format!("{ADOPT_ENTRY_PREFIX}{}", target.instance),
+        "restricted": "true",
+        NETWORKS_ACCESS: network,
+        "restricted.snapshots": "allow",
+        "restricted.backups": "allow",
+        "features.networks": "false",
+        "features.profiles": "true",
+        "features.storage.volumes": "true",
+        "features.images": "true",
+    });
+    if let Value::Object(config) = &mut config {
+        for (key, value) in allowances {
+            config.insert(key.clone(), json!(value));
+        }
+    }
     json!({
         "name": target.to,
         "description": format!("Arca adoption of {}", target.instance),
-        "config": {
-            KERNEL_ENTRY_KEY: format!("{ADOPT_ENTRY_PREFIX}{}", target.instance),
-            "restricted": "true",
-            "restricted.networks.access": attach.join(","),
-            "restricted.snapshots": "allow",
-            "restricted.backups": "allow",
-            "features.networks": "false",
-            "features.profiles": "true",
-            "features.storage.volumes": "true",
-            "features.images": "true",
-        },
+        "config": config,
     })
+}
+
+/// The `restricted` keys of a project config, and its mark: the part of an adoption project the plan settles. Incus adds
+/// default `features.*` keys of its own on a create, so those are not compared.
+fn settled(config: &BTreeMap<String, String>) -> BTreeMap<&str, &str> {
+    config
+        .iter()
+        .filter(|(key, _)| key.starts_with("restricted") || key.as_str() == KERNEL_ENTRY_KEY)
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
 }
 
 /// The steps, adoption then release.
@@ -162,33 +459,55 @@ pub enum AdoptStep {
     Stop,
     Snapshot,
     PinNic,
+    LocalizeRoot,
     Move,
     Mark,
     Start,
     ReleaseStop,
     Unmark,
     MoveBack,
+    RestoreRoot,
     ReleaseStart,
+    DeleteProject,
 }
 
 impl AdoptStep {
-    /// The adoption, in order.
-    pub const ADOPT: [AdoptStep; 7] = [
+    /// Every adoption step, in order. A plan that localizes nothing leaves LocalizeRoot out ([`AdoptStep::adopt_steps`]).
+    pub const ADOPT: [AdoptStep; 8] = [
         AdoptStep::CreateProject,
         AdoptStep::Stop,
         AdoptStep::Snapshot,
         AdoptStep::PinNic,
+        AdoptStep::LocalizeRoot,
         AdoptStep::Move,
         AdoptStep::Mark,
         AdoptStep::Start,
     ];
-    /// The release, in order.
-    pub const RELEASE: [AdoptStep; 4] = [
+    /// Every release step, in order. A plan that localizes nothing leaves RestoreRoot out ([`AdoptStep::release_steps`]).
+    pub const RELEASE: [AdoptStep; 6] = [
         AdoptStep::ReleaseStop,
         AdoptStep::Unmark,
         AdoptStep::MoveBack,
+        AdoptStep::RestoreRoot,
         AdoptStep::ReleaseStart,
+        AdoptStep::DeleteProject,
     ];
+
+    /// The adoption steps of a plan: LocalizeRoot only when the plan localizes a device.
+    pub fn adopt_steps(localize: bool) -> Vec<AdoptStep> {
+        Self::ADOPT
+            .into_iter()
+            .filter(|step| localize || *step != AdoptStep::LocalizeRoot)
+            .collect()
+    }
+
+    /// The release steps of a plan: RestoreRoot only when the plan localizes a device.
+    pub fn release_steps(localize: bool) -> Vec<AdoptStep> {
+        Self::RELEASE
+            .into_iter()
+            .filter(|step| localize || *step != AdoptStep::RestoreRoot)
+            .collect()
+    }
 }
 
 /// What a step did: it sent its request, or its outcome already held and it sent nothing.
@@ -222,7 +541,8 @@ pub struct Expect {
 }
 
 /// One request of the step table: the step, the method, the path and the body; whether it carries the ETag of the read before
-/// it; and, for the forced stop, the condition it is sent under.
+/// it; for the forced stop, the condition it is sent under; and, for RestoreRoot's full PUT, how its body is taken from the
+/// read before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdoptRequest {
@@ -233,7 +553,23 @@ pub struct AdoptRequest {
     pub body: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub only_if: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_read: Option<&'static str>,
 }
+
+/// How RestoreRoot's PUT body is made. A PATCH cannot remove a device, so the step sends the whole instance back as it read it,
+/// under that read's ETag, less the device it localized.
+const FROM_READ: &str = "the instance's writable fields as the read before the PUT gives them, less each device this body sets to null";
+/// The fields of an instance a PUT replaces (`api.InstancePut`).
+const WRITABLE: [&str; 7] = [
+    "architecture",
+    "config",
+    "devices",
+    "ephemeral",
+    "profiles",
+    "stateful",
+    "description",
+];
 
 /// The instance as one read showed it.
 struct Seen {
@@ -241,8 +577,10 @@ struct Seen {
     class: OwnerClass,
     status: String,
     kernel_keys: bool,
-    devices: BTreeMap<String, BTreeMap<String, String>>,
-    expanded: BTreeMap<String, BTreeMap<String, String>>,
+    devices: Devices,
+    expanded: Devices,
+    /// The whole read, for RestoreRoot's PUT.
+    body: Value,
 }
 
 /// The adoption writer for one allowlisted target and its recorded pre-image.
@@ -251,8 +589,8 @@ pub struct AdoptWriter {
     writer: UnixIncusWriter,
     read: UnixIncus,
     target: AdoptTarget,
-    attach: Vec<String>,
     pre: PreImage,
+    allowances: Allowances,
     pin: Pin,
     entry: EntryId,
     snapshot: Option<String>,
@@ -266,8 +604,8 @@ impl Clone for AdoptWriter {
             writer: self.writer.clone(),
             read: self.read.clone(),
             target: self.target.clone(),
-            attach: self.attach.clone(),
             pre: self.pre.clone(),
+            allowances: self.allowances.clone(),
             pin: self.pin.clone(),
             entry: self.entry.clone(),
             snapshot: self.snapshot.clone(),
@@ -277,30 +615,48 @@ impl Clone for AdoptWriter {
 }
 
 impl AdoptWriter {
-    /// A writer for `target` over the Incus socket at `socket`. `attach` lists the networks the adoption project may grant, and
-    /// it must hold the network the pre-image's NIC names. Nothing is read or sent here.
+    /// A writer for `target` over the Incus socket at `socket`, for a plan that allows and localizes nothing (see
+    /// [`AdoptWriter::new_allowing`]). Nothing is read or sent here.
     pub fn new(
         socket: PathBuf,
         target: AdoptTarget,
         attach: Vec<String>,
         pre: PreImage,
     ) -> Result<Self, IncusError> {
+        Self::new_allowing(socket, target, attach, pre, Allowances::default())
+    }
+
+    /// A writer for `target` and a plan of `pre` and `allowances`, over the Incus socket at `socket`. `attach` lists the
+    /// networks the adoption project grants without an allowance. The pre-image's `eth0` must be one the pin can carry: on a
+    /// plain network, with no key but [`PIN_KEYS`] and [`NIC_KEPT_KEYS`], and a `hwaddr` or `ipv4.address` it sets must be the
+    /// pre-image's. The allowances must be exactly the ones the pre-image needs ([`needed_allowances`]), and the grant one
+    /// only when it names eth0's network and `attach` does not list it; a localized device must be a pool-backed root that
+    /// the pre-image holds as recorded. Nothing is read or sent here.
+    pub fn new_allowing(
+        socket: PathBuf,
+        target: AdoptTarget,
+        attach: Vec<String>,
+        pre: PreImage,
+        allowances: Allowances,
+    ) -> Result<Self, IncusError> {
         target.check().map_err(refused)?;
         let entry = target
             .entry()
             .ok_or_else(|| refused("the adoption entry is not a valid entry id"))?;
-        if attach.is_empty() || !attach.iter().all(|name| plain_name(name)) {
+        if !attach.iter().all(|name| plain_name(name)) {
             return Err(refused("an attach network is not a plain name"));
         }
         let pin = pre
             .pin()
             .ok_or_else(|| refused("the pre-image names no network on eth0"))?;
-        if !attach.contains(&pin.network) {
-            return Err(refused("the NIC's network is not an attach network"));
+        if !plain_name(&pin.network) {
+            return Err(refused("the NIC's network is not a plain name"));
         }
         if !mac_ok(&pin.mac) || pre.uuid.is_empty() {
             return Err(refused("the pre-image has no plain MAC or uuid"));
         }
+        pin_carries(&pre, &pin)?;
+        check_allowances(&attach, &pre, &pin, &allowances)?;
         let uuid = Mutex::new(pre.uuid.clone());
         let family = ProjectFamily::new([target.to.as_str()], [])
             .map_err(|_| refused("the adoption project cannot be named"))?;
@@ -309,13 +665,28 @@ impl AdoptWriter {
             writer,
             read: UnixIncus::new(socket),
             target,
-            attach,
             pre,
+            allowances,
             pin,
             entry,
             snapshot: None,
             uuid,
         })
+    }
+
+    /// The adoption steps this writer's plan runs, in order.
+    pub fn adopt_steps(&self) -> Vec<AdoptStep> {
+        AdoptStep::adopt_steps(!self.allowances.localize.is_empty())
+    }
+
+    /// The release steps this writer's plan runs, in order.
+    pub fn release_steps(&self) -> Vec<AdoptStep> {
+        AdoptStep::release_steps(!self.allowances.localize.is_empty())
+    }
+
+    /// The plan's allowances.
+    pub fn allowances(&self) -> &Allowances {
+        &self.allowances
     }
 
     /// The same writer with the adoption snapshot's name, `arca-adopt-` and 12 lowercase hex characters. The Snapshot step
@@ -385,13 +756,14 @@ impl AdoptWriter {
         use Side::{Default, To};
         let (project, class, status) = match step {
             S::CreateProject | S::Stop => (Default, Foreign, "Running"),
-            S::Snapshot | S::PinNic | S::Move => (Default, Foreign, "Stopped"),
+            S::Snapshot | S::PinNic | S::LocalizeRoot | S::Move => (Default, Foreign, "Stopped"),
             // Or Running: one started by hand after a move whose outcome was not recorded.
             S::Mark => (To, Foreign, "Stopped"),
             S::Start | S::Unmark => (To, Adopted, "Stopped"),
             S::ReleaseStop => (To, Adopted, "Running"),
             S::MoveBack => (To, Foreign, "Stopped"),
-            S::ReleaseStart => (Default, Foreign, "Stopped"),
+            S::RestoreRoot | S::ReleaseStart => (Default, Foreign, "Stopped"),
+            S::DeleteProject => (Default, Foreign, "Running"),
         };
         Expect {
             project,
@@ -413,14 +785,37 @@ impl AdoptWriter {
             if_match,
             body,
             only_if: None,
+            from_read: None,
         };
         let mark = |value: String| json!({ "config": { KERNEL_ENTRY_KEY: value } });
+        let localize = &self.allowances.localize;
         match step {
-            AdoptStep::CreateProject => vec![request(
-                "POST",
-                "/1.0/projects",
+            AdoptStep::CreateProject => {
+                vec![request("POST", "/1.0/projects", false, self.project_body())]
+            }
+            AdoptStep::LocalizeRoot if localize.is_empty() => Vec::new(),
+            AdoptStep::LocalizeRoot => vec![request(
+                "PATCH",
+                &instance,
+                true,
+                json!({ "devices": localize }),
+            )],
+            AdoptStep::RestoreRoot if localize.is_empty() => Vec::new(),
+            AdoptStep::RestoreRoot => {
+                let removed: serde_json::Map<String, Value> = localize
+                    .keys()
+                    .map(|name| (name.clone(), Value::Null))
+                    .collect();
+                vec![AdoptRequest {
+                    from_read: Some(FROM_READ),
+                    ..request("PUT", &instance, true, json!({ "devices": removed }))
+                }]
+            }
+            AdoptStep::DeleteProject => vec![request(
+                "DELETE",
+                &format!("/1.0/projects/{}", self.target.to),
                 false,
-                adoption_project_body(&self.target, &self.attach),
+                Value::Null,
             )],
             AdoptStep::Stop | AdoptStep::ReleaseStop => vec![
                 request(
@@ -477,11 +872,76 @@ impl AdoptWriter {
     /// on, and the instance is read back. [`IncusError::Refused`] means nothing was sent by this step.
     pub fn run(&self, step: AdoptStep) -> Result<StepOutcome, IncusError> {
         self.idle()?;
+        let localizes = !self.allowances.localize.is_empty();
         match step {
+            // A plan that localizes nothing has nothing to localize or restore.
+            AdoptStep::LocalizeRoot | AdoptStep::RestoreRoot if !localizes => {
+                Ok(StepOutcome::AlreadyDone)
+            }
             AdoptStep::CreateProject => self.create_project(),
             AdoptStep::Move | AdoptStep::MoveBack => self.move_step(step),
+            AdoptStep::DeleteProject => self.delete_project(),
             _ => self.instance_step(step),
         }
+    }
+
+    /// The adoption project's create body: eth0's network granted, and the plan's allowances.
+    fn project_body(&self) -> Value {
+        adoption_project_body(&self.target, &self.pin.network, &self.allowances.project)
+    }
+
+    /// Refuses, with GET alone, a RestoreRoot that would change the instance's disks or keep one it changed: the profiles the
+    /// pre-image names, read in `default`, must give each localized device as the plan recorded it, so that taking the
+    /// instance's own copy off leaves its expanded devices as they are; and the instance, wherever it is, must hold each one
+    /// as the plan made it, or not at all. A release runs it before ReleaseStop, so it never stops half way.
+    pub fn restore_ready(&self) -> Result<(), IncusError> {
+        self.profiles_give(&self.pre.profiles)?;
+        // By name, whatever its uuid: a move whose copy is not yet recorded is the steps' to judge, and this only refuses.
+        for side in [Side::To, Side::Default] {
+            let Some((_, seen)) = self.read_any(self.side(side))? else {
+                continue;
+            };
+            for (name, device) in &self.allowances.localize {
+                if seen.devices.get(name).is_some_and(|own| own != device) {
+                    return Err(refused(&format!(
+                        "the instance's own {name} device changed since the adoption localized it, so RestoreRoot would keep it"
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    fn profiles_give(&self, profiles: &[String]) -> Result<(), IncusError> {
+        let mut given = Devices::new();
+        for profile in profiles {
+            if !plain_name(profile) {
+                return Err(refused("a profile the instance names is not a plain name"));
+            }
+            let path = format!("/1.0/profiles/{profile}?project={SOURCE_PROJECT}");
+            match self.read.get(&path) {
+                Ok(body) => given.extend(devices_of(body.get("devices"))?),
+                Err(IncusError::Status { code: 404, .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for (name, device) in &self.allowances.localize {
+            if given.get(name) != Some(device) {
+                return Err(refused(&format!(
+                    "the default project's profiles no longer give the {name} device the plan recorded, so taking the instance's own {name} off would change it"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether every device the plan localizes is the instance's own, as recorded.
+    fn localized(&self, seen: &Seen) -> bool {
+        self.allowances
+            .localize
+            .iter()
+            .all(|(name, device)| seen.devices.get(name) == Some(device))
     }
 
     fn side(&self, side: Side) -> &str {
@@ -553,19 +1013,23 @@ impl AdoptWriter {
         let config = text_map(metadata.get("config"))
             .ok_or_else(|| decode("the instance's config is not a map of text"))?;
         let uuid = config.get("volatile.uuid").cloned().unwrap_or_default();
+        let status = metadata
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let devices = devices_of(metadata.get("devices"))?;
+        let expanded = devices_of(metadata.get("expanded_devices"))?;
         Ok(Some((
             uuid,
             Seen {
                 etag,
                 class: classify(&config, &BTreeMap::new()),
-                status: metadata
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
+                status,
                 kernel_keys: config.keys().any(|key| key.starts_with(KERNEL_NAMESPACE)),
-                devices: devices_of(metadata.get("devices"))?,
-                expanded: devices_of(metadata.get("expanded_devices"))?,
+                devices,
+                expanded,
+                body: metadata,
             },
         )))
     }
@@ -612,40 +1076,74 @@ impl AdoptWriter {
             .ok_or_else(|| refused("the instance is not in the project the step expects"))
     }
 
-    /// Whether the adoption project is this adoption's: it carries this entry's mark.
-    fn project_is_ours(&self) -> Result<Option<bool>, IncusError> {
+    /// The adoption project's config, or `None` when it does not exist.
+    fn project_config(&self) -> Result<Option<BTreeMap<String, String>>, IncusError> {
         match self.writer.get_etag(&self.project_ref()) {
-            Ok((metadata, _)) => {
-                let config = text_map(metadata.get("config"))
-                    .ok_or_else(|| decode("the project's config is not a map of text"))?;
-                let ours = classify(&config, &BTreeMap::new())
-                    == OwnerClass::Kernel {
-                        entry: self.entry.clone(),
-                    };
-                Ok(Some(ours))
-            }
+            Ok((metadata, _)) => text_map(metadata.get("config"))
+                .map(Some)
+                .ok_or_else(|| decode("the project's config is not a map of text")),
             Err(IncusError::Status { code: 404, .. }) => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    /// Whether the adoption project holds no instance but this one.
-    fn holds_only_ours(&self) -> Result<bool, IncusError> {
+    /// Whether a project config carries this entry's mark.
+    fn marked_ours(&self, config: &BTreeMap<String, String>) -> bool {
+        classify(config, &BTreeMap::new())
+            == OwnerClass::Kernel {
+                entry: self.entry.clone(),
+            }
+    }
+
+    /// Whether the adoption project is this adoption's: it carries this entry's mark.
+    fn project_is_ours(&self) -> Result<Option<bool>, IncusError> {
+        Ok(self
+            .project_config()?
+            .map(|config| self.marked_ours(&config)))
+    }
+
+    /// Whether a project config sets exactly the `restricted` keys the plan's body sets, and its mark.
+    fn settled_as_planned(&self, config: &BTreeMap<String, String>) -> bool {
+        let body = text_map(self.project_body().get("config")).unwrap_or_default();
+        settled(config) == settled(&body)
+    }
+
+    /// The instance listing's rows in the adoption project.
+    fn rows_in_project(&self) -> Result<Vec<Value>, IncusError> {
         let listing = self
             .read
             .get("/1.0/instances?all-projects=true&recursion=1")?;
         let rows = listing
             .as_array()
             .ok_or_else(|| decode("the instance listing is not a list"))?;
-        Ok(rows.iter().all(|row| {
-            row.get("project").and_then(Value::as_str) != Some(self.target.to.as_str())
-                || row.get("name").and_then(Value::as_str) == Some(self.target.instance.as_str())
+        Ok(rows
+            .iter()
+            .filter(|row| {
+                row.get("project").and_then(Value::as_str) == Some(self.target.to.as_str())
+            })
+            .cloned()
+            .collect())
+    }
+
+    /// Whether the adoption project holds no instance but this one.
+    fn holds_only_ours(&self) -> Result<bool, IncusError> {
+        Ok(self.rows_in_project()?.iter().all(|row| {
+            row.get("name").and_then(Value::as_str) == Some(self.target.instance.as_str())
         }))
     }
 
+    /// CreateProject. A project that exists, is this adoption's, holds no other instance and sets the plan's restrictions is
+    /// the step done; one that sets other restrictions is refused, since no step writes a project's config.
     fn create_project(&self) -> Result<StepOutcome, IncusError> {
-        match self.project_is_ours()? {
-            Some(true) if self.holds_only_ours()? => return Ok(StepOutcome::AlreadyDone),
+        match self.project_config()? {
+            Some(config) if self.marked_ours(&config) && self.holds_only_ours()? => {
+                if !self.settled_as_planned(&config) {
+                    return Err(refused(
+                        "the adoption project exists with restrictions other than the plan's",
+                    ));
+                }
+                return Ok(StepOutcome::AlreadyDone);
+            }
             Some(_) => {
                 return Err(refused(
                     "the adoption project exists and is not this adoption's",
@@ -655,12 +1153,44 @@ impl AdoptWriter {
         }
         let seen = self.located(AdoptStep::CreateProject)?;
         self.before(AdoptStep::CreateProject, &seen)?;
-        self.send_all(AdoptStep::CreateProject, None)?;
-        match self.project_is_ours() {
-            Ok(Some(true)) => Ok(StepOutcome::Sent),
+        self.send_all(AdoptStep::CreateProject, None, None)?;
+        match self.project_config() {
+            Ok(Some(config)) if self.marked_ours(&config) && self.settled_as_planned(&config) => {
+                Ok(StepOutcome::Sent)
+            }
             _ => Err(self.unconfirmed(
                 &self.project_ref(),
-                "the adoption project does not read back marked",
+                "the adoption project does not read back marked, with the plan's restrictions",
+            )),
+        }
+    }
+
+    /// DeleteProject, the release's last step: deletes the adoption project once the instance is back in `default` and
+    /// running, and the project holds no instance. A project already gone is the step done; one that is not this adoption's,
+    /// or that still holds an instance, is refused.
+    fn delete_project(&self) -> Result<StepOutcome, IncusError> {
+        match self.project_is_ours()? {
+            None => return Ok(StepOutcome::AlreadyDone),
+            Some(false) => {
+                return Err(refused(
+                    "the adoption project is not this adoption's, so it is not deleted",
+                ));
+            }
+            Some(true) => {}
+        }
+        let seen = self.located(AdoptStep::DeleteProject)?;
+        self.before(AdoptStep::DeleteProject, &seen)?;
+        if !self.rows_in_project()?.is_empty() {
+            return Err(refused(
+                "the adoption project still holds an instance, so it is not deleted",
+            ));
+        }
+        self.send_all(AdoptStep::DeleteProject, None, None)?;
+        match self.project_config() {
+            Ok(None) => Ok(StepOutcome::Sent),
+            _ => Err(self.unconfirmed(
+                &self.project_ref(),
+                "the adoption project still reads back after its delete",
             )),
         }
     }
@@ -699,11 +1229,16 @@ impl AdoptWriter {
         if !self.pinned(&seen) {
             return Err(refused("the instance's NIC is not pinned"));
         }
+        if step == AdoptStep::Move && !self.localized(&seen) {
+            return Err(refused(
+                "the instance's root is not its own device yet, and the adoption project does not have the profile that gives it",
+            ));
+        }
         if self.project_is_ours()? != Some(true) {
             return Err(refused("the adoption project is not this adoption's"));
         }
         self.follow(&uuid);
-        self.send_all(step, None)?;
+        self.send_all(step, None, None)?;
         let back = match self.read_any(to) {
             Ok(Some((moved, _))) if moved == uuid => Ok(()),
             Ok(Some((moved, seen))) => self
@@ -812,12 +1347,63 @@ impl AdoptWriter {
                 self.class_is(seen, Foreign) && self.snapshot_in(SOURCE_PROJECT)?
             }
             AdoptStep::PinNic => self.class_is(seen, Foreign) && self.pinned(seen),
+            AdoptStep::LocalizeRoot => self.class_is(seen, Foreign) && self.localized(seen),
+            AdoptStep::RestoreRoot => {
+                self.class_is(seen, Foreign)
+                    && self
+                        .allowances
+                        .localize
+                        .keys()
+                        .all(|name| !seen.devices.contains_key(name))
+            }
             AdoptStep::Mark => self.class_is(seen, Adopted),
             AdoptStep::Unmark => self.class_is(seen, Foreign),
             AdoptStep::Start => self.class_is(seen, Adopted) && seen.status == "Running",
             AdoptStep::ReleaseStart => self.class_is(seen, Foreign) && seen.status == "Running",
-            AdoptStep::CreateProject | AdoptStep::Move | AdoptStep::MoveBack => false,
+            AdoptStep::CreateProject
+            | AdoptStep::Move
+            | AdoptStep::MoveBack
+            | AdoptStep::DeleteProject => false,
         })
+    }
+
+    /// Refuses a LocalizeRoot whose device changed since the plan, or that the instance already has a device of its own by
+    /// that name that is not the plan's.
+    fn localizable(&self, seen: &Seen) -> Result<(), IncusError> {
+        for (name, device) in &self.allowances.localize {
+            if seen.expanded.get(name) != Some(device) {
+                return Err(refused(&format!(
+                    "the instance's {name} device changed since the plan"
+                )));
+            }
+            if seen.devices.contains_key(name) {
+                return Err(refused(&format!(
+                    "the instance has a {name} device of its own that is not the plan's"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a RestoreRoot unless each device the plan localized is the instance's own exactly as the plan made it, so a
+    /// device changed since is kept, and the profiles the instance names give it as recorded.
+    fn restorable(&self, seen: &Seen) -> Result<(), IncusError> {
+        for (name, device) in &self.allowances.localize {
+            if seen.devices.get(name) != Some(device) {
+                return Err(refused(&format!(
+                    "the instance's own {name} device is not the one the adoption made its own, so it is kept"
+                )));
+            }
+        }
+        let profiles: Vec<String> = seen
+            .body
+            .get("profiles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
+        self.profiles_give(&profiles)
     }
 
     /// Whether the instance in `project` holds the adoption snapshot.
@@ -847,13 +1433,21 @@ impl AdoptWriter {
         if step == AdoptStep::PinNic && seen.expanded.get(NIC) != self.pre.devices.get(NIC) {
             return Err(refused("the instance's NIC changed since the plan"));
         }
+        if step == AdoptStep::LocalizeRoot {
+            self.localizable(&seen)?;
+        }
+        if step == AdoptStep::RestoreRoot {
+            self.restorable(&seen)?;
+        }
         match step {
             AdoptStep::Stop | AdoptStep::ReleaseStop => return self.stop(step),
             // A config or device change is sent under the ETag of the read its checks were made on.
-            AdoptStep::PinNic | AdoptStep::Mark | AdoptStep::Unmark => {
-                self.send_all(step, Some(&seen.etag))?
+            AdoptStep::PinNic | AdoptStep::LocalizeRoot | AdoptStep::Mark | AdoptStep::Unmark => {
+                self.send_all(step, Some(&seen.etag), None)?
             }
-            _ => self.send_all(step, None)?,
+            // The full PUT is that same read, less the device, under its ETag.
+            AdoptStep::RestoreRoot => self.send_all(step, Some(&seen.etag), Some(&seen.body))?,
+            _ => self.send_all(step, None, None)?,
         }
         let project = self.side(Self::expect(step).project).to_string();
         let back = self.read_in(&project);
@@ -876,13 +1470,13 @@ impl AdoptWriter {
     fn stop(&self, step: AdoptStep) -> Result<StepOutcome, IncusError> {
         let [graceful, forced] = <[AdoptRequest; 2]>::try_from(self.requests(step))
             .map_err(|_| refused("the stop is not two requests"))?;
-        match self.send(&graceful, None) {
+        match self.send(&graceful, None, None) {
             Ok(()) | Err(IncusError::Status { .. }) => {}
             Err(error) => return Err(error),
         }
         let still = self.located(step)?;
         if still.status == "Running" {
-            match self.send(&forced, None) {
+            match self.send(&forced, None, None) {
                 Ok(()) | Err(IncusError::Status { .. }) => {}
                 Err(error) => return Err(error),
             }
@@ -897,17 +1491,29 @@ impl AdoptWriter {
         }
     }
 
-    /// Sends every request of `step` that carries no condition.
-    fn send_all(&self, step: AdoptStep, etag: Option<&str>) -> Result<(), IncusError> {
+    /// Sends every request of `step` that carries no condition. `read` is the read a body taken from a read is made of.
+    fn send_all(
+        &self,
+        step: AdoptStep,
+        etag: Option<&str>,
+        read: Option<&Value>,
+    ) -> Result<(), IncusError> {
         for request in self.requests(step).iter().filter(|r| r.only_if.is_none()) {
-            self.send(request, etag)?;
+            self.send(request, etag, read)?;
         }
         Ok(())
     }
 
     /// Sends one request and waits on its operation. A request that is not one of the table's is refused before any byte is
-    /// written, and so is one whose ETag does not match its `if_match`.
-    fn send(&self, request: &AdoptRequest, etag: Option<&str>) -> Result<(), IncusError> {
+    /// written, and so is one whose ETag does not match its `if_match`, and one whose body is taken from a read without the
+    /// read. A body taken from a read is that read's writable fields, less each device the table's body sets to null, and
+    /// nothing else; a null body is no body.
+    fn send(
+        &self,
+        request: &AdoptRequest,
+        etag: Option<&str>,
+        read: Option<&Value>,
+    ) -> Result<(), IncusError> {
         let listed = AdoptStep::ADOPT
             .iter()
             .chain(AdoptStep::RELEASE.iter())
@@ -921,11 +1527,21 @@ impl AdoptWriter {
         if request.step == AdoptStep::Snapshot && self.snapshot.is_none() {
             return Err(refused("the writer was given no snapshot name"));
         }
+        let body = match (request.from_read, read) {
+            (None, _) if request.body.is_null() => None,
+            (None, _) => Some(request.body.clone()),
+            (Some(_), Some(read)) => Some(from_read(read, &request.body)?),
+            (Some(_), None) => {
+                return Err(refused(
+                    "the request's body is taken from a read, and none was given",
+                ));
+            }
+        };
         let framed = self.writer.send_checked(
             request.method,
             &request.path,
             etag,
-            Some(&request.body),
+            body.as_ref(),
             TIMEOUT,
         )?;
         let envelope = checked_envelope(&framed.into_raw())?;
@@ -954,6 +1570,107 @@ impl AdoptWriter {
             reason: reason.to_string(),
         }))
     }
+}
+
+/// Refuses a pre-image whose `eth0` the pin cannot carry: a key other than [`PIN_KEYS`] and [`NIC_KEPT_KEYS`], a type other
+/// than `nic`, a name other than `eth0`, or a `hwaddr` or `ipv4.address` other than the pin's.
+fn pin_carries(pre: &PreImage, pin: &Pin) -> Result<(), IncusError> {
+    let eth0 = pre.devices.get(NIC).cloned().unwrap_or_default();
+    let field = |key: &str| eth0.get(key).map(String::as_str);
+    let known = eth0
+        .keys()
+        .all(|key| PIN_KEYS.contains(&key.as_str()) || NIC_KEPT_KEYS.contains(&key.as_str()));
+    let ipv4 = pin.ipv4.to_string();
+    if !known
+        || field("type") != Some("nic")
+        || field("name").is_some_and(|name| name != NIC)
+        || field("hwaddr").is_some_and(|mac| mac != pin.mac)
+        || field("ipv4.address").is_some_and(|address| address != ipv4)
+    {
+        return Err(refused(
+            "the pre-image's eth0 sets a key the pin does not carry, or one the pin would change",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuses allowances that are not exactly the ones the pre-image needs: its [`needed_allowances`], and the grant when it
+/// names eth0's network, which it must when `attach` does not list that network. A localized device must be a pool-backed
+/// root disk that the pre-image's devices hold as it is recorded, and there is at most one.
+fn check_allowances(
+    attach: &[String],
+    pre: &PreImage,
+    pin: &Pin,
+    allowances: &Allowances,
+) -> Result<(), IncusError> {
+    let mut expected = needed_allowances(&pre.config, &pre.devices)
+        .map_err(|why| refused(&why))?
+        .project;
+    match allowances.project.get(NETWORKS_ACCESS) {
+        Some(network) if *network == pin.network => {
+            expected.insert(NETWORKS_ACCESS.to_string(), network.clone());
+        }
+        Some(_) => {
+            return Err(refused(
+                "the plan grants a network other than the one eth0 names",
+            ));
+        }
+        None if !attach.contains(&pin.network) => {
+            return Err(refused(
+                "the NIC's network is not an attach network, and the plan does not allow it",
+            ));
+        }
+        None => {}
+    }
+    if allowances.project != expected {
+        return Err(refused(
+            "the plan's allowances are not exactly the ones its pre-image needs",
+        ));
+    }
+    if allowances.localize.len() > 1 {
+        return Err(refused("the plan localizes more than the root disk"));
+    }
+    for (name, device) in &allowances.localize {
+        let field = |key: &str| device.get(key).map_or("", String::as_str);
+        if field("type") != "disk"
+            || field("path") != "/"
+            || field("pool").is_empty()
+            || pre.devices.get(name) != Some(device)
+        {
+            return Err(refused(
+                "the plan localizes a device that is not the pre-image's pool-backed root disk",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// RestoreRoot's PUT body: the read's writable fields, less each device `template` sets to null. Nothing else is added or
+/// changed, so the PUT gives back the instance as it was read but for those devices.
+fn from_read(read: &Value, template: &Value) -> Result<Value, IncusError> {
+    let removed: Vec<&String> = template
+        .get("devices")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(_, device)| device.is_null())
+        .map(|(name, _)| name)
+        .collect();
+    let mut body = serde_json::Map::new();
+    for field in WRITABLE {
+        if let Some(value) = read.get(field) {
+            body.insert(field.to_string(), value.clone());
+        }
+    }
+    let devices = body
+        .entry("devices")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| decode("the instance's devices are not a map"))?;
+    for name in removed {
+        devices.remove(name);
+    }
+    Ok(Value::Object(body))
 }
 
 /// A network name that is safe in a grant: letters, digits, hyphens and underscores.
@@ -1087,6 +1804,7 @@ mod tests {
             if_match: false,
             body,
             only_if: None,
+            from_read: None,
         };
         let outside = [
             request("DELETE", "/1.0/instances/svc1?project=default", Value::Null),
@@ -1143,7 +1861,7 @@ mod tests {
             ),
         ];
         for request in &outside {
-            let sent = writer.send(request, None);
+            let sent = writer.send(request, None, None);
             assert!(
                 matches!(sent, Err(IncusError::Refused(_))),
                 "{request:?}: {sent:?}"
@@ -1152,14 +1870,50 @@ mod tests {
         // A table request is refused too when its ETag does not match the table: Mark is sent under If-Match only.
         let mark = writer.requests(AdoptStep::Mark).remove(0);
         assert!(matches!(
-            writer.send(&mark, None),
+            writer.send(&mark, None, None),
             Err(IncusError::Refused(_))
         ));
         let start = writer.requests(AdoptStep::Start).remove(0);
         assert!(matches!(
-            writer.send(&start, Some("\"x\"")),
+            writer.send(&start, Some("\"x\""), None),
             Err(IncusError::Refused(_))
         ));
+        // The one DELETE in the table is the adoption project's, under DeleteProject: the same DELETE under another step,
+        // and a DELETE of the instance under DeleteProject, are not.
+        let delete = writer.requests(AdoptStep::DeleteProject).remove(0);
+        assert_eq!(
+            (delete.method, delete.path.as_str()),
+            ("DELETE", "/1.0/projects/arcak-adopt-svc1")
+        );
+        for step in AdoptStep::ADOPT.iter().chain(AdoptStep::RELEASE.iter()) {
+            for listed in writer.requests(*step) {
+                assert!(
+                    listed.method != "DELETE" || listed == delete,
+                    "{step:?}: {listed:?}"
+                );
+            }
+        }
+        let instance = AdoptRequest {
+            path: "/1.0/instances/svc1?project=default".to_string(),
+            ..delete.clone()
+        };
+        let under_mark = AdoptRequest {
+            step: AdoptStep::Mark,
+            ..delete
+        };
+        for request in [instance, under_mark] {
+            assert!(
+                matches!(
+                    writer.send(&request, None, None),
+                    Err(IncusError::Refused(_))
+                ),
+                "{request:?}"
+            );
+        }
+        // A writer whose plan localizes nothing has no LocalizeRoot or RestoreRoot request, so neither PUT nor PATCH of a
+        // root is in its table.
+        assert!(writer.requests(AdoptStep::LocalizeRoot).is_empty());
+        assert!(writer.requests(AdoptStep::RestoreRoot).is_empty());
         assert!(
             fake.requests().is_empty(),
             "no byte reached the fake: {:?}",

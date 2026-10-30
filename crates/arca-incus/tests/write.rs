@@ -2133,11 +2133,11 @@ fn a_project_put_on_the_fake_replaces_the_config_and_the_description_under_its_e
     assert_eq!(metadata["config"], config, "the PUT's config is the config");
     assert_eq!(metadata["description"], json!("kept"));
 
-    // Only a project takes a PUT: no other path the writer reaches does.
+    // Only a project and an instance take a PUT: no other object the writer reaches does.
     let elsewhere = raw_write(
         fake.socket(),
         "PUT",
-        "/1.0/instances/k1?project=svc",
+        "/1.0/networks/n1?project=svc",
         None,
         &json!({"config": {}}),
     );

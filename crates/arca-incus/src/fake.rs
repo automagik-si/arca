@@ -34,8 +34,9 @@
 //!
 //! A PATCH merges the `config` of every kind but a project. A project's config is written as Incus 7.3 writes it
 //! (`projectPatch` and `projectPut` in `cmd/incusd/api_project.go`): a PATCH that names `config` replaces the whole config with
-//! the keys it sent, and a PUT replaces the config and the description, under `If-Match` like a PATCH. A project is the one
-//! object that takes a PUT. A project that holds an object is in use, and a PATCH or a PUT that would turn off one of its
+//! the keys it sent, and a PUT replaces the config and the description, under `If-Match` like a PATCH. A project and an
+//! instance are the objects that take a PUT: an instance's PUT replaces its writable fields whole, under `If-Match`, as an
+//! operation. A project that holds an object is in use, and a PATCH or a PUT that would turn off one of its
 //! features is refused with 400 and changes nothing, as Incus refuses it.
 //!
 //! Instances for adoption: an instance that names its `profiles` has its `expanded_devices` and `expanded_config` worked out
@@ -50,9 +51,10 @@
 //! its body names: it must be stopped, the target project must exist, and, as on Incus 7.5, the move is a copy that gets a new
 //! `volatile.uuid`. When a PATCH or a move takes a device out of the expanded devices, or changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
 //! does: every one when the device goes or changes type, and otherwise each one whose key the new device sets. A restricted
-//! project refuses a snapshot unless `restricted.snapshots` is `allow`, a backup unless `restricted.backups` is `allow`, and a
-//! moved-in instance whose NIC names a network its grant does not list, or that sets `security.privileged`, `security.nesting`
-//! or a `raw.*` key.
+//! project refuses a snapshot unless `restricted.snapshots` is `allow`, and a backup unless `restricted.backups` is `allow`.
+//! A moved-in instance is refused when a NIC names an ACL that the project serving its network lacks, and, in a restricted
+//! project, by the restrictions as Incus 7.5's `checkRestrictions` applies them: the NIC grant, host-path disks and their
+//! paths, the device types that need `allow`, privilege, nesting, interception and low-level keys.
 //!
 //! The fake records each request, and each write with the names of the config keys it carried. It never records a value.
 
@@ -293,7 +295,7 @@ impl Route {
                 &["GET", "PUT", "PATCH", "DELETE"]
             }
             Route::Object(address) if address.kind == "instance" => {
-                &["GET", "POST", "PATCH", "DELETE"]
+                &["GET", "POST", "PUT", "PATCH", "DELETE"]
             }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
@@ -1455,18 +1457,62 @@ fn written(
     Ok((index, changes))
 }
 
-/// Replaces a project from a PUT, as Incus's `projectPut` does: the config and the description are the ones sent, and an absent
-/// one is empty. Only a project's route takes a PUT.
+/// Replaces a project or an instance from a PUT. A project's config and description are the ones sent, and an absent one is
+/// empty, as Incus's `projectPut` does. An instance's writable fields (`api.InstancePut`) are the ones sent, an absent one
+/// empty, and its devices are expanded again with the volatile reset; it is answered with an operation, as `instancePut` is.
+/// Only a project's and an instance's routes take a PUT.
 fn put(
     shared: &Shared,
     store: &mut Store,
     request: &Request,
     address: &Address,
 ) -> (u16, String, Value) {
-    match written(store, request, address) {
-        Ok((index, body)) => write_project(shared, store, index, &body, true),
-        Err(answer) => answer,
+    let (index, body) = match written(store, request, address) {
+        Ok(found) => found,
+        Err(answer) => return answer,
+    };
+    if store.objects[index].kind == "project" {
+        return write_project(shared, store, index, &body, true);
     }
+    let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    let text_map = |key: &str| match body.get(key) {
+        None => Some(Map::new()),
+        Some(Value::Object(map)) if map.values().all(Value::is_string) => Some(map.clone()),
+        Some(_) => None,
+    };
+    let Some(config) = text_map("config") else {
+        return bad("config must be a map of text");
+    };
+    let devices = match body.get("devices") {
+        None => Map::new(),
+        Some(Value::Object(devices)) if devices.values().all(Value::is_object) => devices.clone(),
+        Some(_) => return bad("devices must be a map of objects"),
+    };
+    let profiles = match body.get("profiles") {
+        None => json!([]),
+        Some(Value::Array(names)) if names.iter().all(Value::is_string) => json!(names),
+        Some(_) => return bad("profiles must be a list of names"),
+    };
+    let Some(object) = store.objects[index].body.as_object_mut() else {
+        return (
+            500,
+            String::new(),
+            error_envelope(500, "the object is not an object"),
+        );
+    };
+    object.insert("config".to_string(), Value::Object(config));
+    object.insert("devices".to_string(), Value::Object(devices));
+    object.insert("profiles".to_string(), profiles);
+    for (field, empty) in [
+        ("architecture", json!("")),
+        ("description", json!("")),
+        ("ephemeral", json!(false)),
+        ("stateful", json!(false)),
+    ] {
+        object.insert(field.to_string(), body.get(field).cloned().unwrap_or(empty));
+    }
+    store.expand(index, true);
+    answered(shared, store, "instance", "PUT", Ok(()))
 }
 
 /// Changes an object from a PATCH. A stale `If-Match` is 412 and changes nothing. An empty string in `config` removes its key.
@@ -1980,45 +2026,188 @@ impl Store {
             == Some("allow")
     }
 
-    /// Why a restricted project refuses an instance body moved into it, when it does: a NIC on a network its grant does not
-    /// list, or a privileged, nesting or low-level config key it does not allow.
-    fn moved_in_refusal(&self, project: &str, body: &Value) -> Option<&'static str> {
+    /// Why the instance body moved into `project` is refused, when it is, as Incus 7.5 checks a moved-in instance's devices
+    /// and config in the project, expanded with that project's profiles. A NIC's ACL must exist in the project that serves
+    /// its network: its own when `features.networks` is on, and `default` otherwise. A restricted project then checks its
+    /// restrictions as `checkRestrictions` does (`internal/server/project/permissions.go`), each `restricted.*` key at the
+    /// value it is set to, or at Incus's default. This model is the fake's own, written from that source apart from the
+    /// adoption writer's table, so a test of the writer against it is not the table checked against itself.
+    fn moved_in_refusal(&self, project: &str, body: &Value) -> Option<String> {
+        let (devices, config) = self.effective(project, body);
+        let device_field = |device: &Value, key: &str| {
+            device
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        let acl_home = if self
+            .project_config(project)
+            .and_then(|config| config.get("features.networks"))
+            .and_then(Value::as_str)
+            == Some("true")
+        {
+            project.to_string()
+        } else {
+            DEFAULT_PROJECT.to_string()
+        };
+        for (name, device) in &devices {
+            if device_field(device, "type") != "nic" {
+                continue;
+            }
+            let acls = device_field(device, "security.acls");
+            for acl in acls.split(',').map(str::trim).filter(|acl| !acl.is_empty()) {
+                let found = self.objects.iter().any(|object| {
+                    object.kind == "acl" && object.project == acl_home && object.name == acl
+                });
+                if !found {
+                    return Some(format!(
+                        "Invalid device {name:?}: network ACL {acl:?} not found in project {acl_home:?}"
+                    ));
+                }
+            }
+        }
         if !self.restricted(project) {
             return None;
         }
-        let (devices, config) = self.effective(project, body);
-        let grant = self
-            .project_config(project)
-            .and_then(|config| config.get("restricted.networks.access"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let ungranted = devices.values().any(|device| {
-            device.get("type").and_then(Value::as_str) == Some("nic")
-                && device
-                    .get("network")
-                    .and_then(Value::as_str)
-                    .is_some_and(|network| !grant.split(',').any(|name| name == network))
-        });
-        let set = |key: &str| config.get(key).and_then(Value::as_str) == Some("true");
-        if ungranted {
-            Some("the project may not use the network")
-        } else if set("security.privileged")
-            && !self.allows(project, "restricted.containers.privilege")
-        {
-            Some("the project forbids a privileged container")
-        } else if set("security.nesting") && !self.allows(project, "restricted.containers.nesting")
-        {
-            Some("the project forbids nesting")
-        } else if config.keys().any(|key| key.starts_with("raw."))
-            && !self.allows(project, "restricted.containers.lowlevel")
-        {
-            Some("the project forbids low-level keys")
-        } else {
-            None
+        let restriction = |key: &str| -> String {
+            self.project_config(project)
+                .and_then(|config| config.get(key))
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || {
+                        match key {
+                            "restricted.containers.privilege" => "unprivileged",
+                            "restricted.devices.nic" | "restricted.devices.disk" => "managed",
+                            "restricted.devices.disk.paths" | "restricted.networks.access" => "",
+                            _ => "block",
+                        }
+                        .to_string()
+                    },
+                    str::to_string,
+                )
+        };
+        let forbidden = |what: &str| Some(format!("Project restricted: {what} are forbidden"));
+        for (name, device) in &devices {
+            let field = |key: &str| device_field(device, key);
+            match field("type").as_str() {
+                "nic" => {
+                    let nic = restriction("restricted.devices.nic");
+                    if nic == "block" || (nic == "managed" && field("network").is_empty()) {
+                        return forbidden(&format!("the network device {name}"));
+                    }
+                    let grant = restriction("restricted.networks.access");
+                    let network = field("network");
+                    if !network.is_empty()
+                        && !grant.is_empty()
+                        && !grant
+                            .split(',')
+                            .map(str::trim)
+                            .any(|listed| listed == network)
+                    {
+                        return Some(format!(
+                            "Invalid device {name:?}: Network not allowed in project"
+                        ));
+                    }
+                }
+                "disk" if field("path") == "/" && !field("pool").is_empty() => {}
+                "disk" if field("pool").is_empty() => {
+                    let paths = restriction("restricted.devices.disk.paths");
+                    let source = format!("{}/", field("source").trim_end_matches('/'));
+                    let under = |parent: &str| {
+                        source.starts_with(&format!("{}/", parent.trim_end_matches('/')))
+                    };
+                    let listed = paths.is_empty() || paths.split(',').any(under);
+                    if restriction("restricted.devices.disk") != "allow" || !listed {
+                        return forbidden(&format!("the host path disk {name}"));
+                    }
+                }
+                "disk" if restriction("restricted.devices.disk") == "block" => {
+                    return forbidden(&format!("the disk {name}"));
+                }
+                kind @ ("unix-char" | "unix-block" | "unix-hotplug" | "infiniband" | "gpu"
+                | "usb" | "pci" | "proxy")
+                    if restriction(&format!("restricted.devices.{kind}")) != "allow" =>
+                {
+                    return forbidden(&format!("{kind} devices"));
+                }
+                _ => {}
+            }
         }
+        let truthy = |value: &str| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            )
+        };
+        let falsy = |value: &str| {
+            value.is_empty()
+                || matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "false" | "0" | "no" | "off"
+                )
+        };
+        let lowlevel = restriction("restricted.containers.lowlevel") == "allow";
+        for (key, value) in &config {
+            let value = value.as_str().unwrap_or("");
+            if FAKE_INTERCEPT.contains(&key.as_str()) {
+                if !falsy(value) && restriction("restricted.containers.interception") != "allow" {
+                    return forbidden("container syscall interceptions");
+                }
+            } else if (key.starts_with("security.syscalls.intercept")
+                || key.starts_with("security.bpffs")
+                || key.starts_with("raw.")
+                || FAKE_LOW_LEVEL.contains(&key.as_str()))
+                && !lowlevel
+            {
+                return Some(format!("Use of low-level config {key:?} is forbidden"));
+            }
+            match key.as_str() {
+                "security.privileged"
+                    if truthy(value)
+                        && restriction("restricted.containers.privilege") != "allow" =>
+                {
+                    return forbidden("privileged containers");
+                }
+                "security.nesting"
+                    if truthy(value) && restriction("restricted.containers.nesting") == "block" =>
+                {
+                    return forbidden("nested containers");
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }
+
+/// The interception keys Incus 7.5 lets `restricted.containers.interception` allow (`allowableIntercept`).
+const FAKE_INTERCEPT: [&str; 7] = [
+    "security.syscalls.intercept.bpf",
+    "security.syscalls.intercept.bpf.devices",
+    "security.syscalls.intercept.mknod",
+    "security.syscalls.intercept.mount",
+    "security.syscalls.intercept.mount.fuse",
+    "security.syscalls.intercept.setxattr",
+    "security.syscalls.intercept.sysinfo",
+];
+
+/// The container keys Incus 7.5 counts as low level (`isContainerLowLevelOptionForbidden`), beside every
+/// `security.syscalls.intercept*` key not in [`FAKE_INTERCEPT`], every `raw.*` key and every `security.bpffs*` key.
+const FAKE_LOW_LEVEL: [&str; 12] = [
+    "boot.host_shutdown_action",
+    "boot.host_shutdown_timeout",
+    "linux.kernel_modules",
+    "limits.memory.swap",
+    "limits.memory.oom_priority",
+    "security.guestapi.images",
+    "security.idmap.base",
+    "security.idmap.size",
+    "security.selinux.domain",
+    "security.selinux.label_rootfs",
+    "security.selinux.level",
+    "security.selinux.type",
+];
 
 /// The volatile keys `deviceVolatileReset` clears when an instance's expanded devices go from `old` to `new`. A device that is
 /// gone, or whose type changes, loses every `volatile.<dev>.*` key. A device that changes in more than its addresses loses each
@@ -2274,7 +2463,7 @@ fn move_instance(
         return bad(409, "the name is taken in the target project");
     }
     if let Some(reason) = store.moved_in_refusal(&to, &store.objects[index].body) {
-        return bad(403, reason);
+        return bad(403, &reason);
     }
     let from = std::mem::replace(&mut store.objects[index].project, to.clone());
     if let Some(body) = store.objects[index].body.as_object_mut() {
@@ -2318,7 +2507,7 @@ mod tests {
         );
         assert_eq!(
             parse("/1.0/instances/a").map(|r| r.methods()),
-            Some(&["GET", "POST", "PATCH", "DELETE"][..])
+            Some(&["GET", "POST", "PUT", "PATCH", "DELETE"][..])
         );
         assert_eq!(
             parse("/1.0/instances/a/state").map(|r| r.methods()),
