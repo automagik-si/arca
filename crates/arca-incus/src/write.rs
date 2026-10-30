@@ -184,9 +184,10 @@ impl UnixIncusWriter {
     }
 
     /// Creates an object. The target's project must be in the family, and the target names no uuid yet. The body's source,
-    /// when it has one, must be an image. The body's config must class as this entry's own, so the object belongs to the
-    /// entry from the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object
-    /// is read back, which must class as this entry's own.
+    /// when it has one, must be an image. Every key in the body, at any depth, must be plain ASCII, and the body's config may
+    /// not set a `volatile.*` key. The body's config must class as this entry's own, so the object belongs to the entry from
+    /// the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object is read
+    /// back, which must class as this entry's own.
     pub fn create(&self, target: &Target, body: &Value) -> Result<Owned, IncusError> {
         self.allow_project(&target.object.project)?;
         if target.object.uuid.is_some() {
@@ -196,10 +197,18 @@ impl UnixIncusWriter {
         let Value::Object(fields) = body else {
             return Err(refused("a create body is not an object"));
         };
+        if !plain_keys(body) {
+            return Err(refused("a create body names a key that is not plain ASCII"));
+        }
         check_source(fields)?;
         let config = match fields.get("config") {
-            Some(Value::Object(config)) => text_map(config)
-                .ok_or_else(|| refused("a config value in a create body is not text"))?,
+            Some(Value::Object(config)) => {
+                if config.keys().any(|key| volatile(key)) {
+                    return Err(refused("a create may not set a volatile config key"));
+                }
+                text_map(config)
+                    .ok_or_else(|| refused("a config value in a create body is not text"))?
+            }
             _ => BTreeMap::new(),
         };
         if config.contains_key(KERNEL_RETIRING_KEY) {
@@ -222,8 +231,8 @@ impl UnixIncusWriter {
     }
 
     /// Sets and removes config keys of an object this entry owns, under the ETag of `owned`. A removed key is sent as the empty
-    /// string. The change must leave the object classed as this entry's own, and it may not name the tombstone key. The
-    /// object is read back, and the read must show the change.
+    /// string. The change must leave the object classed as this entry's own, and it may not name the tombstone key, a key that
+    /// is not plain ASCII, or a `volatile.*` key. The object is read back, and the read must show the change.
     pub fn patch(
         &self,
         owned: &Owned,
@@ -235,6 +244,14 @@ impl UnixIncusWriter {
         }
         if changes.contains_key(KERNEL_RETIRING_KEY) {
             return Err(refused("the tombstone is set only by tombstone"));
+        }
+        if changes.keys().any(|key| !plain_key(key)) {
+            return Err(refused(
+                "a patch names a config key that is not plain ASCII",
+            ));
+        }
+        if changes.keys().any(|key| volatile(key)) {
+            return Err(refused("a patch may not set a volatile config key"));
         }
         let after = apply(&owned.config, changes);
         if !kernel_may_write(&classify(&after, &self.retained), &self.entry) {
@@ -673,6 +690,31 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     } else {
         Err(refused("a create may name only an image source"))
     }
+}
+
+/// A key the writer sends: plain ASCII `[a-z0-9_.-]`, and not empty. Incus's decoder matches a key to a field whatever its case,
+/// and folds some Unicode letters onto ASCII ones, so a key outside this set can reach a field the checks did not read.
+fn plain_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// Whether every object key in a value is plain, at any depth through objects and arrays.
+fn plain_keys(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .all(|(key, value)| plain_key(key) && plain_keys(value)),
+        Value::Array(items) => items.iter().all(plain_keys),
+        _ => true,
+    }
+}
+
+/// Whether a config key is in Incus's `volatile` namespace, which Incus sets for itself.
+fn volatile(key: &str) -> bool {
+    key == "volatile" || key.starts_with("volatile.")
 }
 
 /// Whether Incus gives an object of this kind a uuid: instances and volumes do, through their `volatile.uuid` key.

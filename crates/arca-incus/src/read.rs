@@ -28,6 +28,10 @@ const MAX_MESSAGE: usize = 512;
 
 /// Why a read failed. No variant carries a header byte or a raw body byte. A `Status` message is the envelope's own
 /// `error` text, or the reason phrase, and is at most 512 bytes.
+///
+/// Only [`IncusError::Refused`] means that no write was sent. Every other variant may follow a write that landed: an
+/// accepted write whose operation fails, times out or answers unreadably, or whose read-back fails or does not confirm it.
+/// A caller that gets any of them after a write must read the object before it decides anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncusError {
     /// The socket could not be connected, written or read.

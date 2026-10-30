@@ -777,6 +777,161 @@ fn a_create_takes_only_an_image_source_and_sends_nothing_else() {
 }
 
 #[test]
+fn a_create_key_that_is_not_plain_ascii_is_refused_before_any_request() {
+    let (_dir, fake) = start("key-folding");
+    let writer = writer(&fake, "toy");
+    let before_writes = write_count(&fake);
+    let before_requests = fake.requests().len();
+    // Go's decoder binds a key whatever its case, and folds Unicode too, so each of these reaches Incus as `source`. The
+    // exact-key check reads only `source`, so it sees none of them.
+    for (n, key) in ["Source", "SOURCE", "\u{017f}ource"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut body = marked();
+        body[key] = json!({"type": "copy", "source": "svc/k1"});
+        let refused = writer
+            .create(
+                &target(IncusKind::Instance, "svc", &format!("fold{n}"), None),
+                &body,
+            )
+            .expect_err("a body key that is not plain ASCII");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{key}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        write_count(&fake),
+        before_writes,
+        "no refused create reached the fake"
+    );
+    assert_eq!(
+        fake.requests().len(),
+        before_requests,
+        "no refused create sent even a read"
+    );
+}
+
+#[test]
+fn a_config_key_that_differs_only_in_case_is_refused_before_any_request() {
+    let (_dir, fake) = start("config-folding");
+    let writer = writer(&fake, "toy");
+    let before_writes = write_count(&fake);
+    let before_requests = fake.requests().len();
+    // Both keys bind to the one config field, and the later one wins. The check reads only `config`, which is marked.
+    for (n, key) in ["Config", "CONFIG"].into_iter().enumerate() {
+        let mut body = marked();
+        body[key] = json!({"user.droid.lease": "1"});
+        let refused = writer
+            .create(
+                &target(IncusKind::Instance, "svc", &format!("cfg{n}"), None),
+                &body,
+            )
+            .expect_err("a second config key that differs in case");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{key}: {refused:?}"
+        );
+    }
+    assert_eq!(write_count(&fake), before_writes);
+    assert_eq!(fake.requests().len(), before_requests);
+}
+
+#[test]
+fn a_key_that_is_not_plain_ascii_is_refused_at_any_depth_and_inside_source() {
+    let (_dir, fake) = start("key-depth");
+    let writer = writer(&fake, "toy");
+    let before_writes = write_count(&fake);
+    let before_requests = fake.requests().len();
+    let bodies = [
+        json!({"config": {MARK: "toy"}, "devices": {"root": {"Pool": "default"}}}),
+        json!({"config": {MARK: "toy"}, "tags": [{"Bad": 1}]}),
+        json!({"config": {MARK: "toy"}, "source": {"type": "image", "alias": "base", "properties": {"OS": "linux"}}}),
+        json!({"config": {MARK: "toy"}, "": 1}),
+    ];
+    for (n, body) in bodies.into_iter().enumerate() {
+        let refused = writer
+            .create(
+                &target(IncusKind::Instance, "svc", &format!("deep{n}"), None),
+                &body,
+            )
+            .expect_err("a key that is not plain ASCII at some depth");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{body}: {refused:?}"
+        );
+    }
+    assert_eq!(write_count(&fake), before_writes);
+    assert_eq!(fake.requests().len(), before_requests);
+}
+
+#[test]
+fn a_volatile_config_key_is_refused_in_a_create_and_in_a_patch() {
+    let (_dir, fake) = start("volatile");
+    let writer = writer(&fake, "toy");
+    let before_writes = write_count(&fake);
+    let before_requests = fake.requests().len();
+    let mut body = marked();
+    body["config"]["volatile.uuid"] = json!(OTHER_UUID);
+    let refused = writer
+        .create(&target(IncusKind::Instance, "svc", "vol1", None), &body)
+        .expect_err("a create that sets volatile.uuid");
+    assert!(matches!(refused, IncusError::Refused(_)), "{refused:?}");
+    assert_eq!(write_count(&fake), before_writes);
+    assert_eq!(fake.requests().len(), before_requests);
+
+    let owned = writer
+        .create(&target(IncusKind::Instance, "svc", "vol2", None), &marked())
+        .expect("create");
+    let before_writes = write_count(&fake);
+    for change in [
+        changes(&[("volatile.uuid", Some(OTHER_UUID))]),
+        changes(&[("volatile.uuid", None)]),
+        changes(&[("volatile.last_state.power", Some("RUNNING"))]),
+        changes(&[("volatile", Some("x"))]),
+    ] {
+        let refused = writer
+            .patch(&owned, &change)
+            .expect_err("a patch that names a volatile key");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{change:?}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        write_count(&fake),
+        before_writes,
+        "no refused patch reached the fake"
+    );
+}
+
+#[test]
+fn a_patch_key_that_is_not_plain_ascii_is_refused_before_any_request() {
+    let (_dir, fake) = start("patch-key");
+    let writer = writer(&fake, "toy");
+    let owned = writer
+        .create(&target(IncusKind::Instance, "svc", "pk1", None), &marked())
+        .expect("create");
+    let before_writes = write_count(&fake);
+    let before_requests = fake.requests().len();
+    for change in [
+        changes(&[("User.Note", Some("x"))]),
+        changes(&[("user.n\u{00f6}te", Some("x"))]),
+    ] {
+        let refused = writer
+            .patch(&owned, &change)
+            .expect_err("a patch key that is not plain ASCII");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{change:?}: {refused:?}"
+        );
+    }
+    assert_eq!(write_count(&fake), before_writes);
+    assert_eq!(fake.requests().len(), before_requests);
+}
+
+#[test]
 fn a_create_whose_name_is_taken_is_refused_and_nothing_is_written() {
     let (_dir, fake) = start("taken");
     let writer = writer(&fake, "toy");
@@ -1022,6 +1177,83 @@ fn the_refused_and_unconfirmed_errors_say_whether_a_write_was_sent() {
     }))
     .to_string();
     assert!(landed.contains("landed"), "{landed}");
+}
+
+/// A complete HTTP answer with an error envelope of `status` and the message `text`.
+fn error_reply(status: u16, text: &str) -> Vec<u8> {
+    reply(
+        status,
+        "",
+        &json!({"type": "error", "status": "Failure", "status_code": status, "operation": "", "error_code": status, "error": text, "metadata": null}),
+    )
+}
+
+/// Runs a create against `canned`, which accepts its POST, and checks that the POST was sent and that the error is not
+/// `Refused`. Refused means that no write was sent, so no error after a sent POST may be it.
+fn error_after_sent_post(canned: &Canned, name: &str) -> IncusError {
+    let error = canned
+        .writer()
+        .create(&target(IncusKind::Instance, "svc", name, None), &marked())
+        .expect_err("a create that fails after its POST was sent");
+    assert_eq!(canned.count("POST"), 1, "the POST was sent");
+    assert!(!matches!(error, IncusError::Refused(_)), "{error:?}");
+    error
+}
+
+#[test]
+fn every_error_after_a_sent_write_is_something_other_than_refused() {
+    let failed_post = Canned::start("sent-failed", |method, _| {
+        if method == "POST" {
+            return error_reply(500, "the backend failed");
+        }
+        not_found()
+    });
+    let stuck_wait = Canned::start("sent-stuck", |method, target| {
+        if method == "POST" {
+            return reply(202, "", &accepted_post());
+        }
+        if target.contains("/wait") {
+            return wait_reply(operation(OP, 103, "Running", ""));
+        }
+        not_found()
+    });
+    let unreadable_wait = Canned::start("sent-decode", |method, target| {
+        if method == "POST" {
+            return reply(202, "", &accepted_post());
+        }
+        if target.contains("/wait") {
+            return sync_reply(200, Value::Null);
+        }
+        not_found()
+    });
+    let mut posted = false;
+    let unread_back = Canned::start("sent-readback", move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return reply(202, "", &accepted_post());
+        }
+        if target.contains("/wait") {
+            return wait_reply(operation(OP, 200, "Success", ""));
+        }
+        if method == "GET" && posted && target.starts_with("/1.0/instances/rb1") {
+            return error_reply(500, "the read-back failed");
+        }
+        not_found()
+    });
+
+    let status = error_after_sent_post(&failed_post, "pf1");
+    assert_eq!(status_of(&status), Some(500), "{status:?}");
+    assert_eq!(
+        error_after_sent_post(&stuck_wait, "sw1"),
+        IncusError::Timeout
+    );
+    let decode = error_after_sent_post(&unreadable_wait, "uw1");
+    assert!(matches!(decode, IncusError::Decode(_)), "{decode:?}");
+    let landed = error_after_sent_post(&unread_back, "rb1");
+    assert!(
+        matches!(landed, IncusError::AppliedUnconfirmed(_)),
+        "{landed:?}"
+    );
 }
 
 #[test]
