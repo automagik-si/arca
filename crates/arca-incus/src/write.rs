@@ -6,7 +6,9 @@
 //! `kernel_may_write` allows the writer's entry to change the object, so a PATCH, a tombstone or a DELETE can name only an
 //! object the entry owns. A PATCH and a tombstone send the ETag of the read they were checked against as `If-Match`. A DELETE
 //! reads the object again first, because Incus checks no ETag on a DELETE. A create is refused unless its body classes as the
-//! entry's own, its source is an image, and its name is free. Writes are POST, PATCH and DELETE; nothing here sends PUT.
+//! entry's own, its source is an image (a local one, or one on the one pinned image server), and its name is free. A retiring
+//! project's DELETE is preceded by the DELETE of each image in its own store, which is the project's by containment. Writes are
+//! POST, PATCH and DELETE; nothing here sends PUT.
 //!
 //! A write whose answer is sync, or names no operation, is done. One that names an operation is waited on until it succeeds,
 //! fails, or passes the writer's deadline. A write that Incus accepted and whose read-back does not confirm it is
@@ -41,13 +43,26 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_PAUSE: Duration = Duration::from_millis(100);
 /// Projects the writer never changes, whatever the family names.
 const RESERVED_PROJECTS: [&str; 2] = ["bench", "default"];
-/// The project a network and a forward are addressed in. Incus holds the kernel's bridges here, and a forward hangs off its
-/// network. The writer sends no other kind here.
+/// The project a network, a forward and an ACL are addressed in. Incus holds the kernel's bridges here, a forward hangs off its
+/// network, and Incus 7.3 keeps the ACLs of a project that does not enable networks here too. The writer sends no other kind here.
 pub const NETWORK_HOME: &str = "default";
 
-/// Whether a kind is addressed in [`NETWORK_HOME`]: a network, and a forward, which is made under its network.
+/// The one image server a create's source may name: the public server Incus ships as its `images:` remote. Incus pulls an
+/// instance's image from it into the image store the instance's project reads, which for a kernel project is its own, and the
+/// project's retirement deletes it there.
+pub const IMAGE_SERVER: &str = "https://images.linuxcontainers.org";
+/// The protocol a source that names [`IMAGE_SERVER`] must name with it.
+pub const IMAGE_PROTOCOL: &str = "simplestreams";
+/// The project config key that gives a project an image store of its own.
+const IMAGES_KEY: &str = "features.images";
+
+/// Whether a kind is addressed in [`NETWORK_HOME`]: a network; a forward, which is made under its network; and an ACL, which
+/// Incus keeps in the default project for a kernel project, since a kernel project does not enable networks.
 pub fn network_home(kind: IncusKind) -> bool {
-    matches!(kind, IncusKind::Network | IncusKind::Forward)
+    matches!(
+        kind,
+        IncusKind::Network | IncusKind::Forward | IncusKind::Acl
+    )
 }
 
 /// An object the writer read and classed as its entry's own. Its fields are private, and only [`UnixIncusWriter`] makes one,
@@ -78,7 +93,7 @@ impl Owned {
         &self.etag
     }
 
-    /// The object's uuid, for an instance or a volume: its `volatile.uuid` config key. Other kinds carry none, and they are
+    /// The object's uuid, for an instance: its `volatile.uuid` config key. Other kinds carry none, a volume included, and they are
     /// identified by name and ETag.
     pub fn uuid(&self) -> Option<&str> {
         self.uuid.as_deref()
@@ -135,8 +150,8 @@ impl ProjectFamily {
         Ok(Self { projects })
     }
 
-    /// Whether a write of `kind` may name the project. A network and a forward are addressed in [`NETWORK_HOME`] and nowhere
-    /// else. Every other kind is addressed in a project the configuration lists. Whether the object is the entry's own is
+    /// Whether a write of `kind` may name the project. A network, a forward and an ACL are addressed in [`NETWORK_HOME`] and
+    /// nowhere else. Every other kind is addressed in a project the configuration lists. Whether the object is the entry's own is
     /// checked on each read and write, not here.
     pub fn allows(&self, kind: IncusKind, project: &str) -> bool {
         if network_home(kind) {
@@ -356,9 +371,8 @@ impl UnixIncusWriter {
         })
     }
 
-    /// Deletes an object that carries its tombstone. The object is read again first, and it must show the same tombstone,
-    /// and the same uuid where Incus gives one. The DELETE carries no `If-Match`, because Incus checks ETags only on PUT and
-    /// PATCH.
+    /// Deletes an object that carries its tombstone. The object is first read again, and it must show the same tombstone, and the same uuid where Incus gives one. A
+    /// project then has the images in its own store deleted (see [`Self::clear_images`]). The DELETE carries no `If-Match`, because Incus checks ETags only on PUT and PATCH.
     pub fn delete(&self, owned: &Owned) -> Result<(), IncusError> {
         self.check(owned)?;
         let Some(plan) = owned.tombstone.as_deref() else {
@@ -371,8 +385,62 @@ impl UnixIncusWriter {
         if fresh.uuid != owned.uuid || fresh.tombstone.as_deref() != Some(plan) {
             return Err(refused("the object changed after its tombstone"));
         }
+        if owned.target.kind == IncusKind::Project {
+            self.clear_images(&fresh)?;
+        }
         let urls = urls(&owned.target)?;
         self.mutate("DELETE", &urls.object, None, None)
+    }
+
+    /// Deletes every image in a retiring project's own image store, so that Incus lets the project go. An image carries no mark:
+    /// one in a kernel project's own store is the project's by containment, since only a write into the project could have put it
+    /// there, and it goes with the project. The project must be this entry's own and carry its tombstone. Its own config must set
+    /// `features.images` to `"true"`; otherwise the project reads the default project's store, no image in it is the project's,
+    /// and nothing is listed or deleted. Each listed image must name a plain fingerprint and name this project; any other image,
+    /// including one that names no project, is refused, so nothing outside the project is deleted.
+    fn clear_images(&self, project: &Owned) -> Result<(), IncusError> {
+        self.check(project)?;
+        if project.target.kind != IncusKind::Project || project.tombstone.is_none() {
+            return Err(refused("only a retiring project's images are deleted"));
+        }
+        if project.config.get(IMAGES_KEY).map(String::as_str) != Some("true") {
+            return Ok(());
+        }
+        let name = segment(&project.target.name)?;
+        let framed = self.send(
+            "GET",
+            &format!("/1.0/images?project={name}&recursion=1"),
+            None,
+            None,
+        )?;
+        let envelope = checked_envelope(&framed.into_raw())?;
+        let images = envelope
+            .get("metadata")
+            .and_then(Value::as_array)
+            .ok_or_else(|| decode("the image listing is not a list"))?;
+        let mut fingerprints = Vec::new();
+        for image in images {
+            let fingerprint = image
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .filter(|fingerprint| image_fingerprint(fingerprint))
+                .ok_or_else(|| decode("an image names no plain fingerprint"))?;
+            if image.get("project").and_then(Value::as_str) != Some(name) {
+                return Err(refused(
+                    "the listing names an image that is not the project's own",
+                ));
+            }
+            fingerprints.push(fingerprint.to_string());
+        }
+        for fingerprint in fingerprints {
+            self.mutate(
+                "DELETE",
+                &format!("/1.0/images/{fingerprint}?project={name}"),
+                None,
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     /// Refuses a target whose kind and project are outside the family, before any request is made.
@@ -723,7 +791,8 @@ fn urls(target: &Target) -> Result<Urls, IncusError> {
 }
 
 /// The create body's `source`, when it has one, names an image by alias, fingerprint or properties, and nothing else. A
-/// copy, a migration, a refresh, a remote and a server each reach another object or another server, so each is refused.
+/// copy, a migration, a refresh and a remote each reach another object or another server, so each is refused. A server is
+/// refused too, except [`IMAGE_SERVER`] named with [`IMAGE_PROTOCOL`], exactly and together.
 fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     let Some(source) = fields.get("source") else {
         return Ok(());
@@ -735,9 +804,23 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     let allowed_keys = source.keys().all(|key| {
         matches!(
             key.as_str(),
-            "type" | "alias" | "fingerprint" | "properties"
+            "type" | "alias" | "fingerprint" | "properties" | "server" | "protocol"
         )
     });
+    let server = source.get("server").map(|value| value.as_str());
+    let protocol = source.get("protocol").map(|value| value.as_str());
+    let pinned = match (server, protocol) {
+        (None, None) => true,
+        (Some(server), Some(protocol)) => {
+            server == Some(IMAGE_SERVER) && protocol == Some(IMAGE_PROTOCOL)
+        }
+        _ => false,
+    };
+    if !pinned {
+        return Err(refused(
+            "a create may name no image server but the pinned one, with its protocol",
+        ));
+    }
     let text = source
         .iter()
         .all(|(key, value)| match (key.as_str(), value) {
@@ -802,6 +885,14 @@ fn segment(text: &str) -> Result<&str, IncusError> {
     } else {
         Err(refused("a name that is not a plain path segment"))
     }
+}
+
+/// An image fingerprint: the 64 lowercase hex characters of a SHA-256.
+fn image_fingerprint(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// An operation id: the characters of a uuid.

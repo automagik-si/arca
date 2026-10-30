@@ -189,14 +189,55 @@ fn an_instance_answered_without_a_uuid_is_refused_and_its_intent_stays_open() {
 }
 
 #[test]
-fn a_volume_answered_in_another_pool_is_refused_and_its_intent_stays_open() {
-    // A volume is named by its pool, so an answer that names another pool is another object.
+fn a_volume_answered_without_a_uuid_takes_a_delete_by_name_inverse() {
+    // Incus gives a custom volume no uuid, so its create is undone by kind, project, pool and name.
+    let manifest = manifest(IncusKind::Volume, EffectClass::B);
+    let mut provider = Answer::new(EffectClass::B);
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let op = create(IncusKind::Volume, "kproj", Some("fast"), "data");
+    {
+        let mut ctx = Ctx::new(entry(), &manifest, &mut provider, &mut journal, 7);
+        let made = ctx.effect(op).expect("the create applies");
+        assert_eq!(made.uuid, None, "a volume carries no uuid");
+    }
+    let live = journal.live(&entry());
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].state, EffectState::Applied, "{live:?}");
+    assert_eq!(
+        live[0].inverse,
+        Some(Inverse::IncusDelete {
+            object: object(IncusKind::Volume, "kproj", Some("fast"), "data"),
+        }),
+        "the inverse deletes the volume by its pool and name"
+    );
+    assert!(journal.unresolved().is_empty());
+}
+
+#[test]
+fn a_volume_answered_with_a_uuid_is_refused_and_its_intent_stays_open() {
+    // A uuid does not fit a volume, so the answer is not the object the create made.
     let manifest = manifest(IncusKind::Volume, EffectClass::B);
     let mut provider = Answer::new(EffectClass::B);
     provider.object = Some(ObjectRef {
         uuid: Some("u-volume-1".to_string()),
-        ..object(IncusKind::Volume, "kproj", Some("default"), "data")
+        ..object(IncusKind::Volume, "kproj", Some("fast"), "data")
     });
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let op = create(IncusKind::Volume, "kproj", Some("fast"), "data");
+    let result = Ctx::new(entry(), &manifest, &mut provider, &mut journal, 7).effect(op);
+    assert!(
+        matches!(result, Err(EffectRefusal::Provider(_))),
+        "{result:?}"
+    );
+    assert_eq!(journal.unresolved().len(), 1, "the intent stays open");
+}
+
+#[test]
+fn a_volume_answered_in_another_pool_is_refused_and_its_intent_stays_open() {
+    // A volume is named by its pool, so an answer that names another pool is another object.
+    let manifest = manifest(IncusKind::Volume, EffectClass::B);
+    let mut provider = Answer::new(EffectClass::B);
+    provider.object = Some(object(IncusKind::Volume, "kproj", Some("default"), "data"));
     let mut journal = Journal::open(MemJournal::new()).expect("opens");
     let op = create(IncusKind::Volume, "kproj", Some("fast"), "data");
     let result = Ctx::new(entry(), &manifest, &mut provider, &mut journal, 7).effect(op);

@@ -32,10 +32,10 @@ pub enum IncusKind {
 }
 
 impl IncusKind {
-    /// Whether Incus gives an object of this kind a uuid: an instance and a volume, through their `volatile.uuid` config key.
-    /// Every other kind is identified by its kind, project, parent and name.
+    /// Whether Incus gives an object of this kind a uuid: only an instance, through its `volatile.uuid` config key. Incus 7.3
+    /// gives a custom volume none. Every other kind is identified by its kind, project, parent and name.
     pub fn has_uuid(self) -> bool {
-        matches!(self, IncusKind::Instance | IncusKind::Volume)
+        matches!(self, IncusKind::Instance)
     }
 }
 

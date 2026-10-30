@@ -6,12 +6,18 @@
 //! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path, and
 //! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
 //!
-//! A network and a forward are served from the default project unless their project enables `features.networks`, as Incus serves
-//! them. A restricted project refuses an instance whose NIC names a network that its `restricted.networks.access` does not list.
+//! A network, a forward and an ACL are served from the default project unless their project enables `features.networks`, as Incus
+//! 7.3 serves them: a create sent to such a project lands in the default project, and a read sent to it is answered from there.
+//!
+//! Images live in an image store: a project's own when its config sets `features.images` to `"true"`, and the default project's
+//! otherwise. `/1.0/images?project=<p>&recursion=1` lists the store the project reads, and `/1.0/images/<fingerprint>` is read
+//! and deleted there; an image's delete is answered with an operation. An instance whose source names a `server` pulls its image
+//! into the store its project reads, as a cached image, and a local alias is not checked. A project that holds an image is not
+//! empty, so its delete is refused, as Incus refuses it. [`FakeIncus::add_image`] puts an image in a store, as a copy by hand would. A restricted project refuses an instance whose NIC names a network that its `restricted.networks.access` does not list.
 //!
 //! Writes: a POST to a collection creates an object, a PATCH or DELETE changes or removes one. These cover projects and the
-//! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance and a volume
-//! get a uuid, in their `volatile.uuid` key; no other kind has one. Each object's ETag is a digest of its JSON. A PATCH whose
+//! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance gets a uuid, in
+//! its `volatile.uuid` key; no other kind has one, a volume included, as on Incus 7.3. Each object's ETag is a digest of its JSON. A PATCH whose
 //! `If-Match` is not the current ETag is 412 and changes nothing. A DELETE ignores `If-Match`, as Incus does. An instance's or
 //! a volume's create and delete are answered 202 with an operation, whose URL the caller waits on. Every other write, and
 //! every PATCH, is answered sync: 201 for a create and 200 otherwise. A failed operation waits as a status error. A method a
@@ -166,6 +172,7 @@ struct Address {
 enum Route {
     Server,
     ListProjects,
+    ListImages(String),
     ListInstances,
     ListPools,
     HostInterfaces,
@@ -286,6 +293,23 @@ impl FakeIncus {
     /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
     pub fn set_host_interfaces(&self, interfaces: Vec<(String, Vec<IpAddr>)>) {
         *lock(&self.shared.host_interfaces) = interfaces;
+    }
+
+    /// Puts an image with the alias `alias` in the store `project` reads, as a copy by hand would, and returns its fingerprint.
+    pub fn add_image(&self, project: &str, alias: &str) -> String {
+        let fingerprint =
+            Digest::of(format!("{}|{alias}", self.shared.next_id()).as_bytes()).to_hex();
+        lock(&self.shared.store).put_image(project, fingerprint, alias, false)
+    }
+
+    /// Every image the fake holds, as the project whose store holds it and its fingerprint, in the order they were made.
+    pub fn images(&self) -> Vec<(String, String)> {
+        lock(&self.shared.store)
+            .objects
+            .iter()
+            .filter(|object| object.kind == "image")
+            .map(|object| (object.project.clone(), object.name.clone()))
+            .collect()
     }
 
     /// Makes the fake answer 400 to a POST whose path starts with `kind_path_prefix` and whose body carries a `config`. The
@@ -549,6 +573,10 @@ fn parse(target: &str) -> Option<Route> {
         ["profiles", name] => Route::Object(address("profile", "", name)),
         ["network-zones"] => Route::Collection(address("zone", "", "")),
         ["network-zones", name] => Route::Object(address("zone", "", name)),
+        ["images"] if query_param(query, "recursion") == Some("1") => {
+            Route::ListImages(project.to_string())
+        }
+        ["images", fingerprint] => Route::Object(address("image", "", fingerprint)),
         ["storage-pools"] if query == "recursion=1" => Route::ListPools,
         ["storage-pools", pool, "resources"] if query.is_empty() => {
             Route::PoolResources((*pool).to_string())
@@ -585,6 +613,21 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
     match (request.method.as_str(), route) {
         ("GET", Route::Server) => sync(store.server.clone()),
         ("GET", Route::ListProjects) => sync(Value::Array(store.bodies("project"))),
+        ("GET", Route::ListImages(project)) => match store.image_store(&project) {
+            Some(home) => sync(Value::Array(
+                store
+                    .objects
+                    .iter()
+                    .filter(|object| object.kind == "image" && object.project == home)
+                    .map(|object| object.body.clone())
+                    .collect(),
+            )),
+            None => (
+                404,
+                String::new(),
+                error_envelope(404, "the project is not found"),
+            ),
+        },
         ("GET", Route::ListInstances) => sync(Value::Array(store.bodies("instance"))),
         ("GET", Route::HostInterfaces) => {
             let interfaces = lock(&shared.host_interfaces);
@@ -647,11 +690,19 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
 }
 
 impl Store {
-    /// The address a network or a forward is served at. Incus serves a project that does not enable `features.networks` the
-    /// networks of the default project, so such an address is moved there. An address whose project does not exist is kept, and
+    /// The address a network, a forward or an ACL is served at. Incus serves a project that does not enable `features.networks`
+    /// the networks and the ACLs of the default project, so such an address is moved there. An address whose project does not exist is kept, and
     /// answers as Incus answers a missing project.
     fn served_from(&self, mut address: Address) -> Address {
-        if !matches!(address.kind, "network" | "forward") || address.project == DEFAULT_PROJECT {
+        if address.kind == "image" {
+            if let Some(home) = self.image_store(&address.project) {
+                address.project = home;
+            }
+            return address;
+        }
+        if !matches!(address.kind, "network" | "forward" | "acl")
+            || address.project == DEFAULT_PROJECT
+        {
             return address;
         }
         let Some(project) = self
@@ -671,6 +722,58 @@ impl Store {
             address.project = DEFAULT_PROJECT.to_string();
         }
         address
+    }
+
+    /// The project whose image store `project` reads: its own when its config sets `features.images` to `"true"`, and the default
+    /// project's otherwise. `None` when the project does not exist.
+    fn image_store(&self, project: &str) -> Option<String> {
+        if project == DEFAULT_PROJECT {
+            return Some(DEFAULT_PROJECT.to_string());
+        }
+        let config = self
+            .objects
+            .iter()
+            .find(|object| object.kind == "project" && object.project == project)?
+            .body
+            .get("config")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let own = config.get("features.images").and_then(Value::as_str) == Some("true");
+        Some(if own { project } else { DEFAULT_PROJECT }.to_string())
+    }
+
+    /// Puts an image in the store `project` reads, unless one with that fingerprint is there already, and returns the fingerprint.
+    fn put_image(
+        &mut self,
+        project: &str,
+        fingerprint: String,
+        alias: &str,
+        cached: bool,
+    ) -> String {
+        let home = self
+            .image_store(project)
+            .unwrap_or_else(|| project.to_string());
+        let held = self.objects.iter().any(|object| {
+            object.kind == "image" && object.project == home && object.name == fingerprint
+        });
+        if !held {
+            let aliases = if cached {
+                json!([])
+            } else {
+                json!([{ "name": alias }])
+            };
+            self.objects.push(Stored {
+                kind: "image".to_string(),
+                project: home.clone(),
+                name: fingerprint.clone(),
+                parent: String::new(),
+                body: json!({
+                    "fingerprint": fingerprint, "project": home, "cached": cached,
+                    "aliases": aliases, "type": "container",
+                }),
+            });
+        }
+        fingerprint
     }
 
     /// The project's own config, when the project exists.
@@ -781,6 +884,15 @@ fn create(
     {
         return (403, String::new(), error_envelope(403, reason));
     }
+    if kind == "instance"
+        && let Some(source) = body.get("source").and_then(Value::as_object)
+        && let Some(server) = source.get("server").and_then(Value::as_str)
+    {
+        // The image is pulled from the server into the store the project reads, and kept there as a cached image.
+        let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
+        let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
+        store.put_image(&project, fingerprint, alias, true);
+    }
     let parent = address.parent.clone();
     if matches!(kind, "volume" | "bucket") && !store.pools.iter().any(|(pool, _)| *pool == parent) {
         return (
@@ -822,8 +934,9 @@ fn create(
         body.insert("project".to_string(), Value::String(project.clone()));
     }
     body.entry("config").or_insert_with(|| json!({}));
-    if matches!(kind, "instance" | "volume") {
-        // Incus gives an instance and a volume a uuid, in its `volatile.uuid` config key. No other kind has one.
+    if kind == "instance" {
+        // Incus gives an instance a uuid, in its `volatile.uuid` config key. No other kind has one: Incus 7.3 gives a custom
+        // volume none.
         if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
             config.insert("volatile.uuid".to_string(), Value::String(shared.next_id()));
         }
@@ -958,9 +1071,9 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
 }
 
 /// Whether Incus answers a write to this kind and method with an operation. An instance's and a volume's create and delete
-/// are. Their config update is sync, as every other write is.
+/// are, and so is an image's delete. Their config update is sync, as every other write is.
 fn is_async(kind: &str, method: &str) -> bool {
-    matches!(kind, "instance" | "volume") && method != "PATCH"
+    matches!(kind, "instance" | "volume" | "image") && method != "PATCH"
 }
 
 /// Answers a write. An async write records its operation and answers 202 with the operation's URL; the operation's own status

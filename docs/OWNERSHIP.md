@@ -55,15 +55,15 @@ Source: `UnixIncusWriter::create` and `read_owned` classify with the writer's re
 
 **Rule 8.** The kernel writes only inside the project family its configuration names. `ProjectFamily` holds those names and
 nothing else. A target outside the family is refused before any request is sent, a read included. `bench` and `default` are
-never in the family, so they are refused whatever the configuration says. The one exception is a network and a forward, which
-are addressed in `default` and nowhere else, and only when the object carries the entry's mark (Rule 40). The other system's
+never in the family, so they are refused whatever the configuration says. The one exception is a network, a forward and an ACL,
+which are addressed in `default` and nowhere else, and only when the object carries the entry's mark (Rule 40). The other system's
 projects come from the node's configuration, and `ProjectFamily::new` refuses a family that names one of them, so such a
 configuration does not start. The Incus provider (`crates/arca-providers/src/incus.rs`) checks the same family in `plan` and
 again in `effect`, so an effect made by hand for a project outside the family sends nothing.
 Source: `write::ProjectFamily::{new, allows}` and `UnixIncusWriter::{allow_target, create, read_owned, check}` in
 `crates/arca-incus/src/write.rs`; tests `a_target_outside_the_kernel_family_is_refused_before_any_request`,
 `the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_project`,
-`networks_and_forwards_are_addressed_in_default_and_no_other_kind_is` and
+`networks_forwards_and_acls_are_addressed_in_default_and_no_other_kind_is` and
 `a_non_network_create_in_default_is_refused_before_any_request_at_the_writer` in `crates/arca-incus/tests/write.rs`.
 `arca_kernel::plugin::Ctx::effect` refuses a project the manifest does not name (`ProjectNotAllowed`), a second check. The
 provider's test `an_effect_rechecks_the_family_for_a_plan_the_caller_made_by_hand` is in
@@ -76,7 +76,9 @@ Source: `write::urls` in `crates/arca-incus/src/write.rs`; test
 `an_object_name_that_is_not_a_plain_path_segment_is_refused_before_any_write`.
 
 **Rule 10.** A non-empty project is not deleted: Incus refuses the DELETE, and the project stays. The writer sends the DELETE
-and returns Incus's answer as `IncusError::Status`. It does not count the project's objects first.
+and returns Incus's answer as `IncusError::Status`. It does not count the project's objects first. The images in a kernel project's
+own store are the one exception: they are the project's by containment, and the project's retirement deletes them before the
+project (Rule 42).
 Source: `UnixIncusWriter::delete` returns the status error from `mutate`. The refusal is Incus's, and it is listed under
 "Assumptions to confirm". Test `a_non_empty_project_is_not_deleted` models it on the fake (`crates/arca-incus/src/fake.rs`,
 `delete`).
@@ -85,11 +87,16 @@ Source: `UnixIncusWriter::delete` returns the status error from `mutate`. The re
 
 **Rule 11.** A create carries this entry's mark and no other owner's key, and it names an image source only. The body's config
 must classify as the writer's entry's own, with no retiring mark. A `source`, when the body has one, must be an image named by
-alias, fingerprint or properties. A copy, a migration, a refresh, a server, a remote or a protocol is refused. The name must be
-free: the object's GET must answer 404 before the POST is sent. Every refusal happens before any write.
-Source: `UnixIncusWriter::create` and `write::check_source` in `crates/arca-incus/src/write.rs`; tests
-`a_create_is_refused_unless_its_config_classes_as_the_entrys_own`, `a_create_takes_only_an_image_source_and_sends_nothing_else`
-and `a_create_whose_name_is_taken_is_refused_and_nothing_is_written`.
+alias, fingerprint or properties. A copy, a migration, a refresh and a remote are refused, and so is a server, with one exception:
+the image server `https://images.linuxcontainers.org` named with the protocol `simplestreams`, exactly and together, and with no
+secret or certificate. Incus then pulls the image into the store the instance's project reads, which for a kernel project is its
+own (Rules 30, 42), so a probe makes its instance with no copy by hand. Any other server, any other protocol, and either one without
+the other are refused. The name must be free: the object's GET must answer 404 before the POST is sent. Every refusal happens
+before any write.
+Source: `UnixIncusWriter::create`, `write::check_source` and `write::{IMAGE_SERVER, IMAGE_PROTOCOL}` in
+`crates/arca-incus/src/write.rs`; tests `a_create_is_refused_unless_its_config_classes_as_the_entrys_own`,
+`a_create_takes_only_an_image_source_and_sends_nothing_else`, `a_create_may_name_the_one_image_server_and_no_other` and
+`a_create_whose_name_is_taken_is_refused_and_nothing_is_written`.
 
 **Rule 12.** A write that Incus accepted is confirmed by a read-back. After a create, a PATCH or a tombstone, the writer reads
 the object again. The read must class as the writer's entry's own, and it must show the write: the change, or the tombstone on
@@ -135,14 +142,15 @@ delete plan, and `C` is an emission that is never reverted. A plugin's manifest 
 class. The default classes this document proposes are: project `B`, instance `B`, volume `B`, bucket `B`, network `B`; ACL `A`,
 profile `A`, zone `A`, forward `A`. A network is `B` because it is a bridge the default project shares, and an instance attached
 to it must be deleted first: a plan deletes the most recent object first, while a class-`A` revert runs before any plan and would
-ask Incus to delete a bridge still in use. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
+ask Incus to delete a bridge still in use. An ACL stays `A` although it is addressed in `default` (Rule 40), since no ACL the
+kernel makes today is named by a NIC. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
 manifest does not declare for that kind. Whether a declared class is stricter than the default is not checked.
 Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arca_kernel::plugin::Manifest.effects` and the
 `NotDeclared` check in `Ctx::effect`.
 
 **Rule 18.** A destructive removal runs in five steps: read the object with its ETag and classify it; PATCH it with `If-Match`
 to set `user.arcakernel.retiring` to the plan's digest; read it back and require the entry's mark, the tombstone and, for an
-instance or a volume, the same uuid; read it again immediately before the delete and require the same; then DELETE. A DELETE
+instance, the same uuid; read it again immediately before the delete and require the same; then DELETE. A DELETE
 sends no `If-Match`, so a change that lands between the last read and the DELETE is not caught by Incus. That gap is the
 residual risk of this step. It is covered by the one-writer rule (only the entry's own writer changes its objects) and by the
 tombstone, which another writer would have to clear on purpose.
@@ -158,13 +166,21 @@ records drift for that object, and the plan becomes partial.
 Source: the refusals in `tombstone` and `delete`, and the read-back in `confirm`; test
 `a_tombstone_needs_a_uuid_where_incus_gives_one_and_a_delete_needs_its_tombstone`.
 
-**Rule 20.** Only the kinds Incus gives a uuid carry one: an instance and a volume, through their `volatile.uuid` config key. An
-instance or a volume without that key cannot be retired or deleted. Every other kind is identified by its name and ETag. Its
-tombstone is set under its ETag, and its delete follows a fresh read that shows the tombstone. A target that names a uuid reads
-only the object with that uuid, and a mismatch is refused before any write.
-Source: `write::{has_uuid, uuid_of}`, `UnixIncusWriter::{classed, tombstone, delete}`; tests
+**Rule 20.** Only the kind Incus gives a uuid carries one: an instance, through its `volatile.uuid` config key. An instance
+without that key cannot be retired or deleted. Every other kind is identified by its kind, project, parent and name, with its
+ETag, and that includes a custom volume: Incus 7.3 gives a volume no `volatile.uuid` and no uuid field, so a volume's create, its
+inverse and its retirement name it by its pool and name. Such an object's tombstone is set under its ETag, and its delete follows
+a fresh read that shows the tombstone. A target that names a uuid reads only the object with that uuid, and a mismatch is refused
+before any write. A journal record that an earlier kernel left open for a volume, because it refused a create answered without a
+uuid, is settled when the reconciler opens: the volume reads back owned and without a uuid, so it is adopted with a delete by name.
+Source: `arca_kernel::ownership::IncusKind::has_uuid`, `write::uuid_of`, `UnixIncusWriter::{classed, tombstone, delete}`; tests
+`only_an_instance_has_a_uuid` (`crates/arca-kernel/tests/ownership.rs`),
+`a_volume_answered_without_a_uuid_takes_a_delete_by_name_inverse` (`crates/arca-kernel/tests/inverse_by_name.rs`),
 `a_tombstone_needs_a_uuid_where_incus_gives_one_and_a_delete_needs_its_tombstone`,
-`a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid` and `each_kind_round_trips_through_create_patch_tombstone_and_delete`.
+`a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid` and `each_kind_round_trips_through_create_patch_tombstone_and_delete`
+(`crates/arca-incus/tests/write.rs`), `a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name`
+(`crates/arca-providers/tests/incus_provider.rs`), and `the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name`
+(`crates/arca-reconcile/tests/probe.rs`, over the journal fixture `crates/arca-reconcile/tests/fixtures/journal-volume-without-uuid.jsonl`).
 
 **Rule 21.** A delete reaches an object only through a tombstone that the writer has read back. A plugin cannot ask the
 kernel to delete an object through its context.
@@ -188,7 +204,7 @@ Source: `arca_kernel::plugin::Ctx::effect` and `Provider`; tests
 and `a_plan_refusal_writes_no_record` in `crates/arca-kernel/tests/plugin.rs`.
 
 **Rule 24.** The inverse is data from a closed vocabulary, built when the effect applies. A create's inverse is an `IncusDelete`
-of the object the read-back showed. For a kind that carries a uuid (an instance or a volume) the inverse names the uuid. For any
+of the object the read-back showed. For the kind that carries a uuid (an instance) the inverse names the uuid. For any
 other kind it names the object by kind, project, parent and name, with no uuid: a delete by name. The kernel accepts a create's
 inverse only when the uuid it names is present exactly for the kinds that carry one (`required_inverse`). A create whose
 read-back does not fit its kind is refused by the kernel, and its intent stays open. A patch's inverse is an `IncusRestoreConfig`
@@ -226,17 +242,19 @@ Source: `crates/arca-incus/Cargo.toml`, the `write` feature; `#[cfg(feature = "w
 **Rule 29.** A write to an object that is not an instance or a project lands only in a project that enables the feature its kind
 needs: `features.networks.zones` for a network zone; `features.profiles` for a profile; `features.storage.volumes` for a volume;
 `features.storage.buckets` for a bucket. The provider reads the project's config and refuses the write when the key is not
-`"true"`. Without the key, Incus sends the write to the default project. A network and a forward need no project feature, since
-they are addressed in `default`, which holds them (Rule 40). An ACL needs none either: its kernel project keeps it, as the
-kernel's ruling stands, which is listed under "Assumptions to confirm". The check runs for a create, a patch and a delete, and it
-is made before any write is sent. Reading the project's config is a GET.
+`"true"`. Without the key, Incus sends the write to the default project. A network, a forward and an ACL need no project feature,
+since they are addressed in `default`, which holds them (Rule 40). The check runs for a create, a patch and a delete, and it is
+made before any write is sent. Reading the project's config is a GET.
 Source: `IncusProvider::check_features` in `crates/arca-providers/src/incus.rs`; tests
 `a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature` and
 `a_zone_write_is_refused_before_any_write_in_a_project_without_the_zones_key`, in `crates/arca-providers/tests/incus_provider.rs`.
 
-**Rule 30.** Every kernel project is created with `features.networks.zones`, `features.profiles`, `features.storage.volumes` and
-`features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's mark. `features.networks` is
-not set: a kernel project has no networks of its own (Rule 40). A plugin may set a `restricted`, `restricted.*` or `features.*` key
+**Rule 30.** Every kernel project is created with `features.images`, `features.networks.zones`, `features.profiles`,
+`features.storage.volumes` and `features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's
+mark. `features.networks` is not set: a kernel project has no networks of its own (Rule 40). `features.images` gives the project its
+own image store, so an image an instance pulls lands inside the project and never in the default project's store, and the
+project's retirement deletes it (Rule 42). Incus 7.3 sets it to `"true"` by default; the kernel sets it so that nothing depends on
+that default. A plugin may set a `restricted`, `restricted.*` or `features.*` key
 on a project create only to the value the kernel pins it at, with one exception: `restricted.networks.access`, which names the
 bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
 whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
@@ -315,8 +333,8 @@ in `crates/arca-providers/tests/incus_provider.rs`, and
 `a_wait_whose_own_answer_is_an_http_error_is_not_the_operations_status` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 34.** A retirement runs only through `IncusProvider::retire`, under a plan digest: an approved class-B plan (Rule 37), or
-the create's op digest for a class-A revert (Rule 18). An instance or a volume is
-named by its uuid, so a retirement that names none is refused before any request. The object is read, and it must be the entry's
+the create's op digest for a class-A revert (Rule 18). An instance is named by its
+uuid, so a retirement that names none is refused before any request; a volume has none and is named by its pool and name. The object is read, and it must be the entry's
 own with the plan's uuid. The writer tombstones it under its ETag and reads it back. The object is read again, and it is deleted
 only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
 `Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
@@ -325,7 +343,8 @@ plan can continue. A DELETE the writer refuses is drift; any other failure of th
 when it is first read is already gone: the retirement is `Deleted`, and no DELETE is sent.
 Source: `IncusProvider::retire` in `crates/arca-providers/src/incus.rs`; tests
 `retire_tombstones_then_deletes_an_owned_instance_in_order`,
-`retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request`,
+`retire_refuses_an_instance_named_without_its_uuid_before_any_request`,
+`a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name`,
 `retire_skips_the_delete_as_drift_when_the_delete_read_back_shows_another_uuid`,
 `retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete` and `retire_stops_on_a_stale_etag_and_sends_no_delete`,
 all in `crates/arca-providers/tests/incus_provider.rs`.
@@ -383,20 +402,28 @@ Source: `arca_reconcile::Reconciler::{resolve, open}` in `crates/arca-reconcile/
 
 ## Bridges in the default project
 
-**Rule 40.** A network and a forward are addressed in project `default`, which Incus shares with a project that does not enable
-networks, and no other kind is. A kernel project does not enable networks, so an instance in it attaches to a bridge in `default`.
-Each write to either kind carries the entry's mark: a create names a free name and stamps the mark, and a patch, a tombstone or a
-delete reads the object first and refuses it unless the entry owns it. An unmarked bridge therefore costs one read and no write.
-A forward is made under its network, since Incus keeps forwards in their network's project, so a forward create also reads its
-network and refuses one the entry does not own. Zones and ACLs are not addressed in `default`: a zone stays in its kernel project
-under `features.networks.zones`, since a bridge sets no DNS key that would attach one.
+**Rule 40.** A network, a forward and an ACL are addressed in project `default`, which Incus shares with a project that does not
+enable networks, and no other kind is. A kernel project does not enable networks, so an instance in it attaches to a bridge in
+`default`, and Incus 7.3 keeps the project's ACLs in `default` too: an ACL created with `?project=<kernel project>` lands in
+`default`, and a read sent to the kernel project is answered from there. Each write to any of the three kinds carries the entry's
+mark: a create names a free name and stamps the mark, and a patch, a tombstone or a delete reads the object first and refuses it
+unless the entry owns it. An unmarked bridge or ACL therefore costs one read and no write. A forward is made under its network,
+since Incus keeps forwards in their network's project, so a forward create also reads its network and refuses one the entry does
+not own. A zone is not addressed in `default`: it stays in its kernel project under `features.networks.zones`, since a bridge sets
+no DNS key that would attach one. A journal record an earlier kernel wrote can name an ACL in its kernel project; the provider
+reads and retires that ACL in `default` when the project's own config does not set `features.networks` to `"true"` (or the
+project is gone), and keeps the record's address, which the family refuses, when it does. The read-back still names the object
+as the record names it, so the journal accepts the outcome.
 Source: `write::{network_home, NETWORK_HOME}`, `ProjectFamily::allows`, `UnixIncusWriter::network_is_own` in
 `crates/arca-incus/src/write.rs`, and `IncusProvider::{check_family, prepared_create}` in `crates/arca-providers/src/incus.rs`;
 tests `a_marked_bridge_in_default_is_created_patched_and_removed`,
 `an_unmarked_bridge_in_default_is_refused_for_patch_and_delete_and_no_write_is_sent`,
-`a_non_network_create_in_default_is_still_refused_before_any_request`, `a_forward_is_made_only_on_a_network_the_entry_holds_in_default`
-in `crates/arca-providers/tests/incus_provider.rs`, and `a_forward_is_refused_before_any_write_when_its_network_is_not_the_entrys`
-in `crates/arca-incus/tests/write.rs`.
+`a_non_network_create_in_default_is_still_refused_before_any_request`, `a_forward_is_made_only_on_a_network_the_entry_holds_in_default`,
+`an_acl_is_made_marked_in_default_and_refused_in_a_kernel_project_before_any_request` and
+`an_acl_an_earlier_kernel_named_in_its_kernel_project_is_read_and_retired_in_default` in `crates/arca-providers/tests/incus_provider.rs`
+(`IncusProvider::served_at`), and `a_forward_is_refused_before_any_write_when_its_network_is_not_the_entrys`,
+`an_acl_is_created_marked_in_default_and_refused_in_a_kernel_project_before_any_request` and
+`an_acl_sent_to_a_project_without_the_networks_key_lands_in_default` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 41.** A project grants its instances the bridges it may use through `restricted.networks.access`, a comma-separated list of
 plain names. The grant is set at the project's create only, since a project patch may not change it (Rule 30). Each name must be a
@@ -407,6 +434,24 @@ Source: `IncusProvider::check_network_access` in `crates/arca-providers/src/incu
 `a_project_create_may_grant_only_bridges_the_entry_holds_in_default` in `crates/arca-providers/tests/incus_provider.rs`, and
 `a_nic_on_a_network_the_restricted_project_does_not_list_is_refused_by_incus` in `crates/arca-incus/tests/write.rs`, which runs
 against the fake's restriction (`FakeIncus` answers 403 to such a NIC).
+
+## Images in a kernel project
+
+**Rule 42.** An image carries no mark. An image in a kernel project's own store is the project's by containment: only a write into
+the project puts one there (an instance the kernel makes from the image server, or a copy by hand), and it goes with the project.
+A project's DELETE is preceded, in the writer, by the DELETE of each image in its own store: the project must be the entry's own and
+carry its tombstone (Rule 18), its own config must set `features.images` to `"true"`, the listing is
+`/1.0/images?project=<project>&recursion=1`, each image must name a plain fingerprint, and an image whose `project` names another
+project refuses the whole step before any image is deleted. A project whose config does not set `features.images` reads the
+default project's store, none of whose images is the project's, so nothing is listed or deleted for it. The project is then read
+again and deleted as Rule 18 states. A failed image DELETE leaves the project tombstoned, and a retirement under the same plan
+continues it.
+Source: `UnixIncusWriter::{delete, clear_images}` in `crates/arca-incus/src/write.rs`, and `PROJECT_KEYS` in
+`crates/arca-providers/src/incus.rs`; tests `a_retiring_project_deletes_the_images_in_its_own_store_and_then_itself`,
+`a_project_that_reads_the_default_image_store_deletes_no_image` and
+`an_instance_from_the_image_server_pulls_its_image_into_the_store_its_project_reads` in `crates/arca-incus/tests/write.rs`, which run
+against the fake's image stores, and `an_uninterrupted_probe_creates_and_removes_every_object` and
+`the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_then_runs` in `crates/arca-reconcile/tests/probe.rs`.
 
 ## Out of scope
 
@@ -423,7 +468,8 @@ must run before any live write.
 
 - Incus checks `If-Match` only on PUT and PATCH, so a DELETE has no compare step, and the tombstone is the only one (Rule 18).
 - A PATCH merges the `config` map, and an empty value unsets a key (Rule 16).
-- An instance's and a volume's uuid is their `volatile.uuid` key, and no other kind has a uuid (Rule 20).
+- An instance's uuid is its `volatile.uuid` key, and no other kind has a uuid (Rule 20). Confirmed for a volume on Incus 7.3: a
+  custom volume has no `volatile.uuid` and no uuid field.
 - Incus answers sync to the project, network, profile, ACL, zone, forward and bucket writes, and to an instance's or a volume's
   PATCH. It answers an instance's or a volume's create and delete with an operation (Rule 14).
 - The wait's answer carries the operation's `id`, `status_code` and `status`, and 200 with `Success` is the only success (Rule 14).
@@ -438,16 +484,23 @@ must run before any live write.
   `"true"` first (Rule 29).
 - Incus serves a network, and a forward, that a project without `features.networks` names from the default project, so a kernel
   project's instance reaches a bridge in `default` (Rule 40). A forward is kept in its network's project (Rule 40).
-- Incus keeps an ACL in its own project, and does not route it to `default`, when the project does not enable `features.networks`.
-  This is a ruling, and no check here confirms it. If Incus routes ACLs by that key, an ACL create lands in `default`
-  carrying the entry's mark, and the read-back in the kernel project does not find it. Confirm on a live host before any ACL write.
+- Incus 7.3 keeps the ACLs of a project that does not enable `features.networks` in `default`: an ACL created with
+  `?project=<kernel project>` lands there, and a GET in the kernel project is answered from there (Rule 40). Confirmed on a live
+  host, which superseded the earlier ruling that an ACL stays in its kernel project.
 - Incus gives a zone its own project under `features.networks.zones`, whether or not `features.networks` is set (Rule 29).
 - Incus 7.3 has `restricted.networks.access`, and a restricted project refuses an instance NIC on a network the grant does not
   list (Rule 41). The grant is the only key this rule adds to a kernel project.
 - Incus refuses to delete a bridge that an instance still attaches to (Rule 17).
-- The probe's image alias resolves in the probe's project. A kernel project does not enable `features.images` (Rule 30), so it
-  reads the image store that Incus gives it, and the host imports the alias there before a live probe. The kernel imports nothing.
-- Incus accepts `restricted` and the four `features.*` keys on a project create (Rule 30).
+- Incus refuses to delete an ACL that a NIC still names. An ACL is class `A`, so a revert of an ACL that an instance's NIC names
+  runs before the plan deletes the instance, and Incus keeps the ACL; the removal reports it, and nothing is lost (Rule 17).
+- Incus 7.3 creates a project with `features.images` set to `"true"` when the create does not name it, and an image in the project's
+  own store keeps Incus from deleting the project. Both were seen on a live host, which superseded the earlier assumption that a
+  kernel project reads another project's image store (Rules 30, 42).
+- An instance whose source names the image server and `simplestreams` pulls its image into the store its project reads, as a cached
+  image (Rules 11, 42). The probe's alias `alpine/edge` is on that server.
+- An image listing in a project with its own store names only that project's images, each with its 64-hex fingerprint, and Incus
+  answers an image's DELETE with an operation (Rule 42).
+- Incus accepts `restricted` and the five `features.*` keys on a project create (Rule 30).
 - Incus accepts `ipv6.address` set to `none` on a bridge create (Rule 31).
 - Incus accepts `ipv4.nat` on a bridge create, and reports a network's config with the keys that were set on it and no others.
   A key Incus adds on read would refuse a patch of that network, which fails closed (Rule 31).

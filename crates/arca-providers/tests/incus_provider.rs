@@ -22,7 +22,7 @@ use arca_kernel::journal::{
 };
 use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass};
 use arca_kernel::plugin::{
-    Ctx, EffectOp, EffectRefusal, Manifest, Observe, Planned, Provider, op_digest,
+    Ctx, EffectOp, EffectRefusal, Manifest, Observe, Planned, Provider, ReadBack, op_digest,
 };
 use arca_providers::incus::{
     DROIDD_PROJECTS_FIXED, Family, IncusProvider, RetainedSet, Retirement, SECRET_PREFIX,
@@ -603,6 +603,11 @@ fn a_project_create_carries_the_mark_the_features_restricted_and_the_op_config()
     assert_eq!(config["features.profiles"], json!("true"));
     assert_eq!(config["features.storage.volumes"], json!("true"));
     assert_eq!(config["features.storage.buckets"], json!("true"));
+    assert_eq!(
+        config["features.images"],
+        json!("true"),
+        "a kernel project keeps its own image store, which its retirement clears: {config}"
+    );
     assert_eq!(config["restricted"], json!("true"));
     assert_eq!(config["limits.virtual-machines"], json!("4"));
 }
@@ -666,7 +671,10 @@ fn a_volume_create_names_its_pool_and_its_inverse_names_the_same_pool() {
         panic!("a delete inverse: {:?}", live[0].inverse);
     };
     assert_eq!(named.parent.as_deref(), Some("fast"));
-    assert!(named.uuid.is_some(), "a volume's inverse carries its uuid");
+    assert_eq!(
+        named.uuid, None,
+        "a volume has no uuid, so its inverse deletes it by name"
+    );
 }
 
 #[test]
@@ -2320,27 +2328,71 @@ fn a_plain_patch_over_a_reference_shaped_value_that_no_secret_matches_is_refused
 // ---------------------------------------------------------------------------------------------------------------------------
 
 #[test]
-fn retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request() {
+fn retire_refuses_an_instance_named_without_its_uuid_before_any_request() {
     let (scratch, fake) = start("retire-no-uuid");
     let provider = provider(&fake, &secrets_dir(&scratch));
     let plan = Digest::of(b"approved");
-    for target in [
-        object(IncusKind::Instance, "svc", None, "k1"),
-        object(IncusKind::Volume, "svc", Some("fast"), "v1"),
-    ] {
-        assert!(
-            matches!(
-                provider.retire(&entry("toy"), &target, &plan),
-                Err(EffectRefusal::Provider(_))
-            ),
-            "{:?} without a uuid",
-            target.kind
-        );
-    }
+    let target = object(IncusKind::Instance, "svc", None, "k1");
+    assert!(
+        matches!(
+            provider.retire(&entry("toy"), &target, &plan),
+            Err(EffectRefusal::Provider(_))
+        ),
+        "an instance without a uuid"
+    );
     assert!(
         fake.requests().is_empty(),
         "no request was made: {:?}",
         fake.requests()
+    );
+}
+
+#[test]
+fn a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name() {
+    // Incus 7.3 gives a custom volume no uuid. Its create answers with none, its inverse deletes it by name, and its retirement
+    // tombstones and deletes it by name.
+    let (scratch, fake) = start("volume-by-name");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(IncusKind::Volume, "svc", Some("fast"), "v1", json!({}));
+    let planned = provider.plan(&entry("toy"), &op).expect("the plan");
+    let (made, inverse) = provider
+        .effect(&entry("toy"), &op, &planned)
+        .expect("the volume is made");
+    let by_name = object(IncusKind::Volume, "svc", Some("fast"), "v1");
+    assert_eq!(made, by_name, "a volume carries no uuid");
+    assert_eq!(
+        inverse,
+        Inverse::IncusDelete {
+            object: by_name.clone()
+        }
+    );
+    let volume = read(
+        &fake,
+        "/1.0/storage-pools/fast/volumes/custom/v1?project=svc",
+    );
+    assert!(volume["config"].get("volatile.uuid").is_none(), "{volume}");
+
+    let plan = Digest::of(b"approved");
+    assert_eq!(
+        provider.retire(&entry("toy"), &by_name, &plan),
+        Ok(Retirement::Deleted(by_name.clone()))
+    );
+    assert_eq!(
+        writes(&fake),
+        vec![
+            (
+                "POST".to_string(),
+                "/1.0/storage-pools/fast/volumes/custom?project=svc".to_string()
+            ),
+            (
+                "PATCH".to_string(),
+                "/1.0/storage-pools/fast/volumes/custom/v1?project=svc".to_string()
+            ),
+            (
+                "DELETE".to_string(),
+                "/1.0/storage-pools/fast/volumes/custom/v1?project=svc".to_string()
+            ),
+        ]
     );
 }
 
@@ -2591,7 +2643,6 @@ fn a_non_network_create_in_default_is_still_refused_before_any_request() {
     for (kind, parent, name) in [
         (IncusKind::Project, None, "default"),
         (IncusKind::Instance, None, "i9"),
-        (IncusKind::Acl, None, "a9"),
         (IncusKind::Profile, None, "p9"),
         (IncusKind::Zone, None, "z9"),
         (IncusKind::Volume, Some("default"), "v9"),
@@ -2729,4 +2780,122 @@ fn a_forward_is_made_only_on_a_network_the_entry_holds_in_default() {
             "/1.0/networks/kbr/forwards?project=default"
         )]
     );
+}
+
+#[test]
+fn an_acl_is_made_marked_in_default_and_refused_in_a_kernel_project_before_any_request() {
+    // Incus 7.3 keeps the ACLs of a project that does not enable networks in the default project, so an ACL is addressed there and
+    // nowhere else, as a bridge is.
+    let (scratch, fake) = start("acl-home");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let in_kernel = create(IncusKind::Acl, "svc", None, "a1", json!({"config": {}}));
+    assert_eq!(
+        provider.plan(&entry("toy"), &in_kernel),
+        Err(EffectRefusal::ProjectNotAllowed)
+    );
+    assert!(fake.requests().is_empty(), "{:?}", fake.requests());
+
+    let mut manifest = manifest();
+    manifest.projects.push("default".into());
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let made = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+        .effect(create(
+            IncusKind::Acl,
+            "default",
+            None,
+            "a1",
+            json!({"config": {}}),
+        ))
+        .expect("an ACL in default");
+    assert_eq!(made, object(IncusKind::Acl, "default", None, "a1"));
+    let acl = read(&fake, "/1.0/network-acls/a1?project=default");
+    assert_eq!(acl["config"][MARK], json!("toy"), "{acl}");
+    assert_eq!(
+        provider.plan(
+            &entry("other"),
+            &patch(made.clone(), &[("user.note", Some("x"))])
+        ),
+        Err(EffectRefusal::NotOwned(OwnerClass::Kernel {
+            entry: entry("toy")
+        })),
+        "another entry may not change it"
+    );
+    assert_eq!(
+        provider.retire(&entry("toy"), &made, &Digest::of(b"approved")),
+        Ok(Retirement::Deleted(made.clone()))
+    );
+    assert!(
+        UnixIncus::new(fake.socket().to_path_buf())
+            .get("/1.0/network-acls/a1?project=default")
+            .is_err(),
+        "the ACL is gone"
+    );
+}
+
+#[test]
+fn an_acl_an_earlier_kernel_named_in_its_kernel_project_is_read_and_retired_in_default() {
+    // An earlier kernel sent an ACL to its kernel project, and Incus made it in default, since the project does not enable
+    // networks. Its journal record names the kernel project. The provider reads and retires that ACL in default.
+    let (scratch, fake) = start("acl-earlier");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let mut manifest = manifest();
+    manifest.projects.push("default".into());
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    {
+        let mut ctx = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1);
+        ctx.effect(create(
+            IncusKind::Project,
+            "kfam",
+            None,
+            "kfam",
+            json!({"config": {}}),
+        ))
+        .expect("a kernel project, without networks");
+        ctx.effect(create(
+            IncusKind::Acl,
+            "default",
+            None,
+            "a-old",
+            json!({"config": {}}),
+        ))
+        .expect("the ACL, held in default");
+    }
+    let earlier = object(IncusKind::Acl, "kfam", None, "a-old");
+    assert_eq!(
+        provider.read_back(&entry("toy"), &earlier, None),
+        Ok(ReadBack::Present {
+            object: earlier.clone(),
+            owned: true,
+            holds_pre_image: false,
+        }),
+        "the record's ACL is read in default, and named as the record names it"
+    );
+    let plan = Digest::of(b"the create's own digest");
+    assert_eq!(
+        provider.retire(&entry("toy"), &earlier, &plan),
+        Ok(Retirement::Deleted(object(
+            IncusKind::Acl,
+            "default",
+            None,
+            "a-old"
+        )))
+    );
+    assert!(
+        UnixIncus::new(fake.socket().to_path_buf())
+            .get("/1.0/network-acls/a-old?project=default")
+            .is_err(),
+        "the ACL is gone from default"
+    );
+
+    // A project that enables networks keeps its own ACLs, so a record naming one keeps its address, and the family refuses it.
+    let before = writes(&fake).len();
+    assert_eq!(
+        provider.retire(
+            &entry("toy"),
+            &object(IncusKind::Acl, "svc", None, "a-old"),
+            &plan
+        ),
+        Err(EffectRefusal::ProjectNotAllowed)
+    );
+    assert_eq!(writes(&fake).len(), before, "nothing was written");
 }

@@ -254,3 +254,22 @@ fn the_mark_keys_and_droidd_prefixes_are_the_decided_ones() {
         ["user.droid.", "user.tactu.", "user.arca."]
     );
 }
+
+#[test]
+fn only_an_instance_has_a_uuid() {
+    // Incus 7.3 gives an instance a `volatile.uuid` and gives a custom volume none, so every kind but the instance is named by
+    // its kind, project, parent and name.
+    for kind in [
+        IncusKind::Project,
+        IncusKind::Network,
+        IncusKind::Acl,
+        IncusKind::Profile,
+        IncusKind::Volume,
+        IncusKind::Zone,
+        IncusKind::Forward,
+        IncusKind::Bucket,
+    ] {
+        assert!(!kind.has_uuid(), "{kind:?} has no uuid");
+    }
+    assert!(IncusKind::Instance.has_uuid());
+}

@@ -42,7 +42,7 @@ fn pe_id() -> EntryId {
 fn acl(name: &str) -> ObjectRef {
     ObjectRef {
         kind: IncusKind::Acl,
-        project: PROJECT.to_string(),
+        project: ACL_HOME.to_string(),
         parent: None,
         name: name.to_string(),
         uuid: None,
@@ -82,7 +82,7 @@ impl Plugin for Patcher {
                 (IncusKind::Acl, EffectClass::A),
                 (IncusKind::Instance, EffectClass::B),
             ],
-            projects: vec![PROJECT.to_string()],
+            projects: vec![PROJECT.to_string(), ACL_HOME.to_string()],
             observes: false,
         }
     }
@@ -92,7 +92,7 @@ impl Plugin for Patcher {
         let box_name = format!("p-box-{}", cfg.tag);
         let acl_made = ctx.effect(EffectOp::IncusCreate {
             kind: IncusKind::Acl,
-            project: PROJECT.to_string(),
+            project: ACL_HOME.to_string(),
             parent: None,
             name: acl_name.clone(),
             body: json!({ "name": acl_name, "config": {} }),
@@ -989,7 +989,7 @@ fn a_delete_intent_over_another_entrys_object_is_drift_and_no_delete_is_sent() {
     let (status, _) = raw(
         &fake,
         "POST",
-        "/1.0/network-acls?project=arcak-scratch-toy",
+        "/1.0/network-acls?project=default",
         Some(
             &json!({ "name": "toy-acl-t1", "config": { "user.arcakernel.entry": "other-entry" } }),
         ),
@@ -1028,7 +1028,7 @@ fn a_create_whose_name_holds_a_foreign_object_is_not_adopted_and_no_delete_is_se
     let (status, _) = raw(
         &fake,
         "POST",
-        "/1.0/network-acls?project=arcak-scratch-toy",
+        "/1.0/network-acls?project=default",
         Some(&json!({ "name": "toy-acl-t1", "config": {} })),
     );
     assert_eq!(status, 201, "a foreign ACL is in place");
@@ -1070,7 +1070,7 @@ fn a_patch_whose_object_is_foreign_fails_without_an_inverse() {
     let (status, _) = raw(
         &fake,
         "POST",
-        "/1.0/network-acls?project=arcak-scratch-toy",
+        "/1.0/network-acls?project=default",
         Some(&json!({ "name": "toy-acl-t1", "config": {} })),
     );
     assert_eq!(status, 201, "a foreign ACL is in place");
@@ -1265,14 +1265,14 @@ fn no_effect_is_sent_before_the_resolution_returns() {
     let (status, _) = raw(
         &fake,
         "POST",
-        "/1.0/network-acls?project=arcak-scratch-toy",
+        "/1.0/network-acls?project=default",
         Some(&json!({ "name": "toy-acl-t2", "config": { "user.arcakernel.entry": TOY } })),
     );
     assert_eq!(status, 201);
     let (status, _) = raw(
         &fake,
         "POST",
-        "/1.0/network-acls?project=arcak-scratch-toy",
+        "/1.0/network-acls?project=default",
         Some(
             &json!({ "name": "toy-acl-t3", "config": { "user.arcakernel.entry": TOY, "user.k": "x" } }),
         ),

@@ -17,7 +17,7 @@ use arca_kernel::ownership::{IncusKind, ObjectRef};
 use arca_kernel::plugin::{
     EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
 };
-use arca_providers::incus::{Family, IncusProvider, RetainedSet};
+use arca_providers::incus::{Family, IMAGE_PROTOCOL, IMAGE_SERVER, IncusProvider, RetainedSet};
 use arca_reconcile::probe::{
     DEFAULT_PROBE_IMAGE, PROBE_BRIDGE, PROBE_PLUGIN, ProbeOutcome, ProbeSpec,
 };
@@ -343,6 +343,14 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
         .expect("the probe completes after the restart");
     assert_agree(&fake, &reconciler, &targets);
     assert_eq!(live_places(&reconciler).len(), CREATES);
+    assert_eq!(
+        fake.images()
+            .iter()
+            .map(|(project, _)| project.as_str())
+            .collect::<Vec<_>>(),
+        vec![PROJECT],
+        "the instance's image was pulled into the probe project's own store"
+    );
 
     // Removal goes through the journalled retirement: class-A objects revert at once and class-B objects run under an approval.
     let key = SkKey::from_seed(7);
@@ -370,6 +378,11 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
             target.name
         );
     }
+    assert!(
+        fake.images().is_empty(),
+        "the project's image went with it: {:?}",
+        fake.images()
+    );
     assert!(
         reconciler
             .journal()
@@ -414,7 +427,8 @@ fn the_probe_instance_has_an_image_source_a_root_disk_and_a_nic_on_the_probe_bri
     let instance = body_of(&spec, IncusKind::Instance);
     assert_eq!(
         instance["source"],
-        json!({"type": "image", "alias": DEFAULT_PROBE_IMAGE})
+        json!({"type": "image", "alias": DEFAULT_PROBE_IMAGE, "server": IMAGE_SERVER, "protocol": IMAGE_PROTOCOL}),
+        "the image is pulled from the image server into the project's own store, with no copy by hand"
     );
     assert_eq!(
         instance["devices"]["root"],
@@ -458,6 +472,14 @@ fn the_probe_instance_has_an_image_source_a_root_disk_and_a_nic_on_the_probe_bri
         body_of(&spec, IncusKind::Project)["config"]["restricted.networks.access"],
         json!(PROBE_BRIDGE),
         "the project grants its instances the bridge"
+    );
+    let acl = targets
+        .iter()
+        .find(|target| target.kind == IncusKind::Acl)
+        .expect("the spec makes an ACL");
+    assert_eq!(
+        acl.project, "default",
+        "the ACL is addressed in default, where Incus keeps it"
     );
 }
 
@@ -560,4 +582,178 @@ fn a_kind_on_a_failed_dependency_is_not_attempted_and_names_what_it_needs() {
             target.name
         );
     }
+}
+
+/// A journal an earlier kernel wrote during a probe, before a custom volume was known to have no uuid. Its names are the test
+/// spec's. Its creates are the bridge and the project (applied), the instance (failed: its image was not in the project's
+/// store), the ACL (sent to the kernel project, which Incus served from `default`) and the profile (applied), and the volume,
+/// whose intent has no outcome: the volume landed and carries the mark, but the earlier kernel refused an answer without a uuid.
+const EARLIER_JOURNAL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/journal-volume-without-uuid.jsonl"
+);
+
+/// Copies the earlier journal to `path`, with the mode a journal file has.
+fn earlier_journal_at(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::copy(EARLIER_JOURNAL, path).expect("the fixture is copied");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("mode 0600");
+}
+
+/// Makes on the fake what the earlier probe left on the host: each object it made, carrying the probe's mark. The ACL is sent
+/// to the kernel project, as the earlier kernel sent it.
+fn seed_earlier_objects(fake: &arca_incus::FakeIncus) {
+    let mark = json!(ENTRY);
+    let made = [
+        (
+            "/1.0/networks?project=default".to_string(),
+            json!({"name": PROBE_BRIDGE, "type": "bridge", "config": {
+                "ipv4.address": "203.0.113.1/24", "ipv6.address": "none", MARK: mark}}),
+        ),
+        (
+            "/1.0/projects".to_string(),
+            json!({"name": PROJECT, "config": {
+                MARK: mark, "restricted": "true", "restricted.networks.access": PROBE_BRIDGE,
+                "features.images": "true", "features.networks.zones": "true", "features.profiles": "true",
+                "features.storage.volumes": "true", "features.storage.buckets": "true"}}),
+        ),
+        (
+            format!("/1.0/network-acls?project={PROJECT}"),
+            json!({"name": "probe-acl", "config": {MARK: mark}}),
+        ),
+        (
+            format!("/1.0/profiles?project={PROJECT}"),
+            json!({"name": "probe-profile", "config": {MARK: mark}}),
+        ),
+        (
+            format!("/1.0/storage-pools/default/volumes/custom?project={PROJECT}"),
+            json!({"name": "probe-volume", "config": {MARK: mark}}),
+        ),
+    ];
+    for (path, body) in made {
+        let (status, _) = raw(fake, "POST", &path, Some(&body));
+        assert!((200..300).contains(&status), "{path}: {status}");
+    }
+}
+
+#[test]
+fn the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name() {
+    let scratch = Scratch::new("probe-earlier-open");
+    let fake = start_fake(&scratch);
+    seed_earlier_objects(&fake);
+    let journal = scratch.path("journal.jsonl");
+    earlier_journal_at(&journal);
+
+    let reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    let volume = ObjectRef {
+        kind: IncusKind::Volume,
+        project: PROJECT.to_string(),
+        parent: Some("default".to_string()),
+        name: "probe-volume".to_string(),
+        uuid: None,
+    };
+    assert_eq!(
+        reconciler.resolution().adopted,
+        vec![volume.clone()],
+        "the volume is adopted by its pool and name"
+    );
+    let record = reconciler
+        .journal()
+        .live(&EntryId(ENTRY.to_string()))
+        .into_iter()
+        .find(|record| record.target.kind == IncusKind::Volume)
+        .expect("the volume's record is live");
+    assert_eq!(
+        record.inverse,
+        Some(Inverse::IncusDelete { object: volume })
+    );
+}
+
+#[test]
+fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_then_runs() {
+    let scratch = Scratch::new("probe-earlier-remove");
+    let fake = start_fake(&scratch);
+    seed_earlier_objects(&fake);
+    // The image copied by hand into the project's own store, after the instance's create was refused.
+    fake.add_image(PROJECT, DEFAULT_PROBE_IMAGE);
+    assert!(
+        get(&fake, "/1.0/network-acls/probe-acl?project=default").is_some(),
+        "the ACL sent to the kernel project is held in default"
+    );
+    let journal = scratch.path("journal.jsonl");
+    earlier_journal_at(&journal);
+    let mut reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    let spec = spec();
+    let key = SkKey::from_seed(7);
+    let mut verifier: ApprovalVerifier<SshSigVerifier, FileNonces> =
+        verifier_for(&scratch, &key, "probe");
+
+    let run = reconciler
+        .probe_remove(
+            &spec,
+            NOW,
+            |plan: &Digest| approval_for_plan(&key, plan, 1),
+            &mut verifier,
+        )
+        .expect("the earlier probe is removed under its approval");
+    assert!(!run.partial, "every class-B object is deleted: {run:?}");
+    assert_eq!(
+        run.deleted.len(),
+        3,
+        "the volume, the project and the bridge"
+    );
+    for path in [
+        "/1.0/networks/probe-net?project=default".to_string(),
+        "/1.0/network-acls/probe-acl?project=default".to_string(),
+        format!("/1.0/projects/{PROJECT}"),
+        format!("/1.0/profiles/probe-profile?project={PROJECT}"),
+        format!("/1.0/storage-pools/default/volumes/custom/probe-volume?project={PROJECT}"),
+    ] {
+        assert!(get(&fake, &path).is_none(), "{path} is gone");
+    }
+    assert!(
+        fake.images().is_empty(),
+        "the image inside the project went with it: {:?}",
+        fake.images()
+    );
+    assert!(
+        reconciler
+            .journal()
+            .live(&EntryId(ENTRY.to_string()))
+            .is_empty(),
+        "the journal holds nothing live"
+    );
+
+    // A fresh probe of every kind then runs on the same journal, and its removal leaves nothing.
+    let rows = reconciler
+        .probe_create(&spec, NOW)
+        .expect("the fresh probe runs");
+    assert!(
+        rows.iter().all(|row| row.outcome == ProbeOutcome::Created),
+        "{rows:?}"
+    );
+    let run = reconciler
+        .probe_remove(
+            &spec,
+            NOW,
+            |plan: &Digest| approval_for_plan(&key, plan, 2),
+            &mut verifier,
+        )
+        .expect("the fresh probe is removed under its approval");
+    assert!(!run.partial, "{run:?}");
+    for target in spec.targets() {
+        assert!(
+            !present(&fake, &target),
+            "{:?} {} is gone",
+            target.kind,
+            target.name
+        );
+    }
+    assert!(fake.images().is_empty(), "{:?}", fake.images());
+    assert!(
+        reconciler
+            .journal()
+            .live(&EntryId(ENTRY.to_string()))
+            .is_empty()
+    );
 }

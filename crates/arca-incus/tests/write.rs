@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arca_incus::write::{IMAGE_PROTOCOL, IMAGE_SERVER};
 use arca_incus::{
     FakeIncus, FakeState, IncusError, IncusRead, Owned, ProjectFamily, Reading, Target,
     Unconfirmed, UnixIncus, UnixIncusWriter,
@@ -99,9 +100,10 @@ fn project_target(name: &str) -> Target {
     target(IncusKind::Project, name, name, None)
 }
 
-/// Whether Incus gives an object of this kind a uuid: instances and volumes do, through their `volatile.uuid` key.
+/// Whether Incus gives an object of this kind a uuid: only an instance does, through its `volatile.uuid` key. Incus 7.3 gives a
+/// custom volume none.
 fn has_uuid(kind: IncusKind) -> bool {
-    matches!(kind, IncusKind::Instance | IncusKind::Volume)
+    matches!(kind, IncusKind::Instance)
 }
 
 /// A create body that marks the object as the entry `toy`.
@@ -419,7 +421,7 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     for (kind, name, parent) in cases {
         let project = match kind {
             IncusKind::Project => name,
-            IncusKind::Network | IncusKind::Forward => "default",
+            IncusKind::Network | IncusKind::Forward | IncusKind::Acl => "default",
             _ => "svc",
         };
         let target = target(kind, project, name, parent);
@@ -430,12 +432,11 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
             has_uuid(kind),
             "{kind:?} has a uuid exactly when Incus gives one"
         );
-        if has_uuid(kind) {
-            assert!(
-                created.config().contains_key("volatile.uuid"),
-                "{kind:?} carries volatile.uuid"
-            );
-        }
+        assert_eq!(
+            created.config().contains_key("volatile.uuid"),
+            has_uuid(kind),
+            "{kind:?} carries volatile.uuid exactly when Incus gives one"
+        );
 
         let set = writer
             .patch(&created, &changes(&[("user.note", Some("first"))]))
@@ -675,7 +676,6 @@ fn a_non_network_create_in_default_is_refused_before_any_request_at_the_writer()
     let before = write_count(&fake);
     for (kind, parent, name) in [
         (IncusKind::Instance, None, "kd1"),
-        (IncusKind::Acl, None, "kd2"),
         (IncusKind::Profile, None, "kd3"),
         (IncusKind::Zone, None, "kd4"),
         (IncusKind::Volume, Some("default"), "kd5"),
@@ -784,14 +784,17 @@ fn the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_proj
 }
 
 #[test]
-fn networks_and_forwards_are_addressed_in_default_and_no_other_kind_is() {
+fn networks_forwards_and_acls_are_addressed_in_default_and_no_other_kind_is() {
     let family = ProjectFamily::new(["svc"], ["droid"]).expect("a family");
     assert!(family.allows(IncusKind::Network, "default"));
     assert!(family.allows(IncusKind::Forward, "default"));
+    assert!(
+        family.allows(IncusKind::Acl, "default"),
+        "Incus 7.3 keeps the ACLs of a project without networks in default"
+    );
     for kind in [
         IncusKind::Project,
         IncusKind::Instance,
-        IncusKind::Acl,
         IncusKind::Profile,
         IncusKind::Zone,
         IncusKind::Volume,
@@ -802,16 +805,74 @@ fn networks_and_forwards_are_addressed_in_default_and_no_other_kind_is() {
             "{kind:?} is not addressed in default"
         );
     }
-    assert!(
-        !family.allows(IncusKind::Network, "svc"),
-        "a network is not addressed in a kernel project"
+    for kind in [IncusKind::Network, IncusKind::Forward, IncusKind::Acl] {
+        assert!(
+            !family.allows(kind, "svc"),
+            "{kind:?} is not addressed in a kernel project"
+        );
+        assert!(!family.allows(kind, "bench"));
+        assert!(!family.allows(kind, "droid"));
+    }
+}
+
+#[test]
+fn an_acl_sent_to_a_project_without_the_networks_key_lands_in_default() {
+    // Incus 7.3 keeps the ACLs of a project that does not enable networks in the default project: a create sent to the project
+    // lands there, and a read sent to the project is answered from there. The fake does the same.
+    let (_dir, fake) = start("acl-routing");
+    let body = json!({"name": "a1", "config": {}}).to_string();
+    let created = raw(
+        fake.socket(),
+        &format!(
+            "POST /1.0/network-acls?project=svc HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
     );
-    assert!(
-        !family.allows(IncusKind::Forward, "svc"),
-        "a forward is not addressed in a kernel project"
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    let client = UnixIncus::new(fake.socket().to_path_buf());
+    let home = client
+        .get("/1.0/network-acls/a1?project=default")
+        .expect("the ACL is held in default");
+    assert_eq!(home["project"], json!("default"), "{home}");
+    let routed = client
+        .get("/1.0/network-acls/a1?project=svc")
+        .expect("the project's read is answered from default");
+    assert_eq!(routed["project"], json!("default"), "{routed}");
+}
+
+#[test]
+fn an_acl_is_created_marked_in_default_and_refused_in_a_kernel_project_before_any_request() {
+    let (_dir, fake) = start("acl-home");
+    let writer = writer(&fake, "toy");
+    let requests = fake.requests().len();
+    let refused = writer
+        .create(&target(IncusKind::Acl, "svc", "a2", None), &marked())
+        .expect_err("an ACL is not addressed in a kernel project");
+    assert!(matches!(refused, IncusError::Refused(_)), "{refused:?}");
+    assert_eq!(fake.requests().len(), requests, "not even a read was sent");
+
+    let made = writer
+        .create(&target(IncusKind::Acl, "default", "a2", None), &marked())
+        .expect("an ACL in default, marked");
+    assert_eq!(made.entry(), &EntryId("toy".to_string()));
+    assert_eq!(
+        fake.writes()
+            .last()
+            .map(|w| (w.method.clone(), w.path.clone())),
+        Some((
+            "POST".to_string(),
+            "/1.0/network-acls?project=default".to_string()
+        ))
     );
-    assert!(!family.allows(IncusKind::Network, "bench"));
-    assert!(!family.allows(IncusKind::Network, "droid"));
+    // Every later write reads the ACL first and needs the entry's mark, as a bridge's does.
+    let read = UnixIncusWriter::new(
+        fake.socket().to_path_buf(),
+        EntryId("other".to_string()),
+        BTreeMap::new(),
+        family(),
+    )
+    .read_owned(&target(IncusKind::Acl, "default", "a2", None));
+    assert!(matches!(read, Err(IncusError::Refused(_))), "{read:?}");
 }
 
 #[test]
@@ -914,6 +975,151 @@ fn a_create_takes_only_an_image_source_and_sends_nothing_else() {
         .create(&target(IncusKind::Instance, "svc", "img1", None), &body)
         .expect("an image source is sent");
     assert_eq!(write_count(&fake), before + 1);
+}
+
+#[test]
+fn a_create_may_name_the_one_image_server_and_no_other() {
+    // An instance may be made from an image on the public image server Incus ships as its `images:` remote, over simplestreams.
+    // Any other server, any other protocol, and one without the other are refused before any request.
+    let (_dir, fake) = start("image-server");
+    let writer = writer(&fake, "toy");
+    let before = write_count(&fake);
+    let requests = fake.requests().len();
+    let refused_sources = [
+        json!({"type": "image", "alias": "alpine/edge", "server": "https://images.example.org", "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": format!("{IMAGE_SERVER}/"), "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER.to_uppercase(), "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": "incus"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER}),
+        json!({"type": "image", "alias": "alpine/edge", "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": "simplestreams", "secret": "x"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": "simplestreams", "certificate": "x"}),
+    ];
+    for (n, source) in refused_sources.into_iter().enumerate() {
+        let mut body = marked();
+        body["source"] = source.clone();
+        let refused = writer
+            .create(
+                &target(IncusKind::Instance, "svc", &format!("srv{n}"), None),
+                &body,
+            )
+            .expect_err("a source that names another server");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{source}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        write_count(&fake),
+        before,
+        "no refused source reached the fake"
+    );
+    assert_eq!(fake.requests().len(), requests, "not even a read was sent");
+
+    let mut body = marked();
+    body["source"] = json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": IMAGE_PROTOCOL});
+    writer
+        .create(&target(IncusKind::Instance, "svc", "srv-ok", None), &body)
+        .expect("an image on the image server is sent");
+    assert_eq!(write_count(&fake), before + 1);
+    assert_eq!(IMAGE_PROTOCOL, "simplestreams");
+}
+
+#[test]
+fn an_instance_from_the_image_server_pulls_its_image_into_the_store_its_project_reads() {
+    // Incus pulls the image into the project's own store when the project sets `features.images`, and into the default project's
+    // store otherwise. The fake does the same, so a kernel project, which sets it, holds the image it pulled.
+    let (_dir, fake) = start("image-pull");
+    let writer = writer(&fake, "toy");
+    writer
+        .create(
+            &project_target("kproj1"),
+            &json!({"config": {MARK: "toy", "features.images": "true"}}),
+        )
+        .expect("a project with its own image store");
+    let mut body = marked();
+    body["source"] = json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": IMAGE_PROTOCOL});
+    writer
+        .create(&target(IncusKind::Instance, "kproj1", "pull1", None), &body)
+        .expect("the instance is made");
+    let images = fake.images();
+    assert_eq!(images.len(), 1, "{images:?}");
+    assert_eq!(
+        images[0].0, "kproj1",
+        "the image is in the project's own store"
+    );
+}
+
+#[test]
+fn a_retiring_project_deletes_the_images_in_its_own_store_and_then_itself() {
+    // An image inside a kernel project's own store is the project's by containment: it carries no mark, and only the project's
+    // retirement removes it, after the tombstone and before the project's own delete. An image in another store is not touched.
+    let (_dir, fake) = start("project-images");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kproj1");
+    let owned = writer
+        .create(
+            &project,
+            &json!({"config": {MARK: "toy", "features.images": "true"}}),
+        )
+        .expect("a project with its own image store");
+    let inside = fake.add_image("kproj1", "alpine/edge");
+    let elsewhere = fake.add_image("default", "alpine/edge");
+    let early = writer
+        .delete(&owned)
+        .expect_err("no image is deleted before the tombstone");
+    assert!(matches!(early, IncusError::Refused(_)), "{early:?}");
+    assert_eq!(fake.images().len(), 2, "nothing was deleted");
+
+    let retiring = writer.tombstone(&owned, &plan()).expect("tombstone");
+    writer
+        .delete(&retiring)
+        .expect("the project and its image are deleted");
+    assert_eq!(
+        status_of(&writer.get_etag(&project).expect_err("gone")),
+        Some(404)
+    );
+    assert_eq!(
+        fake.images(),
+        vec![("default".to_string(), elsewhere)],
+        "only the project's own image was deleted"
+    );
+    let deletes: Vec<String> = fake
+        .writes()
+        .into_iter()
+        .filter(|w| w.method == "DELETE")
+        .map(|w| w.path)
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![
+            format!("/1.0/images/{inside}?project=kproj1"),
+            "/1.0/projects/kproj1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_project_that_reads_the_default_image_store_deletes_no_image() {
+    // A project without `features.images` has no store of its own: every image it lists is the default project's, so its
+    // retirement lists none and deletes none.
+    let (_dir, fake) = start("project-shared-images");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kcan");
+    let owned = writer
+        .create(&project, &marked())
+        .expect("a project that reads the default store");
+    let shared = fake.add_image("default", "alpine/edge");
+    let retiring = writer.tombstone(&owned, &plan()).expect("tombstone");
+    writer.delete(&retiring).expect("the project is deleted");
+    assert_eq!(fake.images(), vec![("default".to_string(), shared)]);
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|r| !r.path.starts_with("/1.0/images")),
+        "no image was listed or deleted: {:?}",
+        fake.requests()
+    );
 }
 
 #[test]
@@ -1681,7 +1887,8 @@ fn the_ownership_document_carries_no_plan_cross_reference() {
 
 #[test]
 fn a_landed_write_names_its_full_target_and_the_uuid_it_read_back() {
-    // A volume is named by its pool, so the unconfirmed error must carry the pool and the uuid the read-back showed.
+    // A volume is named by its pool, so the unconfirmed error must carry the pool. A volume has no uuid, so a `volatile.uuid` a
+    // read-back shows is not taken as one.
     let mut posted = false;
     let canned = Canned::start("unconfirmed-volume", move |method, target| {
         if method == "POST" {
@@ -1701,12 +1908,36 @@ fn a_landed_write_names_its_full_target_and_the_uuid_it_read_back() {
     match canned.writer().create(&wanted, &marked()) {
         Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
             assert_eq!(unconfirmed.target, wanted, "the full target, pool included");
+            assert_eq!(unconfirmed.uuid, None, "a volume carries no uuid");
+            assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
+        }
+        other => panic!("expected AppliedUnconfirmed: {other:?}"),
+    }
+    // An instance has one, so the error carries the uuid the read-back showed.
+    let mut posted = false;
+    let canned = Canned::start("unconfirmed-instance", move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return sync_reply(201, Value::Null);
+        }
+        if method == "GET" && target.starts_with("/1.0/instances/cn9") {
+            return if posted {
+                object_reply(&instance("cn9", json!({"volatile.uuid": OTHER_UUID})))
+            } else {
+                not_found()
+            };
+        }
+        not_found()
+    });
+    let wanted = target(IncusKind::Instance, "svc", "cn9", None);
+    match canned.writer().create(&wanted, &marked()) {
+        Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
+            assert_eq!(unconfirmed.target, wanted);
             assert_eq!(
                 unconfirmed.uuid.as_deref(),
                 Some(OTHER_UUID),
                 "the uuid read back"
             );
-            assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
         }
         other => panic!("expected AppliedUnconfirmed: {other:?}"),
     }
