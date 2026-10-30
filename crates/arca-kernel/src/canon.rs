@@ -1,9 +1,13 @@
 //! Canonical JSON and digests. Desired state and approval statements are signed over these bytes, so they must be the bytes
-//! droidd's `canonicalJson` and `paramsDigest` produce (`packages/droidd/src/owner-plugins/owner-approvals.ts`).
+//! droidd's `canonicalJson` and `paramsDigest` produce.
 //!
 //! The canonical form is what `JSON.stringify` writes for a value whose object keys are sorted by UTF-16 code unit, with no
 //! whitespace. A number is a double, as it is in JavaScript, so it is written the way ECMAScript's `Number::toString` writes
 //! it. An integer above 2^53 therefore rounds to the double that droidd would hold.
+//!
+//! Non-finite numbers: JSON has no NaN or infinity, and serde_json cannot hold one either. `serde_json::to_value(f64::NAN)`
+//! yields `Value::Null`, not an error, so a NaN field converted by serde reaches this module as `null`. `finite_text` refuses a
+//! non-finite double with `CanonError::NotFinite`. No `Value` can reach that refusal, so the tests exercise it directly.
 
 use std::fmt;
 
@@ -174,11 +178,16 @@ fn write_string(s: &str, out: &mut String) {
 
 /// A number as JavaScript's `JSON.stringify` writes it: the double the number holds.
 fn number_text(n: &Number) -> Result<String, CanonError> {
-    let x = n
-        .as_f64()
-        .filter(|x| x.is_finite())
-        .ok_or(CanonError::NotFinite)?;
-    Ok(ecma_number(x))
+    finite_text(n.as_f64().ok_or(CanonError::NotFinite)?)
+}
+
+/// A double as JavaScript's `JSON.stringify` writes it. NaN and the infinities have no JSON text, so they are `NotFinite`.
+fn finite_text(x: f64) -> Result<String, CanonError> {
+    if x.is_finite() {
+        Ok(ecma_number(x))
+    } else {
+        Err(CanonError::NotFinite)
+    }
 }
 
 /// ECMAScript's `Number::toString` for a finite double: the shortest digits that read back as the same double, placed the
@@ -400,11 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn a_non_finite_number_cannot_be_a_value() {
-        // serde_json refuses to hold one, so `NotFinite` is a guard, not a path a caller can reach.
-        assert!(Number::from_f64(f64::NAN).is_none());
-        assert!(Number::from_f64(f64::INFINITY).is_none());
-        assert!(Number::from_f64(f64::NEG_INFINITY).is_none());
+    fn a_non_finite_double_has_no_canonical_text() {
+        // JSON cannot write NaN or an infinity, so `finite_text` refuses each one instead of writing `null`.
+        assert_eq!(finite_text(f64::NAN), Err(CanonError::NotFinite));
+        assert_eq!(finite_text(f64::INFINITY), Err(CanonError::NotFinite));
+        assert_eq!(finite_text(f64::NEG_INFINITY), Err(CanonError::NotFinite));
+        assert_eq!(finite_text(1.5), Ok("1.5".to_string()));
     }
 
     #[test]

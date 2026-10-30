@@ -1,5 +1,5 @@
-//! The Rust side reads droidd's approval vectors, which the droid monorepo's `arca vectors` suite generated from droidd's own
-//! `paramsDigest` and `parseOwnerStatement` (Group 1). The fixture is a byte-for-byte copy of that file.
+//! The Rust side reads droidd's approval vectors, which the reference implementation's vector suite generated from droidd's
+//! own `paramsDigest` and `parseOwnerStatement`. The fixture is a byte-for-byte copy of that file.
 
 use arca_kernel::canon::{Digest, canonical_json, params_digest};
 use serde_json::Value;

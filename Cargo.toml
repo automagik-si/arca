@@ -8,7 +8,7 @@ license = "Apache-2.0"
 repository = "https://github.com/weunfold/arca"
 
 # Every external version is an exact pin, written once here. A crate takes one with `.workspace = true`.
-# The pins read from this host's cargo cache or from the crates.io index on 2026-10-30 (Decision 4 of the arca-core wish).
+# The pins read from this host's cargo cache or from the crates.io index on 2026-10-30.
 # The workspace crates are listed now so that no later group edits this file. Cargo ignores an entry no member uses, so
 # the entries for crates that do not exist yet resolve nothing.
 [workspace.dependencies]
