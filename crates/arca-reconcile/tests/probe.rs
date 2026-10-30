@@ -459,6 +459,14 @@ fn the_probe_instance_has_an_image_source_a_root_disk_and_a_nic_on_the_probe_bri
         json!(PROBE_BRIDGE),
         "the project grants its instances the bridge"
     );
+    let acl = targets
+        .iter()
+        .find(|target| target.kind == IncusKind::Acl)
+        .expect("the spec makes an ACL");
+    assert_eq!(
+        acl.project, "default",
+        "the ACL is addressed in default, where Incus keeps it"
+    );
 }
 
 /// The outcome the probe recorded for `kind`.
@@ -644,5 +652,86 @@ fn the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name() {
     assert_eq!(
         record.inverse,
         Some(Inverse::IncusDelete { object: volume })
+    );
+}
+
+#[test]
+fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_then_runs() {
+    let scratch = Scratch::new("probe-earlier-remove");
+    let fake = start_fake(&scratch);
+    seed_earlier_objects(&fake);
+    assert!(
+        get(&fake, "/1.0/network-acls/probe-acl?project=default").is_some(),
+        "the ACL sent to the kernel project is held in default"
+    );
+    let journal = scratch.path("journal.jsonl");
+    earlier_journal_at(&journal);
+    let mut reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    let spec = spec();
+    let key = SkKey::from_seed(7);
+    let mut verifier: ApprovalVerifier<SshSigVerifier, FileNonces> =
+        verifier_for(&scratch, &key, "probe");
+
+    let run = reconciler
+        .probe_remove(
+            &spec,
+            NOW,
+            |plan: &Digest| approval_for_plan(&key, plan, 1),
+            &mut verifier,
+        )
+        .expect("the earlier probe is removed under its approval");
+    assert!(!run.partial, "every class-B object is deleted: {run:?}");
+    assert_eq!(
+        run.deleted.len(),
+        3,
+        "the volume, the project and the bridge"
+    );
+    for path in [
+        "/1.0/networks/probe-net?project=default".to_string(),
+        "/1.0/network-acls/probe-acl?project=default".to_string(),
+        format!("/1.0/projects/{PROJECT}"),
+        format!("/1.0/profiles/probe-profile?project={PROJECT}"),
+        format!("/1.0/storage-pools/default/volumes/custom/probe-volume?project={PROJECT}"),
+    ] {
+        assert!(get(&fake, &path).is_none(), "{path} is gone");
+    }
+    assert!(
+        reconciler
+            .journal()
+            .live(&EntryId(ENTRY.to_string()))
+            .is_empty(),
+        "the journal holds nothing live"
+    );
+
+    // A fresh probe of every kind then runs on the same journal, and its removal leaves nothing.
+    let rows = reconciler
+        .probe_create(&spec, NOW)
+        .expect("the fresh probe runs");
+    assert!(
+        rows.iter().all(|row| row.outcome == ProbeOutcome::Created),
+        "{rows:?}"
+    );
+    let run = reconciler
+        .probe_remove(
+            &spec,
+            NOW,
+            |plan: &Digest| approval_for_plan(&key, plan, 2),
+            &mut verifier,
+        )
+        .expect("the fresh probe is removed under its approval");
+    assert!(!run.partial, "{run:?}");
+    for target in spec.targets() {
+        assert!(
+            !present(&fake, &target),
+            "{:?} {} is gone",
+            target.kind,
+            target.name
+        );
+    }
+    assert!(
+        reconciler
+            .journal()
+            .live(&EntryId(ENTRY.to_string()))
+            .is_empty()
     );
 }

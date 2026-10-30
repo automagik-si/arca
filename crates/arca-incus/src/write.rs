@@ -41,13 +41,17 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_PAUSE: Duration = Duration::from_millis(100);
 /// Projects the writer never changes, whatever the family names.
 const RESERVED_PROJECTS: [&str; 2] = ["bench", "default"];
-/// The project a network and a forward are addressed in. Incus holds the kernel's bridges here, and a forward hangs off its
-/// network. The writer sends no other kind here.
+/// The project a network, a forward and an ACL are addressed in. Incus holds the kernel's bridges here, a forward hangs off its
+/// network, and Incus 7.3 keeps the ACLs of a project that does not enable networks here too. The writer sends no other kind here.
 pub const NETWORK_HOME: &str = "default";
 
-/// Whether a kind is addressed in [`NETWORK_HOME`]: a network, and a forward, which is made under its network.
+/// Whether a kind is addressed in [`NETWORK_HOME`]: a network; a forward, which is made under its network; and an ACL, which
+/// Incus keeps in the default project for a kernel project, since a kernel project does not enable networks.
 pub fn network_home(kind: IncusKind) -> bool {
-    matches!(kind, IncusKind::Network | IncusKind::Forward)
+    matches!(
+        kind,
+        IncusKind::Network | IncusKind::Forward | IncusKind::Acl
+    )
 }
 
 /// An object the writer read and classed as its entry's own. Its fields are private, and only [`UnixIncusWriter`] makes one,
@@ -135,8 +139,8 @@ impl ProjectFamily {
         Ok(Self { projects })
     }
 
-    /// Whether a write of `kind` may name the project. A network and a forward are addressed in [`NETWORK_HOME`] and nowhere
-    /// else. Every other kind is addressed in a project the configuration lists. Whether the object is the entry's own is
+    /// Whether a write of `kind` may name the project. A network, a forward and an ACL are addressed in [`NETWORK_HOME`] and
+    /// nowhere else. Every other kind is addressed in a project the configuration lists. Whether the object is the entry's own is
     /// checked on each read and write, not here.
     pub fn allows(&self, kind: IncusKind, project: &str) -> bool {
         if network_home(kind) {

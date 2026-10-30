@@ -33,11 +33,12 @@ use arca_kernel::plugin::{
 };
 use serde_json::{Map, Value, json};
 
-/// The project a network and a forward are addressed in. The kernel's bridges live here, and a forward hangs off its network.
+/// The project a network, a forward and an ACL are addressed in. The kernel's bridges live here, a forward hangs off its network,
+/// and Incus 7.3 keeps a kernel project's ACLs here.
 pub use arca_incus::write::NETWORK_HOME;
 /// The two projects the kernel never writes, whatever its family names. Incus gives them to nobody else, and droidd and the
-/// host use them. The one exception is a network and a forward, which the kernel addresses in `default` (Rule 40 of the ownership
-/// document) and nowhere else.
+/// host use them. The one exception is a network, a forward and an ACL, which the kernel addresses in `default` (Rule 40 of the
+/// ownership document) and nowhere else.
 pub const DROIDD_PROJECTS_FIXED: [&str; 2] = ["bench", "default"];
 /// The prefix every kernel project carries in a scratch run.
 const SCRATCH_PREFIX: &str = "arcak-scratch-";
@@ -237,8 +238,8 @@ impl IncusProvider {
         })
     }
 
-    /// Refuses a target outside the family before any request is made. A network and a forward are addressed in the default
-    /// project and in no other; every other kind is addressed in a kernel project.
+    /// Refuses a target outside the family before any request is made. A network, a forward and an ACL are addressed in the
+    /// default project and in no other; every other kind is addressed in a kernel project.
     fn check_family(&self, kind: IncusKind, project: &str) -> Result<(), EffectRefusal> {
         let allowed = if arca_incus::write::network_home(kind) {
             project == NETWORK_HOME
@@ -250,6 +251,45 @@ impl IncusProvider {
         } else {
             Err(EffectRefusal::ProjectNotAllowed)
         }
+    }
+
+    /// Where Incus holds the object a journal record names. A network, a forward and an ACL are addressed in the default project.
+    /// A record an earlier kernel wrote may name an ACL in its kernel project instead: Incus 7.3 keeps the ACLs of a project that
+    /// does not enable `features.networks` in the default project, so the ACL was made there, and it is read and retired there.
+    /// The project's own config is read first. A project that enables `features.networks` keeps its own ACLs, so its record keeps
+    /// its address, which the family refuses. A project that is gone holds nothing, so its record is addressed in the default
+    /// project. Any other kind, and a record already addressed in the default project, is returned as it is.
+    fn served_at(&self, entry: &EntryId, object: &ObjectRef) -> Result<ObjectRef, EffectRefusal> {
+        if !arca_incus::write::network_home(object.kind)
+            || object.project == NETWORK_HOME
+            || !self.family.allows(&object.project)
+        {
+            return Ok(object.clone());
+        }
+        let project = ObjectRef {
+            kind: IncusKind::Project,
+            project: object.project.clone(),
+            parent: None,
+            name: object.project.clone(),
+            uuid: None,
+        };
+        let enables = match self.writer(entry)?.get_etag(&project) {
+            Ok((metadata, _)) => {
+                text_config(metadata.get("config"))
+                    .get("features.networks")
+                    .map(String::as_str)
+                    == Some("true")
+            }
+            Err(IncusError::Status { code: 404, .. }) => false,
+            Err(error) => return Err(incus_refusal(error)),
+        };
+        if enables {
+            return Ok(object.clone());
+        }
+        Ok(ObjectRef {
+            project: NETWORK_HOME.to_string(),
+            ..object.clone()
+        })
     }
 
     /// The config of a project, read with a GET. A project's features live in its own config.
@@ -273,10 +313,8 @@ impl IncusProvider {
     }
 
     /// Refuses a write whose project does not enable the feature its kind needs. Without the feature, Incus routes the write to
-    /// the default project. An instance and a project need no feature, and neither does a network or a forward: those are
-    /// addressed in the default project, which holds them. An ACL is kept in its kernel project, as the kernel's ruling
-    /// stands, so it needs no feature either; `docs/OWNERSHIP.md` lists that as an assumption to confirm on a live host. The
-    /// check runs for every write, a delete included.
+    /// the default project. An instance and a project need no feature, and neither does a network, a forward or an ACL: those are
+    /// addressed in the default project, which holds them. The check runs for every write, a delete included.
     fn check_features(
         &self,
         entry: &EntryId,
@@ -775,6 +813,7 @@ impl IncusProvider {
                 "a retirement names the object's uuid".to_string(),
             ));
         }
+        let object = &self.served_at(entry, object)?;
         self.check_family(object.kind, &object.project)?;
         self.check_features(entry, object.kind, &object.project)?;
         let writer = self.writer(entry)?;
@@ -982,9 +1021,10 @@ impl Provider for IncusProvider {
         target: &ObjectRef,
         pre_image: Option<&BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
-        self.check_family(target.kind, &target.project)?;
-        self.check_features(entry, target.kind, &target.project)?;
-        let reading = match self.writer(entry)?.read_class(target) {
+        let place = self.served_at(entry, target)?;
+        self.check_family(place.kind, &place.project)?;
+        self.check_features(entry, place.kind, &place.project)?;
+        let reading = match self.writer(entry)?.read_class(&place) {
             Ok(reading) => reading,
             Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
             Err(error) => return Err(incus_refusal(error)),

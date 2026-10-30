@@ -41,7 +41,7 @@ impl Plugin for Patcher {
                 (IncusKind::Acl, EffectClass::A),
                 (IncusKind::Instance, EffectClass::B),
             ],
-            projects: vec![PROJECT.to_string()],
+            projects: vec![PROJECT.to_string(), ACL_HOME.to_string()],
             observes: false,
         }
     }
@@ -51,7 +51,7 @@ impl Plugin for Patcher {
         let box_name = format!("p-box-{}", cfg.tag);
         let acl = ctx.effect(EffectOp::IncusCreate {
             kind: IncusKind::Acl,
-            project: PROJECT.to_string(),
+            project: ACL_HOME.to_string(),
             parent: None,
             name: acl_name.clone(),
             body: json!({ "name": acl_name, "config": {} }),

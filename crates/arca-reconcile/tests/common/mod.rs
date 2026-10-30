@@ -443,7 +443,10 @@ pub fn instance_path(name: &str) -> String {
     format!("/1.0/instances/{name}?project={PROJECT}")
 }
 
-/// The path of an ACL in `PROJECT`.
+/// The project every ACL is addressed in. Incus 7.3 keeps the ACLs of a project that does not enable networks in `default`.
+pub const ACL_HOME: &str = "default";
+
+/// The path of an ACL, in [`ACL_HOME`].
 pub fn acl_path(name: &str) -> String {
-    format!("/1.0/network-acls/{name}?project={PROJECT}")
+    format!("/1.0/network-acls/{name}?project={ACL_HOME}")
 }

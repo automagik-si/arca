@@ -172,7 +172,7 @@ impl ProbeSpec {
             ),
             create(
                 IncusKind::Acl,
-                &self.project,
+                NETWORK_HOME,
                 None,
                 "probe-acl",
                 json!({ "name": "probe-acl", "config": {} }),
@@ -216,7 +216,8 @@ impl ProbeSpec {
     }
 
     /// The kinds a create of `kind` needs made before it. A bridge needs nothing. The project needs the bridge it grants. An
-    /// instance needs its project and its bridge. A forward needs its bridge. Every other kind needs its project.
+    /// instance needs its project and its bridge. A forward needs its bridge. Every other kind needs its project, an ACL included:
+    /// it is addressed in the default project, but it is the probe project's ACL.
     pub fn needs(kind: IncusKind) -> &'static [IncusKind] {
         match kind {
             IncusKind::Network => &[],
@@ -233,7 +234,7 @@ impl ProbeSpec {
     }
 
     /// The manifest the probe's effects run under: the nine kinds it writes, and two projects, its scratch project and the default
-    /// project that holds the bridge and its forward. The bridge is class B, not A, since the probe's instance attaches to it: a
+    /// project that holds the bridge, its forward and the ACL. The bridge is class B, not A, since the probe's instance attaches to it: a
     /// class-A revert of the bridge would run before the instance is deleted, and Incus refuses to delete a bridge in use. A
     /// declared class that is stricter than the default is not checked by the kernel. The project, the instance, the volume and
     /// the bucket are class B; the rest are class A.

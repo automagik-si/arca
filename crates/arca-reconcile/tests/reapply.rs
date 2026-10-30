@@ -85,7 +85,7 @@ fn a_failed_apply_is_applied_again_on_the_next_reconcile_with_the_same_config() 
     let (status, _) = raw(
         &fake,
         "POST",
-        "/1.0/network-acls?project=arcak-scratch-toy",
+        "/1.0/network-acls?project=default",
         Some(&json!({ "name": "toy-acl-t1", "config": {} })),
     );
     assert_eq!(status, 201, "the foreign ACL is in place");

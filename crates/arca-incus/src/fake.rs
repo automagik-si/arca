@@ -6,8 +6,8 @@
 //! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path, and
 //! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
 //!
-//! A network and a forward are served from the default project unless their project enables `features.networks`, as Incus serves
-//! them. A restricted project refuses an instance whose NIC names a network that its `restricted.networks.access` does not list.
+//! A network, a forward and an ACL are served from the default project unless their project enables `features.networks`, as Incus
+//! 7.3 serves them: a create sent to such a project lands in the default project, and a read sent to it is answered from there. A restricted project refuses an instance whose NIC names a network that its `restricted.networks.access` does not list.
 //!
 //! Writes: a POST to a collection creates an object, a PATCH or DELETE changes or removes one. These cover projects and the
 //! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance gets a uuid, in
@@ -647,11 +647,13 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
 }
 
 impl Store {
-    /// The address a network or a forward is served at. Incus serves a project that does not enable `features.networks` the
-    /// networks of the default project, so such an address is moved there. An address whose project does not exist is kept, and
+    /// The address a network, a forward or an ACL is served at. Incus serves a project that does not enable `features.networks`
+    /// the networks and the ACLs of the default project, so such an address is moved there. An address whose project does not exist is kept, and
     /// answers as Incus answers a missing project.
     fn served_from(&self, mut address: Address) -> Address {
-        if !matches!(address.kind, "network" | "forward") || address.project == DEFAULT_PROJECT {
+        if !matches!(address.kind, "network" | "forward" | "acl")
+            || address.project == DEFAULT_PROJECT
+        {
             return address;
         }
         let Some(project) = self

@@ -5,6 +5,7 @@ use arca_kernel::desired::PluginId;
 use arca_kernel::journal::EffectClass;
 use arca_kernel::ownership::IncusKind;
 use arca_kernel::plugin::{Ctx, EffectOp, Manifest, Plugin, PluginError};
+use arca_providers::incus::NETWORK_HOME;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -20,7 +21,8 @@ pub struct ToyConfig {
     pub tag: String,
 }
 
-/// The toy plugin. It creates an ACL `toy-acl-<tag>` and an instance `toy-box-<tag>` in [`TOY_PROJECT`].
+/// The toy plugin. It creates an ACL `toy-acl-<tag>`, which is addressed in the default project as every ACL is, and an instance
+/// `toy-box-<tag>` in [`TOY_PROJECT`].
 pub struct Toy;
 
 impl Plugin for Toy {
@@ -36,7 +38,7 @@ impl Plugin for Toy {
                 (IncusKind::Acl, EffectClass::A),
                 (IncusKind::Instance, EffectClass::B),
             ],
-            projects: vec![TOY_PROJECT.to_string()],
+            projects: vec![TOY_PROJECT.to_string(), NETWORK_HOME.to_string()],
             observes: false,
         }
     }
@@ -44,7 +46,7 @@ impl Plugin for Toy {
     fn apply(ctx: &mut Ctx<'_>, cfg: &ToyConfig) -> Result<(), PluginError> {
         ctx.effect(EffectOp::IncusCreate {
             kind: IncusKind::Acl,
-            project: TOY_PROJECT.to_string(),
+            project: NETWORK_HOME.to_string(),
             parent: None,
             name: format!("toy-acl-{}", cfg.tag),
             body: json!({ "name": format!("toy-acl-{}", cfg.tag), "config": {} }),

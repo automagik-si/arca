@@ -131,17 +131,20 @@ fn droidd_and_foreign_config_hashes_are_unchanged_by_removal() {
         before, after,
         "droidd and foreign config hashes are unchanged"
     );
-    // Every write the removal sent names the scratch project, so no request reached a droidd or foreign object.
+    // Every write the removal sent names the scratch project, or the toy's own ACL in the default project, where Incus keeps
+    // ACLs. No request reached a droidd or foreign object.
     let writes = fake.writes();
     assert!(
         !writes.is_empty(),
         "the toy's creates and the removal's delete were sent"
     );
     assert!(
-        writes
-            .iter()
-            .all(|write| write.path.contains(&format!("project={PROJECT}"))),
-        "every write is in the scratch project: {writes:?}"
+        writes.iter().all(|write| {
+            write.path.contains(&format!("project={PROJECT}"))
+                || (write.path.starts_with("/1.0/network-acls") && write.path.contains("toy-acl-")
+                    || write.path == format!("/1.0/network-acls?project={ACL_HOME}"))
+        }),
+        "every write is in the scratch project or on the toy's ACL: {writes:?}"
     );
 }
 
@@ -322,7 +325,7 @@ fn open_resolves_an_unresolved_create_before_any_effect_and_sends_only_reads() {
                 Digest::of(b"an intent with no outcome"),
                 ObjectRef {
                     kind: IncusKind::Acl,
-                    project: PROJECT.to_string(),
+                    project: ACL_HOME.to_string(),
                     parent: None,
                     name: "toy-acl-t9".to_string(),
                     uuid: None,

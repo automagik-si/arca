@@ -420,7 +420,7 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     for (kind, name, parent) in cases {
         let project = match kind {
             IncusKind::Project => name,
-            IncusKind::Network | IncusKind::Forward => "default",
+            IncusKind::Network | IncusKind::Forward | IncusKind::Acl => "default",
             _ => "svc",
         };
         let target = target(kind, project, name, parent);
@@ -675,7 +675,6 @@ fn a_non_network_create_in_default_is_refused_before_any_request_at_the_writer()
     let before = write_count(&fake);
     for (kind, parent, name) in [
         (IncusKind::Instance, None, "kd1"),
-        (IncusKind::Acl, None, "kd2"),
         (IncusKind::Profile, None, "kd3"),
         (IncusKind::Zone, None, "kd4"),
         (IncusKind::Volume, Some("default"), "kd5"),
@@ -784,14 +783,17 @@ fn the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_proj
 }
 
 #[test]
-fn networks_and_forwards_are_addressed_in_default_and_no_other_kind_is() {
+fn networks_forwards_and_acls_are_addressed_in_default_and_no_other_kind_is() {
     let family = ProjectFamily::new(["svc"], ["droid"]).expect("a family");
     assert!(family.allows(IncusKind::Network, "default"));
     assert!(family.allows(IncusKind::Forward, "default"));
+    assert!(
+        family.allows(IncusKind::Acl, "default"),
+        "Incus 7.3 keeps the ACLs of a project without networks in default"
+    );
     for kind in [
         IncusKind::Project,
         IncusKind::Instance,
-        IncusKind::Acl,
         IncusKind::Profile,
         IncusKind::Zone,
         IncusKind::Volume,
@@ -802,16 +804,74 @@ fn networks_and_forwards_are_addressed_in_default_and_no_other_kind_is() {
             "{kind:?} is not addressed in default"
         );
     }
-    assert!(
-        !family.allows(IncusKind::Network, "svc"),
-        "a network is not addressed in a kernel project"
+    for kind in [IncusKind::Network, IncusKind::Forward, IncusKind::Acl] {
+        assert!(
+            !family.allows(kind, "svc"),
+            "{kind:?} is not addressed in a kernel project"
+        );
+        assert!(!family.allows(kind, "bench"));
+        assert!(!family.allows(kind, "droid"));
+    }
+}
+
+#[test]
+fn an_acl_sent_to_a_project_without_the_networks_key_lands_in_default() {
+    // Incus 7.3 keeps the ACLs of a project that does not enable networks in the default project: a create sent to the project
+    // lands there, and a read sent to the project is answered from there. The fake does the same.
+    let (_dir, fake) = start("acl-routing");
+    let body = json!({"name": "a1", "config": {}}).to_string();
+    let created = raw(
+        fake.socket(),
+        &format!(
+            "POST /1.0/network-acls?project=svc HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
     );
-    assert!(
-        !family.allows(IncusKind::Forward, "svc"),
-        "a forward is not addressed in a kernel project"
+    assert!(created.starts_with("HTTP/1.1 201"), "{created}");
+    let client = UnixIncus::new(fake.socket().to_path_buf());
+    let home = client
+        .get("/1.0/network-acls/a1?project=default")
+        .expect("the ACL is held in default");
+    assert_eq!(home["project"], json!("default"), "{home}");
+    let routed = client
+        .get("/1.0/network-acls/a1?project=svc")
+        .expect("the project's read is answered from default");
+    assert_eq!(routed["project"], json!("default"), "{routed}");
+}
+
+#[test]
+fn an_acl_is_created_marked_in_default_and_refused_in_a_kernel_project_before_any_request() {
+    let (_dir, fake) = start("acl-home");
+    let writer = writer(&fake, "toy");
+    let requests = fake.requests().len();
+    let refused = writer
+        .create(&target(IncusKind::Acl, "svc", "a2", None), &marked())
+        .expect_err("an ACL is not addressed in a kernel project");
+    assert!(matches!(refused, IncusError::Refused(_)), "{refused:?}");
+    assert_eq!(fake.requests().len(), requests, "not even a read was sent");
+
+    let made = writer
+        .create(&target(IncusKind::Acl, "default", "a2", None), &marked())
+        .expect("an ACL in default, marked");
+    assert_eq!(made.entry(), &EntryId("toy".to_string()));
+    assert_eq!(
+        fake.writes()
+            .last()
+            .map(|w| (w.method.clone(), w.path.clone())),
+        Some((
+            "POST".to_string(),
+            "/1.0/network-acls?project=default".to_string()
+        ))
     );
-    assert!(!family.allows(IncusKind::Network, "bench"));
-    assert!(!family.allows(IncusKind::Network, "droid"));
+    // Every later write reads the ACL first and needs the entry's mark, as a bridge's does.
+    let read = UnixIncusWriter::new(
+        fake.socket().to_path_buf(),
+        EntryId("other".to_string()),
+        BTreeMap::new(),
+        family(),
+    )
+    .read_owned(&target(IncusKind::Acl, "default", "a2", None));
+    assert!(matches!(read, Err(IncusError::Refused(_))), "{read:?}");
 }
 
 #[test]

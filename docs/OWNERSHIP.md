@@ -55,15 +55,15 @@ Source: `UnixIncusWriter::create` and `read_owned` classify with the writer's re
 
 **Rule 8.** The kernel writes only inside the project family its configuration names. `ProjectFamily` holds those names and
 nothing else. A target outside the family is refused before any request is sent, a read included. `bench` and `default` are
-never in the family, so they are refused whatever the configuration says. The one exception is a network and a forward, which
-are addressed in `default` and nowhere else, and only when the object carries the entry's mark (Rule 40). The other system's
+never in the family, so they are refused whatever the configuration says. The one exception is a network, a forward and an ACL,
+which are addressed in `default` and nowhere else, and only when the object carries the entry's mark (Rule 40). The other system's
 projects come from the node's configuration, and `ProjectFamily::new` refuses a family that names one of them, so such a
 configuration does not start. The Incus provider (`crates/arca-providers/src/incus.rs`) checks the same family in `plan` and
 again in `effect`, so an effect made by hand for a project outside the family sends nothing.
 Source: `write::ProjectFamily::{new, allows}` and `UnixIncusWriter::{allow_target, create, read_owned, check}` in
 `crates/arca-incus/src/write.rs`; tests `a_target_outside_the_kernel_family_is_refused_before_any_request`,
 `the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_project`,
-`networks_and_forwards_are_addressed_in_default_and_no_other_kind_is` and
+`networks_forwards_and_acls_are_addressed_in_default_and_no_other_kind_is` and
 `a_non_network_create_in_default_is_refused_before_any_request_at_the_writer` in `crates/arca-incus/tests/write.rs`.
 `arca_kernel::plugin::Ctx::effect` refuses a project the manifest does not name (`ProjectNotAllowed`), a second check. The
 provider's test `an_effect_rechecks_the_family_for_a_plan_the_caller_made_by_hand` is in
@@ -135,7 +135,8 @@ delete plan, and `C` is an emission that is never reverted. A plugin's manifest 
 class. The default classes this document proposes are: project `B`, instance `B`, volume `B`, bucket `B`, network `B`; ACL `A`,
 profile `A`, zone `A`, forward `A`. A network is `B` because it is a bridge the default project shares, and an instance attached
 to it must be deleted first: a plan deletes the most recent object first, while a class-`A` revert runs before any plan and would
-ask Incus to delete a bridge still in use. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
+ask Incus to delete a bridge still in use. An ACL stays `A` although it is addressed in `default` (Rule 40), since no ACL the
+kernel makes today is named by a NIC. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
 manifest does not declare for that kind. Whether a declared class is stricter than the default is not checked.
 Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arca_kernel::plugin::Manifest.effects` and the
 `NotDeclared` check in `Ctx::effect`.
@@ -234,10 +235,9 @@ Source: `crates/arca-incus/Cargo.toml`, the `write` feature; `#[cfg(feature = "w
 **Rule 29.** A write to an object that is not an instance or a project lands only in a project that enables the feature its kind
 needs: `features.networks.zones` for a network zone; `features.profiles` for a profile; `features.storage.volumes` for a volume;
 `features.storage.buckets` for a bucket. The provider reads the project's config and refuses the write when the key is not
-`"true"`. Without the key, Incus sends the write to the default project. A network and a forward need no project feature, since
-they are addressed in `default`, which holds them (Rule 40). An ACL needs none either: its kernel project keeps it, as the
-kernel's ruling stands, which is listed under "Assumptions to confirm". The check runs for a create, a patch and a delete, and it
-is made before any write is sent. Reading the project's config is a GET.
+`"true"`. Without the key, Incus sends the write to the default project. A network, a forward and an ACL need no project feature,
+since they are addressed in `default`, which holds them (Rule 40). The check runs for a create, a patch and a delete, and it is
+made before any write is sent. Reading the project's config is a GET.
 Source: `IncusProvider::check_features` in `crates/arca-providers/src/incus.rs`; tests
 `a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature` and
 `a_zone_write_is_refused_before_any_write_in_a_project_without_the_zones_key`, in `crates/arca-providers/tests/incus_provider.rs`.
@@ -392,20 +392,28 @@ Source: `arca_reconcile::Reconciler::{resolve, open}` in `crates/arca-reconcile/
 
 ## Bridges in the default project
 
-**Rule 40.** A network and a forward are addressed in project `default`, which Incus shares with a project that does not enable
-networks, and no other kind is. A kernel project does not enable networks, so an instance in it attaches to a bridge in `default`.
-Each write to either kind carries the entry's mark: a create names a free name and stamps the mark, and a patch, a tombstone or a
-delete reads the object first and refuses it unless the entry owns it. An unmarked bridge therefore costs one read and no write.
-A forward is made under its network, since Incus keeps forwards in their network's project, so a forward create also reads its
-network and refuses one the entry does not own. Zones and ACLs are not addressed in `default`: a zone stays in its kernel project
-under `features.networks.zones`, since a bridge sets no DNS key that would attach one.
+**Rule 40.** A network, a forward and an ACL are addressed in project `default`, which Incus shares with a project that does not
+enable networks, and no other kind is. A kernel project does not enable networks, so an instance in it attaches to a bridge in
+`default`, and Incus 7.3 keeps the project's ACLs in `default` too: an ACL created with `?project=<kernel project>` lands in
+`default`, and a read sent to the kernel project is answered from there. Each write to any of the three kinds carries the entry's
+mark: a create names a free name and stamps the mark, and a patch, a tombstone or a delete reads the object first and refuses it
+unless the entry owns it. An unmarked bridge or ACL therefore costs one read and no write. A forward is made under its network,
+since Incus keeps forwards in their network's project, so a forward create also reads its network and refuses one the entry does
+not own. A zone is not addressed in `default`: it stays in its kernel project under `features.networks.zones`, since a bridge sets
+no DNS key that would attach one. A journal record an earlier kernel wrote can name an ACL in its kernel project; the provider
+reads and retires that ACL in `default` when the project's own config does not set `features.networks` to `"true"` (or the
+project is gone), and keeps the record's address, which the family refuses, when it does. The read-back still names the object
+as the record names it, so the journal accepts the outcome.
 Source: `write::{network_home, NETWORK_HOME}`, `ProjectFamily::allows`, `UnixIncusWriter::network_is_own` in
 `crates/arca-incus/src/write.rs`, and `IncusProvider::{check_family, prepared_create}` in `crates/arca-providers/src/incus.rs`;
 tests `a_marked_bridge_in_default_is_created_patched_and_removed`,
 `an_unmarked_bridge_in_default_is_refused_for_patch_and_delete_and_no_write_is_sent`,
-`a_non_network_create_in_default_is_still_refused_before_any_request`, `a_forward_is_made_only_on_a_network_the_entry_holds_in_default`
-in `crates/arca-providers/tests/incus_provider.rs`, and `a_forward_is_refused_before_any_write_when_its_network_is_not_the_entrys`
-in `crates/arca-incus/tests/write.rs`.
+`a_non_network_create_in_default_is_still_refused_before_any_request`, `a_forward_is_made_only_on_a_network_the_entry_holds_in_default`,
+`an_acl_is_made_marked_in_default_and_refused_in_a_kernel_project_before_any_request` and
+`an_acl_an_earlier_kernel_named_in_its_kernel_project_is_read_and_retired_in_default` in `crates/arca-providers/tests/incus_provider.rs`
+(`IncusProvider::served_at`), and `a_forward_is_refused_before_any_write_when_its_network_is_not_the_entrys`,
+`an_acl_is_created_marked_in_default_and_refused_in_a_kernel_project_before_any_request` and
+`an_acl_sent_to_a_project_without_the_networks_key_lands_in_default` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 41.** A project grants its instances the bridges it may use through `restricted.networks.access`, a comma-separated list of
 plain names. The grant is set at the project's create only, since a project patch may not change it (Rule 30). Each name must be a
@@ -448,13 +456,15 @@ must run before any live write.
   `"true"` first (Rule 29).
 - Incus serves a network, and a forward, that a project without `features.networks` names from the default project, so a kernel
   project's instance reaches a bridge in `default` (Rule 40). A forward is kept in its network's project (Rule 40).
-- Incus keeps an ACL in its own project, and does not route it to `default`, when the project does not enable `features.networks`.
-  This is a ruling, and no check here confirms it. If Incus routes ACLs by that key, an ACL create lands in `default`
-  carrying the entry's mark, and the read-back in the kernel project does not find it. Confirm on a live host before any ACL write.
+- Incus 7.3 keeps the ACLs of a project that does not enable `features.networks` in `default`: an ACL created with
+  `?project=<kernel project>` lands there, and a GET in the kernel project is answered from there (Rule 40). Confirmed on a live
+  host, which superseded the earlier ruling that an ACL stays in its kernel project.
 - Incus gives a zone its own project under `features.networks.zones`, whether or not `features.networks` is set (Rule 29).
 - Incus 7.3 has `restricted.networks.access`, and a restricted project refuses an instance NIC on a network the grant does not
   list (Rule 41). The grant is the only key this rule adds to a kernel project.
 - Incus refuses to delete a bridge that an instance still attaches to (Rule 17).
+- Incus refuses to delete an ACL that a NIC still names. An ACL is class `A`, so a revert of an ACL that an instance's NIC names
+  runs before the plan deletes the instance, and Incus keeps the ACL; the removal reports it, and nothing is lost (Rule 17).
 - The probe's image alias resolves in the probe's project. A kernel project does not enable `features.images` (Rule 30), so it
   reads the image store that Incus gives it, and the host imports the alias there before a live probe. The kernel imports nothing.
 - Incus accepts `restricted` and the four `features.*` keys on a project create (Rule 30).
