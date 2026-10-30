@@ -46,6 +46,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arca-metrics"
+version = "0.1.0"
+dependencies = [
+ "arca-api",
+ "arca-incus",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arca-wit"
 version = "0.1.0"
 dependencies = [
