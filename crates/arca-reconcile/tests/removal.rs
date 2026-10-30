@@ -3,7 +3,6 @@
 
 mod common;
 
-use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{DesiredStateGate, DocRefusal, EntryId};
 use arca_kernel::journal::{DeletePlan, EffectClass, FileJournal, Journal, JournalSink};
@@ -306,7 +305,7 @@ fn a_replayed_older_valid_document_is_refused_with_no_inverse_run() {
 }
 
 #[test]
-fn open_on_a_journal_with_an_unresolved_intent_fails_unresolved_and_sends_no_request() {
+fn open_resolves_an_unresolved_create_before_any_effect_and_sends_only_reads() {
     let scratch = Scratch::new("unresolved");
     let fake = start_fake(&scratch);
     let key = node_key();
@@ -341,21 +340,29 @@ fn open_on_a_journal_with_an_unresolved_intent_fails_unresolved_and_sends_no_req
     plugins
         .add::<arca_reconcile::toy::Toy>()
         .expect("the toy plugin is valid");
-    let refused = match Reconciler::open(
+    let r = Reconciler::open(
         DesiredStateGate::new(key.public(), None),
         journal,
         plugins,
         Box::new(provider(&scratch, &fake, &retained)),
         retained.clone(),
-    ) {
-        Ok(_) => panic!("a journal with an unresolved intent must not open"),
-        Err(error) => error,
-    };
+        NOW,
+    )
+    .expect("the absent create is settled, so the journal opens");
 
-    assert_eq!(refused, KernelError::Unresolved { ids: vec![1] });
+    // The create never landed, so its intent is settled as reverted: nothing was sent but reads.
+    assert_eq!(r.resolution().reverted, vec![1]);
+    assert!(r.journal().unresolved().is_empty());
     assert!(
-        fake.requests().is_empty(),
-        "no request was sent: {:?}",
+        fake.writes().is_empty(),
+        "no write was sent: {:?}",
+        fake.writes()
+    );
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|request| request.method == "GET"),
+        "only reads were sent: {:?}",
         fake.requests()
     );
 }

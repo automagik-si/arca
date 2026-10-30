@@ -123,6 +123,7 @@ fn a_plugin_that_swallows_an_unresolved_effect_cannot_make_a_second_write() {
             calls: calls.clone(),
         }),
         RetainedSet::empty(),
+        NOW,
     )
     .expect("an empty journal opens the reconciler");
     let entry = entry("p1", PERSIST, json!({}));

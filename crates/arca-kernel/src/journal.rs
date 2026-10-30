@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::KernelError;
 use crate::canon::{Digest, canonical_json};
-use crate::desired::EntryId;
+use crate::desired::{EntryId, PluginId};
 use crate::ownership::ObjectRef;
 
 /// How an effect is undone when its entry leaves the desired state.
@@ -135,6 +135,10 @@ pub struct EffectRecord {
     /// bytes it always had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<IntentKind>,
+    /// The plugin whose apply made the effect, set on its intent and on every later record of it. A restart reads it to find the
+    /// plugin of each entry again. It is omitted when absent, so a record without it keeps the bytes it always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginId>,
     #[serde(default, deserialize_with = "closed::optional")]
     pub object: Option<ObjectRef>,
     pub inverse: Option<Inverse>,
@@ -445,6 +449,7 @@ impl<S: JournalStore> Journal<S> {
             target: prev.target.clone(),
             pre_image: prev.pre_image.clone(),
             intent: prev.intent,
+            plugin: prev.plugin.clone(),
             object,
             inverse,
             state: to,
@@ -469,6 +474,7 @@ impl<S: JournalStore> Journal<S> {
 struct IntentShape {
     pre_image: Option<BTreeMap<String, Option<String>>>,
     intent: Option<IntentKind>,
+    plugin: Option<PluginId>,
 }
 
 impl<S: JournalStore> Journal<S> {
@@ -485,6 +491,7 @@ impl<S: JournalStore> Journal<S> {
         let shape = IntentShape {
             pre_image: None,
             intent: Some(IntentKind::Delete),
+            plugin: None,
         };
         self.intend_as(entry, class, op_digest, target, shape, now_ms)
     }
@@ -516,6 +523,7 @@ impl<S: JournalStore> Journal<S> {
             target,
             pre_image: shape.pre_image,
             intent: shape.intent,
+            plugin: shape.plugin,
             object: None,
             inverse: None,
             state: EffectState::Intent,
@@ -523,6 +531,30 @@ impl<S: JournalStore> Journal<S> {
         })?;
         self.next_id = following;
         Ok(id)
+    }
+}
+
+impl<S: JournalStore> Journal<S> {
+    /// Records an intent that `plugin`'s apply makes, so the record and every later record of the effect name the plugin. A restart
+    /// reads the name to find which plugin an entry belongs to. Refused on the terms of [`JournalSink::intend`].
+    pub fn intend_by(
+        &mut self,
+        plugin: &PluginId,
+        fields: IntentFields<'_>,
+    ) -> Result<u64, KernelError> {
+        let shape = IntentShape {
+            pre_image: fields.pre_image,
+            intent: None,
+            plugin: Some(plugin.clone()),
+        };
+        self.intend_as(
+            fields.entry,
+            fields.class,
+            fields.op_digest,
+            fields.target,
+            shape,
+            fields.now_ms,
+        )
     }
 }
 
@@ -539,6 +571,7 @@ impl<S: JournalStore> JournalSink for Journal<S> {
         let shape = IntentShape {
             pre_image,
             intent: None,
+            plugin: None,
         };
         self.intend_as(entry, class, op_digest, target, shape, now_ms)
     }
@@ -550,6 +583,16 @@ impl<S: JournalStore> JournalSink for Journal<S> {
     fn failed(&mut self, id: u64, _why: &str) -> Result<(), KernelError> {
         self.advance(id, EffectState::Failed, None)
     }
+}
+
+/// The fields of an intent a plugin's apply makes, for [`Journal::intend_by`]. They are the fields [`JournalSink::intend`] takes.
+pub struct IntentFields<'a> {
+    pub entry: &'a EntryId,
+    pub class: EffectClass,
+    pub op_digest: Digest,
+    pub target: ObjectRef,
+    pub pre_image: Option<BTreeMap<String, Option<String>>>,
+    pub now_ms: u64,
 }
 
 /// The class-B objects of one entry, awaiting an approval over exactly this list.
@@ -632,6 +675,7 @@ fn plan_digest(entry: &EntryId, objects: &[ObjectRef]) -> Digest {
 fn refusal_to_follow(prev: &EffectRecord, next: &EffectRecord) -> Option<&'static str> {
     if prev.id != next.id
         || prev.entry != next.entry
+        || prev.plugin != next.plugin
         || prev.class != next.class
         || prev.op_digest != next.op_digest
         || prev.at_ms != next.at_ms

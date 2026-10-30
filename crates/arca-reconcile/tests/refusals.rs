@@ -44,6 +44,7 @@ fn bare(
         plugins,
         Box::new(provider(scratch, fake, retained)),
         retained.clone(),
+        NOW,
     )
     .expect("the journal has no unresolved intent")
 }

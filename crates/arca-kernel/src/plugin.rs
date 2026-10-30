@@ -191,6 +191,18 @@ pub trait Provider {
         op: &EffectOp,
         planned: &Planned,
     ) -> Result<(ObjectRef, Inverse), EffectRefusal>;
+    /// Reads the object an unresolved intent names, to settle the intent after a restart. The read is a GET and nothing else. A
+    /// read that cannot be answered is an error, and the intent then stays open. A provider that cannot read back keeps the
+    /// default, which refuses, so every intent stays open.
+    fn read_back(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&BTreeMap<String, Option<String>>>,
+    ) -> Result<ReadBack, EffectRefusal> {
+        let _ = (entry, target, pre_image);
+        Err(EffectRefusal::NotDeclared)
+    }
     /// Deletes an object the entry owns, with `plan` as the digest its tombstone carries. Only the reconciler calls this:
     /// a class-B delete runs after an approval over `plan`, and a class-A revert runs at once with the digest of the create it
     /// undoes. A provider that never deletes keeps this default, which refuses.
@@ -203,6 +215,19 @@ pub trait Provider {
         let _ = (entry, object, plan);
         Err(EffectRefusal::NotDeclared)
     }
+}
+
+/// What an object shows when an unresolved intent is settled after a restart. It comes from a read only. `Absent` is an object the
+/// host does not hold at the intent's place. `Present` carries the object as Incus names it, with its uuid when its kind has one,
+/// and says whether the entry may change it and whether its config holds the intent's pre-image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadBack {
+    Absent,
+    Present {
+        object: ObjectRef,
+        owned: bool,
+        holds_pre_image: bool,
+    },
 }
 
 /// What a retirement did: the object was deleted, or the delete was skipped because the object no longer showed what the plan
