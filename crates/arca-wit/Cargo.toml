@@ -9,5 +9,9 @@ description = "The WIT world arca:plugin@0.1.0, and a check of the imports and e
 [dependencies]
 wit-parser.workspace = true
 
+[dev-dependencies]
+wasmtime.workspace = true
+wit-component = { workspace = true, features = ["dummy-module"] }
+
 [lints]
 workspace = true
