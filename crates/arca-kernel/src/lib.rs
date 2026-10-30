@@ -1,12 +1,17 @@
-//! The Arca kernel's contracts: canonical JSON, node identity, signed desired state and the ownership model.
+//! The Arca kernel's contracts: canonical JSON, node identity, signed desired state, the ownership model, the effect journal
+//! and the plugin contract.
 //!
 //! Nothing in this crate touches Incus or a host. The kernel's one-writer rule is stated here as
-//! [`ownership::kernel_may_write`]; the providers that write must ask it before they act.
+//! [`ownership::kernel_may_write`]; the providers that write must ask it before they act. Every effect is journalled as
+//! an intent before it runs and as its inverse once it applies ([`journal`]); a plugin reaches the host only through
+//! [`plugin::Ctx`].
 
 pub mod canon;
 pub mod desired;
 pub mod identity;
+pub mod journal;
 pub mod ownership;
+pub mod plugin;
 
 use std::fmt;
 
@@ -33,6 +38,8 @@ pub enum KernelError {
     Locked { path: String },
     /// A proposed desired-state document was refused by the acceptance gate.
     Refused(DocRefusal),
+    /// A plugin was refused at registration: its id is not a valid plugin id, or it is not the id its manifest names.
+    Plugin(String),
 }
 
 impl fmt::Display for KernelError {
@@ -55,6 +62,7 @@ impl fmt::Display for KernelError {
                 write!(f, "desired-state store {path} is locked by another process")
             }
             Self::Refused(reason) => write!(f, "document refused: {reason}"),
+            Self::Plugin(why) => write!(f, "plugin refused: {why}"),
         }
     }
 }
