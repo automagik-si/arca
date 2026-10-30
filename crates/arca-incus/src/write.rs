@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::ownership::{
-    IncusKind, KERNEL_RETIRING_KEY, OwnerClass, classify, kernel_may_write,
+    IncusKind, KERNEL_RETIRING_KEY, ObjectRef, OwnerClass, classify, kernel_may_write,
 };
 use serde_json::{Map, Value, json};
 
@@ -41,6 +41,14 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_PAUSE: Duration = Duration::from_millis(100);
 /// Projects the writer never changes, whatever the family names.
 const RESERVED_PROJECTS: [&str; 2] = ["bench", "default"];
+/// The project a network and a forward are addressed in. Incus holds the kernel's bridges here, and a forward hangs off its
+/// network. The writer sends no other kind here.
+pub const NETWORK_HOME: &str = "default";
+
+/// Whether a kind is addressed in [`NETWORK_HOME`]: a network, and a forward, which is made under its network.
+pub fn network_home(kind: IncusKind) -> bool {
+    matches!(kind, IncusKind::Network | IncusKind::Forward)
+}
 
 /// An object the writer read and classed as its entry's own. Its fields are private, and only [`UnixIncusWriter`] makes one,
 /// so holding one is proof that the classifier allowed the entry to change the object at that read. Its `etag` is the one
@@ -127,8 +135,13 @@ impl ProjectFamily {
         Ok(Self { projects })
     }
 
-    /// Whether a write may name the project.
-    pub fn allows(&self, project: &str) -> bool {
+    /// Whether a write of `kind` may name the project. A network and a forward are addressed in [`NETWORK_HOME`] and nowhere
+    /// else. Every other kind is addressed in a project the configuration lists. Whether the object is the entry's own is
+    /// checked on each read and write, not here.
+    pub fn allows(&self, kind: IncusKind, project: &str) -> bool {
+        if network_home(kind) {
+            return project == NETWORK_HOME;
+        }
         !RESERVED_PROJECTS.contains(&project) && self.projects.contains(project)
     }
 }
@@ -183,7 +196,7 @@ impl UnixIncusWriter {
     /// family is still checked first, so a target outside it sends nothing. A caller that refuses a write uses this to name the
     /// class it refused; a write itself still needs [`Self::read_owned`].
     pub fn read_class(&self, target: &Target) -> Result<Reading, IncusError> {
-        self.allow_project(&target.project)?;
+        self.allow_target(target)?;
         let (metadata, etag) = self.fetch(target)?;
         let config = own_config(&metadata)?;
         Ok(Reading {
@@ -197,7 +210,7 @@ impl UnixIncusWriter {
     /// Reads an object and returns it as [`Owned`] when this entry may change it. A target outside the family, an object of
     /// another class, and a target whose uuid is not the object's are refused, and nothing is written.
     pub fn read_owned(&self, target: &Target) -> Result<Owned, IncusError> {
-        self.allow_project(&target.project)?;
+        self.allow_target(target)?;
         let (metadata, etag) = self.fetch(target)?;
         let config = own_config(&metadata)?;
         self.classed(target, etag, config)
@@ -210,7 +223,7 @@ impl UnixIncusWriter {
     /// the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object is read
     /// back, which must class as this entry's own.
     pub fn create(&self, target: &Target, body: &Value) -> Result<Owned, IncusError> {
-        self.allow_project(&target.project)?;
+        self.allow_target(target)?;
         if target.uuid.is_some() {
             return Err(refused("a create names no uuid yet"));
         }
@@ -245,6 +258,9 @@ impl UnixIncusWriter {
         sent.insert("name".to_string(), json!(target.name));
         if target.kind == IncusKind::Forward {
             sent.insert("listen_address".to_string(), json!(target.name));
+        }
+        if let (IncusKind::Forward, Some(network)) = (target.kind, target.parent.as_deref()) {
+            self.network_is_own(network)?;
         }
         self.require_free(&urls.object)?;
         self.mutate("POST", &urls.collection, None, Some(&Value::Object(sent)))?;
@@ -359,13 +375,26 @@ impl UnixIncusWriter {
         self.mutate("DELETE", &urls.object, None, None)
     }
 
-    /// Refuses a target whose project is outside the family, before any request is made.
-    fn allow_project(&self, project: &str) -> Result<(), IncusError> {
-        if self.family.allows(project) {
+    /// Refuses a target whose kind and project are outside the family, before any request is made.
+    fn allow_target(&self, target: &Target) -> Result<(), IncusError> {
+        if self.family.allows(target.kind, &target.project) {
             Ok(())
         } else {
             Err(refused("the project is outside the kernel's family"))
         }
+    }
+
+    /// Refuses a forward whose network is not this entry's own. A forward is made under its network, so one under another
+    /// owner's bridge would change that bridge. The network is read, and it must class as this entry's own.
+    fn network_is_own(&self, network: &str) -> Result<(), IncusError> {
+        let bridge = ObjectRef {
+            kind: IncusKind::Network,
+            project: NETWORK_HOME.to_string(),
+            parent: None,
+            name: network.to_string(),
+            uuid: None,
+        };
+        self.read_owned(&bridge).map(|_| ())
     }
 
     /// Classes a read's object for this entry: it must be the entry's own, and a target that names a uuid must see that uuid.
@@ -443,7 +472,7 @@ impl UnixIncusWriter {
         if owned.entry != self.entry {
             return Err(refused("the object was read for another entry"));
         }
-        self.allow_project(&owned.target.project)?;
+        self.allow_target(&owned.target)?;
         let class = classify(&owned.config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
             return Err(refused(refusal_reason(&class)));

@@ -55,16 +55,20 @@ Source: `UnixIncusWriter::create` and `read_owned` classify with the writer's re
 
 **Rule 8.** The kernel writes only inside the project family its configuration names. `ProjectFamily` holds those names and
 nothing else. A target outside the family is refused before any request is sent, a read included. `bench` and `default` are
-refused whatever the configuration says. The other system's projects come from the node's configuration, and
-`ProjectFamily::new` refuses a family that names one of them, so such a configuration does not start. The Incus provider
-(`crates/arca-providers/src/incus.rs`) checks the same family in `plan` and again in `effect`, so an effect made by hand for a
-project outside the family sends nothing.
-Source: `write::ProjectFamily::{new, allows}` and `UnixIncusWriter::{allow_project, create, read_owned, check}` in
-`crates/arca-incus/src/write.rs`; tests `a_target_outside_the_kernel_family_is_refused_before_any_request` and
-`the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_project` in `crates/arca-incus/tests/write.rs`.
+never in the family, so they are refused whatever the configuration says. The one exception is a network and a forward, which
+are addressed in `default` and nowhere else, and only when the object carries the entry's mark (Rule 40). The other system's
+projects come from the node's configuration, and `ProjectFamily::new` refuses a family that names one of them, so such a
+configuration does not start. The Incus provider (`crates/arca-providers/src/incus.rs`) checks the same family in `plan` and
+again in `effect`, so an effect made by hand for a project outside the family sends nothing.
+Source: `write::ProjectFamily::{new, allows}` and `UnixIncusWriter::{allow_target, create, read_owned, check}` in
+`crates/arca-incus/src/write.rs`; tests `a_target_outside_the_kernel_family_is_refused_before_any_request`,
+`the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_project`,
+`networks_and_forwards_are_addressed_in_default_and_no_other_kind_is` and
+`a_non_network_create_in_default_is_refused_before_any_request_at_the_writer` in `crates/arca-incus/tests/write.rs`.
 `arca_kernel::plugin::Ctx::effect` refuses a project the manifest does not name (`ProjectNotAllowed`), a second check. The
 provider's test `an_effect_rechecks_the_family_for_a_plan_the_caller_made_by_hand` is in
-`crates/arca-providers/tests/incus_provider.rs`.
+`crates/arca-providers/tests/incus_provider.rs`, and `a_non_network_create_in_default_is_still_refused_before_any_request` is
+there too.
 
 **Rule 9.** A project is named by its own name. A project's path names it alone, and a project whose name differs from its
 `project` field is refused before any request.
@@ -128,9 +132,11 @@ Source: `write::config_patch` and fake `merge`; round-trip test. This encoding i
 
 **Rule 17.** Each journal record names its effect's class: `A` reverts at once, `B` is destructive and waits for an approved
 delete plan, and `C` is an emission that is never reverted. A plugin's manifest declares each Incus kind it may write with its
-class. The default classes this document proposes are: project `B`, instance `B`, volume `B`, bucket `B`; network `A`, ACL `A`,
-profile `A`, zone `A`, forward `A`. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the manifest
-does not declare for that kind. Whether a declared class is stricter than the default is not checked.
+class. The default classes this document proposes are: project `B`, instance `B`, volume `B`, bucket `B`, network `B`; ACL `A`,
+profile `A`, zone `A`, forward `A`. A network is `B` because it is a bridge the default project shares, and an instance attached
+to it must be deleted first: a plan deletes the most recent object first, while a class-`A` revert runs before any plan and would
+ask Incus to delete a bridge still in use. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
+manifest does not declare for that kind. Whether a declared class is stricter than the default is not checked.
 Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arca_kernel::plugin::Manifest.effects` and the
 `NotDeclared` check in `Ctx::effect`.
 
@@ -218,28 +224,33 @@ Source: `crates/arca-incus/Cargo.toml`, the `write` feature; `#[cfg(feature = "w
 ## Provider
 
 **Rule 29.** A write to an object that is not an instance or a project lands only in a project that enables the feature its kind
-needs: `features.networks` for a network, ACL or forward; `features.networks.zones` for a network zone; `features.profiles` for a
-profile; `features.storage.volumes` for a volume; `features.storage.buckets` for a bucket. The provider reads the project's config
-and refuses the write when the key is not `"true"`. Without the key, Incus sends the write to the default project. The check runs
-for a create, a patch and a delete, and it is made before any write is sent. Reading the project's config is a GET.
+needs: `features.networks.zones` for a network zone; `features.profiles` for a profile; `features.storage.volumes` for a volume;
+`features.storage.buckets` for a bucket. The provider reads the project's config and refuses the write when the key is not
+`"true"`. Without the key, Incus sends the write to the default project. A network and a forward need no project feature, since
+they are addressed in `default`, which holds them (Rule 40). An ACL needs none either: its kernel project keeps it, as the
+kernel's ruling stands, which is listed under "Assumptions to confirm". The check runs for a create, a patch and a delete, and it
+is made before any write is sent. Reading the project's config is a GET.
 Source: `IncusProvider::check_features` in `crates/arca-providers/src/incus.rs`; tests
 `a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature` and
 `a_zone_write_is_refused_before_any_write_in_a_project_without_the_zones_key`, in `crates/arca-providers/tests/incus_provider.rs`.
 
-**Rule 30.** Every kernel project is created with `features.networks`, `features.networks.zones`, `features.profiles`,
-`features.storage.volumes` and `features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's
-mark. A plugin may set a `restricted`, `restricted.*` or `features.*` key on a project create only to the value the kernel pins
-it at. Any other value is refused, and so is a key the kernel does not pin, whatever its value, so `restricted.containers.privilege`
-set to `allow` and `features.images` set to `false` are both refused. A project patch may not change any such key, whatever its
-value, and the refusal is made before any request. A project is named by its own name.
-Source: `IncusProvider::prepared_create` (`PROJECT_KEYS`, `RESTRICTED_KEY`, `guarded_project_key`) and `check_patch_keys`; tests
-`a_project_create_carries_the_mark_the_features_restricted_and_the_op_config`,
+**Rule 30.** Every kernel project is created with `features.networks.zones`, `features.profiles`, `features.storage.volumes` and
+`features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's mark. `features.networks` is
+not set: a kernel project has no networks of its own (Rule 40). A plugin may set a `restricted`, `restricted.*` or `features.*` key
+on a project create only to the value the kernel pins it at, with one exception: `restricted.networks.access`, which names the
+bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
+whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
+set to anything are all refused. A project patch may not change any such key, whatever its value, and the refusal is made before
+any request. A project is named by its own name.
+Source: `IncusProvider::prepared_create` (`PROJECT_KEYS`, `RESTRICTED_KEY`, `NETWORK_ACCESS_KEY`, `guarded_project_key`) and
+`check_patch_keys`; tests `a_project_create_carries_the_mark_the_features_restricted_and_the_op_config`,
 `a_project_create_refuses_a_restricted_or_features_key_that_loosens_the_pinned_project`,
 `a_project_patch_refuses_every_restricted_or_features_key_before_any_request`,
-`a_project_create_that_sets_a_kernel_key_another_way_is_refused` and `a_project_create_carries_the_zones_key_pinned_to_true`.
+`a_project_create_that_sets_a_kernel_key_another_way_is_refused`, `a_project_create_carries_the_zones_key_pinned_to_true` and
+`a_project_create_may_grant_only_bridges_the_entry_holds_in_default`.
 
-**Rule 31.** A kernel network is a bridge. Its `ipv6.address` is `none`, its `ipv4.address` is an IPv4 CIDR, and that range
-overlaps no reserved range. The test is overlap, not containment. The config keys a bridge may hold are an allowlist: the three
+**Rule 31.** A kernel network is a bridge in the default project (Rule 40). Its `ipv6.address` is `none`, its `ipv4.address` is an
+IPv4 CIDR, and that range overlaps no reserved range. The test is overlap, not containment. The config keys a bridge may hold are an allowlist: the three
 that the plans' bridges set, `ipv4.address`, `ipv4.nat` and `ipv6.address`. Any other key is refused. That includes a route
 (`ipv4.routes` or `ipv6.routes`, whatever its range), `bridge.external_interfaces`, a `raw.*` key and the DNS keys, which no plan
 sets. The kernel's own mark is not a setting, so it is allowed. A network patch meets the same rules for the config it leaves
@@ -370,6 +381,33 @@ Source: `arca_reconcile::Reconciler::{resolve, open}` in `crates/arca-reconcile/
 `arca_providers::incus::IncusProvider::read_back`; tests in `crates/arca-reconcile/tests/restart.rs` and
 `a_read_back_in_a_project_without_the_feature_is_refused_and_sends_only_gets` in `crates/arca-providers/tests/incus_provider.rs`.
 
+## Bridges in the default project
+
+**Rule 40.** A network and a forward are addressed in project `default`, which Incus shares with a project that does not enable
+networks, and no other kind is. A kernel project does not enable networks, so an instance in it attaches to a bridge in `default`.
+Each write to either kind carries the entry's mark: a create names a free name and stamps the mark, and a patch, a tombstone or a
+delete reads the object first and refuses it unless the entry owns it. An unmarked bridge therefore costs one read and no write.
+A forward is made under its network, since Incus keeps forwards in their network's project, so a forward create also reads its
+network and refuses one the entry does not own. Zones and ACLs are not addressed in `default`: a zone stays in its kernel project
+under `features.networks.zones`, since a bridge sets no DNS key that would attach one.
+Source: `write::{network_home, NETWORK_HOME}`, `ProjectFamily::allows`, `UnixIncusWriter::network_is_own` in
+`crates/arca-incus/src/write.rs`, and `IncusProvider::{check_family, prepared_create}` in `crates/arca-providers/src/incus.rs`;
+tests `a_marked_bridge_in_default_is_created_patched_and_removed`,
+`an_unmarked_bridge_in_default_is_refused_for_patch_and_delete_and_no_write_is_sent`,
+`a_non_network_create_in_default_is_still_refused_before_any_request`, `a_forward_is_made_only_on_a_network_the_entry_holds_in_default`
+in `crates/arca-providers/tests/incus_provider.rs`, and `a_forward_is_refused_before_any_write_when_its_network_is_not_the_entrys`
+in `crates/arca-incus/tests/write.rs`.
+
+**Rule 41.** A project grants its instances the bridges it may use through `restricted.networks.access`, a comma-separated list of
+plain names. The grant is set at the project's create only, since a project patch may not change it (Rule 30). Each name must be a
+bridge in `default` that carries the entry's mark, read before the create is sent; one name that is not marked refuses the whole
+list, and so does an empty or a non-plain name. `restricted` stays `"true"`. A restricted project refuses an instance whose NIC
+names a bridge its grant does not list.
+Source: `IncusProvider::check_network_access` in `crates/arca-providers/src/incus.rs`; tests
+`a_project_create_may_grant_only_bridges_the_entry_holds_in_default` in `crates/arca-providers/tests/incus_provider.rs`, and
+`a_nic_on_a_network_the_restricted_project_does_not_list_is_refused_by_incus` in `crates/arca-incus/tests/write.rs`, which runs
+against the fake's restriction (`FakeIncus` answers 403 to such a NIC).
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -398,6 +436,17 @@ must run before any live write.
   its pool and its project (Rules 24, 27).
 - Incus routes a write sent to a project without its feature key to the default project, so the provider requires the key to be
   `"true"` first (Rule 29).
+- Incus serves a network, and a forward, that a project without `features.networks` names from the default project, so a kernel
+  project's instance reaches a bridge in `default` (Rule 40). A forward is kept in its network's project (Rule 40).
+- Incus keeps an ACL in its own project, and does not route it to `default`, when the project does not enable `features.networks`.
+  This is a ruling, and no check here confirms it. If Incus routes ACLs by that key, an ACL create lands in `default`
+  carrying the entry's mark, and the read-back in the kernel project does not find it. Confirm on a live host before any ACL write.
+- Incus gives a zone its own project under `features.networks.zones`, whether or not `features.networks` is set (Rule 29).
+- Incus 7.3 has `restricted.networks.access`, and a restricted project refuses an instance NIC on a network the grant does not
+  list (Rule 41). The grant is the only key this rule adds to a kernel project.
+- Incus refuses to delete a bridge that an instance still attaches to (Rule 17).
+- The probe's image alias resolves in the probe's project. A kernel project does not enable `features.images` (Rule 30), so it
+  reads the image store that Incus gives it, and the host imports the alias there before a live probe. The kernel imports nothing.
 - Incus accepts `restricted` and the four `features.*` keys on a project create (Rule 30).
 - Incus accepts `ipv6.address` set to `none` on a bridge create (Rule 31).
 - Incus accepts `ipv4.nat` on a bridge create, and reports a network's config with the keys that were set on it and no others.

@@ -33,8 +33,11 @@ use arca_kernel::plugin::{
 };
 use serde_json::{Map, Value, json};
 
+/// The project a network and a forward are addressed in. The kernel's bridges live here, and a forward hangs off its network.
+pub use arca_incus::write::NETWORK_HOME;
 /// The two projects the kernel never writes, whatever its family names. Incus gives them to nobody else, and droidd and the
-/// host use them.
+/// host use them. The one exception is a network and a forward, which the kernel addresses in `default` (Rule 40 of the ownership
+/// document) and nowhere else.
 pub const DROIDD_PROJECTS_FIXED: [&str; 2] = ["bench", "default"];
 /// The prefix every kernel project carries in a scratch run.
 const SCRATCH_PREFIX: &str = "arcak-scratch-";
@@ -45,8 +48,9 @@ const SECRET_MAX_BYTES: u64 = 64 * 1024;
 /// How deep the provider looks for secret files under its directory.
 const SECRET_MAX_DEPTH: usize = 4;
 /// The project keys every kernel project is created with. A plugin may not set any `restricted*` or `features*` key another way.
-const PROJECT_KEYS: [(&str, &str); 5] = [
-    ("features.networks", "true"),
+/// `features.networks` is not among them: the kernel's bridges and forwards live in the default project, which Incus shares
+/// with a project that does not enable networks.
+const PROJECT_KEYS: [(&str, &str); 4] = [
     ("features.networks.zones", "true"),
     ("features.profiles", "true"),
     ("features.storage.volumes", "true"),
@@ -54,6 +58,9 @@ const PROJECT_KEYS: [(&str, &str); 5] = [
 ];
 /// The key every kernel project is created restricted with.
 const RESTRICTED_KEY: &str = "restricted";
+/// The restriction key a plugin may set on a project create: the bridges the project's instances may use. Each name must be a
+/// bridge in the default project that carries the entry's mark.
+pub const NETWORK_ACCESS_KEY: &str = "restricted.networks.access";
 /// The config keys a bridge network may set. A plan's bridge sets each of them, and nothing else: a route, an external interface,
 /// a `raw.*` key, DNS and every other key is refused.
 const BRIDGE_KEYS: [&str; 3] = ["ipv4.address", "ipv4.nat", "ipv6.address"];
@@ -230,9 +237,15 @@ impl IncusProvider {
         })
     }
 
-    /// Refuses a project outside the family before any request is made.
-    fn check_family(&self, project: &str) -> Result<(), EffectRefusal> {
-        if self.family.allows(project) {
+    /// Refuses a target outside the family before any request is made. A network and a forward are addressed in the default
+    /// project and in no other; every other kind is addressed in a kernel project.
+    fn check_family(&self, kind: IncusKind, project: &str) -> Result<(), EffectRefusal> {
+        let allowed = if arca_incus::write::network_home(kind) {
+            project == NETWORK_HOME
+        } else {
+            self.family.allows(project)
+        };
+        if allowed {
             Ok(())
         } else {
             Err(EffectRefusal::ProjectNotAllowed)
@@ -260,7 +273,10 @@ impl IncusProvider {
     }
 
     /// Refuses a write whose project does not enable the feature its kind needs. Without the feature, Incus routes the write to
-    /// the default project. An instance and a project need no feature. The check runs for every write, a delete included.
+    /// the default project. An instance and a project need no feature, and neither does a network or a forward: those are
+    /// addressed in the default project, which holds them. An ACL is kept in its kernel project, as the kernel's ruling
+    /// stands, so it needs no feature either; `docs/OWNERSHIP.md` lists that as an assumption to confirm on a live host. The
+    /// check runs for every write, a delete included.
     fn check_features(
         &self,
         entry: &EntryId,
@@ -268,8 +284,11 @@ impl IncusProvider {
         project: &str,
     ) -> Result<(), EffectRefusal> {
         let needed = match kind {
-            IncusKind::Project | IncusKind::Instance => return Ok(()),
-            IncusKind::Network | IncusKind::Acl | IncusKind::Forward => "features.networks",
+            IncusKind::Project
+            | IncusKind::Instance
+            | IncusKind::Network
+            | IncusKind::Forward
+            | IncusKind::Acl => return Ok(()),
             IncusKind::Zone => "features.networks.zones",
             IncusKind::Profile => "features.profiles",
             IncusKind::Volume => "features.storage.volumes",
@@ -330,6 +349,7 @@ impl IncusProvider {
         entry: &EntryId,
         kind: IncusKind,
         project: &str,
+        parent: Option<&str>,
         name: &str,
         body: &Value,
     ) -> Result<Value, EffectRefusal> {
@@ -373,8 +393,16 @@ impl IncusProvider {
                 .chain([(RESTRICTED_KEY, "true")])
                 .collect();
             // A plugin may set a guarded key only to the value the kernel pins it at. Any other guarded key, pinned or not,
-            // would loosen the project, so it is refused before any request.
+            // would loosen the project, so it is refused before any request. The one exception is the list of bridges the
+            // project grants, which is checked name by name.
             for (key, set) in &config {
+                if key == NETWORK_ACCESS_KEY {
+                    let list = set.as_str().ok_or_else(|| {
+                        EffectRefusal::Provider("the bridge grant is not text".to_string())
+                    })?;
+                    self.check_network_access(entry, list)?;
+                    continue;
+                }
                 if !guarded_project_key(key) {
                     continue;
                 }
@@ -394,6 +422,14 @@ impl IncusProvider {
         if kind == IncusKind::Network {
             check_bridge_create(fields, &self.family.reserved_cidrs)?;
         }
+        if kind == IncusKind::Forward {
+            // A forward is made under its network, so the network must be the entry's own. A forward on another owner's bridge
+            // would change that bridge.
+            let network = parent.ok_or_else(|| {
+                EffectRefusal::Provider("a forward names its network".to_string())
+            })?;
+            self.read_for_plan(entry, &network_home_target(network))?;
+        }
         let mut text = BTreeMap::new();
         for (key, value) in &config {
             let Some(value) = value.as_str() else {
@@ -410,6 +446,20 @@ impl IncusProvider {
         let mut sent = fields.clone();
         sent.insert("config".to_string(), Value::Object(resolved));
         Ok(Value::Object(sent))
+    }
+
+    /// Checks the bridges a project grants its instances. The list is comma-separated, and each name is a plain name of a bridge in
+    /// the default project that carries the entry's mark. One name that fails refuses the whole list.
+    fn check_network_access(&self, entry: &EntryId, list: &str) -> Result<(), EffectRefusal> {
+        for name in list.split(',') {
+            if !plain_name(name) {
+                return Err(EffectRefusal::Provider(
+                    "the bridge grant names a network that is not a plain name".to_string(),
+                ));
+            }
+            self.read_for_plan(entry, &network_home_target(name))?;
+        }
+        Ok(())
     }
 
     /// The checks a change must pass against the object's current config: the keys are plain and not reserved, the object stays
@@ -443,7 +493,7 @@ impl IncusProvider {
         changes: Option<&BTreeMap<String, Option<String>>>,
         digest: Digest,
     ) -> Result<Planned, EffectRefusal> {
-        self.check_family(&object.project)?;
+        self.check_family(object.kind, &object.project)?;
         // The key rules come before any read, so a refused key sends no request at all.
         if let Some(changes) = changes {
             check_patch_keys(object.kind, changes)?;
@@ -725,7 +775,7 @@ impl IncusProvider {
                 "a retirement names the object's uuid".to_string(),
             ));
         }
-        self.check_family(&object.project)?;
+        self.check_family(object.kind, &object.project)?;
         self.check_features(entry, object.kind, &object.project)?;
         let writer = self.writer(entry)?;
         let owned = match writer.read_owned(object) {
@@ -797,12 +847,12 @@ impl Provider for IncusProvider {
             EffectOp::IncusCreate {
                 kind,
                 project,
+                parent,
                 name,
                 body,
-                ..
             } => {
-                self.check_family(project)?;
-                self.prepared_create(entry, *kind, project, name, body)?;
+                self.check_family(*kind, project)?;
+                self.prepared_create(entry, *kind, project, parent.as_deref(), name, body)?;
                 self.check_features(entry, *kind, project)?;
                 Ok(Planned {
                     class: class_of(*kind),
@@ -852,8 +902,9 @@ impl Provider for IncusProvider {
                         "a create's plan carries no pre-image".to_string(),
                     ));
                 }
-                self.check_family(project)?;
-                let sent = self.prepared_create(entry, *kind, project, name, body)?;
+                self.check_family(*kind, project)?;
+                let sent =
+                    self.prepared_create(entry, *kind, project, parent.as_deref(), name, body)?;
                 self.check_features(entry, *kind, project)?;
                 let target = ObjectRef {
                     kind: *kind,
@@ -880,7 +931,7 @@ impl Provider for IncusProvider {
                         "the plan names another class for this kind".to_string(),
                     ));
                 }
-                self.check_family(&object.project)?;
+                self.check_family(object.kind, &object.project)?;
                 self.check_features(entry, object.kind, &object.project)?;
                 let writer = self.writer(entry)?;
                 let owned = self.owned_for_write(entry, &writer, object)?;
@@ -931,7 +982,7 @@ impl Provider for IncusProvider {
         target: &ObjectRef,
         pre_image: Option<&BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
-        self.check_family(&target.project)?;
+        self.check_family(target.kind, &target.project)?;
         self.check_features(entry, target.kind, &target.project)?;
         let reading = match self.writer(entry)?.read_class(target) {
             Ok(reading) => reading,
@@ -961,18 +1012,30 @@ impl Provider for IncusProvider {
     }
 }
 
-/// The class an effect on a kind is journalled under: a project, an instance, a volume and a bucket are destructive to remove,
-/// and every other kind is revertible without loss.
+/// The address of a bridge in the default project, by its name. The provider reads it to check the entry's mark.
+fn network_home_target(name: &str) -> ObjectRef {
+    ObjectRef {
+        kind: IncusKind::Network,
+        project: NETWORK_HOME.to_string(),
+        parent: None,
+        name: name.to_string(),
+        uuid: None,
+    }
+}
+
+/// The class an effect on a kind is journalled under. A project, an instance, a volume, a bucket and a network are destructive to
+/// remove: a network is a bridge the default project shares, and an instance attached to it must go first, so its removal waits
+/// for an approved plan, which deletes the most recent object first. Every other kind is revertible without loss.
 fn class_of(kind: IncusKind) -> EffectClass {
     match kind {
-        IncusKind::Project | IncusKind::Instance | IncusKind::Volume | IncusKind::Bucket => {
-            EffectClass::B
+        IncusKind::Project
+        | IncusKind::Instance
+        | IncusKind::Volume
+        | IncusKind::Bucket
+        | IncusKind::Network => EffectClass::B,
+        IncusKind::Acl | IncusKind::Profile | IncusKind::Zone | IncusKind::Forward => {
+            EffectClass::A
         }
-        IncusKind::Network
-        | IncusKind::Acl
-        | IncusKind::Profile
-        | IncusKind::Zone
-        | IncusKind::Forward => EffectClass::A,
     }
 }
 

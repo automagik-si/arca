@@ -18,10 +18,12 @@ use arca_kernel::plugin::{
     EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
 };
 use arca_providers::incus::{Family, IncusProvider, RetainedSet};
-use arca_reconcile::probe::{PROBE_PLUGIN, ProbeSpec};
+use arca_reconcile::probe::{
+    DEFAULT_PROBE_IMAGE, PROBE_BRIDGE, PROBE_PLUGIN, ProbeOutcome, ProbeSpec,
+};
 use arca_reconcile::{PluginSet, Reconciler};
 use common::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The scratch project the probe makes. Its name carries the scratch prefix the family requires.
 const PROJECT: &str = "arcak-scratch-probe";
@@ -105,7 +107,21 @@ fn spec() -> ProbeSpec {
         cidr: "203.0.113.1/24".to_string(),
         listen: "203.0.113.10".to_string(),
         pool: "default".to_string(),
+        image: DEFAULT_PROBE_IMAGE.to_string(),
     }
+}
+
+/// The body of the one create of `kind` the spec makes.
+fn body_of(spec: &ProbeSpec, kind: IncusKind) -> Value {
+    spec.ops()
+        .into_iter()
+        .find_map(|op| match op {
+            EffectOp::IncusCreate {
+                kind: made, body, ..
+            } if made == kind => Some(body),
+            _ => None,
+        })
+        .expect("the spec makes one create of this kind")
 }
 
 /// The family the probe writes in: its scratch project, and the droidd project it must never touch.
@@ -343,8 +359,8 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
     assert!(!run.partial, "every class-B object is deleted");
     assert_eq!(
         run.deleted.len(),
-        4,
-        "the instance, the volume, the bucket and the project"
+        5,
+        "the instance, the volume, the bucket, the project and the bridge"
     );
     for target in &targets {
         assert!(
@@ -389,5 +405,159 @@ fn a_kill_before_each_effect_restarts_to_agreement() {
 fn a_kill_after_each_effect_restarts_to_agreement() {
     for index in 0..CREATES {
         kill_then_restart(Some((index, Phase::After)));
+    }
+}
+
+#[test]
+fn the_probe_instance_has_an_image_source_a_root_disk_and_a_nic_on_the_probe_bridge() {
+    let spec = spec();
+    let instance = body_of(&spec, IncusKind::Instance);
+    assert_eq!(
+        instance["source"],
+        json!({"type": "image", "alias": DEFAULT_PROBE_IMAGE})
+    );
+    assert_eq!(
+        instance["devices"]["root"],
+        json!({"type": "disk", "path": "/", "pool": "default"})
+    );
+    assert_eq!(
+        instance["devices"]["eth0"],
+        json!({"type": "nic", "network": PROBE_BRIDGE})
+    );
+
+    let other = ProbeSpec {
+        image: "busybox/1.36".to_string(),
+        ..spec.clone()
+    };
+    assert_eq!(
+        body_of(&other, IncusKind::Instance)["source"]["alias"],
+        json!("busybox/1.36"),
+        "the image alias is configurable"
+    );
+
+    let targets = spec.targets();
+    let bridge = targets
+        .iter()
+        .find(|target| target.kind == IncusKind::Network)
+        .expect("the spec makes a network");
+    assert_eq!(
+        (bridge.project.as_str(), bridge.name.as_str()),
+        ("default", PROBE_BRIDGE),
+        "the bridge is addressed in default"
+    );
+    let forward = targets
+        .iter()
+        .find(|target| target.kind == IncusKind::Forward)
+        .expect("the spec makes a forward");
+    assert_eq!(
+        (forward.project.as_str(), forward.parent.as_deref()),
+        ("default", Some(PROBE_BRIDGE)),
+        "the forward hangs off the bridge in default"
+    );
+    assert_eq!(
+        body_of(&spec, IncusKind::Project)["config"]["restricted.networks.access"],
+        json!(PROBE_BRIDGE),
+        "the project grants its instances the bridge"
+    );
+}
+
+/// The outcome the probe recorded for `kind`.
+fn outcome_of(rows: &[arca_reconcile::probe::ProbeRow], kind: IncusKind) -> ProbeOutcome {
+    rows.iter()
+        .find(|row| row.kind == kind)
+        .map(|row| row.outcome.clone())
+        .expect("the probe records a row for every kind")
+}
+
+#[test]
+fn a_refused_create_does_not_stop_the_probe_and_each_kind_is_recorded() {
+    let scratch = Scratch::new("probe-refused");
+    let fake = start_fake(&scratch);
+    // Incus refuses an ACL that carries a config. Every other kind is still made.
+    fake.set_reject_config_on_post("/1.0/network-acls");
+    let journal = scratch.path("journal.jsonl");
+    let mut reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    let rows = reconciler
+        .probe_create(&spec(), NOW)
+        .expect("the probe runs to its end");
+    assert_eq!(rows.len(), CREATES, "one row per kind");
+    assert!(
+        matches!(outcome_of(&rows, IncusKind::Acl), ProbeOutcome::Refused(_)),
+        "{:?}",
+        outcome_of(&rows, IncusKind::Acl)
+    );
+    for kind in [
+        IncusKind::Project,
+        IncusKind::Instance,
+        IncusKind::Network,
+        IncusKind::Profile,
+        IncusKind::Volume,
+        IncusKind::Zone,
+        IncusKind::Forward,
+        IncusKind::Bucket,
+    ] {
+        assert_eq!(
+            outcome_of(&rows, kind),
+            ProbeOutcome::Created,
+            "{kind:?} is made after the refusal"
+        );
+    }
+    for target in spec().targets() {
+        if target.kind != IncusKind::Acl {
+            assert!(
+                present(&fake, &target),
+                "{:?} {} exists",
+                target.kind,
+                target.name
+            );
+        }
+    }
+}
+
+#[test]
+fn a_kind_on_a_failed_dependency_is_not_attempted_and_names_what_it_needs() {
+    let scratch = Scratch::new("probe-needs");
+    let fake = start_fake(&scratch);
+    // Incus refuses the bridge's create. The project grants the bridge, so it needs the bridge; every other kind needs
+    // the project, or the bridge for a forward.
+    fake.set_reject_config_on_post("/1.0/networks");
+    let journal = scratch.path("journal.jsonl");
+    let mut reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    let rows = reconciler
+        .probe_create(&spec(), NOW)
+        .expect("the probe runs to its end");
+    assert!(matches!(
+        outcome_of(&rows, IncusKind::Network),
+        ProbeOutcome::Refused(_)
+    ));
+    assert_eq!(
+        outcome_of(&rows, IncusKind::Project),
+        ProbeOutcome::NotAttempted {
+            needs: IncusKind::Network
+        }
+    );
+    assert_eq!(
+        outcome_of(&rows, IncusKind::Instance),
+        ProbeOutcome::NotAttempted {
+            needs: IncusKind::Project
+        }
+    );
+    assert_eq!(
+        outcome_of(&rows, IncusKind::Forward),
+        ProbeOutcome::NotAttempted {
+            needs: IncusKind::Network
+        }
+    );
+    assert_eq!(
+        outcome_of(&rows, IncusKind::Bucket).to_string(),
+        "not-attempted: needs project"
+    );
+    for target in spec().targets() {
+        assert!(
+            !present(&fake, &target),
+            "{:?} {} was not made",
+            target.kind,
+            target.name
+        );
     }
 }

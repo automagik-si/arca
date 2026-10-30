@@ -14,8 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arca_incus::{
-    FakeIncus, FakeState, IncusError, Owned, ProjectFamily, Reading, Target, Unconfirmed,
-    UnixIncusWriter,
+    FakeIncus, FakeState, IncusError, IncusRead, Owned, ProjectFamily, Reading, Target,
+    Unconfirmed, UnixIncus, UnixIncusWriter,
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
@@ -54,8 +54,16 @@ impl Drop for Scratch {
     }
 }
 
+/// The fixture with the bridges the host keeps in `default`: `kbr` is the entry `toy`'s, and `plainbr` carries no mark.
 fn fixture() -> FakeState {
-    FakeState::load(Path::new(FIXTURE)).expect("load the fixture")
+    let mut state = FakeState::load(Path::new(FIXTURE)).expect("load the fixture");
+    state.networks = vec![
+        json!({"name": "kbr", "project": "default", "type": "bridge", "config": {
+            "ipv4.address": "192.0.2.1/24", "ipv6.address": "none", MARK: "toy"}}),
+        json!({"name": "plainbr", "project": "default", "type": "bridge", "config": {
+            "ipv4.address": "192.0.2.2/24", "ipv6.address": "none"}}),
+    ];
+    state
 }
 
 fn start(tag: &str) -> (Scratch, FakeIncus) {
@@ -392,7 +400,10 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     let writer = writer(&fake, "toy");
     // The forward's network is made first and kept, so the forward's parent exists when its turn comes.
     writer
-        .create(&target(IncusKind::Network, "svc", "fnet1", None), &marked())
+        .create(
+            &target(IncusKind::Network, "default", "fnet1", None),
+            &marked(),
+        )
         .expect("the forward's network");
     let cases = [
         (IncusKind::Project, "kproj1", None),
@@ -406,10 +417,10 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
         (IncusKind::Forward, "192.0.2.10", Some("fnet1")),
     ];
     for (kind, name, parent) in cases {
-        let project = if kind == IncusKind::Project {
-            name
-        } else {
-            "svc"
+        let project = match kind {
+            IncusKind::Project => name,
+            IncusKind::Network | IncusKind::Forward => "default",
+            _ => "svc",
         };
         let target = target(kind, project, name, parent);
         let created = writer.create(&target, &marked()).expect("create");
@@ -657,6 +668,105 @@ fn a_target_outside_the_kernel_family_is_refused_before_any_request() {
 }
 
 #[test]
+fn a_non_network_create_in_default_is_refused_before_any_request_at_the_writer() {
+    let (_dir, fake) = start("default-kinds");
+    let writer = writer(&fake, "toy");
+    let requests = fake.requests().len();
+    let before = write_count(&fake);
+    for (kind, parent, name) in [
+        (IncusKind::Instance, None, "kd1"),
+        (IncusKind::Acl, None, "kd2"),
+        (IncusKind::Profile, None, "kd3"),
+        (IncusKind::Zone, None, "kd4"),
+        (IncusKind::Volume, Some("default"), "kd5"),
+        (IncusKind::Bucket, Some("default"), "kd6"),
+    ] {
+        let refused = writer
+            .create(&target(kind, "default", name, parent), &marked())
+            .expect_err("a non-network object in default");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{kind:?}: {refused:?}"
+        );
+    }
+    assert_eq!(write_count(&fake), before, "no write reached the fake");
+    assert_eq!(fake.requests().len(), requests, "not even a read was sent");
+}
+
+#[test]
+fn a_forward_is_refused_before_any_write_when_its_network_is_not_the_entrys() {
+    let (_dir, fake) = start("forward-parent");
+    let writer = writer(&fake, "toy");
+    let before = write_count(&fake);
+    let on_plain = writer.create(
+        &target(IncusKind::Forward, "default", "192.0.2.10", Some("plainbr")),
+        &marked(),
+    );
+    assert!(
+        matches!(on_plain, Err(IncusError::Refused(_))),
+        "{on_plain:?}"
+    );
+    assert_eq!(
+        write_count(&fake),
+        before,
+        "no forward was written under an unmarked bridge"
+    );
+
+    writer
+        .create(
+            &target(IncusKind::Forward, "default", "192.0.2.10", Some("kbr")),
+            &marked(),
+        )
+        .expect("a forward under the entry's own bridge");
+    assert_eq!(
+        fake.writes()
+            .last()
+            .map(|w| (w.method.clone(), w.path.clone())),
+        Some((
+            "POST".to_string(),
+            "/1.0/networks/kbr/forwards?project=default".to_string()
+        ))
+    );
+}
+
+#[test]
+fn a_nic_on_a_network_the_restricted_project_does_not_list_is_refused_by_incus() {
+    let (_dir, fake) = start("restricted-nic");
+    let writer = writer(&fake, "toy");
+    writer
+        .create(
+            &project_target("kproj1"),
+            &json!({"config": {MARK: "toy", "restricted": "true", "restricted.networks.access": "knet1"}}),
+        )
+        .expect("a project that lists knet1");
+    writer
+        .create(
+            &project_target("kcan"),
+            &json!({"config": {MARK: "toy", "restricted": "true", "restricted.networks.access": "other1"}}),
+        )
+        .expect("a project that lists another network");
+    let on = |network: &str| json!({"config": {MARK: "toy"}, "devices": {"eth0": {"type": "nic", "network": network}}});
+    writer
+        .create(
+            &target(IncusKind::Instance, "kproj1", "ri1", None),
+            &on("knet1"),
+        )
+        .expect("an instance on a network its project lists");
+    let refused = writer
+        .create(
+            &target(IncusKind::Instance, "kcan", "ri2", None),
+            &on("knet1"),
+        )
+        .expect_err("an instance on a network its project does not list");
+    assert_eq!(status_of(&refused), Some(403), "{refused:?}");
+    let gone = writer.get_etag(&target(IncusKind::Instance, "kcan", "ri2", None));
+    assert_eq!(
+        status_of(&gone.expect_err("nothing was created")),
+        Some(404)
+    );
+}
+
+#[test]
 fn the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_project() {
     assert!(ProjectFamily::new(["bench"], NONE).is_err());
     assert!(ProjectFamily::new(["default"], NONE).is_err());
@@ -667,10 +777,41 @@ fn the_family_is_refused_at_construction_when_it_names_a_reserved_or_droidd_proj
         "a name that is not a plain segment"
     );
     let family = ProjectFamily::new(["svc"], ["droid"]).expect("a family");
-    assert!(family.allows("svc"));
-    assert!(!family.allows("droid"));
-    assert!(!family.allows("default"));
-    assert!(!family.allows("bench"));
+    assert!(family.allows(IncusKind::Instance, "svc"));
+    assert!(!family.allows(IncusKind::Instance, "droid"));
+    assert!(!family.allows(IncusKind::Instance, "default"));
+    assert!(!family.allows(IncusKind::Instance, "bench"));
+}
+
+#[test]
+fn networks_and_forwards_are_addressed_in_default_and_no_other_kind_is() {
+    let family = ProjectFamily::new(["svc"], ["droid"]).expect("a family");
+    assert!(family.allows(IncusKind::Network, "default"));
+    assert!(family.allows(IncusKind::Forward, "default"));
+    for kind in [
+        IncusKind::Project,
+        IncusKind::Instance,
+        IncusKind::Acl,
+        IncusKind::Profile,
+        IncusKind::Zone,
+        IncusKind::Volume,
+        IncusKind::Bucket,
+    ] {
+        assert!(
+            !family.allows(kind, "default"),
+            "{kind:?} is not addressed in default"
+        );
+    }
+    assert!(
+        !family.allows(IncusKind::Network, "svc"),
+        "a network is not addressed in a kernel project"
+    );
+    assert!(
+        !family.allows(IncusKind::Forward, "svc"),
+        "a forward is not addressed in a kernel project"
+    );
+    assert!(!family.allows(IncusKind::Network, "bench"));
+    assert!(!family.allows(IncusKind::Network, "droid"));
 }
 
 #[test]
@@ -1038,9 +1179,12 @@ fn a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid() {
 
     // A network has no uuid, so a target that names one never reads as that network.
     writer
-        .create(&target(IncusKind::Network, "svc", "mn1", None), &marked())
+        .create(
+            &target(IncusKind::Network, "default", "mn1", None),
+            &marked(),
+        )
         .expect("a network");
-    let mut named_network = target(IncusKind::Network, "svc", "mn1", None);
+    let mut named_network = target(IncusKind::Network, "default", "mn1", None);
     named_network.uuid = Some(uuid);
     assert!(matches!(
         writer.read_owned(&named_network),
@@ -1460,7 +1604,7 @@ fn a_create_that_the_switch_rejects_is_refused_by_the_fake_and_nothing_is_stored
     let (_dir, fake) = start("reject");
     fake.set_reject_config_on_post("/1.0/networks");
     let writer = writer(&fake, "toy");
-    let target = target(IncusKind::Network, "svc", "rn1", None);
+    let target = target(IncusKind::Network, "default", "rn1", None);
     let rejected = writer
         .create(&target, &marked())
         .expect_err("the fake rejects config");
@@ -1598,4 +1742,14 @@ fn read_class_refuses_a_target_outside_the_family_before_any_request() {
     let result = writer.read_class(&target(IncusKind::Instance, "default", "guest1", None));
     assert!(matches!(result, Err(IncusError::Refused(_))), "{result:?}");
     assert!(fake.requests().is_empty(), "no request was made");
+}
+
+#[test]
+fn a_network_read_in_a_project_without_the_networks_key_is_served_from_default() {
+    // Incus gives a project that does not enable networks the networks of the default project, so the fake does the same.
+    let (_dir, fake) = start("routing");
+    let served = UnixIncus::new(fake.socket().to_path_buf()).get("/1.0/networks/kbr?project=svc");
+    let served = served.expect("the default project's bridge answers for svc");
+    assert_eq!(served["name"], json!("kbr"), "{served}");
+    assert_eq!(served["project"], json!("default"), "{served}");
 }
