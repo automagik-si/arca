@@ -1,5 +1,6 @@
-//! Arca's Incus access. The read client sends only GET. The writer is the one module that sends POST, PATCH or DELETE. It is
-//! compiled only with the `write` feature, and every write it sends is gated by the project family and the ownership classifier.
+//! Arca's Incus access. The read client sends only GET. The writer is the one module that sends POST, PATCH, PUT or DELETE, and it
+//! sends a PUT only for a project's config. It is compiled only with the `write` feature, and every write it sends is gated by the
+//! project family and the ownership classifier.
 //! The recording shim answers any method other than GET with 405 without forwarding it. The fake Incus serves a fixture and
 //! accepts the writer's requests in memory.
 

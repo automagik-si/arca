@@ -4,11 +4,17 @@
 //! Every write is gated twice. The project family is checked first: a target outside the projects the kernel's configuration
 //! names is refused before any request. The ownership classifier is checked next: a read returns an [`Owned`] only when
 //! `kernel_may_write` allows the writer's entry to change the object, so a PATCH, a tombstone or a DELETE can name only an
-//! object the entry owns. A PATCH and a tombstone send the ETag of the read they were checked against as `If-Match`. A DELETE
-//! reads the object again first, because Incus checks no ETag on a DELETE. A create is refused unless its body classes as the
-//! entry's own, its source is an image (a local one, or one on the one pinned image server), and its name is free. A retiring
-//! project's DELETE is preceded by the DELETE of each image in its own store, which is the project's by containment. Writes are
-//! POST, PATCH and DELETE; nothing here sends PUT.
+//! object the entry owns. A config change and a tombstone send the ETag of the read they were checked against as `If-Match`. A
+//! DELETE reads the object again first, because Incus checks no ETag on a DELETE. A create is refused unless its body classes as
+//! the entry's own, its source is an image (a local one, or one on the one pinned image server), and its name is free. A retiring
+//! project's DELETE is preceded by the DELETE of each image in its own store, which is the project's by containment.
+//!
+//! Writes are POST, PATCH, PUT and DELETE. A PATCH carries only the config keys it changes, and it is sent to every kind but a
+//! project. A project's config change and its tombstone are a PUT of the project's whole config, with the change applied, and of
+//! the description, both as the read showed them: Incus 7.3's project PATCH replaces the whole config with the keys it names
+//! (`projectPatch` in `cmd/incusd/api_project.go` copies the old keys into the raw request map, not into the request it applies),
+//! so a PATCH of one key would drop the kernel's mark, `restricted` and every feature. Nothing else is sent as a PUT, and nothing
+//! sends a PATCH to a project.
 //!
 //! A write whose answer is sync, or names no operation, is done. One that names an operation is waited on until it succeeds,
 //! fails, or passes the writer's deadline. A write that Incus accepted and whose read-back does not confirm it is
@@ -76,6 +82,8 @@ pub struct Owned {
     uuid: Option<String>,
     config: BTreeMap<String, String>,
     tombstone: Option<String>,
+    /// The object's description, as read. A project's PUT sends it back unchanged, since a PUT replaces it too.
+    description: String,
 }
 
 impl Owned {
@@ -228,7 +236,8 @@ impl UnixIncusWriter {
         self.allow_target(target)?;
         let (metadata, etag) = self.fetch(target)?;
         let config = own_config(&metadata)?;
-        self.classed(target, etag, config)
+        let description = own_description(&metadata)?;
+        self.classed(target, etag, config, description)
             .map_err(|unread| refused(&unread.reason))
     }
 
@@ -282,9 +291,11 @@ impl UnixIncusWriter {
         self.confirm(target, |_| Ok(()))
     }
 
-    /// Sets and removes config keys of an object this entry owns, under the ETag of `owned`. A removed key is sent as the empty
-    /// string. The change must leave the object classed as this entry's own, and it may not name the tombstone key, a key that
-    /// is not plain ASCII, or a `volatile.*` key. The object is read back, and the read must show the change.
+    /// Sets and removes config keys of an object this entry owns, under the ETag of `owned`. The change must leave the object
+    /// classed as this entry's own, and it may not name the tombstone key, a key that is not plain ASCII, or a `volatile.*` key.
+    /// It is sent as [`Self::send_config`] sends it: a PATCH of the changed keys, where a removed key is the empty string, or for a
+    /// project a PUT of the whole config. The object is read back, and the read must show the change, and for a project every key
+    /// the PUT sent.
     pub fn patch(
         &self,
         owned: &Owned,
@@ -311,29 +322,26 @@ impl UnixIncusWriter {
                 "the change would leave the object owned by another owner",
             ));
         }
-        let urls = urls(&owned.target)?;
-        self.mutate(
-            "PATCH",
-            &urls.object,
-            Some(&owned.etag),
-            Some(&config_patch(changes)),
-        )?;
+        let whole = self.send_config(owned, changes, &after)?;
         let expected = changes.clone();
         self.confirm(&owned.target, move |fresh| {
             let shows = expected.iter().all(|(key, value)| {
                 fresh.config().get(key).map(String::as_str) == value.as_deref()
             });
-            if shows {
-                Ok(())
-            } else {
+            if !shows {
                 Err("the read-back does not show the change".to_string())
+            } else if !holds_sent(fresh, whole.as_ref()) {
+                Err("the read-back lost a key the whole config sent".to_string())
+            } else {
+                Ok(())
             }
         })
     }
 
-    /// Marks an object as retiring with the digest of its delete plan, under the ETag of `owned`, then reads it back. The
-    /// read must show the same uuid, this entry's mark and the tombstone. The result is the only input [`Self::delete`]
-    /// takes.
+    /// Marks an object as retiring with the digest of its delete plan, under the ETag of `owned`, then reads it back. It is sent
+    /// as [`Self::send_config`] sends a change, so a project's tombstone is a PUT of its whole config with the tombstone added. The
+    /// read must show the same uuid, this entry's mark and the tombstone, and for a project every key the PUT sent. The result is
+    /// the only input [`Self::delete`] takes.
     pub fn tombstone(&self, owned: &Owned, plan: &Digest) -> Result<Owned, IncusError> {
         self.check(owned)?;
         let value = plan.to_hex();
@@ -352,23 +360,45 @@ impl UnixIncusWriter {
                 "the tombstone would leave the object owned by another owner",
             ));
         }
-        let urls = urls(&owned.target)?;
-        self.mutate(
-            "PATCH",
-            &urls.object,
-            Some(&owned.etag),
-            Some(&config_patch(&changes)),
-        )?;
+        let whole = self.send_config(owned, &changes, &after)?;
         let uuid = owned.uuid.clone();
         self.confirm(&owned.target, move |fresh| {
             if fresh.uuid() != uuid.as_deref() {
                 Err("the read-back names another uuid".to_string())
             } else if fresh.tombstone() != Some(value.as_str()) {
                 Err("the read-back does not show the tombstone".to_string())
+            } else if !holds_sent(fresh, whole.as_ref()) {
+                Err("the read-back lost a key the whole config sent".to_string())
             } else {
                 Ok(())
             }
         })
+    }
+
+    /// Sends a config change under the ETag of `owned`, which the classifier checked. Every kind but a project takes a PATCH of
+    /// the changed keys alone. A project takes a PUT of `after`, its whole config with the change applied, and of the description
+    /// the read showed: Incus 7.3's project PATCH would replace the whole config with the keys it named. Incus checks a PUT's
+    /// `If-Match` against the project's description and config, so a project changed since the read is 412 and changes nothing,
+    /// as a stale PATCH is. Returns the whole config a PUT sent, which the read-back must hold.
+    fn send_config(
+        &self,
+        owned: &Owned,
+        changes: &BTreeMap<String, Option<String>>,
+        after: &BTreeMap<String, String>,
+    ) -> Result<Option<BTreeMap<String, String>>, IncusError> {
+        let urls = urls(&owned.target)?;
+        if owned.target.kind != IncusKind::Project {
+            self.mutate(
+                "PATCH",
+                &urls.object,
+                Some(&owned.etag),
+                Some(&config_patch(changes)),
+            )?;
+            return Ok(None);
+        }
+        let body = json!({ "description": owned.description, "config": after });
+        self.mutate("PUT", &urls.object, Some(&owned.etag), Some(&body))?;
+        Ok(Some(after.clone()))
     }
 
     /// Deletes an object that carries its tombstone. The object is first read again, and it must show the same tombstone, and the same uuid where Incus gives one. A
@@ -472,6 +502,7 @@ impl UnixIncusWriter {
         target: &Target,
         etag: String,
         config: BTreeMap<String, String>,
+        description: String,
     ) -> Result<Owned, Unread> {
         let class = classify(&config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
@@ -494,6 +525,7 @@ impl UnixIncusWriter {
             uuid,
             tombstone: config.get(KERNEL_RETIRING_KEY).cloned(),
             config,
+            description,
         })
     }
 
@@ -518,9 +550,11 @@ impl UnixIncusWriter {
             .map_err(|error| landed(None, None, format!("the read-back failed: {error}")))?;
         let config = own_config(&metadata)
             .map_err(|error| landed(None, None, format!("the read-back failed: {error}")))?;
+        let description = own_description(&metadata)
+            .map_err(|error| landed(None, None, format!("the read-back failed: {error}")))?;
         let uuid = uuid_of(target.kind, &config);
         let owned = self
-            .classed(target, etag, config)
+            .classed(target, etag, config, description)
             .map_err(|unread| landed(uuid.clone(), unread.owner, unread.reason))?;
         expect(&owned).map_err(|reason| {
             landed(
@@ -670,7 +704,7 @@ impl UnixIncusWriter {
         self.send_within(method, url, if_match, body, TIMEOUT)
     }
 
-    /// Builds the request and exchanges it under `timeout`. `method` is one of the three this module names, and `url` is
+    /// Builds the request and exchanges it under `timeout`. `method` is one of the four this module names, and `url` is
     /// checked as a plain origin-form target before the socket is touched. A request refused here is never sent.
     fn send_within(
         &self,
@@ -920,6 +954,25 @@ fn own_config(metadata: &Value) -> Result<BTreeMap<String, String>, IncusError> 
         .and_then(Value::as_object)
         .ok_or_else(|| decode("the object has no config object"))?;
     text_map(config).ok_or_else(|| decode("a config value is not text"))
+}
+
+/// The object's description, from its `description` field: empty when the object has none, and a decode error when it is not
+/// text.
+fn own_description(metadata: &Value) -> Result<String, IncusError> {
+    match metadata.get("description") {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(text)) => Ok(text.clone()),
+        Some(_) => Err(decode("the object's description is not text")),
+    }
+}
+
+/// Whether a read-back holds every key of the whole config a PUT sent, with the value it sent. A write that was not a PUT sent
+/// no whole config, so there is nothing more to hold.
+fn holds_sent(fresh: &Owned, whole: Option<&BTreeMap<String, String>>) -> bool {
+    whole.is_none_or(|sent| {
+        sent.iter()
+            .all(|(key, value)| fresh.config().get(key) == Some(value))
+    })
 }
 
 /// The config after a change: a `Some` sets a key and a `None` removes it.
