@@ -103,6 +103,10 @@ fn read_refusal(error: IncusError) -> EffectRefusal {
         IncusError::Decode(_) => "the Incus answer is not in the expected shape".to_string(),
         IncusError::Timeout => "Incus did not answer in time".to_string(),
         IncusError::TooLarge => "the Incus answer is too large".to_string(),
+        IncusError::Refused(_) => "the Incus request was refused before it was sent".to_string(),
+        IncusError::AppliedUnconfirmed(_) => {
+            "the Incus write landed but was not confirmed".to_string()
+        }
     };
     EffectRefusal::Provider(reason)
 }
