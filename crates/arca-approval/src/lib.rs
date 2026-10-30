@@ -68,8 +68,9 @@ pub enum ApprovalRefusal {
     TtlTooLong,
     /// The statement's nonce is spent.
     Replayed,
-    /// A file that holds the owner's trust (the signers file, the nonce file, or a directory above either) cannot be
-    /// trusted. The text names the file and the rule it broke, never a key.
+    /// A file that holds the owner's trust (the signers file, or the nonce file) cannot be trusted, or a directory
+    /// above the signers file cannot be. The nonce file's directory is not checked: the caller keeps the state
+    /// directory at mode 0700. The text names the file and the rule it broke, never a key.
     Untrusted(String),
     /// The nonce store could not be read, or a spend could not be made durable. Nothing was allowed.
     Storage(String),

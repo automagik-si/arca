@@ -244,6 +244,23 @@ fn an_ordinary_ed25519_signature_is_refused_as_not_hardware() {
 }
 
 #[test]
+fn a_signature_relabelled_to_another_algorithm_is_refused_as_not_hardware() {
+    // A genuine owner signature whose algorithm name is changed, with its bytes framed to match, still verifies under
+    // the key: neither the name nor the framing is signed. Only sk-ssh-ed25519 may pass.
+    let key = owner();
+    let statement = statement_with(serde_json::json!({}));
+    let verifier = verifier_for(&key);
+    for label in ["rsa-sha2-512", "x@example.com"] {
+        let relabelled = key.sign_as(ARCA_NAMESPACE, statement.as_bytes(), label);
+        assert_eq!(
+            refusal(&verifier, ARCA_NAMESPACE, &statement, &relabelled),
+            ApprovalRefusal::NotHardwareKey,
+            "a signature labelled {label} is not an sk-ssh-ed25519 signature"
+        );
+    }
+}
+
+#[test]
 fn a_hardware_key_the_signers_list_does_not_hold_is_refused_as_bad_signature() {
     let listed = owner();
     let stranger = SkKey::from_seed(OTHER_SEED);

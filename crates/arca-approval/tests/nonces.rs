@@ -136,6 +136,23 @@ fn a_symlinked_nonce_file_is_refused() {
 }
 
 #[test]
+fn a_dangling_symlink_at_the_nonce_path_is_refused_and_its_target_is_not_created() {
+    // An open with create would create the file the link names. The refusal must come before any create.
+    let dir = Scratch::new("dangling");
+    let target = dir.path("created-by-open.jsonl");
+    let link = dir.path("nonces.jsonl");
+    std::os::unix::fs::symlink(&target, &link).expect("the symlink is made");
+    assert!(matches!(
+        FileNonces::open(&link),
+        Err(ApprovalRefusal::Untrusted(_))
+    ));
+    assert!(
+        fs::symlink_metadata(&target).is_err(),
+        "the link's target must not be created"
+    );
+}
+
+#[test]
 fn a_second_open_of_a_held_file_is_refused() {
     let dir = Scratch::new("locked");
     let path = dir.path("nonces.jsonl");

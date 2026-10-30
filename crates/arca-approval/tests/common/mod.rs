@@ -126,15 +126,48 @@ impl SkKey {
     /// As `sign`, with the flags the authenticator signed (`signed`) and the flags the signature carries (`sent`).
     /// Equal values give a signature a real authenticator could make. Unequal ones give a forgery attempt.
     pub fn sign_flags(&self, namespace: &str, message: &[u8], signed: u8, sent: u8) -> String {
-        self.build(namespace, message, signed, sent, false)
+        let (ed, counter) = self.ed25519(namespace, message, signed, false);
+        let mut sig = Vec::new();
+        put(&mut sig, SK_TYPE.as_bytes());
+        put(&mut sig, &ed);
+        sig.push(sent);
+        sig.extend_from_slice(&counter.to_be_bytes());
+        armour(&sshsig(&self.blob(), namespace, &sig))
     }
 
     /// A signature whose ed25519 bytes are altered after signing, with the flags as they were signed.
     pub fn sign_tampered(&self, namespace: &str, message: &[u8]) -> String {
-        self.build(namespace, message, 0x01, 0x01, true)
+        let (ed, counter) = self.ed25519(namespace, message, 0x01, true);
+        let mut sig = Vec::new();
+        put(&mut sig, SK_TYPE.as_bytes());
+        put(&mut sig, &ed);
+        sig.push(0x01);
+        sig.extend_from_slice(&counter.to_be_bytes());
+        armour(&sshsig(&self.blob(), namespace, &sig))
     }
 
-    fn build(&self, namespace: &str, message: &[u8], signed: u8, sent: u8, tamper: bool) -> String {
+    /// A genuine signature with its algorithm name changed to `label`. The name and the framing after it are outside
+    /// what the authenticator signs, so the relabel keeps the ed25519 signature valid. The ed25519 bytes, flags and
+    /// counter are packed into one string, the only framing another algorithm name reads without trailing data.
+    pub fn sign_as(&self, namespace: &str, message: &[u8], label: &str) -> String {
+        let (ed, counter) = self.ed25519(namespace, message, 0x01, false);
+        let mut packed = ed.to_vec();
+        packed.push(0x01);
+        packed.extend_from_slice(&counter.to_be_bytes());
+        let mut sig = Vec::new();
+        put(&mut sig, label.as_bytes());
+        put(&mut sig, &packed);
+        armour(&sshsig(&self.blob(), namespace, &sig))
+    }
+
+    /// The ed25519 signature over the sk signed data for `signed` flags, and the counter the signature carries.
+    fn ed25519(
+        &self,
+        namespace: &str,
+        message: &[u8],
+        signed: u8,
+        tamper: bool,
+    ) -> ([u8; 64], u32) {
         let counter: u32 = 7;
         let data = signed_data(namespace, message);
         let mut inner = Vec::new();
@@ -146,12 +179,7 @@ impl SkKey {
         if tamper {
             ed[0] ^= 0x01;
         }
-        let mut sig = Vec::new();
-        put(&mut sig, SK_TYPE.as_bytes());
-        put(&mut sig, &ed);
-        sig.push(sent);
-        sig.extend_from_slice(&counter.to_be_bytes());
-        armour(&sshsig(&self.blob(), namespace, &sig))
+        (ed, counter)
     }
 }
 

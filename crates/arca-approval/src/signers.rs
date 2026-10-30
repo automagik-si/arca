@@ -15,8 +15,10 @@ use crate::{ARCA_NAMESPACE, ApprovalRefusal};
 pub const OWNER_SIGNERS: &str = "/etc/arca/owner-signers";
 /// The prefix every project of a scratch kernel carries, and the only projects the test injection may serve.
 pub const SCRATCH_PREFIX: &str = "arcak-scratch-";
-/// Whether this build honours the scratch-only test injection at all. Only a build with debug assertions does, so no
-/// release profile can enable it, whatever features or flags it is built with.
+/// Whether this build honours the scratch-only test injection at all. Only a build with debug assertions does. A
+/// release build can turn debug assertions on through its profile or `-C debug-assertions`, and then it honours the
+/// injection too. The scratch check in `signers_trust` still applies in that build, so the injection never serves a
+/// production kernel.
 pub const TEST_INJECTION_BUILT: bool = cfg!(debug_assertions);
 
 /// The largest signers file that is read, in bytes.

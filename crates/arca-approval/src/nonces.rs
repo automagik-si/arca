@@ -34,6 +34,8 @@ impl FileNonces {
     ///
     /// Refuses a symbolic link, a file that is not a regular file owned by this uid with mode exactly 0600, or a file that
     /// another open store holds. Refuses a complete record that is not a spent-nonce record, or a nonce spent twice.
+    ///
+    /// The directory that holds the file is not checked. The caller keeps the state directory at mode 0700.
     pub fn open(path: &Path) -> Result<Self, ApprovalRefusal> {
         let existed = match fs::symlink_metadata(path) {
             Ok(meta) => {

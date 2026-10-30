@@ -6,7 +6,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use ssh_key::{HashAlg, LineEnding, PublicKey, SshSig};
+use ssh_key::{Algorithm, HashAlg, LineEnding, PublicKey, SshSig};
 
 use crate::signers::SignerLine;
 use crate::verifier::SignatureVerifier;
@@ -66,9 +66,10 @@ impl SshSigVerifier {
 
 impl SignatureVerifier for SshSigVerifier {
     /// Refuses in this order: a namespace other than Arca's; a signature that is not one canonical SSHSIG version 1; a key
-    /// that is not a hardware key; a signature in another namespace than the one asked; no trusted key at all; a key the
-    /// signers file does not hold; a signature that does not verify over the statement's bytes; a signature without the
-    /// user-presence flag. Returns the key's fingerprint on a pass.
+    /// that is not a hardware key, or a signature whose algorithm is not `sk-ssh-ed25519@openssh.com`; a signature in
+    /// another namespace than the one asked; no trusted key at all; a key the signers file does not hold; a signature
+    /// that does not verify over the statement's bytes; a signature without the user-presence flag. Returns the key's
+    /// fingerprint on a pass.
     fn verify(
         &self,
         namespace: &str,
@@ -95,7 +96,9 @@ impl SignatureVerifier for SshSigVerifier {
             ));
         }
         let key_data = sshsig.public_key();
-        if key_data.sk_ed25519().is_none() {
+        // `ssh-key` checks the signature bytes under the key and not the algorithm name, so a genuine signature
+        // relabelled to another name would still verify. The name is checked here.
+        if key_data.sk_ed25519().is_none() || sshsig.algorithm() != Algorithm::SkEd25519 {
             return Err(ApprovalRefusal::NotHardwareKey);
         }
         if sshsig.namespace() != namespace {
