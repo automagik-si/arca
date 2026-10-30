@@ -2899,3 +2899,210 @@ fn an_acl_an_earlier_kernel_named_in_its_kernel_project_is_read_and_retired_in_d
     );
     assert_eq!(writes(&fake).len(), before, "nothing was written");
 }
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// A project's config: every write is a PUT of the whole config, since Incus 7.3's project PATCH replaces it
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// The PATCHes the fake received at a project's own path. A kernel path that sent one would have Incus 7.3 replace the project's
+/// whole config with the keys it named.
+fn project_patches(fake: &FakeIncus) -> Vec<(String, String)> {
+    writes(fake)
+        .into_iter()
+        .filter(|(method, path)| method == "PATCH" && path.starts_with("/1.0/projects/"))
+        .collect()
+}
+
+/// Makes the kernel project `kfam` for `toy` through the kernel, then puts an image in its own store, as a probe's instance or
+/// a copy by hand would, so the project is in use. Returns the project's address.
+fn kernel_project_in_use<S: JournalStore>(
+    provider: &mut IncusProvider,
+    fake: &FakeIncus,
+    journal: &mut Journal<S>,
+) -> ObjectRef {
+    let manifest = manifest();
+    Ctx::new(entry("toy"), &manifest, provider, journal, 1)
+        .effect(create(IncusKind::Project, "kfam", None, "kfam", json!({})))
+        .expect("the project is created");
+    fake.add_image("kfam", "alpine/edge");
+    object(IncusKind::Project, "kfam", None, "kfam")
+}
+
+#[test]
+fn a_project_patch_and_its_restore_are_puts_that_keep_every_other_key() {
+    let (scratch, fake) = start("project-patch-put");
+    let secrets = secrets_dir(&scratch);
+    let mut provider = provider(&fake, &secrets);
+    let manifest = manifest();
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let project = kernel_project_in_use(&mut provider, &fake, &mut journal);
+    let made = read(&fake, "/1.0/projects/kfam")["config"].clone();
+
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+        .effect(patch(project.clone(), &[("user.note", Some("plain"))]))
+        .expect("the project patch lands");
+    let mut noted = made.clone();
+    noted["user.note"] = json!("plain");
+    assert_eq!(read(&fake, "/1.0/projects/kfam")["config"], noted);
+
+    let restore = journalled_restore(&journal, "toy");
+    Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 3)
+        .effect(EffectOp::IncusPatchConfig {
+            object: project,
+            config: restore,
+        })
+        .expect("the restore lands");
+    assert_eq!(
+        read(&fake, "/1.0/projects/kfam")["config"],
+        made,
+        "the restore leaves the mark, restricted and every feature as they were made"
+    );
+    assert_eq!(project_patches(&fake), Vec::<(String, String)>::new());
+    let puts: Vec<(String, String)> = writes(&fake)
+        .into_iter()
+        .filter(|(method, _)| method == "PUT")
+        .collect();
+    assert_eq!(
+        puts,
+        vec![
+            method_path("PUT", "/1.0/projects/kfam"),
+            method_path("PUT", "/1.0/projects/kfam"),
+        ]
+    );
+}
+
+#[test]
+fn retire_of_a_project_in_use_tombstones_it_with_a_put_then_deletes_its_image_and_itself() {
+    let (scratch, fake) = start("project-retire-put");
+    let secrets = secrets_dir(&scratch);
+    let mut provider = provider(&fake, &secrets);
+    let mut journal = Journal::open(MemJournal::new()).expect("opens");
+    let project = kernel_project_in_use(&mut provider, &fake, &mut journal);
+    let plan = Digest::of(b"the approved plan");
+
+    assert_eq!(
+        provider.retire(&entry("toy"), &project, &plan),
+        Ok(Retirement::Deleted(project.clone()))
+    );
+    assert!(fake.images().is_empty(), "{:?}", fake.images());
+    let methods: Vec<String> = writes(&fake)
+        .into_iter()
+        .map(|(method, path)| format!("{method} {}", path.split('?').next().unwrap_or("")))
+        .map(|line| {
+            if line.starts_with("DELETE /1.0/images/") {
+                "DELETE image".to_string()
+            } else {
+                line
+            }
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "POST /1.0/projects".to_string(),
+            "PUT /1.0/projects/kfam".to_string(),
+            "DELETE image".to_string(),
+            "DELETE /1.0/projects/kfam".to_string(),
+        ]
+    );
+    assert_eq!(project_patches(&fake), Vec::<(String, String)>::new());
+}
+
+#[test]
+fn a_tombstone_refused_with_a_4xx_that_reads_back_without_it_is_drift_and_no_delete_is_sent() {
+    let plan = Digest::of(b"the approved plan");
+    let script = Script::start("tombstone-400", move |method, _| match method {
+        "GET" => object_reply(&r2(READ_UUID, None), "\"e1\""),
+        "PATCH" => http(400, None, &error_env(400)),
+        _ => not_found(),
+    });
+    let secrets = Scratch::new("secrets-tombstone-400");
+    let provider = script.provider(&secrets.0);
+    let target = ObjectRef {
+        uuid: Some(READ_UUID.to_string()),
+        ..object(IncusKind::Instance, "svc", None, "r2")
+    };
+    let outcome = provider
+        .retire(&entry("toy"), &target, &plan)
+        .expect("a refused tombstone is settled, not open");
+    assert!(matches!(outcome, Retirement::Drift(_)), "{outcome:?}");
+    assert_eq!(script.count("DELETE"), 0, "no DELETE was sent");
+    assert_eq!(
+        script.count("GET"),
+        2,
+        "the object was read, then read back after the refusal: {:?}",
+        script.seen()
+    );
+}
+
+#[test]
+fn a_project_tombstone_incus_refuses_with_400_is_drift_and_not_an_open_outcome() {
+    // On Incus 7.3 a project's tombstone was refused with 400, nothing landed, and the delete's intent was left open, so no
+    // later run could open the journal. A refusal whose read-back shows no tombstone is a delete that did not happen.
+    let plan = Digest::of(b"the approved plan");
+    let script = Script::start("project-tombstone-400", move |method, target| {
+        match (method, target) {
+            ("GET", "/1.0/projects/kfam") => object_reply(
+                &json!({"name": "kfam", "description": "", "config": {
+                    MARK: "toy", "restricted": "true", "features.images": "true"}}),
+                "\"p1\"",
+            ),
+            ("GET", _) => not_found(),
+            _ => http(400, None, &error_env(400)),
+        }
+    });
+    let secrets = Scratch::new("secrets-project-400");
+    let provider = script.provider(&secrets.0);
+    let outcome = provider
+        .retire(
+            &entry("toy"),
+            &object(IncusKind::Project, "kfam", None, "kfam"),
+            &plan,
+        )
+        .expect("a refused tombstone is settled, not open");
+    assert!(matches!(outcome, Retirement::Drift(_)), "{outcome:?}");
+    assert_eq!(script.count("DELETE"), 0, "no DELETE was sent");
+    assert_eq!(script.count("PATCH"), 0, "a project takes no PATCH");
+}
+
+#[test]
+fn a_tombstone_that_reads_back_after_a_4xx_or_is_answered_5xx_stays_unresolved() {
+    let plan = Digest::of(b"the approved plan");
+    let plan_hex = plan.to_hex();
+    let target = ObjectRef {
+        uuid: Some(READ_UUID.to_string()),
+        ..object(IncusKind::Instance, "svc", None, "r2")
+    };
+    // A 4xx whose read-back shows the tombstone: the write landed after all, so the outcome cannot be vouched for.
+    let mut step = 0;
+    let landed = Script::start("tombstone-400-landed", move |method, _| {
+        step += 1;
+        match (method, step) {
+            ("GET", 1) => object_reply(&r2(READ_UUID, None), "\"e1\""),
+            ("PATCH", 2) => http(400, None, &error_env(400)),
+            ("GET", _) => object_reply(&r2(READ_UUID, Some(&plan_hex)), "\"e2\""),
+            _ => not_found(),
+        }
+    });
+    let secrets = Scratch::new("secrets-tombstone-landed");
+    assert_eq!(
+        landed
+            .provider(&secrets.0)
+            .retire(&entry("toy"), &target, &plan),
+        Err(EffectRefusal::Unresolved)
+    );
+    assert_eq!(landed.count("DELETE"), 0);
+    // A 5xx says nothing about whether the write landed, so it stays open.
+    let failed = Script::start("tombstone-500", move |method, _| match method {
+        "GET" => object_reply(&r2(READ_UUID, None), "\"e1\""),
+        "PATCH" => http(500, None, &error_env(500)),
+        _ => not_found(),
+    });
+    assert_eq!(
+        failed
+            .provider(&secrets.0)
+            .retire(&entry("toy"), &target, &plan),
+        Err(EffectRefusal::Unresolved)
+    );
+    assert_eq!(failed.count("DELETE"), 0);
+}

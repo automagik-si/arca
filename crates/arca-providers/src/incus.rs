@@ -1,7 +1,8 @@
 //! The kernel's Incus write provider. It is the only code path in the kernel that writes to Incus. It sends only the writer's
-//! checked requests: a POST for a create, a PATCH under an `If-Match` for a config change, and the tombstone-then-DELETE sequence
-//! for a retirement. Each effect is planned read-only first. `plan` refuses before anything is journalled, and `effect` checks the
-//! family, the features, the ownership and the plan again before it applies anything. `docs/OWNERSHIP.md` states the rules.
+//! checked requests: a POST for a create, a config change under an `If-Match` (a PATCH, or for a project a PUT of its whole
+//! config), and the tombstone-then-DELETE sequence for a retirement. Each effect is planned read-only first. `plan` refuses
+//! before anything is journalled, and `effect` checks the family, the features, the ownership and the plan again before it
+//! applies anything. `docs/OWNERSHIP.md` states the rules.
 //!
 //! A write that Incus answered with an error, or that did not finish, may still have landed. The provider reads the object back
 //! before it decides the outcome, unless the answer could not be read at all: then it makes no read, since a read after a write
@@ -804,7 +805,8 @@ impl IncusProvider {
 
     /// Retires an object the entry owns, through an approved plan. The object is read, then tombstoned under its ETag and read
     /// back; the delete reads it again and sends nothing unless it still shows the tombstone and the same uuid. A change the reads
-    /// show is drift, and skips the delete. A stale ETag stops the sequence.
+    /// show is drift, and skips the delete. A stale ETag stops the sequence. A tombstone Incus refused with another 4xx is read
+    /// back (see [`settle_tombstone`]).
     pub fn retire(
         &self,
         entry: &EntryId,
@@ -846,6 +848,9 @@ impl IncusProvider {
             }
             Err(IncusError::Refused(reason)) => return Ok(Retirement::Drift(reason)),
             Err(IncusError::Status { code: 412, .. }) => return Err(EffectRefusal::Stale),
+            Err(IncusError::Status { code, .. }) if (400..500).contains(&code) => {
+                return settle_tombstone(&writer, object, plan, code);
+            }
             Err(_) => return Err(EffectRefusal::Unresolved),
         };
         match writer.delete(&tombstoned) {
@@ -1165,6 +1170,32 @@ fn settle_create(writer: &UnixIncusWriter, target: &ObjectRef, error: IncusError
         | IncusError::Timeout
         | IncusError::TooLarge
         | IncusError::AppliedUnconfirmed(_) => EffectRefusal::Unresolved,
+    }
+}
+
+/// The settled outcome of a tombstone Incus refused with a 4xx other than 412. A 4xx is Incus's refusal of the request, so the
+/// object is read back to see it. One that shows no tombstone of this plan, or is gone, was not tombstoned, so no delete followed
+/// and the retirement is a settled [`Retirement::Drift`]: the delete's intent is failed, not left open, and a later removal tries
+/// again. A read-back that shows the tombstone, or that cannot be read, cannot vouch for what happened, so it is
+/// [`EffectRefusal::Unresolved`].
+fn settle_tombstone(
+    writer: &UnixIncusWriter,
+    object: &ObjectRef,
+    plan: &Digest,
+    code: u16,
+) -> Result<Retirement, EffectRefusal> {
+    let tombstone = plan.to_hex();
+    match writer.read_class(object) {
+        Ok(reading)
+            if reading.config.get(KERNEL_RETIRING_KEY).map(String::as_str)
+                == Some(tombstone.as_str()) =>
+        {
+            Err(EffectRefusal::Unresolved)
+        }
+        Ok(_) | Err(IncusError::Status { code: 404, .. }) => Ok(Retirement::Drift(format!(
+            "Incus refused the tombstone with status {code}, and the object shows no tombstone"
+        ))),
+        Err(_) => Err(EffectRefusal::Unresolved),
     }
 }
 

@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arca_incus::write::{IMAGE_PROTOCOL, IMAGE_SERVER};
 use arca_incus::{
     FakeIncus, FakeState, IncusError, IncusRead, Owned, ProjectFamily, Reading, Target,
-    Unconfirmed, UnixIncus, UnixIncusWriter,
+    Unconfirmed, UnixIncus, UnixIncusWriter, WriteRecord,
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
@@ -151,6 +151,17 @@ fn raw(socket: &Path, request: &str) -> String {
 
 /// A raw PATCH to the fake, the way another writer's change would reach it.
 fn raw_patch(socket: &Path, path: &str, if_match: Option<&str>, body: &Value) -> String {
+    raw_write(socket, "PATCH", path, if_match, body)
+}
+
+/// A raw write with a JSON body to the fake, the way another writer's change would reach it.
+fn raw_write(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    if_match: Option<&str>,
+    body: &Value,
+) -> String {
     let body = body.to_string();
     let condition = if_match
         .map(|tag| format!("If-Match: {tag}\r\n"))
@@ -158,7 +169,7 @@ fn raw_patch(socket: &Path, path: &str, if_match: Option<&str>, body: &Value) ->
     raw(
         socket,
         &format!(
-            "PATCH {path} HTTP/1.1\r\nHost: incus\r\n{condition}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: incus\r\n{condition}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         ),
     )
@@ -460,11 +471,32 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     // Five writes per case, and the one create of the forward's network.
     let writes = fake.writes();
     assert_eq!(writes.len(), cases.len() * 5 + 1, "{writes:?}");
+    // A project's config is written with a PUT of its whole config, and every other kind's with a PATCH. No PATCH reaches a
+    // project, since Incus 7.3 would replace the project's config with the keys it names.
+    for write in &writes {
+        let project = write.path.starts_with("/1.0/projects/");
+        let allowed = match write.method.as_str() {
+            "POST" | "DELETE" => true,
+            "PUT" => project,
+            "PATCH" => !project,
+            _ => false,
+        };
+        assert!(allowed, "{write:?}");
+    }
+    let project_puts: Vec<&WriteRecord> = writes
+        .iter()
+        .filter(|w| w.method == "PUT" && w.path == "/1.0/projects/kproj1")
+        .collect();
+    assert_eq!(
+        project_puts.len(),
+        3,
+        "the project's two patches and its tombstone: {writes:?}"
+    );
     assert!(
-        writes
+        project_puts
             .iter()
-            .all(|w| matches!(w.method.as_str(), "POST" | "PATCH" | "DELETE")),
-        "only POST, PATCH and DELETE are sent: {writes:?}"
+            .all(|w| w.config_keys.iter().any(|key| key == MARK)),
+        "every PUT carries the project's whole config, its mark included: {project_puts:?}"
     );
     // Instances and volumes create and delete through an operation (202). Every other write, and every PATCH, is sync.
     for write in &writes {
@@ -1983,4 +2015,283 @@ fn a_network_read_in_a_project_without_the_networks_key_is_served_from_default()
     let served = served.expect("the default project's bridge answers for svc");
     assert_eq!(served["name"], json!("kbr"), "{served}");
     assert_eq!(served["project"], json!("default"), "{served}");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// A project's config, as Incus 7.3 writes it: a PATCH replaces the whole config, and a PUT replaces it under the ETag
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// A project's config as the fake serves it now.
+fn project_config(fake: &FakeIncus, name: &str) -> Value {
+    UnixIncus::new(fake.socket().to_path_buf())
+        .get(&format!("/1.0/projects/{name}"))
+        .expect("the project reads")["config"]
+        .clone()
+}
+
+/// The config a kernel project is made with, before anything else is set on it.
+fn kernel_project_config() -> Value {
+    json!({MARK: "toy", "restricted": "true", "features.images": "true", "features.profiles": "true"})
+}
+
+#[test]
+fn a_project_patch_on_the_fake_replaces_the_whole_config_as_incus_7_3_does() {
+    // Incus 7.3's project PATCH keeps only the keys it was sent: on a project in use only by its default profile it lands, and
+    // every key it did not name is gone, the kernel's mark and the features included.
+    let (_dir, fake) = start("project-patch-replaces");
+    writer(&fake, "toy")
+        .create(
+            &project_target("kproj1"),
+            &json!({"config": kernel_project_config()}),
+        )
+        .expect("a kernel project");
+    let reply = raw_patch(
+        fake.socket(),
+        "/1.0/projects/kproj1",
+        None,
+        &json!({"config": {RETIRING: "x"}}),
+    );
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert_eq!(
+        project_config(&fake, "kproj1"),
+        json!({RETIRING: "x"}),
+        "only the key the PATCH sent is left"
+    );
+}
+
+#[test]
+fn a_project_write_that_drops_a_feature_of_a_project_in_use_is_refused_by_the_fake() {
+    // A project that holds an object is in use, and Incus refuses to turn a feature off on it, whether a PATCH or a PUT asks.
+    let (_dir, fake) = start("project-patch-in-use");
+    writer(&fake, "toy")
+        .create(
+            &project_target("kproj1"),
+            &json!({"config": kernel_project_config()}),
+        )
+        .expect("a kernel project");
+    fake.add_image("kproj1", "alpine/edge");
+    let before = project_config(&fake, "kproj1");
+    let patched = raw_patch(
+        fake.socket(),
+        "/1.0/projects/kproj1",
+        None,
+        &json!({"config": {MARK: "toy", RETIRING: "x"}}),
+    );
+    assert!(patched.starts_with("HTTP/1.1 400"), "{patched}");
+    assert!(patched.contains("cannot be disabled"), "{patched}");
+    let put = raw_write(
+        fake.socket(),
+        "PUT",
+        "/1.0/projects/kproj1",
+        None,
+        &json!({"description": "", "config": {MARK: "toy"}}),
+    );
+    assert!(put.starts_with("HTTP/1.1 400"), "{put}");
+    assert_eq!(
+        project_config(&fake, "kproj1"),
+        before,
+        "the refusals changed nothing"
+    );
+}
+
+#[test]
+fn a_project_put_on_the_fake_replaces_the_config_and_the_description_under_its_etag() {
+    let (_dir, fake) = start("project-put");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kproj1");
+    writer
+        .create(
+            &project,
+            &json!({"description": "kept", "config": kernel_project_config()}),
+        )
+        .expect("a kernel project");
+    fake.add_image("kproj1", "alpine/edge");
+    let (_, etag) = writer.get_etag(&project).expect("the project reads");
+    let mut config = kernel_project_config();
+    config[RETIRING] = json!("x");
+    let body = json!({"description": "kept", "config": config});
+
+    let stale = raw_write(
+        fake.socket(),
+        "PUT",
+        "/1.0/projects/kproj1",
+        Some("\"stale\""),
+        &body,
+    );
+    assert!(stale.starts_with("HTTP/1.1 412"), "{stale}");
+    assert_eq!(project_config(&fake, "kproj1"), kernel_project_config());
+
+    let put = raw_write(
+        fake.socket(),
+        "PUT",
+        "/1.0/projects/kproj1",
+        Some(&etag),
+        &body,
+    );
+    assert!(put.starts_with("HTTP/1.1 200"), "{put}");
+    let (metadata, _) = writer.get_etag(&project).expect("the project reads");
+    assert_eq!(metadata["config"], config, "the PUT's config is the config");
+    assert_eq!(metadata["description"], json!("kept"));
+
+    // Only a project takes a PUT: no other path the writer reaches does.
+    let elsewhere = raw_write(
+        fake.socket(),
+        "PUT",
+        "/1.0/instances/k1?project=svc",
+        None,
+        &json!({"config": {}}),
+    );
+    assert!(elsewhere.starts_with("HTTP/1.1 405"), "{elsewhere}");
+}
+
+/// The writes the fake received at one project's own path, in order.
+fn project_writes(fake: &FakeIncus, name: &str) -> Vec<WriteRecord> {
+    let path = format!("/1.0/projects/{name}");
+    fake.writes()
+        .into_iter()
+        .filter(|write| write.path == path)
+        .collect()
+}
+
+/// The names of a config's keys, in order.
+fn keys_of(config: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = config
+        .as_object()
+        .map(|config| config.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn a_project_patch_and_tombstone_are_each_a_put_of_the_whole_config_under_the_reads_etag() {
+    // The project holds an image, so it is in use: a write that dropped one of its features would be refused.
+    let (_dir, fake) = start("project-put-writer");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kproj1");
+    let created = writer
+        .create(
+            &project,
+            &json!({"description": "kept", "config": kernel_project_config()}),
+        )
+        .expect("a kernel project");
+    fake.add_image("kproj1", "alpine/edge");
+
+    let noted = writer
+        .patch(&created, &changes(&[("user.note", Some("first"))]))
+        .expect("the patch lands");
+    let mut with_note = kernel_project_config();
+    with_note["user.note"] = json!("first");
+    assert_eq!(
+        project_config(&fake, "kproj1"),
+        with_note,
+        "every key the patch did not name is kept"
+    );
+    let cleared = writer
+        .patch(&noted, &changes(&[("user.note", None)]))
+        .expect("a removed key lands");
+    assert_eq!(project_config(&fake, "kproj1"), kernel_project_config());
+    let retiring = writer
+        .tombstone(&cleared, &plan())
+        .expect("the tombstone lands");
+    assert_eq!(retiring.tombstone(), Some(plan().to_hex().as_str()));
+    let mut tombstoned = kernel_project_config();
+    tombstoned[RETIRING] = json!(plan().to_hex());
+    assert_eq!(project_config(&fake, "kproj1"), tombstoned);
+    let (metadata, _) = writer.get_etag(&project).expect("the project reads");
+    assert_eq!(
+        metadata["description"],
+        json!("kept"),
+        "the description goes back as it was read"
+    );
+
+    let sent = project_writes(&fake, "kproj1");
+    let methods: Vec<&str> = sent.iter().map(|write| write.method.as_str()).collect();
+    assert_eq!(methods, vec!["PUT", "PUT", "PUT"], "{sent:?}");
+    assert_eq!(sent[0].config_keys, keys_of(&with_note));
+    assert_eq!(sent[1].config_keys, keys_of(&kernel_project_config()));
+    assert_eq!(sent[2].config_keys, keys_of(&tombstoned));
+
+    writer
+        .delete(&retiring)
+        .expect("the project and its image are deleted");
+    assert!(fake.images().is_empty(), "{:?}", fake.images());
+}
+
+#[test]
+fn a_project_put_under_a_stale_etag_is_412_and_changes_nothing() {
+    let (_dir, fake) = start("project-put-stale");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kproj1");
+    let first = writer
+        .create(&project, &json!({"config": kernel_project_config()}))
+        .expect("a kernel project");
+    // Another writer adds a key with a PUT of the whole config, so the first read's ETag is stale.
+    let (_, etag) = writer.get_etag(&project).expect("the project reads");
+    let mut raced = kernel_project_config();
+    raced["user.other"] = json!("1");
+    let reply = raw_write(
+        fake.socket(),
+        "PUT",
+        "/1.0/projects/kproj1",
+        Some(&etag),
+        &json!({"description": "", "config": raced}),
+    );
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+
+    let stale = writer
+        .tombstone(&first, &plan())
+        .expect_err("the ETag moved");
+    assert_eq!(status_of(&stale), Some(412), "{stale:?}");
+    let stale = writer
+        .patch(&first, &changes(&[("user.note", Some("x"))]))
+        .expect_err("the ETag moved");
+    assert_eq!(status_of(&stale), Some(412), "{stale:?}");
+    assert_eq!(
+        project_config(&fake, "kproj1"),
+        raced,
+        "the 412s changed nothing"
+    );
+    let refused: Vec<(String, u16)> = project_writes(&fake, "kproj1")
+        .into_iter()
+        .filter(|write| write.status == 412)
+        .map(|write| (write.method, write.status))
+        .collect();
+    assert_eq!(
+        refused,
+        vec![("PUT".to_string(), 412), ("PUT".to_string(), 412)],
+        "each write was a PUT that carried the first read's ETag"
+    );
+}
+
+#[test]
+fn a_project_put_that_reads_back_without_a_key_it_sent_is_applied_unconfirmed() {
+    // A project's PUT replaces its whole config, so its read-back must hold every key it sent, not only the one it changed.
+    let mut written = false;
+    let plan_hex = plan().to_hex();
+    let canned = Canned::start("project-put-readback", move |method, target| {
+        if method != "GET" {
+            written = true;
+            return sync_reply(200, Value::Null);
+        }
+        if target == "/1.0/projects/kproj1" {
+            let config = if written {
+                json!({MARK: "toy", RETIRING: plan_hex})
+            } else {
+                json!({MARK: "toy", "features.images": "true", "restricted": "true"})
+            };
+            return object_reply(&json!({"name": "kproj1", "description": "", "config": config}));
+        }
+        not_found()
+    });
+    let writer = canned.writer();
+    let owned = writer
+        .read_owned(&project_target("kproj1"))
+        .expect("the project reads");
+    let result = writer.tombstone(&owned, &plan());
+    assert!(
+        matches!(result, Err(IncusError::AppliedUnconfirmed(_))),
+        "the PUT landed and its read-back lost keys it sent: {result:?}"
+    );
+    assert_eq!(canned.count("PUT"), 1, "{:?}", canned.seen());
 }

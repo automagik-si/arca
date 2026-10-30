@@ -40,10 +40,10 @@ Source: `arca_kernel::ownership::kernel_may_write` is true only for `Kernel { en
 `UnixIncusWriter::read_owned` and `refusal_reason` in `crates/arca-incus/src/write.rs`; test
 `a_read_is_owned_only_for_this_entrys_own_kernel_object` in `crates/arca-incus/tests/write.rs`.
 
-**Rule 6.** Ownership is checked at each write. A PATCH and a tombstone check the `Owned` value's config against the writer's
-entry, and they send that value's ETag as `If-Match`, so Incus refuses the write with 412 when the object has changed since the
-read. A DELETE alone starts from a fresh read, which must class as the writer's entry's own and show the tombstone. An `Owned`
-value that names another entry is refused.
+**Rule 6.** Ownership is checked at each write. A config change and a tombstone check the `Owned` value's config against the
+writer's entry, and they send that value's ETag as `If-Match` (a PATCH, or for a project a PUT of its whole config, Rule 43), so
+Incus refuses the write with 412 when the object has changed since the read. A DELETE alone starts from a fresh read, which must
+class as the writer's entry's own and show the tombstone. An `Owned` value that names another entry is refused.
 Source: `UnixIncusWriter::{patch, tombstone, delete, check}` in `crates/arca-incus/src/write.rs`; tests
 `a_write_that_names_another_entrys_read_is_refused` and `a_stale_etag_is_412_and_changes_nothing`.
 
@@ -98,23 +98,26 @@ Source: `UnixIncusWriter::create`, `write::check_source` and `write::{IMAGE_SERV
 `a_create_takes_only_an_image_source_and_sends_nothing_else`, `a_create_may_name_the_one_image_server_and_no_other` and
 `a_create_whose_name_is_taken_is_refused_and_nothing_is_written`.
 
-**Rule 12.** A write that Incus accepted is confirmed by a read-back. After a create, a PATCH or a tombstone, the writer reads
-the object again. The read must class as the writer's entry's own, and it must show the write: the change, or the tombstone on
-the same uuid. If it does not, the result is `IncusError::AppliedUnconfirmed`, which carries the full target the write named,
-the uuid the read-back showed when it showed one, the class the read found when it found one, and the reason. That error means
-the write landed. `IncusError::Refused` means that no write was sent.
+**Rule 12.** A write that Incus accepted is confirmed by a read-back. After a create, a config change or a tombstone, the writer
+reads the object again. The read must class as the writer's entry's own, and it must show the write: the change, or the tombstone
+on the same uuid, and after a project's PUT every key the PUT sent, with its value (Rule 43). If it does not, the result is
+`IncusError::AppliedUnconfirmed`, which carries the full target the write named, the uuid the read-back showed when it showed
+one, the class the read found when it found one, and the reason. That error means the write landed. `IncusError::Refused` means
+that no write was sent.
 Source: `UnixIncusWriter::confirm`; tests `a_create_that_lands_and_reads_back_foreign_is_applied_unconfirmed`,
 `a_patch_that_reads_back_without_its_change_is_applied_unconfirmed`,
 `a_tombstone_that_reads_back_without_the_tombstone_is_applied_unconfirmed`,
-`a_tombstone_that_reads_back_on_another_uuid_is_applied_unconfirmed` and
+`a_tombstone_that_reads_back_on_another_uuid_is_applied_unconfirmed`,
+`a_project_put_that_reads_back_without_a_key_it_sent_is_applied_unconfirmed`,
 `the_refused_and_unconfirmed_errors_say_whether_a_write_was_sent` and `a_landed_write_names_its_full_target_and_the_uuid_it_read_back`.
 
 ## Writes
 
-**Rule 13.** A PATCH carries the ETag of the read it was checked against, as `If-Match`. A PATCH with a stale ETag gets 412
-and changes nothing, and the writer returns it as `IncusError::Status { code: 412 }`.
-Source: `write::send_within` sets `If-Match`; `UnixIncusWriter::patch`; fake `patch` in `crates/arca-incus/src/fake.rs`; test
-`a_stale_etag_is_412_and_changes_nothing`.
+**Rule 13.** A PATCH, and a project's PUT, carries the ETag of the read it was checked against, as `If-Match`. A write with a
+stale ETag gets 412 and changes nothing, and the writer returns it as `IncusError::Status { code: 412 }`.
+Source: `write::send_within` sets `If-Match`; `UnixIncusWriter::{patch, send_config}`; fake `patch` and `put` in
+`crates/arca-incus/src/fake.rs`; tests `a_stale_etag_is_412_and_changes_nothing` and
+`a_project_put_under_a_stale_etag_is_412_and_changes_nothing`.
 
 **Rule 14.** A write that Incus answers with an operation is settled by waiting on it. The writer GETs
 `/1.0/operations/<id>/wait?timeout=5` until the operation's `status_code` is 200 with the status `Success`. It waits again while
@@ -126,14 +129,19 @@ Source: `UnixIncusWriter::{wait_for, wait_on}` and `IncusError::Status` in `crat
 `the_operation_wait_follows_running_and_accepts_only_status_200_success`, `a_sync_answer_is_done_at_once_and_an_async_one_is_waited_on`,
 `an_answer_with_an_empty_or_absent_operation_is_done_without_a_wait` and `a_failed_operation_is_a_status_error_and_the_object_stays`.
 
-**Rule 15.** The writer sends only POST, PATCH and DELETE. It never sends PUT, and it never changes an object wholesale: a POST
-creates, a PATCH sets or removes config keys, and a DELETE removes.
-Source: the methods passed to `mutate` in `crates/arca-incus/src/write.rs` (`POST` in `create`, `PATCH` in `patch` and
-`tombstone`, `DELETE` in `delete`); `UnixIncus` in `crates/arca-incus/src/read.rs` sends only GET; round-trip test, which asserts
-the methods the fake receives.
+**Rule 15.** The writer sends only POST, PATCH, PUT and DELETE. A POST creates, a PATCH sets or removes config keys of any kind
+but a project, and a DELETE removes. A PUT is sent for one thing only: a project's config change or tombstone, as the project's
+whole config with the change applied, under the ETag of the read the change was checked against (Rule 43). No other object is
+written wholesale, and no PATCH is sent to a project.
+Source: the methods passed to `mutate` in `crates/arca-incus/src/write.rs` (`POST` in `create`, `PATCH` and `PUT` in
+`send_config`, which `patch` and `tombstone` call, `DELETE` in `delete` and `clear_images`); `UnixIncus` in
+`crates/arca-incus/src/read.rs` sends only GET; the round-trip test `each_kind_round_trips_through_create_patch_tombstone_and_delete`,
+which asserts that a PUT reaches only a project and a PATCH never does.
 
-**Rule 16.** A removed config key is sent as the empty string in a PATCH. The fake reads an empty value as unset.
-Source: `write::config_patch` and fake `merge`; round-trip test. This encoding is listed under "Assumptions to confirm".
+**Rule 16.** A removed config key is sent as the empty string in a PATCH. The fake reads an empty value as unset. A project's PUT
+leaves a removed key out of the whole config it sends.
+Source: `write::config_patch` and fake `merge`; `UnixIncusWriter::send_config`; round-trip test. This encoding is listed under
+"Assumptions to confirm".
 
 ## Removal
 
@@ -148,12 +156,12 @@ manifest does not declare for that kind. Whether a declared class is stricter th
 Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arca_kernel::plugin::Manifest.effects` and the
 `NotDeclared` check in `Ctx::effect`.
 
-**Rule 18.** A destructive removal runs in five steps: read the object with its ETag and classify it; PATCH it with `If-Match`
-to set `user.arcakernel.retiring` to the plan's digest; read it back and require the entry's mark, the tombstone and, for an
-instance, the same uuid; read it again immediately before the delete and require the same; then DELETE. A DELETE
-sends no `If-Match`, so a change that lands between the last read and the DELETE is not caught by Incus. That gap is the
-residual risk of this step. It is covered by the one-writer rule (only the entry's own writer changes its objects) and by the
-tombstone, which another writer would have to clear on purpose.
+**Rule 18.** A destructive removal runs in five steps: read the object with its ETag and classify it; set
+`user.arcakernel.retiring` to the plan's digest under `If-Match`, with a PATCH, or for a project a PUT of its whole config
+(Rule 43); read it back and require the entry's mark, the tombstone and, for an instance, the same uuid; read it again
+immediately before the delete and require the same; then DELETE. A DELETE sends no `If-Match`, so a change that lands between
+the last read and the DELETE is not caught by Incus. That gap is the residual risk of this step. It is covered by the one-writer
+rule (only the entry's own writer changes its objects) and by the tombstone, which another writer would have to clear on purpose.
 The tombstone digest is the plan digest of an approved class-B plan (Rule 37). A class-A revert of a create has no
 approval, so its tombstone is the create's own op digest, which the journal already records.
 Source: `UnixIncusWriter::{tombstone, delete}` in `crates/arca-incus/src/write.rs`; tests
@@ -337,17 +345,23 @@ the create's op digest for a class-A revert (Rule 18). An instance is named by i
 uuid, so a retirement that names none is refused before any request; a volume has none and is named by its pool and name. The object is read, and it must be the entry's
 own with the plan's uuid. The writer tombstones it under its ETag and reads it back. The object is read again, and it is deleted
 only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
-`Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
-`Drift`, and the object stays tombstoned. The writer accepts a tombstone with the same plan again, so a later retirement under that
-plan can continue. A DELETE the writer refuses is drift; any other failure of the DELETE is `Unresolved`. An object that answers 404
-when it is first read is already gone: the retirement is `Deleted`, and no DELETE is sent.
+`Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone Incus answers with another 4xx is read
+back: an object that shows no tombstone of the plan, or is gone, was not tombstoned, so the retirement is `Drift`, a settled failure
+that leaves no intent open, and a later removal tries again; one that shows the tombstone, or cannot be read, is `Unresolved`, and so
+is a tombstone answered with a 5xx. A tombstone that landed but did not read back is `Drift`, and the object stays tombstoned. The
+writer accepts a tombstone with the same plan again, so a later retirement under that plan can continue. A DELETE the writer
+refuses is drift; any other failure of the DELETE is `Unresolved`. An object that answers 404 when it is first read is already
+gone: the retirement is `Deleted`, and no DELETE is sent.
 Source: `IncusProvider::retire` in `crates/arca-providers/src/incus.rs`; tests
 `retire_tombstones_then_deletes_an_owned_instance_in_order`,
 `retire_refuses_an_instance_named_without_its_uuid_before_any_request`,
 `a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name`,
 `retire_skips_the_delete_as_drift_when_the_delete_read_back_shows_another_uuid`,
-`retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete` and `retire_stops_on_a_stale_etag_and_sends_no_delete`,
-all in `crates/arca-providers/tests/incus_provider.rs`.
+`retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete`, `retire_stops_on_a_stale_etag_and_sends_no_delete`,
+`a_tombstone_refused_with_a_4xx_that_reads_back_without_it_is_drift_and_no_delete_is_sent`,
+`a_project_tombstone_incus_refuses_with_400_is_drift_and_not_an_open_outcome` and
+`a_tombstone_that_reads_back_after_a_4xx_or_is_answered_5xx_stays_unresolved`, all in
+`crates/arca-providers/tests/incus_provider.rs`.
 
 **Rule 35.** `effect` checks the plan again before it writes, since a plan may be made by hand. The plan's class must be the class
 its kind gives. A create's plan has no pre-image. A patch's pre-image is derived again from the object's config as the effect reads
@@ -453,6 +467,40 @@ Source: `UnixIncusWriter::{delete, clear_images}` in `crates/arca-incus/src/writ
 against the fake's image stores, and `an_uninterrupted_probe_creates_and_removes_every_object` and
 `the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_then_runs` in `crates/arca-reconcile/tests/probe.rs`.
 
+## Project config writes
+
+**Rule 43.** A project's config is written with a PUT, never with a PATCH. Incus 7.3's project PATCH replaces the whole config
+with the keys it names: `projectPatch` in `cmd/incusd/api_project.go` copies the project's old keys into the raw request map, not
+into the request it applies, so `projectChange` sees only the keys sent. On a project in use, a PATCH of the tombstone alone reads
+as turning every feature off, and Incus refuses it with 400, which a live host showed. On a project used only by its default profile
+the same PATCH would land and erase the kernel's mark, `restricted` and every feature, which would leave a project the kernel can
+never manage again. So every
+project config write, whether a plugin's patch, its restore or the tombstone, is the read the classifier checked (a GET of the
+whole project) followed by a PUT of the project's whole config with the change applied and of its description as read, under
+`If-Match` set to that GET's ETag. Incus checks a PUT's `If-Match` against the project's description and config, the pair its GET's
+ETag covers, so a project that changed since the read gets 412 and changes nothing (Rule 13). The read-back must hold every key the
+PUT sent (Rule 12). The writer sends a PUT for nothing else, and it sends no PATCH to a project. A profile's, an ACL's, a volume's
+and a network's PATCH merge on Incus 7.3, so they stay PATCHes. The fake writes a project's config as Incus 7.3 does: a PATCH
+replaces it, a PUT replaces it and the description, and a write that would turn off a feature of a project that holds an object is
+refused with 400, so any kernel path that sent a project PATCH would fail the tests. A journal an earlier kernel left with a
+project's delete open, because its tombstone PATCH was refused, opens with that delete settled as failed (the project is still
+there and still the entry's, Rule 39), and the next removal deletes the project, the images in its own store (Rule 42) and the
+bridge it granted.
+Source: `UnixIncusWriter::{patch, tombstone, send_config}` and `write::holds_sent` in `crates/arca-incus/src/write.rs`; fake
+`write_project` in `crates/arca-incus/src/fake.rs`; tests `a_project_patch_on_the_fake_replaces_the_whole_config_as_incus_7_3_does`,
+`a_project_write_that_drops_a_feature_of_a_project_in_use_is_refused_by_the_fake`,
+`a_project_put_on_the_fake_replaces_the_config_and_the_description_under_its_etag`,
+`a_project_patch_and_tombstone_are_each_a_put_of_the_whole_config_under_the_reads_etag`,
+`a_project_put_under_a_stale_etag_is_412_and_changes_nothing`,
+`a_project_put_that_reads_back_without_a_key_it_sent_is_applied_unconfirmed` and
+`each_kind_round_trips_through_create_patch_tombstone_and_delete` in `crates/arca-incus/tests/write.rs`;
+`a_project_patch_and_its_restore_are_puts_that_keep_every_other_key` and
+`retire_of_a_project_in_use_tombstones_it_with_a_put_then_deletes_its_image_and_itself` in
+`crates/arca-providers/tests/incus_provider.rs`; and in `crates/arca-reconcile/tests/probe.rs`, where the full probe runs and the
+removals of an earlier journal assert that no project PATCH was sent, and
+`the_journal_a_refused_project_tombstone_left_opens_and_its_removal_deletes_the_project_its_image_and_the_bridge` runs over the
+journal fixture `crates/arca-reconcile/tests/fixtures/journal-project-tombstone-open.jsonl`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -467,7 +515,12 @@ These hold in the fake and are the basis of the rules above. None has yet been c
 must run before any live write.
 
 - Incus checks `If-Match` only on PUT and PATCH, so a DELETE has no compare step, and the tombstone is the only one (Rule 18).
-- A PATCH merges the `config` map, and an empty value unsets a key (Rule 16).
+- A PATCH merges the `config` map, and an empty value unsets a key (Rule 16). Confirmed on Incus 7.3 for a profile, an ACL and a
+  volume, whose tombstones landed beside their other keys, and for a network. A project's PATCH does not merge: it replaces the
+  whole config, which a live host showed and the Incus source explains (Rule 43).
+- Incus checks a project PUT's `If-Match` against the project's description and config, the pair its GET's ETag covers, and a PUT
+  replaces both (Rule 43). Read from the Incus source (`projectGet` and `projectPut` in `cmd/incusd/api_project.go`); a live
+  probe must confirm the PUT lands with its tombstone.
 - An instance's uuid is its `volatile.uuid` key, and no other kind has a uuid (Rule 20). Confirmed for a volume on Incus 7.3: a
   custom volume has no `volatile.uuid` and no uuid field.
 - Incus answers sync to the project, network, profile, ACL, zone, forward and bucket writes, and to an instance's or a volume's

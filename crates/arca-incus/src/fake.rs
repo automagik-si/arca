@@ -23,6 +23,12 @@
 //! every PATCH, is answered sync: 201 for a create and 200 otherwise. A failed operation waits as a status error. A method a
 //! route does not take is 405 with an `Allow` header.
 //!
+//! A PATCH merges the `config` of every kind but a project. A project's config is written as Incus 7.3 writes it
+//! (`projectPatch` and `projectPut` in `cmd/incusd/api_project.go`): a PATCH that names `config` replaces the whole config with
+//! the keys it sent, and a PUT replaces the config and the description, under `If-Match` like a PATCH. A project is the one
+//! object that takes a PUT. A project that holds an object is in use, and a PATCH or a PUT that would turn off one of its
+//! features is refused with 400 and changes nothing, as Incus refuses it.
+//!
 //! The fake records each request, and each write with the names of the config keys it carried. It never records a value.
 
 use std::collections::BTreeMap;
@@ -187,6 +193,9 @@ impl Route {
     fn methods(&self) -> &'static [&'static str] {
         match self {
             Route::Collection(_) => &["POST"],
+            Route::Object(address) if address.kind == "project" => {
+                &["GET", "PUT", "PATCH", "DELETE"]
+            }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             _ => &["GET"],
         }
@@ -680,6 +689,7 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         },
         ("POST", Route::Collection(address)) => create(shared, store, request, &address),
         ("PATCH", Route::Object(address)) => patch(shared, store, request, &address),
+        ("PUT", Route::Object(address)) => put(shared, store, request, &address),
         ("DELETE", Route::Object(address)) => delete(shared, store, &address),
         _ => (
             405,
@@ -963,32 +973,77 @@ fn create(
     answered(shared, store, kind, "POST", Ok(()))
 }
 
+/// The project config keys that are features. Incus refuses a write that turns one off on a project in use.
+const PROJECT_FEATURES: [&str; 6] = [
+    "features.images",
+    "features.networks",
+    "features.networks.zones",
+    "features.profiles",
+    "features.storage.buckets",
+    "features.storage.volumes",
+];
+
+/// A complete answer: the status, the extra header lines and the envelope.
+type Answer = (u16, String, Value);
+
+/// The object a write names and its body, after the `If-Match` check: 404 when it is not there, 412 when `If-Match` is not its
+/// current ETag, and 400 when the body is not a JSON object.
+fn written(
+    store: &Store,
+    request: &Request,
+    address: &Address,
+) -> Result<(usize, Map<String, Value>), Answer> {
+    let Some(index) = store.find(address) else {
+        return Err((404, String::new(), error_envelope(404, "not found")));
+    };
+    if let Some(sent) = request.header("if-match")
+        && sent != etag_of(&store.objects[index].body)
+    {
+        return Err((
+            412,
+            String::new(),
+            error_envelope(412, "the object changed after it was read"),
+        ));
+    }
+    let Ok(Value::Object(changes)) = serde_json::from_slice::<Value>(&request.body) else {
+        return Err((
+            400,
+            String::new(),
+            error_envelope(400, "the body is not a JSON object"),
+        ));
+    };
+    Ok((index, changes))
+}
+
+/// Replaces a project from a PUT, as Incus's `projectPut` does: the config and the description are the ones sent, and an absent
+/// one is empty. Only a project's route takes a PUT.
+fn put(
+    shared: &Shared,
+    store: &mut Store,
+    request: &Request,
+    address: &Address,
+) -> (u16, String, Value) {
+    match written(store, request, address) {
+        Ok((index, body)) => write_project(shared, store, index, &body, true),
+        Err(answer) => answer,
+    }
+}
+
 /// Changes an object from a PATCH. A stale `If-Match` is 412 and changes nothing. An empty string in `config` removes its key.
+/// A project's PATCH replaces its whole config (see [`write_project`]).
 fn patch(
     shared: &Shared,
     store: &mut Store,
     request: &Request,
     address: &Address,
 ) -> (u16, String, Value) {
-    let Some(index) = store.find(address) else {
-        return (404, String::new(), error_envelope(404, "not found"));
+    let (index, changes) = match written(store, request, address) {
+        Ok(found) => found,
+        Err(answer) => return answer,
     };
-    if let Some(sent) = request.header("if-match")
-        && sent != etag_of(&store.objects[index].body)
-    {
-        return (
-            412,
-            String::new(),
-            error_envelope(412, "the object changed after it was read"),
-        );
+    if store.objects[index].kind == "project" {
+        return write_project(shared, store, index, &changes, false);
     }
-    let Ok(Value::Object(changes)) = serde_json::from_slice::<Value>(&request.body) else {
-        return (
-            400,
-            String::new(),
-            error_envelope(400, "the body is not a JSON object"),
-        );
-    };
     let Some(object) = store.objects[index].body.as_object_mut() else {
         return (
             500,
@@ -1001,6 +1056,79 @@ fn patch(
     }
     let kind = store.objects[index].kind.clone();
     answered(shared, store, &kind, "PATCH", Ok(()))
+}
+
+/// Writes a project's config and description as Incus 7.3 does. A PUT sets both to what it sent, and an absent one is empty.
+/// A PATCH that names `config` replaces the whole config with the keys it sent, and keeps the description unless it names one:
+/// Incus's `projectPatch` copies the old keys into the raw request map, not into the request it applies, so every key the PATCH
+/// did not name is dropped. An empty value is unset. A project in use (one that holds an object) refuses a write that turns off
+/// one of its features, with 400, and nothing changes.
+fn write_project(
+    shared: &Shared,
+    store: &mut Store,
+    index: usize,
+    sent: &Map<String, Value>,
+    put: bool,
+) -> (u16, String, Value) {
+    let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    let current = store.objects[index].body.clone();
+    let config = match sent.get("config") {
+        Some(Value::Object(config)) => {
+            let mut kept = Map::new();
+            for (key, value) in config {
+                match value {
+                    Value::String(text) if text.is_empty() => {}
+                    Value::String(_) => {
+                        kept.insert(key.clone(), value.clone());
+                    }
+                    Value::Null => {}
+                    _ => return bad("a config value must be text"),
+                }
+            }
+            kept
+        }
+        Some(_) => return bad("config must be an object"),
+        None if put => Map::new(),
+        None => current
+            .get("config")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let description = match sent.get("description") {
+        Some(Value::String(text)) => text.clone(),
+        Some(_) => return bad("description must be text"),
+        None if put => String::new(),
+        None => text_of(&current, "description"),
+    };
+    let name = store.objects[index].name.clone();
+    let in_use = store
+        .objects
+        .iter()
+        .any(|object| object.kind != "project" && object.project == name);
+    if in_use {
+        let was = |key: &str| current.get("config").and_then(|config| config.get(key));
+        for feature in PROJECT_FEATURES {
+            if was(feature).and_then(Value::as_str) == Some("true")
+                && was(feature) != config.get(feature)
+            {
+                return bad(&format!(
+                    "Project feature \"{feature}\" cannot be disabled on non-empty projects"
+                ));
+            }
+        }
+    }
+    let Some(object) = store.objects[index].body.as_object_mut() else {
+        return (
+            500,
+            String::new(),
+            error_envelope(500, "the object is not an object"),
+        );
+    };
+    object.insert("config".to_string(), Value::Object(config));
+    object.insert("description".to_string(), Value::String(description));
+    let method = if put { "PUT" } else { "PATCH" };
+    answered(shared, store, "project", method, Ok(()))
 }
 
 /// Applies a PATCH body to an object. Top-level keys replace; `config` keys merge, and an empty or null value removes a key.

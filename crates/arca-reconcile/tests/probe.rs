@@ -19,7 +19,7 @@ use arca_kernel::plugin::{
 };
 use arca_providers::incus::{Family, IMAGE_PROTOCOL, IMAGE_SERVER, IncusProvider, RetainedSet};
 use arca_reconcile::probe::{
-    DEFAULT_PROBE_IMAGE, PROBE_BRIDGE, PROBE_PLUGIN, ProbeOutcome, ProbeSpec,
+    DEFAULT_PROBE_IMAGE, PROBE_BRIDGE, PROBE_PLUGIN, ProbeOutcome, ProbeSpec, kind_name,
 };
 use arca_reconcile::{PluginSet, Reconciler};
 use common::*;
@@ -389,6 +389,11 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
             .live(&EntryId(ENTRY.to_string()))
             .is_empty()
     );
+    assert_eq!(
+        project_patches(&fake),
+        Vec::new(),
+        "no project PATCH was sent"
+    );
 }
 
 /// The places of the live records of the probe entry in a reopened journal.
@@ -755,5 +760,191 @@ fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_the
             .journal()
             .live(&EntryId(ENTRY.to_string()))
             .is_empty()
+    );
+    assert_eq!(
+        project_patches(&fake),
+        Vec::new(),
+        "no project PATCH was sent"
+    );
+}
+
+/// A journal the kernel wrote while it removed an earlier probe on Incus 7.3, whose project PATCH replaces the project's whole
+/// config. Its names are the test spec's. The removal reverted the profile and the ACL and deleted the volume; then the project's
+/// tombstone PATCH named only the tombstone, so it read as turning off every feature of a project that still held an image, and
+/// Incus refused it with 400. Nothing landed, but the kernel left the project's delete (intent 10) with no outcome. The bridge was
+/// never reached. 22 records.
+const PROJECT_TOMBSTONE_JOURNAL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/journal-project-tombstone-open.jsonl"
+);
+
+/// The id of the project's delete intent in [`PROJECT_TOMBSTONE_JOURNAL`].
+const OPEN_PROJECT_DELETE: u64 = 10;
+
+/// Makes on the fake what that removal left: the bridge and the project, each carrying the probe's mark, and the image copied by
+/// hand into the project's own store, which keeps the project in use.
+fn seed_tombstone_leftovers(fake: &arca_incus::FakeIncus) {
+    let mark = json!(ENTRY);
+    let made = [
+        (
+            "/1.0/networks?project=default".to_string(),
+            json!({"name": PROBE_BRIDGE, "type": "bridge", "config": {
+                "ipv4.address": "203.0.113.1/24", "ipv6.address": "none", MARK: mark}}),
+        ),
+        (
+            "/1.0/projects".to_string(),
+            json!({"name": PROJECT, "config": {
+                MARK: mark, "restricted": "true", "restricted.networks.access": PROBE_BRIDGE,
+                "features.images": "true", "features.networks.zones": "true", "features.profiles": "true",
+                "features.storage.volumes": "true", "features.storage.buckets": "true"}}),
+        ),
+    ];
+    for (path, body) in made {
+        let (status, _) = raw(fake, "POST", &path, Some(&body));
+        assert!((200..300).contains(&status), "{path}: {status}");
+    }
+    fake.add_image(PROJECT, DEFAULT_PROBE_IMAGE);
+}
+
+/// The PATCHes the fake received at a project's own path. Incus 7.3 would replace the project's config with the keys one names.
+fn project_patches(fake: &arca_incus::FakeIncus) -> Vec<arca_incus::WriteRecord> {
+    fake.writes()
+        .into_iter()
+        .filter(|write| write.method == "PATCH" && write.path.starts_with("/1.0/projects/"))
+        .collect()
+}
+
+/// Each record of a journal file as `(id, state)`, in the order the file holds them.
+fn journal_states(path: &Path) -> Vec<(u64, String)> {
+    std::fs::read_to_string(path)
+        .expect("the journal reads")
+        .lines()
+        .map(|line| {
+            let record: Value = serde_json::from_str(line).expect("a record is JSON");
+            (
+                record["id"].as_u64().expect("a record has an id"),
+                record["state"]
+                    .as_str()
+                    .expect("a record has a state")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_journal_a_refused_project_tombstone_left_opens_and_its_removal_deletes_the_project_its_image_and_the_bridge()
+ {
+    let scratch = Scratch::new("probe-tombstone-open");
+    let fake = start_fake(&scratch);
+    seed_tombstone_leftovers(&fake);
+    let journal = scratch.path("journal.jsonl");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::copy(PROJECT_TOMBSTONE_JOURNAL, &journal).expect("the fixture is copied");
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o600))
+            .expect("mode 0600");
+    }
+    let written = journal_states(&journal);
+    assert_eq!(
+        written.len(),
+        22,
+        "the journal as the earlier kernel left it"
+    );
+    let earlier = Journal::open(FileJournal::open(&journal).expect("the journal opens"))
+        .expect("the journal folds");
+    let open: Vec<u64> = earlier
+        .unresolved()
+        .iter()
+        .map(|record| record.id)
+        .collect();
+    assert_eq!(
+        open,
+        vec![OPEN_PROJECT_DELETE],
+        "only the project's delete is open"
+    );
+    drop(earlier);
+
+    // The open reads the project back: it is still there and still the entry's, so its delete did not land. The intent is settled
+    // as failed, and the next removal retries the project.
+    let mut reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    assert!(
+        reconciler.journal().unresolved().is_empty(),
+        "nothing is left open"
+    );
+    let resolution = reconciler.resolution().clone();
+    assert!(
+        resolution.adopted.is_empty()
+            && resolution.reverted.is_empty()
+            && resolution.held.is_empty()
+            && resolution.drift.is_empty(),
+        "{resolution:?}"
+    );
+    let settled = journal_states(&journal);
+    assert_eq!(
+        settled[written.len()..],
+        [(OPEN_PROJECT_DELETE, "Failed".to_string())],
+        "the open appended one outcome, for the project's delete"
+    );
+    let mut live: Vec<(&str, String, String)> = live_places(&reconciler)
+        .into_iter()
+        .map(|(kind, project, _, name)| (kind_name(kind), project, name))
+        .collect();
+    live.sort();
+    assert_eq!(
+        live,
+        vec![
+            ("network", "default".to_string(), PROBE_BRIDGE.to_string()),
+            ("project", PROJECT.to_string(), PROJECT.to_string()),
+        ]
+    );
+    assert!(
+        fake.writes().iter().all(|write| write.method == "POST"),
+        "the open sent no write: {:?}",
+        fake.writes()
+    );
+
+    // The removal deletes the project, the image in its own store, and then the bridge, under one approval.
+    let spec = spec();
+    let key = SkKey::from_seed(7);
+    let mut verifier: ApprovalVerifier<SshSigVerifier, FileNonces> =
+        verifier_for(&scratch, &key, "probe");
+    let run = reconciler
+        .probe_remove(
+            &spec,
+            NOW,
+            |plan: &Digest| approval_for_plan(&key, plan, 1),
+            &mut verifier,
+        )
+        .expect("the removal runs under its approval");
+    assert!(!run.partial, "{run:?}");
+    let deleted: Vec<(&str, String)> = run
+        .deleted
+        .iter()
+        .map(|object| (kind_name(object.kind), object.name.clone()))
+        .collect();
+    assert_eq!(
+        deleted,
+        vec![
+            ("project", PROJECT.to_string()),
+            ("network", PROBE_BRIDGE.to_string()),
+        ],
+        "the project first, then the bridge its grant named"
+    );
+    assert!(get(&fake, &format!("/1.0/projects/{PROJECT}")).is_none());
+    assert!(get(&fake, "/1.0/networks/probe-net?project=default").is_none());
+    assert!(fake.images().is_empty(), "{:?}", fake.images());
+    assert!(
+        reconciler
+            .journal()
+            .live(&EntryId(ENTRY.to_string()))
+            .is_empty(),
+        "the journal holds nothing live"
+    );
+    assert!(reconciler.journal().unresolved().is_empty());
+    assert_eq!(
+        project_patches(&fake),
+        Vec::new(),
+        "no project PATCH was sent"
     );
 }
