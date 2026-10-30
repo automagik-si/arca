@@ -267,9 +267,17 @@ on a project create only to the value the kernel pins it at, with one exception:
 bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
 whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
 set to anything are all refused. A project patch may not change any such key, whatever its value, and the refusal is made before
-any request. A project is named by its own name.
+any request. A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
+function every request of the read client and the writer passes through, refuses a PATCH whose path is `/1.0/projects` or under
+it, percent-decoded, with `IncusError::Refused("a project is never sent a PATCH")`, before it connects, so no byte reaches the
+socket (Rule 43).
 Source: `IncusProvider::prepared_create` (`PROJECT_KEYS`, `RESTRICTED_KEY`, `NETWORK_ACCESS_KEY`, `guarded_project_key`) and
-`check_patch_keys`; tests `a_project_create_carries_the_mark_the_features_restricted_and_the_op_config`,
+`check_patch_keys`; the guard `read::guard_request`, which `read::exchange` runs first, in `crates/arca-incus/src/read.rs`, with
+its unit tests `a_patch_to_a_project_path_is_refused_by_exchange_before_any_byte_is_sent` (the encoded, trailing-slash, query,
+dot-segment and letter-case variants), `a_request_whose_line_cannot_be_read_is_refused_before_any_byte_is_sent` and
+`the_guard_passes_every_other_method_and_every_patch_outside_the_projects_path`, and
+`no_public_writer_method_sends_a_patch_to_a_project` in `crates/arca-incus/tests/write.rs`; tests
+`a_project_create_carries_the_mark_the_features_restricted_and_the_op_config`,
 `a_project_create_refuses_a_restricted_or_features_key_that_loosens_the_pinned_project`,
 `a_project_patch_refuses_every_restricted_or_features_key_before_any_request`,
 `a_project_create_that_sets_a_kernel_key_another_way_is_refused`, `a_project_create_carries_the_zones_key_pinned_to_true` and
@@ -408,8 +416,9 @@ as drift. A patch's entry is held, so nothing is written for it until a document
 pre-image is failed; any other value settles the patch with its pre-image as the inverse, which a later removal restores. A delete
 whose object is still the entry's is failed, so the next removal retries it; one whose object is gone is reverted, with the create
 it undid. An object that is not the entry's, or whose uuid differs from the intent's, is failed and reported, and no delete or
-patch is sent. A target outside the family, or in a project that does not enable its kind's feature, is not read. A read that cannot
-be answered leaves its intent open, and `open` refuses.
+patch is sent. A target outside the family, or in a project that does not enable its kind's feature, is not read. A target that a
+running operation names is read only once the operation ends (Rule 44). A read that cannot be answered leaves its intent open, and
+`open` refuses.
 Source: `arca_reconcile::Reconciler::{resolve, open}` in `crates/arca-reconcile/src/restart.rs` and
 `arca_providers::incus::IncusProvider::read_back`; tests in `crates/arca-reconcile/tests/restart.rs` and
 `a_read_back_in_a_project_without_the_feature_is_refused_and_sends_only_gets` in `crates/arca-providers/tests/incus_provider.rs`.
@@ -471,7 +480,8 @@ against the fake's image stores, and `an_uninterrupted_probe_creates_and_removes
 
 **Rule 43.** A project's config is written with a PUT, never with a PATCH. Incus 7.3's project PATCH replaces the whole config
 with the keys it names: `projectPatch` in `cmd/incusd/api_project.go` copies the project's old keys into the raw request map, not
-into the request it applies, so `projectChange` sees only the keys sent. On a project in use, a PATCH of the tombstone alone reads
+into the request it applies, so `projectChange` sees only the keys sent. The same code is still in Incus 7.6.0 and on Incus's main
+branch, so the rule holds after the upgrade to 7.6. On a project in use, a PATCH of the tombstone alone reads
 as turning every feature off, and Incus refuses it with 400, which a live host showed. On a project used only by its default profile
 the same PATCH would land and erase the kernel's mark, `restricted` and every feature, which would leave a project the kernel can
 never manage again. So every
@@ -479,7 +489,8 @@ project config write, whether a plugin's patch, its restore or the tombstone, is
 whole project) followed by a PUT of the project's whole config with the change applied and of its description as read, under
 `If-Match` set to that GET's ETag. Incus checks a PUT's `If-Match` against the project's description and config, the pair its GET's
 ETag covers, so a project that changed since the read gets 412 and changes nothing (Rule 13). The read-back must hold every key the
-PUT sent (Rule 12). The writer sends a PUT for nothing else, and it sends no PATCH to a project. A profile's, an ACL's, a volume's
+PUT sent (Rule 12). The writer sends a PUT for nothing else, and it sends no PATCH to a project; the guard in `exchange` refuses one
+from any client before a byte is sent (Rule 30). A profile's, an ACL's, a volume's
 and a network's PATCH merge on Incus 7.3, so they stay PATCHes. The fake writes a project's config as Incus 7.3 does: a PATCH
 replaces it, a PUT replaces it and the description, and a write that would turn off a feature of a project that holds an object is
 refused with 400, so any kernel path that sent a project PATCH would fail the tests. A journal an earlier kernel left with a
@@ -501,6 +512,40 @@ removals of an earlier journal assert that no project PATCH was sent, and
 `the_journal_a_refused_project_tombstone_left_opens_and_its_removal_deletes_the_project_its_image_and_the_bridge` runs over the
 journal fixture `crates/arca-reconcile/tests/fixtures/journal-project-tombstone-open.jsonl`.
 
+## Running operations
+
+**Rule 44.** An intent is never settled while an operation that Incus still runs names its target. Before the read-back that settles
+an intent after a restart (Rule 39) reads the object, it lists `/1.0/operations?all-projects=true&recursion=1` and keeps each
+operation whose `status_code` is 1xx: pending (105), running (103) or cancelling (104), and any other code that has not ended.
+An operation names the target when one of its `resources` URLs is the target's path, or a path under it such as a snapshot,
+percent-decoded, in the target's project: a URL without a `project` query names `default`, as Incus renders a resource in
+`default` without one. A network, a forward and an ACL are compared in `default` (Rule 40), so their URL's project is not
+compared, and a project is named by its path alone. The read-back waits on each operation that names the target with
+`/1.0/operations/<id>/wait?timeout=<s>`, at most 5 s per wait, until it ends, and lists the operations again; the whole wait is
+bounded by the provider's operation deadline (`OPERATION_DEADLINE`, 600 s, unless the provider is given another). Then it reads
+the object. An operation still running at the deadline, an operations listing that cannot be read and a wait that cannot be
+answered are each `EffectRefusal::Unresolved`: the object is not read, the intent stays open, and `open` refuses with
+`KernelError::Unresolved`. So a create whose operation still runs is not read as absent and reverted, which would leave the
+object it then makes marked and unknown to the journal, and a create that shows its object while it runs and then fails is not
+journalled as made. An operation on any other object holds nothing. Only GETs are sent. `running_on` is the same check for any
+other caller that must not act on an object while an operation names it.
+Source: `read::{running_operations, operation_names, running_on, wait_operation, OPERATIONS_PATH, RunningOp}` in
+`crates/arca-incus/src/read.rs`; `IncusProvider::{read_back, settle_operations}` in `crates/arca-providers/src/incus.rs`; the
+fake's held operations (`FakeIncus::{hold_operation, hold_create, release_operation, fail_operation, set_operations_unreadable}`,
+with a create whose object shows only when its operation is released, `Appears::OnCompletion`, or while it runs,
+`Appears::WhileRunning`) in `crates/arca-incus/src/fake.rs`; tests in `crates/arca-incus/tests/operations.rs`;
+`a_read_back_while_a_create_still_runs_on_its_target_is_unresolved_and_reads_no_object`,
+`a_read_back_waits_for_an_operation_that_ends_before_the_deadline_and_then_reads_the_object`,
+`a_read_back_whose_operation_fails_before_the_deadline_reads_the_object_as_absent`,
+`a_read_back_whose_operations_listing_fails_is_unresolved_and_reads_no_object` and
+`a_read_back_with_no_deadline_left_is_unresolved_at_once_while_an_operation_runs` in
+`crates/arca-providers/tests/incus_provider.rs`; and the kill-restart cases
+`a_restart_while_a_create_still_runs_keeps_its_intent_open_and_the_open_refuses`,
+`a_create_that_completes_while_the_restart_waits_is_adopted_by_that_open`,
+`a_create_whose_operation_fails_while_the_restart_waits_is_reverted_and_leaves_nothing`,
+`a_running_operation_on_another_object_holds_no_intent` and
+`a_failed_operations_read_holds_every_intent_and_the_open_refuses_with_no_write` in `crates/arca-reconcile/tests/restart.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -517,7 +562,8 @@ must run before any live write.
 - Incus checks `If-Match` only on PUT and PATCH, so a DELETE has no compare step, and the tombstone is the only one (Rule 18).
 - A PATCH merges the `config` map, and an empty value unsets a key (Rule 16). Confirmed on Incus 7.3 for a profile, an ACL and a
   volume, whose tombstones landed beside their other keys, and for a network. A project's PATCH does not merge: it replaces the
-  whole config, which a live host showed and the Incus source explains (Rule 43).
+  whole config, which a live host showed and the Incus source explains (Rule 43). The source of Incus 7.6.0 and of its main
+  branch still has it.
 - Incus checks a project PUT's `If-Match` against the project's description and config, the pair its GET's ETag covers, and a PUT
   replaces both (Rule 43). Read from the Incus source (`projectGet` and `projectPut` in `cmd/incusd/api_project.go`); a live
   probe must confirm the PUT lands with its tombstone.
@@ -559,3 +605,9 @@ must run before any live write.
   A key Incus adds on read would refuse a patch of that network, which fails closed (Rule 31).
 - Incus accepts `features.networks.zones` on a project create and reports it in the project's config (Rule 30).
 - Incus answers a GET of an object that is gone with 404, which is how Rule 39 reads an absent object.
+- Incus lists every project's operations at `/1.0/operations?all-projects=true&recursion=1`, as a map keyed by each operation's
+  status in lower case. An operation at work is pending (105), running (103) or cancelling (104). A resource URL carries
+  `?project=<p>` unless the operation's project is `default`, and an instance's create names `/1.0/instances/<name>`. A wait whose
+  `timeout` passes is answered with the operation still running, and an operation Incus no longer holds is 404 (Rule 44). Read from
+  the Incus source (`operationsGet` and `operationWaitGet` in `cmd/incusd/operations.go`, `render` in
+  `internal/server/operations/operations.go`, and `instancesPost`); a live probe must confirm it.

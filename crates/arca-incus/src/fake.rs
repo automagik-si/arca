@@ -3,8 +3,15 @@
 //!
 //! GET routes: `/1.0`, `/1.0/projects?recursion=1`, `/1.0/instances?all-projects=true&recursion=1`,
 //! `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<pool>/resources`, `/1.0/networks?recursion=1` and
-//! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path, and
-//! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
+//! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path,
+//! `/1.0/operations?all-projects=true&recursion=1`, and `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
+//!
+//! Operations: the listing groups every operation the fake holds by its status in lower case, as Incus does. A held operation
+//! ([`FakeIncus::hold_operation`], [`FakeIncus::hold_create`]) stays running (status code 103) and names its object in
+//! `resources`, rendered as Incus renders it: the object's path, with `?project=<p>` unless the project is `default`. It ends
+//! only when the test releases it ([`FakeIncus::release_operation`]) or fails it ([`FakeIncus::fail_operation`]). A wait on a
+//! running operation is held until the operation ends or its `timeout` passes, but never longer than a quarter second, so a test
+//! is not slowed; a caller loops on a wait anyway, since Incus answers a timed-out wait with the operation still running.
 //!
 //! A network, a forward and an ACL are served from the default project unless their project enables `features.networks`, as Incus
 //! 7.3 serves them: a create sent to such a project lands in the default project, and a read sent to it is answered from there.
@@ -40,9 +47,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arca_kernel::canon::{Digest, canonical_json};
+use arca_kernel::ownership::{IncusKind, ObjectRef};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -54,6 +62,10 @@ const DEFAULT_PROJECT: &str = "default";
 const MAX_REQUEST_BODY: usize = 1024 * 1024;
 /// The largest request head the fake reads.
 const MAX_REQUEST_HEAD: usize = 64 * 1024;
+/// The longest the fake holds a wait on a running operation, whatever `timeout` the wait names.
+const MAX_WAIT_HOLD: Duration = Duration::from_millis(250);
+/// The pause between two looks at an operation a wait is held on.
+const WAIT_POLL: Duration = Duration::from_millis(5);
 
 /// The metadata the fake serves. The pools are `(name, resources)` pairs.
 #[derive(Debug, Clone)]
@@ -129,6 +141,23 @@ pub struct WriteRecord {
 /// One host interface: its name and the addresses it holds.
 type HostInterface = (String, Vec<IpAddr>);
 
+/// The id of an operation the fake started for a test, in the shape of a uuid.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OpId(pub String);
+
+impl OpId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// When the object of a held create shows: at once, while its operation runs, or only once the operation is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Appears {
+    WhileRunning,
+    OnCompletion,
+}
+
 /// A running fake Incus. It serves until it is dropped.
 pub struct FakeIncus {
     socket: PathBuf,
@@ -144,6 +173,7 @@ struct Shared {
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
     host_interfaces: Mutex<Vec<HostInterface>>,
+    operations_unreadable: AtomicBool,
     counter: AtomicU64,
 }
 
@@ -153,6 +183,33 @@ struct Store {
     pools: Vec<(String, Value)>,
     objects: Vec<Stored>,
     operations: BTreeMap<String, Value>,
+    /// What each held operation does when it ends, by its id.
+    held: BTreeMap<String, Held>,
+    /// Creates a test armed with [`FakeIncus::hold_create`] that have not arrived yet.
+    armed: Vec<Armed>,
+}
+
+/// What a held operation does when it ends: an object that lands on success, and an object that goes on failure.
+#[derive(Default)]
+struct Held {
+    lands: Option<Stored>,
+    reverts: Option<Place>,
+}
+
+/// An object's place: its kind, its project, its parent and its name, as [`Stored`] keeps them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Place {
+    kind: String,
+    project: String,
+    parent: String,
+    name: String,
+}
+
+/// A create that will run as a held operation with the id the test was given.
+struct Armed {
+    id: String,
+    place: Place,
+    appears: Appears,
 }
 
 /// One object: its kind, its project, its name, its parent (the storage pool for a volume or a bucket, the network for a
@@ -184,7 +241,9 @@ enum Route {
     HostInterfaces,
     HostInterfaceState(String),
     PoolResources(String),
+    ListOperations,
     Operation(String),
+    OperationWait(String),
     Collection(Address),
     Object(Address),
 }
@@ -246,11 +305,14 @@ impl Shared {
                 pools: state.pools,
                 objects,
                 operations: BTreeMap::new(),
+                held: BTreeMap::new(),
+                armed: Vec::new(),
             }),
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
             host_interfaces: Mutex::new(Vec::new()),
+            operations_unreadable: AtomicBool::new(false),
             counter: AtomicU64::new(1),
         }
     }
@@ -326,6 +388,149 @@ impl FakeIncus {
     pub fn set_reject_config_on_post(&self, kind_path_prefix: &str) {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
     }
+
+    /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
+    /// the operations listing at once, and a wait on it answers that it is still running.
+    pub fn hold_operation(&self, target: &ObjectRef) -> OpId {
+        let id = self.shared.next_id();
+        let mut store = lock(&self.shared.store);
+        store
+            .operations
+            .insert(id.clone(), running_operation(&id, &place_of(target)));
+        store.held.insert(id.clone(), Held::default());
+        OpId(id)
+    }
+
+    /// Makes the next create of `target` run as a held operation with the id returned here, whatever the kind. The create is
+    /// answered 202 with the operation, which stays running until the test releases or fails it, and which is not listed before
+    /// the create arrives. With [`Appears::WhileRunning`] the object shows at once and goes again if the operation fails, as
+    /// Incus reverts a failed create. With [`Appears::OnCompletion`] it shows only when the operation is released.
+    pub fn hold_create(&self, target: &ObjectRef, appears: Appears) -> OpId {
+        let id = self.shared.next_id();
+        lock(&self.shared.store).armed.push(Armed {
+            id: id.clone(),
+            place: place_of(target),
+            appears,
+        });
+        OpId(id)
+    }
+
+    /// Ends a held operation with success. A create held until completion lands now. An id whose create has not arrived yet is
+    /// disarmed, and that create then runs as any other does.
+    pub fn release_operation(&self, id: &OpId) {
+        self.end_operation(id, None);
+    }
+
+    /// Ends a held operation with failure, with `message` as its `err`. A held create's object does not land, and one that
+    /// showed while the operation ran is gone. An id whose create has not arrived yet is disarmed.
+    pub fn fail_operation(&self, id: &OpId, message: &str) {
+        self.end_operation(id, Some(message));
+    }
+
+    /// Makes the operations listing answer 500 while `unreadable` is true.
+    pub fn set_operations_unreadable(&self, unreadable: bool) {
+        self.shared
+            .operations_unreadable
+            .store(unreadable, Ordering::SeqCst);
+    }
+
+    fn end_operation(&self, id: &OpId, failure: Option<&str>) {
+        let mut guard = lock(&self.shared.store);
+        let store: &mut Store = &mut guard;
+        store.armed.retain(|armed| armed.id != id.0);
+        let Some(held) = store.held.remove(&id.0) else {
+            return;
+        };
+        if let Some(operation) = store.operations.get_mut(&id.0) {
+            let (status, code, err) = match failure {
+                None => ("Success", 200, ""),
+                Some(message) => ("Failure", 400, message),
+            };
+            operation["status"] = json!(status);
+            operation["status_code"] = json!(code);
+            operation["err"] = json!(err);
+        }
+        match failure {
+            None => {
+                if let Some(object) = held.lands {
+                    store.objects.push(object);
+                }
+            }
+            Some(_) => {
+                if let Some(place) = held.reverts {
+                    store
+                        .objects
+                        .retain(|object| place_of_stored(object) != place);
+                }
+            }
+        }
+    }
+}
+
+/// The place of an object a test names, as the fake stores it.
+fn place_of(target: &ObjectRef) -> Place {
+    let kind = match target.kind {
+        IncusKind::Project => "project",
+        IncusKind::Instance => "instance",
+        IncusKind::Network => "network",
+        IncusKind::Acl => "acl",
+        IncusKind::Profile => "profile",
+        IncusKind::Volume => "volume",
+        IncusKind::Zone => "zone",
+        IncusKind::Forward => "forward",
+        IncusKind::Bucket => "bucket",
+    };
+    Place {
+        kind: kind.to_string(),
+        project: target.project.clone(),
+        parent: target.parent.clone().unwrap_or_default(),
+        name: target.name.clone(),
+    }
+}
+
+fn place_of_stored(object: &Stored) -> Place {
+    Place {
+        kind: object.kind.clone(),
+        project: object.project.clone(),
+        parent: object.parent.clone(),
+        name: object.name.clone(),
+    }
+}
+
+/// A running operation that names the object at `place`, as Incus renders one: its resource URL is the object's path, with
+/// `?project=<p>` unless the project is `default`, under the key Incus gives the kind.
+fn running_operation(id: &str, place: &Place) -> Value {
+    let name = &place.name;
+    let parent = &place.parent;
+    let (key, path) = match place.kind.as_str() {
+        "project" => ("projects", format!("/1.0/projects/{name}")),
+        "instance" => ("instances", format!("/1.0/instances/{name}")),
+        "network" => ("networks", format!("/1.0/networks/{name}")),
+        "acl" => ("network_acls", format!("/1.0/network-acls/{name}")),
+        "profile" => ("profiles", format!("/1.0/profiles/{name}")),
+        "zone" => ("network_zones", format!("/1.0/network-zones/{name}")),
+        "volume" => (
+            "storage_volumes",
+            format!("/1.0/storage-pools/{parent}/volumes/custom/{name}"),
+        ),
+        "bucket" => (
+            "storage_buckets",
+            format!("/1.0/storage-pools/{parent}/buckets/{name}"),
+        ),
+        _ => (
+            "network_forwards",
+            format!("/1.0/networks/{parent}/forwards/{name}"),
+        ),
+    };
+    let url = if place.kind == "project" || place.project == DEFAULT_PROJECT {
+        path
+    } else {
+        format!("{path}?project={}", place.project)
+    };
+    json!({
+        "id": id, "class": "task", "description": "Held by the test", "status": "Running", "status_code": 103,
+        "err": "", "resources": { key: [url] }, "metadata": null, "may_cancel": false,
+    })
 }
 
 impl Drop for FakeIncus {
@@ -523,6 +728,9 @@ fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
     let route = parse(&request.target);
     let allowed: &[&str] = route.as_ref().map_or(&["GET"][..], Route::methods);
     let method = request.method.as_str();
+    if let (Some(Route::OperationWait(id)), "GET") = (&route, method) {
+        hold_wait(shared, id, &request.target);
+    }
     match route {
         Some(route) if allowed.contains(&method) => dispatch(shared, request, route),
         _ if method == "GET" => (404, String::new(), error_envelope(404, "not found")),
@@ -531,6 +739,31 @@ fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
             format!("Allow: {}\r\n", allowed.join(", ")),
             error_envelope(405, "method not allowed"),
         ),
+    }
+}
+
+/// Holds a wait while its operation runs, for the `timeout` the wait names, at most [`MAX_WAIT_HOLD`]. The store is not locked
+/// while the wait is held, so the test can end the operation meanwhile.
+fn hold_wait(shared: &Shared, id: &str, target: &str) {
+    let timeout = target
+        .split_once('?')
+        .and_then(|(_, query)| query_param(query, "timeout"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(MAX_WAIT_HOLD, |seconds| {
+            Duration::from_secs(seconds).min(MAX_WAIT_HOLD)
+        });
+    let started = Instant::now();
+    loop {
+        let running = lock(&shared.store)
+            .operations
+            .get(id)
+            .and_then(|operation| operation.get("status_code"))
+            .and_then(Value::as_u64)
+            .is_some_and(|code| (100..200).contains(&code));
+        if !running || started.elapsed() >= timeout {
+            return;
+        }
+        thread::sleep(WAIT_POLL);
     }
 }
 
@@ -598,7 +831,9 @@ fn parse(target: &str) -> Option<Route> {
         }
         ["storage-pools", pool, "buckets"] => Route::Collection(address("bucket", pool, "")),
         ["storage-pools", pool, "buckets", name] => Route::Object(address("bucket", pool, name)),
-        ["operations", id] | ["operations", id, "wait"] => Route::Operation((*id).to_string()),
+        ["operations"] if query == "all-projects=true&recursion=1" => Route::ListOperations,
+        ["operations", id] => Route::Operation((*id).to_string()),
+        ["operations", id, "wait"] => Route::OperationWait((*id).to_string()),
         _ => return None,
     };
     Some(route)
@@ -675,7 +910,29 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
                 None => (404, String::new(), error_envelope(404, "not found")),
             }
         }
-        ("GET", Route::Operation(id)) => match store.operations.get(&id) {
+        ("GET", Route::ListOperations) => {
+            if shared.operations_unreadable.load(Ordering::SeqCst) {
+                return (
+                    500,
+                    String::new(),
+                    error_envelope(500, "the operations cannot be listed"),
+                );
+            }
+            let mut groups = Map::new();
+            for operation in store.operations.values() {
+                let status = operation
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if let Value::Array(list) = groups.entry(status).or_insert_with(|| json!([])) {
+                    list.push(operation.clone());
+                }
+            }
+            sync(Value::Object(groups))
+        }
+        ("GET", Route::Operation(id) | Route::OperationWait(id)) => match store.operations.get(&id)
+        {
             Some(operation) => sync(operation.clone()),
             None => (404, String::new(), error_envelope(404, "not found")),
         },
@@ -963,13 +1220,35 @@ fn create(
         }
         _ => {}
     }
-    store.objects.push(Stored {
+    let stored = Stored {
         kind: kind.to_string(),
         project,
         name,
         parent,
         body: Value::Object(body),
-    });
+    };
+    let place = place_of_stored(&stored);
+    if let Some(at) = store.armed.iter().position(|armed| armed.place == place) {
+        let armed = store.armed.remove(at);
+        let held = match armed.appears {
+            Appears::WhileRunning => {
+                store.objects.push(stored);
+                Held {
+                    lands: None,
+                    reverts: Some(place.clone()),
+                }
+            }
+            Appears::OnCompletion => Held {
+                lands: Some(stored),
+                reverts: None,
+            },
+        };
+        let operation = running_operation(&armed.id, &place);
+        store.operations.insert(armed.id.clone(), operation.clone());
+        store.held.insert(armed.id.clone(), held);
+        return (202, String::new(), async_envelope(&armed.id, operation));
+    }
+    store.objects.push(stored);
     answered(shared, store, kind, "POST", Ok(()))
 }
 
@@ -1231,13 +1510,17 @@ fn answered(
             "err": message, "resources": {}, "metadata": null,
         }),
     };
-    let url = format!("/1.0/operations/{id}");
-    let envelope = json!({
-        "type": "async", "status": "Operation created", "status_code": 100,
-        "operation": url, "error_code": 0, "error": "", "metadata": operation,
-    });
+    let envelope = async_envelope(&id, operation.clone());
     store.operations.insert(id, operation);
     (202, String::new(), envelope)
+}
+
+/// The envelope of a write Incus accepted as operation `id`.
+fn async_envelope(id: &str, operation: Value) -> Value {
+    json!({
+        "type": "async", "status": "Operation created", "status_code": 100,
+        "operation": format!("/1.0/operations/{id}"), "error_code": 0, "error": "", "metadata": operation,
+    })
 }
 
 /// The ETag of an object: a digest of its canonical JSON, quoted as HTTP has it.
@@ -1298,6 +1581,7 @@ fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         412 => "Precondition Failed",
+        500 => "Internal Server Error",
         _ => "Bad Request",
     }
 }
