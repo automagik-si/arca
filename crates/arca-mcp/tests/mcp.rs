@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arca_api::{Scope, Verb, VerbClass, conforms, verb, verbs};
 use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, serve_unix};
-use common::{Reply, Scratch, bearer, connect_unix, mint_into, post, rpc, wait_for_socket};
+use common::{
+    Reply, Scratch, bearer, connect_unix, exchange, mint_into, post, rpc, wait_for_socket,
+};
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 
@@ -263,6 +265,62 @@ fn an_origin_header_is_checked_before_the_token() {
     );
 }
 
+/// A raw request on a fresh connection: `method` and `path`, with `headers` and `body`.
+fn raw(fx: &Fixture, method: &str, path: &str, headers: &[(String, String)], body: &[u8]) -> Reply {
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    let mut stream = connect_unix(&fx.socket);
+    exchange(&mut stream, &bytes)
+}
+
+#[test]
+fn a_get_with_an_origin_is_403_not_405() {
+    let fx = Fixture::start("get-origin");
+    let headers = [
+        bearer(&fx.viewer),
+        ("Origin".into(), "https://example.com".into()),
+    ];
+    let reply = raw(&fx, "GET", "/mcp", &headers, b"");
+    assert_eq!(
+        reply.status, 403,
+        "a browser GET is refused whatever its method"
+    );
+}
+
+#[test]
+fn an_origin_on_an_unknown_path_is_403_not_404() {
+    let fx = Fixture::start("path-origin");
+    let headers = [bearer(&fx.operator), ("Origin".into(), "null".into())];
+    let reply = raw(&fx, "POST", "/elsewhere", &headers, b"{}");
+    assert_eq!(
+        reply.status, 403,
+        "a browser request is refused on any path"
+    );
+}
+
+#[test]
+fn an_origin_is_refused_before_an_oversize_body_is_read() {
+    let fx = Fixture::start("origin-body");
+    let headers = [
+        bearer(&fx.operator),
+        ("Origin".into(), "https://example.com".into()),
+    ];
+    let big = vec![b'x'; 128 * 1024];
+    let reply = raw(&fx, "POST", "/mcp", &headers, &big);
+    assert_eq!(
+        reply.status, 403,
+        "the Origin refusal comes before the body limit"
+    );
+}
+
 #[test]
 fn a_viewer_calling_token_list_is_403() {
     let fx = Fixture::start("viewer-tl");
@@ -511,6 +569,26 @@ fn a_handler_for_a_verb_the_table_lacks_is_a_wiring_error() {
     let _ = Server::new(table(), tokens).handle("no_such_verb", Arc::new(Canned(json!({}))));
 }
 
+#[test]
+#[should_panic(expected = "is open to viewers")]
+fn a_write_verb_open_to_viewers_is_a_wiring_error_at_start() {
+    let scratch = Scratch::new("viewer-write-table");
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let mut all = verbs().to_vec();
+    all.push(Verb {
+        name: "write_for_viewers",
+        summary: "A write verb that a viewer may call.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: true,
+        destructive: false,
+        params: write_probe_params,
+        result: write_probe_result,
+    });
+    let table: &'static [Verb] = Box::leak(all.into_boxed_slice());
+    let _ = Server::new(table, tokens);
+}
+
 // Framing.
 
 #[test]
@@ -569,6 +647,19 @@ fn a_request_without_the_jsonrpc_version_is_an_invalid_request() {
     let body = serde_json::to_vec(&json!({ "id": 1, "method": "ping" })).expect("json");
     let reply = fx.send(Some(fx.viewer.as_str()), &[], &body);
     assert_eq!(reply.json()["error"]["code"], -32600);
+}
+
+#[test]
+fn a_null_id_is_an_invalid_request() {
+    let fx = Fixture::start("null-id");
+    let body = serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": null, "method": "ping" }))
+        .expect("json");
+    let reply = fx.send(Some(fx.viewer.as_str()), &[], &body);
+    assert_eq!(
+        reply.json()["error"]["code"],
+        -32600,
+        "a null id is not a valid request id"
+    );
 }
 
 #[test]

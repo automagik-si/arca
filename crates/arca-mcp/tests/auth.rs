@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::fs;
-use std::os::unix::fs::symlink;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Command;
 
@@ -29,7 +29,7 @@ fn file_of(err: &TokenStoreError) -> Option<&str> {
         | TokenStoreError::NotOwner { file }
         | TokenStoreError::Malformed { file }
         | TokenStoreError::Io { file } => Some(file),
-        TokenStoreError::NotDir => None,
+        TokenStoreError::NotDir | TokenStoreError::UnsafeDir { .. } => None,
     }
 }
 
@@ -253,6 +253,76 @@ fn a_hash_file_owned_by_another_uid_is_refused_as_not_owner() {
     assert!(
         TokenStore::load_as(scratch.path(), mine).is_ok(),
         "the same files load for their own uid"
+    );
+}
+
+// The token directory itself: a real directory, owned by the server, writable by its owner only.
+
+#[test]
+fn a_token_directory_that_is_a_symlink_is_refused() {
+    let elsewhere = Scratch::new("dirlink-target");
+    mint_into(elsewhere.path(), "ops", Scope::Operator);
+    let holder = Scratch::new("dirlink");
+    let link = holder.at("tokens");
+    symlink(elsewhere.path(), &link).expect("create the symlink");
+    let err = TokenStore::load(&link).expect_err("a symlinked token directory must not load");
+    assert_eq!(
+        err,
+        TokenStoreError::UnsafeDir {
+            reason: "is a symlink"
+        }
+    );
+}
+
+#[test]
+fn a_token_directory_writable_by_a_group_or_others_is_refused() {
+    for mode in [0o775, 0o757, 0o777] {
+        let scratch = Scratch::new("dirmode");
+        mint_into(scratch.path(), "ops", Scope::Operator);
+        fs::set_permissions(scratch.path(), Permissions::from_mode(mode))
+            .expect("set the directory's mode");
+        let err = TokenStore::load(scratch.path())
+            .expect_err("a token directory others may write must not load");
+        assert_eq!(
+            err,
+            TokenStoreError::UnsafeDir {
+                reason: "is writable by a group or by others"
+            },
+            "mode {mode:o}"
+        );
+    }
+}
+
+#[test]
+fn a_token_directory_only_its_owner_may_write_loads() {
+    for mode in [0o755, 0o750, 0o700] {
+        let scratch = Scratch::new("dirok");
+        mint_into(scratch.path(), "ops", Scope::Operator);
+        fs::set_permissions(scratch.path(), Permissions::from_mode(mode))
+            .expect("set the directory's mode");
+        assert!(
+            TokenStore::load(scratch.path()).is_ok(),
+            "mode {mode:o} is private enough"
+        );
+    }
+}
+
+#[test]
+fn a_token_directory_owned_by_another_uid_is_refused() {
+    // Only root can give a directory away, so the test uses `/`, which root owns. Run as root, the server owns `/`, and the
+    // refusal cannot be shown; the test then says so and passes.
+    let scratch = Scratch::new("dirowner");
+    if own_uid(scratch.path()) == 0 {
+        eprintln!("skipped: running as root, which owns `/`");
+        return;
+    }
+    let err =
+        TokenStore::load(Path::new("/")).expect_err("a directory another uid owns must not load");
+    assert_eq!(
+        err,
+        TokenStoreError::UnsafeDir {
+            reason: "is not owned by the server"
+        }
     );
 }
 

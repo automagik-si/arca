@@ -3,18 +3,23 @@
 
 mod common;
 
-use std::fs;
-use std::io::{ErrorKind, Read};
+use std::fs::{self, Permissions};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use arca_api::Scope;
 use arca_mcp::{
     Server, TokenStore, peer_allowed, serve_filtered, serve_tailnet, serve_unix, tailnet_addr_ok,
 };
-use common::{Scratch, bearer, connect_tcp, connect_unix, mint_into, post, rpc, wait_for_socket};
+use common::{
+    Scratch, bearer, connect_tcp, connect_unix, mint_into, own_uid, post, post_bytes, rpc,
+    wait_for_socket,
+};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -246,6 +251,31 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
 
 // The unix socket: mode 0600, refuses what it must, replaces only a stale socket.
 
+/// Waits until something exists at `path`, and returns at the first moment it does. Nothing is waited for after that.
+fn wait_for_path(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fs::symlink_metadata(path).is_err() {
+        assert!(Instant::now() < deadline, "the socket path never appeared");
+        std::thread::yield_now();
+    }
+}
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("list the directory")
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn serve_unix_binds_a_socket_of_mode_0600_that_answers_401_without_a_bearer() {
     let scratch = Scratch::new("unixok");
@@ -253,7 +283,8 @@ fn serve_unix_binds_a_socket_of_mode_0600_that_answers_401_without_a_bearer() {
     let rt = Runtime::new().expect("runtime");
     let (router, served) = (empty_router("unixok-router"), path.clone());
     rt.spawn(async move { serve_unix(router, &served).await });
-    wait_for_socket(&path);
+    // The path appears only once the socket is at its final mode, so the first look at it sees 0600.
+    wait_for_path(&path);
 
     let meta = fs::symlink_metadata(&path).expect("stat the socket");
     assert!(meta.file_type().is_socket(), "the path is a socket");
@@ -347,4 +378,153 @@ fn serve_unix_refuses_a_directory_at_the_path_and_leaves_it_alone() {
         .expect_err("a directory is never removed or bound over");
     assert_eq!(err.kind(), ErrorKind::AlreadyExists);
     assert!(path.is_dir(), "the directory is still there");
+}
+
+#[test]
+fn serve_unix_leaves_nothing_beside_the_socket_once_it_is_up() {
+    let scratch = Scratch::new("unixstaged");
+    let path = scratch.at("arca.sock");
+    let rt = Runtime::new().expect("runtime");
+    let (router, served) = (empty_router("unixstaged-r"), path.clone());
+    rt.spawn(async move { serve_unix(router, &served).await });
+    wait_for_path(&path);
+    // The staging directory is removed right after the rename, so the listing settles a moment after the path appears.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while names_in(scratch.path()) != ["arca.sock"] {
+        assert!(
+            Instant::now() < deadline,
+            "a staging entry was left beside the socket: {:?}",
+            names_in(scratch.path())
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn serve_unix_fails_to_start_when_a_stale_socket_cannot_be_connected_to() {
+    let scratch = Scratch::new("unixeacces");
+    if own_uid(scratch.path()) == 0 {
+        // Root connects to any socket, so there is no connect error to show; the other tests still cover the path.
+        eprintln!("skipped: running as root, which connects to any socket");
+        return;
+    }
+    let path = scratch.at("arca.sock");
+    drop(UnixListener::bind(&path).expect("bind, then let the listener die"));
+    fs::set_permissions(&path, Permissions::from_mode(0o000))
+        .expect("make the stale socket unconnectable");
+    let rt = Runtime::new().expect("runtime");
+    let router = empty_router("unixeacces-r");
+    let outcome = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), serve_unix(router, &path)).await
+    });
+    match outcome {
+        Ok(Err(err)) => {
+            assert_eq!(
+                err.kind(),
+                ErrorKind::PermissionDenied,
+                "a connect error other than refusal fails the start: {err}"
+            );
+        }
+        Ok(Ok(())) => panic!("the server started over a socket it could not connect to"),
+        Err(_) => panic!("the server did not fail to start within five seconds"),
+    }
+    assert!(
+        fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_socket()),
+        "a socket that is not known stale is left alone"
+    );
+}
+
+/// The most connections one listener serves at once. Mirrors the server's cap.
+const CAP: usize = 64;
+/// How long a connection past the cap is given to answer before it counts as unanswered.
+const QUIET: Duration = Duration::from_millis(500);
+
+/// Holds `CAP` idle connections open, then sends one request on one more. While the cap is full that request gets no
+/// reply within `QUIET`; once one held connection closes, it gets its reply.
+fn cap_holds<S: Read + Write>(connect: impl Fn() -> S, set_read: impl Fn(&S, Option<Duration>)) {
+    let request = post_bytes(&[], &rpc(json!(1), "ping", json!({})));
+    let mut held: Vec<S> = (0..CAP).map(|_| connect()).collect();
+    let mut extra = connect();
+    set_read(&extra, Some(QUIET));
+    extra
+        .write_all(&request)
+        .expect("write the request past the cap");
+    let mut early = Vec::new();
+    let _ = extra.read_to_end(&mut early);
+    assert!(
+        early.is_empty(),
+        "a connection past the cap got a reply while the cap was full"
+    );
+
+    drop(held.pop());
+    set_read(&extra, Some(Duration::from_secs(5)));
+    let mut reply = Vec::new();
+    extra
+        .read_to_end(&mut reply)
+        .expect("the queued connection is served once a slot frees");
+    assert!(
+        String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 401"),
+        "the queued request is answered"
+    );
+}
+
+#[test]
+fn a_tcp_connection_past_the_cap_waits_until_a_held_one_closes() {
+    let rt = Runtime::new().expect("runtime");
+    let listener = rt
+        .block_on(TcpListener::bind("127.0.0.1:0"))
+        .expect("bind loopback");
+    let at = listener.local_addr().expect("the bound address");
+    rt.spawn(serve_filtered(
+        empty_router("tcpcap"),
+        listener,
+        allow_loopback,
+    ));
+    cap_holds(
+        || connect_tcp(at),
+        |s, d| s.set_read_timeout(d).expect("set a read timeout"),
+    );
+}
+
+#[test]
+fn a_unix_connection_past_the_cap_waits_until_a_held_one_closes() {
+    let scratch = Scratch::new("unixcap");
+    let path = scratch.at("arca.sock");
+    let rt = Runtime::new().expect("runtime");
+    let (router, served) = (empty_router("unixcap-r"), path.clone());
+    rt.spawn(async move { serve_unix(router, &served).await });
+    wait_for_path(&path);
+    cap_holds(
+        || connect_unix(&path),
+        |s, d| s.set_read_timeout(d).expect("set a read timeout"),
+    );
+}
+
+#[test]
+fn the_real_peer_filter_gives_a_loopback_peer_no_bytes() {
+    let rt = Runtime::new().expect("runtime");
+    let listener = rt
+        .block_on(TcpListener::bind("127.0.0.1:0"))
+        .expect("bind loopback");
+    let at = listener.local_addr().expect("the bound address");
+    rt.spawn(serve_filtered(
+        empty_router("real-filter"),
+        listener,
+        peer_allowed,
+    ));
+
+    let mut stream = connect_tcp(at);
+    let _ = stream.write_all(&post_bytes(&[], &rpc(json!(1), "ping", json!({}))));
+    let mut received = Vec::new();
+    match stream.read_to_end(&mut received) {
+        Ok(_) => {}
+        Err(err) => assert!(
+            !matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+            "the refused loopback peer must be closed, not left open: {err}"
+        ),
+    }
+    assert!(
+        received.is_empty(),
+        "the real filter sends a loopback peer no bytes"
+    );
 }

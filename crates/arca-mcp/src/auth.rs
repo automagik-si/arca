@@ -3,10 +3,11 @@
 //! A token is the secret `arca_` followed by 43 base64url characters (32 random bytes). The server holds only the SHA-256
 //! digest of the whole secret, in `<id>.hash`, whose text is `scope=<scope>` and `sha256=<64 lowercase hex>`, each on its
 //! own line. A secret carries 256 random bits, so a plain digest is enough: a copied hash file yields no usable secret.
-//! A secret is never stored, logged or echoed, and an error names a file, never its content.
+//! A secret is never stored, logged or echoed, and an error names a file, never its content. The token directory is a real
+//! directory, not a symlink, owned by this process and writable by its owner only.
 
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,8 @@ use arca_api::Scope;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+
+use crate::fresh::process_uid;
 
 const PREFIX: &str = "arca_";
 const BODY_LEN: usize = 43;
@@ -30,10 +33,13 @@ pub struct Caller {
     pub scope: Scope,
 }
 
-/// Why a token directory will not load. Each variant names one file, never the file's content.
+/// Why a token directory will not load. Each variant names one file, never the file's content. `UnsafeDir` names the
+/// directory itself, with a fixed phrase for its reason: a symlink, a uid other than the server's, or a group or other
+/// write bit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenStoreError {
     NotDir,
+    UnsafeDir { reason: &'static str },
     BadMode { file: String },
     Symlink { file: String },
     NotOwner { file: String },
@@ -47,6 +53,7 @@ impl std::fmt::Display for TokenStoreError {
             TokenStoreError::NotDir => {
                 write!(f, "the token directory is missing or not a directory")
             }
+            TokenStoreError::UnsafeDir { reason } => write!(f, "the token directory {reason}"),
             TokenStoreError::BadMode { file } => write!(f, "token file {file} is not mode 0400"),
             TokenStoreError::Symlink { file } => write!(f, "token file {file} is a symlink"),
             TokenStoreError::NotOwner { file } => {
@@ -81,20 +88,22 @@ impl std::fmt::Debug for TokenStore {
 }
 
 impl TokenStore {
-    /// Loads every hash file of `dir`, which must be owned by this process's effective uid.
+    /// Loads every hash file of `dir`, a private directory of this process's uid whose files are owned by that uid too.
     pub fn load(dir: &Path) -> Result<TokenStore, TokenStoreError> {
-        let uid = effective_uid().map_err(|_| TokenStoreError::Io {
-            file: "/proc/self/status".into(),
+        let uid = process_uid().map_err(|_| TokenStoreError::Io {
+            file: "the uid probe".into(),
         })?;
         TokenStore::load_as(dir, uid)
     }
 
-    /// Loads every hash file of `dir`, which must be owned by `owner_uid`. [`TokenStore::load`] passes this process's uid.
-    /// A caller other than `load` names the uid the files must carry, so a test can check the owner refusal without root.
+    /// Loads every hash file of `dir`, each of which must be owned by `owner_uid`. [`TokenStore::load`] passes this
+    /// process's uid.
+    ///
+    /// Test seam: a test names a uid other than its own to reach the file-owner refusal without root. The directory is
+    /// always checked against this process's uid, never against `owner_uid`.
+    #[doc(hidden)]
     pub fn load_as(dir: &Path, owner_uid: u32) -> Result<TokenStore, TokenStoreError> {
-        if !fs::metadata(dir).is_ok_and(|m| m.is_dir()) {
-            return Err(TokenStoreError::NotDir);
-        }
+        check_dir(dir)?;
         let mut paths = list(dir)?;
         paths.sort();
         let mut entries: Vec<Entry> = Vec::with_capacity(paths.len());
@@ -160,6 +169,34 @@ pub fn mint(scope: Scope) -> (String, String) {
         to_hex(&sha256(secret.as_bytes()))
     );
     (secret, text)
+}
+
+/// The token directory itself: a real directory, not a symlink, owned by this process's uid and not writable by a group or
+/// by others. A path that is missing or is not a directory is `NotDir`.
+fn check_dir(dir: &Path) -> Result<(), TokenStoreError> {
+    let meta = fs::symlink_metadata(dir).map_err(|_| TokenStoreError::NotDir)?;
+    if meta.file_type().is_symlink() {
+        return Err(TokenStoreError::UnsafeDir {
+            reason: "is a symlink",
+        });
+    }
+    if !meta.is_dir() {
+        return Err(TokenStoreError::NotDir);
+    }
+    let uid = process_uid().map_err(|_| TokenStoreError::Io {
+        file: "the uid probe".into(),
+    })?;
+    if meta.uid() != uid {
+        return Err(TokenStoreError::UnsafeDir {
+            reason: "is not owned by the server",
+        });
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(TokenStoreError::UnsafeDir {
+            reason: "is writable by a group or by others",
+        });
+    }
+    Ok(())
 }
 
 fn list(dir: &Path) -> Result<Vec<PathBuf>, TokenStoreError> {
@@ -303,17 +340,4 @@ fn digests_equal(a: &[u8; 32], b: &[u8; 32]) -> bool {
         diff |= x ^ y;
     }
     std::hint::black_box(diff) == 0
-}
-
-/// The effective uid of this process, from `/proc/self/status`, the second field of its `Uid:` line.
-fn effective_uid() -> io::Result<u32> {
-    let status = fs::read_to_string("/proc/self/status")?;
-    let line = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Uid:"))
-        .ok_or_else(|| io::Error::other("no Uid line"))?;
-    line.split_whitespace()
-        .nth(1)
-        .and_then(|field| field.parse().ok())
-        .ok_or_else(|| io::Error::other("no effective uid"))
 }

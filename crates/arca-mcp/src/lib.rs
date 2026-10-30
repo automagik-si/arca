@@ -5,6 +5,7 @@
 //! It listens on a unix socket (mode 0600) and, optionally, on one tailnet address.
 
 pub mod auth;
+mod fresh;
 pub mod http;
 pub mod jsonrpc;
 pub mod tools;

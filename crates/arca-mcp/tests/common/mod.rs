@@ -30,6 +30,8 @@ impl Scratch {
         let dir =
             std::env::temp_dir().join(format!("arca-mcp-{}-{nanos}-{n}-{tag}", std::process::id()));
         fs::create_dir_all(&dir).expect("create the scratch directory");
+        // A private directory whatever the umask: a token directory must not be writable by a group or by others.
+        fs::set_permissions(&dir, Permissions::from_mode(0o700)).expect("make it private");
         Scratch(dir)
     }
 
@@ -137,8 +139,8 @@ impl Reply {
     }
 }
 
-/// Sends `POST /mcp` with `headers` and `body`, then reads the reply until the server closes.
-pub fn post<S: Read + Write>(stream: &mut S, headers: &[(String, String)], body: &[u8]) -> Reply {
+/// The bytes of `POST /mcp` with `headers` and `body`, sent with `Connection: close`.
+pub fn post_bytes(headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
     let mut head = format!(
         "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
@@ -147,14 +149,23 @@ pub fn post<S: Read + Write>(stream: &mut S, headers: &[(String, String)], body:
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
-    stream
-        .write_all(head.as_bytes())
-        .expect("write the request head");
-    // A server may answer and close before it reads a large body, so a failed body write is not a test failure here.
-    let _ = stream.write_all(body);
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Sends `bytes`, then reads the reply until the server closes. A server may answer and close before it reads a large
+/// body, so a failed write is not a test failure here.
+pub fn exchange<S: Read + Write>(stream: &mut S, bytes: &[u8]) -> Reply {
+    let _ = stream.write_all(bytes);
     let mut raw = Vec::new();
     let _ = stream.read_to_end(&mut raw);
     parse(&raw)
+}
+
+/// Sends `POST /mcp` with `headers` and `body`, then reads the reply until the server closes.
+pub fn post<S: Read + Write>(stream: &mut S, headers: &[(String, String)], body: &[u8]) -> Reply {
+    exchange(stream, &post_bytes(headers, body))
 }
 
 fn parse(raw: &[u8]) -> Reply {

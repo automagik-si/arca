@@ -1,7 +1,8 @@
 //! JSON-RPC 2.0 framing for the MCP methods the server answers: `initialize`, `ping`, `tools/list` and `tools/call`.
 //!
 //! A request without an `id` is a notification and gets no body, but only a `notifications/` method may be one. Any other
-//! method without an id is refused as an invalid request, so a write never runs with no answer to its caller.
+//! method without an id is refused as an invalid request, so a write never runs with no answer to its caller. An `id` is
+//! a string or a number; a `null` id is invalid.
 
 use arca_api::{API_VERSION, conforms, may_call};
 use serde_json::{Value, json};
@@ -44,9 +45,7 @@ pub async fn dispatch(
         )));
     };
     let id = request.get("id").cloned();
-    let id_ok = id
-        .as_ref()
-        .is_none_or(|v| v.is_string() || v.is_number() || v.is_null());
+    let id_ok = id.as_ref().is_none_or(|v| v.is_string() || v.is_number());
     let method = request.get("method").and_then(Value::as_str);
     let version_ok = request.get("jsonrpc") == Some(&json!("2.0"));
     let (true, true, Some(method)) = (version_ok, id_ok, method) else {
@@ -88,7 +87,7 @@ pub async fn dispatch(
 
 fn valid_id_or_null(id: &Option<Value>) -> Value {
     match id {
-        Some(v) if v.is_string() || v.is_number() || v.is_null() => v.clone(),
+        Some(v) if v.is_string() || v.is_number() => v.clone(),
         _ => Value::Null,
     }
 }
