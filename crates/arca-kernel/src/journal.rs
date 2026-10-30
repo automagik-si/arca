@@ -375,6 +375,18 @@ impl<S: JournalStore> Journal<S> {
             .collect()
     }
 
+    /// Every entry with at least one effect that still counts, in id order. Recovery and removal start from this list, so an
+    /// entry the desired state no longer carries is found from the journal alone.
+    pub fn live_entries(&self) -> Vec<EntryId> {
+        let entries: std::collections::BTreeSet<EntryId> = self
+            .latest
+            .values()
+            .filter(|r| !matches!(r.state, EffectState::Reverted | EffectState::Failed))
+            .map(|r| r.entry.clone())
+            .collect();
+        entries.into_iter().collect()
+    }
+
     /// Every intent with no applied, failed or reverted record, in id order.
     pub fn unresolved(&self) -> Vec<EffectRecord> {
         self.latest

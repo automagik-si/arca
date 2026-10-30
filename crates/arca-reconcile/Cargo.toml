@@ -1,0 +1,29 @@
+[package]
+name = "arca-reconcile"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arca's single reconciler: applies signed desired state through the plugins, reverts removed entries and deletes only under an approved plan"
+
+[dependencies]
+arca-approval.workspace = true
+arca-kernel.workspace = true
+arca-providers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# The removal suite runs the toy plugin, which only this feature builds. The crate turns the feature on for its own tests, so
+# `cargo test --workspace` runs them without a feature flag.
+arca-reconcile = { path = ".", features = ["toy"] }
+arca-incus.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+
+[features]
+toy = []
+
+[lints]
+workspace = true

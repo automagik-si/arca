@@ -191,6 +191,26 @@ pub trait Provider {
         op: &EffectOp,
         planned: &Planned,
     ) -> Result<(ObjectRef, Inverse), EffectRefusal>;
+    /// Deletes an object the entry owns, with `plan` as the digest its tombstone carries. Only the reconciler calls this:
+    /// a class-B delete runs after an approval over `plan`, and a class-A revert runs at once with the digest of the create it
+    /// undoes. A provider that never deletes keeps this default, which refuses.
+    fn retire(
+        &mut self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        plan: &Digest,
+    ) -> Result<Retirement, EffectRefusal> {
+        let _ = (entry, object, plan);
+        Err(EffectRefusal::NotDeclared)
+    }
+}
+
+/// What a retirement did: the object was deleted, or the delete was skipped because the object no longer showed what the plan
+/// approved. The text of a drift names the rule that did not hold and never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retirement {
+    Deleted(ObjectRef),
+    Drift(String),
 }
 
 /// What a plugin's apply runs against: its entry, its manifest, the provider, the journal and the clock.

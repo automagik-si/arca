@@ -74,6 +74,8 @@ pub enum ApprovalRefusal {
     Untrusted(String),
     /// The nonce store could not be read, or a spend could not be made durable. Nothing was allowed.
     Storage(String),
+    /// The journal holds an intent with no recorded outcome, so no delete may run until it is resolved. Nothing was spent.
+    Unresolved,
 }
 
 impl std::fmt::Display for ApprovalRefusal {
@@ -110,6 +112,9 @@ impl std::fmt::Display for ApprovalRefusal {
             Self::Storage(why) => {
                 write!(f, "the nonce store cannot be read or made durable: {why}")
             }
+            Self::Unresolved => f.write_str(
+                "the journal holds an unresolved intent; no delete runs until it is resolved",
+            ),
         }
     }
 }

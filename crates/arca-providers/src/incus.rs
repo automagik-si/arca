@@ -27,6 +27,7 @@ use arca_kernel::journal::{EffectClass, Inverse};
 use arca_kernel::ownership::{
     IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify, kernel_may_write,
 };
+pub use arca_kernel::plugin::Retirement;
 use arca_kernel::plugin::{EffectOp, EffectRefusal, Observe, Planned, Provider, op_digest};
 use serde_json::{Map, Value, json};
 
@@ -90,6 +91,11 @@ impl RetainedSet {
             .map_err(|_| unreadable_retained_set())?
             .insert(entry, (plugin, plan));
         Ok(())
+    }
+
+    /// Whether `entry` is retained. A set whose lock was poisoned is refused, so the caller never reads it as "not retained".
+    pub fn holds(&self, entry: &EntryId) -> Result<bool, EffectRefusal> {
+        Ok(self.snapshot()?.contains_key(entry))
     }
 
     /// A copy of the set as it is now. A set whose lock was poisoned is refused, never read as empty.
@@ -157,14 +163,6 @@ impl Family {
         )
         .map_err(EffectRefusal::Provider)
     }
-}
-
-/// What a retirement did: the object was deleted, or the delete was skipped because the object no longer showed what the plan
-/// approved. The text of a drift names the rule that did not hold and never a value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Retirement {
-    Deleted(ObjectRef),
-    Drift(String),
 }
 
 /// The Incus write provider. It writes only inside its family, only the objects an entry owns, and only through the writer.
@@ -903,6 +901,16 @@ impl Provider for IncusProvider {
             // A delete runs only through `retire`, after an approved plan. The kernel's own path refuses it.
             EffectOp::IncusDelete { .. } => Err(EffectRefusal::NotDeclared),
         }
+    }
+
+    /// The reconciler's delete, through [`IncusProvider::retire`]: the tombstone, the read-back and the delete, in that order.
+    fn retire(
+        &mut self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        plan: &Digest,
+    ) -> Result<Retirement, EffectRefusal> {
+        IncusProvider::retire(self, entry, object, plan)
     }
 }
 

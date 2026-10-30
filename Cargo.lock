@@ -120,6 +120,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arca-reconcile"
+version = "0.1.0"
+dependencies = [
+ "arca-approval",
+ "arca-incus",
+ "arca-kernel",
+ "arca-providers",
+ "arca-reconcile",
+ "base64",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+]
+
+[[package]]
 name = "arca-watch"
 version = "0.1.0"
 dependencies = [
