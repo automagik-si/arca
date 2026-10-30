@@ -86,17 +86,7 @@ impl DesiredStore {
     /// state file, when there is one, must be private and must verify as this node's own signed document; anything else is
     /// refused and nothing is changed.
     pub fn open(dir: &Path, key: NodeKey) -> Result<Self, KernelError> {
-        let lock_path = dir.join(LOCK_FILE);
-        let lock = open_private(&lock_path)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(KernelError::Locked {
-                    path: lock_path.display().to_string(),
-                });
-            }
-            Err(TryLockError::Error(error)) => return Err(io_error(&lock_path, &error)),
-        }
+        let lock = lock_state_dir(dir)?;
         let state = read_state(&dir.join(STATE_FILE))?;
         let signer = key.public();
         let applied = match &state.current {
@@ -319,6 +309,21 @@ fn records(retained: &Retained) -> Vec<RetainedRecord> {
             plan: plan.clone(),
         })
         .collect()
+}
+
+/// Takes the state directory's exclusive lock, [`LOCK_FILE`], and holds it for as long as the returned file lives. A lock that
+/// another open holds is refused as [`KernelError::Locked`]. The store takes it, and so does `arca adopt apply`, so an
+/// adoption never runs beside a server over the same state directory.
+pub fn lock_state_dir(dir: &Path) -> Result<File, KernelError> {
+    let lock_path = dir.join(LOCK_FILE);
+    let lock = open_private(&lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(TryLockError::WouldBlock) => Err(KernelError::Locked {
+            path: lock_path.display().to_string(),
+        }),
+        Err(TryLockError::Error(error)) => Err(io_error(&lock_path, &error)),
+    }
 }
 
 /// Opens `path` for reading and writing, creating it at mode 0600 when it is missing. A link is refused before anything is

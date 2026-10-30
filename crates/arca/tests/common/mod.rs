@@ -386,3 +386,104 @@ pub fn deletes_for(fake: &FakeIncus, fragment: &str) -> usize {
 pub fn plan_args_digest(plan_hex: &str) -> String {
     params_digest(&json!({ "plan": plan_hex })).expect("the arguments are an object")
 }
+
+// Adoption. The instance the adoption tests take is `svc1`: a running container in `default` whose NIC comes from the default
+// profile, on the bridge `br1`, and whose root is its own device. Its MAC holds the lease of `ADOPT_IP`.
+
+/// The adopted instance's MAC.
+pub const ADOPT_MAC: &str = "10:66:6a:00:00:01";
+/// The adopted instance's IPv4, which its MAC leases.
+pub const ADOPT_IP: &str = "192.0.2.131";
+/// The adopted instance's uuid.
+pub const ADOPT_UUID: &str = "00000000-0000-4000-8000-0000000000a1";
+/// The adoption project.
+pub const ADOPT_TO: &str = "arcak-adopt-svc1";
+
+/// The instance `svc1` in `project`, with `extra` added to its own config.
+pub fn adopt_instance(project: &str, extra: Value) -> Value {
+    let mut config = json!({ "volatile.uuid": ADOPT_UUID, "volatile.eth0.hwaddr": ADOPT_MAC, "image.os": "debian" });
+    if let (Some(config), Value::Object(extra)) = (config.as_object_mut(), extra) {
+        config.extend(extra);
+    }
+    json!({
+        "name": "svc1", "project": project, "type": "container", "status": "Running",
+        "created_at": "2026-01-01T00:00:00Z", "profiles": ["default"], "config": config,
+        "devices": { "root": { "type": "disk", "path": "/", "pool": "pool1", "size": "60GiB" } },
+    })
+}
+
+/// A fake serving `instances` in `default` and `bench`, the bridge `br1`, the default profile's `eth0` on it, and the lease
+/// of `ADOPT_IP` for `ADOPT_MAC`.
+pub fn adopt_fake(scratch: &Scratch, instances: Vec<Value>) -> FakeIncus {
+    let state = FakeState {
+        server: json!({ "api_version": "1.0" }),
+        projects: vec![
+            json!({ "name": "default", "description": "", "config": {} }),
+            json!({ "name": "bench", "description": "", "config": {} }),
+        ],
+        instances,
+        pools: vec![("pool1".to_string(), json!({}))],
+        networks: vec![
+            json!({ "name": "br1", "project": "default", "type": "bridge",
+            "config": { "ipv4.address": "192.0.2.1/24" } }),
+        ],
+    };
+    let fake = FakeIncus::start(&scratch.dir, state).expect("the fake serves");
+    fake.add_profile(
+        "default",
+        json!({ "name": "default", "config": {},
+            "devices": { "eth0": { "type": "nic", "name": "eth0", "network": "br1" } } }),
+    );
+    fake.set_lease("br1", ADOPT_MAC, ADOPT_IP);
+    fake
+}
+
+/// An adoption config over `fake` that lists `svc1` and attaches `br1`, written into `scratch`, with its state directory made.
+pub fn adopt_config(scratch: &Scratch, fake: &FakeIncus) -> std::path::PathBuf {
+    let state = scratch.path("state");
+    fs::create_dir_all(&state).expect("the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    let config = json!({
+        "stateDir": state.display().to_string(),
+        "incus": { "socket": fake.socket().display().to_string() },
+        "identityPhones": ["phone1"],
+        "listen": { "unix": scratch.path("arca.sock").display().to_string() },
+        "tokens": { "hashDir": scratch.path("tokens").display().to_string() },
+        "kernel": {
+            "projects": [ADOPT_TO], "droiddProjects": ["droid"],
+            "adopt": [{ "instance": "svc1", "to": ADOPT_TO }], "attachNetworks": ["br1"],
+        },
+    });
+    let path = scratch.path("adopt.json");
+    fs::write(&path, config.to_string()).expect("the config");
+    path
+}
+
+/// Runs `arca adopt <args> --config <config>` in this process.
+pub fn adopt_run(config: &Path, args: &[&str]) -> Result<Option<Value>, arca::Failure> {
+    let mut argv: Vec<String> = std::iter::once("adopt")
+        .chain(args.iter().copied())
+        .map(str::to_string)
+        .collect();
+    argv.push("--config".to_string());
+    argv.push(config.display().to_string());
+    arca::run(&argv)
+}
+
+/// The plan's digest, from `arca adopt plan`.
+pub fn adopt_digest(config: &Path) -> String {
+    let planned = adopt_run(
+        config,
+        &[
+            "plan",
+            "--instance",
+            "svc1",
+            "--expect-ip",
+            ADOPT_IP,
+            "--json",
+        ],
+    )
+    .expect("the plan")
+    .expect("a result");
+    planned["digest"].as_str().expect("a digest").to_string()
+}

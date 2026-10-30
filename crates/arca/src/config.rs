@@ -1,13 +1,17 @@
 //! The node config file: one JSON document in camelCase. Every key is named and every unknown key is refused. The rules
 //! the kernel depends on are checked here, before any command reads Incus: the tailnet and proxy addresses, the project
-//! names the kernel may never write in, and the scratch prefix.
+//! names the kernel may never write in, the scratch prefix, and the adoption allowlist.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+// The adoption types come from the writer, whose feature reaches this crate through `arca-providers`, the one crate that
+// enables it (docs/OWNERSHIP.md, Rule 28).
+pub use arca_incus::adopt::AdoptTarget;
 use arca_mcp::{proxy_addr_ok, tailnet_addr_ok};
 use serde::Deserialize;
 use serde_json::error::Category;
@@ -84,6 +88,14 @@ pub struct KernelConfig {
     pub droidd_projects: Vec<String>,
     #[serde(default)]
     pub reserved_cidrs: Vec<String>,
+    /// The containers `arca adopt` may take from the default project, each with its adoption project. A config that lists any
+    /// is for `arca adopt` alone: `serve` refuses it.
+    #[serde(default)]
+    pub adopt: Vec<AdoptTarget>,
+    /// The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing
+    /// writes them.
+    #[serde(default)]
+    pub attach_networks: Vec<String>,
 }
 
 /// Why a config is refused. No variant carries a config value, except a project name the rules themselves name.
@@ -105,6 +117,8 @@ pub enum ConfigError {
     ApprovalHost,
     /// Kernel projects are named, and no droidd project is listed to exclude.
     DroiddProjectsEmpty,
+    /// The adoption allowlist or its attach networks break a rule. The text names the rule, never a value.
+    Adopt(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -126,6 +140,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "kernel.droiddProjects must list droidd's projects when kernel.projects is not empty"
             ),
+            Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
@@ -170,6 +185,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     if !kernel.projects.is_empty() && kernel.droidd_projects.is_empty() {
         return Err(ConfigError::DroiddProjectsEmpty);
     }
+    check_adopt(kernel)?;
     if kernel.scratch {
         for name in &kernel.projects {
             if !name.starts_with(SCRATCH_PREFIX) {
@@ -181,6 +197,40 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
         && !host_name_ok(host)
     {
         return Err(ConfigError::ApprovalHost);
+    }
+    Ok(())
+}
+
+/// The adoption rules: plain names, each adoption project starting `arcak-adopt-` and listed in `kernel.projects`, no
+/// instance or project listed twice, plain attach networks, and no scratch run.
+fn check_adopt(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    if !kernel.adopt.is_empty() && kernel.scratch {
+        return Err(ConfigError::Adopt(
+            "kernel.scratch must be false when kernel.adopt is set",
+        ));
+    }
+    let (mut instances, mut projects) = (BTreeSet::new(), BTreeSet::new());
+    for target in &kernel.adopt {
+        target.check().map_err(ConfigError::Adopt)?;
+        if !kernel.projects.contains(&target.to) {
+            return Err(ConfigError::Adopt(
+                "each adoption project must be listed in kernel.projects",
+            ));
+        }
+        if !instances.insert(&target.instance) || !projects.insert(&target.to) {
+            return Err(ConfigError::Adopt(
+                "an instance or an adoption project is listed twice",
+            ));
+        }
+    }
+    let plain = |name: &String| {
+        (1..=63).contains(&name.len())
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if !kernel.attach_networks.iter().all(plain) {
+        return Err(ConfigError::Adopt("an attach network is not a plain name"));
     }
     Ok(())
 }
@@ -258,6 +308,55 @@ mod tests {
                 "{bad:?} is not a host name"
             );
         }
+    }
+
+    fn adopting(kernel: serde_json::Value) -> Result<(), ConfigError> {
+        let mut value = serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": ["droid"], "projects": ["arcak-adopt-svc1"],
+                "adopt": [{ "instance": "svc1", "to": "arcak-adopt-svc1" }], "attachNetworks": ["br1"] }
+        });
+        if let serde_json::Value::Object(extra) = kernel {
+            value["kernel"]
+                .as_object_mut()
+                .expect("kernel")
+                .extend(extra);
+        }
+        let config: NodeConfig =
+            serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        check(&config)
+    }
+
+    #[test]
+    fn an_adoption_allowlist_is_refused_unless_every_rule_holds() {
+        use serde_json::json;
+        assert_eq!(adopting(json!({})), Ok(()));
+        let refused = [
+            json!({ "scratch": true }),
+            json!({ "adopt": [{ "instance": "svc1", "to": "arcak-scratch-svc1" }], "projects": ["arcak-scratch-svc1"] }),
+            json!({ "adopt": [{ "instance": "svc1", "to": "arcak-adopt-other" }] }),
+            json!({ "adopt": [{ "instance": "Svc 1", "to": "arcak-adopt-svc1" }] }),
+            json!({ "adopt": [{ "instance": "svc1", "to": "arcak-adopt-svc1" }, { "instance": "svc1", "to": "arcak-adopt-svc1" }] }),
+            json!({ "attachNetworks": ["br1,br2"] }),
+        ];
+        for kernel in refused {
+            assert!(
+                matches!(
+                    adopting(kernel.clone()),
+                    Err(ConfigError::Adopt(_) | ConfigError::ScratchPrefix(_))
+                ),
+                "{kernel}"
+            );
+        }
+        assert!(
+            adopting(
+                json!({ "adopt": [{ "instance": "svc1", "to": "arcak-adopt-svc1", "x": 1 }] })
+            )
+            .is_err()
+        );
     }
 
     #[test]

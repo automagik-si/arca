@@ -3,8 +3,11 @@
 //!
 //! Exit codes: 0 for success; 1 for a runtime failure (a socket, a read or a write that failed); 2 for a usage or config
 //! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error, whose
-//! JSON-RPC error object `call` prints on stdout; 4 for a token the node refuses, HTTP 401 or 403.
+//! JSON-RPC error object `call` prints on stdout; 4 for a token the node refuses, HTTP 401 or 403. `arca adopt` exits 2 too when
+//! it refuses before any write: a preflight check, a stale plan digest, or an instance the config does not list.
 
+pub mod adoptions;
+pub mod cmd_adopt;
 pub mod cmd_call;
 pub mod cmd_serve;
 pub mod cmd_token;
@@ -31,7 +34,10 @@ const USAGE: &str = "usage: arca <command>
   serve --config <file>
   call <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
-  shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]";
+  shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
+  adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
+  adopt apply --instance <name> --plan-digest <hex> [--dry-run] --config <file>
+  adopt status --instance <name> --json --config <file>";
 
 /// Why a command ended without a result. The message never carries a token, a secret or a key.
 #[derive(Debug)]
@@ -46,12 +52,14 @@ pub enum Failure {
     Tool(Value),
     /// The node refuses the token, or the token's scope may not make the call. The text names the refusal.
     Unauthorized(String),
+    /// `arca adopt` refused before it sent any write. The text names the check.
+    Refused(String),
 }
 
 impl Failure {
     pub fn code(&self) -> i32 {
         match self {
-            Self::Usage(_) | Self::Config(_) => 2,
+            Self::Usage(_) | Self::Config(_) | Self::Refused(_) => 2,
             Self::Runtime(_) => 1,
             Self::Tool(_) => 3,
             Self::Unauthorized(_) => 4,
@@ -64,7 +72,8 @@ impl Failure {
             Self::Usage(text)
             | Self::Config(text)
             | Self::Runtime(text)
-            | Self::Unauthorized(text) => text,
+            | Self::Unauthorized(text)
+            | Self::Refused(text) => text,
             Self::Tool(_) => "",
         }
     }
@@ -168,6 +177,7 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "metrics" => cmd_watch::metrics(&parse_flags(rest, &["config", "sample-for"], &["json"])?),
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),
         "call" => cmd_call::call(rest),
+        "adopt" => cmd_adopt::adopt(rest),
         "token" => match rest.split_first() {
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
                 rest,
