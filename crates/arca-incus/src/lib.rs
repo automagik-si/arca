@@ -10,7 +10,7 @@ pub mod shim;
 pub mod write;
 
 pub use fake::{FakeIncus, FakeState, RecordedRequest, WriteRecord};
-pub use read::{IncusError, IncusRead, Unconfirmed, UnixIncus};
+pub use read::{IncusError, IncusRead, Target, Unconfirmed, UnixIncus};
 pub use shim::{RecordingShim, ShimHandle, ShimSummary};
 #[cfg(feature = "write")]
-pub use write::{Owned, ProjectFamily, Target, UnixIncusWriter};
+pub use write::{Owned, ProjectFamily, Reading, UnixIncusWriter};

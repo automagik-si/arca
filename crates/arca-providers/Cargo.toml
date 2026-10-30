@@ -7,7 +7,8 @@ repository.workspace = true
 description = "Arca's host providers: the read-only Incus provider that serves plugins, which can never write"
 
 [dependencies]
-arca-incus.workspace = true
+# The provider is the one crate that enables the writer; see docs/OWNERSHIP.md, rule 28.
+arca-incus = { workspace = true, features = ["write"] }
 arca-kernel.workspace = true
 serde_json.workspace = true
 

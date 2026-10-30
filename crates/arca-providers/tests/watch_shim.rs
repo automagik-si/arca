@@ -264,6 +264,7 @@ fn the_read_only_provider_refuses_every_plan_and_every_effect() {
     let rig = rig(&scratch);
     let mut provider = host(&rig);
     let op = EffectOp::IncusCreate {
+        parent: None,
         kind: IncusKind::Instance,
         project: "droid".to_string(),
         name: "probe1".to_string(),
@@ -311,6 +312,7 @@ fn an_effect_from_the_watch_is_refused_and_journals_nothing() {
     let manifest = Watch::manifest();
     let mut journal = Journal::open(MemJournal::new()).expect("open the journal");
     let op = EffectOp::IncusCreate {
+        parent: None,
         kind: IncusKind::Instance,
         project: "droid".to_string(),
         name: "probe1".to_string(),
@@ -338,6 +340,7 @@ fn a_planned_write_is_refused_by_the_provider_before_any_intent_is_journalled() 
     let manifest = writer_manifest();
     let mut journal = Journal::open(MemJournal::new()).expect("open the journal");
     let op = EffectOp::IncusCreate {
+        parent: None,
         kind: IncusKind::Instance,
         project: "droid".to_string(),
         name: "probe1".to_string(),

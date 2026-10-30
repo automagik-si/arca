@@ -524,6 +524,7 @@ fn an_effect_attempted_inside_the_watch_is_refused_and_journals_nothing() {
     let mut host = Listing::of(fixture_listing());
     let mut journal = Journal::open(MemJournal::new()).expect("open the journal");
     let op = EffectOp::IncusCreate {
+        parent: None,
         kind: IncusKind::Instance,
         project: "svc".to_string(),
         name: "x9".to_string(),

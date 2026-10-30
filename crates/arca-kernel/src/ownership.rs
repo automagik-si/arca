@@ -31,11 +31,23 @@ pub enum IncusKind {
     Bucket,
 }
 
-/// An Incus object's address. A project's `project` and `name` are both its own name.
+impl IncusKind {
+    /// Whether Incus gives an object of this kind a uuid: an instance and a volume, through their `volatile.uuid` config key.
+    /// Every other kind is identified by its kind, project, parent and name.
+    pub fn has_uuid(self) -> bool {
+        matches!(self, IncusKind::Instance | IncusKind::Volume)
+    }
+}
+
+/// An Incus object's address. A project's `project` and `name` are both its own name. `parent` is the storage pool of a
+/// volume or a bucket and the network of a forward; every other kind has none, and its JSON omits the key, so the digests of
+/// those objects do not change. `uuid` is set only for a kind that has one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectRef {
     pub kind: IncusKind,
     pub project: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub name: String,
     pub uuid: Option<String>,
 }

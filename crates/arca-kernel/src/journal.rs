@@ -602,12 +602,13 @@ fn refusal_to_follow(prev: &EffectRecord, next: &EffectRecord) -> Option<&'stati
     }
 }
 
-/// An applied outcome names the object its intent names: the same kind, project and name, and the same uuid when the intent
-/// carries one. A create's intent carries no uuid, since the uuid is learned only as the create applies.
+/// An applied outcome names the object its intent names: the same kind, project, parent and name, and the same uuid when the
+/// intent carries one. A create's intent carries no uuid, since the uuid is learned only as the create applies.
 fn applied_names_intent_target(record: &EffectRecord) -> Option<&'static str> {
     let object = record.object.as_ref()?;
     let same_place = record.target.kind == object.kind
         && record.target.project == object.project
+        && record.target.parent == object.parent
         && record.target.name == object.name;
     let same_uuid = record.target.uuid.is_none() || record.target.uuid == object.uuid;
     if !same_place || !same_uuid {
@@ -628,8 +629,10 @@ fn inverse_names_other_object(record: &EffectRecord) -> Option<&'static str> {
             return None;
         }
     };
-    let same_place =
-        named.kind == object.kind && named.project == object.project && named.name == object.name;
+    let same_place = named.kind == object.kind
+        && named.project == object.project
+        && named.parent == object.parent
+        && named.name == object.name;
     (!same_place).then_some("has an inverse for another object")
 }
 
@@ -745,6 +748,9 @@ mod closed {
     struct Wire {
         kind: IncusKind,
         project: String,
+        // Absent in records written before the parent field existed, so it is read as none there.
+        #[serde(default)]
+        parent: Option<String>,
         name: String,
         uuid: Option<String>,
     }
@@ -754,6 +760,7 @@ mod closed {
             ObjectRef {
                 kind: wire.kind,
                 project: wire.project,
+                parent: wire.parent,
                 name: wire.name,
                 uuid: wire.uuid,
             }

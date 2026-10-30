@@ -20,12 +20,13 @@ use std::time::{Duration, Instant};
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::ownership::{
-    IncusKind, KERNEL_RETIRING_KEY, ObjectRef, OwnerClass, classify, kernel_may_write,
+    IncusKind, KERNEL_RETIRING_KEY, OwnerClass, classify, kernel_may_write,
 };
 use serde_json::{Map, Value, json};
 
 use crate::read::{
-    Framed, IncusError, TIMEOUT, Unconfirmed, cap_message, check_path, checked_envelope, exchange,
+    Framed, IncusError, TIMEOUT, Target, Unconfirmed, cap_message, check_path, checked_envelope,
+    exchange,
 };
 
 /// The largest write body the writer sends, in bytes.
@@ -40,14 +41,6 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_PAUSE: Duration = Duration::from_millis(100);
 /// Projects the writer never changes, whatever the family names.
 const RESERVED_PROJECTS: [&str; 2] = ["bench", "default"];
-
-/// The object a write names. `parent` is the storage pool of a volume or a bucket, and the network of a forward. It is
-/// required for those kinds and refused for every other kind. Every name must be a plain path segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
-    pub object: ObjectRef,
-    pub parent: Option<String>,
-}
 
 /// An object the writer read and classed as its entry's own. Its fields are private, and only [`UnixIncusWriter`] makes one,
 /// so holding one is proof that the classifier allowed the entry to change the object at that read. Its `etag` is the one
@@ -92,6 +85,19 @@ impl Owned {
     pub fn tombstone(&self) -> Option<&str> {
         self.tombstone.as_deref()
     }
+}
+
+/// What a read of an object shows of its owner. See [`UnixIncusWriter::read_class`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    /// The class the object's own config gives.
+    pub class: OwnerClass,
+    /// The ETag the read returned.
+    pub etag: String,
+    /// The object's uuid, for a kind that has one.
+    pub uuid: Option<String>,
+    /// The object's own config, as read. It may hold values, so it is never printed or journalled.
+    pub config: BTreeMap<String, String>,
 }
 
 /// The projects the kernel may write in: the names its configuration lists, and nothing else.
@@ -173,10 +179,25 @@ impl UnixIncusWriter {
         self.fetch(target)
     }
 
+    /// Reads an object's owner without refusing it: the class, the ETag, the uuid and the own config. Only a GET is sent. The
+    /// family is still checked first, so a target outside it sends nothing. A caller that refuses a write uses this to name the
+    /// class it refused; a write itself still needs [`Self::read_owned`].
+    pub fn read_class(&self, target: &Target) -> Result<Reading, IncusError> {
+        self.allow_project(&target.project)?;
+        let (metadata, etag) = self.fetch(target)?;
+        let config = own_config(&metadata)?;
+        Ok(Reading {
+            class: classify(&config, &self.retained),
+            etag,
+            uuid: uuid_of(target.kind, &config),
+            config,
+        })
+    }
+
     /// Reads an object and returns it as [`Owned`] when this entry may change it. A target outside the family, an object of
     /// another class, and a target whose uuid is not the object's are refused, and nothing is written.
     pub fn read_owned(&self, target: &Target) -> Result<Owned, IncusError> {
-        self.allow_project(&target.object.project)?;
+        self.allow_project(&target.project)?;
         let (metadata, etag) = self.fetch(target)?;
         let config = own_config(&metadata)?;
         self.classed(target, etag, config)
@@ -189,8 +210,8 @@ impl UnixIncusWriter {
     /// the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object is read
     /// back, which must class as this entry's own.
     pub fn create(&self, target: &Target, body: &Value) -> Result<Owned, IncusError> {
-        self.allow_project(&target.object.project)?;
-        if target.object.uuid.is_some() {
+        self.allow_project(&target.project)?;
+        if target.uuid.is_some() {
             return Err(refused("a create names no uuid yet"));
         }
         let urls = urls(target)?;
@@ -221,9 +242,9 @@ impl UnixIncusWriter {
             ));
         }
         let mut sent = fields.clone();
-        sent.insert("name".to_string(), json!(target.object.name));
-        if target.object.kind == IncusKind::Forward {
-            sent.insert("listen_address".to_string(), json!(target.object.name));
+        sent.insert("name".to_string(), json!(target.name));
+        if target.kind == IncusKind::Forward {
+            sent.insert("listen_address".to_string(), json!(target.name));
         }
         self.require_free(&urls.object)?;
         self.mutate("POST", &urls.collection, None, Some(&Value::Object(sent)))?;
@@ -290,7 +311,7 @@ impl UnixIncusWriter {
             Some(_) => return Err(refused("the object carries another plan's tombstone")),
             None => {}
         }
-        if owned.uuid.is_none() && has_uuid(owned.target.object.kind) {
+        if owned.uuid.is_none() && owned.target.kind.has_uuid() {
             return Err(refused("an object without a uuid cannot be retired"));
         }
         let changes = BTreeMap::from([(KERNEL_RETIRING_KEY.to_string(), Some(value.clone()))]);
@@ -327,7 +348,7 @@ impl UnixIncusWriter {
         let Some(plan) = owned.tombstone.as_deref() else {
             return Err(refused("an object is deleted only after its tombstone"));
         };
-        if owned.uuid.is_none() && has_uuid(owned.target.object.kind) {
+        if owned.uuid.is_none() && owned.target.kind.has_uuid() {
             return Err(refused("an object without a uuid cannot be deleted"));
         }
         let fresh = self.read_owned(&owned.target)?;
@@ -362,8 +383,8 @@ impl UnixIncusWriter {
                 owner: Some(class),
             });
         }
-        let uuid = uuid_of(target.object.kind, &config);
-        if target.object.uuid.is_some() && target.object.uuid != uuid {
+        let uuid = uuid_of(target.kind, &config);
+        if target.uuid.is_some() && target.uuid != uuid {
             return Err(Unread {
                 reason: "the object is not the one the target names".to_string(),
                 owner: Some(class),
@@ -386,23 +407,27 @@ impl UnixIncusWriter {
         target: &Target,
         expect: impl FnOnce(&Owned) -> Result<(), String>,
     ) -> Result<Owned, IncusError> {
-        let landed = |owner: Option<OwnerClass>, reason: String| {
+        // The uuid the read-back showed is carried when the read showed one. A failed read showed none.
+        let landed = |uuid: Option<String>, owner: Option<OwnerClass>, reason: String| {
             IncusError::AppliedUnconfirmed(Box::new(Unconfirmed {
-                object: target.object.clone(),
+                target: target.clone(),
+                uuid,
                 owner,
                 reason,
             }))
         };
         let (metadata, etag) = self
             .fetch(target)
-            .map_err(|error| landed(None, format!("the read-back failed: {error}")))?;
+            .map_err(|error| landed(None, None, format!("the read-back failed: {error}")))?;
         let config = own_config(&metadata)
-            .map_err(|error| landed(None, format!("the read-back failed: {error}")))?;
+            .map_err(|error| landed(None, None, format!("the read-back failed: {error}")))?;
+        let uuid = uuid_of(target.kind, &config);
         let owned = self
             .classed(target, etag, config)
-            .map_err(|unread| landed(unread.owner, unread.reason))?;
+            .map_err(|unread| landed(uuid.clone(), unread.owner, unread.reason))?;
         expect(&owned).map_err(|reason| {
             landed(
+                uuid,
                 Some(OwnerClass::Kernel {
                     entry: self.entry.clone(),
                 }),
@@ -418,7 +443,7 @@ impl UnixIncusWriter {
         if owned.entry != self.entry {
             return Err(refused("the object was read for another entry"));
         }
-        self.allow_project(&owned.target.object.project)?;
+        self.allow_project(&owned.target.project)?;
         let class = classify(&owned.config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
             return Err(refused(refusal_reason(&class)));
@@ -486,8 +511,9 @@ impl UnixIncusWriter {
     }
 
     /// Waits on operation `id` until it ends or the writer's deadline passes. Only status code 200 with the status `Success`
-    /// is done. A running code (1xx) is waited on again. A 4xx or 5xx is the operation's own failure, and any other code is
-    /// a failure too.
+    /// is done. A running code (1xx) is waited on again. A 4xx or 5xx in the operation's metadata is the operation's own failure,
+    /// and any other code is a failure too. An error answer to the wait request itself is not the operation's status: it is a
+    /// decode failure, so the outcome of the write stays unknown.
     fn wait_on(&self, id: &str) -> Result<(), IncusError> {
         let started = Instant::now();
         loop {
@@ -496,7 +522,12 @@ impl UnixIncusWriter {
             }
             let path = format!("/1.0/operations/{id}/wait?timeout={WAIT_SECONDS}");
             let framed = self.send_within("GET", &path, None, None, WAIT_TIMEOUT)?;
-            let answer = checked_envelope(&framed.into_raw())?;
+            let answer = checked_envelope(&framed.into_raw()).map_err(|error| match error {
+                IncusError::Status { .. } => {
+                    decode("the wait answered without the operation's status")
+                }
+                other => other,
+            })?;
             let operation = answer
                 .get("metadata")
                 .and_then(Value::as_object)
@@ -604,7 +635,7 @@ struct Urls {
 }
 
 fn urls(target: &Target) -> Result<Urls, IncusError> {
-    let object = &target.object;
+    let object = target;
     let name = segment(&object.name)?;
     let project = segment(&object.project)?;
     let parent = target.parent.as_deref().map(segment).transpose()?;
@@ -717,14 +748,9 @@ fn volatile(key: &str) -> bool {
     key == "volatile" || key.starts_with("volatile.")
 }
 
-/// Whether Incus gives an object of this kind a uuid: instances and volumes do, through their `volatile.uuid` key.
-fn has_uuid(kind: IncusKind) -> bool {
-    matches!(kind, IncusKind::Instance | IncusKind::Volume)
-}
-
 /// The uuid of an object of this kind. Only the kinds Incus gives one have a uuid, so any other kind has none.
 fn uuid_of(kind: IncusKind, config: &BTreeMap<String, String>) -> Option<String> {
-    if !has_uuid(kind) {
+    if !kind.has_uuid() {
         return None;
     }
     config

@@ -57,6 +57,7 @@ fn digest(tag: &str) -> Digest {
 
 fn instance(project: &str, name: &str, uuid: Option<&str>) -> ObjectRef {
     ObjectRef {
+        parent: None,
         kind: IncusKind::Instance,
         project: project.to_string(),
         name: name.to_string(),

@@ -1,0 +1,1255 @@
+//! The kernel's Incus write provider. It is the only code path in the kernel that writes to Incus. It sends only the writer's
+//! checked requests: a POST for a create, a PATCH under an `If-Match` for a config change, and the tombstone-then-DELETE sequence
+//! for a retirement. Each effect is planned read-only first. `plan` refuses before anything is journalled, and `effect` checks the
+//! family, the features, the ownership and the plan again before it applies anything. `docs/OWNERSHIP.md` states the rules.
+//!
+//! A write that Incus answered with an error, or that did not finish, may still have landed. The provider reads the object back
+//! before it decides the outcome, unless the answer could not be read at all: then it makes no read, since a read after a write
+//! still running proves nothing. It reports a failure only when the object shows the write did not happen, and reports
+//! [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
+
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use arca_incus::{
+    IncusError, IncusRead, Owned, ProjectFamily, Reading, UnixIncus, UnixIncusWriter,
+};
+use arca_kernel::canon::Digest;
+use arca_kernel::desired::{EntryId, PluginId};
+use arca_kernel::journal::{EffectClass, Inverse};
+use arca_kernel::ownership::{
+    IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify, kernel_may_write,
+};
+use arca_kernel::plugin::{EffectOp, EffectRefusal, Observe, Planned, Provider, op_digest};
+use serde_json::{Map, Value, json};
+
+/// The two projects the kernel never writes, whatever its family names. Incus gives them to nobody else, and droidd and the
+/// host use them.
+pub const DROIDD_PROJECTS_FIXED: [&str; 2] = ["bench", "default"];
+/// The prefix every kernel project carries in a scratch run.
+const SCRATCH_PREFIX: &str = "arcak-scratch-";
+/// The prefix of a config value that names a secret file rather than being the value itself.
+pub const SECRET_PREFIX: &str = "arca-secret:";
+/// The largest secret file the provider reads, in bytes.
+const SECRET_MAX_BYTES: u64 = 64 * 1024;
+/// How deep the provider looks for secret files under its directory.
+const SECRET_MAX_DEPTH: usize = 4;
+/// The project keys every kernel project is created with. A plugin may not set any `restricted*` or `features*` key another way.
+const PROJECT_KEYS: [(&str, &str); 5] = [
+    ("features.networks", "true"),
+    ("features.networks.zones", "true"),
+    ("features.profiles", "true"),
+    ("features.storage.volumes", "true"),
+    ("features.storage.buckets", "true"),
+];
+/// The key every kernel project is created restricted with.
+const RESTRICTED_KEY: &str = "restricted";
+/// The config keys a bridge network may set. A plan's bridge sets each of them, and nothing else: a route, an external interface,
+/// a `raw.*` key, DNS and every other key is refused.
+const BRIDGE_KEYS: [&str; 3] = ["ipv4.address", "ipv4.nat", "ipv6.address"];
+
+/// Whether a project key is one a plugin may not set unless it is the value the kernel pins: `restricted`, any `restricted.*`
+/// key, and any `features.*` key.
+fn guarded_project_key(key: &str) -> bool {
+    key == RESTRICTED_KEY || key.starts_with("restricted.") || key.starts_with("features.")
+}
+
+/// The entries whose plans were declined, each with the plugin and the plan it was declined under. Every clone shares one set, so a
+/// reconciler that gives the boxed provider away can still update it, and the provider reads the set at every plan, effect and
+/// retirement. The set is never absent: a provider is built only with one, and "nothing retained" is [`RetainedSet::empty`].
+#[derive(Debug, Clone)]
+pub struct RetainedSet(Arc<RwLock<BTreeMap<EntryId, (PluginId, Digest)>>>);
+
+impl RetainedSet {
+    /// The set that holds `entries`.
+    pub fn new(entries: BTreeMap<EntryId, (PluginId, Digest)>) -> Self {
+        RetainedSet(Arc::new(RwLock::new(entries)))
+    }
+
+    /// The set that retains no entry, written out so that it is never mistaken for a set that was not given.
+    pub fn empty() -> Self {
+        Self::new(BTreeMap::new())
+    }
+
+    /// Retains `entry`'s objects under the plugin and the declined plan. Every provider holding a clone of this set sees it.
+    pub fn retain(
+        &self,
+        entry: EntryId,
+        plugin: PluginId,
+        plan: Digest,
+    ) -> Result<(), EffectRefusal> {
+        self.0
+            .write()
+            .map_err(|_| unreadable_retained_set())?
+            .insert(entry, (plugin, plan));
+        Ok(())
+    }
+
+    /// A copy of the set as it is now. A set whose lock was poisoned is refused, never read as empty.
+    fn snapshot(&self) -> Result<BTreeMap<EntryId, (PluginId, Digest)>, EffectRefusal> {
+        self.0
+            .read()
+            .map(|set| set.clone())
+            .map_err(|_| unreadable_retained_set())
+    }
+}
+
+fn unreadable_retained_set() -> EffectRefusal {
+    EffectRefusal::Provider("the retained set is unreadable, so nothing is written".to_string())
+}
+
+/// The projects the kernel may write in, and the rules its configuration gives them. A family is refused at
+/// [`IncusProvider::new`] when it names a reserved or a droidd project, a project outside the scratch prefix in a scratch run, or
+/// a reserved range that is not an IPv4 CIDR.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Family {
+    /// The kernel's projects.
+    pub projects: Vec<String>,
+    /// Whether this is a scratch run, in which every project carries [`SCRATCH_PREFIX`].
+    pub scratch: bool,
+    /// The projects droidd uses. The kernel refuses to write any of them.
+    pub droidd_projects: Vec<String>,
+    /// IPv4 ranges a kernel bridge must not overlap, each in CIDR form.
+    pub reserved_cidrs: Vec<String>,
+}
+
+impl Family {
+    /// Whether the kernel may write in `project`: it is listed, it is not reserved or droidd's, and in a scratch run it has the
+    /// prefix. The writer checks the same family again before it sends a request.
+    fn allows(&self, project: &str) -> bool {
+        self.projects.iter().any(|listed| listed == project)
+            && !DROIDD_PROJECTS_FIXED.contains(&project)
+            && !self.droidd_projects.iter().any(|listed| listed == project)
+            && (!self.scratch || project.starts_with(SCRATCH_PREFIX))
+    }
+
+    /// The writer's family for this configuration, after every rule the configuration must meet.
+    fn validate(&self) -> Result<ProjectFamily, EffectRefusal> {
+        if self.scratch
+            && self
+                .projects
+                .iter()
+                .any(|project| !project.starts_with(SCRATCH_PREFIX))
+        {
+            return Err(EffectRefusal::Provider(
+                "in a scratch run every kernel project carries the scratch prefix".to_string(),
+            ));
+        }
+        if self
+            .reserved_cidrs
+            .iter()
+            .any(|range| parse_cidr(range).is_none())
+        {
+            return Err(EffectRefusal::Provider(
+                "a reserved range is not an IPv4 CIDR".to_string(),
+            ));
+        }
+        ProjectFamily::new(
+            self.projects.iter().map(String::as_str),
+            self.droidd_projects.iter().map(String::as_str),
+        )
+        .map_err(EffectRefusal::Provider)
+    }
+}
+
+/// What a retirement did: the object was deleted, or the delete was skipped because the object no longer showed what the plan
+/// approved. The text of a drift names the rule that did not hold and never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Retirement {
+    Deleted(ObjectRef),
+    Drift(String),
+}
+
+/// The Incus write provider. It writes only inside its family, only the objects an entry owns, and only through the writer.
+#[derive(Debug)]
+pub struct IncusProvider {
+    socket: PathBuf,
+    reader: UnixIncus,
+    family: Family,
+    writer_family: ProjectFamily,
+    secrets_dir: PathBuf,
+    uid: u32,
+    deadline: Option<Duration>,
+    retained: RetainedSet,
+}
+
+impl IncusProvider {
+    /// A provider over the Incus socket at `socket`, for `family`, with secret files under `secrets_dir`, and with the entries
+    /// in `retained` never written. The family is refused when it breaks a rule of [`Family`].
+    pub fn new(
+        socket: PathBuf,
+        family: Family,
+        secrets_dir: PathBuf,
+        retained: RetainedSet,
+    ) -> Result<Self, EffectRefusal> {
+        let writer_family = family.validate()?;
+        let uid = process_uid()?;
+        Ok(IncusProvider {
+            reader: UnixIncus::new(socket.clone()),
+            socket,
+            family,
+            writer_family,
+            secrets_dir,
+            uid,
+            deadline: None,
+            retained,
+        })
+    }
+
+    /// The same provider with another overall deadline for an Incus operation.
+    pub fn with_operation_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// The writer for `entry`, with this provider's family, the retained set as it is now, and its deadline. A set that cannot
+    /// be read refuses the write.
+    fn writer(&self, entry: &EntryId) -> Result<UnixIncusWriter, EffectRefusal> {
+        let writer = UnixIncusWriter::new(
+            self.socket.clone(),
+            entry.clone(),
+            self.retained.snapshot()?,
+            self.writer_family.clone(),
+        );
+        Ok(match self.deadline {
+            Some(deadline) => writer.with_operation_deadline(deadline),
+            None => writer,
+        })
+    }
+
+    /// Refuses a project outside the family before any request is made.
+    fn check_family(&self, project: &str) -> Result<(), EffectRefusal> {
+        if self.family.allows(project) {
+            Ok(())
+        } else {
+            Err(EffectRefusal::ProjectNotAllowed)
+        }
+    }
+
+    /// The config of a project, read with a GET. A project's features live in its own config.
+    fn project_config(
+        &self,
+        entry: &EntryId,
+        project: &str,
+    ) -> Result<BTreeMap<String, String>, EffectRefusal> {
+        let target = ObjectRef {
+            kind: IncusKind::Project,
+            project: project.to_string(),
+            parent: None,
+            name: project.to_string(),
+            uuid: None,
+        };
+        let (metadata, _) = self
+            .writer(entry)?
+            .get_etag(&target)
+            .map_err(incus_refusal)?;
+        Ok(text_config(metadata.get("config")))
+    }
+
+    /// Refuses a write whose project does not enable the feature its kind needs. Without the feature, Incus routes the write to
+    /// the default project. An instance and a project need no feature. The check runs for every write, a delete included.
+    fn check_features(
+        &self,
+        entry: &EntryId,
+        kind: IncusKind,
+        project: &str,
+    ) -> Result<(), EffectRefusal> {
+        let needed = match kind {
+            IncusKind::Project | IncusKind::Instance => return Ok(()),
+            IncusKind::Network | IncusKind::Acl | IncusKind::Forward => "features.networks",
+            IncusKind::Zone => "features.networks.zones",
+            IncusKind::Profile => "features.profiles",
+            IncusKind::Volume => "features.storage.volumes",
+            IncusKind::Bucket => "features.storage.buckets",
+        };
+        let config = self.project_config(entry, project)?;
+        if config.get(needed).map(String::as_str) == Some("true") {
+            Ok(())
+        } else {
+            Err(EffectRefusal::Provider(format!(
+                "the project does not enable {needed}"
+            )))
+        }
+    }
+
+    /// Reads an object for a write the plan makes, and refuses an object the entry may not change. A change that names a uuid
+    /// must see that uuid.
+    fn read_for_plan(&self, entry: &EntryId, object: &ObjectRef) -> Result<Reading, EffectRefusal> {
+        let reading = self
+            .writer(entry)?
+            .read_class(object)
+            .map_err(incus_refusal)?;
+        if !kernel_may_write(&reading.class, entry) {
+            return Err(EffectRefusal::NotOwned(reading.class));
+        }
+        if object.uuid.is_some() && object.uuid != reading.uuid {
+            return Err(EffectRefusal::Provider(
+                "the object is not the one the op names".to_string(),
+            ));
+        }
+        Ok(reading)
+    }
+
+    /// The owned value an effect writes through. A refusal names the owner the read found, when it found one.
+    fn owned_for_write(
+        &self,
+        entry: &EntryId,
+        writer: &UnixIncusWriter,
+        object: &ObjectRef,
+    ) -> Result<Owned, EffectRefusal> {
+        match writer.read_owned(object) {
+            Ok(owned) => Ok(owned),
+            Err(IncusError::Refused(reason)) => match writer.read_class(object) {
+                Ok(reading) if !kernel_may_write(&reading.class, entry) => {
+                    Err(EffectRefusal::NotOwned(reading.class))
+                }
+                _ => Err(EffectRefusal::Provider(reason)),
+            },
+            Err(error) => Err(incus_refusal(error)),
+        }
+    }
+
+    /// The checks a create's body must pass before any request: the mark names this entry, a project's kernel keys are not set
+    /// another way, a bridge fits the reserved ranges, and every secret reference resolves to a usable file. The result is the
+    /// body the writer sends, with each secret reference replaced by the file's content.
+    fn prepared_create(
+        &self,
+        entry: &EntryId,
+        kind: IncusKind,
+        project: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<Value, EffectRefusal> {
+        if kind == IncusKind::Project && project != name {
+            return Err(EffectRefusal::Provider(
+                "a project is named by its own name".to_string(),
+            ));
+        }
+        let Value::Object(fields) = body else {
+            return Err(EffectRefusal::Provider(
+                "a create body is not an object".to_string(),
+            ));
+        };
+        let mut config = match fields.get("config") {
+            None => Map::new(),
+            Some(Value::Object(config)) => config.clone(),
+            Some(_) => {
+                return Err(EffectRefusal::Provider(
+                    "a create's config is not an object".to_string(),
+                ));
+            }
+        };
+        if config
+            .get(KERNEL_ENTRY_KEY)
+            .is_some_and(|mark| mark.as_str() != Some(entry.0.as_str()))
+        {
+            return Err(EffectRefusal::Provider(
+                "the create names another entry's mark".to_string(),
+            ));
+        }
+        if config.contains_key(KERNEL_RETIRING_KEY) {
+            return Err(EffectRefusal::Provider(
+                "a create may not carry a retiring tombstone".to_string(),
+            ));
+        }
+        config.insert(KERNEL_ENTRY_KEY.to_string(), Value::String(entry.0.clone()));
+        if kind == IncusKind::Project {
+            let pinned: Vec<(&str, &str)> = PROJECT_KEYS
+                .iter()
+                .copied()
+                .chain([(RESTRICTED_KEY, "true")])
+                .collect();
+            // A plugin may set a guarded key only to the value the kernel pins it at. Any other guarded key, pinned or not,
+            // would loosen the project, so it is refused before any request.
+            for (key, set) in &config {
+                if !guarded_project_key(key) {
+                    continue;
+                }
+                let kept = pinned
+                    .iter()
+                    .any(|(pin, value)| *pin == key.as_str() && set.as_str() == Some(*value));
+                if !kept {
+                    return Err(EffectRefusal::Provider(format!(
+                        "a plugin may not set {key} on a project, except to the value the kernel pins"
+                    )));
+                }
+            }
+            for (key, value) in pinned {
+                config.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+        if kind == IncusKind::Network {
+            check_bridge_create(fields, &self.family.reserved_cidrs)?;
+        }
+        let mut text = BTreeMap::new();
+        for (key, value) in &config {
+            let Some(value) = value.as_str() else {
+                return Err(EffectRefusal::Provider(
+                    "a config value in a create is not text".to_string(),
+                ));
+            };
+            text.insert(key.clone(), value.to_string());
+        }
+        let mut resolved = Map::new();
+        for (key, value) in &text {
+            resolved.insert(key.clone(), Value::String(self.resolve_text(value)?));
+        }
+        let mut sent = fields.clone();
+        sent.insert("config".to_string(), Value::Object(resolved));
+        Ok(Value::Object(sent))
+    }
+
+    /// The checks a change must pass against the object's current config: the keys are plain and not reserved, the object stays
+    /// the entry's own, and a network stays a bridge inside the rules.
+    fn check_change(
+        &self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        changes: &BTreeMap<String, Option<String>>,
+        current: &BTreeMap<String, String>,
+    ) -> Result<(), EffectRefusal> {
+        check_patch_keys(object.kind, changes)?;
+        let after = apply_changes(current, changes);
+        if !kernel_may_write(&classify(&after, &self.retained.snapshot()?), entry) {
+            return Err(EffectRefusal::Provider(
+                "the change would leave the object owned by another owner".to_string(),
+            ));
+        }
+        if object.kind == IncusKind::Network {
+            check_bridge_config(&after, &self.family.reserved_cidrs)?;
+        }
+        Ok(())
+    }
+
+    /// A change's or a delete's read-only plan: the family, the owner, the features, the ETag, the pre-image of each changed key,
+    /// and the class. The pre-image holds a secret's reference where the value is a secret's content.
+    fn plan_for_object(
+        &self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        changes: Option<&BTreeMap<String, Option<String>>>,
+        digest: Digest,
+    ) -> Result<Planned, EffectRefusal> {
+        self.check_family(&object.project)?;
+        // The key rules come before any read, so a refused key sends no request at all.
+        if let Some(changes) = changes {
+            check_patch_keys(object.kind, changes)?;
+        }
+        let reading = self.read_for_plan(entry, object)?;
+        self.check_features(entry, object.kind, &object.project)?;
+        let class = class_of(object.kind);
+        let Some(changes) = changes else {
+            return Ok(Planned {
+                class,
+                op_digest: digest,
+                pre_image: None,
+                etag: Some(reading.etag),
+            });
+        };
+        self.check_change(entry, object, changes, &reading.config)?;
+        self.resolve_changes(changes)?;
+        let pre_image = self.pre_image_of(changes, &reading.config)?;
+        Ok(Planned {
+            class,
+            op_digest: digest,
+            pre_image: Some(pre_image),
+            etag: Some(reading.etag),
+        })
+    }
+
+    /// The pre-image of a patch, as the journal holds it. For each changed key the object holds a value, that value is journalled
+    /// as a current secret's reference when its content is one, and otherwise as the value itself, which the inverse restores.
+    /// A key the patch sets to a secret reference, and whose value is no current secret, is journalled as `None`: a redacted
+    /// marker whose inverse removes the key. A key the object does not hold is `None`. A value that starts with the reference
+    /// prefix and matches no current secret is refused, since an inverse that restored it would read it as a reference.
+    fn pre_image_of(
+        &self,
+        changes: &BTreeMap<String, Option<String>>,
+        current: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
+        let secrets = self.secrets_by_value();
+        let mut pre_image = BTreeMap::new();
+        for (key, new) in changes {
+            let value = match current.get(key) {
+                None => None,
+                Some(text) => match secret_reference(text, &secrets) {
+                    Some(reference) => Some(reference),
+                    None if new.as_deref().is_some_and(is_reference) => None,
+                    None if is_reference(text) => {
+                        return Err(EffectRefusal::Provider(
+                            "the patch replaces a value that names a secret which no current secret matches; the journal could not restore it"
+                                .to_string(),
+                        ));
+                    }
+                    None => Some(text.clone()),
+                },
+            };
+            pre_image.insert(key.clone(), value);
+        }
+        Ok(pre_image)
+    }
+
+    /// Resolves one config value: a secret reference becomes the file's content, and any other text passes through.
+    fn resolve_text(&self, text: &str) -> Result<String, EffectRefusal> {
+        if text.starts_with(SECRET_PREFIX) {
+            self.read_secret(text)
+        } else {
+            Ok(text.to_string())
+        }
+    }
+
+    /// Resolves the secret references in a change. A removed key stays removed.
+    fn resolve_changes(
+        &self,
+        changes: &BTreeMap<String, Option<String>>,
+    ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
+        let mut resolved = BTreeMap::new();
+        for (key, value) in changes {
+            let value = value
+                .as_deref()
+                .map(|text| self.resolve_text(text))
+                .transpose()?;
+            resolved.insert(key.clone(), value);
+        }
+        Ok(resolved)
+    }
+
+    /// Whether the secrets directory is a real directory, not a symlink, owned by this process, and private: no group or other
+    /// bits. While it is not, no reference resolves and no secret is known, so nothing is read from it.
+    fn secrets_root_private(&self) -> bool {
+        fs::symlink_metadata(&self.secrets_dir).is_ok_and(|meta| {
+            meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == self.uid
+                && meta.mode() & 0o077 == 0
+        })
+    }
+
+    /// The content of the secret a reference names. The name is checked as a plain path. The secrets directory must be private,
+    /// and so must each directory on the way: a real directory, owned by this process, with no group or other bits. The file must
+    /// be a regular file, mode 0600, owned by this process, and small. A reference that fails any rule is refused with a fixed
+    /// reason, and the value is never read into an error.
+    fn read_secret(&self, reference: &str) -> Result<String, EffectRefusal> {
+        let name = reference
+            .strip_prefix(SECRET_PREFIX)
+            .filter(|name| valid_secret_name(name))
+            .ok_or_else(|| {
+                EffectRefusal::Provider("a secret reference names no valid secret".to_string())
+            })?;
+        let unavailable = || EffectRefusal::Provider("a secret is not available".to_string());
+        if !self.secrets_root_private() {
+            return Err(unavailable());
+        }
+        let parts: Vec<&str> = name.split('/').collect();
+        if parts.iter().any(|part| part.is_empty()) {
+            return Err(unavailable());
+        }
+        let mut path = self.secrets_dir.clone();
+        for (index, part) in parts.iter().enumerate() {
+            path.push(part);
+            let meta = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
+            if meta.file_type().is_symlink() {
+                return Err(unavailable());
+            }
+            if index + 1 < parts.len() {
+                let private = meta.is_dir() && meta.uid() == self.uid && meta.mode() & 0o077 == 0;
+                if !private {
+                    return Err(unavailable());
+                }
+                continue;
+            }
+            if !meta.is_file()
+                || (meta.mode() & 0o777) != 0o600
+                || meta.uid() != self.uid
+                || meta.len() > SECRET_MAX_BYTES
+            {
+                return Err(unavailable());
+            }
+            let opened = File::open(&path).map_err(|_| unavailable())?;
+            let opened_meta = opened.metadata().map_err(|_| unavailable())?;
+            if opened_meta.dev() != meta.dev() || opened_meta.ino() != meta.ino() {
+                return Err(unavailable());
+            }
+            let mut text = String::new();
+            opened
+                .take(SECRET_MAX_BYTES + 1)
+                .read_to_string(&mut text)
+                .map_err(|_| unavailable())?;
+            let len = text.len() as u64;
+            if len > SECRET_MAX_BYTES {
+                return Err(unavailable());
+            }
+            return Ok(text);
+        }
+        Err(unavailable())
+    }
+
+    /// Every usable secret under the directory, as (reference, content). Used to name a value a journal must not hold by its
+    /// reference. A file that is not usable is skipped, since it cannot be a reference a value came from.
+    fn secrets_by_value(&self) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        if self.secrets_root_private() {
+            self.collect_secrets(&self.secrets_dir, "", 0, &mut found);
+        }
+        found
+    }
+
+    fn collect_secrets(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        depth: usize,
+        found: &mut Vec<(String, String)>,
+    ) {
+        if depth > SECRET_MAX_DEPTH {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let name = if prefix.is_empty() {
+                file_name
+            } else {
+                format!("{prefix}/{file_name}")
+            };
+            if meta.is_dir() {
+                self.collect_secrets(&entry.path(), &name, depth + 1, found);
+            } else if meta.is_file() && valid_secret_name(&name) {
+                let reference = format!("{SECRET_PREFIX}{name}");
+                if let Some(content) = self
+                    .read_secret(&reference)
+                    .ok()
+                    .filter(|content| !content.is_empty())
+                {
+                    found.push((reference, content));
+                }
+            }
+        }
+    }
+
+    /// Whether the config holds every pre-image value, with a reference resolved to the file it names.
+    fn shows_pre_image(
+        &self,
+        config: &BTreeMap<String, String>,
+        pre_image: &BTreeMap<String, Option<String>>,
+    ) -> bool {
+        pre_image.iter().all(|(key, value)| {
+            let expected = match value {
+                Some(text) => match self.resolve_text(text) {
+                    Ok(content) => Some(content),
+                    Err(_) => return false,
+                },
+                None => None,
+            };
+            config.get(key).cloned() == expected
+        })
+    }
+
+    /// The settled outcome of a patch whose request failed. A refusal before the write is final. A 412 is a stale plan, and changes
+    /// nothing. An answer that could not be read, an unconfirmed write and a timeout are unresolved with no read-back: an operation
+    /// still running can apply after a read that shows the pre-image. Any other error is settled by a read-back. A patch the
+    /// read-back shows is landed; a patch the read-back shows without its change did not land; anything else is unresolved. The
+    /// read-back's uuid is used only for the writer's own checks, so the answer names the object as the op did.
+    fn settle_patch(
+        &self,
+        entry: &EntryId,
+        writer: &UnixIncusWriter,
+        object: &ObjectRef,
+        changes: &BTreeMap<String, Option<String>>,
+        pre_image: &BTreeMap<String, Option<String>>,
+        error: IncusError,
+    ) -> Result<(), EffectRefusal> {
+        match error {
+            IncusError::Refused(reason) => Err(EffectRefusal::Provider(reason)),
+            IncusError::Status { code: 412, .. } => Err(EffectRefusal::Stale),
+            IncusError::AppliedUnconfirmed(_)
+            | IncusError::Timeout
+            | IncusError::Io(_)
+            | IncusError::Decode(_) => Err(EffectRefusal::Unresolved),
+            _ => {
+                let Ok(reading) = writer.read_class(object) else {
+                    return Err(EffectRefusal::Unresolved);
+                };
+                if !kernel_may_write(&reading.class, entry) {
+                    return Err(EffectRefusal::Unresolved);
+                }
+                if shows(&reading.config, changes) {
+                    return Ok(());
+                }
+                if self.shows_pre_image(&reading.config, pre_image) {
+                    return Err(EffectRefusal::Provider(
+                        "the patch did not land".to_string(),
+                    ));
+                }
+                Err(EffectRefusal::Unresolved)
+            }
+        }
+    }
+
+    /// Retires an object the entry owns, through an approved plan. The object is read, then tombstoned under its ETag and read
+    /// back; the delete reads it again and sends nothing unless it still shows the tombstone and the same uuid. A change the reads
+    /// show is drift, and skips the delete. A stale ETag stops the sequence.
+    pub fn retire(
+        &self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        plan: &Digest,
+    ) -> Result<Retirement, EffectRefusal> {
+        // An instance or a volume is named by its uuid. A retirement that names none is refused before any request, since the
+        // object it would reach is not the one the approved plan names.
+        if object.kind.has_uuid() && object.uuid.is_none() {
+            return Err(EffectRefusal::Provider(
+                "a retirement names the object's uuid".to_string(),
+            ));
+        }
+        self.check_family(&object.project)?;
+        self.check_features(entry, object.kind, &object.project)?;
+        let writer = self.writer(entry)?;
+        let owned = match writer.read_owned(object) {
+            Ok(owned) => owned,
+            Err(IncusError::Refused(reason)) => {
+                return match writer.read_class(object) {
+                    Ok(reading) if kernel_may_write(&reading.class, entry) => {
+                        Ok(Retirement::Drift(reason))
+                    }
+                    Ok(reading) => Err(EffectRefusal::NotOwned(reading.class)),
+                    Err(_) => Err(EffectRefusal::Provider(reason)),
+                };
+            }
+            Err(error) => return Err(incus_refusal(error)),
+        };
+        let tombstoned = match writer.tombstone(&owned, plan) {
+            Ok(tombstoned) => tombstoned,
+            Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
+                return Ok(Retirement::Drift(unconfirmed.reason));
+            }
+            Err(IncusError::Refused(reason)) => return Ok(Retirement::Drift(reason)),
+            Err(IncusError::Status { code: 412, .. }) => return Err(EffectRefusal::Stale),
+            Err(_) => return Err(EffectRefusal::Unresolved),
+        };
+        match writer.delete(&tombstoned) {
+            Ok(()) => Ok(Retirement::Deleted(ObjectRef {
+                uuid: tombstoned.uuid().map(str::to_string),
+                ..object.clone()
+            })),
+            Err(IncusError::Refused(reason)) => Ok(Retirement::Drift(reason)),
+            Err(_) => Err(EffectRefusal::Unresolved),
+        }
+    }
+}
+
+impl Provider for IncusProvider {
+    /// Answers the host's own addresses. Any other read is refused: a plugin reads Incus through the watch provider, not here.
+    fn observe(
+        &self,
+        _entry: &EntryId,
+        _projects: &[String],
+        query: &Observe,
+    ) -> Result<Value, EffectRefusal> {
+        match query {
+            Observe::HostAddresses => {
+                let addresses = host_addresses(&self.reader)?;
+                Ok(Value::Array(
+                    addresses.iter().map(|ip| json!(ip.to_string())).collect(),
+                ))
+            }
+            Observe::IncusGet { .. } => Err(EffectRefusal::NotDeclared),
+        }
+    }
+
+    /// Plans an op with reads only. Each refusal here leaves no record, since the kernel journals only what a plan allowed.
+    fn plan(&self, entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
+        let digest = op_digest(op);
+        match op {
+            EffectOp::IncusCreate {
+                kind,
+                project,
+                name,
+                body,
+                ..
+            } => {
+                self.check_family(project)?;
+                self.prepared_create(entry, *kind, project, name, body)?;
+                self.check_features(entry, *kind, project)?;
+                Ok(Planned {
+                    class: class_of(*kind),
+                    op_digest: digest,
+                    pre_image: None,
+                    etag: None,
+                })
+            }
+            EffectOp::IncusPatchConfig { object, config } => {
+                self.plan_for_object(entry, object, Some(config), digest)
+            }
+            EffectOp::IncusDelete { object, .. } => {
+                self.plan_for_object(entry, object, None, digest)
+            }
+        }
+    }
+
+    /// Applies a planned op. A refusal before a write is a plain failure. A write that may have landed is reported as
+    /// [`EffectRefusal::Unresolved`] unless the object shows what happened.
+    fn effect(
+        &mut self,
+        entry: &EntryId,
+        op: &EffectOp,
+        planned: &Planned,
+    ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
+        if planned.op_digest != op_digest(op) {
+            return Err(EffectRefusal::Provider(
+                "the plan names another op".to_string(),
+            ));
+        }
+        match op {
+            EffectOp::IncusCreate {
+                kind,
+                project,
+                parent,
+                name,
+                body,
+            } => {
+                // The plan's class and absence of a pre-image are checked again, since a plan may be made by hand.
+                if planned.class != class_of(*kind) {
+                    return Err(EffectRefusal::Provider(
+                        "the plan names another class for this kind".to_string(),
+                    ));
+                }
+                if planned.pre_image.is_some() {
+                    return Err(EffectRefusal::Provider(
+                        "a create's plan carries no pre-image".to_string(),
+                    ));
+                }
+                self.check_family(project)?;
+                let sent = self.prepared_create(entry, *kind, project, name, body)?;
+                self.check_features(entry, *kind, project)?;
+                let target = ObjectRef {
+                    kind: *kind,
+                    project: project.clone(),
+                    parent: parent.clone(),
+                    name: name.clone(),
+                    uuid: None,
+                };
+                let writer = self.writer(entry)?;
+                match writer.create(&target, &sent) {
+                    Ok(owned) => {
+                        let object = ObjectRef {
+                            uuid: owned.uuid().map(str::to_string),
+                            ..target
+                        };
+                        Ok((object.clone(), Inverse::IncusDelete { object }))
+                    }
+                    Err(error) => Err(settle_create(&writer, &target, error)),
+                }
+            }
+            EffectOp::IncusPatchConfig { object, config } => {
+                if planned.class != class_of(object.kind) {
+                    return Err(EffectRefusal::Provider(
+                        "the plan names another class for this kind".to_string(),
+                    ));
+                }
+                self.check_family(&object.project)?;
+                self.check_features(entry, object.kind, &object.project)?;
+                let writer = self.writer(entry)?;
+                let owned = self.owned_for_write(entry, &writer, object)?;
+                if planned.etag.as_deref() != Some(owned.etag()) {
+                    return Err(EffectRefusal::Stale);
+                }
+                self.check_change(entry, object, config, owned.config())?;
+                let Some(pre_image) = planned.pre_image.clone() else {
+                    return Err(EffectRefusal::Provider(
+                        "the plan carries no pre-image".to_string(),
+                    ));
+                };
+                // The pre-image is derived again from the object as it is now, and must be the plan's.
+                if self.pre_image_of(config, owned.config())? != pre_image {
+                    return Err(EffectRefusal::Provider(
+                        "the plan's pre-image is not the one the object holds".to_string(),
+                    ));
+                }
+                let sent = self.resolve_changes(config)?;
+                match writer.patch(&owned, &sent) {
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.settle_patch(entry, &writer, object, &sent, &pre_image, error)?
+                    }
+                }
+                // The answer and the inverse name the object exactly as the op named it. A by-name op gets a by-name inverse, so
+                // the kernel's check of the inverse matches. The uuid the writer read back guarded the write and is not carried.
+                Ok((
+                    object.clone(),
+                    Inverse::IncusRestoreConfig {
+                        object: object.clone(),
+                        config: pre_image,
+                    },
+                ))
+            }
+            // A delete runs only through `retire`, after an approved plan. The kernel's own path refuses it.
+            EffectOp::IncusDelete { .. } => Err(EffectRefusal::NotDeclared),
+        }
+    }
+}
+
+/// The class an effect on a kind is journalled under: a project, an instance, a volume and a bucket are destructive to remove,
+/// and every other kind is revertible without loss.
+fn class_of(kind: IncusKind) -> EffectClass {
+    match kind {
+        IncusKind::Project | IncusKind::Instance | IncusKind::Volume | IncusKind::Bucket => {
+            EffectClass::B
+        }
+        IncusKind::Network
+        | IncusKind::Acl
+        | IncusKind::Profile
+        | IncusKind::Zone
+        | IncusKind::Forward => EffectClass::A,
+    }
+}
+
+/// The Incus path of an object. A project is named by its own name; every other kind carries `?project=`. A volume, a bucket and a
+/// forward need their parent to be addressed, so no path is given for them: the writer builds those.
+pub fn kind_path(kind: IncusKind, project: &str, name: Option<&str>) -> Option<String> {
+    let item = |collection: &str| match name {
+        Some(name) => format!("{collection}/{name}?project={project}"),
+        None => format!("{collection}?project={project}"),
+    };
+    match kind {
+        IncusKind::Project => Some(match name {
+            Some(name) => format!("/1.0/projects/{name}"),
+            None => "/1.0/projects".to_string(),
+        }),
+        IncusKind::Instance => Some(item("/1.0/instances")),
+        IncusKind::Network => Some(item("/1.0/networks")),
+        IncusKind::Acl => Some(item("/1.0/network-acls")),
+        IncusKind::Profile => Some(item("/1.0/profiles")),
+        IncusKind::Zone => Some(item("/1.0/network-zones")),
+        IncusKind::Volume | IncusKind::Bucket | IncusKind::Forward => None,
+    }
+}
+
+/// Every address of the host's own interfaces, as Incus lists them: the listing of `/1.0/networks?recursion=1`, then the state of
+/// each listed interface. Only those two GETs are sent, and an address of another family is skipped.
+pub fn host_addresses(read: &dyn IncusRead) -> Result<Vec<IpAddr>, EffectRefusal> {
+    let listing = read
+        .get("/1.0/networks?recursion=1")
+        .map_err(incus_refusal)?;
+    let rows = listing
+        .as_array()
+        .ok_or_else(|| EffectRefusal::Provider("the Incus answer is not a list".to_string()))?;
+    let mut found = Vec::new();
+    for row in rows {
+        let name = row
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| plain_name(name))
+            .ok_or_else(|| {
+                EffectRefusal::Provider("a host interface names no usable name".to_string())
+            })?;
+        let state = read
+            .get(&format!("/1.0/networks/{name}/state"))
+            .map_err(incus_refusal)?;
+        let Some(addresses) = state.get("addresses").and_then(Value::as_array) else {
+            continue;
+        };
+        for address in addresses {
+            let family = address.get("family").and_then(Value::as_str).unwrap_or("");
+            if family != "inet" && family != "inet6" {
+                continue;
+            }
+            let ip = address
+                .get("address")
+                .and_then(Value::as_str)
+                .and_then(|text| text.parse::<IpAddr>().ok())
+                .ok_or_else(|| {
+                    EffectRefusal::Provider("an address is not an IP address".to_string())
+                })?;
+            found.push(ip);
+        }
+    }
+    Ok(found)
+}
+
+/// The settled refusal for a create whose request failed. A refusal before the write is final. A failed create is recorded as
+/// failed only when Incus answered with a status error and a GET of the name then answers 404. Any other failure, including a
+/// transport, decode, timeout or wait failure, leaves the outcome unknown, since the answer says nothing about whether the create
+/// landed.
+fn settle_create(writer: &UnixIncusWriter, target: &ObjectRef, error: IncusError) -> EffectRefusal {
+    match error {
+        IncusError::Refused(reason) => EffectRefusal::Provider(reason),
+        IncusError::Status { .. } => match writer.get_etag(target) {
+            Err(IncusError::Status { code: 404, .. }) => {
+                EffectRefusal::Provider("the create did not land".to_string())
+            }
+            _ => EffectRefusal::Unresolved,
+        },
+        IncusError::Io(_)
+        | IncusError::Decode(_)
+        | IncusError::Timeout
+        | IncusError::TooLarge
+        | IncusError::AppliedUnconfirmed(_) => EffectRefusal::Unresolved,
+    }
+}
+
+/// Whether the config holds every changed key with its new value: a removed key must be absent.
+fn shows(config: &BTreeMap<String, String>, changes: &BTreeMap<String, Option<String>>) -> bool {
+    changes
+        .iter()
+        .all(|(key, value)| config.get(key).cloned() == *value)
+}
+
+/// The config after a change: a `Some` sets a key and a `None` removes it.
+fn apply_changes(
+    config: &BTreeMap<String, String>,
+    changes: &BTreeMap<String, Option<String>>,
+) -> BTreeMap<String, String> {
+    let mut after = config.clone();
+    for (key, value) in changes {
+        match value {
+            Some(text) => {
+                after.insert(key.clone(), text.clone());
+            }
+            None => {
+                after.remove(key);
+            }
+        }
+    }
+    after
+}
+
+/// The keys a change may name: plain, and never the kernel's tombstone or Incus's own `volatile` namespace. On a project, no
+/// guarded key at all, whatever its value: a patch may not loosen the project the kernel pinned. The writer refuses the same
+/// keys; the plan refuses them before any read, so a refused change sends no request.
+fn check_patch_keys(
+    kind: IncusKind,
+    changes: &BTreeMap<String, Option<String>>,
+) -> Result<(), EffectRefusal> {
+    for key in changes.keys() {
+        if kind == IncusKind::Project && guarded_project_key(key) {
+            return Err(EffectRefusal::Provider(
+                "a plugin may not change a restricted or features key on a project".to_string(),
+            ));
+        }
+        if key == KERNEL_RETIRING_KEY {
+            return Err(EffectRefusal::Provider(
+                "the tombstone is set only by a retirement".to_string(),
+            ));
+        }
+        if !plain_config_key(key) {
+            return Err(EffectRefusal::Provider(
+                "a change names a config key that is not plain".to_string(),
+            ));
+        }
+        if key == "volatile" || key.starts_with("volatile.") {
+            return Err(EffectRefusal::Provider(
+                "a change may not set a volatile config key".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A config key that is plain: lowercase ASCII letters, digits, and `_ . -`.
+fn plain_config_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+        })
+}
+
+/// The bridge rule for a create: a bridge network, and its config passes [`check_bridge_config`].
+fn check_bridge_create(
+    fields: &Map<String, Value>,
+    reserved: &[String],
+) -> Result<(), EffectRefusal> {
+    if fields.get("type").and_then(Value::as_str) != Some("bridge") {
+        return Err(EffectRefusal::Provider(
+            "the kernel creates only bridge networks".to_string(),
+        ));
+    }
+    let config: BTreeMap<String, String> = fields
+        .get("config")
+        .and_then(Value::as_object)
+        .map(|config| {
+            config
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|text| (key.clone(), text.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    check_bridge_config(&config, reserved)
+}
+
+/// The bridge rule. Every key must be on the allowlist, which is the keys a plan's bridge sets. `ipv6.address` is `none`, the IPv4
+/// range is a CIDR, and it does not overlap a reserved range. A route, an external interface and a `raw.*` key are refused by
+/// the allowlist, each under its own reason.
+fn check_bridge_config(
+    config: &BTreeMap<String, String>,
+    reserved: &[String],
+) -> Result<(), EffectRefusal> {
+    for key in config.keys() {
+        // The kernel's own mark is on every object it made. Ownership already checked it, so it is not a setting to refuse.
+        if key != KERNEL_ENTRY_KEY && !BRIDGE_KEYS.contains(&key.as_str()) {
+            return Err(EffectRefusal::Provider(bridge_key_refusal(key).to_string()));
+        }
+    }
+    if config.get("ipv6.address").map(String::as_str) != Some("none") {
+        return Err(EffectRefusal::Provider(
+            "a bridge sets ipv6.address to none".to_string(),
+        ));
+    }
+    let ipv4 = config
+        .get("ipv4.address")
+        .and_then(|text| parse_cidr(text))
+        .ok_or_else(|| EffectRefusal::Provider("a bridge names an IPv4 range".to_string()))?;
+    for range in reserved {
+        let range = parse_cidr(range).ok_or_else(|| {
+            EffectRefusal::Provider("a reserved range is not an IPv4 CIDR".to_string())
+        })?;
+        if overlaps(ipv4, range) {
+            return Err(EffectRefusal::Provider(
+                "the bridge's IPv4 range overlaps a reserved range".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An IPv4 CIDR, as its address and prefix length.
+fn parse_cidr(text: &str) -> Option<(Ipv4Addr, u8)> {
+    let (address, length) = text.split_once('/')?;
+    let address: Ipv4Addr = address.parse().ok()?;
+    let length: u8 = length.parse().ok()?;
+    (length <= 32).then_some((address, length))
+}
+
+/// Whether two IPv4 ranges share an address.
+fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
+    let length = a.1.min(b.1);
+    let mask = if length == 0 {
+        0
+    } else {
+        u32::MAX << (32 - length)
+    };
+    (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
+}
+
+/// A secret name: `^[a-z0-9][a-z0-9/-]{0,127}$`. It is checked by hand, so no pattern library is needed.
+fn valid_secret_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'/' | b'-'))
+}
+
+/// A name that is a plain path segment: letters, digits and `-_.:`, not `.` or `..`, and at most 253 bytes.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name != "."
+        && name != ".."
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
+/// The reference of the current secret whose content is `value`, when one is. A match is equal content: equal bytes have equal
+/// sha256 digests, and the provider already holds the content it compares against.
+fn secret_reference(value: &str, secrets: &[(String, String)]) -> Option<String> {
+    secrets
+        .iter()
+        .find(|(_, content)| content == value)
+        .map(|(reference, _)| reference.clone())
+}
+
+/// Whether a config value names a secret file rather than being the value itself.
+fn is_reference(text: &str) -> bool {
+    text.starts_with(SECRET_PREFIX)
+}
+
+/// Why a bridge config key is refused. The text names the rule and never a value.
+fn bridge_key_refusal(key: &str) -> &'static str {
+    if key.starts_with("raw.") {
+        "a bridge may not set a raw key"
+    } else if key == "bridge.external_interfaces" {
+        "a bridge may not take an external interface"
+    } else if key.ends_with(".routes") {
+        "a bridge may not set a route"
+    } else {
+        "a bridge may set only its address and NAT keys"
+    }
+}
+
+/// An object's string-valued config, or nothing when it has none.
+fn text_config(config: Option<&Value>) -> BTreeMap<String, String> {
+    config
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|text| (key.clone(), text.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A read failure as a fixed reason. Incus's own message is left out, since it can echo a response body.
+fn incus_refusal(error: IncusError) -> EffectRefusal {
+    match error {
+        IncusError::Refused(reason) => EffectRefusal::Provider(reason),
+        IncusError::Io(_) => EffectRefusal::Provider("the Incus socket failed".to_string()),
+        IncusError::Status { code, .. } => {
+            EffectRefusal::Provider(format!("Incus answered {code}"))
+        }
+        IncusError::Decode(_) => {
+            EffectRefusal::Provider("the Incus answer is not in the expected shape".to_string())
+        }
+        IncusError::Timeout => EffectRefusal::Provider("Incus did not answer in time".to_string()),
+        IncusError::TooLarge => {
+            EffectRefusal::Provider("the Incus answer is too large".to_string())
+        }
+        IncusError::AppliedUnconfirmed(_) => EffectRefusal::Unresolved,
+    }
+}
+
+/// The sequence every uid probe's directory name carries. Two probes that read the same clock value still name different directories.
+static UID_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// The uid this process runs as, read from the owner of a file it creates now in a fresh directory. No libc call is needed.
+fn process_uid() -> Result<u32, EffectRefusal> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos())
+        .unwrap_or(0);
+    let sequence = UID_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "arca-uid-{}-{nanos}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir)
+        .map_err(|_| EffectRefusal::Provider("the uid probe failed".to_string()))?;
+    let made = File::create_new(dir.join("uid")).and_then(|file| file.metadata());
+    let _ = fs::remove_dir_all(&dir);
+    made.map(|meta| meta.uid())
+        .map_err(|_| EffectRefusal::Provider("the uid probe failed".to_string()))
+}

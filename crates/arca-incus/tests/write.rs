@@ -14,7 +14,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arca_incus::{
-    FakeIncus, FakeState, IncusError, Owned, ProjectFamily, Target, Unconfirmed, UnixIncusWriter,
+    FakeIncus, FakeState, IncusError, Owned, ProjectFamily, Reading, Target, Unconfirmed,
+    UnixIncusWriter,
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
@@ -77,14 +78,12 @@ fn writer(fake: &FakeIncus, entry: &str) -> UnixIncusWriter {
 }
 
 fn target(kind: IncusKind, project: &str, name: &str, parent: Option<&str>) -> Target {
-    Target {
-        object: ObjectRef {
-            kind,
-            project: project.to_string(),
-            name: name.to_string(),
-            uuid: None,
-        },
+    ObjectRef {
+        kind,
+        project: project.to_string(),
         parent: parent.map(str::to_string),
+        name: name.to_string(),
+        uuid: None,
     }
 }
 
@@ -1029,9 +1028,9 @@ fn a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid() {
     let uuid = created.uuid().expect("an instance has a uuid").to_string();
 
     let mut named = target(IncusKind::Instance, "svc", "m1", None);
-    named.object.uuid = Some(uuid.clone());
+    named.uuid = Some(uuid.clone());
     writer.read_owned(&named).expect("the named uuid reads");
-    named.object.uuid = Some(OTHER_UUID.to_string());
+    named.uuid = Some(OTHER_UUID.to_string());
     assert!(
         matches!(writer.read_owned(&named), Err(IncusError::Refused(_))),
         "another uuid is refused"
@@ -1042,7 +1041,7 @@ fn a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid() {
         .create(&target(IncusKind::Network, "svc", "mn1", None), &marked())
         .expect("a network");
     let mut named_network = target(IncusKind::Network, "svc", "mn1", None);
-    named_network.object.uuid = Some(uuid);
+    named_network.uuid = Some(uuid);
     assert!(matches!(
         writer.read_owned(&named_network),
         Err(IncusError::Refused(_))
@@ -1051,7 +1050,7 @@ fn a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid() {
     // A create names no uuid yet, so a target that does is refused before anything is sent.
     let before = write_count(&fake);
     let mut creating = target(IncusKind::Instance, "svc", "m2", None);
-    creating.object.uuid = Some(OTHER_UUID.to_string());
+    creating.uuid = Some(OTHER_UUID.to_string());
     assert!(matches!(
         writer.create(&creating, &marked()),
         Err(IncusError::Refused(_))
@@ -1152,7 +1151,7 @@ fn a_create_that_lands_and_reads_back_foreign_is_applied_unconfirmed() {
     let result = canned.writer().create(&project_target("kcan"), &marked());
     match result {
         Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
-            assert_eq!(unconfirmed.object.name, "kcan");
+            assert_eq!(unconfirmed.target.name, "kcan");
             assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
             assert!(!unconfirmed.reason.is_empty());
         }
@@ -1166,12 +1165,14 @@ fn the_refused_and_unconfirmed_errors_say_whether_a_write_was_sent() {
     let refused = IncusError::Refused("the name is taken".to_string()).to_string();
     assert!(refused.contains("before any write was sent"), "{refused}");
     let landed = IncusError::AppliedUnconfirmed(Box::new(Unconfirmed {
-        object: ObjectRef {
+        target: ObjectRef {
             kind: IncusKind::Instance,
             project: "svc".to_string(),
+            parent: None,
             name: "x".to_string(),
             uuid: None,
         },
+        uuid: None,
         owner: None,
         reason: "the object is not this entry's".to_string(),
     }))
@@ -1254,6 +1255,23 @@ fn every_error_after_a_sent_write_is_something_other_than_refused() {
         matches!(landed, IncusError::AppliedUnconfirmed(_)),
         "{landed:?}"
     );
+}
+
+#[test]
+fn a_wait_whose_own_answer_is_an_http_error_is_not_the_operations_status() {
+    // The operation's status is read from the wait's metadata. An HTTP error on the wait request is not that status, so it is
+    // not reported as one.
+    let canned = Canned::start("wait-http-500", |method, target| {
+        if method == "POST" {
+            return reply(202, "", &accepted_post());
+        }
+        if target.contains("/wait") {
+            return error_reply(500, "the wait failed");
+        }
+        not_found()
+    });
+    let error = error_after_sent_post(&canned, "wh5");
+    assert!(matches!(error, IncusError::Decode(_)), "{error:?}");
 }
 
 #[test]
@@ -1515,4 +1533,69 @@ fn the_ownership_document_carries_no_plan_cross_reference() {
             "the public document carries the reference {word:?}"
         );
     }
+}
+
+#[test]
+fn a_landed_write_names_its_full_target_and_the_uuid_it_read_back() {
+    // A volume is named by its pool, so the unconfirmed error must carry the pool and the uuid the read-back showed.
+    let mut posted = false;
+    let canned = Canned::start("unconfirmed-volume", move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return sync_reply(201, Value::Null);
+        }
+        if method == "GET" && target.starts_with("/1.0/storage-pools/fast/volumes/custom/vol1") {
+            return if posted {
+                object_reply(&json!({"name": "vol1", "config": {"volatile.uuid": OTHER_UUID}}))
+            } else {
+                not_found()
+            };
+        }
+        not_found()
+    });
+    let wanted = target(IncusKind::Volume, "svc", "vol1", Some("fast"));
+    match canned.writer().create(&wanted, &marked()) {
+        Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
+            assert_eq!(unconfirmed.target, wanted, "the full target, pool included");
+            assert_eq!(
+                unconfirmed.uuid.as_deref(),
+                Some(OTHER_UUID),
+                "the uuid read back"
+            );
+            assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
+        }
+        other => panic!("expected AppliedUnconfirmed: {other:?}"),
+    }
+}
+
+#[test]
+fn read_class_names_the_owner_of_an_object_with_a_get_and_no_write() {
+    // A read names the class of every owner. Only a GET is sent, so the fake records no write.
+    let (_dir, fake) = start("read-class");
+    let writer = writer(&fake, "toy");
+    let droidd: Reading = writer
+        .read_class(&target(IncusKind::Instance, "svc", "db1", None))
+        .expect("the read names the owner");
+    assert_eq!(droidd.class, OwnerClass::Droidd);
+    assert!(droidd.etag.starts_with('"'), "{}", droidd.etag);
+    let kernel = writer
+        .read_class(&target(IncusKind::Instance, "svc", "k1", None))
+        .expect("the read names the owner");
+    assert_eq!(
+        kernel.class,
+        OwnerClass::Kernel {
+            entry: EntryId("toy".to_string())
+        }
+    );
+    assert_eq!(write_count(&fake), 0, "a read sends no write");
+}
+
+#[test]
+fn read_class_refuses_a_target_outside_the_family_before_any_request() {
+    // The family is checked before the read, so a target outside it sends no request at all.
+    let (_dir, fake) = start("read-class-family");
+    let writer = writer(&fake, "toy");
+    let result = writer.read_class(&target(IncusKind::Instance, "default", "guest1", None));
+    assert!(matches!(result, Err(IncusError::Refused(_))), "{result:?}");
+    assert!(fake.requests().is_empty(), "no request was made");
 }

@@ -2,8 +2,9 @@
 //! request it receives.
 //!
 //! GET routes: `/1.0`, `/1.0/projects?recursion=1`, `/1.0/instances?all-projects=true&recursion=1`,
-//! `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<pool>/resources`, every object path, and `/1.0/operations/<id>` with
-//! its `/wait`. Any other GET is 404.
+//! `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<pool>/resources`, `/1.0/networks?recursion=1` and
+//! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path, and
+//! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
 //!
 //! Writes: a POST to a collection creates an object, a PATCH or DELETE changes or removes one. These cover projects and the
 //! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance and a volume
@@ -18,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
+use std::net::IpAddr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,6 +106,9 @@ pub struct WriteRecord {
     pub config_keys: Vec<String>,
 }
 
+/// One host interface: its name and the addresses it holds.
+type HostInterface = (String, Vec<IpAddr>);
+
 /// A running fake Incus. It serves until it is dropped.
 pub struct FakeIncus {
     socket: PathBuf,
@@ -118,6 +123,7 @@ struct Shared {
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
+    host_interfaces: Mutex<Vec<HostInterface>>,
     counter: AtomicU64,
 }
 
@@ -154,6 +160,8 @@ enum Route {
     ListProjects,
     ListInstances,
     ListPools,
+    HostInterfaces,
+    HostInterfaceState(String),
     PoolResources(String),
     Operation(String),
     Collection(Address),
@@ -204,6 +212,7 @@ impl Shared {
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
+            host_interfaces: Mutex::new(Vec::new()),
             counter: AtomicU64::new(1),
         }
     }
@@ -249,6 +258,12 @@ impl FakeIncus {
     /// Every write received so far, in arrival order: each non-GET request, with the config keys it carried.
     pub fn writes(&self) -> Vec<WriteRecord> {
         lock(&self.shared.writes).clone()
+    }
+
+    /// Sets the host's own interfaces: each name with the addresses it holds. The fake answers the listing of
+    /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
+    pub fn set_host_interfaces(&self, interfaces: Vec<(String, Vec<IpAddr>)>) {
+        *lock(&self.shared.host_interfaces) = interfaces;
     }
 
     /// Makes the fake answer 400 to a POST whose path starts with `kind_path_prefix` and whose body carries a `config`. The
@@ -498,7 +513,11 @@ fn parse(target: &str) -> Option<Route> {
         ["instances"] if query == "all-projects=true&recursion=1" => Route::ListInstances,
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
+        ["networks"] if query == "recursion=1" => Route::HostInterfaces,
         ["networks"] => Route::Collection(address("network", "", "")),
+        ["networks", name, "state"] if query.is_empty() => {
+            Route::HostInterfaceState((*name).to_string())
+        }
         ["networks", name] => Route::Object(address("network", "", name)),
         ["networks", network, "forwards"] => Route::Collection(address("forward", network, "")),
         ["networks", network, "forwards", name] => Route::Object(address("forward", network, name)),
@@ -540,6 +559,30 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         ("GET", Route::Server) => sync(store.server.clone()),
         ("GET", Route::ListProjects) => sync(Value::Array(store.bodies("project"))),
         ("GET", Route::ListInstances) => sync(Value::Array(store.bodies("instance"))),
+        ("GET", Route::HostInterfaces) => {
+            let interfaces = lock(&shared.host_interfaces);
+            sync(Value::Array(
+                interfaces
+                    .iter()
+                    .map(|(name, _)| json!({ "name": name, "managed": false, "type": "broadcast" }))
+                    .collect(),
+            ))
+        }
+        ("GET", Route::HostInterfaceState(name)) => {
+            let interfaces = lock(&shared.host_interfaces);
+            match interfaces.iter().find(|(listed, _)| *listed == name) {
+                Some((_, addresses)) => sync(json!({
+                    "addresses": addresses
+                        .iter()
+                        .map(|address| json!({
+                            "family": if address.is_ipv4() { "inet" } else { "inet6" },
+                            "address": address.to_string(),
+                        }))
+                        .collect::<Vec<Value>>(),
+                })),
+                None => (404, String::new(), error_envelope(404, "not found")),
+            }
+        }
         ("GET", Route::ListPools) => sync(Value::Array(
             store
                 .pools

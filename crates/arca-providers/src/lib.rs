@@ -3,6 +3,8 @@
 //! provider filters its rows. It refuses every plan and every effect with `WatchOnly`. It holds an [`IncusRead`], whose only
 //! method is GET, so no path through this type can send a write.
 
+pub mod incus;
+
 use arca_incus::{IncusError, IncusRead};
 use arca_kernel::desired::EntryId;
 use arca_kernel::journal::Inverse;
