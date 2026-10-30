@@ -36,6 +36,22 @@
 //! object that takes a PUT. A project that holds an object is in use, and a PATCH or a PUT that would turn off one of its
 //! features is refused with 400 and changes nothing, as Incus refuses it.
 //!
+//! Instances for adoption: an instance that names its `profiles` has its `expanded_devices` and `expanded_config` worked out
+//! from those profiles and its own keys, as Incus expands them. A project reads its own profiles when its config sets
+//! `features.profiles` to `"true"`, and the default project's otherwise; its `default` profile is empty until a test adds one
+//! ([`FakeIncus::add_profile`]). `/1.0/instances/<i>/state` serves the status and each NIC's MAC and IPv4, and a PUT there starts
+//! or stops the instance as an operation. A graceful stop can be made to outlast its timeout ([`FakeIncus::hang_stop`]), and
+//! then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`, else its `volatile.<dev>.hwaddr`, else one the start
+//! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
+//! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). Snapshots are served under
+//! `/1.0/instances/<i>/snapshots`. A POST to an instance moves it to the project its body names: it must be stopped, the target
+//! project must exist, and its `volatile.uuid` stays. When a PATCH or a move takes a device out of the expanded devices, or
+//! changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
+//! does: every one when the device goes or changes type, and otherwise each one whose key the new device sets. A restricted
+//! project refuses a snapshot unless `restricted.snapshots` is `allow`, a backup unless `restricted.backups` is `allow`, and a
+//! moved-in instance whose NIC names a network its grant does not list, or that sets `security.privileged`, `security.nesting`
+//! or a `raw.*` key.
+//!
 //! The fake records each request, and each write with the names of the config keys it carried. It never records a value.
 
 use std::collections::BTreeMap;
@@ -187,6 +203,19 @@ struct Store {
     held: BTreeMap<String, Held>,
     /// Creates a test armed with [`FakeIncus::hold_create`] that have not arrived yet.
     armed: Vec<Armed>,
+    /// The DHCP lease table, one lease per MAC.
+    leases: Vec<Lease>,
+    /// The instances whose graceful stop outlasts its timeout, by name, and whether a forced stop fails too.
+    hung: BTreeMap<String, bool>,
+}
+
+/// One DHCP lease: the network, the MAC that holds it and its address, and whether a device's `ipv4.address` pinned it.
+#[derive(Debug, Clone)]
+struct Lease {
+    network: String,
+    hwaddr: String,
+    address: String,
+    fixed: bool,
 }
 
 /// What a held operation does when it ends: an object that lands on success, and an object that goes on failure.
@@ -241,6 +270,10 @@ enum Route {
     HostInterfaces,
     HostInterfaceState(String),
     PoolResources(String),
+    NetworkLeases(String),
+    InstanceState(Address),
+    InstanceSnapshots(Address),
+    InstanceBackups(Address),
     ListOperations,
     Operation(String),
     OperationWait(String),
@@ -255,7 +288,13 @@ impl Route {
             Route::Object(address) if address.kind == "project" => {
                 &["GET", "PUT", "PATCH", "DELETE"]
             }
+            Route::Object(address) if address.kind == "instance" => {
+                &["GET", "POST", "PATCH", "DELETE"]
+            }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
+            Route::InstanceState(_) => &["GET", "PUT"],
+            Route::InstanceSnapshots(_) => &["GET", "POST"],
+            Route::InstanceBackups(_) => &["POST"],
             _ => &["GET"],
         }
     }
@@ -299,15 +338,21 @@ impl Shared {
                 body,
             });
         }
+        let mut store = Store {
+            server: state.server,
+            pools: state.pools,
+            objects,
+            operations: BTreeMap::new(),
+            held: BTreeMap::new(),
+            armed: Vec::new(),
+            leases: Vec::new(),
+            hung: BTreeMap::new(),
+        };
+        for index in 0..store.objects.len() {
+            store.expand(index, false);
+        }
         Shared {
-            store: Mutex::new(Store {
-                server: state.server,
-                pools: state.pools,
-                objects,
-                operations: BTreeMap::new(),
-                held: BTreeMap::new(),
-                armed: Vec::new(),
-            }),
+            store: Mutex::new(store),
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
@@ -432,6 +477,54 @@ impl FakeIncus {
         self.shared
             .operations_unreadable
             .store(unreadable, Ordering::SeqCst);
+    }
+
+    /// Puts a profile in `project`, as a create by hand would, and expands again every instance that reads it. It records no
+    /// write.
+    pub fn add_profile(&self, project: &str, body: Value) {
+        let mut store = lock(&self.shared.store);
+        let name = text_of(&body, "name");
+        store.objects.retain(|object| {
+            !(object.kind == "profile" && object.project == project && object.name == name)
+        });
+        store.objects.push(Stored {
+            kind: "profile".to_string(),
+            project: project.to_string(),
+            name,
+            parent: String::new(),
+            body,
+        });
+        for index in 0..store.objects.len() {
+            store.expand(index, false);
+        }
+    }
+
+    /// Gives `mac` the lease of `address` on `network`, replacing any lease the MAC held.
+    pub fn set_lease(&self, network: &str, mac: &str, address: &str) {
+        lock(&self.shared.store).lease(network, mac, address, false);
+    }
+
+    /// Every lease, as its network, its MAC and its address, in the order they were made.
+    pub fn leases(&self) -> Vec<(String, String, String)> {
+        lock(&self.shared.store)
+            .leases
+            .iter()
+            .map(|lease| {
+                (
+                    lease.network.clone(),
+                    lease.hwaddr.clone(),
+                    lease.address.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Makes every graceful stop of the instance `name` outlast its timeout: its operation fails and the instance keeps
+    /// running. A forced stop then stops it, unless `forced_too` is true, when it fails as well.
+    pub fn hang_stop(&self, name: &str, forced_too: bool) {
+        lock(&self.shared.store)
+            .hung
+            .insert(name.to_string(), forced_too);
     }
 
     fn end_operation(&self, id: &OpId, failure: Option<&str>) {
@@ -801,6 +894,13 @@ fn parse(target: &str) -> Option<Route> {
         ["instances"] if query == "all-projects=true&recursion=1" => Route::ListInstances,
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
+        ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
+        ["instances", name, "snapshots"] => Route::InstanceSnapshots(address("snapshot", name, "")),
+        ["instances", name, "snapshots", snapshot] => {
+            Route::Object(address("snapshot", name, snapshot))
+        }
+        ["instances", name, "backups"] => Route::InstanceBackups(address("backup", name, "")),
+        ["networks", name, "leases"] => Route::NetworkLeases((*name).to_string()),
         ["networks"] if query == "recursion=1" => Route::HostInterfaces,
         ["networks"] => Route::Collection(address("network", "", "")),
         ["networks", name, "state"] if query.is_empty() => {
@@ -944,6 +1044,40 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
             }
             None => (404, String::new(), error_envelope(404, "not found")),
         },
+        ("GET", Route::NetworkLeases(network)) => sync(Value::Array(
+            store
+                .leases
+                .iter()
+                .filter(|lease| lease.network == network)
+                .map(|lease| {
+                    json!({
+                        "hwaddr": lease.hwaddr, "address": lease.address,
+                        "type": if lease.fixed { "static" } else { "dynamic" },
+                    })
+                })
+                .collect(),
+        )),
+        ("GET", Route::InstanceState(address)) => instance_state(store, &address),
+        ("PUT", Route::InstanceState(address)) => change_state(shared, store, request, &address),
+        ("GET", Route::InstanceSnapshots(address)) => sync(Value::Array(
+            store
+                .objects
+                .iter()
+                .filter(|object| {
+                    object.kind == "snapshot"
+                        && object.project == address.project
+                        && object.parent == address.parent
+                })
+                .map(|object| object.body.clone())
+                .collect(),
+        )),
+        ("POST", Route::InstanceSnapshots(address)) => {
+            snapshot_or_backup(shared, store, request, &address, "snapshot")
+        }
+        ("POST", Route::InstanceBackups(address)) => {
+            snapshot_or_backup(shared, store, request, &address, "backup")
+        }
+        ("POST", Route::Object(address)) => move_instance(shared, store, request, &address),
         ("POST", Route::Collection(address)) => create(shared, store, request, &address),
         ("PATCH", Route::Object(address)) => patch(shared, store, request, &address),
         ("PUT", Route::Object(address)) => put(shared, store, request, &address),
@@ -1249,6 +1383,10 @@ fn create(
         return (202, String::new(), async_envelope(&armed.id, operation));
     }
     store.objects.push(stored);
+    if kind == "instance" {
+        let at = store.objects.len() - 1;
+        store.expand(at, false);
+    }
     answered(shared, store, kind, "POST", Ok(()))
 }
 
@@ -1323,6 +1461,10 @@ fn patch(
     if store.objects[index].kind == "project" {
         return write_project(shared, store, index, &changes, false);
     }
+    let mut changes = changes;
+    let devices = (store.objects[index].kind == "instance")
+        .then(|| changes.remove("devices"))
+        .flatten();
     let Some(object) = store.objects[index].body.as_object_mut() else {
         return (
             500,
@@ -1333,7 +1475,41 @@ fn patch(
     if let Err(message) = merge(object, &changes) {
         return (400, String::new(), error_envelope(400, message));
     }
+    if let Some(devices) = devices {
+        // An instance's PATCH replaces each device it names, whole, and keeps the others, as Incus's `instancePatch` does.
+        let Value::Object(devices) = devices else {
+            return (
+                400,
+                String::new(),
+                error_envelope(400, "devices must be an object"),
+            );
+        };
+        let local = object
+            .entry("devices")
+            .or_insert_with(|| json!({}))
+            .as_object_mut();
+        let Some(local) = local else {
+            return (
+                400,
+                String::new(),
+                error_envelope(400, "devices must be an object"),
+            );
+        };
+        for (name, device) in devices {
+            if !device.is_object() {
+                return (
+                    400,
+                    String::new(),
+                    error_envelope(400, "a device must be an object"),
+                );
+            }
+            local.insert(name, device);
+        }
+    }
     let kind = store.objects[index].kind.clone();
+    if kind == "instance" {
+        store.expand(index, true);
+    }
     answered(shared, store, &kind, "PATCH", Ok(()))
 }
 
@@ -1480,7 +1656,10 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
 /// Whether Incus answers a write to this kind and method with an operation. An instance's and a volume's create and delete
 /// are, and so is an image's delete. Their config update is sync, as every other write is.
 fn is_async(kind: &str, method: &str) -> bool {
-    matches!(kind, "instance" | "volume" | "image") && method != "PATCH"
+    matches!(
+        kind,
+        "instance" | "volume" | "image" | "snapshot" | "backup"
+    ) && method != "PATCH"
 }
 
 /// Answers a write. An async write records its operation and answers 202 with the operation's URL; the operation's own status
@@ -1586,6 +1765,497 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// The NIC keys Incus changes in place. A device that changes only in these keeps its volatile keys.
+const UPDATABLE_NIC_KEYS: [&str; 2] = ["ipv4.address", "ipv6.address"];
+
+impl Store {
+    /// The project whose profiles `project` reads: its own when its config sets `features.profiles` to `"true"`, and the
+    /// default project's otherwise.
+    fn profile_home(&self, project: &str) -> String {
+        let own = self
+            .project_config(project)
+            .and_then(|config| config.get("features.profiles"))
+            .and_then(Value::as_str)
+            == Some("true");
+        if own { project } else { DEFAULT_PROJECT }.to_string()
+    }
+
+    /// The expanded devices and config of an instance body in `project`: each profile it names, in order, then its own keys.
+    /// `None` when the body names no profiles. A profile that is not there adds nothing, as an empty `default` profile does.
+    fn expansion(
+        &self,
+        project: &str,
+        body: &Value,
+    ) -> Option<(Map<String, Value>, Map<String, Value>)> {
+        let profiles = body.get("profiles")?.as_array()?;
+        let home = self.profile_home(project);
+        let mut devices = Map::new();
+        let mut config = Map::new();
+        let layers = profiles
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|name| {
+                self.objects
+                    .iter()
+                    .find(|object| {
+                        object.kind == "profile" && object.project == home && object.name == name
+                    })
+                    .map(|object| &object.body)
+            })
+            .chain(std::iter::once(body));
+        for layer in layers {
+            for (key, into) in [("devices", &mut devices), ("config", &mut config)] {
+                if let Some(Value::Object(map)) = layer.get(key) {
+                    into.extend(map.clone());
+                }
+            }
+        }
+        Some((devices, config))
+    }
+
+    /// The devices and config an instance body has in `project`: its expansion, or its own keys when it names no profiles.
+    fn effective(&self, project: &str, body: &Value) -> (Map<String, Value>, Map<String, Value>) {
+        self.expansion(project, body).unwrap_or_else(|| {
+            let own = |key: &str| {
+                body.get(key)
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            (own("devices"), own("config"))
+        })
+    }
+
+    /// Works out the expanded devices and config of the instance at `index` again. With `reset`, the volatile keys of each
+    /// device the new expansion drops or changes are cleared first (see [`reset_keys`]).
+    fn expand(&mut self, index: usize, reset: bool) {
+        let object = &self.objects[index];
+        if object.kind != "instance" {
+            return;
+        }
+        let Some((devices, _)) = self.expansion(&object.project, &object.body) else {
+            return;
+        };
+        let cleared = if reset {
+            let old = object
+                .body
+                .get("expanded_devices")
+                .and_then(Value::as_object);
+            let config = object.body.get("config").and_then(Value::as_object);
+            reset_keys(
+                old.cloned().unwrap_or_default(),
+                &devices,
+                config.cloned().unwrap_or_default(),
+            )
+        } else {
+            Vec::new()
+        };
+        let project = object.project.clone();
+        if let Some(config) = self.objects[index]
+            .body
+            .get_mut("config")
+            .and_then(Value::as_object_mut)
+        {
+            for key in &cleared {
+                config.remove(key);
+            }
+        }
+        let Some((devices, config)) = self.expansion(&project, &self.objects[index].body) else {
+            return;
+        };
+        if let Some(body) = self.objects[index].body.as_object_mut() {
+            body.insert("expanded_devices".to_string(), Value::Object(devices));
+            body.insert("expanded_config".to_string(), Value::Object(config));
+        }
+    }
+
+    /// Gives `mac` the lease of `address` on `network`, in place of any lease it held.
+    fn lease(&mut self, network: &str, mac: &str, address: &str, fixed: bool) {
+        self.leases.retain(|lease| lease.hwaddr != mac);
+        self.leases.push(Lease {
+            network: network.to_string(),
+            hwaddr: mac.to_string(),
+            address: address.to_string(),
+            fixed,
+        });
+    }
+
+    /// The first host address from .100 in the network's own /24 that no lease holds.
+    fn free_address(&self, network: &str) -> Option<String> {
+        let own = self
+            .objects
+            .iter()
+            .find(|object| object.kind == "network" && object.name == network)?
+            .body
+            .get("config")?
+            .get("ipv4.address")?
+            .as_str()?;
+        let gateway: std::net::Ipv4Addr = own.split_once('/')?.0.parse().ok()?;
+        let [a, b, c, _] = gateway.octets();
+        (100..=250)
+            .map(|d| std::net::Ipv4Addr::new(a, b, c, d))
+            .filter(|candidate| *candidate != gateway)
+            .map(|candidate| candidate.to_string())
+            .find(|candidate| !self.leases.iter().any(|lease| lease.address == *candidate))
+    }
+
+    /// Starts the instance at `index`. Each NIC on a network gets its MAC (a new one is kept in `volatile.<dev>.hwaddr`) and
+    /// its IPv4: a device's `ipv4.address` pins its lease, and a MAC without a lease is leased a free address.
+    fn start(&mut self, index: usize, seed: u64) {
+        for (name, device) in nics(&self.objects[index].body) {
+            let Some(network) = device.get("network").and_then(Value::as_str) else {
+                continue;
+            };
+            let mac = match nic_mac(&self.objects[index].body, &name, &device) {
+                Some(mac) => mac,
+                None => {
+                    let mac = format!(
+                        "10:66:6a:{:02x}:{:02x}:{:02x}",
+                        (seed >> 16) & 0xff,
+                        (seed >> 8) & 0xff,
+                        seed & 0xff
+                    );
+                    if let Some(config) = self.objects[index]
+                        .body
+                        .get_mut("config")
+                        .and_then(Value::as_object_mut)
+                    {
+                        config.insert(format!("volatile.{name}.hwaddr"), json!(mac));
+                    }
+                    mac
+                }
+            };
+            match device.get("ipv4.address").and_then(Value::as_str) {
+                Some(fixed) => self.lease(network, &mac, fixed, true),
+                None if self.leases.iter().any(|lease| lease.hwaddr == mac) => {}
+                None => {
+                    if let Some(address) = self.free_address(network) {
+                        self.lease(network, &mac, &address, false);
+                    }
+                }
+            }
+        }
+        if let Some(body) = self.objects[index].body.as_object_mut() {
+            body.insert("status".to_string(), json!("Running"));
+        }
+        self.expand(index, false);
+    }
+
+    /// Whether `project` sets `restricted` to `"true"`.
+    fn restricted(&self, project: &str) -> bool {
+        self.project_config(project)
+            .and_then(|config| config.get("restricted"))
+            .and_then(Value::as_str)
+            == Some("true")
+    }
+
+    /// Whether a restricted project's key `key` is `"allow"`.
+    fn allows(&self, project: &str, key: &str) -> bool {
+        self.project_config(project)
+            .and_then(|config| config.get(key))
+            .and_then(Value::as_str)
+            == Some("allow")
+    }
+
+    /// Why a restricted project refuses an instance body moved into it, when it does: a NIC on a network its grant does not
+    /// list, or a privileged, nesting or low-level config key it does not allow.
+    fn moved_in_refusal(&self, project: &str, body: &Value) -> Option<&'static str> {
+        if !self.restricted(project) {
+            return None;
+        }
+        let (devices, config) = self.effective(project, body);
+        let grant = self
+            .project_config(project)
+            .and_then(|config| config.get("restricted.networks.access"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let ungranted = devices.values().any(|device| {
+            device.get("type").and_then(Value::as_str) == Some("nic")
+                && device
+                    .get("network")
+                    .and_then(Value::as_str)
+                    .is_some_and(|network| !grant.split(',').any(|name| name == network))
+        });
+        let set = |key: &str| config.get(key).and_then(Value::as_str) == Some("true");
+        if ungranted {
+            Some("the project may not use the network")
+        } else if set("security.privileged")
+            && !self.allows(project, "restricted.containers.privilege")
+        {
+            Some("the project forbids a privileged container")
+        } else if set("security.nesting") && !self.allows(project, "restricted.containers.nesting")
+        {
+            Some("the project forbids nesting")
+        } else if config.keys().any(|key| key.starts_with("raw."))
+            && !self.allows(project, "restricted.containers.lowlevel")
+        {
+            Some("the project forbids low-level keys")
+        } else {
+            None
+        }
+    }
+}
+
+/// The volatile keys `deviceVolatileReset` clears when an instance's expanded devices go from `old` to `new`. A device that is
+/// gone, or whose type changes, loses every `volatile.<dev>.*` key. A device that changes in more than its addresses loses each
+/// `volatile.<dev>.<key>` whose `<key>` the new device sets. A device that does not change keeps them all.
+fn reset_keys(
+    old: Map<String, Value>,
+    new: &Map<String, Value>,
+    config: Map<String, Value>,
+) -> Vec<String> {
+    let strip = |device: &Value| -> Option<Map<String, Value>> {
+        device.as_object().map(|map| {
+            map.iter()
+                .filter(|(key, _)| !UPDATABLE_NIC_KEYS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+    };
+    let mut cleared = Vec::new();
+    for (name, before) in &old {
+        let after = new.get(name);
+        if after.is_some_and(|after| strip(after) == strip(before)) {
+            continue;
+        }
+        let prefix = format!("volatile.{name}.");
+        let retyped = after.is_none_or(|after| after.get("type") != before.get("type"));
+        for key in config.keys().filter(|key| key.starts_with(&prefix)) {
+            let field = &key[prefix.len()..];
+            if retyped || after.is_some_and(|after| after.get(field).is_some()) {
+                cleared.push(key.clone());
+            }
+        }
+    }
+    cleared
+}
+
+/// The NIC devices an instance has: its expanded devices when it has them, and its own otherwise.
+fn nics(body: &Value) -> Vec<(String, Map<String, Value>)> {
+    body.get("expanded_devices")
+        .or_else(|| body.get("devices"))
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, device)| {
+            device
+                .as_object()
+                .filter(|device| device.get("type").and_then(Value::as_str) == Some("nic"))
+                .map(|device| (name.clone(), device.clone()))
+        })
+        .collect()
+}
+
+/// A NIC's MAC: its device's `hwaddr`, else its `volatile.<dev>.hwaddr`.
+fn nic_mac(body: &Value, name: &str, device: &Map<String, Value>) -> Option<String> {
+    device
+        .get("hwaddr")
+        .and_then(Value::as_str)
+        .filter(|mac| !mac.is_empty())
+        .or_else(|| {
+            body.get("config")?
+                .get(format!("volatile.{name}.hwaddr"))?
+                .as_str()
+        })
+        .map(str::to_string)
+}
+
+/// An instance's state: its status and, while it runs, each NIC's MAC and the IPv4 its device pins or its MAC leases.
+fn instance_state(store: &Store, address: &Address) -> Answer {
+    let Some(index) = store.find(address) else {
+        return (404, String::new(), error_envelope(404, "not found"));
+    };
+    let body = &store.objects[index].body;
+    let status = text_of(body, "status");
+    let running = status == "Running";
+    let mut network = Map::new();
+    for (name, device) in nics(body).into_iter().filter(|_| running) {
+        let mac = nic_mac(body, &name, &device).unwrap_or_default();
+        let address = device
+            .get("ipv4.address")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                store
+                    .leases
+                    .iter()
+                    .find(|lease| lease.hwaddr == mac)
+                    .map(|lease| lease.address.clone())
+            });
+        let addresses: Vec<Value> = address
+            .into_iter()
+            .map(|address| json!({ "family": "inet", "address": address, "netmask": "24", "scope": "global" }))
+            .collect();
+        network.insert(
+            name,
+            json!({ "hwaddr": mac, "addresses": addresses, "state": "up", "type": "broadcast" }),
+        );
+    }
+    sync(
+        json!({ "status": status, "status_code": if running { 103 } else { 102 }, "network": network }),
+    )
+}
+
+/// Starts or stops an instance from a PUT of its state, as an operation. A stop of a hung instance fails inside its operation
+/// and leaves it running, unless it is forced and only the graceful stop hangs.
+fn change_state(
+    shared: &Shared,
+    store: &mut Store,
+    request: &Request,
+    address: &Address,
+) -> Answer {
+    let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    let Some(index) = store.find(address) else {
+        return (404, String::new(), error_envelope(404, "not found"));
+    };
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
+        return bad("the body is not a JSON object");
+    };
+    let force = sent.get("force").and_then(Value::as_bool) == Some(true);
+    let running = text_of(&store.objects[index].body, "status") == "Running";
+    match text_in(&sent, "action").as_str() {
+        "start" if running => bad("The instance is already running"),
+        "start" => {
+            store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
+            answered(shared, store, "instance", "PUT", Ok(()))
+        }
+        "stop" if !running => bad("The instance is already stopped"),
+        "stop" => {
+            let hung = store.hung.get(&store.objects[index].name).copied();
+            if hung.is_some_and(|forced_too| forced_too || !force) {
+                let failure = Err((400, "Failed shutting down instance".to_string()));
+                return answered(shared, store, "instance", "PUT", failure);
+            }
+            if let Some(body) = store.objects[index].body.as_object_mut() {
+                body.insert("status".to_string(), json!("Stopped"));
+            }
+            answered(shared, store, "instance", "PUT", Ok(()))
+        }
+        _ => bad("the fake takes only a start or a stop"),
+    }
+}
+
+/// Takes a snapshot of an instance, or a backup, which the fake does not keep. A restricted project refuses either unless its
+/// `restricted.snapshots` or `restricted.backups` is `allow`.
+fn snapshot_or_backup(
+    shared: &Shared,
+    store: &mut Store,
+    request: &Request,
+    address: &Address,
+    kind: &str,
+) -> Answer {
+    let instance = Address {
+        kind: "instance",
+        project: address.project.clone(),
+        parent: String::new(),
+        name: address.parent.clone(),
+    };
+    if store.find(&instance).is_none() {
+        return (404, String::new(), error_envelope(404, "not found"));
+    }
+    if store.restricted(&address.project)
+        && !store.allows(&address.project, &format!("restricted.{kind}s"))
+    {
+        return (
+            403,
+            String::new(),
+            error_envelope(403, &format!("Project restricted: {kind}s are forbidden")),
+        );
+    }
+    if kind == "backup" {
+        return answered(shared, store, kind, "POST", Ok(()));
+    }
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "the body is not a JSON object"),
+        );
+    };
+    let name = text_in(&sent, "name");
+    if name.is_empty() || name.contains('/') {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "the snapshot has no usable name"),
+        );
+    }
+    let place = Address {
+        name: name.clone(),
+        ..address.clone()
+    };
+    if store.find(&place).is_some() {
+        return (
+            409,
+            String::new(),
+            error_envelope(409, "the snapshot already exists"),
+        );
+    }
+    store.objects.push(Stored {
+        kind: kind.to_string(),
+        project: address.project.clone(),
+        name: name.clone(),
+        parent: address.parent.clone(),
+        body: json!({ "name": name, "stateful": sent.get("stateful").cloned().unwrap_or(json!(false)) }),
+    });
+    answered(shared, store, kind, "POST", Ok(()))
+}
+
+/// Moves a stopped instance to the project its POST names, under its own name, with its snapshots, as an operation. Its
+/// `volatile.uuid` stays, and its devices are expanded in the new project with the volatile reset. A rename, a migration or
+/// any other POST is refused.
+fn move_instance(
+    shared: &Shared,
+    store: &mut Store,
+    request: &Request,
+    address: &Address,
+) -> Answer {
+    let bad = |code: u16, message: &str| (code, String::new(), error_envelope(code, message));
+    let Some(index) = store.find(address) else {
+        return bad(404, "not found");
+    };
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
+        return bad(400, "the body is not a JSON object");
+    };
+    let name = text_in(&sent, "name");
+    let to = text_in(&sent, "project");
+    let plain = sent.keys().all(|key| key == "name" || key == "project");
+    if !plain || name != address.name || to.is_empty() || to == address.project {
+        return bad(
+            400,
+            "the fake only moves an instance to another project under its own name",
+        );
+    }
+    if text_of(&store.objects[index].body, "status") == "Running" {
+        return bad(400, "Instance must be stopped to be moved");
+    }
+    if store.project_config(&to).is_none() {
+        return bad(404, "Project not found");
+    }
+    let taken = Address {
+        project: to.clone(),
+        ..address.clone()
+    };
+    if store.find(&taken).is_some() {
+        return bad(409, "the name is taken in the target project");
+    }
+    if let Some(reason) = store.moved_in_refusal(&to, &store.objects[index].body) {
+        return bad(403, reason);
+    }
+    let from = std::mem::replace(&mut store.objects[index].project, to.clone());
+    if let Some(body) = store.objects[index].body.as_object_mut() {
+        body.insert("project".to_string(), json!(to));
+    }
+    for object in &mut store.objects {
+        if object.kind == "snapshot" && object.project == from && object.parent == name {
+            object.project = to.clone();
+        }
+    }
+    store.expand(index, true);
+    answered(shared, store, "instance", "POST", Ok(()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1611,7 +2281,11 @@ mod tests {
         );
         assert_eq!(
             parse("/1.0/instances/a").map(|r| r.methods()),
-            Some(&["GET", "PATCH", "DELETE"][..])
+            Some(&["GET", "POST", "PATCH", "DELETE"][..])
+        );
+        assert_eq!(
+            parse("/1.0/instances/a/state").map(|r| r.methods()),
+            Some(&["GET", "PUT"][..])
         );
     }
 
