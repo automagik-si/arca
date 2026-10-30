@@ -13,6 +13,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
+| `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
 
 `watch` and `metrics` print the same JSON as the MCP verb of the same name, so a command's output can be compared with the
 server's answer.
@@ -60,6 +61,8 @@ refused without the value being echoed back.
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
+| `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
+| `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 
 The config is refused, with exit 2, when:
@@ -73,6 +76,9 @@ The config is refused, with exit 2, when:
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
 - `kernel.projects` is not empty and `kernel.droiddProjects` is empty;
 - `kernel.scratch` is `true` and a kernel project does not start with `arcak-scratch-`.
+- an adopted instance is not a plain name (`^[a-z][a-z0-9-]{0,56}$`), its `to` does not start with `arcak-adopt-` or is
+  not in `kernel.projects`, an instance or a `to` is listed twice, an attach network is not a plain name, or
+  `kernel.scratch` is `true` while `kernel.adopt` is set.
 
 No command reads Incus before the config passes these checks.
 
@@ -459,6 +465,66 @@ owner's yes, and has its own rollback. Take them in order and roll back in rever
 Once all four are in place, from a tailnet host: a `POST https://<host name>/mcp` without a bearer gets 401, `initialize`
 with the viewer token gets 200, and any other path gets 403 or 404. Send the bearer from a 0600 header file
 (`curl -H @<file>`), never on the command line.
+
+## Adopting a container
+
+`arca adopt` moves one existing container, listed in `kernel.adopt`, out of the default project into its own adoption
+project, and back. It is the one path that writes outside the kernel's project family, through a closed table of steps
+(Rule 45 in [`OWNERSHIP.md`](OWNERSHIP.md)). `serve` refuses a config that lists an adoption, so the adoption config is a
+second file that names the service's `stateDir`, the adoption project in `kernel.projects`, and the bridge in
+`kernel.attachNetworks`:
+
+```json
+"kernel": {
+  "projects": ["arcak-adopt-svc1"],
+  "scratch": false,
+  "droiddProjects": ["app1"],
+  "adopt": [{ "instance": "svc1", "to": "arcak-adopt-svc1" }],
+  "attachNetworks": ["br1"]
+}
+```
+
+1. `arca adopt plan --instance svc1 --expect-ip 192.0.2.131 --json --config adopt.json` runs the preflight with GET alone
+   and prints the plan, its digest and every request. The preflight refuses, naming the reason, any container a project
+   move would refuse or change (see `cmd_adopt::preflight`).
+2. `arca adopt apply --instance svc1 --plan-digest <digest> --dry-run --config adopt.json` takes no lock and sends no write.
+3. Stop the service that holds the state directory (`systemctl --user stop arca-watch.service`), then run `apply` without
+   `--dry-run`. It takes `desired.lock` and runs CreateProject, Stop, Snapshot, PinNic, Move, Mark and Start. Each step
+   writes an intent line before its request and an outcome line after it to `<stateDir>/adoptions.jsonl` (mode 0600,
+   synced). A fresh plan's digest must be the one given.
+4. `arca adopt verify --instance svc1 --port 8080 [--http-path /] [--wait <s>] --config adopt.json` checks that the instance
+   runs with the pre-image's MAC and IPv4 on `eth0`, then connects to `<ipv4>:<port>` and needs an HTTP answer below 500
+   within 10 s. It tries again every 2 s for up to `--wait` seconds (60 by default, at most 3600), so a lease still being
+   given or a service still starting is waited for, and then reports the last failure.
+5. Start the service again. `watch_report` and `arca watch --once --json` count each adoption that is not released in full as
+   a live entry, so the instance shows in its adoption project as kernel-owned (`adopt-svc1`) with no drift.
+
+**The pin.** PinNic sets `devices.eth0` on the instance itself: the network, the pre-image MAC as `hwaddr` and the pre-image
+IPv4 as `ipv4.address`. It is set before Move and never removed, and Move and MoveBack refuse an unpinned instance. Because
+the pin sets `hwaddr`, Incus drops `volatile.eth0.hwaddr` at PinNic (`deviceVolatileReset`), and from then on the MAC is the
+device's own, in both projects and after a release. The snapshot `arca-adopt-<digest[0..12]>` is taken after Stop and before
+PinNic: restore it only after a release, never in the adoption project, where it would drop `eth0`.
+
+**Resume.** When `apply` stops at any point, whether a kill, a crash or a failed step, run the same `apply` with the same
+digest again. It goes on from the plan in the record, never from a fresh preflight, which would refuse an instance that has
+moved. A step whose intent is the last line runs again without a second intent, and a step that had landed sends nothing.
+The digest must be the recorded plan's. Only one adoption may be open at a time, and a complete adoption applied again sends
+nothing.
+
+**Release.** `arca adopt release --instance svc1 [--dry-run] --config adopt.json` takes the lock, except for `--dry-run`, and
+returns the instance to `default`, running and unmarked, from wherever its record stands. Before Move, only ReleaseStart is
+left; after Move, MoveBack comes first; after Mark, Unmark comes before it; after Start, ReleaseStop, Unmark, MoveBack and
+ReleaseStart all run. An adopt step left at its intent is closed as failed first, and each release step reads before it
+sends. When the instance is in its adoption project without the pin, the release, and its dry run, refuse before any write,
+since MoveBack would refuse it only after the instance was stopped and unmarked. The pin and the snapshot are kept, and nothing is deleted, the empty adoption project included. Once a release has
+begun, `apply` refuses to resume and `release` finishes it. A release done in full, run again, sends nothing. `verify` then
+checks the instance in `default`.
+
+Exit codes: `2` for a refusal before any write: an instance the config does not list, a preflight check, a stale digest, a
+digest that is not the recorded plan's, a record that holds no such adoption, another open adoption, a resume after a
+release has begun, a release of an instance that lost its pin, a verify before the adoption or release completed, or a bad
+`--port`, `--http-path` or `--wait`. `1` for a held
+lock, a failed step (the record names it) or a failed verify.
 
 ## Tests
 

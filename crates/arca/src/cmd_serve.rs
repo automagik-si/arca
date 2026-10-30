@@ -30,6 +30,7 @@ use arca_reconcile::PluginSet;
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
     Clock, MetricsHandler, Published, SAMPLE_INTERVAL, StatusHandler, TokenListHandler,
@@ -49,6 +50,26 @@ const SECRETS_DIR: &str = "secrets";
 const TEST_SIGNERS_ENV: &str = "ARCA_TEST_OWNER_SIGNERS";
 /// The system's host name, which an approval statement names when the config names no approval host.
 const SYSTEM_HOSTNAME: &str = "/proc/sys/kernel/hostname";
+
+/// The `watch_report` handler of `cfg`. Each sweep reads the adoption record in the state directory again and counts its
+/// adopted instances as live entries, so an adopted instance shows kernel-owned. A record that cannot be read counts none, and
+/// says so on stderr: its adopted instances then show as drift, never as clean.
+pub fn watch_handler(cfg: &NodeConfig) -> WatchHandler {
+    let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
+    let state_dir = cfg.state_dir.clone();
+    WatchHandler::new(cfg.incus.socket.clone(), phones).with_adopted(move || {
+        match AdoptionRecord::open(&state_dir) {
+            Ok(record) => record.adopted(),
+            Err(failure) => {
+                eprintln!(
+                    "arca: the adoption record cannot be read, so adopted instances show as drift: {}",
+                    failure.message()
+                );
+                BTreeSet::new()
+            }
+        }
+    })
+}
 
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let cfg = config::load(Path::new(flags.required("config")?))?;
@@ -94,7 +115,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     spawn_sampler(new_sampler(&cfg), published.clone())
         .map_err(|e| Failure::Runtime(e.to_string()))?;
 
-    let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
     let mut server = Server::new(verbs(), tokens)
         .handle(
             "arca_status",
@@ -105,10 +125,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .handle("node_metrics", Arc::new(MetricsHandler { published }))
-        .handle(
-            "watch_report",
-            Arc::new(WatchHandler::new(cfg.incus.socket.clone(), phones)),
-        )
+        .handle("watch_report", Arc::new(watch_handler(&cfg)))
         .handle("token_list", Arc::new(TokenListHandler { ids }));
     let clock: Clock = Arc::new(now_ms);
     for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock) {

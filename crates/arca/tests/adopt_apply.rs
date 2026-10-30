@@ -670,13 +670,26 @@ fn a_step_that_fails_is_recorded_and_the_adoption_is_not_planned_again() {
     );
     let record = AdoptionRecord::open(&scratch.path("state")).expect("the record");
     assert_eq!(record.last("svc1"), Some((AdoptStep::Stop, Phase::Failed)));
-    let before = fake.writes().len();
+    // A second apply resumes from the record: it runs no preflight, and runs the failed Stop again, which fails again.
+    let (before, read_from) = (fake.writes().len(), fake.requests().len());
     let again = apply(&config, &digest, &[]);
     assert!(
-        matches!(&again, Err(Failure::Refused(why)) if why.contains("not completed")),
+        matches!(&again, Err(Failure::Runtime(why)) if why.contains("Stop")),
         "{again:?}"
     );
-    assert_eq!(fake.writes().len(), before);
+    assert_eq!(
+        fake.writes().len(),
+        before + 2,
+        "the graceful stop and the forced stop"
+    );
+    assert!(
+        fake.requests()[read_from..]
+            .iter()
+            .all(|r| !r.path.contains("/backups") && !r.path.contains("/leases")),
+        "no preflight read"
+    );
+    let record = AdoptionRecord::open(&scratch.path("state")).expect("the record");
+    assert_eq!(record.last("svc1"), Some((AdoptStep::Stop, Phase::Failed)));
 }
 
 #[test]

@@ -69,6 +69,10 @@ Source: `write::ProjectFamily::{new, allows}` and `UnixIncusWriter::{allow_targe
 provider's test `an_effect_rechecks_the_family_for_a_plan_the_caller_made_by_hand` is in
 `crates/arca-providers/tests/incus_provider.rs`, and `a_non_network_create_in_default_is_still_refused_before_any_request` is
 there too.
+The one other exception is the adoption writer (Rule 45): for one container that `kernel.adopt` lists, it writes that instance
+in `default`, creates its adoption project, and moves the instance between the two, through a closed table of steps. It is a
+separate writer with its own family of one project; `ProjectFamily` and every other path are unchanged, so `default` stays out
+of every family.
 
 **Rule 9.** A project is named by its own name. A project's path names it alone, and a project whose name differs from its
 `project` field is refused before any request.
@@ -452,11 +456,15 @@ tests `a_marked_bridge_in_default_is_created_patched_and_removed`,
 plain names. The grant is set at the project's create only, since a project patch may not change it (Rule 30). Each name must be a
 bridge in `default` that carries the entry's mark, read before the create is sent; one name that is not marked refuses the whole
 list, and so does an empty or a non-plain name. `restricted` stays `"true"`. A restricted project refuses an instance whose NIC
-names a bridge its grant does not list.
+names a bridge its grant does not list. The one exception is an adoption project's grant (Rule 45), which is attach-only: it
+may name an unmarked bridge when `kernel.attachNetworks` lists it, and nothing writes a listed bridge. Every other path still
+refuses an unmarked bridge.
 Source: `IncusProvider::check_network_access` in `crates/arca-providers/src/incus.rs`; tests
 `a_project_create_may_grant_only_bridges_the_entry_holds_in_default` in `crates/arca-providers/tests/incus_provider.rs`, and
 `a_nic_on_a_network_the_restricted_project_does_not_list_is_refused_by_incus` in `crates/arca-incus/tests/write.rs`, which runs
-against the fake's restriction (`FakeIncus` answers 403 to such a NIC).
+against the fake's restriction (`FakeIncus` answers 403 to such a NIC). The attach-only grant is `adoption_project_body` in
+`crates/arca-incus/src/adopt.rs`, tested by `the_adoption_project_grants_only_the_attach_networks_and_allows_snapshots_and_backups`
+in `crates/arca-incus/tests/adopt.rs`.
 
 ## Images in a kernel project
 
@@ -545,6 +553,70 @@ with a create whose object shows only when its operation is released, `Appears::
 `a_create_whose_operation_fails_while_the_restart_waits_is_reverted_and_leaves_nothing`,
 `a_running_operation_on_another_object_holds_no_intent` and
 `a_failed_operations_read_holds_every_intent_and_the_open_refuses_with_no_write` in `crates/arca-reconcile/tests/restart.rs`.
+
+## Adoption
+
+**Rule 45.** An adoption takes one existing container that `kernel.adopt` lists from `default` into its adoption project
+`arcak-adopt-<name>`, and a release takes it back. `AdoptWriter` is the only path that does it. It sends only the requests of
+the table below, for that one instance, and before each request it reads the instance and refuses unless it is a container
+whose `volatile.uuid` is the recorded pre-image's, in the project, owner class and status the step names. A step whose
+outcome already reads true sends nothing. No step sends a DELETE, writes a network, a profile or an ACL, or sends a project
+anything but the one create, and every request passes the `exchange` guard (Rule 30). No step runs while an operation names
+the instance, in either project, or the adoption project (Rule 44). Foreign means no owner's mark and no key in the
+kernel's namespace; Adopted means the mark `adopt-<instance>`.
+
+| Step | Request | Before | Done when |
+|------|---------|--------|-----------|
+| CreateProject | `POST /1.0/projects`, marked, restricted, granting the attach networks, allowing snapshots and backups | `default`, Foreign, Running | the project exists, is marked, and holds no other instance |
+| Stop | `PUT .../state` stop, 60 s graceful, then forced if it still runs | `default`, Foreign, Running | Stopped |
+| Snapshot | `POST .../snapshots`, `arca-adopt-<digest[0..12]>`, stateless | `default`, Foreign, Stopped | the snapshot exists |
+| PinNic | `PATCH` `devices.eth0` only, under `If-Match` | `default`, Foreign, Stopped | the local `eth0` is the pin |
+| Move | `POST` `{"name": i, "project": to}` | `default`, Foreign, Stopped, pinned | in `to` and not in `default` |
+| Mark | `PATCH` `config.user.arcakernel.entry` only, under `If-Match` | `to`, Foreign, Stopped | Adopted |
+| Start | `PUT .../state` start | `to`, Adopted, Stopped | Running |
+| ReleaseStop | as Stop, in `to` | `to`, Adopted, Running | Stopped |
+| Unmark | `PATCH` the entry key to `""`, under `If-Match` | `to`, Adopted, Stopped | Foreign |
+| MoveBack | `POST` `{"name": i, "project": "default"}` | `to`, Foreign, Stopped, pinned | in `default` and not in `to` |
+| ReleaseStart | as Start, in `default` | `default`, Foreign, Stopped | Running |
+
+The pin is `devices.eth0` with the network, the pre-image MAC as `hwaddr` and the pre-image IPv4 as `ipv4.address`. It is set
+before Move and never removed. Because it sets `hwaddr`, Incus's `deviceVolatileReset` drops `volatile.eth0.hwaddr` at PinNic,
+and from then on the MAC is the device's own, the same in `default`, in `to` and after a release; no step removes or renames
+`eth0`. An adopted instance is never a desired-state entry, and its steps are not journal effects: the adoption lives in its
+mark and in `<stateDir>/adoptions.jsonl` (JSON lines, synced, mode 0600, a link refused), which holds the plan, its digest, the
+pre-image, and an intent line before each request and an outcome line after it. The record takes no intent while another is
+open, and only one adoption may be open. A resume works from the recorded plan, never a fresh preflight: the plan's digest
+must be the one given, and the step whose intent is the last line runs again and closes it, so Foreign-in-`to`, the window
+between Move and Mark, is accepted only by the recorded uuid. A release computes its steps from the last recorded step
+(ReleaseStart alone before Move; MoveBack first after Move; Unmark first after Mark; all four after Start), closes an adopt
+step left at its intent as failed, and keeps the pin and the snapshot. A release whose steps include MoveBack first reads
+the instance in `to` and refuses, before any write, one whose local `eth0` is not the pin, since MoveBack would refuse it
+only after ReleaseStop and Unmark. The watch counts each adoption not released in full as
+a live entry, so an adopted instance is kernel-owned with no drift, and one that is gone is `EntryWithoutObject`. `serve`
+refuses a config that lists an adoption.
+Source: `adopt::{AdoptWriter, adoption_project_body, pin_patch, pin_device}` in `crates/arca-incus/src/adopt.rs`;
+`adoptions::{AdoptionPlan, AdoptionRecord, resume_steps, release_steps}` in `crates/arca/src/adoptions.rs`;
+`cmd_adopt::{preflight, verify, verify_with, http_probe}` in `crates/arca/src/cmd_adopt.rs`; `cmd_serve::watch_handler` in
+`crates/arca/src/cmd_serve.rs`; the fake's stop and start, snapshots, backups, moves, lease table and `deviceVolatileReset` in
+`crates/arca-incus/src/fake.rs`. Tests: in `crates/arca-incus/tests/adopt.rs`,
+`the_expected_class_and_project_of_each_step_follow_the_table`,
+`an_adoption_keeps_the_mac_and_ip_and_each_step_sends_only_its_own_request_once`,
+`a_release_keeps_the_pin_the_snapshot_the_mac_and_the_ip_and_each_step_runs_once`,
+`a_move_without_the_pin_clears_the_mac_the_instance_depends_on`,
+`every_step_out_of_its_expected_project_class_or_status_is_refused_with_no_write` and
+`a_running_operation_on_the_instance_holds_every_step_with_no_write`; in `crates/arca/tests/adopt_apply.rs`, the preflight
+refusals and `plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and_config`; in
+`crates/arca/tests/adopt_release.rs`,
+`every_kill_point_of_an_apply_resumes_to_a_complete_adoption_with_no_step_sent_twice`,
+`every_kill_point_of_an_apply_releases_to_the_pre_image_location_class_mac_and_ipv4`,
+`the_move_mark_window_stopped_unmarked_in_to_is_resumed_and_released`,
+`foreign_in_to_is_accepted_only_for_the_uuid_the_record_holds`,
+`a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled`,
+`a_release_whose_pin_was_removed_is_refused_before_any_write`,
+`a_held_operation_blocks_the_next_step_of_a_resume_and_of_a_release`,
+`verify_fails_on_a_changed_mac_a_changed_ipv4_a_closed_port_or_a_5xx`,
+`verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out` and
+`after_adoption_the_watch_shows_the_instance_kernel_owned_with_no_drift`.
 
 ## Out of scope
 
