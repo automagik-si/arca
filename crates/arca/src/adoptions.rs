@@ -3,6 +3,9 @@
 //! request and its outcome line after. An adoption is never a desired-state entry, and its steps are not journal effects: this
 //! record and the instance's own mark are the only places it lives.
 //!
+//! A move that Incus ran as a copy gives the instance a new uuid. The writer confirms it by the copy rule, and a uuid line
+//! records it before the move's outcome line; every later step, and `verify`, expect the uuid the record holds last.
+//!
 //! The file is the owner's alone: a link, a file that is not regular, one not owned by this user, or one whose mode is not 0600
 //! is refused. A torn last line, which a crash mid-write leaves, was never synced as a whole line, so it is dropped: its step
 //! either had not started or reads its outcome back from Incus.
@@ -13,7 +16,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use arca_incus::adopt::{AdoptStep, AdoptTarget, PreImage, SNAPSHOT_PREFIX, SOURCE_PROJECT};
+use arca_incus::adopt::{
+    AdoptStep, AdoptTarget, PreImage, SNAPSHOT_PREFIX, SOURCE_PROJECT, uuid_ok,
+};
 use arca_kernel::canon::{Digest, canonical_json};
 use arca_kernel::desired::EntryId;
 use serde::{Deserialize, Serialize};
@@ -114,6 +119,12 @@ enum Line {
         phase: Phase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         why: Option<String>,
+    },
+    /// The new uuid a move's copy gave the instance, written before that move's outcome line.
+    Uuid {
+        instance: String,
+        step: AdoptStep,
+        uuid: String,
     },
 }
 
@@ -247,6 +258,39 @@ impl AdoptionRecord {
     /// Records that `step`, whose intent is the last line of the active adoption, failed, and why.
     pub fn failed(&mut self, step: AdoptStep, why: &str) -> Result<(), Failure> {
         self.step_line(step, Phase::Failed, Some(why.to_string()))
+    }
+
+    /// Records that `step`, a Move or a MoveBack whose intent is the last line of the active adoption, left the instance under
+    /// the new `uuid`: Incus ran the move as a copy. It is written before the step's outcome line.
+    pub fn moved(&mut self, step: AdoptStep, uuid: &str) -> Result<(), Failure> {
+        let instance = self.active()?;
+        if !matches!(step, AdoptStep::Move | AdoptStep::MoveBack)
+            || self.last(&instance) != Some((step, Phase::Intent))
+            || !uuid_ok(uuid)
+        {
+            return Err(Failure::Runtime(format!(
+                "the record of {instance} does not stand where a new uuid can be recorded"
+            )));
+        }
+        self.append(Line::Uuid {
+            instance,
+            step,
+            uuid: uuid.to_string(),
+        })
+    }
+
+    /// The uuid the latest adoption of `instance` expects the instance to have: the last one a copy gave it, else the
+    /// pre-image's. `None` when the record holds no adoption of it.
+    pub fn uuid(&self, instance: &str) -> Option<String> {
+        self.lines.iter().rev().find_map(|line| match line {
+            Line::Uuid {
+                instance: named,
+                uuid,
+                ..
+            } if named == instance => Some(uuid.clone()),
+            Line::Plan { plan } if plan.instance == instance => Some(plan.pre_image.uuid.clone()),
+            _ => None,
+        })
     }
 
     fn step_line(

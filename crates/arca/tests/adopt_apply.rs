@@ -564,7 +564,13 @@ fn plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and_config() {
         after["config"]["user.arcakernel.entry"],
         json!("adopt-svc1")
     );
-    assert_eq!(after["config"]["volatile.uuid"], json!(ADOPT_UUID));
+    // The move was a copy, under a new uuid, which the record holds.
+    let recorded = AdoptionRecord::open(&scratch.path("state"))
+        .expect("the record")
+        .uuid("svc1")
+        .expect("the recorded uuid");
+    assert_ne!(recorded, ADOPT_UUID);
+    assert_eq!(after["config"]["volatile.uuid"], json!(recorded));
     let own = |body: &Value| -> Vec<(String, Value)> {
         body["config"]
             .as_object()

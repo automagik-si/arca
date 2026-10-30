@@ -179,7 +179,7 @@ fn apply(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
     if dry_run {
         return describe(&cfg, &target, &found, true);
     }
-    let writer = writer(&cfg, &target, &found.plan)?;
+    let writer = writer(&cfg, &target, &found.plan, &found.plan.pre_image.uuid)?;
     record.begin(&found.plan)?;
     record.facts(&found.facts)?;
     let ran = drive(
@@ -221,7 +221,7 @@ fn resume(
         )));
     }
     let steps = resume_steps(&plan, last);
-    let writer = writer(cfg, target, &plan)?;
+    let writer = writer(cfg, target, &plan, &recorded_uuid(&record, &plan))?;
     if dry_run {
         return Ok(Some(dry_run_of(&writer, &plan, &steps, last)));
     }
@@ -267,7 +267,7 @@ fn release(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
     }
     let last = record.last(&target.instance);
     let steps = release_steps(last);
-    let writer = writer(&cfg, &target, &plan)?;
+    let writer = writer(&cfg, &target, &plan, &recorded_uuid(&record, &plan))?;
     if steps.contains(&AdoptStep::MoveBack) {
         pin_kept(&cfg, &target, &writer)?;
     }
@@ -369,7 +369,8 @@ fn last_json(last: Option<(AdoptStep, Phase)>) -> Value {
 
 /// Runs `steps` through the writer, each with its intent line before its request and its outcome line after. A step whose
 /// intent is the record's last line is run again without a second intent, and its outcome closes that intent: the writer reads
-/// first, so a step that had landed sends nothing. A failed step is recorded and ends the run.
+/// first, so a step that had landed sends nothing. A move that left the instance under a new uuid has a uuid line before its
+/// outcome. A failed step is recorded and ends the run.
 fn drive(
     record: &mut AdoptionRecord,
     writer: &AdoptWriter,
@@ -391,6 +392,12 @@ fn drive(
             Ok(outcome) => {
                 if halt(step, Kill::BeforeOutcome) {
                     return Err(halted(step));
+                }
+                // A move that Incus ran as a copy left the instance under a new uuid, which the writer confirmed by the copy
+                // rule. It is recorded before the outcome, so every later step and a later run expect it.
+                let uuid = writer.uuid();
+                if record.uuid(instance).as_deref() != Some(uuid.as_str()) {
+                    record.moved(step, &uuid)?;
                 }
                 record.done(step)?;
                 if halt(step, Kill::AfterOutcome) {
@@ -434,19 +441,22 @@ pub type Probe<'a> = &'a dyn Fn(SocketAddrV4, &str, Duration) -> Result<u16, Str
 pub fn verify(
     read: &dyn IncusRead,
     plan: &AdoptionPlan,
+    uuid: &str,
     project: &str,
     port: u16,
     path: &str,
 ) -> Result<Verified, Failure> {
-    verify_with(read, plan, project, port, path, &http_probe)
+    verify_with(read, plan, uuid, project, port, path, &http_probe)
 }
 
-/// Checks that the planned instance runs in `project` with the pre-image's MAC and IPv4 on `eth0`, then that the service at
+/// Checks that the planned instance runs in `project` under `uuid`, the one the record holds last, with the pre-image's MAC
+/// and IPv4 on `eth0`, then that the service at
 /// `<ipv4>:<port>` answers a GET of `path` below 500 within [`VERIFY_TIMEOUT`]. It reads with GET alone and sends no write. A
 /// port of 0 or a path that is not plain is a usage failure; every failed check is a runtime failure that names it.
 pub fn verify_with(
     read: &dyn IncusRead,
     plan: &AdoptionPlan,
+    uuid: &str,
     project: &str,
     port: u16,
     path: &str,
@@ -467,9 +477,7 @@ pub fn verify_with(
         }
         Err(error) => return Err(read_failed(error)),
     };
-    if body["type"] != "container"
-        || body["config"]["volatile.uuid"].as_str() != Some(plan.pre_image.uuid.as_str())
-    {
+    if body["type"] != "container" || body["config"]["volatile.uuid"].as_str() != Some(uuid) {
         return Err(failed(
             "the instance is not the one the plan recorded".to_string(),
         ));
@@ -517,6 +525,7 @@ pub fn verify_with(
 pub fn verify_until(
     read: &dyn IncusRead,
     plan: &AdoptionPlan,
+    uuid: &str,
     project: &str,
     port: u16,
     path: &str,
@@ -526,7 +535,7 @@ pub fn verify_until(
 ) -> Result<Verified, Failure> {
     let deadline = Instant::now() + wait;
     loop {
-        match verify_with(read, plan, project, port, path, probe) {
+        match verify_with(read, plan, uuid, project, port, path, probe) {
             Err(Failure::Runtime(_)) if Instant::now() < deadline => {
                 thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
             }
@@ -650,9 +659,11 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
         )));
     };
     let read = UnixIncus::new(cfg.incus.socket.clone());
+    let uuid = recorded_uuid(&record, &plan);
     let verified = verify_until(
         &read,
         &plan,
+        &uuid,
         project,
         port,
         path,
@@ -700,6 +711,7 @@ fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
         "digest": plan.as_ref().map(|plan| plan.digest.clone()),
         "plan": plan,
         "last": last_json(last),
+        "uuid": record.uuid(&target.instance),
         "complete": record.complete(&target.instance),
         "released": record.released(&target.instance),
         "live": live,
@@ -713,7 +725,7 @@ fn describe(
     found: &Preflight,
     dry_run: bool,
 ) -> Result<Option<Value>, Failure> {
-    let writer = writer(cfg, target, &found.plan)?;
+    let writer = writer(cfg, target, &found.plan, &found.plan.pre_image.uuid)?;
     let requests: Vec<Value> = found
         .plan
         .steps
@@ -727,10 +739,12 @@ fn describe(
     })))
 }
 
+/// The writer of `plan`, expecting the instance under `uuid`: the pre-image's, or the one the record holds last.
 fn writer(
     cfg: &NodeConfig,
     target: &AdoptTarget,
     plan: &AdoptionPlan,
+    uuid: &str,
 ) -> Result<AdoptWriter, Failure> {
     AdoptWriter::new(
         cfg.incus.socket.clone(),
@@ -739,7 +753,21 @@ fn writer(
         plan.pre_image.clone(),
     )
     .and_then(|writer| writer.with_snapshot(&plan.snapshot))
+    .and_then(|writer| {
+        if uuid == plan.pre_image.uuid {
+            Ok(writer)
+        } else {
+            writer.with_uuid(uuid)
+        }
+    })
     .map_err(|error| refuse(error.to_string()))
+}
+
+/// The uuid the record expects the instance of `plan` to have now.
+fn recorded_uuid(record: &AdoptionRecord, plan: &AdoptionPlan) -> String {
+    record
+        .uuid(&plan.instance)
+        .unwrap_or_else(|| plan.pre_image.uuid.clone())
 }
 
 fn lock_failure(error: KernelError) -> Failure {

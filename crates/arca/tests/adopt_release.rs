@@ -231,7 +231,12 @@ fn assert_adopted(run: &Run, tag: &str) {
         .expect("the instance is in its adoption project");
     assert_eq!(body["status"], json!("Running"), "{tag}");
     assert_eq!(body["config"][MARK], json!("adopt-svc1"), "{tag}");
-    assert_eq!(body["config"]["volatile.uuid"], json!(ADOPT_UUID), "{tag}");
+    let uuid = run.record().uuid("svc1").expect("the recorded uuid");
+    assert_ne!(
+        uuid, ADOPT_UUID,
+        "{tag}: the move was a copy, under a new uuid"
+    );
+    assert_eq!(body["config"]["volatile.uuid"], json!(uuid), "{tag}");
     assert_eq!(
         body["devices"]["eth0"],
         pin(),
@@ -266,7 +271,8 @@ fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
         !config.keys().any(|key| key.starts_with("user.arcakernel.")),
         "{tag}: the instance is Foreign again: {config:?}"
     );
-    assert_eq!(body["config"]["volatile.uuid"], json!(ADOPT_UUID), "{tag}");
+    let uuid = run.record().uuid("svc1").expect("the recorded uuid");
+    assert_eq!(body["config"]["volatile.uuid"], json!(uuid), "{tag}");
     assert_eq!(configured_mac(&body), json!(ADOPT_MAC), "{tag}");
     assert_eq!(
         run.nic("default"),
@@ -863,11 +869,13 @@ fn verify_passes_for_the_pinned_mac_and_ipv4_and_an_answer_below_500() {
     let run = Run::new("verify");
     run.apply().expect("the adoption").expect("a result");
     let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
     let read = UnixIncus::new(run.fake.socket().to_path_buf());
     for code in [200, 302, 404, 499] {
         let verified = verify_with(
             &read,
             &plan,
+            &uuid,
             ADOPT_TO,
             8080,
             "/",
@@ -881,6 +889,20 @@ fn verify_passes_for_the_pinned_mac_and_ipv4_and_an_answer_below_500() {
         );
         assert_eq!(verified.http_status, code);
     }
+    // The pre-image's uuid is not the instance's any more: the move was a copy.
+    let stale = verify_with(
+        &read,
+        &plan,
+        ADOPT_UUID,
+        ADOPT_TO,
+        8080,
+        "/",
+        &probe_answering(Ok(200)),
+    );
+    assert!(
+        matches!(&stale, Err(Failure::Runtime(why)) if why.contains("recorded")),
+        "{stale:?}"
+    );
     assert!(
         run.fake.writes().len() == adoption_writes().len(),
         "verify sends no write"
@@ -892,9 +914,18 @@ fn verify_fails_on_a_changed_mac_a_changed_ipv4_a_closed_port_or_a_5xx() {
     let run = Run::new("verify-fail");
     run.apply().expect("the adoption").expect("a result");
     let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
     let read = UnixIncus::new(run.fake.socket().to_path_buf());
     let fails = |what: &str, project: &str, answer: Result<u16, String>| {
-        let result = verify_with(&read, &plan, project, 8080, "/", &probe_answering(answer));
+        let result = verify_with(
+            &read,
+            &plan,
+            &uuid,
+            project,
+            8080,
+            "/",
+            &probe_answering(answer),
+        );
         assert!(
             matches!(&result, Err(failure @ Failure::Runtime(why)) if why.contains(what) && failure.code() == 1),
             "{what}: {result:?}"
@@ -1030,20 +1061,21 @@ fn verify_refuses_a_path_or_port_that_is_not_plain_and_an_adoption_that_is_not_c
         );
     }
     let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
     let read = UnixIncus::new(run.fake.socket().to_path_buf());
     let never = |_: SocketAddrV4, _: &str, _: Duration| -> Result<u16, String> {
         panic!("no probe for a refused path")
     };
     assert!(matches!(
-        verify_with(&read, &plan, ADOPT_TO, 8080, "nope", &never),
+        verify_with(&read, &plan, &uuid, ADOPT_TO, 8080, "nope", &never),
         Err(Failure::Usage(_))
     ));
     assert!(matches!(
-        verify_with(&read, &plan, ADOPT_TO, 0, "/", &never),
+        verify_with(&read, &plan, &uuid, ADOPT_TO, 0, "/", &never),
         Err(Failure::Usage(_))
     ));
     // A stopped instance is refused before the probe.
-    let stopped = verify_with(&read, &plan, ADOPT_TO, 8080, "/", &never);
+    let stopped = verify_with(&read, &plan, &uuid, ADOPT_TO, 8080, "/", &never);
     assert!(
         matches!(&stopped, Err(Failure::Runtime(why)) if why.contains("not running")),
         "{stopped:?}"
@@ -1149,6 +1181,7 @@ fn verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out
     // The instance is still stopped when verify starts, and starts a moment later, as a service does after Start.
     let run = Run::killed("verify-wait", AdoptStep::Mark, Kill::AfterOutcome);
     let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
     let read = UnixIncus::new(run.fake.socket().to_path_buf());
     let socket = run.fake.socket().to_path_buf();
     let starter = thread::spawn(move || {
@@ -1172,6 +1205,7 @@ fn verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out
     let waited = verify_until(
         &read,
         &plan,
+        &uuid,
         ADOPT_TO,
         8080,
         "/",
@@ -1195,6 +1229,7 @@ fn verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out
     let once = verify_until(
         &read,
         &plan,
+        &uuid,
         ADOPT_TO,
         8080,
         "/",
@@ -1220,6 +1255,7 @@ fn verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out
     let late = verify_until(
         &read,
         &plan,
+        &uuid,
         ADOPT_TO,
         8080,
         "/",
@@ -1242,6 +1278,7 @@ fn verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out
     let bad = verify_until(
         &read,
         &plan,
+        &uuid,
         ADOPT_TO,
         8080,
         "nope",
@@ -1282,4 +1319,144 @@ fn verify_takes_a_wait_in_whole_seconds() {
             "{bad}: {refused:?}"
         );
     }
+}
+
+/// The record a move left when Incus ran it as a copy and the writer of that run could not confirm it: the plan, the facts,
+/// four steps done, and the move's intent and failure, twelve lines. The copy is in the adoption project under a new uuid,
+/// unmarked, and was started by hand.
+fn copied_unconfirmed(tag: &str) -> (Run, String) {
+    let run = Run::killed(tag, AdoptStep::Move, Kill::AfterIntent);
+    let path = "/1.0/instances/svc1?project=default";
+    let moved = json!({ "name": "svc1", "project": ADOPT_TO });
+    assert_eq!(run.raw("POST", path, &moved), 202, "{tag}: the copy lands");
+    let mut record = run.record();
+    record
+        .failed(
+            AdoptStep::Move,
+            "the write landed, but its read-back is not confirmed: the instance does not read back in its new project",
+        )
+        .expect("the failure line");
+    let text = fs::read_to_string(run.record_path()).expect("the record");
+    assert_eq!(text.lines().count(), 12, "{tag}: {text}");
+    let start = json!({ "action": "start" });
+    let state = format!("/1.0/instances/svc1/state?project={ADOPT_TO}");
+    assert_eq!(
+        run.raw("PUT", &state, &start),
+        202,
+        "{tag}: started by hand"
+    );
+    let body = run.instance(ADOPT_TO).expect("the copy");
+    assert_eq!(body["status"], json!("Running"));
+    assert!(body["config"].get(MARK).is_none(), "{tag}: unmarked");
+    let copy = body["config"]["volatile.uuid"]
+        .as_str()
+        .expect("a uuid")
+        .to_string();
+    assert_ne!(copy, ADOPT_UUID, "{tag}: the copy has a new uuid");
+    (run, copy)
+}
+
+#[test]
+fn a_resume_of_a_move_incus_ran_as_a_copy_records_the_new_uuid_marks_it_and_sends_no_second_move() {
+    let (run, copy) = copied_unconfirmed("copy-resume");
+    assert_eq!(
+        run.record().last("svc1"),
+        Some((AdoptStep::Move, Phase::Failed))
+    );
+    assert_eq!(run.record().uuid("svc1").as_deref(), Some(ADOPT_UUID));
+    let before = run.writes().len();
+    let from = run.fake.requests().len();
+    let resumed = run.apply().expect("the resume").expect("a result");
+    assert_eq!(resumed["resumed"], json!(true));
+    assert_eq!(
+        run.writes()[before..],
+        [(
+            "PATCH".to_string(),
+            format!("/1.0/instances/svc1?project={ADOPT_TO}")
+        )],
+        "Mark alone: the move is not sent again and the running copy is not started again"
+    );
+    let outcomes: Vec<(Value, Value)> = resumed["steps"]
+        .as_array()
+        .expect("the steps")
+        .iter()
+        .map(|step| (step["step"].clone(), step["outcome"].clone()))
+        .collect();
+    assert_eq!(
+        outcomes,
+        [
+            (json!("move"), json!("alreadyDone")),
+            (json!("mark"), json!("sent")),
+            (json!("start"), json!("alreadyDone")),
+        ]
+    );
+    assert!(preflight_reads(&run, from).is_empty(), "no fresh preflight");
+    assert_eq!(run.record().uuid("svc1"), Some(copy.clone()));
+    let text = fs::read_to_string(run.record_path()).expect("the record");
+    let kinds: Vec<Value> = text
+        .lines()
+        .skip(12)
+        .map(|line| {
+            let line: Value = serde_json::from_str(line).expect("a line");
+            json!([line["kind"], line["step"], line["phase"]])
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            json!(["step", "move", "intent"]),
+            json!(["uuid", "move", null]),
+            json!(["step", "move", "done"]),
+            json!(["step", "mark", "intent"]),
+            json!(["step", "mark", "done"]),
+            json!(["step", "start", "intent"]),
+            json!(["step", "start", "done"]),
+        ],
+        "the new uuid is recorded before the move's outcome"
+    );
+    assert_adopted(&run, "copy-resume");
+    assert_writes_in_table(&run, "copy-resume");
+
+    // verify, the watch's view and the release all follow the recorded uuid. MoveBack is a copy too, and its uuid is recorded.
+    let plan = run.record().plan("svc1").expect("the plan");
+    let read = UnixIncus::new(run.fake.socket().to_path_buf());
+    verify_with(
+        &read,
+        &plan,
+        &copy,
+        ADOPT_TO,
+        8080,
+        "/",
+        &probe_answering(Ok(200)),
+    )
+    .expect("verified under the recorded uuid");
+    let status = adopt_run(&run.config, &["status", "--instance", "svc1", "--json"])
+        .expect("the status")
+        .expect("a result");
+    assert_eq!(status["uuid"], json!(copy));
+    run.release().expect("the release").expect("a result");
+    assert_released(&run, "copy-resume", true, true);
+    let back = run.record().uuid("svc1").expect("the uuid");
+    assert_ne!(back, copy, "the move back was a copy too");
+}
+
+#[test]
+fn a_resume_of_an_unconfirmed_copy_whose_pin_differs_is_refused_with_no_write() {
+    let (run, _copy) = copied_unconfirmed("copy-unpinned");
+    let path = format!("/1.0/instances/svc1?project={ADOPT_TO}");
+    let unpinned =
+        json!({ "devices": { "eth0": { "type": "nic", "name": "eth0", "network": "br1" } } });
+    assert_eq!(run.raw("PATCH", &path, &unpinned), 200);
+    let before = run.writes().len();
+    let resumed = run.apply();
+    assert!(
+        matches!(&resumed, Err(Failure::Runtime(why)) if why.contains("Move") && why.contains("pin")),
+        "{resumed:?}"
+    );
+    assert_eq!(run.writes().len(), before, "no write");
+    assert_eq!(run.record().uuid("svc1").as_deref(), Some(ADOPT_UUID));
+    assert_eq!(
+        run.record().last("svc1"),
+        Some((AdoptStep::Move, Phase::Failed))
+    );
 }

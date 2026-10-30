@@ -1,7 +1,7 @@
 #![cfg(feature = "write")]
 //! The adoption writer's step table, step by step, against the fake Incus. The fake models the stop, the start, snapshots, the
-//! cross-project move, the DHCP lease table and Incus's `deviceVolatileReset`. Every refusal is checked twice: the writer
-//! returns `IncusError::Refused`, and the fake records no write.
+//! cross-project move (a copy under a new uuid, as Incus 7.5 runs it), the DHCP lease table and Incus's `deviceVolatileReset`.
+//! Every refusal is checked twice: the writer returns `IncusError::Refused`, and the fake records no write.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -278,11 +278,9 @@ fn an_adoption_keeps_the_mac_and_ip_and_each_step_sends_only_its_own_request_onc
     let after = instance_in(&fake, TO).expect("the instance is in its adoption project");
     assert_eq!(after["status"], json!("Running"));
     assert_eq!(after["config"][MARK], json!("adopt-svc1"));
-    assert_eq!(
-        after["config"]["volatile.uuid"],
-        json!(UUID),
-        "the uuid survived the move"
-    );
+    let copied = after["config"]["volatile.uuid"].as_str().expect("a uuid");
+    assert_ne!(copied, UUID, "the move is a copy, under a new uuid");
+    assert_eq!(writer.uuid(), copied, "the writer follows the copy");
     let kept = |body: &Value| -> BTreeMap<String, Value> {
         body["config"]
             .as_object()
@@ -409,10 +407,10 @@ fn a_move_without_the_pin_clears_the_mac_the_instance_depends_on() {
         "the move cleared the MAC: {}",
         moved["config"]
     );
-    assert_eq!(
+    assert_ne!(
         moved["config"]["volatile.uuid"],
         json!(UUID),
-        "the uuid stays"
+        "a stopped project move is a copy, under a new uuid"
     );
 }
 
@@ -744,4 +742,158 @@ fn a_restricted_project_refuses_a_moved_in_nic_its_grant_does_not_list() {
         instance_in(&fake, "default").is_some(),
         "the instance stayed in default"
     );
+}
+
+/// The step's refusal names `needle`.
+fn refused_naming(result: Result<StepOutcome, IncusError>, needle: &str) {
+    assert!(
+        matches!(&result, Err(IncusError::Refused(why)) if why.contains(needle)),
+        "{needle}: {result:?}"
+    );
+}
+
+/// Runs `steps` on a writer of the recorded pre-image, as a run that then stops would.
+fn ran(fake: &FakeIncus, steps: &[AdoptStep]) {
+    let writer = writer(fake);
+    for step in steps {
+        let _ = writer.run(*step);
+    }
+}
+
+const TO_MOVE: [AdoptStep; 5] = [
+    AdoptStep::CreateProject,
+    AdoptStep::Stop,
+    AdoptStep::Snapshot,
+    AdoptStep::PinNic,
+    AdoptStep::Move,
+];
+
+#[test]
+fn a_move_that_copies_the_instance_under_a_new_uuid_is_confirmed_and_the_new_uuid_is_followed() {
+    let (_dir, fake) = start("copy");
+    let writer = writer(&fake);
+    for step in &TO_MOVE[..4] {
+        writer.run(*step).expect("the step runs");
+    }
+    assert_eq!(writer.uuid(), UUID);
+    assert_eq!(writer.run(AdoptStep::Move), Ok(StepOutcome::Sent));
+    let copy = instance_in(&fake, TO).expect("the copy is in its adoption project");
+    let new = copy["config"]["volatile.uuid"]
+        .as_str()
+        .expect("a uuid")
+        .to_string();
+    assert_ne!(new, UUID, "the fake copies under a new uuid, as Incus does");
+    assert_eq!(writer.uuid(), new, "the writer follows the copy");
+
+    // A writer that resumes without the new uuid, from a record whose Move has no outcome, finds the move done by the same
+    // rule and sends nothing; one given the new uuid goes on.
+    let sent = fake.writes().len();
+    let resumed = self::writer(&fake);
+    assert_eq!(resumed.run(AdoptStep::Move), Ok(StepOutcome::AlreadyDone));
+    assert_eq!(resumed.uuid(), new);
+    assert_eq!(fake.writes().len(), sent, "the move was not sent again");
+    let later = self::writer(&fake).with_uuid(&new).expect("a plain uuid");
+    assert_eq!(later.run(AdoptStep::Mark), Ok(StepOutcome::Sent));
+    assert_eq!(later.run(AdoptStep::Start), Ok(StepOutcome::Sent));
+
+    // The release's MoveBack is a copy too, which the writer follows the same way.
+    for step in AdoptStep::RELEASE {
+        assert_eq!(later.run(step), Ok(StepOutcome::Sent), "{step:?}");
+    }
+    let back = instance_in(&fake, "default").expect("back in default");
+    let newer = back["config"]["volatile.uuid"].as_str().expect("a uuid");
+    assert_ne!(newer, new);
+    assert_eq!(later.uuid(), newer);
+    assert_eq!(back["status"], json!("Running"));
+    assert!(self::writer(&fake).with_uuid("not a uuid!").is_err());
+}
+
+#[test]
+fn a_copy_under_a_new_uuid_is_refused_when_the_snapshot_is_missing_or_the_pin_differs() {
+    // A Move sent without the snapshot lands, but its copy is not confirmed, and a resume refuses it with no write.
+    let (_dir, fake) = start("copy-no-snapshot");
+    let writer = writer(&fake);
+    for step in [AdoptStep::CreateProject, AdoptStep::Stop, AdoptStep::PinNic] {
+        writer.run(step).expect("the step runs");
+    }
+    assert!(
+        matches!(
+            writer.run(AdoptStep::Move),
+            Err(IncusError::AppliedUnconfirmed(_))
+        ),
+        "the move landed, unconfirmed"
+    );
+    let before = fake.writes().len();
+    refused_naming(self::writer(&fake).run(AdoptStep::Move), "snapshot");
+    refused_naming(self::writer(&fake).run(AdoptStep::MoveBack), "snapshot");
+    assert_eq!(fake.writes().len(), before);
+
+    // A copy whose eth0 is not the pin.
+    let (_dir, fake) = start("copy-unpinned");
+    ran(&fake, &TO_MOVE);
+    let (status, _) = raw(
+        &fake,
+        "PATCH",
+        &format!("/1.0/instances/svc1?project={TO}"),
+        &json!({ "devices": { "eth0": { "type": "nic", "name": "eth0", "network": "br1" } } }),
+    );
+    assert_eq!(status, 200);
+    let before = fake.writes().len();
+    refused_naming(self::writer(&fake).run(AdoptStep::Move), "pin");
+    refused_naming(self::writer(&fake).run(AdoptStep::Mark), "recorded");
+    assert_eq!(fake.writes().len(), before);
+}
+
+#[test]
+fn a_copy_under_a_new_uuid_is_refused_while_the_old_uuid_is_in_default_or_two_of_the_name_are_in_to()
+ {
+    // An instance in default that still carries the old uuid.
+    let (_dir, fake) = start("copy-old-uuid");
+    ran(&fake, &TO_MOVE);
+    let other = json!({ "name": "svc9", "type": "container", "config": {} });
+    let (status, _) = raw(&fake, "POST", "/1.0/instances?project=default", &other);
+    assert_eq!(status, 202);
+    let old = json!({ "config": { "volatile.uuid": UUID } });
+    let (status, _) = raw(&fake, "PATCH", "/1.0/instances/svc9?project=default", &old);
+    assert_eq!(status, 200);
+    let before = fake.writes().len();
+    refused_naming(self::writer(&fake).run(AdoptStep::Move), "default");
+    assert_eq!(fake.writes().len(), before);
+
+    // Two instances of the name in the adoption project.
+    let dir = Scratch::new("copy-two");
+    let pinned = json!({ "type": "nic", "name": "eth0", "network": "br1", "hwaddr": MAC, "ipv4.address": IP });
+    let copy = |uuid: &str| {
+        json!({
+            "name": "svc1", "project": TO, "type": "container", "status": "Stopped",
+            "created_at": "2026-01-01T00:00:00Z", "profiles": ["default"],
+            "config": { "volatile.uuid": uuid, "image.os": "debian" },
+            "devices": { "eth0": pinned, "root": { "type": "disk", "path": "/", "pool": "pool1", "size": "60GiB" } },
+        })
+    };
+    let mut two = state(copy("00000000-0000-4000-8000-0000000000b1"));
+    two.instances
+        .push(copy("00000000-0000-4000-8000-0000000000b2"));
+    let mut project = adoption_project_body(&target(), &["br1".to_string()]);
+    project["description"] = json!("");
+    two.projects.push(project);
+    let fake = FakeIncus::start(&dir.0, two).expect("start the fake");
+    let (status, _) = raw(
+        &fake,
+        "POST",
+        &format!("/1.0/instances/svc1/snapshots?project={TO}"),
+        &json!({ "name": SNAPSHOT, "stateful": false }),
+    );
+    assert_eq!(status, 202);
+    let listed = read(&fake, "/1.0/instances?all-projects=true&recursion=1").expect("the listing");
+    let named = listed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter(|row| row["project"] == TO && row["name"] == "svc1")
+        .count();
+    assert_eq!(named, 2, "the fixture holds two of the name");
+    let before = fake.writes().len();
+    refused_naming(writer(&fake).run(AdoptStep::Move), "more than one");
+    assert_eq!(fake.writes().len(), before);
 }
