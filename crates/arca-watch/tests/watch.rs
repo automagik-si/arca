@@ -85,6 +85,7 @@ fn run(rows: Value, cfg: &WatchConfig) -> WatchReport {
 fn default_cfg() -> WatchConfig {
     WatchConfig {
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     }
 }
@@ -159,6 +160,7 @@ fn privileged_comes_from_the_expanded_config_and_identity_from_the_phone_names()
     let cfg = WatchConfig {
         identity_phones: ["phone1".to_string()].into_iter().collect(),
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = run(fixture_listing(), &cfg);
@@ -192,6 +194,7 @@ fn a_live_kernel_entry_with_its_object_gives_no_drift() {
     let cfg = WatchConfig {
         live_entries: [entry("toy")].into_iter().collect(),
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = run(fixture_listing(), &cfg);
@@ -218,6 +221,7 @@ fn a_live_entry_with_no_object_is_entry_without_object() {
     let cfg = WatchConfig {
         live_entries: [entry("ghost")].into_iter().collect(),
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = run(fixture_listing(), &cfg);
@@ -241,6 +245,7 @@ fn a_retained_entry_is_owned_and_not_drift() {
         .into_iter()
         .collect(),
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = run(fixture_listing(), &cfg);
@@ -321,6 +326,7 @@ fn ownership_is_classed_from_own_config_and_a_profile_cannot_supply_a_mark() {
     let cfg = WatchConfig {
         live_entries: [entry("toy")].into_iter().collect(),
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = run(rows, &cfg);
@@ -419,6 +425,7 @@ fn config_hash_ignores_volatile_keys_and_expanded_config_but_not_own_keys() {
 fn the_watch_covers_only_the_projects_it_is_given() {
     let cfg = WatchConfig {
         projects: ["droid".to_string()].into_iter().collect(),
+        complete: false,
         ..WatchConfig::default()
     };
     let report = run(fixture_listing(), &cfg);
@@ -483,6 +490,7 @@ fn the_report_conforms_to_the_watch_report_schema() {
         identity_phones: ["phone1".to_string()].into_iter().collect(),
         live_entries: [entry("toy")].into_iter().collect(),
         projects: all_projects(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = run(fixture_listing(), &cfg);
@@ -541,6 +549,127 @@ fn a_listing_that_is_not_a_list_fails_the_watch() {
     let mut host = Listing::of(json!({ "not": "a list" }));
     assert!(matches!(
         watch_once(&mut host, &default_cfg(), 1),
+        Err(PluginError::Failed(_))
+    ));
+}
+
+#[test]
+fn a_scoped_watch_reports_no_entry_without_object_for_an_object_it_does_not_cover() {
+    // toy's objects are in svc, which this scoped watch leaves out. The watch cannot see them, so it must not say toy or ghost
+    // has no object.
+    let cfg = WatchConfig {
+        live_entries: [entry("toy"), entry("ghost")].into_iter().collect(),
+        projects: ["droid".to_string()].into_iter().collect(),
+        complete: false,
+        ..WatchConfig::default()
+    };
+    let report = run(fixture_listing(), &cfg);
+    assert!(
+        !report
+            .drift
+            .iter()
+            .any(|d| matches!(d, Drift::EntryWithoutObject { .. })),
+        "a scoped watch reports no entry without object: {:?}",
+        report.drift
+    );
+}
+
+#[test]
+fn a_complete_watch_reports_entry_without_object_only_for_an_entry_with_no_object() {
+    let cfg = WatchConfig {
+        live_entries: [entry("toy"), entry("ghost")].into_iter().collect(),
+        projects: all_projects(),
+        complete: true,
+        ..WatchConfig::default()
+    };
+    let report = run(fixture_listing(), &cfg);
+    assert_eq!(
+        report.drift,
+        vec![Drift::EntryWithoutObject {
+            entry: entry("ghost")
+        }],
+        "toy has objects and ghost has none: {:?}",
+        report.drift
+    );
+}
+
+#[test]
+fn a_contested_object_alone_does_not_satisfy_a_live_entry() {
+    // x1 carries droidd's lease mark and toy's kernel mark, so it is contested. No other object carries toy's mark.
+    let rows = json!([instance(
+        "svc",
+        "x1",
+        json!({ "user.droid.lease": "1", "user.arcakernel.entry": "toy" }),
+        json!({ "user.droid.lease": "1", "user.arcakernel.entry": "toy" }),
+    )]);
+    let cfg = WatchConfig {
+        live_entries: [entry("toy")].into_iter().collect(),
+        projects: all_projects(),
+        complete: true,
+        ..WatchConfig::default()
+    };
+    let report = run(rows, &cfg);
+    assert_eq!(find(&report, "svc", "x1").owner, OwnerClass::Contested);
+    assert_eq!(
+        report.drift,
+        vec![Drift::EntryWithoutObject {
+            entry: entry("toy")
+        }],
+        "a contested object does not hold toy: {:?}",
+        report.drift
+    );
+}
+
+#[test]
+fn a_malformed_row_outside_the_scope_does_not_fail_a_scoped_watch() {
+    // svc's row names a type the watch does not classify. The watch covers only droid, so that row is never read.
+    let rows = json!([
+        instance(
+            "droid",
+            "phone1",
+            json!({ "user.droid.lease": "1" }),
+            json!({ "user.droid.lease": "1" }),
+        ),
+        {
+            "name": "u1",
+            "project": "svc",
+            "type": "lxc-weird",
+            "status": "Running",
+            "config": {},
+            "expanded_config": {},
+        },
+    ]);
+    let cfg = WatchConfig {
+        projects: ["droid".to_string()].into_iter().collect(),
+        complete: false,
+        ..WatchConfig::default()
+    };
+    let report = run(rows, &cfg);
+    let names: Vec<String> = every_row(&report)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    assert_eq!(names, vec!["phone1".to_string()]);
+}
+
+#[test]
+fn a_row_that_names_no_project_fails_even_a_scoped_watch() {
+    // Without a project a row cannot be placed in or out of the scope, so the watch refuses it.
+    let rows = json!([{
+        "name": "n1",
+        "type": "container",
+        "status": "Running",
+        "config": {},
+        "expanded_config": {},
+    }]);
+    let cfg = WatchConfig {
+        projects: ["droid".to_string()].into_iter().collect(),
+        complete: false,
+        ..WatchConfig::default()
+    };
+    let mut host = Listing::of(rows);
+    assert!(matches!(
+        watch_once(&mut host, &cfg, 1),
         Err(PluginError::Failed(_))
     ));
 }

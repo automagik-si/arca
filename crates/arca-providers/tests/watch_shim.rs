@@ -109,6 +109,7 @@ fn a_watch_through_the_shim_classes_the_fixture_and_the_shim_refuses_nothing() {
     let cfg = WatchConfig {
         identity_phones: ["phone1".to_string()].into_iter().collect(),
         projects: fixture_projects().into_iter().collect(),
+        complete: true,
         ..WatchConfig::default()
     };
     let report = watch_once(&mut provider, &cfg, 1_000).expect("the watch runs through the shim");
@@ -208,6 +209,7 @@ fn a_watch_scoped_to_one_project_reads_only_that_project_through_the_shim() {
     let mut provider = host(&rig);
     let cfg = WatchConfig {
         projects: ["droid".to_string()].into_iter().collect(),
+        complete: false,
         ..WatchConfig::default()
     };
     let report = watch_once(&mut provider, &cfg, 1).expect("the scoped watch runs");

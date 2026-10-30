@@ -1,6 +1,7 @@
 //! Arca's read-only Incus provider. It serves plugins that observe and never write: it answers the one listing a watch reads,
-//! scoped to the projects the calling manifest names, and it refuses every plan and every effect with `WatchOnly`. It holds
-//! an [`IncusRead`], whose only method is GET, so no path through this type can send a write.
+//! with every row a plugin sees scoped to the projects the calling manifest names. The listing itself is all-projects, and the
+//! provider filters its rows. It refuses every plan and every effect with `WatchOnly`. It holds an [`IncusRead`], whose only
+//! method is GET, so no path through this type can send a write.
 
 use arca_incus::{IncusError, IncusRead};
 use arca_kernel::desired::EntryId;
