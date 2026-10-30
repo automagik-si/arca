@@ -3,6 +3,8 @@
 //! test reads a host's owner file. No test prints a token or an approval.
 
 mod common;
+#[path = "../../arca-approval/tests/common/webauthn.rs"]
+mod webauthn;
 
 use std::fs;
 use std::io::Read;
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 use arca_kernel::canon::{Digest, canonical_json, params_digest};
 use common::*;
 use serde_json::{Value, json};
+use webauthn::SoftPasskey;
 
 const WAIT: Duration = Duration::from_secs(15);
 /// A scratch project name for the served kernel. The node takes its owner signers from the test injection only when every
@@ -83,6 +86,12 @@ fn start_node(tag: &str) -> Node {
 
 /// A served node whose owner signers file holds exactly `signers`.
 fn start_node_with(tag: &str, signers: &str) -> Node {
+    start_node_keys(tag, signers, None)
+}
+
+/// A served node whose owner signers file holds exactly `signers`, and whose test passkeys file, when `passkeys` names one,
+/// holds exactly that text at mode `0600`.
+fn start_node_keys(tag: &str, signers: &str, passkeys: Option<&str>) -> Node {
     let scratch = Scratch::new(tag);
     let fake = start_fake(&scratch);
     let owner = SkKey::from_seed(1);
@@ -116,14 +125,19 @@ fn start_node_with(tag: &str, signers: &str) -> Node {
     });
     write_mode(&config, &value.to_string(), 0o600);
 
-    let serve = arca()
+    let mut command = arca();
+    command
         .args(["serve", "--config"])
         .arg(&config)
         .env("ARCA_TEST_OWNER_SIGNERS", &signers_path)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start arca serve");
+        .stderr(Stdio::piped());
+    if let Some(text) = passkeys {
+        let passkeys_path = scratch.path("owner-passkeys");
+        write_mode(&passkeys_path, text, 0o600);
+        command.env("ARCA_TEST_OWNER_PASSKEYS", &passkeys_path);
+    }
+    let serve = command.spawn().expect("start arca serve");
     let mut node = Node {
         scratch,
         serve,
@@ -209,9 +223,108 @@ fn the_server_logs_the_count_of_the_keys_it_trusts_after_it_drops_the_other_line
     let mut node = start_node_with("serve-count", &text);
     let served = node.stop();
     assert!(
-        served.contains("arca: 1 owner signing key(s) kept"),
+        served.contains("arca: 1 owner signing key(s), 0 passkey(s) kept"),
         "the count is the one the verifier keeps: {served}"
     );
+}
+
+#[test]
+fn the_server_logs_the_count_of_the_passkeys_it_keeps_and_never_a_key() {
+    let owner = SkKey::from_seed(1);
+    let (kept, other) = (SoftPasskey::from_seed(1), SoftPasskey::from_seed(2));
+    let passkeys = format!(
+        "# the owner's passkeys\n{}\n{}\n",
+        kept.line(NAMESPACE),
+        other.line("arca-approve"),
+    );
+    let signers = format!("{}\n", owner.line(NAMESPACE));
+    let mut node = start_node_keys("serve-passkeys", &signers, Some(&passkeys));
+    let served = node.stop();
+    assert!(
+        served.contains("arca: 1 owner signing key(s), 1 passkey(s) kept"),
+        "only the Arca passkey is kept: {served}"
+    );
+    for key in [&kept, &other] {
+        assert!(!served.contains(&key.cred_text()) && !served.contains(&key.key_text()));
+    }
+}
+
+#[test]
+fn a_malformed_passkeys_file_refuses_passkeys_by_line_number_and_the_server_still_serves() {
+    let key = SoftPasskey::from_seed(1);
+    let passkeys = format!(
+        "{}\nnot a passkey line {}\n",
+        key.line(NAMESPACE),
+        key.cred_text()
+    );
+    let signers = format!("{}\n", SkKey::from_seed(1).line(NAMESPACE));
+    let mut node = start_node_keys("serve-passkeys-bad", &signers, Some(&passkeys));
+    let out = call(&node, &node.viewer, "arca_status", &[]);
+    assert_eq!(code(&out), 0, "the server serves");
+    let served = node.stop();
+    assert!(
+        served.contains("arca: 1 owner signing key(s), 0 passkey(s) kept"),
+        "the SSH key is kept and no passkey: {served}"
+    );
+    assert!(
+        served.contains("every passkey approval is refused") && served.contains("line 2 "),
+        "the refusal names the line: {served}"
+    );
+    assert!(!served.contains(&key.cred_text()) && !served.contains(&key.key_text()));
+}
+
+#[test]
+fn a_test_passkeys_file_outside_a_scratch_kernel_refuses_start_with_exit_2() {
+    let scratch = Scratch::new("serve-passkeys-prod");
+    let state = scratch.path("state");
+    fs::create_dir(&state).expect("the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    let hash_dir = scratch.path("tokens");
+    fs::create_dir(&hash_dir).expect("the token directory");
+    fs::set_permissions(&hash_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    let passkeys = scratch.path("owner-passkeys");
+    write_mode(&passkeys, "", 0o600);
+    // A scratch kernel with a project outside the prefix is refused by the config itself, before the injection is read.
+    for (tag, scratch_kernel, projects) in [
+        ("not-scratch", false, json!([])),
+        ("not-scratch-prefixed", false, json!([CALL_PROJECT])),
+        ("no-projects", true, json!([])),
+    ] {
+        let config = scratch.path(&format!("node-{tag}.json"));
+        let value = json!({
+            "stateDir": state.display().to_string(),
+            "approvalHost": HOST,
+            "incus": { "socket": scratch.path("no-incus.sock").display().to_string(), "pools": [] },
+            "identityPhones": [],
+            "listen": { "unix": scratch.path(&format!("{tag}.sock")).display().to_string(), "tailnet": null },
+            "tokens": { "hashDir": hash_dir.display().to_string() },
+            "kernel": {
+                "projects": projects,
+                "scratch": scratch_kernel,
+                "droiddProjects": ["droid"],
+                "reservedCidrs": []
+            }
+        });
+        write_mode(&config, &value.to_string(), 0o600);
+        // No signers file is injected, so the refusal is the passkeys injection's alone.
+        let out = arca()
+            .args(["serve", "--config"])
+            .arg(&config)
+            .env("ARCA_TEST_OWNER_PASSKEYS", &passkeys)
+            .output()
+            .expect("run arca serve");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{tag}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("passkeys"),
+            "{tag}: the refusal names the passkeys injection: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -390,7 +503,7 @@ fn an_approval_for_no_waiting_plan_is_spent_once_then_refused_replayed_and_never
     }
     let served = node.stop();
     assert!(
-        served.contains("owner signing key(s) kept"),
+        served.contains("owner signing key(s), 0 passkey(s) kept"),
         "the server's stderr is read: {served}"
     );
     assert!(

@@ -9,13 +9,14 @@ description = "Arca's owner approvals: the signed statement, its canonical form,
 [dependencies]
 arca-kernel.workspace = true
 base64.workspace = true
+p256.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 ssh-key.workspace = true
 
 [dev-dependencies]
-# The tests build software sk-ssh-ed25519 signatures.
+# The tests build software sk-ssh-ed25519 signatures. Their P-256 passkey assertions use the P-256 dependency above.
 ed25519-dalek.workspace = true
-sha2.workspace = true
 
 [lints]
 workspace = true

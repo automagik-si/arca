@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use arca_approval::{ApprovalRefusal, ApprovalVerifier, ArcaAction, FileNonces, SshSigVerifier};
+use arca_approval::{ApprovalRefusal, ApprovalVerifier, ArcaAction, FileNonces, OwnerKeys};
 use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::DesiredStateGate;
@@ -25,7 +25,7 @@ pub struct Kernel {
     store: DesiredStore,
     reconciler: Reconciler<FileJournal>,
     retained: RetainedSet,
-    verifier: ApprovalVerifier<SshSigVerifier, FileNonces>,
+    verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
     host: String,
 }
 
@@ -38,7 +38,7 @@ impl Kernel {
         state_dir: &Path,
         key: NodeKey,
         plugins: PluginSet,
-        verifier: ApprovalVerifier<SshSigVerifier, FileNonces>,
+        verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
         host: String,
         provider: impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError>,
         now_ms: u64,

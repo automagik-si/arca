@@ -21,7 +21,7 @@ pub const SCRATCH_PREFIX: &str = "arcak-scratch-";
 /// production kernel.
 pub const TEST_INJECTION_BUILT: bool = cfg!(debug_assertions);
 
-/// The largest signers file that is read, in bytes.
+/// The largest owner trust file (the signers file, the passkeys file) that is read, in bytes.
 const SIGNERS_MAX_BYTES: u64 = 64 * 1024;
 /// The principal the owner's key lines name, as the owner's template does.
 const PRINCIPAL: &str = "owner";
@@ -30,7 +30,7 @@ const HARDWARE_KEY_TYPE: &str = "sk-ssh-ed25519@openssh.com";
 /// The group- and other-write bits. A file or directory with either set is not trusted.
 const WRITABLE_BY_OTHERS: u32 = 0o022;
 
-/// Who must own the signers file and each directory above it.
+/// Who must own an owner trust file (the signers file, the passkeys file) and each directory above it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustRoot {
     /// Root (uid 0) owns the file and every directory above it, up to `/`.
@@ -60,13 +60,25 @@ pub fn signers_trust(
     projects: &[String],
     test_signers: Option<PathBuf>,
 ) -> Result<(PathBuf, TrustRoot), ApprovalRefusal> {
-    let Some(path) = test_signers else {
-        return Ok((PathBuf::from(OWNER_SIGNERS), TrustRoot::Root));
+    trust_for("signers", OWNER_SIGNERS, scratch, projects, test_signers)
+}
+
+/// The owner trust file named `what` (`signers`, `passkeys`) to read, and the trust it must carry: `production`, root-owned,
+/// unless `test` names the scratch-only injection, under the rules [`signers_trust`] states.
+pub(crate) fn trust_for(
+    what: &str,
+    production: &str,
+    scratch: bool,
+    projects: &[String],
+    test: Option<PathBuf>,
+) -> Result<(PathBuf, TrustRoot), ApprovalRefusal> {
+    let Some(path) = test else {
+        return Ok((PathBuf::from(production), TrustRoot::Root));
     };
     if !TEST_INJECTION_BUILT {
-        return Err(untrusted(
-            "a test signers file is named, and this build does not honour one".to_string(),
-        ));
+        return Err(untrusted(format!(
+            "a test {what} file is named, and this build does not honour one"
+        )));
     }
     let scratch_only = scratch
         && !projects.is_empty()
@@ -75,18 +87,18 @@ pub fn signers_trust(
             .all(|p| p.len() > SCRATCH_PREFIX.len() && p.starts_with(SCRATCH_PREFIX));
     if !scratch_only {
         return Err(untrusted(format!(
-            "a test signers file is named, and the kernel is not a scratch kernel whose every project starts with {SCRATCH_PREFIX}"
+            "a test {what} file is named, and the kernel is not a scratch kernel whose every project starts with {SCRATCH_PREFIX}"
         )));
     }
     if !path.is_absolute() {
-        return Err(untrusted(
-            "the test signers file is not an absolute path".to_string(),
-        ));
+        return Err(untrusted(format!(
+            "the test {what} file is not an absolute path"
+        )));
     }
     let Some(up_to) = path.parent() else {
-        return Err(untrusted(
-            "the test signers file has no directory above it".to_string(),
-        ));
+        return Err(untrusted(format!(
+            "the test {what} file has no directory above it"
+        )));
     };
     Ok((
         path.clone(),
@@ -103,7 +115,7 @@ pub fn signers_trust(
 /// owner's template shape (another namespace, another key type) is skipped. A line that is not of that shape refuses the
 /// whole file, so the file never means more than its lines say.
 pub fn load_signers(path: &Path, trust: &TrustRoot) -> Result<Vec<SignerLine>, ApprovalRefusal> {
-    let bytes = read_trusted(path, trust)?;
+    let bytes = read_trusted(path, trust, "signers")?;
     parse_signers(&bytes)
 }
 
@@ -119,7 +131,7 @@ pub fn effective_uid() -> Result<u32, ApprovalRefusal> {
         .ok_or_else(unreadable)
 }
 
-fn untrusted(why: String) -> ApprovalRefusal {
+pub(crate) fn untrusted(why: String) -> ApprovalRefusal {
     ApprovalRefusal::Untrusted(why)
 }
 
@@ -131,66 +143,70 @@ fn trust_parts(trust: &TrustRoot) -> (u32, Option<&Path>) {
     }
 }
 
-/// The file's bytes, read only when the file and every directory above it carry `trust`: one that is not a symbolic link,
-/// owned by the trusted uid, and not group- or other-writable.
-fn read_trusted(path: &Path, trust: &TrustRoot) -> Result<Vec<u8>, ApprovalRefusal> {
+/// The bytes of the owner trust file named `what` (`signers`, `passkeys`), read only when the file and every directory
+/// above it carry `trust`: one that is not a symbolic link, owned by the trusted uid, and not group- or other-writable.
+pub(crate) fn read_trusted(
+    path: &Path,
+    trust: &TrustRoot,
+    what: &str,
+) -> Result<Vec<u8>, ApprovalRefusal> {
     let (uid, up_to) = trust_parts(trust);
     if !path.is_absolute() {
-        return Err(untrusted("the signers path is not absolute".to_string()));
+        return Err(untrusted(format!("the {what} path is not absolute")));
     }
     // The directories checked are the path's own ancestors, so a `.` or `..` would let the walk and the open disagree.
     if path
         .components()
         .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
     {
-        return Err(untrusted(
-            "the signers path has a `.` or `..` component".to_string(),
-        ));
+        return Err(untrusted(format!(
+            "the {what} path has a `.` or `..` component"
+        )));
     }
-    check_directories(path, uid, up_to)?;
+    check_directories(path, uid, up_to, what)?;
 
     let before = fs::symlink_metadata(path).map_err(|e| {
         untrusted(format!(
-            "the signers file {} cannot be read ({})",
+            "the {what} file {} cannot be read ({})",
             path.display(),
             e.kind()
         ))
     })?;
     if before.file_type().is_symlink() {
         return Err(untrusted(format!(
-            "the signers file {} is a symbolic link",
+            "the {what} file {} is a symbolic link",
             path.display()
         )));
     }
     if !before.is_file() {
         return Err(untrusted(format!(
-            "the signers file {} is not a regular file",
+            "the {what} file {} is not a regular file",
             path.display()
         )));
     }
-    check_file(&before, uid, path)?;
+    check_file(&before, uid, path, what)?;
 
     let mut file = File::open(path).map_err(|e| {
         untrusted(format!(
-            "the signers file {} cannot be opened ({})",
+            "the {what} file {} cannot be opened ({})",
             path.display(),
             e.kind()
         ))
     })?;
     let opened = file.metadata().map_err(|e| {
         untrusted(format!(
-            "the signers file {} cannot be inspected ({})",
+            "the {what} file {} cannot be inspected ({})",
             path.display(),
             e.kind()
         ))
     })?;
     if (opened.dev(), opened.ino()) != (before.dev(), before.ino()) {
         return Err(untrusted(format!(
-            "the signers file {} changed while it was opened",
+            "the {what} file {} changed while it was opened",
             path.display()
         )));
     }
-    check_file(&opened, uid, path)?;
+    check_file(&opened, uid, path, what)?;
 
     let mut bytes = Vec::new();
     (&mut file)
@@ -198,14 +214,14 @@ fn read_trusted(path: &Path, trust: &TrustRoot) -> Result<Vec<u8>, ApprovalRefus
         .read_to_end(&mut bytes)
         .map_err(|e| {
             untrusted(format!(
-                "the signers file {} cannot be read ({})",
+                "the {what} file {} cannot be read ({})",
                 path.display(),
                 e.kind()
             ))
         })?;
     if bytes.len() as u64 > SIGNERS_MAX_BYTES {
         return Err(untrusted(format!(
-            "the signers file {} is larger than 64 KiB",
+            "the {what} file {} is larger than 64 KiB",
             path.display()
         )));
     }
@@ -214,12 +230,17 @@ fn read_trusted(path: &Path, trust: &TrustRoot) -> Result<Vec<u8>, ApprovalRefus
 
 /// Every directory above `path`, up to `up_to` when one is named, else up to `/`: a real directory, owned by `uid`, and
 /// not group- or other-writable.
-fn check_directories(path: &Path, uid: u32, up_to: Option<&Path>) -> Result<(), ApprovalRefusal> {
+fn check_directories(
+    path: &Path,
+    uid: u32,
+    up_to: Option<&Path>,
+    what: &str,
+) -> Result<(), ApprovalRefusal> {
     if let Some(stop) = up_to
         && !path.ancestors().any(|ancestor| ancestor == stop)
     {
         return Err(untrusted(format!(
-            "{} is not above the signers file",
+            "{} is not above the {what} file",
             stop.display()
         )));
     }
@@ -251,16 +272,21 @@ fn check_directories(path: &Path, uid: u32, up_to: Option<&Path>) -> Result<(), 
     Ok(())
 }
 
-fn check_file(meta: &fs::Metadata, uid: u32, path: &Path) -> Result<(), ApprovalRefusal> {
+fn check_file(
+    meta: &fs::Metadata,
+    uid: u32,
+    path: &Path,
+    what: &str,
+) -> Result<(), ApprovalRefusal> {
     if meta.uid() != uid {
         return Err(untrusted(format!(
-            "the signers file {} is not owned by the trusted uid",
+            "the {what} file {} is not owned by the trusted uid",
             path.display()
         )));
     }
     if meta.mode() & WRITABLE_BY_OTHERS != 0 {
         return Err(untrusted(format!(
-            "the signers file {} is group- or other-writable",
+            "the {what} file {} is group- or other-writable",
             path.display()
         )));
     }
@@ -321,6 +347,17 @@ pub(crate) fn parse_signers(bytes: &[u8]) -> Result<Vec<SignerLine>, ApprovalRef
     Ok(keys)
 }
 
+/// Whether `list` is a `namespaces=` list: comma-separated names of lowercase letters, digits, dots and dashes, none empty.
+pub(crate) fn namespaces_ok(list: &str) -> bool {
+    !list.is_empty()
+        && list.split(',').all(|ns| {
+            !ns.is_empty()
+                && ns
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        })
+}
+
 /// `owner namespaces="<list>" <key type> <base64> [comment]` as its three parts, or `None` for any other shape. The list
 /// holds lowercase names, digits, dots, dashes and commas. The key type and the base64 hold no space, and the comment is
 /// printable ASCII.
@@ -334,13 +371,7 @@ fn parse_key_line(text: &str) -> Option<(&str, &str, &str)> {
     let key_type = parts.next()?;
     let encoded = parts.next()?;
     let comment = parts.next().unwrap_or("");
-    let names_ok = !namespaces.is_empty()
-        && namespaces.split(',').all(|ns| {
-            !ns.is_empty()
-                && ns
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
-        });
+    let names_ok = namespaces_ok(namespaces);
     let type_ok = !key_type.is_empty()
         && key_type
             .bytes()

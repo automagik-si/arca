@@ -37,96 +37,8 @@ impl FileNonces {
     ///
     /// The directory that holds the file is not checked. The caller keeps the state directory at mode 0700.
     pub fn open(path: &Path) -> Result<Self, ApprovalRefusal> {
-        let existed = match fs::symlink_metadata(path) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    return Err(ApprovalRefusal::Untrusted(format!(
-                        "the nonce file {} is not a regular file",
-                        path.display()
-                    )));
-                }
-                true
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => {
-                return Err(storage(format!(
-                    "the nonce file cannot be read ({})",
-                    e.kind()
-                )));
-            }
-        };
-
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(FILE_MODE)
-            .open(path)
-            .map_err(|e| storage(format!("the nonce file cannot be opened ({})", e.kind())))?;
-        let opened = file
-            .metadata()
-            .map_err(|e| storage(format!("the nonce file cannot be inspected ({})", e.kind())))?;
-        let linked = fs::symlink_metadata(path)
-            .map_err(|e| storage(format!("the nonce file cannot be inspected ({})", e.kind())))?;
-        if linked.file_type().is_symlink()
-            || (linked.dev(), linked.ino()) != (opened.dev(), opened.ino())
-        {
-            return Err(ApprovalRefusal::Untrusted(format!(
-                "the nonce file {} changed while it was opened",
-                path.display()
-            )));
-        }
-        if !opened.is_file() {
-            return Err(ApprovalRefusal::Untrusted(format!(
-                "the nonce file {} is not a regular file",
-                path.display()
-            )));
-        }
-        if opened.uid() != effective_uid()? {
-            return Err(ApprovalRefusal::Untrusted(format!(
-                "the nonce file {} is not owned by this kernel's uid",
-                path.display()
-            )));
-        }
-        if opened.mode() & 0o777 != FILE_MODE {
-            return Err(ApprovalRefusal::Untrusted(format!(
-                "the nonce file {} is not mode 0600",
-                path.display()
-            )));
-        }
-        if !existed {
-            sync_parent(path).map_err(|e| {
-                storage(format!(
-                    "the nonce file's directory cannot be synced ({})",
-                    e.kind()
-                ))
-            })?;
-        }
-        match file.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => {
-                return Err(storage(
-                    "the nonce file is held by another store".to_string(),
-                ));
-            }
-            Err(TryLockError::Error(e)) => {
-                return Err(storage(format!(
-                    "the nonce file cannot be locked ({})",
-                    e.kind()
-                )));
-            }
-        }
-
-        let mut bytes = Vec::new();
-        (&file)
-            .read_to_end(&mut bytes)
-            .map_err(|e| storage(format!("the nonce file cannot be read ({})", e.kind())))?;
-        let complete = bytes
-            .iter()
-            .rposition(|b| *b == b'\n')
-            .map_or(0, |at| at + 1);
+        let (file, body) = open_records(path, "nonce file")?;
         let mut spent = BTreeSet::new();
-        let body = &bytes[..complete];
         if let Some(records) = body.strip_suffix(b"\n") {
             for (index, line) in records.split(|b| *b == b'\n').enumerate() {
                 let nonce = parse_record(line).ok_or_else(|| {
@@ -136,14 +48,6 @@ impl FileNonces {
                     return Err(storage(format!("line {} repeats a spent nonce", index + 1)));
                 }
             }
-        }
-        if complete < bytes.len() {
-            // The unterminated tail is a record whose spend never returned, so nothing was allowed on its account.
-            file.set_len(complete as u64)
-                .and_then(|()| file.sync_all())
-                .map_err(|e| {
-                    storage(format!("the torn record cannot be dropped ({})", e.kind()))
-                })?;
         }
         Ok(Self {
             file,
@@ -190,6 +94,105 @@ impl NonceStore for FileNonces {
         self.spent.insert(nonce.to_string());
         Ok(())
     }
+}
+
+/// Opens the record file at `path`, named `what` in every refusal (`nonce file`, `sign-count file`), creating it mode 0600 if
+/// it does not exist, and returns it locked with its complete records: every byte up to its last newline.
+///
+/// Refuses a symbolic link, a file that is not a regular file owned by this uid with mode exactly 0600, or a file another
+/// open store holds. An unterminated tail is a record whose write never returned, so nothing was allowed on its account: it
+/// is cut off and the file synced before the records are returned. The directory that holds the file is not checked.
+pub(crate) fn open_records(path: &Path, what: &str) -> Result<(File, Vec<u8>), ApprovalRefusal> {
+    let existed = match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(ApprovalRefusal::Untrusted(format!(
+                    "the {what} {} is not a regular file",
+                    path.display()
+                )));
+            }
+            true
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(storage(format!("the {what} cannot be read ({})", e.kind())));
+        }
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .mode(FILE_MODE)
+        .open(path)
+        .map_err(|e| storage(format!("the {what} cannot be opened ({})", e.kind())))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| storage(format!("the {what} cannot be inspected ({})", e.kind())))?;
+    let linked = fs::symlink_metadata(path)
+        .map_err(|e| storage(format!("the {what} cannot be inspected ({})", e.kind())))?;
+    if linked.file_type().is_symlink()
+        || (linked.dev(), linked.ino()) != (opened.dev(), opened.ino())
+    {
+        return Err(ApprovalRefusal::Untrusted(format!(
+            "the {what} {} changed while it was opened",
+            path.display()
+        )));
+    }
+    if !opened.is_file() {
+        return Err(ApprovalRefusal::Untrusted(format!(
+            "the {what} {} is not a regular file",
+            path.display()
+        )));
+    }
+    if opened.uid() != effective_uid()? {
+        return Err(ApprovalRefusal::Untrusted(format!(
+            "the {what} {} is not owned by this kernel's uid",
+            path.display()
+        )));
+    }
+    if opened.mode() & 0o777 != FILE_MODE {
+        return Err(ApprovalRefusal::Untrusted(format!(
+            "the {what} {} is not mode 0600",
+            path.display()
+        )));
+    }
+    if !existed {
+        sync_parent(path).map_err(|e| {
+            storage(format!(
+                "the {what}'s directory cannot be synced ({})",
+                e.kind()
+            ))
+        })?;
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(storage(format!("the {what} is held by another store")));
+        }
+        Err(TryLockError::Error(e)) => {
+            return Err(storage(format!(
+                "the {what} cannot be locked ({})",
+                e.kind()
+            )));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    (&file)
+        .read_to_end(&mut bytes)
+        .map_err(|e| storage(format!("the {what} cannot be read ({})", e.kind())))?;
+    let complete = bytes
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |at| at + 1);
+    if complete < bytes.len() {
+        file.set_len(complete as u64)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| storage(format!("the torn record cannot be dropped ({})", e.kind())))?;
+        bytes.truncate(complete);
+    }
+    Ok((file, bytes))
 }
 
 fn storage(why: String) -> ApprovalRefusal {
