@@ -10,6 +10,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
+| `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file>` | forwards GET, refuses the rest | the shim summary, on SIGTERM |
 
@@ -17,7 +18,8 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 server's answer.
 
 Exit codes: `0` success; `1` a runtime failure (a socket, a read or a write failed); `2` a usage or config failure (a bad
-command line, a refused config, or a token directory that is unsafe or missing). Messages go to stderr. A message never
+command line, a refused config, or a token directory that is unsafe or missing); `3` a tool error from `call`, whose JSON-RPC
+error object is printed on stdout; `4` a token the node refuses, HTTP 401 or 403. Other messages go to stderr. A message never
 carries a token, a secret or a key.
 
 `metrics` samples once at start and then every 5 seconds for `--sample-for` seconds (default 5, from 0 to 60). Its `mean`
@@ -46,22 +48,23 @@ refused without the value being echoed back.
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `stateDir` | yes | An existing directory. The node key is created in it as `node.key` when `serve` starts. |
+| `stateDir` | yes | An existing directory, mode 0700. The node key and the desired-state files live in it. See the state section below. |
 | `incus.socket` | yes | The Incus unix socket. Reads only. |
 | `incus.pools` | no | Storage pools whose space the sampler reads. |
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
 | `tokens.hashDir` | yes | The directory of hash files. See below. |
-| `kernel.projects` | no | The project family the kernel may write in. Validated now; no writer uses it in this build. |
+| `kernel.projects` | no | The project family the kernel may write in. With projects named, the writer serves only those projects. With none, the provider reads only, and a removal cannot reach Incus. |
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
-| `approvalHost` | no | Read by no command in this build. |
+| `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 
 The config is refused, with exit 2, when:
 
 - a key is unknown, a required key is missing, or a value has the wrong form;
+- `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
 - `listen.tailnet` is not a tailnet address: it must be a fixed port, not a wildcard, inside `100.64.0.0/10` or
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
@@ -126,7 +129,7 @@ The secret file holds the secret and one newline. A client reads that file, stri
 |--------|--------|
 | no `Authorization`, a malformed bearer or an unknown token | 401 |
 | a `doctor` calling `token_list` | 403 |
-| a `viewer` calling `token_list`, or any verb that writes | 403 |
+| a `viewer` calling `token_list`, or any verb that writes (`plan_decline`, `approval_submit`) | 403 |
 | any request carrying an `Origin` header | 403, before the body is read |
 | a call the caller may make | 200, with the verb's result or a JSON-RPC error |
 
@@ -135,7 +138,8 @@ The secret file holds the secret and one newline. A client reads that file, stri
 ## The MCP server
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
-in this build are `arca_status`, `node_metrics`, `watch_report` and `token_list`.
+in this build are `arca_status`, `node_metrics`, `watch_report`, `token_list`, `plan_list`, `plan_decline` and
+`approval_submit`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -147,8 +151,87 @@ its request is read.
 - `watch_report` reads every project and instance through Incus GET. Live desired-state entries do not exist yet, so the
   report has no entries to compare, and every kernel-marked object is reported as drift.
 - `token_list` lists each token's id and scope as they were when the server started. It never lists a secret or a digest.
+- `plan_list` lists each waiting delete plan with the statement its owner signs. See the next section.
+- `plan_decline` retains a waiting plan's objects. A decline is final and survives a restart.
+- `approval_submit` checks an owner's approval for a waiting plan and, when it holds, deletes the plan's objects once.
 
 `serve` removes its socket on SIGTERM or SIGINT, then exits 0. A socket that another server answers on is left alone.
+
+## Calling the server
+
+`arca call <verb>` makes one call and prints its result. The token is read from `--token-file`, which must be a regular file
+with no group or other permission bit, and holds the secret and one newline. Its text is never printed. The arguments are a JSON
+object: `--args <json>` for the ones that carry no approval, or `--args-file <file>`, which must be private in the same way.
+
+`--args` may not carry an `approval` key, and it is refused with exit 2 before anything is sent. An approval is passed only in
+`--args-file`, so it never appears in the process list or in the shell history.
+
+```sh
+arca call plan_list --config /etc/arca/node.json --token-file "$HOME/.config/arca/viewer-1.secret" --args '{}'
+arca call approval_submit --config /etc/arca/node.json --token-file "$HOME/.config/arca/doctor-1.secret" --args-file "$HOME/approve.json"
+```
+
+A call sends `initialize` and then `tools/call`, each on its own connection. Its exit codes:
+
+- `0`: the result is printed on stdout as JSON.
+- `3`: the node refused the call with a JSON-RPC error. The error object is printed on stdout, with the refusal in
+  `data.refusal`, and nothing is printed on stderr.
+- `4`: the node answered 401 or 403 to the token.
+- `1`: any other failure, such as a socket that does not answer.
+
+## Desired state, delete plans and approvals
+
+`serve` opens the desired-state store before it listens. The state directory holds these files:
+
+| File | Holds |
+|------|-------|
+| `node.key` | the node's ed25519 key, created on first start |
+| `desired.json` | the current signed desired-state document, with the entries that converged and the plans that were declined. Mode 0600 |
+| `desired.lock` | the lock held while `serve` runs. A second process over the same directory is refused |
+| `journal.jsonl` | the journal of every effect the reconciler sent, as intents and outcomes |
+| `approval-nonces.jsonl` | the approval nonces that were spent |
+| `secrets/` | the secret files the writer reads, if any |
+
+`serve` refuses a state directory that is not mode 0700, or not owned by the user that runs it, before it creates the node key.
+It refuses a state file that is a link, is not mode 0600, does not parse, or is not signed by this node's key. It refuses a lock
+file that is a link or is not owned by that user. Each refusal is a config or runtime failure, and nothing is served.
+
+A removal of a desired entry whose objects are class B (deleted by an Incus delete) does not delete them. It waits as a delete
+plan until an owner approves it. A plan lapses fifteen minutes after it was made. `plan_list` leaves a lapsed plan out, and an
+approval for it is refused as `Expired`. A restart, or a new proposal while the removal still waits, makes a fresh plan with a new
+creation time and fifteen new minutes.
+
+The desired-state document expires thirty days after it is issued. A document past its expiry holds the applied state, and the
+reconciler makes no plan from it. So a restart after the thirty days drops every waiting plan, and `plan_list` lists none.
+
+`plan_list` returns each waiting plan that has not lapsed, with `plan` (its digest), `entry`, `createdAt`, `expiresAt`,
+`objects`, `paramsDigest`, and `statement`. The statement is the exact text the owner signs, built fresh for each listing. Its
+keys are sorted, it has no spaces, and it ends without a newline:
+
+```
+{"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
+```
+
+The owner signs that text with a hardware key in the namespace `arca-kernel-approve`, and the approval string is the
+base64 of the statement, a dot, and the base64 of the armoured signature. The owner key is read from the signers file
+`/etc/arca/owner-signers`, root-owned, which lists the owner's keys for that namespace. A file that is not there holds no key,
+so every approval is refused with `NoVerifier`.
+
+`approval_submit` takes the plan digest and the approval. It refuses, and spends nothing, when:
+
+- the signature does not verify against a listed key (`BadSignature`), or no key is listed (`NoVerifier`);
+- the statement names another host, action, target or arguments (`WrongHost`, `WrongAction`, `WrongTarget`, `WrongParams`);
+- the statement is issued more than five minutes ahead of the node's clock (`IssuedAhead`), has expired (`Expired`), or
+  runs for more than fifteen minutes (`TtlTooLong`);
+- its nonce is spent (`Replayed`).
+
+A plan that waits under no digest is `NoSuchPlan`. A valid approval for such a plan is still checked, so a spent approval reads as
+`Replayed`. The approval string is never stored or echoed, and an approval spends its nonce once, before its delete runs.
+
+**A scratch kernel can take its owner keys from a file named in `ARCA_TEST_OWNER_SIGNERS`.** That is honoured only when
+`kernel.scratch` is `true`, every kernel project starts with `arcak-scratch-`, and the build has debug assertions. Any other kernel
+refuses to start while the variable is set. It exists so that the tests run the real verifier against keys they write
+themselves.
 
 ## The recording shim
 
@@ -168,5 +251,6 @@ shim's log, read after the shim has stopped, together with `refused: 0`.
 ## Tests
 
 The tests use the fake Incus and the recording shim from the Incus crate. They never open a real Incus socket, a tailnet
-address or a system service. They run under the default temporary directory, because a longer socket path breaks the unix
+address or a system service. The approval tests sign with software keys from fixed seeds, listed in a signers file the test
+writes itself, so no owner key or host file is read. They run under the default temporary directory, because a longer socket path breaks the unix
 socket's length limit. Run them with `cargo test -p arca`.

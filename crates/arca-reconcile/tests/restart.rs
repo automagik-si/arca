@@ -207,7 +207,7 @@ impl Provider for Killing {
     }
 }
 
-fn plain(scratch: &Scratch, fake: &FakeIncus, retained: &RetainedSet) -> Box<dyn Provider> {
+fn plain(scratch: &Scratch, fake: &FakeIncus, retained: &RetainedSet) -> Box<dyn Provider + Send> {
     Box::new(provider(scratch, fake, retained))
 }
 
@@ -216,7 +216,7 @@ fn killing(
     fake: &FakeIncus,
     retained: &RetainedSet,
     kill: Kill,
-) -> Box<dyn Provider> {
+) -> Box<dyn Provider + Send> {
     Box::new(Killing {
         inner: provider(scratch, fake, retained),
         kill,
@@ -230,7 +230,7 @@ fn killing(
 fn restarted(
     scratch: &Scratch,
     key: &NodeKey,
-    provider: Box<dyn Provider>,
+    provider: Box<dyn Provider + Send>,
     plugins: PluginSet,
     retained: &RetainedSet,
     applied: Option<Applied>,

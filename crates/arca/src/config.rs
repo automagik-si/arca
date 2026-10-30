@@ -31,7 +31,7 @@ pub struct NodeConfig {
     pub listen: ListenConfig,
     pub tokens: TokenConfig,
     pub kernel: KernelConfig,
-    /// The approval host, when one is set. Nothing in this build reads it.
+    /// The host name every owner approval statement names. When it is not set, the system's host name is used.
     #[serde(default)]
     pub approval_host: Option<String>,
 }
@@ -88,6 +88,8 @@ pub enum ConfigError {
     ProjectForbidden(String),
     /// A scratch run names a project outside the scratch prefix.
     ScratchPrefix(String),
+    /// The approval host is not a host name. The value is left out of the message.
+    ApprovalHost,
     /// Kernel projects are named, and no droidd project is listed to exclude.
     DroiddProjectsEmpty,
 }
@@ -109,6 +111,10 @@ impl fmt::Display for ConfigError {
             Self::DroiddProjectsEmpty => write!(
                 f,
                 "kernel.droiddProjects must list droidd's projects when kernel.projects is not empty"
+            ),
+            Self::ApprovalHost => write!(
+                f,
+                "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
             ),
         }
     }
@@ -149,7 +155,26 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
             }
         }
     }
+    if let Some(host) = &config.approval_host
+        && !host_name_ok(host)
+    {
+        return Err(ConfigError::ApprovalHost);
+    }
     Ok(())
+}
+
+/// Whether `host` is a host name the approval statement may carry: one letter or digit to start, then up to 252 letters,
+/// digits, dots or hyphens. An empty name is refused.
+pub fn host_name_ok(host: &str) -> bool {
+    let bytes = host.as_bytes();
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && rest.len() <= 252
+        && rest
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-')
 }
 
 /// A fixed reason for a read failure. The operating system's text is left out.
@@ -181,4 +206,41 @@ fn parse_reason(error: &serde_json::Error) -> String {
         Category::Io => "the file could not be read".to_string(),
     };
     format!("{message} ({position})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with(approval_host: Option<&str>) -> NodeConfig {
+        let mut value = serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": ["droid"] }
+        });
+        if let Some(host) = approval_host {
+            value["approvalHost"] = serde_json::json!(host);
+        }
+        serde_json::from_value(value).expect("the fixture config parses")
+    }
+
+    #[test]
+    fn an_approval_host_that_is_not_a_host_name_is_refused() {
+        for bad in ["under_score", "-leading", "has space", "", "node/1"] {
+            let refused = check(&config_with(Some(bad)));
+            assert_eq!(
+                refused,
+                Err(ConfigError::ApprovalHost),
+                "{bad:?} is not a host name"
+            );
+        }
+    }
+
+    #[test]
+    fn an_approval_host_that_is_a_host_name_or_none_is_accepted() {
+        assert_eq!(check(&config_with(Some("node1.example"))), Ok(()));
+        assert_eq!(check(&config_with(None)), Ok(()));
+    }
 }

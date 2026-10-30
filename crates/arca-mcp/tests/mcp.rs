@@ -391,9 +391,10 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
     let fx = Fixture::start("list-viewer");
     let reply = fx.call(&fx.viewer, "tools/list", json!({}));
     assert_eq!(reply.status, 200);
+    // The viewer's reads of the table, in table order: the watch verbs and the read-only plan listing.
     assert_eq!(
         names_of(&reply),
-        vec!["arca_status", "node_metrics", "watch_report"]
+        vec!["arca_status", "node_metrics", "watch_report", "plan_list"]
     );
 }
 

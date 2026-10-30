@@ -1,21 +1,35 @@
-//! The four verbs the binary answers, and the host reads they share with the one-shot commands. The MCP handlers and the
-//! `watch` and `metrics` commands call the same functions, so a command's JSON output equals the MCP result of its verb.
+//! The verbs the binary answers, and the host reads they share with the one-shot commands. The MCP handlers and the `watch`
+//! and `metrics` commands call the same functions, so a command's JSON output equals the MCP result of its verb. The three
+//! plan verbs run over the kernel, through one lock and one clock.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_api::Scope;
+use arca_approval::{ApprovalRefusal, parse_statement};
 use arca_incus::{IncusRead, UnixIncus};
+use arca_kernel::canon::{Digest, params_digest};
+use arca_kernel::journal::DeletePlan;
+use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
 use arca_mcp::{CallError, Caller, ToolHandler};
 use arca_metrics::{DEFAULT_MINUTES, HostSample, Sampler, SamplerConfig, mean};
 use arca_providers::ReadOnlyIncusProvider;
+use arca_reconcile::PLAN_TTL_MS;
 use arca_watch::{WatchConfig, watch_once};
 use serde_json::{Value, json};
 
 use crate::config::NodeConfig;
+use crate::kernel::Kernel;
+
+/// How long an approval statement a plan listing carries is valid from its issue. Droidd's own window for an owner's
+/// approval, and the most the verifier accepts.
+pub const STATEMENT_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// The clock the plan verbs read, in epoch milliseconds. The server reads the system clock; a test sets its own.
+pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// How often the server adds a host sample to its ring.
 pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
@@ -32,6 +46,35 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
     u64::try_from(since).unwrap_or(u64::MAX)
+}
+
+/// An instant written as `Date.prototype.toISOString` writes it: `YYYY-MM-DDTHH:MM:SS.sssZ`, in UTC.
+pub fn iso_utc(ms: u64) -> String {
+    let secs = ms / 1_000;
+    let millis = ms % 1_000;
+    let days = i64::try_from(secs / 86_400).unwrap_or(i64::MAX);
+    let in_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
+        in_day / 3_600,
+        (in_day % 3_600) / 60,
+        in_day % 60
+    )
+}
+
+/// The civil date of a day count since 1970-01-01, in the proleptic Gregorian calendar (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = u32::try_from(doy - (153 * mp + 2) / 5 + 1).unwrap_or(1);
+    let month = u32::try_from(if mp < 10 { mp + 3 } else { mp - 9 }).unwrap_or(1);
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// A sampler over the host's procfs and sysfs, reading the configured pools through the Incus socket.
@@ -239,6 +282,216 @@ impl ToolHandler for TokenListHandler {
     }
 }
 
+/// The handlers of the three plan verbs, keyed by verb name, over one kernel and one clock.
+pub fn plan_handlers(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    vec![
+        (
+            "plan_list",
+            Arc::new(PlanList {
+                kernel: Arc::clone(&kernel),
+                clock: Arc::clone(&clock),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "plan_decline",
+            Arc::new(PlanDecline {
+                kernel: Arc::clone(&kernel),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "approval_submit",
+            Arc::new(ApprovalSubmit { kernel, clock }) as Arc<dyn ToolHandler>,
+        ),
+    ]
+}
+
+/// `plan_list`: each waiting delete plan that has not lapsed, with the statement the owner signs for it. Every listing draws a
+/// new nonce, so each statement is built fresh. A lapsed plan is left out, since its run is refused as expired.
+struct PlanList {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+}
+
+impl ToolHandler for PlanList {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let now = (self.clock)();
+        let kernel = lock(&self.kernel)?;
+        let plans = kernel
+            .pending_plans()
+            .iter()
+            .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
+            .map(|plan| plan_json(kernel.host(), plan, now))
+            .collect::<Result<Vec<Value>, CallError>>()?;
+        Ok(json!({ "plans": plans }))
+    }
+}
+
+/// `plan_decline`: declines one waiting plan. Its objects are retained, and the decline is final.
+struct PlanDecline {
+    kernel: Arc<Mutex<Kernel>>,
+}
+
+impl ToolHandler for PlanDecline {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let digest = plan_argument(&args)?;
+        let mut kernel = lock(&self.kernel)?;
+        match kernel.decline(&digest).map_err(|_| internal())? {
+            None => Err(no_such_plan()),
+            Some(objects) => Ok(json!({
+                "plan": digest.to_hex(),
+                "retained": objects_json(&objects)?,
+            })),
+        }
+    }
+}
+
+/// `approval_submit`: checks an owner's approval for one waiting plan and, when it holds, runs the plan's delete. The approval
+/// is read here and never stored or echoed.
+struct ApprovalSubmit {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+}
+
+impl ToolHandler for ApprovalSubmit {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let digest = plan_argument(&args)?;
+        let approval = args
+            .get("approval")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CallError::Invalid("approval is required".to_string()))?;
+        let now = (self.clock)();
+        let mut kernel = lock(&self.kernel)?;
+        match kernel.approve(&digest, approval, now) {
+            Ok(None) => Err(no_such_plan()),
+            Ok(Some(run)) => Ok(json!({
+                "plan": digest.to_hex(),
+                "deleted": objects_json(&run.deleted)?,
+                "drift": objects_json(&run.drift)?,
+                "partial": run.partial,
+            })),
+            Err(refusal) => Err(refusal_failure(refusal)),
+        }
+    }
+}
+
+fn lock(kernel: &Mutex<Kernel>) -> Result<MutexGuard<'_, Kernel>, CallError> {
+    kernel.lock().map_err(|_| internal())
+}
+
+/// The failure a kernel error becomes. The text stays inside the server.
+fn internal() -> CallError {
+    CallError::Internal("the kernel could not complete the call".to_string())
+}
+
+fn no_such_plan() -> CallError {
+    CallError::Refused {
+        code: "NoSuchPlan".to_string(),
+        message: "no delete plan waits under this digest".to_string(),
+    }
+}
+
+/// The plan digest a call names. The schema has checked its length; this checks its digits.
+fn plan_argument(args: &Value) -> Result<Digest, CallError> {
+    let text = args
+        .get("plan")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CallError::Invalid("plan is required".to_string()))?;
+    Digest::from_hex(text).map_err(|_| CallError::Invalid("plan is not a digest".to_string()))
+}
+
+/// A refused approval as a call's refusal. A storage failure is the server's own, and is not a refusal of the approval.
+fn refusal_failure(refusal: ApprovalRefusal) -> CallError {
+    if matches!(refusal, ApprovalRefusal::Storage(_)) {
+        return CallError::Internal("the approval could not be recorded".to_string());
+    }
+    CallError::Refused {
+        code: refusal_code(&refusal).to_string(),
+        message: refusal.to_string(),
+    }
+}
+
+/// The name of a refusal, as a caller's `refusal` field carries it.
+fn refusal_code(refusal: &ApprovalRefusal) -> &'static str {
+    match refusal {
+        ApprovalRefusal::Malformed(_) => "Malformed",
+        ApprovalRefusal::NotCanonical => "NotCanonical",
+        ApprovalRefusal::NoVerifier => "NoVerifier",
+        ApprovalRefusal::BadSignature => "BadSignature",
+        ApprovalRefusal::NotHardwareKey => "NotHardwareKey",
+        ApprovalRefusal::NoUserPresence => "NoUserPresence",
+        ApprovalRefusal::WrongNamespace => "WrongNamespace",
+        ApprovalRefusal::WrongHost => "WrongHost",
+        ApprovalRefusal::WrongAction => "WrongAction",
+        ApprovalRefusal::WrongTarget => "WrongTarget",
+        ApprovalRefusal::WrongParams => "WrongParams",
+        ApprovalRefusal::IssuedAhead => "IssuedAhead",
+        ApprovalRefusal::Expired => "Expired",
+        ApprovalRefusal::TtlTooLong => "TtlTooLong",
+        ApprovalRefusal::Replayed => "Replayed",
+        ApprovalRefusal::Untrusted(_) => "Untrusted",
+        ApprovalRefusal::Storage(_) => "Storage",
+        ApprovalRefusal::Unresolved => "Unresolved",
+    }
+}
+
+fn plan_json(host: &str, plan: &DeletePlan, now: u64) -> Result<Value, CallError> {
+    let digest = plan.digest.to_hex();
+    let params = params_digest(&json!({ "plan": digest.clone() })).map_err(|_| internal())?;
+    let statement = plan_statement(host, &digest, now, &fresh_nonce()?)?;
+    Ok(json!({
+        "plan": digest,
+        "entry": plan.entry.0,
+        "createdAt": plan.created_ms,
+        "expiresAt": plan.created_ms.saturating_add(PLAN_TTL_MS),
+        "objects": objects_json(&plan.objects)?,
+        "paramsDigest": params,
+        "statement": statement,
+    }))
+}
+
+/// The statement an owner signs to approve the delete of plan `plan`: the exact bytes, with the keys in sorted order, no spaces
+/// and no trailing newline. The statement is read back by the kernel's own parser before it is returned, so a listing never
+/// carries a statement the verifier would refuse for its form.
+pub fn plan_statement(
+    host: &str,
+    plan: &str,
+    issued_ms: u64,
+    nonce: &str,
+) -> Result<String, CallError> {
+    let params = params_digest(&json!({ "plan": plan })).map_err(|_| internal())?;
+    let text = format!(
+        r#"{{"action":"delete","expiresAt":"{}","host":"{host}","issuedAt":"{}","nonce":"{nonce}","paramsDigest":"{params}","target":"plan-{plan}"}}"#,
+        iso_utc(issued_ms.saturating_add(STATEMENT_TTL_MS)),
+        iso_utc(issued_ms),
+    );
+    parse_statement(text.as_bytes()).map_err(|_| internal())?;
+    Ok(text)
+}
+
+/// Sixteen random bytes as 32 lowercase hex digits: a statement's nonce.
+fn fresh_nonce() -> Result<String, CallError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|_| internal())?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn objects_json(objects: &[ObjectRef]) -> Result<Vec<Value>, CallError> {
+    objects.iter().map(object_json).collect()
+}
+
+fn object_json(object: &ObjectRef) -> Result<Value, CallError> {
+    let kind = serde_json::to_value(object.kind).map_err(|_| internal())?;
+    Ok(json!({
+        "kind": kind,
+        "project": object.project,
+        "name": object.name,
+        "uuid": object.uuid,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -428,6 +681,34 @@ mod tests {
             let from_snapshot =
                 metrics_row(snapshot.last(), &window_of(&snapshot, minutes), minutes, 9);
             assert_eq!(from_snapshot, node_metrics(&sampler, Some(minutes), 9));
+        }
+    }
+}
+
+#[cfg(test)]
+mod iso_tests {
+    use super::*;
+    use arca_kernel::desired::instant_ms;
+
+    #[test]
+    fn the_epoch_and_the_test_clock_are_written_as_to_iso_string_writes_them() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_utc(1_793_361_600_000), "2026-10-30T12:00:00.000Z");
+    }
+
+    #[test]
+    fn every_instant_written_reads_back_to_the_same_milliseconds() {
+        // Leap days, a century year, a year before the epoch's last leap year and the end of a day.
+        for ms in [
+            951_782_400_000u64,
+            4_107_542_399_999,
+            1_709_251_199_999,
+            1_234_567_890_123,
+            86_399_999,
+        ] {
+            let text = iso_utc(ms);
+            assert_eq!(text.len(), 24, "{text}");
+            assert_eq!(instant_ms(&text), Some(ms), "{text}");
         }
     }
 }

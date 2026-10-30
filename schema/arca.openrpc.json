@@ -717,6 +717,310 @@
       "x-arca-class": "L",
       "x-arca-scope": "operator",
       "x-arca-writes": false
+    },
+    {
+      "name": "plan_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "plans": {
+              "items": {
+                "properties": {
+                  "createdAt": {
+                    "type": "integer"
+                  },
+                  "entry": {
+                    "type": "string"
+                  },
+                  "expiresAt": {
+                    "type": "integer"
+                  },
+                  "objects": {
+                    "items": {
+                      "properties": {
+                        "kind": {
+                          "enum": [
+                            "project",
+                            "instance",
+                            "network",
+                            "acl",
+                            "profile",
+                            "volume",
+                            "zone",
+                            "forward",
+                            "bucket"
+                          ],
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "project": {
+                          "type": "string"
+                        },
+                        "uuid": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "project",
+                        "name",
+                        "uuid"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "paramsDigest": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "type": "string"
+                  },
+                  "plan": {
+                    "maxLength": 64,
+                    "minLength": 64,
+                    "type": "string"
+                  },
+                  "statement": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "plan",
+                  "entry",
+                  "createdAt",
+                  "expiresAt",
+                  "objects",
+                  "paramsDigest",
+                  "statement"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "plans"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The delete plans waiting for an owner's approval, each with the exact statement the owner signs.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "plan_decline",
+      "params": [
+        {
+          "name": "plan",
+          "required": true,
+          "schema": {
+            "maxLength": 64,
+            "minLength": 64,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "plan": {
+              "maxLength": 64,
+              "minLength": 64,
+              "type": "string"
+            },
+            "retained": {
+              "items": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "project",
+                      "instance",
+                      "network",
+                      "acl",
+                      "profile",
+                      "volume",
+                      "zone",
+                      "forward",
+                      "bucket"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "uuid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "project",
+                  "name",
+                  "uuid"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "plan",
+            "retained"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Declines a waiting delete plan. Its objects are retained, and the decline is final.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "approval_submit",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "maxLength": 16384,
+            "type": "string"
+          }
+        },
+        {
+          "name": "plan",
+          "required": true,
+          "schema": {
+            "maxLength": 64,
+            "minLength": 64,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "deleted": {
+              "items": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "project",
+                      "instance",
+                      "network",
+                      "acl",
+                      "profile",
+                      "volume",
+                      "zone",
+                      "forward",
+                      "bucket"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "uuid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "project",
+                  "name",
+                  "uuid"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "drift": {
+              "items": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "project",
+                      "instance",
+                      "network",
+                      "acl",
+                      "profile",
+                      "volume",
+                      "zone",
+                      "forward",
+                      "bucket"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "uuid": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "kind",
+                  "project",
+                  "name",
+                  "uuid"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "partial": {
+              "type": "boolean"
+            },
+            "plan": {
+              "maxLength": 64,
+              "minLength": 64,
+              "type": "string"
+            }
+          },
+          "required": [
+            "plan",
+            "deleted",
+            "drift",
+            "partial"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Submits an owner's approval for a waiting delete plan, which deletes the plan's objects once. The approval is never echoed.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     }
   ],
   "openrpc": "1.3.2"

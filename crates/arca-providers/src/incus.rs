@@ -100,6 +100,12 @@ impl RetainedSet {
         Ok(self.snapshot()?.contains_key(entry))
     }
 
+    /// Every retained entry with the plugin and the declined plan it was retained under, so the set can be written to disk. A
+    /// set whose lock was poisoned is refused.
+    pub fn entries(&self) -> Result<BTreeMap<EntryId, (PluginId, Digest)>, EffectRefusal> {
+        self.snapshot()
+    }
+
     /// A copy of the set as it is now. A set whose lock was poisoned is refused, never read as empty.
     fn snapshot(&self) -> Result<BTreeMap<EntryId, (PluginId, Digest)>, EffectRefusal> {
         self.0

@@ -18,7 +18,7 @@ pub mod statement;
 pub mod verifier;
 
 pub use nonces::FileNonces;
-pub use signers::{SignerLine, TrustRoot, load_signers, signers_trust};
+pub use signers::{SignerLine, TrustRoot, effective_uid, load_signers, signers_trust};
 pub use sshsig::SshSigVerifier;
 pub use statement::{ArcaAction, OwnerApproval, parse_statement, split_approval};
 pub use verifier::{ApprovalVerifier, MemNonces, NonceStore, RefuseAll, SignatureVerifier, Spent};

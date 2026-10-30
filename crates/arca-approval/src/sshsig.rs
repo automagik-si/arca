@@ -62,6 +62,11 @@ impl SshSigVerifier {
             .collect();
         Self { signers }
     }
+
+    /// The number of keys this verifier trusts.
+    pub fn key_count(&self) -> usize {
+        self.signers.len()
+    }
 }
 
 impl SignatureVerifier for SshSigVerifier {

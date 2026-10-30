@@ -110,7 +110,10 @@ fn arca() -> Command {
 
 /// A node config that reads through `socket`, names one identity phone and keeps the kernel out of every project.
 fn write_config(scratch: &Scratch, socket: &Path, hash_dir: &Path) -> PathBuf {
-    fs::create_dir_all(scratch.at("state")).expect("create the state directory");
+    // The state directory must be private to its owner before serve starts: serve refuses any other mode.
+    let state = scratch.at("state");
+    fs::create_dir_all(&state).expect("create the state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let value = json!({
         "stateDir": scratch.at("state").display().to_string(),
         "incus": { "socket": socket.display().to_string(), "pools": [] },
@@ -402,6 +405,33 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
         rig.fake.requests().iter().all(|r| r.method == "GET"),
         "the fake saw only GET"
     );
+}
+
+#[test]
+fn a_state_directory_another_user_may_read_is_refused_at_start_and_no_node_key_is_made() {
+    let scratch = Scratch::new("statedir");
+    let rig = rig(&scratch);
+    let socket = rig.shim.socket().to_path_buf();
+    let (hash_dir, _) = mint_tokens(&scratch);
+    let config = write_config(&scratch, &socket, &hash_dir);
+    fs::set_permissions(scratch.at("state"), fs::Permissions::from_mode(0o755))
+        .expect("chmod 0755");
+
+    let out = arca()
+        .args(["serve", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run serve");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a state directory that is not mode 0700 is a config failure"
+    );
+    assert!(
+        !scratch.at("state").join("node.key").exists(),
+        "no node key is written into a directory another user may read"
+    );
+    let _ = rig.shim.stop();
 }
 
 #[test]
