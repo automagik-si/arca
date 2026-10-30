@@ -1,0 +1,723 @@
+{
+  "info": {
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "title": "Arca API",
+    "version": "0.1.0"
+  },
+  "methods": [
+    {
+      "name": "arca_status",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "appliedSeq": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "incusReachable": {
+              "type": "boolean"
+            },
+            "mode": {
+              "enum": [
+                "watch-only",
+                "kernel"
+              ],
+              "type": "string"
+            },
+            "node": {
+              "maxLength": 64,
+              "minLength": 64,
+              "type": "string"
+            },
+            "uptimeS": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "node",
+            "mode",
+            "uptimeS",
+            "incusReachable",
+            "appliedSeq"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "node_metrics",
+      "params": [
+        {
+          "name": "minutes",
+          "required": false,
+          "schema": {
+            "maximum": 60,
+            "minimum": 1,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "at": {
+              "type": "integer"
+            },
+            "latest": {
+              "properties": {
+                "at": {
+                  "type": "integer"
+                },
+                "cpu": {
+                  "properties": {
+                    "cores": {
+                      "type": "integer"
+                    },
+                    "usedPct": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "usedPct",
+                    "cores"
+                  ],
+                  "type": "object"
+                },
+                "cpuTempC": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "gpuBusyPct": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "load": {
+                  "properties": {
+                    "fifteen": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "five": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "one": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "one",
+                    "five",
+                    "fifteen"
+                  ],
+                  "type": "object"
+                },
+                "memory": {
+                  "properties": {
+                    "availableBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "swapFreeBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "swapTotalBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "totalBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "totalBytes",
+                    "availableBytes",
+                    "swapTotalBytes",
+                    "swapFreeBytes"
+                  ],
+                  "type": "object"
+                },
+                "network": {
+                  "properties": {
+                    "rxBytesPerSec": {
+                      "type": "number"
+                    },
+                    "txBytesPerSec": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "rxBytesPerSec",
+                    "txBytesPerSec"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "pools": {
+                  "items": {
+                    "properties": {
+                      "freeBytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "totalBytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "usedBytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "usedBytes",
+                      "totalBytes",
+                      "freeBytes"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "projects": {
+                  "items": {
+                    "properties": {
+                      "project": {
+                        "type": "string"
+                      },
+                      "running": {
+                        "type": "integer"
+                      },
+                      "total": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "project",
+                      "total",
+                      "running"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "psi": {
+                  "properties": {
+                    "cpuSomeAvg10": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "memoryFullAvg10": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "memorySomeAvg10": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "memorySomeAvg10",
+                    "memoryFullAvg10",
+                    "cpuSomeAvg10"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "at",
+                "cpu",
+                "load",
+                "memory",
+                "psi",
+                "cpuTempC",
+                "gpuBusyPct",
+                "pools",
+                "network",
+                "projects"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "mean": {
+              "properties": {
+                "at": {
+                  "type": "integer"
+                },
+                "cpu": {
+                  "properties": {
+                    "cores": {
+                      "type": "integer"
+                    },
+                    "usedPct": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "usedPct",
+                    "cores"
+                  ],
+                  "type": "object"
+                },
+                "cpuTempC": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "gpuBusyPct": {
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "load": {
+                  "properties": {
+                    "fifteen": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "five": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "one": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "one",
+                    "five",
+                    "fifteen"
+                  ],
+                  "type": "object"
+                },
+                "memory": {
+                  "properties": {
+                    "availableBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "swapFreeBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "swapTotalBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "totalBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "totalBytes",
+                    "availableBytes",
+                    "swapTotalBytes",
+                    "swapFreeBytes"
+                  ],
+                  "type": "object"
+                },
+                "network": {
+                  "properties": {
+                    "rxBytesPerSec": {
+                      "type": "number"
+                    },
+                    "txBytesPerSec": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "rxBytesPerSec",
+                    "txBytesPerSec"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "pools": {
+                  "items": {
+                    "properties": {
+                      "freeBytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "totalBytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "usedBytes": {
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "name",
+                      "usedBytes",
+                      "totalBytes",
+                      "freeBytes"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "projects": {
+                  "items": {
+                    "properties": {
+                      "project": {
+                        "type": "string"
+                      },
+                      "running": {
+                        "type": "integer"
+                      },
+                      "total": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "project",
+                      "total",
+                      "running"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "psi": {
+                  "properties": {
+                    "cpuSomeAvg10": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "memoryFullAvg10": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "memorySomeAvg10": {
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "memorySomeAvg10",
+                    "memoryFullAvg10",
+                    "cpuSomeAvg10"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "at",
+                "cpu",
+                "load",
+                "memory",
+                "psi",
+                "cpuTempC",
+                "gpuBusyPct",
+                "pools",
+                "network",
+                "projects"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "minutes": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "at",
+            "minutes",
+            "latest",
+            "mean"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Host metrics of the node: the latest sample and the mean over the requested minutes.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "watch_report",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "at": {
+              "type": "integer"
+            },
+            "drift": {
+              "items": {
+                "properties": {
+                  "entry": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "markedWithoutEntry",
+                      "entryWithoutObject"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "entry"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "projects": {
+              "items": {
+                "properties": {
+                  "instances": {
+                    "items": {
+                      "properties": {
+                        "configHash": {
+                          "maxLength": 64,
+                          "minLength": 64,
+                          "type": "string"
+                        },
+                        "identity": {
+                          "type": "boolean"
+                        },
+                        "kind": {
+                          "enum": [
+                            "container",
+                            "virtual-machine"
+                          ],
+                          "type": "string"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "owner": {
+                          "properties": {
+                            "class": {
+                              "enum": [
+                                "droidd",
+                                "foreign",
+                                "kernel",
+                                "retained",
+                                "contested"
+                              ],
+                              "type": "string"
+                            },
+                            "entry": {
+                              "type": "string"
+                            },
+                            "plan": {
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            },
+                            "plugin": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "class"
+                          ],
+                          "type": "object"
+                        },
+                        "privileged": {
+                          "type": "boolean"
+                        },
+                        "status": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "kind",
+                        "status",
+                        "owner",
+                        "privileged",
+                        "identity",
+                        "configHash"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "project": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "project",
+                  "instances"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "at",
+            "projects",
+            "drift"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Every instance in every project with its ownership class, and the drift between marks and desired state.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "token_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "tokens": {
+              "items": {
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "scope": {
+                    "enum": [
+                      "viewer",
+                      "doctor",
+                      "operator"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "scope"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "tokens"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The interim API tokens by id and scope. Never a secret or a hash.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "operator",
+      "x-arca-writes": false
+    }
+  ],
+  "openrpc": "1.3.2"
+}
