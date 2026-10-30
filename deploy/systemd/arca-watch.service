@@ -15,7 +15,9 @@ Restart=on-failure
 RestartSec=10
 RuntimeDirectory=arca
 RuntimeDirectoryMode=0700
-StateDirectory=arca
+# Not "arca": systemd 254 and later make StateDirectory=arca a link to ~/.config/arca, which holds the config, when
+# ~/.local/state/arca does not exist yet, and serve refuses a state directory that is a link.
+StateDirectory=arca-node
 StateDirectoryMode=0700
 UMask=0077
 MemoryHigh=192M

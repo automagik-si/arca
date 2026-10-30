@@ -677,8 +677,13 @@ fn parse_count_record(line: &[u8]) -> Option<(String, u32)> {
 ///
 /// The count is checked and advanced inside [`SignatureVerifier::verify`], before `ApprovalVerifier::check` reads the
 /// statement's nonce. So a replay of a counting passkey's approval is refused as [`ApprovalRefusal::SignCountRegressed`],
-/// and a replay of a synced passkey's (count 0) as [`ApprovalRefusal::Replayed`]. A count advanced for an approval that a
-/// later check refuses costs nothing, because a count only grows.
+/// and a replay of a synced passkey's (count 0) as [`ApprovalRefusal::Replayed`].
+///
+/// The count is advanced before `check` compares the statement's host, action, target and arguments with the call and checks
+/// its time window. So a counting passkey's approval that one of those checks refuses is used up: sent again, even for the
+/// call it names, it is refused as [`ApprovalRefusal::SignCountRegressed`], and the owner signs a new statement. Its nonce is
+/// not spent, and the passkey's next assertion carries a higher count, so later approvals are not affected. A synced
+/// passkey's approval (count 0) is not used up.
 pub struct PasskeyVerifier {
     keys: Keys,
 }

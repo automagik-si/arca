@@ -9,9 +9,11 @@
 //! Operations: the listing groups every operation the fake holds by its status in lower case, as Incus does. A held operation
 //! ([`FakeIncus::hold_operation`], [`FakeIncus::hold_create`]) stays running (status code 103) and names its object in
 //! `resources`, rendered as Incus renders it: the object's path, with `?project=<p>` unless the project is `default`. It ends
-//! only when the test releases it ([`FakeIncus::release_operation`]) or fails it ([`FakeIncus::fail_operation`]). A wait on a
-//! running operation is held until the operation ends or its `timeout` passes, but never longer than a quarter second, so a test
-//! is not slowed; a caller loops on a wait anyway, since Incus answers a timed-out wait with the operation still running.
+//! only when the test releases it ([`FakeIncus::release_operation`]) or fails it ([`FakeIncus::fail_operation`]). A held
+//! operation is of class `task` unless the test gives it the class and the description Incus gives an operation of another type
+//! ([`FakeIncus::hold_operation_as`]). A wait on a running operation is held until the operation ends or its `timeout` passes,
+//! but never longer than a quarter second, so a test is not slowed; a caller loops on a wait anyway, since Incus answers a
+//! timed-out wait with the operation still running. [`FakeIncus::answer_wait_ended`] makes a wait disagree with the listing.
 //!
 //! A network, a forward and an ACL are served from the default project unless their project enables `features.networks`, as Incus
 //! 7.3 serves them: a create sent to such a project lands in the default project, and a read sent to it is answered from there.
@@ -190,6 +192,8 @@ struct Shared {
     reject_config: Mutex<Vec<String>>,
     host_interfaces: Mutex<Vec<HostInterface>>,
     operations_unreadable: AtomicBool,
+    /// The operations whose wait answers 404 while the listing still shows them running.
+    waits_ended: Mutex<Vec<String>>,
     counter: AtomicU64,
 }
 
@@ -358,6 +362,7 @@ impl Shared {
             reject_config: Mutex::new(Vec::new()),
             host_interfaces: Mutex::new(Vec::new()),
             operations_unreadable: AtomicBool::new(false),
+            waits_ended: Mutex::new(Vec::new()),
             counter: AtomicU64::new(1),
         }
     }
@@ -437,13 +442,26 @@ impl FakeIncus {
     /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
     /// the operations listing at once, and a wait on it answers that it is still running.
     pub fn hold_operation(&self, target: &ObjectRef) -> OpId {
+        self.hold_operation_as(target, "task", "Held by the test")
+    }
+
+    /// [`FakeIncus::hold_operation`] with the `class` and the `description` Incus gives an operation of some type, such as
+    /// `websocket` and `Executing command` for an interactive exec.
+    pub fn hold_operation_as(&self, target: &ObjectRef, class: &str, description: &str) -> OpId {
         let id = self.shared.next_id();
+        let mut operation = running_operation(&id, &place_of(target));
+        operation["class"] = json!(class);
+        operation["description"] = json!(description);
         let mut store = lock(&self.shared.store);
-        store
-            .operations
-            .insert(id.clone(), running_operation(&id, &place_of(target)));
+        store.operations.insert(id.clone(), operation);
         store.held.insert(id.clone(), Held::default());
         OpId(id)
+    }
+
+    /// Makes every wait on operation `id` answer 404 at once, as for an operation the server no longer holds, while the listing
+    /// still shows it as it is.
+    pub fn answer_wait_ended(&self, id: &OpId) {
+        lock(&self.shared.waits_ended).push(id.0.clone());
     }
 
     /// Makes the next create of `target` run as a held operation with the id returned here, whatever the kind. The create is
@@ -822,6 +840,9 @@ fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
     let allowed: &[&str] = route.as_ref().map_or(&["GET"][..], Route::methods);
     let method = request.method.as_str();
     if let (Some(Route::OperationWait(id)), "GET") = (&route, method) {
+        if lock(&shared.waits_ended).contains(id) {
+            return (404, String::new(), error_envelope(404, "not found"));
+        }
         hold_wait(shared, id, &request.target);
     }
     match route {

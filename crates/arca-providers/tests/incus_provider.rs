@@ -3272,6 +3272,78 @@ fn a_read_back_whose_operations_listing_fails_is_unresolved_and_reads_no_object(
 }
 
 #[test]
+fn a_read_back_reads_its_object_at_once_while_only_an_exec_or_a_console_session_runs_on_it() {
+    // An interactive exec or console stays running for as long as its session is open, and writes nothing. A token operation
+    // runs nothing. Before this rule each one held the read-back to the operation deadline.
+    let (scratch, fake) = start("op-sessions");
+    let provider =
+        provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::from_secs(20));
+    let target = svc_instance("k1");
+    fake.hold_operation_as(&target, "websocket", "Executing command");
+    fake.hold_operation_as(&target, "task", "Executing command");
+    fake.hold_operation_as(&target, "websocket", "Showing console");
+    fake.hold_operation_as(&target, "token", "Image download token");
+    let started = Instant::now();
+    assert!(
+        matches!(
+            Provider::read_back(&provider, &entry("toy"), &target, None),
+            Ok(ReadBack::Present { .. })
+        ),
+        "the object is read while only sessions run on it"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let paths = paths_since(&fake, 0);
+    assert!(
+        !paths.iter().any(|path| path.contains("/wait")),
+        "no session is waited on: {paths:?}"
+    );
+}
+
+#[test]
+fn a_read_back_still_waits_for_a_websocket_create_on_its_object() {
+    // Incus runs a push migration's create as a websocket operation, so its class does not free the object.
+    let (scratch, fake) = start("op-websocket-create");
+    let provider =
+        provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::from_millis(300));
+    let target = svc_instance("k1");
+    fake.hold_operation_as(&target, "websocket", "Executing command");
+    fake.hold_operation_as(&target, "websocket", "Creating instance");
+    assert_eq!(
+        Provider::read_back(&provider, &entry("toy"), &target, None),
+        Err(EffectRefusal::Unresolved)
+    );
+    assert!(
+        !paths_since(&fake, 0)
+            .iter()
+            .any(|path| path.starts_with("/1.0/instances/")),
+        "the object was not read while a create ran on it"
+    );
+}
+
+#[test]
+fn a_read_back_pauses_between_listings_when_a_wait_says_an_operation_ended_that_is_still_listed() {
+    let (scratch, fake) = start("op-wait-ended");
+    let provider =
+        provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::from_millis(500));
+    let target = svc_instance("k1");
+    let held = fake.hold_operation(&target);
+    fake.answer_wait_ended(&held);
+    assert_eq!(
+        Provider::read_back(&provider, &entry("toy"), &target, None),
+        Err(EffectRefusal::Unresolved),
+        "an operation still listed at the deadline holds the object"
+    );
+    let listings = paths_since(&fake, 0)
+        .iter()
+        .filter(|path| path.as_str() == OPERATIONS_PATH)
+        .count();
+    assert!(
+        listings <= 10,
+        "a pause of 100 ms comes between two listings: {listings} in 500 ms"
+    );
+}
+
+#[test]
 fn a_read_back_with_no_deadline_left_is_unresolved_at_once_while_an_operation_runs() {
     let (scratch, fake) = start("op-zero");
     let provider = provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::ZERO);

@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_incus::{
     Appears, FakeIncus, FakeState, IncusError, IncusRead, OPERATIONS_PATH, RunningOp, UnixIncus,
-    operation_names, running_on, running_operations, wait_operation,
+    operation_names, running_on, running_operations, wait_operation, writing_on,
 };
 use arca_kernel::ownership::{IncusKind, ObjectRef};
 use serde_json::{Value, json};
@@ -90,6 +90,8 @@ fn running(resources: &[&str]) -> RunningOp {
         id: OP.to_string(),
         status_code: 103,
         resources: resources.iter().map(|url| url.to_string()).collect(),
+        class: None,
+        description: None,
     }
 }
 
@@ -164,6 +166,88 @@ fn the_listing_keeps_only_the_operations_that_have_not_ended() {
         OPERATIONS_PATH,
         "/1.0/operations?all-projects=true&recursion=1"
     );
+}
+
+#[test]
+fn the_listing_reads_each_operations_class_and_description_when_they_are_text() {
+    let listing = json!({ "running": [
+        { "id": "00000000-0000-4000-8000-000000000001", "class": "websocket", "description": "Executing command", "status_code": 103 },
+        { "id": "00000000-0000-4000-8000-000000000002", "status_code": 103 },
+        { "id": "00000000-0000-4000-8000-000000000003", "class": 2, "description": null, "status_code": 103 },
+    ]});
+    let found = running_operations(&Canned::new(Ok(listing))).expect("the listing reads");
+    let read: Vec<(Option<&str>, Option<&str>)> = found
+        .iter()
+        .map(|op| (op.class.as_deref(), op.description.as_deref()))
+        .collect();
+    assert_eq!(
+        read,
+        vec![
+            (Some("websocket"), Some("Executing command")),
+            (None, None),
+            (None, None)
+        ]
+    );
+}
+
+#[test]
+fn only_an_operation_that_can_still_create_change_or_delete_its_object_may_write_it() {
+    let typed = |class: &str, description: &str| RunningOp {
+        class: Some(class.to_string()),
+        description: Some(description.to_string()),
+        ..running(&[])
+    };
+    // Incus runs an exec as a websocket operation, or as a task one without websockets, a console as a websocket one, and a
+    // token operation runs nothing at all. None of them writes the instance, and a session stays running while it is open.
+    for (class, description) in [
+        ("websocket", "Executing command"),
+        ("task", "Executing command"),
+        ("websocket", "Showing console"),
+        ("token", "Image download token"),
+    ] {
+        assert!(
+            !typed(class, description).may_write(),
+            "{class} {description}"
+        );
+    }
+    // A push migration's create is a websocket operation, so the class alone frees nothing; a description is matched exactly.
+    for (class, description) in [
+        ("websocket", "Creating instance"),
+        ("websocket", "Migrating instance"),
+        ("task", "Creating instance"),
+        ("task", "Updating instance"),
+        ("task", "Deleting instance"),
+        ("task", "executing command"),
+        ("task", "Held by the test"),
+    ] {
+        assert!(
+            typed(class, description).may_write(),
+            "{class} {description}"
+        );
+    }
+    assert!(
+        running(&[]).may_write(),
+        "an operation with no class and no description may write"
+    );
+}
+
+#[test]
+fn writing_on_leaves_out_the_sessions_running_on_an_object() {
+    let (_dir, fake) = start("writing-on");
+    let target = object(IncusKind::Instance, "svc", None, "db1");
+    fake.hold_operation_as(&target, "websocket", "Executing command");
+    fake.hold_operation_as(&target, "task", "Executing command");
+    fake.hold_operation_as(&target, "websocket", "Showing console");
+    let create = fake.hold_operation_as(&target, "websocket", "Creating instance");
+    let read = reader(&fake);
+    let all = running_on(&read, IncusKind::Instance, "svc", None, "db1").expect("lists");
+    assert_eq!(
+        all.len(),
+        4,
+        "running_on holds every operation that names it"
+    );
+    let writing = writing_on(&read, IncusKind::Instance, "svc", None, "db1").expect("lists");
+    assert_eq!(ids(&writing), vec![create.as_str()]);
 }
 
 #[test]

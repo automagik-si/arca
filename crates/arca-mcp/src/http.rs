@@ -7,7 +7,8 @@
 //! listener binds one address that lies in the tailnet ranges, and every TCP peer is checked against the same ranges; a
 //! peer outside them is dropped before any byte is read or written. The proxy listener binds one fixed address outside the
 //! tailnet ranges for a reverse proxy on the same host, and serves exactly one peer address; any other peer is dropped the
-//! same way. Each listener serves at most [`MAX_CONNECTIONS`] connections at once.
+//! same way. The proxy address may not be assigned yet when the server starts, so its bind is tried again for a while. Each
+//! listener serves at most [`MAX_CONNECTIONS`] connections at once.
 
 use std::collections::HashMap;
 use std::fs;
@@ -46,6 +47,13 @@ const MAX_CONNECTIONS: usize = 64;
 const RESERVED_PORTS: [u16; 4] = [80, 443, 7443, 9443];
 /// How long a listener waits after a failed accept before it tries again.
 const ACCEPT_RETRY: Duration = Duration::from_secs(1);
+/// How the proxy listener tries again to bind an address that is not assigned yet, such as a bridge's before the bridge is up
+/// at boot: for 120 s from the first try, pausing 1 s, then twice as long each time, up to 16 s.
+const PROXY_BIND: Backoff = Backoff {
+    wait: Duration::from_secs(120),
+    first: Duration::from_secs(1),
+    max: Duration::from_secs(16),
+};
 
 /// The server: the verb table, the token store and one handler per verb.
 pub struct Server {
@@ -218,14 +226,76 @@ pub async fn serve_tailnet(router: Router, addr: SocketAddr) -> io::Result<()> {
 /// Serves `router` on one proxy address, to the single peer address `peer` only. The address must pass
 /// [`proxy_addr_ok`]. A peer is compared as its IPv4 address when it arrives IPv4-mapped, and every other peer is closed at
 /// accept with no bytes sent. The bearer rules are the same as on every listener.
+///
+/// An address that is not assigned yet is bound again for up to 120 s (see [`PROXY_BIND`]), each try logged on stderr, so a
+/// server started at boot before its bridge is up waits for the bridge. Any other bind error fails at once.
 pub async fn serve_proxy(router: Router, addr: SocketAddr, peer: IpAddr) -> io::Result<()> {
     proxy_addr_ok(&addr).map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
-    let listener = TcpListener::bind(addr).await?;
+    let mut waited = false;
+    let listener = bind_when_assigned(
+        PROXY_BIND,
+        || TcpListener::bind(addr),
+        |error: &io::Error, pause: Duration| {
+            waited = true;
+            eprintln!(
+                "arca: the proxy address {addr} cannot be bound yet ({error}); trying again in {:.1} s",
+                pause.as_secs_f64()
+            );
+        },
+    )
+    .await
+    .map_err(|error| io::Error::new(error.kind(), format!("the proxy address {addr}: {error}")))?;
+    if waited {
+        eprintln!("arca: the proxy address {addr} is bound");
+    }
     let peer = peer.to_canonical();
     serve_filtered(router, listener, move |ip: &IpAddr| {
         ip.to_canonical() == peer
     })
     .await
+}
+
+/// How a bind is tried again: for `wait` from the first try, pausing `first`, then twice as long each time, up to `max`.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    wait: Duration,
+    first: Duration,
+    max: Duration,
+}
+
+/// Runs `bind` until it succeeds or fails with an error other than [`io::ErrorKind::AddrNotAvailable`], which it returns at
+/// once. While the address is not assigned, `bind` is tried again after each pause of `backoff`, and each failure and the
+/// pause after it go to `log` first. The last pause ends at the end of the wait, and a try then that still finds the address
+/// not assigned fails, naming the wait.
+async fn bind_when_assigned<L, F, Fut>(
+    backoff: Backoff,
+    mut bind: F,
+    mut log: impl FnMut(&io::Error, Duration),
+) -> io::Result<L>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = io::Result<L>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut pause = backoff.first;
+    loop {
+        let error = match bind().await {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => error,
+            Err(error) => return Err(error),
+        };
+        let left = backoff.wait.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("not assigned within {:?}: {error}", backoff.wait),
+            ));
+        }
+        let next = pause.min(left);
+        log(&error, next);
+        tokio::time::sleep(next).await;
+        pause = pause.saturating_mul(2).min(backoff.max);
+    }
 }
 
 /// Serves `router` on an already bound TCP listener, admitting only the peers `allow` accepts, and at most
@@ -459,7 +529,106 @@ fn in_tailnet(ip: &IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::owner_admitted;
+    use std::io;
+    use std::time::{Duration, Instant};
+
+    use super::{Backoff, bind_when_assigned, owner_admitted};
+
+    /// A backoff short enough for a test: 10 ms, doubling up to 40 ms, for 300 ms.
+    const QUICK: Backoff = Backoff {
+        wait: Duration::from_millis(300),
+        first: Duration::from_millis(10),
+        max: Duration::from_millis(40),
+    };
+
+    fn not_assigned() -> io::Error {
+        io::Error::from(io::ErrorKind::AddrNotAvailable)
+    }
+
+    #[tokio::test]
+    async fn a_bind_refused_while_its_address_is_not_assigned_is_tried_again_with_a_doubling_pause()
+    {
+        let mut tries = 0;
+        let mut pauses = Vec::new();
+        // A wait no slow run reaches, so every pause is the backoff's own.
+        let long = Backoff {
+            wait: Duration::from_secs(30),
+            ..QUICK
+        };
+        let bound = bind_when_assigned(
+            long,
+            || {
+                tries += 1;
+                let now = tries;
+                async move {
+                    if now < 5 {
+                        Err(not_assigned())
+                    } else {
+                        Ok(now)
+                    }
+                }
+            },
+            |error: &io::Error, pause| {
+                assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+                pauses.push(pause);
+            },
+        )
+        .await;
+        assert_eq!(bound.ok(), Some(5), "the fifth try binds");
+        let ms = Duration::from_millis;
+        assert_eq!(
+            pauses,
+            [ms(10), ms(20), ms(40), ms(40)],
+            "each pause is logged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bind_whose_address_is_still_not_assigned_at_the_end_of_the_wait_fails_naming_the_wait()
+     {
+        let started = Instant::now();
+        let mut pauses = Vec::new();
+        let bound: io::Result<()> = bind_when_assigned(
+            QUICK,
+            || async { Err(not_assigned()) },
+            |_: &io::Error, pause| {
+                pauses.push(pause);
+            },
+        )
+        .await;
+        let error = bound.expect_err("the address never comes up");
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        assert!(error.to_string().contains("not assigned within"), "{error}");
+        assert!(
+            started.elapsed() >= QUICK.wait,
+            "it tried for the whole wait"
+        );
+        assert!(pauses.iter().all(|pause| *pause <= QUICK.max), "{pauses:?}");
+        assert!(pauses.iter().sum::<Duration>() <= QUICK.wait, "{pauses:?}");
+    }
+
+    #[tokio::test]
+    async fn any_other_bind_error_fails_at_once_with_no_pause() {
+        for kind in [
+            io::ErrorKind::AddrInUse,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+        ] {
+            let mut tries = 0;
+            let mut pauses = Vec::new();
+            let bound: io::Result<()> = bind_when_assigned(
+                QUICK,
+                || {
+                    tries += 1;
+                    async move { Err(io::Error::from(kind)) }
+                },
+                |_: &io::Error, pause| pauses.push(pause),
+            )
+            .await;
+            assert_eq!(bound.map_err(|e| e.kind()), Err(kind));
+            assert_eq!((tries, pauses.len()), (1, 0), "{kind:?} is not tried again");
+        }
+    }
 
     #[test]
     fn a_peer_is_admitted_only_with_the_servers_own_uid() {

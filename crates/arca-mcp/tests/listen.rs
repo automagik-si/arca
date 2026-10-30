@@ -600,6 +600,52 @@ fn serve_proxy_refuses_a_refused_address_before_it_binds() {
     }
 }
 
+#[test]
+fn serve_proxy_keeps_trying_an_address_that_is_not_assigned_yet() {
+    // No host carries the documentation address 192.0.2.1, so its bind fails as a bridge address's does before the bridge is
+    // up at boot. A host that binds addresses it does not carry cannot show this.
+    let at = addr("192.0.2.1:7461");
+    match std::net::TcpListener::bind(at) {
+        Err(err) if err.kind() == ErrorKind::AddrNotAvailable => {}
+        other => {
+            eprintln!("skipped: this host binds an address it does not carry: {other:?}");
+            return;
+        }
+    }
+    let rt = Runtime::new().expect("runtime");
+    let router = empty_router("proxy-unassigned");
+    let outcome = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(1500),
+            serve_proxy(router, at, ip("192.0.2.2")),
+        )
+        .await
+    });
+    assert!(
+        outcome.is_err(),
+        "the proxy listener is still waiting for its address: {outcome:?}"
+    );
+}
+
+#[test]
+fn serve_proxy_fails_at_once_on_an_address_already_in_use() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
+    let at = held.local_addr().expect("its address");
+    let rt = Runtime::new().expect("runtime");
+    let router = empty_router("proxy-in-use");
+    let outcome = rt.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_proxy(router, at, ip("127.0.0.2")),
+        )
+        .await
+    });
+    let err = outcome
+        .expect("the bind is not tried again")
+        .expect_err("a port in use is never bound");
+    assert_eq!(err.kind(), ErrorKind::AddrInUse);
+}
+
 /// A free loopback port: bound once, read, and released for the listener under test.
 fn free_loopback_port() -> SocketAddr {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe");
