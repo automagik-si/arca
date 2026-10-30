@@ -39,6 +39,12 @@ const TYPE_NAMES: &[&str] = &[
     "null", "boolean", "string", "array", "object", "number", "integer",
 ];
 
+/// Whether a keyword is outside the subset: not supported, not an annotation and not an `x-` extension. The schema check
+/// refuses such a keyword, and the compatibility checker treats a difference in it as a break.
+pub(crate) fn outside_subset(key: &str) -> bool {
+    !(key.starts_with("x-") || ANNOTATIONS.contains(&key) || SUPPORTED.contains(&key))
+}
+
 /// Whether `value` conforms to `schema`. The first failure is returned as `Err`, naming its path and reason.
 pub fn conforms(schema: &Value, value: &Value) -> Result<(), String> {
     check_schema(schema, "")?;
@@ -46,14 +52,15 @@ pub fn conforms(schema: &Value, value: &Value) -> Result<(), String> {
 }
 
 /// The schema itself must be inside the subset. Every nested schema is visited, so an unsupported keyword is refused even
-/// where the value never reaches it.
-fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
+/// where the value never reaches it. Each supported keyword must also hold a value of its own type: `enum` an array,
+/// `minimum` a number, `required` an array of names, and so on. The document check runs this over every schema of a
+/// method, so a malformed one fails the compatibility gate.
+pub(crate) fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
     let Value::Object(map) = schema else {
         return Err(format!("{}: a schema must be an object", here(at)));
     };
     for key in map.keys() {
-        let skip = key.starts_with("x-") || ANNOTATIONS.contains(&key.as_str());
-        if !skip && !SUPPORTED.contains(&key.as_str()) {
+        if outside_subset(key) {
             return Err(format!("{}: keyword {key} is not supported", here(at)));
         }
     }
