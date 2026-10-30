@@ -39,7 +39,7 @@ const USAGE: &str = "usage: arca <command>
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
   adopt apply --instance <name> --plan-digest <hex> [--dry-run] --config <file>
   adopt release --instance <name> [--dry-run] --config <file>
-  adopt verify --instance <name> --port <n> [--http-path <path>] [--wait <seconds>] --config <file>
+  adopt verify --instance <name> (--port <n> [--http-path <path>] | --url <http url>) [--wait <seconds>] --config <file>
   adopt status --instance <name> --json --config <file>";
 
 /// Why a command ended without a result. The message never carries a token, a secret or a key.

@@ -513,6 +513,12 @@ second file that names the service's `stateDir`, the adoption project in `kernel
    runs under the uuid the record holds, with the pre-image's MAC and IPv4 on `eth0`, then connects to `<ipv4>:<port>`
    and needs an HTTP answer below 500 within 10 s. It tries again every 2 s for up to `--wait` seconds (60 by default, at
    most 3600), so a lease still being given or a service still starting is waited for, and then reports the last failure.
+   A container whose `eth0` ACL admits only its reverse proxy never answers the host on its own port: give
+   `--url http://<proxy host>[:<port>]/<path>` in place of `--port` (exactly one of the two is required, and `--http-path`
+   goes with `--port` only). The instance checks are the same; the port probe is replaced by one GET of the URL, which must
+   answer 2xx or 3xx within 10 s, retried within `--wait` as above. A redirect is not followed: a 3xx is the answer. Only
+   `http://` is supported, since arca carries no TLS client, so point it at a plain-HTTP listener of the proxy. The URL may
+   not carry user info or a fragment, and the host name is resolved by the system resolver, outside the 10 s.
 5. Start the service again. `watch_report` and `arca watch --once --json` count each adoption that is not released in full as
    a live entry, so the instance shows in its adoption project as kernel-owned (`adopt-svc1`) with no drift.
 
@@ -556,6 +562,12 @@ back off at RestoreRoot, after MoveBack, only when the instance's own root is st
 profile still gives the same one: one full PUT of the instance as read, under its ETag, less that device. A root that
 changed meanwhile is kept, and the release refuses before ReleaseStop.
 
+A snapshot keeps only the instance's own devices, so every snapshot taken before LocalizeRoot, the adoption's own
+`arca-adopt-<digest[0..12]>` and any earlier one, holds no root. When the instance moves back, Incus gives such a snapshot a
+bare root on the pool with no `size`, and restoring it later drops the root's size. The adoption does not rewrite
+snapshots: after restoring one, set the size on the instance again (`incus config device set <instance> root
+size=<size>`). `plan` and the dry run say so under `allowances.why`, keyed `localize.root`, with the size the profile gives.
+
 **Resume.** When `apply` stops at any point, whether a kill, a crash or a failed step, run the same `apply` with the same
 digest again. It goes on from the plan in the record, never from a fresh preflight, which would refuse an instance that has
 moved. A step whose intent is the last line runs again without a second intent, and a step that had landed sends nothing.
@@ -589,7 +601,7 @@ Exit codes: `2` for a refusal before any write: an instance the config does not 
 digest that is not the recorded plan's, a record that holds no such adoption, another open adoption, a resume after a
 release has begun, a release of an instance that lost its pin or whose localized root RestoreRoot would keep, a verify before
 the adoption or release completed, or a bad
-`--port`, `--http-path` or `--wait`. `1` for a held
+`--port`, `--http-path`, `--url` or `--wait` (or both or neither of `--port` and `--url`). `1` for a held
 lock, a failed step (the record names it) or a failed verify.
 
 ## Tests

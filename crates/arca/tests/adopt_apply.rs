@@ -951,10 +951,19 @@ fn an_instance_whose_nic_sets_its_ip_and_acls_and_whose_root_a_profile_gives_is_
 
     // The plan allows nothing past the base, localizes the root, and shows the eth0 keys the pin keeps.
     let planned = plan_of(&config);
+    // Every snapshot taken before LocalizeRoot, the adoption's own among them, holds no root of its own, so the plan says that
+    // restoring one after the release gives a root without the profile's size.
+    let note = &planned["allowances"]["why"]["localize.root"];
+    assert_eq!(note.as_array().map(Vec::len), Some(1), "{note}");
+    let note = note[0].as_str().expect("a note");
+    for part in ["snapshot", "arca-adopt-", "size", "60GiB", "restor"] {
+        assert!(note.contains(part), "{part}: {note}");
+    }
     assert_eq!(
         planned["allowances"],
         json!({
-            "project": {}, "localize": { "root": root() }, "why": {},
+            "project": {}, "localize": { "root": root() },
+            "why": { "localize.root": [note] },
             "nic": { "ipv4.address": ADOPT_IP, "security.acls": "web",
                 "security.acls.default.egress.action": "allow",
                 "security.acls.default.ingress.action": "drop" },

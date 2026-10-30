@@ -11,8 +11,9 @@
 //!   record stands, keeping the pin and the snapshot, takes back off a root the adoption made the instance's own, and deletes
 //!   the adoption project. It refuses before any step when the instance has lost its pin, or when the profiles no longer give
 //!   the root it would take off.
-//! - `verify --instance <i> --port <n> [--http-path <p>] [--wait <s>] --config <f>` checks the live MAC and IPv4 against the
-//!   pre-image and that the service answers below 500, trying again for up to `--wait` seconds (60 by default).
+//! - `verify --instance <i> (--port <n> [--http-path <p>] | --url <http url>) [--wait <s>] --config <f>` checks the live MAC
+//!   and IPv4 against the pre-image and that the service answers: below 500 on `<ipv4>:<port>`, or 2xx or 3xx through the
+//!   URL, trying again for up to `--wait` seconds (60 by default).
 //! - `status --instance <i> --json --config <f>` prints the record's plan and last step, and where the instance is now.
 //!
 //! A refusal before any write exits 2 ([`Failure::Refused`]): an instance the config does not list, a preflight check, a stale
@@ -20,8 +21,9 @@
 //! names a failed step.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -85,7 +87,7 @@ pub fn adopt_halting(argv: &[String], halt: Halt<'_>) -> Result<Option<Value>, F
         ),
         "verify" => verify_command(&parse_flags(
             rest,
-            &["instance", "port", "http-path", "wait", "config"],
+            &["instance", "port", "http-path", "url", "wait", "config"],
             &[],
         )?),
         "status" => status(&parse_flags(rest, &["instance", "config"], &["json"])?),
@@ -366,7 +368,8 @@ fn dry_run_of(
 /// What the plan allows past the kernel's own restrictions, as `plan` and a dry run print it: `project`, the `restricted.*`
 /// keys its adoption project sets beyond the base; `localize`, the devices a profile gives that it makes the instance's own;
 /// `nic`, the keys of the instance's `eth0` past the three that name it, which the pin keeps; and `why`, for each key of
-/// `project`, the config keys and devices that need it. All but `why` are in the digest; `why` is derived from the pre-image.
+/// `project`, the config keys and devices that need it, and for each localized device (`localize.<name>`) what that costs the
+/// snapshots taken before it. All but `why` are in the digest; `why` is derived from the plan.
 pub fn allowances_json(plan: &AdoptionPlan) -> Value {
     let pre = &plan.pre_image;
     let mut why = needed_allowances(&pre.config, &pre.devices)
@@ -374,6 +377,20 @@ pub fn allowances_json(plan: &AdoptionPlan) -> Value {
         .unwrap_or_default();
     if plan.allowances.project.contains_key(NETWORKS_ACCESS) {
         why.insert(NETWORKS_ACCESS.to_string(), vec![format!("devices.{NIC}")]);
+    }
+    // A snapshot keeps the instance's own devices, so one taken before LocalizeRoot holds no root, and the move between projects
+    // gives it a bare root: restored after the release, it loses the size the profile gave. Nothing rewrites a snapshot.
+    for (name, device) in &plan.allowances.localize {
+        let size = device
+            .get("size")
+            .map_or_else(String::new, |size| format!(" of {size}"));
+        why.insert(
+            format!("localize.{name}"),
+            vec![format!(
+                "the {name} comes from a profile: the snapshot {} and every earlier snapshot hold no {name} of their own, so after the release Incus gives each a {name} with no size, and restoring one drops the {name}'s size{size}",
+                plan.snapshot
+            )],
+        );
     }
     let nic: BTreeMap<&String, &String> = pre
         .devices
@@ -494,7 +511,28 @@ pub fn verify_with(
         return Err(port_usage());
     }
     check_http_path(path)?;
-    let failed = |why: String| Failure::Runtime(format!("verify failed: {why}"));
+    check_instance(read, plan, uuid, project)?;
+    let status = probe(
+        SocketAddrV4::new(plan.pre_image.ipv4, port),
+        path,
+        VERIFY_TIMEOUT,
+    )
+    .map_err(|why| verify_failed(format!("the service did not answer on port {port}: {why}")))?;
+    if status >= 500 {
+        return Err(verify_failed(format!("the service answered {status}")));
+    }
+    Ok(verified(plan, status))
+}
+
+/// Checks that the planned instance runs in `project` under `uuid`, the one the record holds last, with the pre-image's MAC
+/// and IPv4 on `eth0`, with GET alone. Every failed check is a runtime failure that names it.
+fn check_instance(
+    read: &dyn IncusRead,
+    plan: &AdoptionPlan,
+    uuid: &str,
+    project: &str,
+) -> Result<(), Failure> {
+    let failed = verify_failed;
     let read_failed =
         |error: IncusError| Failure::Runtime(format!("the verify read failed: {error}"));
     let i = &plan.instance;
@@ -530,20 +568,182 @@ pub fn verify_with(
     if addresses != [plan.pre_image.ipv4] {
         return Err(failed("eth0's IPv4 is not the pre-image's".to_string()));
     }
-    let status = probe(
-        SocketAddrV4::new(plan.pre_image.ipv4, port),
-        path,
-        VERIFY_TIMEOUT,
-    )
-    .map_err(|why| failed(format!("the service did not answer on port {port}: {why}")))?;
-    if status >= 500 {
-        return Err(failed(format!("the service answered {status}")));
-    }
-    Ok(Verified {
+    Ok(())
+}
+
+fn verify_failed(why: String) -> Failure {
+    Failure::Runtime(format!("verify failed: {why}"))
+}
+
+fn verified(plan: &AdoptionPlan, http_status: u16) -> Verified {
+    Verified {
         mac: plan.pre_image.mac.clone(),
         ipv4: plan.pre_image.ipv4,
-        http_status: status,
+        http_status,
+    }
+}
+
+/// An `http://` URL that `verify --url` gets: the host as given (a name, an IPv4 address or a bracketed IPv6 address), the
+/// port (80 when the URL names none) and the path with its query (`/` when the URL names none). It holds no user info and no
+/// fragment, and the path is visible ASCII only, so nothing past the request line can reach the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpUrl {
+    pub host: String,
+    pub port: u16,
+    pub path: String,
+}
+
+impl HttpUrl {
+    /// Parses `text` as a plain `http://` URL. `https://` is refused: the workspace carries no TLS client. A refusal is a
+    /// usage failure that never echoes the URL, which may carry a secret.
+    pub fn parse(text: &str) -> Result<HttpUrl, Failure> {
+        let bad = |why: &str| Failure::Usage(format!("--url {why}"));
+        let scheme_end = text
+            .find("://")
+            .ok_or_else(|| bad("must start with http://"))?;
+        let scheme = &text[..scheme_end];
+        if scheme.eq_ignore_ascii_case("https") {
+            return Err(Failure::Usage(
+                "--url takes http:// only: https is not supported, since arca carries no TLS client".to_string(),
+            ));
+        }
+        if !scheme.eq_ignore_ascii_case("http") {
+            return Err(bad("must start with http://"));
+        }
+        let rest = &text[scheme_end + 3..];
+        let split = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (authority, path) = rest.split_at(split);
+        let path = match path {
+            "" => "/".to_string(),
+            query if query.starts_with('?') => format!("/{query}"),
+            path => path.to_string(),
+        };
+        if path.len() > 1024
+            || !path
+                .bytes()
+                .all(|b| (0x21..=0x7e).contains(&b) && b != b'#')
+        {
+            return Err(bad(
+                "must have a path of at most 1024 visible ASCII characters and no fragment",
+            ));
+        }
+        if authority.contains('@') {
+            return Err(bad("must not carry user info"));
+        }
+        let (host, port) = if let Some(inner) = authority.strip_prefix('[') {
+            let close = inner
+                .find(']')
+                .ok_or_else(|| bad("has an IPv6 host with no closing ]"))?;
+            inner[..close]
+                .parse::<std::net::Ipv6Addr>()
+                .map_err(|_| bad("has a bracketed host that is not an IPv6 address"))?;
+            (&authority[..close + 2], &authority[close + 2..])
+        } else {
+            let colon = authority.find(':').unwrap_or(authority.len());
+            let host = &authority[..colon];
+            if host.len() > 253
+                || !host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+            {
+                return Err(bad("must name a host of letters, digits, dots and hyphens"));
+            }
+            (host, &authority[colon..])
+        };
+        if host.is_empty() {
+            return Err(bad("must name a host"));
+        }
+        let port = match port {
+            "" => 80,
+            port => port
+                .strip_prefix(':')
+                .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|digits| digits.parse::<u16>().ok())
+                .filter(|port| *port > 0)
+                .ok_or_else(|| bad("must name a port from 1 to 65535"))?,
+        };
+        Ok(HttpUrl {
+            host: host.to_string(),
+            port,
+            path,
+        })
+    }
+
+    /// The host and port the request's `Host` header names: the port is left out when the URL left it out.
+    fn authority(&self) -> String {
+        if self.port == 80 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+impl fmt::Display for HttpUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "http://{}{}", self.authority(), self.path)
+    }
+}
+
+/// The HTTP request `verify --url` makes: one GET of the URL, answered within the timeout, as the status code. [`url_probe`]
+/// is the one a command uses; a test passes its own.
+pub type UrlProbe<'a> = &'a dyn Fn(&HttpUrl, Duration) -> Result<u16, String>;
+
+/// Checks the instance as [`verify_with`] does, then that a GET of `url` answers 2xx or 3xx within [`VERIFY_TIMEOUT`]. The URL
+/// replaces the port probe for a service that answers only through what is in front of it, such as a reverse proxy, when the
+/// instance's ACL admits nothing else. A redirect is not followed: a 3xx is the answer. It sends no write.
+pub fn verify_url_with(
+    read: &dyn IncusRead,
+    plan: &AdoptionPlan,
+    uuid: &str,
+    project: &str,
+    url: &HttpUrl,
+    probe: UrlProbe<'_>,
+) -> Result<Verified, Failure> {
+    check_instance(read, plan, uuid, project)?;
+    let status = probe(url, VERIFY_TIMEOUT)
+        .map_err(|why| verify_failed(format!("the service did not answer at {url}: {why}")))?;
+    if !(200..400).contains(&status) {
+        return Err(verify_failed(format!(
+            "the service at {url} answered {status}, not 2xx or 3xx"
+        )));
+    }
+    Ok(verified(plan, status))
+}
+
+/// [`verify_url_with`] again every `interval` while it fails and `wait` has not run out, as [`verify_until`] does.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_url_until(
+    read: &dyn IncusRead,
+    plan: &AdoptionPlan,
+    uuid: &str,
+    project: &str,
+    url: &HttpUrl,
+    wait: Duration,
+    interval: Duration,
+    probe: UrlProbe<'_>,
+) -> Result<Verified, Failure> {
+    retry_until(wait, interval, || {
+        verify_url_with(read, plan, uuid, project, url, probe)
     })
+}
+
+/// Runs `attempt` again every `interval` while it fails at run time and `wait` has not run out. Once the time is out, the
+/// failure of the last attempt is the answer. With no wait, it is one attempt. A usage failure is never retried.
+fn retry_until(
+    wait: Duration,
+    interval: Duration,
+    mut attempt: impl FnMut() -> Result<Verified, Failure>,
+) -> Result<Verified, Failure> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match attempt() {
+            Err(Failure::Runtime(_)) if Instant::now() < deadline => {
+                thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            answer => return answer,
+        }
+    }
 }
 
 /// [`verify_with`] again every `interval` while it fails at run time and `wait` has not run out, so a lease still being
@@ -561,31 +761,62 @@ pub fn verify_until(
     interval: Duration,
     probe: Probe<'_>,
 ) -> Result<Verified, Failure> {
-    let deadline = Instant::now() + wait;
-    loop {
-        match verify_with(read, plan, uuid, project, port, path, probe) {
-            Err(Failure::Runtime(_)) if Instant::now() < deadline => {
-                thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
-            }
-            answer => return answer,
-        }
-    }
+    retry_until(wait, interval, || {
+        verify_with(read, plan, uuid, project, port, path, probe)
+    })
 }
 
 /// Connects to `addr`, sends `GET <path> HTTP/1.1` and returns the status code of the answer's status line, all within
 /// `timeout`. A refused or timed-out connect, a closed connection and an answer that is not HTTP/1 are each an error.
 pub fn http_probe(addr: SocketAddrV4, path: &str, timeout: Duration) -> Result<u16, String> {
+    http_get(
+        &[SocketAddr::V4(addr)],
+        &addr.to_string(),
+        path,
+        Instant::now() + timeout,
+    )
+}
+
+/// Resolves the URL's host, connects to the first of its addresses that accepts, sends `GET <path> HTTP/1.1` with the URL's
+/// host as `Host`, and returns the status code of the answer's status line, all within `timeout`. The name lookup is the
+/// system resolver's and is not bound by the timeout.
+pub fn url_probe(url: &HttpUrl, timeout: Duration) -> Result<u16, String> {
     let deadline = Instant::now() + timeout;
+    let host = url.host.trim_start_matches('[').trim_end_matches(']');
+    let addrs: Vec<SocketAddr> = (host, url.port)
+        .to_socket_addrs()
+        .map_err(|error| format!("the host name did not resolve ({})", error.kind()))?
+        .collect();
+    http_get(&addrs, &url.authority(), &url.path, deadline)
+}
+
+/// One GET of `path` with `host` as `Host`, to the first of `addrs` that accepts, answered by `deadline`, as the status code.
+fn http_get(
+    addrs: &[SocketAddr],
+    host: &str,
+    path: &str,
+    deadline: Instant,
+) -> Result<u16, String> {
     let left = || {
         deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
             .ok_or_else(|| "no answer within the deadline".to_string())
     };
-    let mut stream = TcpStream::connect_timeout(&SocketAddr::V4(addr), left()?)
-        .map_err(|error| format!("the TCP connect failed ({})", error.kind()))?;
+    let mut last = "the host name resolved to no address".to_string();
+    let mut connected = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(addr, left()?) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(error) => last = format!("the TCP connect failed ({})", error.kind()),
+        }
+    }
+    let mut stream = connected.ok_or(last)?;
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUser-Agent: arca-verify\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: arca-verify\r\nAccept: */*\r\nConnection: close\r\n\r\n"
     );
     stream
         .set_write_timeout(Some(left()?))
@@ -647,20 +878,44 @@ fn check_http_path(path: &str) -> Result<(), Failure> {
     }
 }
 
-/// `verify --instance <i> --port <n> [--http-path <p>] [--wait <s>] --config <f>`: runs [`verify_until`] where the record says
+/// `verify --instance <i> (--port <n> [--http-path <p>] | --url <http url>) [--wait <s>] --config <f>`: runs [`verify_until`],
+/// or [`verify_url_until`] for a URL, where the record says
 /// the instance is, in its adoption project after an adoption and in `default` after a release, for up to `--wait` seconds
 /// (60 when not given, at most 3600). It takes no lock and sends no write. An adoption that is neither complete nor released
 /// in full is refused.
+/// What `verify` probes after the instance checks: a port of the instance's IPv4 and a path, or a URL.
+enum Service<'a> {
+    Port(u16, &'a str),
+    Url(HttpUrl),
+}
+
 fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
     let (cfg, target) = setup(flags)?;
-    let port = flags
-        .required("port")?
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port > 0)
-        .ok_or_else(port_usage)?;
-    let path = flags.value("http-path").unwrap_or("/");
-    check_http_path(path)?;
+    let service = match (flags.value("port"), flags.value("url")) {
+        (Some(port), None) => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(port_usage)?;
+            let path = flags.value("http-path").unwrap_or("/");
+            check_http_path(path)?;
+            Service::Port(port, path)
+        }
+        (None, Some(url)) => {
+            if flags.value("http-path").is_some() {
+                return Err(Failure::Usage(
+                    "--http-path goes with --port: a --url carries its own path".to_string(),
+                ));
+            }
+            Service::Url(HttpUrl::parse(url)?)
+        }
+        _ => {
+            return Err(Failure::Usage(
+                "exactly one of --port and --url is required".to_string(),
+            ));
+        }
+    };
     let wait = match flags.value("wait") {
         None => VERIFY_WAIT,
         Some(text) => text
@@ -688,22 +943,41 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     let read = UnixIncus::new(cfg.incus.socket.clone());
     let uuid = recorded_uuid(&record, &plan);
-    let verified = verify_until(
-        &read,
-        &plan,
-        &uuid,
-        project,
-        port,
-        path,
-        wait,
-        VERIFY_INTERVAL,
-        &http_probe,
-    )?;
-    Ok(Some(json!({
-        "instance": target.instance, "project": project, "mac": verified.mac,
-        "ipv4": verified.ipv4.to_string(), "port": port, "httpPath": path,
-        "httpStatus": verified.http_status, "verified": true,
-    })))
+    let mut answer = match &service {
+        Service::Port(port, path) => {
+            let verified = verify_until(
+                &read,
+                &plan,
+                &uuid,
+                project,
+                *port,
+                path,
+                wait,
+                VERIFY_INTERVAL,
+                &http_probe,
+            )?;
+            json!({ "port": port, "httpPath": path, "httpStatus": verified.http_status, "mac": verified.mac,
+                "ipv4": verified.ipv4.to_string() })
+        }
+        Service::Url(url) => {
+            let verified = verify_url_until(
+                &read,
+                &plan,
+                &uuid,
+                project,
+                url,
+                wait,
+                VERIFY_INTERVAL,
+                &url_probe,
+            )?;
+            json!({ "url": url.to_string(), "httpStatus": verified.http_status, "mac": verified.mac,
+                "ipv4": verified.ipv4.to_string() })
+        }
+    };
+    answer["instance"] = json!(target.instance);
+    answer["project"] = json!(project);
+    answer["verified"] = json!(true);
+    Ok(Some(answer))
 }
 
 fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
