@@ -2,6 +2,7 @@
 //! arguments and results against those schemas.
 
 pub mod check;
+pub mod compat;
 pub mod openrpc;
 pub mod verbs;
 
