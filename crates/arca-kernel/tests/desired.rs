@@ -49,7 +49,7 @@ struct Node {
 
 fn node() -> Node {
     let key = NodeKey::generate();
-    let gate = DesiredStateGate::new(key.id(), key.public(), None);
+    let gate = DesiredStateGate::new(key.public(), None);
     Node { key, gate }
 }
 
@@ -504,5 +504,189 @@ fn instant_ms_reads_rfc3339_utc_and_refuses_everything_else() {
         "",
     ] {
         assert_eq!(instant_ms(bad), None, "{bad:?}");
+    }
+}
+
+/// 2^53, the largest integer up to which every integer is a double, so the JSON text of each integer is exact.
+const TWO_POW_53: u64 = 9_007_199_254_740_992;
+
+/// Replaces the one occurrence of `from` in the serialized signed document with `to`, then parses the result. This is how a
+/// document tampered in transit reaches the gate: the signature still covers the untouched canonical bytes.
+fn tamper_wire(signed: &SignedDocument, from: &str, to: &str) -> SignedDocument {
+    let text = serde_json::to_string(signed).expect("serializes");
+    assert_eq!(
+        text.matches(from).count(),
+        1,
+        "the text to tamper occurs once: {from}"
+    );
+    serde_json::from_str(&text.replacen(from, to, 1)).expect("the tampered wire document parses")
+}
+
+fn not_canonical() -> DocRefusal {
+    DocRefusal::Malformed("not canonical".to_string())
+}
+
+#[test]
+fn an_integer_that_the_wire_writes_as_a_float_is_refused() {
+    // Signed as 5. The wire carries 5.0: the canonical bytes are the same, so the signature still verifies.
+    let mut n = node();
+    let d1 = doc(n.key.id(), 1, None, vec![entry("watch", json!({"n": 5}))]);
+    let tampered = tamper_wire(&sign(&n.key, d1), "\"n\":5}", "\"n\":5.0}");
+    assert_eq!(n.gate.accept(&tampered, NOW_MS), Err(not_canonical()));
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn zero_that_the_wire_writes_as_negative_zero_is_refused() {
+    let mut n = node();
+    let d1 = doc(n.key.id(), 1, None, vec![entry("watch", json!({"n": 0}))]);
+    let tampered = tamper_wire(&sign(&n.key, d1), "\"n\":0}", "\"n\":-0.0}");
+    assert_eq!(n.gate.accept(&tampered, NOW_MS), Err(not_canonical()));
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn an_integer_above_2_pow_53_on_the_wire_is_refused_when_signed_as_2_pow_53() {
+    // Signed as 2^53, whose canonical text is the same as 2^53 + 1's. The wire carries 2^53 + 1.
+    let mut n = node();
+    let d1 = doc(
+        n.key.id(),
+        1,
+        None,
+        vec![entry("watch", json!({"n": TWO_POW_53}))],
+    );
+    let tampered = tamper_wire(
+        &sign(&n.key, d1),
+        "\"n\":9007199254740992}",
+        "\"n\":9007199254740993}",
+    );
+    assert_eq!(n.gate.accept(&tampered, NOW_MS), Err(not_canonical()));
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn a_config_integer_above_2_pow_53_is_refused_when_signed() {
+    // The canonical text of 2^53 + 1 reads back as 2^53, so the document does not round-trip and is refused.
+    let mut n = node();
+    let d1 = doc(
+        n.key.id(),
+        1,
+        None,
+        vec![entry("watch", json!({"n": TWO_POW_53 + 1}))],
+    );
+    assert_eq!(
+        n.gate.accept(&sign(&n.key, d1), NOW_MS),
+        Err(not_canonical())
+    );
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn a_config_float_with_an_integer_value_is_refused_when_signed() {
+    let mut n = node();
+    let d1 = doc(n.key.id(), 1, None, vec![entry("watch", json!({"n": 5.0}))]);
+    assert_eq!(
+        n.gate.accept(&sign(&n.key, d1), NOW_MS),
+        Err(not_canonical())
+    );
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn a_seq_above_2_pow_53_is_refused_when_signed() {
+    let mut n = node();
+    let d1 = doc(
+        n.key.id(),
+        TWO_POW_53 + 1,
+        None,
+        vec![entry("watch", json!({}))],
+    );
+    assert_eq!(
+        n.gate.accept(&sign(&n.key, d1), NOW_MS),
+        Err(not_canonical())
+    );
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn a_seq_at_2_pow_53_relabelled_above_it_on_the_wire_is_refused() {
+    let mut n = node();
+    let d1 = doc(
+        n.key.id(),
+        TWO_POW_53,
+        None,
+        vec![entry("watch", json!({}))],
+    );
+    let tampered = tamper_wire(
+        &sign(&n.key, d1),
+        "\"seq\":9007199254740992,",
+        "\"seq\":9007199254740993,",
+    );
+    assert_eq!(n.gate.accept(&tampered, NOW_MS), Err(not_canonical()));
+    assert_eq!(n.gate.applied(), None);
+}
+
+#[test]
+fn integers_at_the_edge_of_the_exact_range_apply() {
+    let mut n = node();
+    let d1 = doc(
+        n.key.id(),
+        1,
+        None,
+        vec![entry("watch", json!({"n": TWO_POW_53, "m": -7, "f": 1.5}))],
+    );
+    assert_eq!(
+        n.gate.accept(&sign(&n.key, d1.clone()), NOW_MS),
+        Ok(Target::Apply(applied(1, &d1)))
+    );
+}
+
+#[test]
+fn the_gate_is_for_the_node_whose_key_it_pins() {
+    // A gate takes only its signer's key, and its node is that key's id: a document for any other node is foreign even
+    // when the pinned key signed it, and the pinned node's own document applies.
+    let key = NodeKey::generate();
+    let other = NodeKey::generate();
+    let mut gate = DesiredStateGate::new(key.public(), None);
+    let foreign = doc(other.id(), 1, None, vec![entry("watch", json!({}))]);
+    assert_eq!(
+        gate.accept(&sign(&key, foreign), NOW_MS),
+        Err(DocRefusal::ForeignNode)
+    );
+    assert_eq!(gate.applied(), None);
+    let own = doc(key.id(), 1, None, vec![entry("watch", json!({}))]);
+    assert_eq!(
+        gate.accept(&sign(&key, own.clone()), NOW_MS),
+        Ok(Target::Apply(applied(1, &own)))
+    );
+}
+
+#[test]
+fn an_unknown_field_at_any_level_is_refused() {
+    let n = node();
+    let signed = sign(
+        &n.key,
+        doc(n.key.id(), 1, None, vec![entry("watch", json!({}))]),
+    );
+    let base: Value = serde_json::to_value(&signed).expect("serializes");
+    assert!(
+        serde_json::from_value::<SignedDocument>(base.clone()).is_ok(),
+        "the base document parses"
+    );
+    let mut top = base.clone();
+    top["extra"] = json!(1);
+    let mut document = base.clone();
+    document["document"]["extra"] = json!(1);
+    let mut entry_level = base.clone();
+    entry_level["document"]["entries"][0]["extra"] = json!(1);
+    for (level, value) in [
+        ("signed", top),
+        ("document", document),
+        ("entry", entry_level),
+    ] {
+        assert!(
+            serde_json::from_value::<SignedDocument>(value).is_err(),
+            "an unknown field at the {level} level is refused"
+        );
     }
 }

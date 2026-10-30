@@ -84,6 +84,7 @@ impl From<PluginId> for String {
 
 /// One desired object: which plugin owns it, at which version, with what config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Entry {
     pub id: EntryId,
     pub plugin: PluginId,
@@ -96,6 +97,7 @@ pub struct Entry {
 
 /// A full desired-state document for one node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Document {
     pub node: NodeId,
     pub seq: u64,
@@ -107,22 +109,39 @@ pub struct Document {
 
 impl Document {
     /// The canonical JSON of the document, as bytes. Every object's keys are sorted, so the bytes depend only on content.
+    ///
+    /// The bytes are empty only when the document cannot be written as canonical JSON. No document can cause that: a
+    /// serializable document holds only finite numbers. The gate refuses every document that is not canonical, so bytes
+    /// that could not be produced are never accepted.
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        // A `Value` cannot hold a non-finite number, and a document is serializable, so neither step can fail.
-        let value = serde_json::to_value(self).expect("a document serializes to JSON");
-        canonical_json(&value)
-            .expect("a JSON value holds no non-finite number")
-            .into_bytes()
+        self.canonical_text()
+            .map(String::into_bytes)
+            .unwrap_or_default()
     }
 
     /// The SHA-256 of the canonical bytes.
     pub fn digest(&self) -> Digest {
         Digest::of(&self.canonical_bytes())
     }
+
+    fn canonical_text(&self) -> Option<String> {
+        let value = serde_json::to_value(self).ok()?;
+        canonical_json(&value).ok()
+    }
+
+    /// Whether the document is its own canonical form: reading the canonical text back gives this same document. Canonical
+    /// JSON writes every number as a double, so a number held differently fails: `5.0` for `5`, `-0.0` for `0`, and an
+    /// integer above 2^53 that the double rounds.
+    fn is_canonical(&self) -> bool {
+        self.canonical_text()
+            .and_then(|text| serde_json::from_str::<Document>(&text).ok())
+            .is_some_and(|reread| reread == *self)
+    }
 }
 
 /// A document with the node key that signed it. The signature covers [`DOCUMENT_CONTEXT`] followed by the canonical bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedDocument {
     pub document: Document,
     #[serde(with = "hex_array")]
@@ -131,7 +150,11 @@ pub struct SignedDocument {
     pub signature: [u8; 64],
 }
 
-/// Signs `doc` with the node's own key.
+/// Signs `doc` with the node's own key, over its canonical bytes.
+///
+/// The document is signed as given. A document that does not round-trip through canonical JSON (a float with an integer
+/// value, or an integer above 2^53) is signed, and the gate refuses it as not canonical. Normalizing it here would change
+/// its content, and this function returns no error, so the refusal stays at the one place that accepts documents.
 pub fn sign_document(doc: Document, key: &NodeKey) -> SignedDocument {
     let signature = key.sign(&signed_message(&doc));
     SignedDocument {
@@ -204,10 +227,11 @@ pub struct DesiredStateGate {
 }
 
 impl DesiredStateGate {
-    /// A gate for `node`, which accepts documents signed by `signer` and continues from `applied`.
-    pub fn new(node: NodeId, signer: [u8; 32], applied: Option<Applied>) -> Self {
+    /// A gate for the node whose key is `signer`, which continues from `applied`. The node is the signer's id, so a gate
+    /// cannot pair one node with another node's key.
+    pub fn new(signer: [u8; 32], applied: Option<Applied>) -> Self {
         Self {
-            node,
+            node: NodeId::of_public(&signer),
             signer,
             applied,
         }
@@ -221,7 +245,8 @@ impl DesiredStateGate {
     /// Judges a signed document at `now_ms` (milliseconds since the Unix epoch). A refusal leaves the applied state unchanged.
     ///
     /// Order: the signer is pinned, the signature must verify, the document must be for this node, its content must be
-    /// well formed, and only then are the seq and the chain compared. An expired document holds the applied state.
+    /// well formed and canonical, and only then are the seq and the chain compared. An expired document holds the applied
+    /// state.
     pub fn accept(&mut self, signed: &SignedDocument, now_ms: u64) -> Result<Target, DocRefusal> {
         if signed.signer != self.signer {
             return Err(DocRefusal::UnknownSigner);
@@ -238,6 +263,11 @@ impl DesiredStateGate {
             return Err(DocRefusal::ForeignNode);
         }
         let expires_ms = check_content(doc)?;
+        // The signature covers the canonical bytes, so the applied content must be exactly what those bytes say. Otherwise a
+        // wire form the signature does not cover (5.0 for 5) would verify and apply.
+        if !doc.is_canonical() {
+            return Err(DocRefusal::Malformed("not canonical".to_string()));
+        }
         let digest = doc.digest();
         match &self.applied {
             None => {

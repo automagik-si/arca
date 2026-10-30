@@ -239,3 +239,37 @@ fn a_signature_by_a_small_order_key_is_refused() {
         "strict verification refuses it"
     );
 }
+
+#[test]
+fn concurrent_creates_of_one_path_all_load_the_same_key() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let dir = Scratch::new("race");
+    for round in 0..16 {
+        let path = dir.path(&format!("node-{round}.key"));
+        let barrier = Arc::new(Barrier::new(4));
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    NodeKey::load_or_create(&path).map(|key| key.public())
+                })
+            })
+            .collect();
+        let results: Vec<_> = racers
+            .into_iter()
+            .map(|racer| racer.join().expect("a racer does not panic"))
+            .collect();
+        let first = results[0].clone().expect("the first racer gets a key");
+        for result in results {
+            assert_eq!(
+                result.expect("every racer gets a key, none an error"),
+                first,
+                "every racer loads the one key round {round}"
+            );
+        }
+    }
+}
