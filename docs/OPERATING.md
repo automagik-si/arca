@@ -190,6 +190,7 @@ A call sends `initialize` and then `tools/call`, each on its own connection. Its
 | `desired.lock` | the lock held while `serve` runs. A second process over the same directory is refused |
 | `journal.jsonl` | the journal of every effect the reconciler sent, as intents and outcomes |
 | `approval-nonces.jsonl` | the approval nonces that were spent |
+| `passkey-counts.jsonl` | the last sign count kept for each passkey. Mode 0600 |
 | `secrets/` | the secret files the writer reads, if any |
 
 `serve` refuses a state directory that is not mode 0700, or not owned by the user that runs it, before it creates the node key.
@@ -212,14 +213,74 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-The owner signs that text with a hardware key in the namespace `arca-kernel-approve`, and the approval string is the
-base64 of the statement, a dot, and the base64 of the armoured signature. The owner key is read from the signers file
-`/etc/arca/owner-signers`, root-owned, which lists the owner's keys for that namespace. A file that is not there holds no key,
-so every approval is refused with `NoVerifier`.
+The owner approves that text in the namespace `arca-kernel-approve`, with an SSH key or a passkey. The approval string is the
+base64 of the statement, a dot, and the base64 of the proof. A proof whose first byte is `{` is a passkey proof. Any other proof
+is an armoured SSH signature.
+
+- **An SSH key.** The owner signs the statement with `ssh-keygen -Y sign -n arca-kernel-approve` and an `sk-ssh-ed25519` key.
+  The key is read from the signers file `/etc/arca/owner-signers`, which lists the owner's keys for that namespace.
+- **A passkey.** The proof is a WebAuthn ES256 assertion. The passkey is read from the passkeys file
+  `/etc/arca/owner-passkeys`.
+
+`serve` reads both files at start, and logs only their counts: `arca: <n> owner signing key(s), <m> passkey(s) kept`. A file
+that is not there holds no key, so every approval of that kind is refused with `NoVerifier`.
+
+Each line of the passkeys file is one passkey, on one line, with single spaces:
+
+```
+owner namespaces="arca-kernel-approve" rp="<rp>" origin="<https origin>" alg="ES256" cred="<base64url>" key="<base64>"[ <comment>]
+```
+
+- `rp` is the relying party the passkey was made for, a lowercase DNS name.
+- `origin` is the one page the passkey may answer from: `https://`, then `rp` or a name under it, then an optional
+  `:<port>` (not 443, which a browser leaves out). It is written out because Arca has no fixed serve port.
+- `cred` is the credential id, 16 to 1023 bytes of unpadded base64url.
+- `key` is the P-256 public key, 91 bytes of SPKI DER in base64. Its fingerprint is `base64 -d | sha256sum` of that text.
+
+An existing passkey is enrolled by copying its `cred` and `key` into a line of this shape. A blank line or a `#` comment is
+skipped. A line whose `namespaces` list does not name `arca-kernel-approve` is read and checked, but not kept.
+
+**The trust rule.** The passkeys file is trusted as the signers file is. It and every directory above it must be root-owned,
+must not be group- or other-writable, and must not be a link. The file must also be at most 64 KiB, and every line must be
+of the shape above. If a credential or a key repeats, the file is refused too. A passkeys file that breaks the rule refuses
+every passkey approval with `Untrusted`, and `serve` logs that refusal. The refusal names the file and the line number,
+never a field of the line. The signers file and its SSH keys are not affected.
+
+**The challenge.** A passkey signs `SHA-256("arca-kernel-approval/v1\n" + namespace + "\n" || statement)`, where
+`namespace` is `arca-kernel-approve` and `statement` is the exact statement bytes. The prefix is not droidd's
+`droid-owner-approval/v1\n`, so an assertion made for droidd never verifies here.
+
+**The proof.** The proof is the canonical JSON of exactly these keys: `alg`, `authenticatorData`, `clientDataJSON`,
+`credentialId`, `kind`, `signature` and `v`. The values are `v` 1, `kind` `webauthn` and `alg` `ES256`, and every buffer is
+unpadded base64url. The proof is at most 8192 bytes. A proof that is not its own canonical JSON is refused with
+`NotCanonical`, and any other bad form is refused with `Malformed`.
+
+**The checks**, in order:
+
+- The credential must be on a line that lists the namespace (`BadSignature`).
+- `clientDataJSON` must:
+  - be a `webauthn.get` (`Malformed`);
+  - carry this statement's challenge (`BadSignature`);
+  - come from the line's exact origin, with no `crossOrigin: true` and no `topOrigin` (`WrongOrigin`).
+- `authenticatorData` must:
+  - carry the line's rpIdHash (`WrongRp`);
+  - have user presence set (`NoUserPresence`) and user verification set (`NoUserVerification`);
+  - set the backup state only with backup eligibility, carry no attested data and no extensions, and be exactly 37 bytes
+    (`Malformed`).
+- The ES256 signature over `authenticatorData || SHA-256(clientDataJSON)` must verify (`BadSignature`). It is read as strict
+  DER, and a high-S signature is accepted as its low-S twin.
+
+**The sign count.** A count above 0 must be above the last one kept for that passkey. A count of 0 is accepted only while the
+kept one is 0 or there is none, because a synced passkey always reports 0. Otherwise the approval is refused with
+`SignCountRegressed`. The count is checked and kept in `passkey-counts.jsonl`, fsynced, before the nonce is read. So a replay of a
+counting passkey's approval is refused with `SignCountRegressed`. A replay of a synced passkey's approval (count 0) is refused
+with `Replayed`. A count kept for an approval that a later check refuses costs nothing, because a count only grows.
 
 `approval_submit` takes the plan digest and the approval. It refuses, and spends nothing, when:
 
 - the signature does not verify against a listed key (`BadSignature`), or no key is listed (`NoVerifier`);
+- a passkey assertion fails one of the checks above (`WrongOrigin`, `WrongRp`, `NoUserPresence`, `NoUserVerification`,
+  `SignCountRegressed`, `Malformed`), or its passkeys file cannot be trusted (`Untrusted`);
 - the statement names another host, action, target or arguments (`WrongHost`, `WrongAction`, `WrongTarget`, `WrongParams`);
 - the statement is issued more than five minutes ahead of the node's clock (`IssuedAhead`), has expired (`Expired`), or
   runs for more than fifteen minutes (`TtlTooLong`);
@@ -228,10 +289,16 @@ so every approval is refused with `NoVerifier`.
 A plan that waits under no digest is `NoSuchPlan`. A valid approval for such a plan is still checked, so a spent approval reads as
 `Replayed`. The approval string is never stored or echoed, and an approval spends its nonce once, before its delete runs.
 
-**A scratch kernel can take its owner keys from a file named in `ARCA_TEST_OWNER_SIGNERS`.** That is honoured only when
-`kernel.scratch` is `true`, every kernel project starts with `arcak-scratch-`, and the build has debug assertions. Any other kernel
-refuses to start while the variable is set. It exists so that the tests run the real verifier against keys they write
-themselves.
+**A scratch kernel can take its owner keys from files named in `ARCA_TEST_OWNER_SIGNERS` and `ARCA_TEST_OWNER_PASSKEYS`.**
+That is honoured only when:
+
+- `kernel.scratch` is `true`;
+- every kernel project starts with `arcak-scratch-`;
+- the build has debug assertions.
+
+Any other kernel refuses to start while either variable is set. A named file is then trusted when it and the directory that
+holds it are owned by the user that runs the kernel. The variables exist so that the tests can run the real verifiers against
+keys they write themselves.
 
 ## The recording shim
 

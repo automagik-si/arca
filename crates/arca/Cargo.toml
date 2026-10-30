@@ -33,6 +33,8 @@ tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread"
 arca-reconcile = { workspace = true, features = ["toy"] }
 base64.workspace = true
 ed25519-dalek.workspace = true
+# The passkey tests sign with a software P-256 passkey.
+p256.workspace = true
 sha2.workspace = true
 
 [lints]

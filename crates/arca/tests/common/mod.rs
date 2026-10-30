@@ -11,7 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arca::handlers::{Clock, plan_handlers};
 use arca::kernel::Kernel;
-use arca_approval::{ApprovalVerifier, FileNonces, SshSigVerifier, load_signers, signers_trust};
+use arca_approval::{
+    ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE, PasskeyVerifier,
+    SshSigVerifier, load_passkeys, load_signers, passkeys_trust, signers_trust,
+};
 use arca_incus::{FakeIncus, FakeState, IncusRead, UnixIncus};
 use arca_kernel::canon::{Digest, canonical_json, params_digest};
 use arca_kernel::desired::{Entry, EntryId, PluginId};
@@ -176,14 +179,25 @@ pub fn approve_statement(key: &SkKey, statement: &str) -> String {
     approval_of(statement, &key.sign(NAMESPACE, statement.as_bytes()))
 }
 
-/// A verifier that trusts `keys` alone, built the way the kernel builds one: the signers file is written into `scratch`, read
-/// back through `signers_trust` and `load_signers`, and the nonce file is opened in `scratch`. An empty `keys` is a node whose
-/// owner has installed no key.
+/// A verifier that trusts the SSH `keys` alone, built the way the kernel builds one: the signers file is written into
+/// `scratch`, read back through `signers_trust` and `load_signers`, and the nonce file is opened in `scratch`. No passkey is
+/// enrolled. An empty `keys` is a node whose owner has installed no key.
 pub fn verifier_for(
     scratch: &Scratch,
     keys: &[&SkKey],
     tag: &str,
-) -> ApprovalVerifier<SshSigVerifier, FileNonces> {
+) -> ApprovalVerifier<OwnerKeys, FileNonces> {
+    verifier_with_passkeys(scratch, keys, "", tag)
+}
+
+/// As `verifier_for`, with the passkeys file `passkeys` written into `scratch` and read back through `passkeys_trust` and
+/// `load_passkeys`, and the sign counts kept in `scratch`.
+pub fn verifier_with_passkeys(
+    scratch: &Scratch,
+    keys: &[&SkKey],
+    passkeys: &str,
+    tag: &str,
+) -> ApprovalVerifier<OwnerKeys, FileNonces> {
     let file = scratch.path(&format!("owner-signers-{tag}"));
     let text: String = keys
         .iter()
@@ -196,7 +210,22 @@ pub fn verifier_for(
     let lines = load_signers(&path, &trust).expect("the signers file loads");
     let nonces = FileNonces::open(&scratch.path(&format!("nonces-{tag}.jsonl")))
         .expect("the nonce file opens");
-    ApprovalVerifier::new(HOST.to_string(), SshSigVerifier::new(lines), nonces)
+    let file = scratch.path(&format!("owner-passkeys-{tag}"));
+    fs::write(&file, passkeys).expect("the passkeys file is written");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+    let (path, trust) = passkeys_trust(true, &[PROJECT.to_string()], Some(file))
+        .expect("the test passkeys file is named in a scratch kernel");
+    let passkey_lines = load_passkeys(&path, &trust).expect("the passkeys file loads");
+    let counts = FileSignCounts::open(&scratch.path(&format!("{tag}-{PASSKEY_COUNTS_FILE}")))
+        .expect("the sign-count file opens");
+    ApprovalVerifier::new(
+        HOST.to_string(),
+        OwnerKeys::new(
+            SshSigVerifier::new(lines),
+            PasskeyVerifier::new(passkey_lines, counts),
+        ),
+        nonces,
+    )
 }
 
 /// The node key of the state directory `dir`, created on first use and loaded after that.
@@ -276,7 +305,7 @@ pub fn provider(scratch: &Scratch, fake: &FakeIncus, retained: &RetainedSet) -> 
 pub fn kernel(
     scratch: &Scratch,
     fake: &FakeIncus,
-    verifier: ApprovalVerifier<SshSigVerifier, FileNonces>,
+    verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
     now: u64,
 ) -> Result<Kernel, arca_kernel::KernelError> {
     let mut plugins = PluginSet::new();

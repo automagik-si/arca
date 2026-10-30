@@ -13,8 +13,9 @@ use std::time::Instant;
 
 use arca_api::verbs;
 use arca_approval::{
-    ApprovalRefusal, ApprovalVerifier, FileNonces, SignerLine, SshSigVerifier, load_signers,
-    signers_trust,
+    ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE,
+    PasskeyVerifier, SignerLine, SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys, load_signers,
+    passkeys_trust, signers_trust,
 };
 use arca_incus::UnixIncus;
 use arca_kernel::KernelError;
@@ -63,8 +64,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The kernel opens before anything listens, so a state directory that is held, or whose document is not this node's, stops
     // the start with nothing served.
     let host = approval_host(&cfg)?;
-    let trusted = SshSigVerifier::new(owner_signers(&cfg)?);
-    eprintln!("arca: {} owner signing key(s) kept", trusted.key_count());
+    let trusted = owner_keys(&cfg)?;
+    let (signing_keys, passkeys) = trusted.key_counts();
+    eprintln!("arca: {signing_keys} owner signing key(s), {passkeys} passkey(s) kept");
     let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
     let verifier = ApprovalVerifier::new(host.clone(), trusted, nonces);
     let kernel = Kernel::open(
@@ -180,6 +182,28 @@ fn check_state_dir_owned_by(dir: &Path, uid: u32) -> Result<(), Failure> {
         )));
     }
     Ok(())
+}
+
+/// The owner keys this kernel trusts for the approval namespace: the SSH hardware keys of the signers file and the passkeys
+/// of the passkeys file, with the passkeys' sign counts in the state directory. A signers file that cannot be trusted stops
+/// the start. A passkeys file that cannot be trusted or read refuses every passkey approval, and the SSH keys still verify.
+/// Its refusal names the file, the rule and at most a line number, never a key. A test passkeys file named outside a scratch
+/// kernel stops the start.
+fn owner_keys(cfg: &NodeConfig) -> Result<OwnerKeys, Failure> {
+    let ssh = SshSigVerifier::new(owner_signers(cfg)?);
+    let test: Option<PathBuf> = std::env::var_os(TEST_PASSKEYS_ENV).map(PathBuf::from);
+    let (path, trust) =
+        passkeys_trust(cfg.kernel.scratch, &cfg.kernel.projects, test).map_err(approval_failure)?;
+    let counts =
+        FileSignCounts::open(&cfg.state_dir.join(PASSKEY_COUNTS_FILE)).map_err(approval_failure)?;
+    let passkeys = match load_passkeys(&path, &trust) {
+        Ok(lines) => PasskeyVerifier::new(lines, counts),
+        Err(refusal) => {
+            eprintln!("arca: every passkey approval is refused: {refusal}");
+            PasskeyVerifier::refusing(refusal)
+        }
+    };
+    Ok(OwnerKeys::new(ssh, passkeys))
 }
 
 /// The owner signing keys this kernel trusts for the approval namespace. A signers file that is not there is no key at all, so

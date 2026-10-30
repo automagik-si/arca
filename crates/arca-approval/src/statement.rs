@@ -8,6 +8,7 @@ use base64::engine::general_purpose::PAD_INDIFFERENT;
 use serde_json::{Map, Value};
 
 use crate::ApprovalRefusal;
+use crate::passkey::parse_proof;
 
 /// What an owner approval admits. Droidd's `ARCA_ACTIONS`. `install` belongs to the recipes tier and is refused here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,8 @@ const DROIDD_KEY: &str = "droidd";
 const APPROVAL_MAX_CHARS: usize = 16_384;
 const STATEMENT_MAX_BYTES: usize = 4_096;
 const SIGNATURE_MAX_BYTES: usize = 8_192;
+/// The first byte of a passkey proof, which is a JSON object. No armoured SSH signature starts with it.
+pub(crate) const PASSKEY_PROOF_OPEN: u8 = b'{';
 
 /// The base64 reader for droidd's approval parts: the standard alphabet, padding optional, and trailing bits tolerated as
 /// Node tolerates them (`YR==` reads as `YQ==`). It is stricter than Node, which also decodes `QUJD=`, `QUJD==`, `QUJDR`
@@ -80,8 +83,9 @@ fn malformed(why: impl Into<String>) -> ApprovalRefusal {
 }
 
 /// Reads an approval string, `<base64 statement>.<base64 signature>`, into its statement bytes and its signature bytes.
-/// Surrounding whitespace is trimmed, as droidd trims it. The signature must be an armoured SSH signature, as droidd's
-/// `armoredOf` requires, so anything else is refused before a verifier is asked about it.
+/// Surrounding whitespace is trimmed, as droidd trims it. A signature whose first byte opens a JSON object (`{`) must be a
+/// passkey proof of at most 8192 bytes, read as [`parse_proof`] reads one. Any other signature must be an armoured SSH
+/// signature, as droidd's `armoredOf` requires. So a proof of neither form is refused before a verifier is asked about it.
 pub fn split_approval(approval: &str) -> Result<(Vec<u8>, Vec<u8>), ApprovalRefusal> {
     if approval.is_empty() {
         return Err(malformed("this call needs the owner's signed approval"));
@@ -107,6 +111,10 @@ pub fn split_approval(approval: &str) -> Result<(Vec<u8>, Vec<u8>), ApprovalRefu
         return Err(malformed(
             "the signature is empty or longer than 8192 bytes",
         ));
+    }
+    if signature.first() == Some(&PASSKEY_PROOF_OPEN) {
+        parse_proof(&signature)?;
+        return Ok((statement, signature));
     }
     if !is_armoured_ssh_signature(&signature) {
         return Err(malformed(
