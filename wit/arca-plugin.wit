@@ -1,8 +1,10 @@
 package arca:plugin@0.1.0;
 
-/// The types that cross the plugin boundary. Inverses are canonical JSON strings, so the kernel's closed vocabulary
-/// stays the only one.
-interface types {
+/// What the kernel offers a plugin. A plugin reaches the host through these functions and no other import.
+///
+/// The types that cross the plugin boundary are declared here too, so the world imports this one interface and nothing
+/// else. Inverses are canonical JSON strings, so the kernel's closed vocabulary stays the only one.
+interface host {
   enum effect-class {
     a,
     b,
@@ -18,11 +20,6 @@ interface types {
     object: string,
     inverse: string,
   }
-}
-
-/// What the kernel offers a plugin. A plugin reaches the host through these functions and no other import.
-interface host {
-  use types.{refusal, receipt};
 
   effect: func(kind: string, op: string) -> result<receipt, refusal>;
   observe: func(query: string) -> result<string, refusal>;
@@ -31,7 +28,7 @@ interface host {
 
 /// What the kernel calls on a plugin.
 interface guest {
-  use types.{refusal};
+  use host.{refusal};
 
   manifest: func() -> string;
   apply: func(config: string) -> result<_, refusal>;

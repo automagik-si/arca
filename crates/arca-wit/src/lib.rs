@@ -9,13 +9,19 @@ pub const WORLD: &str = include_str!("../../../wit/arca-plugin.wit");
 /// The package the world belongs to.
 pub const PACKAGE: &str = "arca:plugin@0.1.0";
 
+/// A `wasi:clocks` package that a negative test pushes, so that a probe world can import a wasi interface. It is not part
+/// of the plugin contract, and no shipped world imports it.
+pub const WASI_CLOCKS_STUB: &str =
+    "package wasi:clocks@0.2.0;\n\ninterface wall-clock {\n  now: func() -> u64;\n}\n";
+
 /// The name of the world inside the package.
 const WORLD_NAME: &str = "plugin";
 
 /// Parses `sources` in order, selects `world` from the package pushed last, and returns the world's imports.
 ///
 /// An interface import is named by its package-qualified name, such as `arca:plugin/host@0.1.0`. A function or type
-/// import is named by its bare name, so that no import can go unlisted. The errors are the parser's messages.
+/// import is named by its bare name, so that no import can go unlisted. The errors are the parser's messages, or the
+/// message `no WIT source was given` when `sources` is empty.
 pub fn imports_of(sources: &[(&str, &str)], world: &str) -> Result<Vec<String>, String> {
     let mut resolve = wit_parser::Resolve::default();
     let mut last = None;

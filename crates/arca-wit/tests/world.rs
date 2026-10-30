@@ -1,11 +1,7 @@
 //! The WIT world, read through the parser. The checks run on the parsed world, not on the text, so a typo in the file fails
 //! here and not only at a later host call.
 
-use arca_wit::{PACKAGE, WORLD, imports_of, world_imports};
-
-/// The `wasi:clocks` stub a negative test pushes, so the world can import it.
-const WASI_CLOCKS_STUB: &str =
-    "package wasi:clocks@0.2.0;\n\ninterface wall-clock {\n  now: func() -> u64;\n}\n";
+use arca_wit::{PACKAGE, WASI_CLOCKS_STUB, WORLD, imports_of, world_imports};
 
 /// Parses the world and returns the resolver, the package it belongs to, and the world's id.
 fn parse_world() -> (
@@ -41,27 +37,11 @@ fn package_name_and_version_are_arca_plugin_0_1_0() {
 }
 
 #[test]
-fn world_imports_the_host_interface_and_the_type_package_it_uses() {
-    // wit-parser adds every interface an imported interface `use`s, so `types` is an import too. It declares no function,
-    // so it grants no capability; the test below checks that.
-    let mut imports = world_imports().expect("the world parses");
-    imports.sort();
-    assert_eq!(
-        imports,
-        vec![
-            "arca:plugin/host@0.1.0".to_string(),
-            "arca:plugin/types@0.1.0".to_string(),
-        ]
-    );
-}
-
-#[test]
-fn the_type_package_declares_no_function() {
-    let (resolve, _package, _world) = parse_world();
-    assert!(
-        functions_of(&resolve, "types").is_empty(),
-        "types declares a function, so it would be a capability"
-    );
+fn world_imports_exactly_the_host_interface() {
+    // The types that cross the boundary live in `host`, so the world has one import. Any second import, a type package
+    // included, would be a second grant and fails this exact match.
+    let imports = world_imports().expect("the world parses");
+    assert_eq!(imports, vec!["arca:plugin/host@0.1.0".to_string()]);
 }
 
 #[test]
