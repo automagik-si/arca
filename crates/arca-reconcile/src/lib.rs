@@ -4,7 +4,8 @@
 //! and nothing deletes them afterwards. Every effect is journalled as an intent before it runs and as its outcome after.
 //!
 //! An unresolved intent blocks every new effect. [`Reconciler::open`] refuses a journal that holds one, and a run that leaves one
-//! open stops at once.
+//! open stops at once. A plugin's own writes pass through a gate that refuses its next intent while one is open, so a plugin
+//! that swallows the refusal still cannot write past it.
 
 #[cfg(feature = "toy")]
 pub mod toy;
@@ -118,8 +119,56 @@ pub struct Reconciler<S: JournalStore> {
     plugins: PluginSet,
     provider: Box<dyn Provider>,
     retained: RetainedSet,
-    applied: BTreeMap<EntryId, Entry>,
+    /// The plugin that applied each entry the journal still holds effects for. A removal needs it. An entry is recorded here before
+    /// its apply runs, so a failed apply that made partial effects can still be removed.
+    applied_by: BTreeMap<EntryId, PluginId>,
+    /// The config each entry last applied with, once that apply succeeded. An entry whose config is here is not applied again. A
+    /// removal takes the entry out, and a failed apply never puts it in, so the same config is retried.
+    converged: BTreeMap<EntryId, Entry>,
     pending: Vec<Pending>,
+}
+
+/// The journal as a plugin's context writes to it. An intent is refused while an earlier intent has no outcome, or while the
+/// journal has stopped, so a plugin that swallows an unknown outcome cannot write past it. Outcomes pass through unchanged.
+struct Gate<'a, S: JournalStore> {
+    journal: &'a mut Journal<S>,
+}
+
+impl<S: JournalStore> JournalSink for Gate<'_, S> {
+    fn intend(
+        &mut self,
+        entry: &EntryId,
+        class: EffectClass,
+        op_digest: Digest,
+        target: ObjectRef,
+        pre_image: Option<BTreeMap<String, Option<String>>>,
+        now_ms: u64,
+    ) -> Result<u64, KernelError> {
+        if let Some(error) = self.journal.poisoned() {
+            return Err(error.clone());
+        }
+        let unresolved = self.journal.unresolved();
+        if !unresolved.is_empty() {
+            return Err(KernelError::Unresolved {
+                ids: unresolved.iter().map(|record| record.id).collect(),
+            });
+        }
+        self.journal
+            .intend(entry, class, op_digest, target, pre_image, now_ms)
+    }
+
+    fn applied(&mut self, id: u64, object: ObjectRef, inverse: Inverse) -> Result<(), KernelError> {
+        self.journal.applied(id, object, inverse)
+    }
+
+    fn failed(&mut self, id: u64, why: &str) -> Result<(), KernelError> {
+        self.journal.failed(id, why)
+    }
+}
+
+/// Whether two references name the same object. The uuid is left out, since a create's intent does not carry one.
+fn same_place(a: &ObjectRef, b: &ObjectRef) -> bool {
+    a.kind == b.kind && a.project == b.project && a.parent == b.parent && a.name == b.name
 }
 
 impl<S: JournalStore> Reconciler<S> {
@@ -147,7 +196,8 @@ impl<S: JournalStore> Reconciler<S> {
             plugins,
             provider,
             retained,
-            applied: BTreeMap::new(),
+            applied_by: BTreeMap::new(),
+            converged: BTreeMap::new(),
             pending: Vec::new(),
         })
     }
@@ -182,7 +232,7 @@ impl<S: JournalStore> Reconciler<S> {
             self.apply_entry(entry, now_ms, &mut outcomes);
         }
         let mut gone: BTreeSet<EntryId> = self.journal.live_entries().into_iter().collect();
-        gone.extend(self.applied.keys().cloned());
+        gone.extend(self.applied_by.keys().cloned());
         for id in gone {
             if carried.contains(&id) {
                 continue;
@@ -226,7 +276,7 @@ impl<S: JournalStore> Reconciler<S> {
         let live = self.live_deletes(&delete_plan.entry);
         if live
             .iter()
-            .any(|(_, object)| !delete_plan.objects.contains(object))
+            .any(|object| !delete_plan.objects.contains(object))
         {
             return Err(ApprovalRefusal::WrongParams);
         }
@@ -243,7 +293,7 @@ impl<S: JournalStore> Reconciler<S> {
             partial: false,
         };
         // Most recent first, so a later object is gone before the one it was made on.
-        for (record_id, object) in live.iter().rev() {
+        for object in live.iter().rev() {
             if self.blocked() {
                 run.partial = true;
                 break;
@@ -253,7 +303,7 @@ impl<S: JournalStore> Reconciler<S> {
                 .map_err(|error| ApprovalRefusal::Storage(error.to_string()))?;
             match retired {
                 Retired::Deleted(done) => {
-                    self.journal.reverted(*record_id);
+                    self.settle_deleted(&delete_plan.entry, object);
                     run.deleted.push(done);
                 }
                 Retired::Kept(_) => {
@@ -270,7 +320,7 @@ impl<S: JournalStore> Reconciler<S> {
         if !run.partial {
             self.pending.retain(|pending| pending.plan.digest != *plan);
             if self.revertible_live(&delete_plan.entry) == 0 {
-                self.applied.remove(&delete_plan.entry);
+                self.applied_by.remove(&delete_plan.entry);
             }
         }
         Ok(run)
@@ -299,7 +349,6 @@ impl<S: JournalStore> Reconciler<S> {
         let declined = self.pending.remove(index);
         self.live_deletes(&entry)
             .into_iter()
-            .map(|(_, object)| object)
             .filter(|object| declined.plan.objects.contains(object))
             .collect()
     }
@@ -317,14 +366,14 @@ impl<S: JournalStore> Reconciler<S> {
         self.journal.poisoned().is_some() || !self.journal.unresolved().is_empty()
     }
 
-    /// The entry's class-B objects that still count, each with the record that created the delete it names.
-    fn live_deletes(&self, entry: &EntryId) -> Vec<(u64, ObjectRef)> {
+    /// The entry's class-B objects that still count: each one a live create whose inverse deletes it.
+    fn live_deletes(&self, entry: &EntryId) -> Vec<ObjectRef> {
         self.journal
             .live(entry)
             .into_iter()
             .filter(|record| record.class == EffectClass::B)
             .filter_map(|record| match record.inverse {
-                Some(Inverse::IncusDelete { object }) => Some((record.id, object)),
+                Some(Inverse::IncusDelete { object }) => Some(object),
                 _ => None,
             })
             .collect()
@@ -341,9 +390,9 @@ impl<S: JournalStore> Reconciler<S> {
 
     /// The manifest of the plugin that applied `entry`. A removal that needs it fails closed when the entry is not known.
     fn manifest_of(&self, entry: &EntryId) -> Result<Manifest, String> {
-        self.applied
+        self.applied_by
             .get(entry)
-            .and_then(|applied| self.plugins.get(&applied.plugin.0))
+            .and_then(|plugin| self.plugins.get(&plugin.0))
             .map(|plugin| plugin.manifest())
             .ok_or_else(|| "plugin not known".to_string())
     }
@@ -368,7 +417,8 @@ impl<S: JournalStore> Reconciler<S> {
                 return;
             }
         }
-        if self.applied.get(&id) == Some(entry) {
+        // An entry that applied with this config and has not been removed since is not applied again.
+        if self.converged.get(&id) == Some(entry) {
             return;
         }
         if self.blocked() {
@@ -386,21 +436,32 @@ impl<S: JournalStore> Reconciler<S> {
             return;
         };
         let manifest = plugin.manifest();
-        // The entry is recorded as applied even when the apply fails, so that a later removal finds the plugin that made any
-        // partial effects.
-        self.applied.insert(id.clone(), entry.clone());
+        // The plugin is recorded before the apply runs, even when the apply fails, so that a later removal finds the plugin that
+        // made any partial effects.
+        self.applied_by.insert(id.clone(), entry.plugin.clone());
         let result = {
+            let mut gate = Gate {
+                journal: &mut self.journal,
+            };
             let mut ctx = Ctx::new(
                 id.clone(),
                 &manifest,
                 &mut *self.provider,
-                &mut self.journal,
+                &mut gate,
                 now_ms,
             );
             plugin.apply(&mut ctx, &entry.config)
         };
         match result {
-            Ok(()) => outcomes.push(Outcome::Applied { entry: id }),
+            // A plugin that swallowed a refusal can return Ok with an intent still open. That is not an apply.
+            Ok(()) if self.blocked() => outcomes.push(Outcome::Failed {
+                entry: id,
+                why: BLOCKED_WHY.to_string(),
+            }),
+            Ok(()) => {
+                self.converged.insert(id.clone(), entry.clone());
+                outcomes.push(Outcome::Applied { entry: id });
+            }
             Err(error) => outcomes.push(Outcome::Failed {
                 entry: id,
                 why: error.to_string(),
@@ -411,6 +472,8 @@ impl<S: JournalStore> Reconciler<S> {
     /// Removes an entry the desired state no longer carries: reverts its class-A effects, most recent first, and queues its
     /// class-B objects for an approval. Class-C emissions are left alone.
     fn remove_entry(&mut self, id: &EntryId, now_ms: u64, outcomes: &mut Vec<Outcome>) {
+        // A removed entry has not converged: a document that carries it again applies it again.
+        self.converged.remove(id);
         let split = removal(&self.journal, id, now_ms);
         let mut reverted = 0;
         let mut stopped = false;
@@ -444,17 +507,18 @@ impl<S: JournalStore> Reconciler<S> {
             self.plan_removal(id, plan, outcomes);
         }
         if self.revertible_live(id) == 0 {
-            self.applied.remove(id);
+            self.applied_by.remove(id);
         }
     }
 
-    /// Queues the entry's class-B objects under `plan`. A plan already pending for the same objects keeps its creation time, so
-    /// its age is not reset by a later reconcile.
+    /// Queues the entry's class-B objects under `plan`. A pending plan for the same objects keeps its creation time while it is
+    /// within [`PLAN_TTL_MS`], so a later reconcile does not restart its age. Once it is older, it is replaced by `plan`, which
+    /// was made now and needs an approval of its own.
     fn plan_removal(&mut self, id: &EntryId, plan: DeletePlan, outcomes: &mut Vec<Outcome>) {
         let plugin = self
-            .applied
+            .applied_by
             .get(id)
-            .map(|applied| applied.plugin.clone())
+            .cloned()
             .filter(|plugin| self.plugins.get(&plugin.0).is_some());
         let Some(plugin) = plugin else {
             outcomes.push(Outcome::Failed {
@@ -463,23 +527,32 @@ impl<S: JournalStore> Reconciler<S> {
             });
             return;
         };
-        if !self
+        let waiting = match self
             .pending
             .iter()
-            .any(|pending| pending.plan.digest == plan.digest)
+            .position(|pending| pending.plan.digest == plan.digest)
         {
-            self.pending.retain(|pending| &pending.plan.entry != id);
-            self.pending.push(Pending {
-                plan: plan.clone(),
-                plugin,
-            });
-        }
-        let waiting = self
-            .pending
-            .iter()
-            .find(|pending| pending.plan.digest == plan.digest)
-            .map(|pending| pending.plan.clone())
-            .unwrap_or(plan);
+            Some(index)
+                if plan
+                    .created_ms
+                    .saturating_sub(self.pending[index].plan.created_ms)
+                    <= PLAN_TTL_MS =>
+            {
+                self.pending[index].plan.clone()
+            }
+            Some(index) => {
+                self.pending[index].plan = plan.clone();
+                plan
+            }
+            None => {
+                self.pending.retain(|pending| &pending.plan.entry != id);
+                self.pending.push(Pending {
+                    plan: plan.clone(),
+                    plugin,
+                });
+                plan
+            }
+        };
         outcomes.push(Outcome::AwaitingApproval { plan: waiting });
     }
 
@@ -497,7 +570,7 @@ impl<S: JournalStore> Reconciler<S> {
                     now_ms,
                 ) {
                     Ok(Retired::Deleted(_)) => {
-                        self.journal.reverted(record.id);
+                        self.settle_deleted(&record.entry, object);
                         Ok(())
                     }
                     Ok(Retired::Kept(why)) => Err(why),
@@ -529,11 +602,14 @@ impl<S: JournalStore> Reconciler<S> {
         };
         let digest = op_digest(&op);
         {
+            let mut gate = Gate {
+                journal: &mut self.journal,
+            };
             let mut ctx = Ctx::new(
                 record.entry.clone(),
                 &manifest,
                 &mut *self.provider,
-                &mut self.journal,
+                &mut gate,
                 now_ms,
             );
             ctx.effect(op).map_err(|refusal| refusal.to_string())?;
@@ -567,7 +643,7 @@ impl<S: JournalStore> Reconciler<S> {
         };
         let delete =
             self.journal
-                .intend(entry, class, op_digest(&op), object.clone(), None, now_ms)?;
+                .intend_delete(entry, class, op_digest(&op), object.clone(), now_ms)?;
         match self.provider.retire(entry, object, plan) {
             Ok(Retirement::Deleted(done)) => {
                 self.journal.reverted(delete);
@@ -583,6 +659,28 @@ impl<S: JournalStore> Reconciler<S> {
                 self.journal.failed(delete, &why)?;
                 Ok(Retired::Kept(why))
             }
+        }
+    }
+
+    /// Settles every live record of `entry` that names `object`, once the object is gone: its create, its patches, and the intent
+    /// of the delete. A class-C emission is never reverted, so it is left live.
+    fn settle_deleted(&mut self, entry: &EntryId, object: &ObjectRef) {
+        let ids: Vec<u64> = self
+            .journal
+            .live(entry)
+            .iter()
+            .filter(|record| record.class != EffectClass::C)
+            .filter(|record| {
+                same_place(&record.target, object)
+                    || record
+                        .object
+                        .as_ref()
+                        .is_some_and(|named| same_place(named, object))
+            })
+            .map(|record| record.id)
+            .collect();
+        for id in ids {
+            self.journal.reverted(id);
         }
     }
 }

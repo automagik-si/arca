@@ -747,7 +747,13 @@ impl IncusProvider {
                 uuid: tombstoned.uuid().map(str::to_string),
                 ..object.clone()
             })),
+            // Refused before any write, or answered by Incus with an error status (a running instance, a project that is not
+            // empty, or a failed delete operation). Either way the object stays, so the delete is a settled failure, not an open one.
             Err(IncusError::Refused(reason)) => Ok(Retirement::Drift(reason)),
+            Err(IncusError::Status { code, .. }) => Ok(Retirement::Drift(format!(
+                "Incus refused the delete with status {code}"
+            ))),
+            // Anything else may follow a delete that landed, so the outcome is not known.
             Err(_) => Err(EffectRefusal::Unresolved),
         }
     }

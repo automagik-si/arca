@@ -122,6 +122,7 @@ fn record(
         op_digest: digest("watch"),
         target: instance("p", "n", None),
         pre_image: None,
+        intent: None,
         object,
         inverse,
         state,
@@ -1320,4 +1321,28 @@ fn mode_of(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+/// The bytes an intent record serialized to before a retirement could be marked. A record without the marker must keep them.
+const UNMARKED_INTENT: &str = r#"{"id":1,"entry":"watch","class":"A","op_digest":"baed831623943be39ebf0ef44ae1e9c8fc3eeab51b5f89c113ca410d76a34c1d","target":{"kind":"instance","project":"p","name":"n","uuid":null},"pre_image":null,"object":null,"inverse":null,"state":"Intent","at_ms":1000}"#;
+
+#[test]
+fn an_unmarked_record_keeps_its_bytes_and_a_delete_marker_round_trips() {
+    let plain = record(1, EffectState::Intent, None, None);
+    assert_eq!(
+        serde_json::to_string(&plain).expect("a record serializes"),
+        UNMARKED_INTENT,
+        "a record with no marker serializes to the bytes it always had"
+    );
+    // The marker is an intent field a retirement sets. It must read back and write out again unchanged.
+    let mut marked: serde_json::Value =
+        serde_json::from_str(UNMARKED_INTENT).expect("the bytes are JSON");
+    marked["intent"] = json!("Delete");
+    let back: EffectRecord =
+        serde_json::from_value(marked.clone()).expect("a delete marker is read");
+    assert_eq!(
+        serde_json::to_value(&back).expect("a record serializes"),
+        marked,
+        "the marker survives a round trip"
+    );
 }

@@ -207,8 +207,8 @@ fn record(
 
 /// The entry `entry` as an applied one: the reconciler knows its plugin, so a removal can plan its class-B objects.
 fn known(r: &mut Reconciler<MemJournal>, entry: &str) {
-    r.applied
-        .insert(EntryId(entry.to_string()), dummy_entry(entry, json!({})));
+    r.applied_by
+        .insert(EntryId(entry.to_string()), PluginId(DUMMY.to_string()));
 }
 
 /// An approval of `plan` that the stub verifier accepts, with the statement the kernel's verifier parses.
