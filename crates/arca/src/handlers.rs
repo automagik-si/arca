@@ -254,16 +254,67 @@ impl ToolHandler for MetricsHandler {
     }
 }
 
+/// How long a `watch_report` answer is served from the cache before the next call sweeps the host again.
+pub const WATCH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
 /// `watch_report`: the watch of every project, with the identity flags of the configured phones.
+///
+/// A sweep sends a GET for every project and instance, so an answer is cached for [`WATCH_MIN_INTERVAL`], and only one
+/// sweep runs at a time: a call holds the cache lock across its sweep, so a call that arrives meanwhile waits and then
+/// reads the fresh answer. Every answer carries `ageMs`, the age of the sweep it reports. A failed sweep is not cached.
 pub struct WatchHandler {
     pub socket: PathBuf,
     pub phones: BTreeSet<String>,
+    pub cache: Arc<Mutex<Option<(Instant, Value)>>>,
+}
+
+impl WatchHandler {
+    /// A handler over the Incus socket at `socket`, with an empty cache.
+    pub fn new(socket: PathBuf, phones: BTreeSet<String>) -> Self {
+        WatchHandler {
+            socket,
+            phones,
+            cache: Arc::default(),
+        }
+    }
 }
 
 impl ToolHandler for WatchHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
-        watch_snapshot(UnixIncus::new(self.socket.clone()), &self.phones, now_ms())
+        cached_sweep(&self.cache, WATCH_MIN_INTERVAL, || {
+            watch_snapshot(UnixIncus::new(self.socket.clone()), &self.phones, now_ms())
+        })
     }
+}
+
+/// The cached answer when it is younger than `interval`, else the answer of a new `sweep`, which then replaces it. The lock
+/// is held across the sweep, so concurrent callers share one sweep. The answer gains `ageMs`, the milliseconds since its
+/// sweep ended.
+fn cached_sweep(
+    cache: &Mutex<Option<(Instant, Value)>>,
+    interval: Duration,
+    sweep: impl FnOnce() -> Result<Value, CallError>,
+) -> Result<Value, CallError> {
+    let mut slot = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let fresh = slot
+        .as_ref()
+        .filter(|(taken, _)| taken.elapsed() < interval)
+        .cloned();
+    let (taken, mut report) = match fresh {
+        Some(cached) => cached,
+        None => {
+            let report = sweep()?;
+            let taken = Instant::now();
+            *slot = Some((taken, report.clone()));
+            (taken, report)
+        }
+    };
+    drop(slot);
+    let age = u64::try_from(taken.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Some(object) = report.as_object_mut() {
+        object.insert("ageMs".to_string(), json!(age));
+    }
+    Ok(report)
 }
 
 /// `token_list`: the id and scope of each token, as they were when the server started. No secret and no digest.
@@ -682,6 +733,159 @@ mod tests {
                 metrics_row(snapshot.last(), &window_of(&snapshot, minutes), minutes, 9);
             assert_eq!(from_snapshot, node_metrics(&sampler, Some(minutes), 9));
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_cache_tests {
+    use std::path::Path;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use arca_incus::{FakeIncus, FakeState};
+
+    use super::*;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../arca-incus/tests/fixtures/state.json"
+    );
+
+    /// A fresh directory under the default temporary directory, removed on drop. The default keeps the socket path short.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let dir = std::env::temp_dir().join(format!(
+                "arca-watch-cache-{}-{nanos}-{tag}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fake(scratch: &Scratch) -> FakeIncus {
+        let state = FakeState::load(Path::new(FIXTURE)).expect("load the fixture");
+        FakeIncus::start(&scratch.0, state).expect("start the fake")
+    }
+
+    fn gets(fake: &FakeIncus) -> usize {
+        fake.requests().iter().filter(|r| r.method == "GET").count()
+    }
+
+    fn viewer() -> Caller {
+        Caller {
+            token_id: "viewer-1".to_string(),
+            scope: Scope::Viewer,
+        }
+    }
+
+    #[test]
+    fn two_calls_within_the_interval_make_one_sweep_and_the_second_has_an_age() {
+        let scratch = Scratch::new("twice");
+        let fake = fake(&scratch);
+        let handler = WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new());
+
+        let first = handler.call(json!({}), &viewer()).expect("the first call");
+        let after_first = gets(&fake);
+        assert!(after_first > 0, "the first call sweeps the host");
+        thread::sleep(Duration::from_millis(5));
+        let second = handler.call(json!({}), &viewer()).expect("the second call");
+
+        assert_eq!(gets(&fake), after_first, "the second call sends no GET");
+        assert!(first["ageMs"].as_u64().is_some(), "every answer has ageMs");
+        assert!(
+            second["ageMs"].as_u64().expect("ageMs") > 0,
+            "the cached answer has aged"
+        );
+        let strip = |mut v: Value| {
+            v.as_object_mut().expect("an object").remove("ageMs");
+            v
+        };
+        assert_eq!(
+            strip(first),
+            strip(second),
+            "the second call reports the same sweep"
+        );
+    }
+
+    #[test]
+    fn concurrent_calls_make_one_sweep() {
+        let scratch = Scratch::new("concurrent");
+        let fake = fake(&scratch);
+        // A handler with its own cache measures what one sweep sends.
+        WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new())
+            .call(json!({}), &viewer())
+            .expect("the measuring call");
+        let one_sweep = gets(&fake);
+
+        let handler = Arc::new(WatchHandler::new(
+            fake.socket().to_path_buf(),
+            BTreeSet::new(),
+        ));
+        let callers = 8;
+        let start = Arc::new(Barrier::new(callers));
+        let threads: Vec<_> = (0..callers)
+            .map(|_| {
+                let handler = Arc::clone(&handler);
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    handler.call(json!({}), &viewer())
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread
+                .join()
+                .expect("the caller thread")
+                .expect("every concurrent call answers");
+        }
+        assert_eq!(
+            gets(&fake),
+            2 * one_sweep,
+            "eight concurrent calls made one sweep"
+        );
+    }
+
+    #[test]
+    fn an_expired_answer_is_swept_again_and_a_failed_sweep_is_not_cached() {
+        let cache = Mutex::new(None);
+        let sweeps = AtomicUsize::new(0);
+        let ok = || {
+            sweeps.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "at": 1 }))
+        };
+        cached_sweep(&cache, Duration::ZERO, ok).expect("a sweep");
+        cached_sweep(&cache, Duration::ZERO, ok).expect("a sweep");
+        assert_eq!(
+            sweeps.load(Ordering::SeqCst),
+            2,
+            "an answer older than the interval is swept again"
+        );
+
+        let empty = Mutex::new(None);
+        let failed = cached_sweep(&empty, WATCH_MIN_INTERVAL, || {
+            Err(CallError::Internal("no answer".to_string()))
+        });
+        assert!(failed.is_err());
+        assert!(
+            empty.lock().expect("the cache lock").is_none(),
+            "a failed sweep leaves the cache empty"
+        );
+        cached_sweep(&empty, WATCH_MIN_INTERVAL, ok).expect("the next call sweeps");
+        assert_eq!(sweeps.load(Ordering::SeqCst), 3);
     }
 }
 

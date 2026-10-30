@@ -344,6 +344,7 @@ fn watch_report_params() -> Value {
 fn watch_report_result() -> Value {
     result(vec![
         ("at", true, int()),
+        ("ageMs", false, int()),
         (
             "projects",
             true,

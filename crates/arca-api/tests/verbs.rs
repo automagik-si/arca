@@ -260,6 +260,7 @@ fn watch_report_schemas_equal_its_table_row() {
         open(
             json!({
                 "at": { "type": "integer" },
+                "ageMs": { "type": "integer" },
                 "projects": { "type": "array", "items": project },
                 "drift": { "type": "array", "items": drift }
             }),

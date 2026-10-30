@@ -1,0 +1,27 @@
+# The recording shim as a systemd user unit: the only path from arca-watch to Incus. It forwards GET and refuses every
+# other request, and its live summary (systemctl --user kill -s USR1 arca-shim.service) is the read-only proof.
+# Install: see docs/OPERATING.md, "Running as a user service".
+
+[Unit]
+Description=Arca recording shim (GET-only access to the Incus socket)
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/arca shim --upstream /var/lib/incus/unix.socket --listen %t/arca-shim/incus.sock --log %h/.local/state/arca-shim/shim.log --log-max-bytes 16777216
+# The unit is started only once the shim's socket exists, so arca-watch never starts against a socket that is not there.
+ExecStartPost=/bin/sh -c 'i=0; while [ ! -S "$$1" ]; do i=$$((i + 1)); [ "$$i" -lt 100 ] || exit 1; sleep 0.1; done' wait-for-socket %t/arca-shim/incus.sock
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=arca-shim
+RuntimeDirectoryMode=0700
+StateDirectory=arca-shim
+StateDirectoryMode=0700
+UMask=0077
+MemoryHigh=48M
+MemoryMax=64M
+MemorySwapMax=0
+
+[Install]
+WantedBy=default.target

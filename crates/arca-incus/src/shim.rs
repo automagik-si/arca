@@ -5,8 +5,11 @@
 //! be an HTTP token. Only the head is forwarded, so bytes after it never reach Incus. Every other request, a malformed one
 //! included, is answered `405` or `400` and not forwarded. The log holds one JSON line per request with `method`, `path`,
 //! `status` and `forwarded`. The path is the target without its query string. The log never holds a header or a body byte.
+//! A shim started with a cap ([`RecordingShim::start_capped`]) keeps its log under the cap plus one line: once the log
+//! reaches the cap it is renamed to `<log>.1`, replacing the one before, and a new log is begun.
 
-use std::fs::{File, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -49,21 +52,96 @@ pub struct ShimHandle {
 
 struct Shared {
     upstream: PathBuf,
-    log: Mutex<File>,
+    log: Mutex<Log>,
     log_failed: AtomicBool,
     get: AtomicU64,
     refused: AtomicU64,
 }
 
+/// The open log, its path, the bytes it holds, and the cap past which it is rotated, when there is one.
+struct Log {
+    file: File,
+    path: PathBuf,
+    len: u64,
+    cap: Option<u64>,
+}
+
+impl Log {
+    fn open(path: &Path, cap: Option<u64>) -> io::Result<Log> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Log {
+            file,
+            path: path.to_path_buf(),
+            len,
+            cap,
+        })
+    }
+
+    /// Appends one line. When the log has reached its cap it is then renamed to `<log>.1`, replacing the one before, and
+    /// a new, empty log is opened in its place.
+    fn append(&mut self, line: &[u8]) -> io::Result<()> {
+        self.file.write_all(line)?;
+        self.len = self.len.saturating_add(line.len() as u64);
+        match self.cap {
+            Some(cap) if self.len >= cap => self.rotate(),
+            _ => Ok(()),
+        }
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        fs::rename(&self.path, rotated(&self.path))?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.len = 0;
+        Ok(())
+    }
+}
+
+/// The path a full log is renamed to: the log's own path with `.1` appended.
+fn rotated(path: &Path) -> PathBuf {
+    let mut name = OsString::from(path.as_os_str());
+    name.push(".1");
+    PathBuf::from(name)
+}
+
 impl RecordingShim {
-    /// Binds the shim at `listen`, forwarding to `upstream` and appending to `log`. The log is opened in append mode.
+    /// Binds the shim at `listen`, forwarding to `upstream` and appending to `log`. The log is opened in append mode and
+    /// is never rotated.
     pub fn start(upstream: &Path, listen: &Path, log: &Path) -> io::Result<ShimHandle> {
-        let log_file = OpenOptions::new().create(true).append(true).open(log)?;
+        Self::bind(upstream, listen, Log::open(log, None)?)
+    }
+
+    /// [`RecordingShim::start`] with a log capped at `max_bytes`: once the log holds `max_bytes` or more it is renamed to
+    /// `<log>.1` and a new log is begun, so the log never holds more than `max_bytes` plus one line, and one rotated file
+    /// is kept. A cap of zero is refused.
+    pub fn start_capped(
+        upstream: &Path,
+        listen: &Path,
+        log: &Path,
+        max_bytes: u64,
+    ) -> io::Result<ShimHandle> {
+        if max_bytes == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the log cap must be at least one byte",
+            ));
+        }
+        let mut log = Log::open(log, Some(max_bytes))?;
+        if log.len >= max_bytes {
+            log.rotate()?;
+        }
+        Self::bind(upstream, listen, log)
+    }
+
+    fn bind(upstream: &Path, listen: &Path, log: Log) -> io::Result<ShimHandle> {
         let listener = UnixListener::bind(listen)?;
         listener.set_nonblocking(true)?;
         let shared = Arc::new(Shared {
             upstream: upstream.to_path_buf(),
-            log: Mutex::new(log_file),
+            log: Mutex::new(log),
             log_failed: AtomicBool::new(false),
             get: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -89,18 +167,28 @@ impl ShimHandle {
         &self.socket
     }
 
+    /// The counts so far, read while the shim keeps serving. A request still in flight may not be counted yet.
+    pub fn summary(&self) -> ShimSummary {
+        ShimSummary {
+            get: self.shared.get.load(Ordering::SeqCst),
+            refused: self.shared.refused.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Whether a log line could not be written. A live summary is a proof only while this is false.
+    pub fn log_failed(&self) -> bool {
+        self.shared.log_failed.load(Ordering::SeqCst)
+    }
+
     /// Stops accepting, waits for every connection to finish, removes the socket file and returns the counts. It fails if
     /// the log could not be written, so a missing record is never a pass.
     pub fn stop(mut self) -> io::Result<ShimSummary> {
         self.halt();
         let _ = std::fs::remove_file(&self.socket);
-        if self.shared.log_failed.load(Ordering::SeqCst) {
+        if self.log_failed() {
             return Err(io::Error::other("the shim could not write its log"));
         }
-        Ok(ShimSummary {
-            get: self.shared.get.load(Ordering::SeqCst),
-            refused: self.shared.refused.load(Ordering::SeqCst),
-        })
+        Ok(self.summary())
     }
 
     fn halt(&mut self) {
@@ -416,8 +504,8 @@ fn log(shared: &Shared, method: &str, target: &str, status: u16, forwarded: bool
         }
     };
     bytes.push(b'\n');
-    let mut file = shared.log.lock().unwrap_or_else(PoisonError::into_inner);
-    if file.write_all(&bytes).is_err() {
+    let mut log = shared.log.lock().unwrap_or_else(PoisonError::into_inner);
+    if log.append(&bytes).is_err() {
         shared.log_failed.store(true, Ordering::SeqCst);
     }
 }

@@ -12,7 +12,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
 | `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
-| `arca shim --upstream <socket> --listen <socket> --log <file>` | forwards GET, refuses the rest | the shim summary, on SIGTERM |
+| `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 
 `watch` and `metrics` print the same JSON as the MCP verb of the same name, so a command's output can be compared with the
 server's answer.
@@ -35,7 +35,7 @@ refused without the value being echoed back.
   "stateDir": "/var/lib/arca",
   "incus": { "socket": "/var/lib/incus/unix.socket", "pools": ["default"] },
   "identityPhones": ["phone1"],
-  "listen": { "unix": "/run/arca/arca.sock", "tailnet": null },
+  "listen": { "unix": "/run/arca/arca.sock", "tailnet": null, "proxy": null },
   "tokens": { "hashDir": "/etc/arca/tokens" },
   "kernel": {
     "projects": [],
@@ -54,6 +54,7 @@ refused without the value being echoed back.
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
+| `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. See below. |
 | `tokens.hashDir` | yes | The directory of hash files. See below. |
 | `kernel.projects` | no | The project family the kernel may write in. With projects named, the writer serves only those projects. With none, the provider reads only, and a removal cannot reach Incus. |
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
@@ -67,6 +68,8 @@ The config is refused, with exit 2, when:
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
 - `listen.tailnet` is not a tailnet address: it must be a fixed port, not a wildcard, inside `100.64.0.0/10` or
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
+- `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
+  `listen.proxy.peer` is missing or a wildcard; or `listen.proxy` carries any other key;
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
 - `kernel.projects` is not empty and `kernel.droiddProjects` is empty;
 - `kernel.scratch` is `true` and a kernel project does not start with `arcak-scratch-`.
@@ -77,6 +80,16 @@ No command reads Incus before the config passes these checks.
 
 Serving on a tailnet address is a separate step. The owner approves it before `serve` is started with a tailnet address, and
 until then the node runs on its unix socket alone. A peer outside the tailnet ranges is closed with no bytes sent.
+
+### Proxy listener
+
+`listen.proxy` is for a reverse proxy on the same host, such as Caddy in a container on the host's bridge, which connects
+from its bridge address rather than from a tailnet address. The listener binds `addr` and serves exactly one peer address,
+`peer`; an IPv4-mapped peer is compared as its IPv4 address. Every other peer is closed at accept with no bytes sent. The
+bearer and `Origin` rules are the same as on the unix socket, so the proxy's peer gets the same 401, 403 and 200 answers.
+
+The connection is plain HTTP on the bridge, and a host that can take the peer's address can reach the listener; the bearer
+token is still required. Serving on a proxy address is a separate step, approved by the owner like the tailnet listener.
 
 ## Tokens
 
@@ -149,13 +162,18 @@ its request is read.
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
   `mean` are `null`.
 - `watch_report` reads every project and instance through Incus GET. Live desired-state entries do not exist yet, so the
-  report has no entries to compare, and every kernel-marked object is reported as drift.
+  report has no entries to compare, and every kernel-marked object is reported as drift. A sweep sends a GET for every
+  project and instance, so the server keeps its answer for 30 seconds and runs one sweep at a time: a call within 30
+  seconds of the last sweep gets that sweep's report, and calls that arrive during a sweep wait for it. Every answer
+  carries `ageMs`, the milliseconds since its sweep ended. A failed sweep is not kept.
 - `token_list` lists each token's id and scope as they were when the server started. It never lists a secret or a digest.
 - `plan_list` lists each waiting delete plan with the statement its owner signs. See the next section.
 - `plan_decline` retains a waiting plan's objects. A decline is final and survives a restart.
 - `approval_submit` checks an owner's approval for a waiting plan and, when it holds, deletes the plan's objects once.
 
-`serve` removes its socket on SIGTERM or SIGINT, then exits 0. A socket that another server answers on is left alone.
+`serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
+fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
+A socket that another server answers on is left alone.
 
 ## Calling the server
 
@@ -247,6 +265,133 @@ Its summary has two counts:
 
 The shim prints its summary as one JSON line and exits 0 on SIGTERM or SIGINT. A proof that a client sent only GETs is the
 shim's log, read after the shim has stopped, together with `refused: 0`.
+
+On SIGUSR1 the shim prints its summary so far to stderr, as one JSON line, and keeps serving. A request still in flight may
+not be counted yet. If a log line could not be written, a plain line saying so follows the summary, so a reader that takes
+the last line as the summary gets no proof. This is the live proof for a shim that runs as a service.
+
+`--log-max-bytes <n>` caps the log. Once the log holds `n` bytes or more it is renamed to `<log>.1`, replacing the one
+before, and a new log is begun, so the log never holds more than `n` bytes plus one line, and one rotated file is kept. A
+log already at the cap when the shim starts is rotated first. `n` must be at least 1. Without the flag the log is never
+rotated.
+
+## Running as a user service
+
+`deploy/systemd/` holds two systemd user units that run the node read-only for days:
+
+- `arca-shim.service` runs `arca shim` from the Incus socket `/var/lib/incus/unix.socket` to `%t/arca-shim/incus.sock`. It
+  logs to `~/.local/state/arca-shim/shim.log`, capped at 16 MiB with one rotated file. The unit counts as started only once
+  its socket exists.
+- `arca-watch.service` runs `arca serve --config ~/.config/arca/node.json`. It `Requires=` and comes `After=` the shim, so
+  it never reads Incus except through the shim, and it stops when the shim stops.
+
+Both units restart on failure after 10 seconds, at most 5 times in 10 minutes (`Restart=on-failure`, `RestartSec=10`,
+`StartLimitIntervalSec=600`, `StartLimitBurst=5`). Swap is off for both (`MemorySwapMax=0`). `arca-watch` has
+`MemoryHigh=192M` and `MemoryMax=256M`, and `arca-shim` has `48M` and `64M`. The binary is `~/.local/bin/arca`. The units
+use systemd specifiers only (`%h` for the home directory, `%t` for the user's runtime directory), so they carry no
+host-specific value.
+
+What the host needs:
+
+- The service's user can read the Incus socket, for example through the group that owns it.
+- The user manager delegates the `memory` controller, so the memory limits apply, and lingering is on for the user, so
+  the units run without a login session (`loginctl enable-linger`, run by the owner).
+- `arca` is installed at `~/.local/bin/arca`.
+
+### The service's config
+
+The config must name no kernel project, so the node only reads. Its paths follow the units' directories. `<uid>` is the
+service user's uid, and `<home>` its home directory; the config file takes no specifiers.
+
+```json
+{
+  "stateDir": "<home>/.local/state/arca",
+  "incus": { "socket": "/run/user/<uid>/arca-shim/incus.sock", "pools": ["default"] },
+  "identityPhones": [],
+  "listen": { "unix": "/run/user/<uid>/arca/arca.sock", "tailnet": null, "proxy": null },
+  "tokens": { "hashDir": "<home>/.config/arca/tokens" },
+  "kernel": { "projects": [], "scratch": false, "droiddProjects": ["app1"], "reservedCidrs": [] }
+}
+```
+
+`StateDirectory=arca` creates `~/.local/state/arca` at mode 0700, which `serve` requires. `RuntimeDirectory=arca` creates
+`/run/user/<uid>/arca` for the socket, and removes it when the unit stops. The token directory is minted into at mode 0700
+and then set to 0500 (see Tokens).
+
+### Install (the owner approves it first)
+
+```sh
+install -m 0644 deploy/systemd/arca-shim.service deploy/systemd/arca-watch.service ~/.config/systemd/user/
+systemd-analyze --user verify ~/.config/systemd/user/arca-shim.service ~/.config/systemd/user/arca-watch.service
+systemctl --user daemon-reload
+systemctl --user enable --now arca-shim.service arca-watch.service
+```
+
+**Rollback:** `systemctl --user disable --now arca-watch.service arca-shim.service`, remove both unit files from
+`~/.config/systemd/user/`, then `systemctl --user daemon-reload`. The state directory and the tokens are kept.
+
+### Checks
+
+```sh
+systemctl --user is-active arca-shim.service arca-watch.service
+systemctl --user show arca-watch.service -p MemoryMax -p MemorySwapMax -p StartLimitBurst -p NRestarts -p MemoryPeak
+systemctl --user show arca-shim.service -p MemoryMax -p MemorySwapMax -p NRestarts -p MemoryPeak
+since=$(date '+%Y-%m-%d %H:%M:%S'); systemctl --user kill -s USR1 arca-shim.service; sleep 1
+journalctl --user -u arca-shim.service --since "$since" -o cat | tail -n 1    # {"get":<n>,"refused":0}
+arca call watch_report --config ~/.config/arca/node.json --token-file ~/.config/arca/viewer-1.secret --args '{}'
+```
+
+`arca-watch` reads back `MemoryMax=268435456`, `MemorySwapMax=0` and `StartLimitBurst=5`, and `arca-shim` reads back
+`MemoryMax=67108864`. A second `watch_report` within 30 seconds carries an `ageMs` above 0. The service is stable after 24
+hours active with `NRestarts=0`, a `MemoryPeak` under `MemoryHigh`, and a live shim summary of `refused: 0`.
+
+### Publishing through a reverse proxy (each step approved by the owner at that moment)
+
+Agents on the tailnet reach the node through a reverse proxy, such as Caddy in a container on the host's bridge, that
+serves `/mcp` only, from the tailnet source only, under a host name. Each step below is separate, is taken only after the
+owner's yes, and has its own rollback. Take them in order and roll back in reverse order.
+
+1. **Proxy listener.** Set `listen.proxy` in the service's config to the host's bridge address and a free port, and the
+   proxy container's bridge address as `peer`, for example `{ "addr": "192.0.2.1:7460", "peer": "192.0.2.20" }`. Then
+   `systemctl --user restart arca-watch.service`, and check that the address answers 401 from the peer and nothing from
+   any other address.
+   **Rollback:** set `listen.proxy` back to `null` and restart `arca-watch.service`.
+2. **Proxy site file.** Add one site file for the new host name to the proxy, copied from an existing tailnet-only site on
+   the same proxy, with three changes: the host name; an upstream of plain HTTP to `listen.proxy.addr`; and the rule that
+   admits only `/mcp` from the tailnet source, with every other request answered 403. In Caddy's terms:
+
+   ```
+   <host name> {
+       @mcp {
+           path /mcp
+           remote_ip <tailnet source>
+       }
+       handle @mcp {
+           reverse_proxy <listen.proxy.addr>
+       }
+       handle {
+           respond 403
+       }
+   }
+   ```
+
+   Then reload the proxy (`systemctl reload caddy` in its container).
+   **Rollback:** remove the site file and reload the proxy.
+3. **DNS record.** Create an `A` record from the host name to the host's tailnet address, not proxied by the DNS
+   provider, so the name resolves only to a tailnet address. Keep the provider's API token out of command lines and logs.
+   **Rollback:** delete the record.
+4. **MCP client entry.** Mint a token for the client as the service's user: set the token directory to 0700, run
+   `arca token mint --scope viewer --id <id> --config ~/.config/arca/node.json --out <secret file>`, then set it back
+   to 0500. `serve` reads its tokens only at start, so run `systemctl --user restart arca-watch.service`. Add the client
+   entry under a name of its own, such as `arca-kernel`, that no other server on the client uses, with the URL
+   `https://<host name>/mcp` and the bearer from the secret file. `viewer` is enough to read; `doctor` is needed only for
+   `approval_submit`.
+   **Rollback:** remove the client entry; set the token directory to 0700, remove `<id>.hash`, set it back to 0500, and
+   restart `arca-watch.service`.
+
+Once all four are in place, from a tailnet host: a `POST https://<host name>/mcp` without a bearer gets 401, `initialize`
+with the viewer token gets 200, and any other path gets 403 or 404. Send the bearer from a 0600 header file
+(`curl -H @<file>`), never on the command line.
 
 ## Tests
 

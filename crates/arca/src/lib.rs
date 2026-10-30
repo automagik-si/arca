@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 
-use arca_incus::RecordingShim;
+use arca_incus::{RecordingShim, ShimHandle};
 use arca_mcp::CallError;
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
@@ -31,7 +31,7 @@ const USAGE: &str = "usage: arca <command>
   serve --config <file>
   call <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
-  shim --upstream <socket> --listen <socket> --log <file>";
+  shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]";
 
 /// Why a command ended without a result. The message never carries a token, a secret or a key.
 #[derive(Debug)]
@@ -176,7 +176,11 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
             )?),
             _ => Err(usage_failure()),
         },
-        "shim" => run_shim(&parse_flags(rest, &["upstream", "listen", "log"], &[])?),
+        "shim" => run_shim(&parse_flags(
+            rest,
+            &["upstream", "listen", "log", "log-max-bytes"],
+            &[],
+        )?),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(None)
@@ -185,12 +189,15 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
     }
 }
 
-/// `shim --upstream <socket> --listen <socket> --log <file>`: forwards GET to the upstream socket and refuses every other
-/// request, until SIGTERM or SIGINT. Then it prints its summary and exits 0.
+/// `shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]`: forwards GET to the upstream socket and
+/// refuses every other request, until SIGTERM or SIGINT. Then it prints its summary and exits 0. With `--log-max-bytes`, the
+/// log is rotated to `<log>.1` once it holds that many bytes. On SIGUSR1 it prints its summary so far to stderr, as one
+/// JSON line, and keeps serving.
 fn run_shim(flags: &Flags) -> Result<Option<Value>, Failure> {
     let upstream = PathBuf::from(flags.required("upstream")?);
     let listen = PathBuf::from(flags.required("listen")?);
     let log = PathBuf::from(flags.required("log")?);
+    let cap = flags.value("log-max-bytes").map(log_cap).transpose()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -199,14 +206,45 @@ fn run_shim(flags: &Flags) -> Result<Option<Value>, Failure> {
         // The signals are registered before the shim starts, so a stop that arrives early is still a clean stop.
         let mut terminate = signal(SignalKind::terminate()).map_err(runtime_failure)?;
         let mut interrupt = signal(SignalKind::interrupt()).map_err(runtime_failure)?;
-        let handle = RecordingShim::start(&upstream, &listen, &log).map_err(runtime_failure)?;
-        tokio::select! {
-            _ = terminate.recv() => {}
-            _ = interrupt.recv() => {}
+        let mut report = signal(SignalKind::user_defined1()).map_err(runtime_failure)?;
+        let handle = match cap {
+            Some(cap) => RecordingShim::start_capped(&upstream, &listen, &log, cap),
+            None => RecordingShim::start(&upstream, &listen, &log),
+        }
+        .map_err(runtime_failure)?;
+        loop {
+            tokio::select! {
+                _ = terminate.recv() => break,
+                _ = interrupt.recv() => break,
+                _ = report.recv() => print_live_summary(&handle),
+            }
         }
         let summary = handle.stop().map_err(runtime_failure)?;
         let value = serde_json::to_value(summary)
             .map_err(|_| Failure::Runtime("the summary does not serialize".to_string()))?;
         Ok::<Option<Value>, Failure>(Some(value))
     })
+}
+
+/// The value of `--log-max-bytes`: a whole number of bytes, at least 1.
+fn log_cap(text: &str) -> Result<u64, Failure> {
+    text.parse::<u64>()
+        .ok()
+        .filter(|cap| *cap > 0)
+        .ok_or_else(|| {
+            Failure::Usage(
+                "--log-max-bytes must be a whole number of bytes, at least 1".to_string(),
+            )
+        })
+}
+
+/// The SIGUSR1 answer: the summary so far, as one JSON line on stderr. When a log line could not be written, a plain line
+/// saying so follows it, so a reader that takes the last line as the summary sees no proof.
+fn print_live_summary(handle: &ShimHandle) {
+    if let Ok(line) = serde_json::to_string(&handle.summary()) {
+        eprintln!("{line}");
+    }
+    if handle.log_failed() {
+        eprintln!("arca: the shim could not write its log");
+    }
 }

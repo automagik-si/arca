@@ -648,3 +648,123 @@ fn the_client_is_usable_as_a_shared_trait_object() {
     fn shared<T: Send + Sync>() {}
     shared::<UnixIncus>();
 }
+
+// The capped log and the live summary.
+
+/// The longest line the log holds in these tests: a forwarded GET of the longest path they send.
+fn longest_line(log: &Path) -> u64 {
+    let rotated = log.with_extension("log.1");
+    [log, rotated.as_path()]
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .flat_map(|text| {
+            text.lines()
+                .map(|line| line.len() as u64 + 1)
+                .collect::<Vec<_>>()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_capped_log_never_exceeds_its_cap_plus_one_line_and_keeps_one_rotated_file() {
+    let dir = Scratch::new("capped");
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let log = dir.at("shim.log");
+    let cap = 200;
+    let shim = RecordingShim::start_capped(fake.socket(), &dir.at("shim.sock"), &log, cap)
+        .expect("start the capped shim");
+    let client = UnixIncus::new(shim.socket().to_path_buf());
+    for _ in 0..40 {
+        client.get("/1.0").expect("a GET through the shim");
+    }
+    let summary = shim.stop().expect("stop the shim");
+    assert_eq!(
+        summary,
+        ShimSummary {
+            get: 40,
+            refused: 0
+        }
+    );
+
+    let line = longest_line(&log);
+    assert!(line > 0, "the log holds lines");
+    let rotated = dir.at("shim.log.1");
+    for path in [&log, &rotated] {
+        let len = fs::metadata(path).expect("the log file exists").len();
+        assert!(
+            len < cap + line,
+            "{} holds {len} bytes, over the cap of {cap} plus one line of {line}",
+            path.display()
+        );
+    }
+    assert!(
+        fs::metadata(&rotated).expect("the rotated log").len() >= cap,
+        "the rotated log was full when it was rotated"
+    );
+    assert!(
+        !dir.at("shim.log.2").exists(),
+        "only one rotated file is kept"
+    );
+    for line in log_lines(&log).into_iter().chain(log_lines(&rotated)) {
+        assert_eq!(line["method"], "GET");
+        assert_eq!(line["forwarded"], true);
+    }
+}
+
+#[test]
+fn a_capped_shim_rotates_a_full_log_it_starts_on() {
+    let dir = Scratch::new("capped-start");
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let log = dir.at("shim.log");
+    fs::write(&log, "x".repeat(300)).expect("write a full log");
+    let shim = RecordingShim::start_capped(fake.socket(), &dir.at("shim.sock"), &log, 200)
+        .expect("start the capped shim");
+    assert_eq!(
+        fs::metadata(dir.at("shim.log.1"))
+            .expect("rotated at start")
+            .len(),
+        300
+    );
+    assert_eq!(fs::metadata(&log).expect("a new log").len(), 0);
+    shim.stop().expect("stop the shim");
+}
+
+#[test]
+fn a_log_cap_of_zero_is_refused_before_the_shim_binds() {
+    let dir = Scratch::new("capped-zero");
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let refused =
+        RecordingShim::start_capped(fake.socket(), &dir.at("shim.sock"), &dir.at("shim.log"), 0);
+    assert_eq!(
+        refused.err().map(|e| e.kind()),
+        Some(std::io::ErrorKind::InvalidInput)
+    );
+    assert!(!dir.at("shim.sock").exists(), "nothing was bound");
+}
+
+#[test]
+fn the_live_summary_counts_while_the_shim_keeps_serving() {
+    let dir = Scratch::new("live-summary");
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let shim = RecordingShim::start(fake.socket(), &dir.at("shim.sock"), &dir.at("shim.log"))
+        .expect("start the shim");
+    let client = UnixIncus::new(shim.socket().to_path_buf());
+    client.get("/1.0").expect("a GET through the shim");
+    let refused = exchange(
+        shim.socket(),
+        b"POST /1.0 HTTP/1.1\r\nHost: arca\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status_of(&refused), 405);
+    assert_eq!(shim.summary(), ShimSummary { get: 1, refused: 1 });
+    assert!(!shim.log_failed());
+
+    client
+        .get("/1.0")
+        .expect("the shim still serves after a summary");
+    assert_eq!(shim.summary(), ShimSummary { get: 2, refused: 1 });
+    assert_eq!(
+        shim.stop().expect("stop the shim"),
+        ShimSummary { get: 2, refused: 1 }
+    );
+}
