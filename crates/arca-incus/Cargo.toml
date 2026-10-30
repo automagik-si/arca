@@ -7,8 +7,13 @@ repository.workspace = true
 description = "Arca's Incus access: a GET-only client over the unix socket, a fake Incus and a recording shim"
 
 [dependencies]
+arca-kernel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# The Incus writer. Off by default; only the provider crate enables it.
+write = []

@@ -278,7 +278,7 @@ pub(crate) fn read_head<R: Read>(stream: &mut R) -> io::Result<Option<Vec<u8>>> 
 }
 
 /// The length of the head that `bytes` starts with, through the blank line. Both `\r\n` and bare `\n` endings are read.
-fn head_end(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn head_end(bytes: &[u8]) -> Option<usize> {
     for (index, &byte) in bytes.iter().enumerate() {
         if byte != b'\n' {
             continue;
