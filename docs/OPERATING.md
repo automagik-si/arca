@@ -493,9 +493,9 @@ second file that names the service's `stateDir`, the adoption project in `kernel
    writes an intent line before its request and an outcome line after it to `<stateDir>/adoptions.jsonl` (mode 0600,
    synced). A fresh plan's digest must be the one given.
 4. `arca adopt verify --instance svc1 --port 8080 [--http-path /] [--wait <s>] --config adopt.json` checks that the instance
-   runs with the pre-image's MAC and IPv4 on `eth0`, then connects to `<ipv4>:<port>` and needs an HTTP answer below 500
-   within 10 s. It tries again every 2 s for up to `--wait` seconds (60 by default, at most 3600), so a lease still being
-   given or a service still starting is waited for, and then reports the last failure.
+   runs under the uuid the record holds, with the pre-image's MAC and IPv4 on `eth0`, then connects to `<ipv4>:<port>`
+   and needs an HTTP answer below 500 within 10 s. It tries again every 2 s for up to `--wait` seconds (60 by default, at
+   most 3600), so a lease still being given or a service still starting is waited for, and then reports the last failure.
 5. Start the service again. `watch_report` and `arca watch --once --json` count each adoption that is not released in full as
    a live entry, so the instance shows in its adoption project as kernel-owned (`adopt-svc1`) with no drift.
 
@@ -510,6 +510,15 @@ digest again. It goes on from the plan in the record, never from a fresh preflig
 moved. A step whose intent is the last line runs again without a second intent, and a step that had landed sends nothing.
 The digest must be the recorded plan's. Only one adoption may be open at a time, and a complete adoption applied again sends
 nothing.
+
+**A move is a copy.** Incus 7.5.1 runs a stopped instance's project move as a copy, under a new `volatile.uuid`. The writer
+confirms a move under a new uuid only when the old uuid and the name are both gone from the project it left, exactly one
+instance of the name is in the new one, and that one is unmarked, carries the pin and holds the adoption snapshot. The record
+then holds the new uuid (a `uuid` line before the move's outcome), and every later step, `verify` and `adopt status` follow it.
+A Move that failed as landed but unconfirmed is resumed with the same `apply`: the copy is confirmed by the same rule and the
+move is not sent again. An instance started by hand in its adoption project meanwhile is marked as it runs, and Start then
+sends nothing. Resume it with `apply` before any `release`: a release from that state refuses at MoveBack, because the
+instance runs, and records the failure, so only `release` can finish it after that.
 
 **Release.** `arca adopt release --instance svc1 [--dry-run] --config adopt.json` takes the lock, except for `--dry-run`, and
 returns the instance to `default`, running and unmarked, from wherever its record stands. Before Move, only ReleaseStart is

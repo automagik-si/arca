@@ -11,10 +11,14 @@
 //! The NIC is pinned on the device itself before the move and never unpinned: `devices.eth0` names the network, the pre-image
 //! MAC and the pre-image IPv4 ([`pin_patch`]). No step removes or renames `eth0`, so Incus's `deviceVolatileReset` never clears a
 //! key the instance's MAC depends on.
+//!
+//! Incus 7.5 runs a stopped instance's project move as a copy, which gets a new `volatile.uuid`. A move is confirmed under a
+//! new uuid only by the copy rule ([`AdoptWriter::uuid`]), and the writer then follows the new uuid.
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use arca_kernel::desired::EntryId;
@@ -241,7 +245,7 @@ struct Seen {
 }
 
 /// The adoption writer for one allowlisted target and its recorded pre-image.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AdoptWriter {
     writer: UnixIncusWriter,
     read: UnixIncus,
@@ -251,6 +255,24 @@ pub struct AdoptWriter {
     pin: Pin,
     entry: EntryId,
     snapshot: Option<String>,
+    /// The uuid the instance has now: the pre-image's until a move is confirmed as a copy under a new one.
+    uuid: Mutex<String>,
+}
+
+impl Clone for AdoptWriter {
+    fn clone(&self) -> Self {
+        Self {
+            writer: self.writer.clone(),
+            read: self.read.clone(),
+            target: self.target.clone(),
+            attach: self.attach.clone(),
+            pre: self.pre.clone(),
+            pin: self.pin.clone(),
+            entry: self.entry.clone(),
+            snapshot: self.snapshot.clone(),
+            uuid: Mutex::new(self.uuid()),
+        }
+    }
 }
 
 impl AdoptWriter {
@@ -278,6 +300,7 @@ impl AdoptWriter {
         if !mac_ok(&pin.mac) || pre.uuid.is_empty() {
             return Err(refused("the pre-image has no plain MAC or uuid"));
         }
+        let uuid = Mutex::new(pre.uuid.clone());
         let family = ProjectFamily::new([target.to.as_str()], [])
             .map_err(|_| refused("the adoption project cannot be named"))?;
         let writer = UnixIncusWriter::new(socket.clone(), entry.clone(), BTreeMap::new(), family);
@@ -290,6 +313,7 @@ impl AdoptWriter {
             pin,
             entry,
             snapshot: None,
+            uuid,
         })
     }
 
@@ -314,6 +338,36 @@ impl AdoptWriter {
     pub fn with_operation_deadline(mut self, deadline: Duration) -> Self {
         self.writer = self.writer.with_operation_deadline(deadline);
         self
+    }
+
+    /// The uuid the writer expects the instance to have: the pre-image's, or the one a confirmed copy gave it.
+    ///
+    /// A move that reads back under a new uuid in its new project is confirmed only by the copy rule: the old uuid and the
+    /// name are both gone from the project it left; exactly one instance of the name is in its new project; that one carries
+    /// no owner's mark, its own `eth0` is the recorded pin and it holds the adoption snapshot. Every later step expects the
+    /// new uuid.
+    pub fn uuid(&self) -> String {
+        self.uuid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The same writer expecting the instance under `uuid`, the one a recorded copy gave it. The uuid is lowercase hex in
+    /// groups of 8, 4, 4, 4 and 12, joined by hyphens.
+    pub fn with_uuid(self, uuid: &str) -> Result<Self, IncusError> {
+        if !uuid_ok(uuid) {
+            return Err(refused("the recorded uuid is not a plain uuid"));
+        }
+        self.follow(uuid);
+        Ok(self)
+    }
+
+    fn follow(&self, uuid: &str) {
+        *self
+            .uuid
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = uuid.to_string();
     }
 
     /// The pin this writer sets.
@@ -439,7 +493,7 @@ impl AdoptWriter {
             project: project.to_string(),
             parent: None,
             name: self.target.instance.clone(),
-            uuid: Some(self.pre.uuid.clone()),
+            uuid: Some(self.uuid()),
         }
     }
 
@@ -470,9 +524,20 @@ impl AdoptWriter {
         Ok(())
     }
 
-    /// Reads the instance in `project`: `None` when it is not there. A non-container, or one whose uuid is not the recorded
-    /// one, is refused.
+    /// Reads the instance in `project`: `None` when it is not there. A non-container, or one whose uuid is not the one the
+    /// writer expects, is refused.
     fn read_in(&self, project: &str) -> Result<Option<Seen>, IncusError> {
+        match self.read_any(project)? {
+            Some((uuid, _)) if uuid != self.uuid() => {
+                Err(refused("the instance is not the one the plan recorded"))
+            }
+            found => Ok(found.map(|(_, seen)| seen)),
+        }
+    }
+
+    /// Reads the instance of the target's name in `project`, whatever its uuid: the uuid and the read, or `None` when it is not
+    /// there. A non-container is refused.
+    fn read_any(&self, project: &str) -> Result<Option<(String, Seen)>, IncusError> {
         let (metadata, etag) = match self.writer.get_etag(&self.instance_ref(project)) {
             Ok(found) => found,
             Err(IncusError::Status { code: 404, .. }) => return Ok(None),
@@ -483,21 +548,22 @@ impl AdoptWriter {
         }
         let config = text_map(metadata.get("config"))
             .ok_or_else(|| decode("the instance's config is not a map of text"))?;
-        if config.get("volatile.uuid") != Some(&self.pre.uuid) {
-            return Err(refused("the instance is not the one the plan recorded"));
-        }
-        Ok(Some(Seen {
-            etag,
-            class: classify(&config, &BTreeMap::new()),
-            status: metadata
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            kernel_keys: config.keys().any(|key| key.starts_with(KERNEL_NAMESPACE)),
-            devices: devices_of(metadata.get("devices"))?,
-            expanded: devices_of(metadata.get("expanded_devices"))?,
-        }))
+        let uuid = config.get("volatile.uuid").cloned().unwrap_or_default();
+        Ok(Some((
+            uuid,
+            Seen {
+                etag,
+                class: classify(&config, &BTreeMap::new()),
+                status: metadata
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                kernel_keys: config.keys().any(|key| key.starts_with(KERNEL_NAMESPACE)),
+                devices: devices_of(metadata.get("devices"))?,
+                expanded: devices_of(metadata.get("expanded_devices"))?,
+            },
+        )))
     }
 
     /// Whether a read shows the class a step expects. Foreign is no owner's mark and no key in the kernel's namespace.
@@ -517,7 +583,9 @@ impl AdoptWriter {
         seen.devices.get(NIC) == Some(&pin_device(&self.pin))
     }
 
-    /// Refuses a read that is not in the class and the status `step` expects.
+    /// Refuses a read that is not in the class and the status `step` expects. Mark also takes a running instance: one started
+    /// by hand in its adoption project after a move whose outcome was not recorded is marked as it runs, and Start then finds
+    /// its outcome already holds.
     fn before(&self, step: AdoptStep, seen: &Seen) -> Result<(), IncusError> {
         let expect = Self::expect(step);
         if !self.class_is(seen, expect.class) {
@@ -525,7 +593,8 @@ impl AdoptWriter {
                 "the instance is not in the owner class the step expects",
             ));
         }
-        if seen.status != expect.status {
+        let running_mark = step == AdoptStep::Mark && seen.status == "Running";
+        if seen.status != expect.status && !running_mark {
             return Err(refused(
                 "the instance is not in the status the step expects",
             ));
@@ -592,18 +661,36 @@ impl AdoptWriter {
         }
     }
 
+    /// Move and MoveBack. The move is done when the instance reads in its new project under the expected uuid, or under a new
+    /// one the copy rule confirms. A MoveBack whose writer still expects the pre-image's uuid also takes, in the adoption
+    /// project, a copy the forward move left unrecorded, when the copy rule confirms it there.
     fn move_step(&self, step: AdoptStep) -> Result<StepOutcome, IncusError> {
         let (from, to) = if step == AdoptStep::Move {
             (SOURCE_PROJECT, self.target.to.as_str())
         } else {
             (self.target.to.as_str(), SOURCE_PROJECT)
         };
-        let seen = match (self.read_in(from)?, self.read_in(to)?) {
-            (None, Some(_)) => return Ok(StepOutcome::AlreadyDone),
+        let current = self.uuid();
+        let (uuid, seen) = match (self.read_any(from)?, self.read_any(to)?) {
+            (None, Some((uuid, seen))) => {
+                if uuid != current {
+                    self.copied(from, to, &seen)?;
+                    self.follow(&uuid);
+                }
+                return Ok(StepOutcome::AlreadyDone);
+            }
             (Some(_), Some(_)) => return Err(refused("the instance shows in both projects")),
             (None, None) => return Err(refused("the instance is in neither project")),
-            (Some(seen), None) => seen,
+            (Some(found), None) => found,
         };
+        if uuid != current {
+            // Only a MoveBack whose writer still expects the pre-image's uuid may take a copy: the forward move's copy was
+            // never recorded.
+            if step != AdoptStep::MoveBack || current != self.pre.uuid {
+                return Err(refused("the instance is not the one the plan recorded"));
+            }
+            self.copied(SOURCE_PROJECT, from, &seen)?;
+        }
         self.before(step, &seen)?;
         if !self.pinned(&seen) {
             return Err(refused("the instance's NIC is not pinned"));
@@ -611,14 +698,86 @@ impl AdoptWriter {
         if self.project_is_ours()? != Some(true) {
             return Err(refused("the adoption project is not this adoption's"));
         }
+        self.follow(&uuid);
         self.send_all(step, None)?;
-        match self.read_in(to) {
-            Ok(Some(_)) => Ok(StepOutcome::Sent),
-            _ => Err(self.unconfirmed(
-                &self.instance_ref(to),
+        let back = match self.read_any(to) {
+            Ok(Some((moved, _))) if moved == uuid => Ok(()),
+            Ok(Some((moved, seen))) => self.copied(from, to, &seen).map(|()| self.follow(&moved)),
+            Ok(None) => Err(refused(
                 "the instance does not read back in its new project",
             )),
+            Err(error) => Err(error),
+        };
+        match back {
+            Ok(()) => Ok(StepOutcome::Sent),
+            Err(error) => Err(self.unconfirmed(
+                &self.instance_ref(to),
+                &format!(
+                    "the instance does not read back in its new project: {}",
+                    reason_of(&error)
+                ),
+            )),
         }
+    }
+
+    /// The copy rule: refuses unless the instance read in `to` under a new uuid is the copy of the one that left `from`.
+    fn copied(&self, from: &str, to: &str, seen: &Seen) -> Result<(), IncusError> {
+        let (instance, old) = (self.target.instance.as_str(), self.uuid());
+        if !self.class_is(seen, ExpectClass::Foreign) {
+            return Err(refused(&format!(
+                "the instance under a new uuid in {to} carries an owner's mark"
+            )));
+        }
+        let listing = self
+            .read
+            .get("/1.0/instances?all-projects=true&recursion=1")?;
+        let rows = listing
+            .as_array()
+            .ok_or_else(|| decode("the instance listing is not a list"))?;
+        let text =
+            |row: &Value, key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
+        let mut in_from = rows
+            .iter()
+            .filter(|row| text(row, "project").as_deref() == Some(from));
+        let old_uuid = |row: &Value| {
+            row.get("config")
+                .and_then(|config| config.get("volatile.uuid"))
+                .and_then(Value::as_str)
+                == Some(old.as_str())
+        };
+        if in_from.any(|row| text(row, "name").as_deref() == Some(instance) || old_uuid(row)) {
+            return Err(refused(&format!(
+                "the old uuid or the name is still in {from}, so the instance under a new uuid is not its copy"
+            )));
+        }
+        let named_in_to = rows
+            .iter()
+            .filter(|row| {
+                text(row, "project").as_deref() == Some(to)
+                    && text(row, "name").as_deref() == Some(instance)
+            })
+            .count();
+        if named_in_to > 1 {
+            return Err(refused(&format!(
+                "more than one instance of the name is in {to}"
+            )));
+        }
+        if named_in_to == 0 {
+            return Err(refused(&format!(
+                "the listing shows no instance of the name in {to}"
+            )));
+        }
+        if !self.pinned(seen) {
+            return Err(refused(&format!(
+                "the instance under a new uuid in {to} does not carry the recorded pin"
+            )));
+        }
+        if !self.snapshot_in(to)? {
+            return Err(refused(&format!(
+                "the instance under a new uuid in {to} holds no adoption snapshot"
+            )));
+        }
+        Ok(())
     }
 
     /// Whether a step's outcome already holds on a read of the instance in the step's own project.
@@ -627,7 +786,9 @@ impl AdoptWriter {
         Ok(match step {
             AdoptStep::Stop => self.class_is(seen, Foreign) && seen.status == "Stopped",
             AdoptStep::ReleaseStop => self.class_is(seen, Adopted) && seen.status == "Stopped",
-            AdoptStep::Snapshot => self.class_is(seen, Foreign) && self.snapshot_exists()?,
+            AdoptStep::Snapshot => {
+                self.class_is(seen, Foreign) && self.snapshot_in(SOURCE_PROJECT)?
+            }
             AdoptStep::PinNic => self.class_is(seen, Foreign) && self.pinned(seen),
             AdoptStep::Mark => self.class_is(seen, Adopted),
             AdoptStep::Unmark => self.class_is(seen, Foreign),
@@ -637,13 +798,14 @@ impl AdoptWriter {
         })
     }
 
-    fn snapshot_exists(&self) -> Result<bool, IncusError> {
+    /// Whether the instance in `project` holds the adoption snapshot.
+    fn snapshot_in(&self, project: &str) -> Result<bool, IncusError> {
         let name = self
             .snapshot
             .as_deref()
             .ok_or_else(|| refused("the writer was given no snapshot name"))?;
         let path = format!(
-            "/1.0/instances/{}/snapshots/{name}?project={SOURCE_PROJECT}",
+            "/1.0/instances/{}/snapshots/{name}?project={project}",
             self.target.instance
         );
         match self.read.get(&path) {
@@ -778,6 +940,26 @@ fn plain_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A uuid as Incus writes it: lowercase hex in groups of 8, 4, 4, 4 and 12, joined by hyphens.
+pub fn uuid_ok(uuid: &str) -> bool {
+    let groups: Vec<&str> = uuid.split('-').collect();
+    groups.len() == 5
+        && groups.iter().zip([8, 4, 4, 4, 12]).all(|(group, len)| {
+            group.len() == len
+                && group
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// The reason an error gives, for a message that carries it on.
+fn reason_of(error: &IncusError) -> String {
+    match error {
+        IncusError::Refused(reason) | IncusError::Decode(reason) => reason.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// A MAC as Incus writes it: six lowercase hex pairs joined by colons.

@@ -44,9 +44,9 @@
 //! then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`, else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
 //! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). Snapshots and backups are
-//! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`. A POST to an instance moves it to the project its body names: it must be stopped, the target
-//! project must exist, and its `volatile.uuid` stays. When a PATCH or a move takes a device out of the expanded devices, or
-//! changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
+//! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`. A POST to an instance moves it to the project
+//! its body names: it must be stopped, the target project must exist, and, as on Incus 7.5, the move is a copy that gets a new
+//! `volatile.uuid`. When a PATCH or a move takes a device out of the expanded devices, or changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
 //! does: every one when the device goes or changes type, and otherwise each one whose key the new device sets. A restricted
 //! project refuses a snapshot unless `restricted.snapshots` is `allow`, a backup unless `restricted.backups` is `allow`, and a
 //! moved-in instance whose NIC names a network its grant does not list, or that sets `security.privileged`, `security.nesting`
@@ -2214,9 +2214,9 @@ fn snapshot_or_backup(
     answered(shared, store, kind, "POST", Ok(()))
 }
 
-/// Moves a stopped instance to the project its POST names, under its own name, with its snapshots, as an operation. Its
-/// `volatile.uuid` stays, and its devices are expanded in the new project with the volatile reset. A rename, a migration or
-/// any other POST is refused.
+/// Moves a stopped instance to the project its POST names, under its own name, with its snapshots, as an operation. As Incus
+/// 7.5 does, the move is a copy: the instance gets a new `volatile.uuid` and `volatile.apply_template` is `copy`. Its devices
+/// are expanded in the new project with the volatile reset. A rename, a migration or any other POST is refused.
 fn move_instance(
     shared: &Shared,
     store: &mut Store,
@@ -2258,6 +2258,10 @@ fn move_instance(
     let from = std::mem::replace(&mut store.objects[index].project, to.clone());
     if let Some(body) = store.objects[index].body.as_object_mut() {
         body.insert("project".to_string(), json!(to));
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
+            config.insert("volatile.uuid".to_string(), json!(shared.next_id()));
+            config.insert("volatile.apply_template".to_string(), json!("copy"));
+        }
     }
     for object in &mut store.objects {
         if object.kind == "snapshot" && object.project == from && object.parent == name {

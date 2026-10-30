@@ -559,7 +559,8 @@ with a create whose object shows only when its operation is released, `Appears::
 **Rule 45.** An adoption takes one existing container that `kernel.adopt` lists from `default` into its adoption project
 `arcak-adopt-<name>`, and a release takes it back. `AdoptWriter` is the only path that does it. It sends only the requests of
 the table below, for that one instance, and before each request it reads the instance and refuses unless it is a container
-whose `volatile.uuid` is the recorded pre-image's, in the project, owner class and status the step names. A step whose
+whose `volatile.uuid` is the one the record holds (the pre-image's, until a move's copy gives it a new one), in the project,
+owner class and status the step names. A step whose
 outcome already reads true sends nothing. No step sends a DELETE, writes a network, a profile or an ACL, or sends a project
 anything but the one create, and every request passes the `exchange` guard (Rule 30). No step runs while an operation names
 the instance, in either project, or the adoption project (Rule 44). Foreign means no owner's mark and no key in the
@@ -571,12 +572,12 @@ kernel's namespace; Adopted means the mark `adopt-<instance>`.
 | Stop | `PUT .../state` stop, 60 s graceful, then forced if it still runs | `default`, Foreign, Running | Stopped |
 | Snapshot | `POST .../snapshots`, `arca-adopt-<digest[0..12]>`, stateless | `default`, Foreign, Stopped | the snapshot exists |
 | PinNic | `PATCH` `devices.eth0` only, under `If-Match` | `default`, Foreign, Stopped | the local `eth0` is the pin |
-| Move | `POST` `{"name": i, "project": to}` | `default`, Foreign, Stopped, pinned | in `to` and not in `default` |
-| Mark | `PATCH` `config.user.arcakernel.entry` only, under `If-Match` | `to`, Foreign, Stopped | Adopted |
+| Move | `POST` `{"name": i, "project": to}` | `default`, Foreign, Stopped, pinned | in `to` and not in `default`, under the recorded uuid or a copy's |
+| Mark | `PATCH` `config.user.arcakernel.entry` only, under `If-Match` | `to`, Foreign, Stopped or Running | Adopted |
 | Start | `PUT .../state` start | `to`, Adopted, Stopped | Running |
 | ReleaseStop | as Stop, in `to` | `to`, Adopted, Running | Stopped |
 | Unmark | `PATCH` the entry key to `""`, under `If-Match` | `to`, Adopted, Stopped | Foreign |
-| MoveBack | `POST` `{"name": i, "project": "default"}` | `to`, Foreign, Stopped, pinned | in `default` and not in `to` |
+| MoveBack | `POST` `{"name": i, "project": "default"}` | `to`, Foreign, Stopped, pinned | in `default` and not in `to`, under the recorded uuid or a copy's |
 | ReleaseStart | as Start, in `default` | `default`, Foreign, Stopped | Running |
 
 The pin is `devices.eth0` with the network, the pre-image MAC as `hwaddr` and the pre-image IPv4 as `ipv4.address`. It is set
@@ -594,15 +595,29 @@ the instance in `to` and refuses, before any write, one whose local `eth0` is no
 only after ReleaseStop and Unmark. The watch counts each adoption not released in full as
 a live entry, so an adopted instance is kernel-owned with no drift, and one that is gone is `EntryWithoutObject`. `serve`
 refuses a config that lists an adoption.
+
+Incus 7.5.1 runs a stopped instance's project move as a copy: the instance gets a new `volatile.uuid`, a new `created_at` and
+`volatile.apply_template=copy`. A Move or a MoveBack is confirmed under a new uuid only by the copy rule: the old uuid and the
+name are both gone from the project it left; exactly one instance of the name is in its new project; that one is Foreign, its
+local `eth0` is the recorded pin and it holds the snapshot `arca-adopt-<digest[0..12]>`. Otherwise the step refuses, and after
+its request it fails as landed but unconfirmed. The record writes the new uuid in a `uuid` line before the step's outcome, and
+every later step, `verify` and a later run expect the uuid the record holds last. A Move whose copy was not recorded is
+confirmed by the same rule when the run is resumed, and nothing is sent again. A MoveBack whose writer still expects the
+pre-image's uuid takes such a copy in `to` by the same rule. Mark also takes a Running instance, which is one started by hand
+in `to` after a Move whose outcome was not recorded; Start then finds its outcome already holds.
 Source: `adopt::{AdoptWriter, adoption_project_body, pin_patch, pin_device}` in `crates/arca-incus/src/adopt.rs`;
 `adoptions::{AdoptionPlan, AdoptionRecord, resume_steps, release_steps}` in `crates/arca/src/adoptions.rs`;
 `cmd_adopt::{preflight, verify, verify_with, http_probe}` in `crates/arca/src/cmd_adopt.rs`; `cmd_serve::watch_handler` in
-`crates/arca/src/cmd_serve.rs`; the fake's stop and start, snapshots, backups, moves, lease table and `deviceVolatileReset` in
+`crates/arca/src/cmd_serve.rs`; the fake's stop and start, snapshots, backups, moves (copies under a new uuid), lease table
+and `deviceVolatileReset` in
 `crates/arca-incus/src/fake.rs`. Tests: in `crates/arca-incus/tests/adopt.rs`,
 `the_expected_class_and_project_of_each_step_follow_the_table`,
 `an_adoption_keeps_the_mac_and_ip_and_each_step_sends_only_its_own_request_once`,
 `a_release_keeps_the_pin_the_snapshot_the_mac_and_the_ip_and_each_step_runs_once`,
 `a_move_without_the_pin_clears_the_mac_the_instance_depends_on`,
+`a_move_that_copies_the_instance_under_a_new_uuid_is_confirmed_and_the_new_uuid_is_followed`,
+`a_copy_under_a_new_uuid_is_refused_when_the_snapshot_is_missing_or_the_pin_differs`,
+`a_copy_under_a_new_uuid_is_refused_while_the_old_uuid_is_in_default_or_two_of_the_name_are_in_to`,
 `every_step_out_of_its_expected_project_class_or_status_is_refused_with_no_write` and
 `a_running_operation_on_the_instance_holds_every_step_with_no_write`; in `crates/arca/tests/adopt_apply.rs`, the preflight
 refusals and `plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and_config`; in
@@ -611,6 +626,8 @@ refusals and `plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and
 `every_kill_point_of_an_apply_releases_to_the_pre_image_location_class_mac_and_ipv4`,
 `the_move_mark_window_stopped_unmarked_in_to_is_resumed_and_released`,
 `foreign_in_to_is_accepted_only_for_the_uuid_the_record_holds`,
+`a_resume_of_a_move_incus_ran_as_a_copy_records_the_new_uuid_marks_it_and_sends_no_second_move`,
+`a_resume_of_an_unconfirmed_copy_whose_pin_differs_is_refused_with_no_write`,
 `a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled`,
 `a_release_whose_pin_was_removed_is_refused_before_any_write`,
 `a_held_operation_blocks_the_next_step_of_a_resume_and_of_a_release`,
