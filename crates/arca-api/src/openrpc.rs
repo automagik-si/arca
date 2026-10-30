@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 use crate::API_VERSION;
+use crate::check::check_schema;
 use crate::verbs::{Verb, verbs};
 
 /// The OpenRPC specification version of the document.
@@ -69,7 +70,10 @@ fn descriptors(params: &Value) -> Vec<Value> {
 /// Whether a document has the shape the verb table promises: the version, the info version, and for every method a name,
 /// a params list, a result, and the three extensions with a legal value. A method without a class is refused, so a verb
 /// cannot reach the document unclassed. Method names are unique, and so are the parameter names of a method, and every
-/// parameter is named: the compatibility checker compares one entry per name, so a repeat would go unread.
+/// parameter is named: the compatibility checker compares one entry per name, so a repeat would go unread. Every
+/// parameter has a schema, and every parameter and result schema is well formed in the subset `check::conforms` reads.
+/// The compatibility checker reads a keyword only where both sides hold a value of its type, so a malformed one would
+/// pass unread.
 pub fn check_document(doc: &Value) -> Result<(), String> {
     if doc.get("openrpc").and_then(Value::as_str) != Some(OPENRPC_VERSION) {
         return Err(format!("openrpc must be {OPENRPC_VERSION}"));
@@ -120,10 +124,18 @@ pub fn check_document(doc: &Value) -> Result<(), String> {
             if !param_names.insert(param) {
                 return Err(format!("method {name} lists parameter {param} twice"));
             }
+            let schema = p
+                .get("schema")
+                .ok_or_else(|| format!("method {name} parameter {param} has no schema"))?;
+            check_schema(schema, "").map_err(|e| {
+                format!("method {name} parameter {param} has a malformed schema: {e}")
+            })?;
         }
-        if m.pointer("/result/schema").is_none() {
-            return Err(format!("method {name} has no result schema"));
-        }
+        let result = m
+            .pointer("/result/schema")
+            .ok_or_else(|| format!("method {name} has no result schema"))?;
+        check_schema(result, "")
+            .map_err(|e| format!("method {name} result has a malformed schema: {e}"))?;
     }
     Ok(())
 }

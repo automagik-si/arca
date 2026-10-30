@@ -410,9 +410,11 @@ fn a_parameter_schema_of_false_fails_the_released_gate() {
     param_mut(&mut current, "node_metrics", "minutes")["schema"] = json!(false);
     let got = check_released_dir(Path::new(RELEASED_DIR), &current);
     let message = got.expect_err("a parameter that admits nothing must fail the gate");
+    // The document check refuses a schema that is not an object before the compatibility check reads it, so the refusal
+    // names the parameter. The narrowing itself is still reported by `compatible`, in the test above this one.
     assert!(
-        message.contains("minutes narrowed"),
-        "the break is named: {message}"
+        message.contains("parameter minutes has a malformed schema"),
+        "the refused parameter is named: {message}"
     );
 }
 
@@ -503,6 +505,57 @@ fn a_current_document_that_fails_its_own_check_fails_the_gate() {
         got.is_err(),
         "a current document that fails check_document must fail the gate"
     );
+}
+
+// A supported keyword with a malformed value on the current side. The checker reads a keyword only where both sides
+// hold a value of its type, so a malformed value there passes unread. The document check refuses the schema first.
+
+/// The gate refuses the current document, and the refusal names the malformed keyword.
+fn assert_gate_refuses(current: &Value, expect: &str) {
+    assert!(
+        check_document(current).is_err(),
+        "the document check refuses {expect}"
+    );
+    let message = check_released_dir(Path::new(RELEASED_DIR), current)
+        .expect_err("a malformed schema must fail the gate");
+    assert!(
+        message.contains(expect),
+        "the malformed keyword is named ({expect}): {message}"
+    );
+}
+
+#[test]
+fn a_malformed_keyword_on_a_current_parameter_fails_the_gate() {
+    let cases: [(&str, Value); 6] = [
+        ("enum", json!("x")),
+        ("minimum", json!("1")),
+        ("minLength", json!(-1)),
+        ("required", json!("minutes")),
+        ("properties", json!("x")),
+        ("additionalProperties", json!("no")),
+    ];
+    for (keyword, value) in cases {
+        let mut current = openrpc();
+        param_mut(&mut current, "node_metrics", "minutes")["schema"][keyword] = value;
+        assert_gate_refuses(&current, keyword);
+    }
+}
+
+#[test]
+fn a_malformed_keyword_on_a_current_result_field_fails_the_gate() {
+    let mut current = openrpc();
+    result_mut(&mut current, "arca_status")["properties"]["version"]["maxLength"] = json!("64");
+    assert_gate_refuses(&current, "maxLength");
+}
+
+#[test]
+fn a_parameter_without_a_schema_fails_the_gate() {
+    let mut current = openrpc();
+    param_mut(&mut current, "node_metrics", "minutes")
+        .as_object_mut()
+        .expect("a parameter is an object")
+        .remove("schema");
+    assert_gate_refuses(&current, "schema");
 }
 
 // The passing fixture and the additions and widenings that must stay silent.

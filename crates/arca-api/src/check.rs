@@ -52,8 +52,10 @@ pub fn conforms(schema: &Value, value: &Value) -> Result<(), String> {
 }
 
 /// The schema itself must be inside the subset. Every nested schema is visited, so an unsupported keyword is refused even
-/// where the value never reaches it.
-fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
+/// where the value never reaches it. Each supported keyword must also hold a value of its own type: `enum` an array,
+/// `minimum` a number, `required` an array of names, and so on. The document check runs this over every schema of a
+/// method, so a malformed one fails the compatibility gate.
+pub(crate) fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
     let Value::Object(map) = schema else {
         return Err(format!("{}: a schema must be an object", here(at)));
     };
