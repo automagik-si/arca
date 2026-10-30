@@ -76,6 +76,43 @@ fn log_lines(log: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// A raw upstream on `socket` that takes one connection, records every byte the client sends, and answers `200`. It keeps
+/// reading until the client is idle for a moment, so bytes sent after a request head are recorded too. The bytes come back
+/// through the join handle.
+fn record_one_connection(socket: &Path) -> thread::JoinHandle<Vec<u8>> {
+    let listener = UnixListener::bind(socket).expect("bind the recording upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    thread::spawn(move || {
+        let started = Instant::now();
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("no connection reached the recording upstream: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).expect("blocking stream");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("read timeout");
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        seen
+    })
+}
+
 #[test]
 fn unix_incus_reads_each_fixture_path_and_the_fake_records_only_gets() {
     let dir = Scratch::new("reads");
@@ -306,6 +343,93 @@ fn the_shim_log_carries_no_header_or_body_bytes() {
 }
 
 #[test]
+fn a_query_string_never_reaches_the_shim_log() {
+    const SECRET: &str = "secret=x-query-9b2f";
+    let dir = Scratch::new("query");
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let shim = RecordingShim::start(fake.socket(), &dir.at("shim.sock"), &dir.at("shim.log"))
+        .expect("start the shim");
+
+    let get = format!("GET /1.0?{SECRET} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n");
+    let post = format!(
+        "POST /1.0/instances/db1?{SECRET} HTTP/1.1\r\nHost: incus\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    exchange(shim.socket(), get.as_bytes());
+    assert_eq!(status_of(&exchange(shim.socket(), post.as_bytes())), 405);
+    shim.stop().expect("stop the shim");
+
+    let raw = fs::read_to_string(dir.at("shim.log")).expect("read the log");
+    assert!(!raw.contains(SECRET), "a query string reached the log");
+    assert!(
+        !raw.contains("secret"),
+        "a query parameter name reached the log"
+    );
+    let log = log_lines(&dir.at("shim.log"));
+    assert_eq!(log[0]["path"], "/1.0");
+    assert_eq!(log[1]["path"], "/1.0/instances/db1");
+}
+
+#[test]
+fn an_upgrade_or_a_header_name_that_is_not_a_token_is_refused_with_400_and_never_forwarded() {
+    let dir = Scratch::new("tokens");
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let shim = RecordingShim::start(fake.socket(), &dir.at("shim.sock"), &dir.at("shim.log"))
+        .expect("start the shim");
+
+    let bad = [
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\nupgrade: h2c\r\n\r\n",
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\nX(Bad): 1\r\n\r\n",
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\nX@Name: 1\r\n\r\n",
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\n\"quoted\": 1\r\n\r\n",
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\nX/Slash: 1\r\n\r\n",
+    ];
+    for request in bad {
+        assert_eq!(
+            status_of(&exchange(shim.socket(), request.as_bytes())),
+            400,
+            "{request:?}"
+        );
+    }
+    assert!(
+        fake.requests().is_empty(),
+        "a refused head reached the fake"
+    );
+
+    // A header name made of token characters is still a plain GET and is forwarded.
+    let token =
+        "GET /1.0 HTTP/1.1\r\nHost: incus\r\nX-Probe.1_a!b~: y\r\nConnection: close\r\n\r\n";
+    assert_eq!(status_of(&exchange(shim.socket(), token.as_bytes())), 200);
+    assert_eq!(fake.requests().len(), 1);
+
+    let summary = shim.stop().expect("stop the shim");
+    assert_eq!(summary, ShimSummary { get: 1, refused: 6 });
+}
+
+#[test]
+fn a_timeout_too_long_for_the_clock_is_an_unbounded_wait_not_a_panic() {
+    let dir = Scratch::new("huge");
+    let state = fixture();
+    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
+    let client = UnixIncus::new(fake.socket().to_path_buf()).with_timeout(Duration::MAX);
+    assert_eq!(
+        client
+            .get("/1.0")
+            .expect("a server answer with an unbounded deadline"),
+        state.server
+    );
+}
+
+#[test]
+fn the_shim_summary_serializes_as_its_two_counts() {
+    let summary = ShimSummary { get: 2, refused: 1 };
+    assert_eq!(
+        serde_json::to_value(summary).expect("serialize the summary"),
+        json!({ "get": 2, "refused": 1 })
+    );
+}
+
+#[test]
 fn a_get_through_the_shim_reaches_the_fake_and_is_logged_as_forwarded() {
     let dir = Scratch::new("forward");
     let state = fixture();
@@ -344,9 +468,13 @@ fn a_get_through_the_shim_reaches_the_fake_and_is_logged_as_forwarded() {
 #[test]
 fn a_get_that_carries_a_body_is_refused_and_bytes_after_a_get_head_are_never_forwarded() {
     let dir = Scratch::new("smuggle");
-    let fake = FakeIncus::start(&dir.0, fixture()).expect("start the fake");
-    let shim = RecordingShim::start(fake.socket(), &dir.at("shim.sock"), &dir.at("shim.log"))
-        .expect("start the shim");
+    let upstream = record_one_connection(&dir.at("upstream.sock"));
+    let shim = RecordingShim::start(
+        &dir.at("upstream.sock"),
+        &dir.at("shim.sock"),
+        &dir.at("shim.log"),
+    )
+    .expect("start the shim");
 
     let with_body =
         "GET /1.0 HTTP/1.1\r\nHost: incus\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody";
@@ -357,22 +485,23 @@ fn a_get_that_carries_a_body_is_refused_and_bytes_after_a_get_head_are_never_for
     );
     assert_eq!(status_of(&exchange(shim.socket(), chunked.as_bytes())), 400);
 
-    let pipelined = "GET /1.0 HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n\
-                     POST /1.0/instances/db1 HTTP/1.1\r\nHost: incus\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let get_head = "GET /1.0 HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n";
+    let pipelined = format!(
+        "{get_head}POST /1.0/instances/db1 HTTP/1.1\r\nHost: incus\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
     assert_eq!(
         status_of(&exchange(shim.socket(), pipelined.as_bytes())),
         200
     );
 
-    let seen = fake.requests();
-    assert_eq!(
-        seen.len(),
-        1,
-        "only the GET head may reach the fake: {seen:?}"
-    );
-    assert_eq!(seen[0].method, "GET");
     let summary = shim.stop().expect("stop the shim");
     assert_eq!(summary, ShimSummary { get: 1, refused: 2 });
+    let relayed = upstream.join().expect("the recording upstream");
+    assert_eq!(
+        relayed,
+        get_head.as_bytes(),
+        "the upstream must receive exactly the GET head and nothing after it"
+    );
 }
 
 #[test]

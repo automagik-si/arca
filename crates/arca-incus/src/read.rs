@@ -3,7 +3,8 @@
 //! A request is written with one constant method, `GET`, and [`IncusRead`] has no other method, so this module cannot send
 //! anything else. The response reader accepts a `Content-Length` body, a chunked body and a body that ends with the
 //! connection. A body over [`MAX_BODY`] is refused as [`IncusError::TooLarge`], and an answer that does not finish by the
-//! request's deadline is refused as [`IncusError::Timeout`]. No error carries a header or a body byte.
+//! request's deadline is refused as [`IncusError::Timeout`]. No error carries a header byte or a raw body byte. A status
+//! error keeps only the envelope's `error` text, or the reason phrase, cut to 512 bytes.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -21,13 +22,16 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEAD: usize = 64 * 1024;
 /// The longest request path the client sends.
 const MAX_PATH: usize = 2048;
+/// The longest message a status error keeps, in bytes. A longer one is cut at a character boundary.
+const MAX_MESSAGE: usize = 512;
 
-/// Why a read failed. No variant carries a header or a body byte.
+/// Why a read failed. No variant carries a header byte or a raw body byte. A `Status` message is the envelope's own
+/// `error` text, or the reason phrase, and is at most 512 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncusError {
     /// The socket could not be connected, written or read.
     Io(String),
-    /// Incus answered with a status that is not success, or with an error envelope.
+    /// Incus answered with a status that is not success, or with an error envelope. The message is at most 512 bytes.
     Status { code: u16, message: String },
     /// The answer is not the HTTP or JSON shape the client reads.
     Decode(String),
@@ -72,11 +76,17 @@ impl UnixIncus {
         }
     }
 
-    /// The same client with another deadline for each request.
+    /// The same client with another deadline for each request. A deadline too long for the clock to hold is no deadline at
+    /// all, so the caller's unbounded wait does not panic.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
+}
+
+/// The instant a request's deadline falls at, or `None` when the timeout reaches past the clock's range.
+fn deadline_for(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
 }
 
 impl IncusRead for UnixIncus {
@@ -85,7 +95,7 @@ impl IncusRead for UnixIncus {
         if self.timeout.is_zero() {
             return Err(IncusError::Timeout);
         }
-        let deadline = Instant::now() + self.timeout;
+        let deadline = deadline_for(self.timeout);
         let mut stream = UnixStream::connect(&self.socket).map_err(io_error)?;
         stream
             .set_write_timeout(Some(self.timeout))
@@ -120,20 +130,25 @@ fn check_path(path: &str) -> Result<(), IncusError> {
     }
 }
 
-/// A reader that gives up when the request's deadline passes, whatever the socket is doing.
+/// A reader that gives up when the request's deadline passes, whatever the socket is doing. With no deadline it waits as
+/// long as the socket does.
 struct Deadline<'a> {
     stream: &'a UnixStream,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl Read for Deadline<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let left = self
             .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-            .ok_or(io::ErrorKind::TimedOut)?;
-        self.stream.set_read_timeout(Some(left))?;
+            .map(|deadline| {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|left| !left.is_zero())
+                    .ok_or(io::ErrorKind::TimedOut)
+            })
+            .transpose()?;
+        self.stream.set_read_timeout(left)?;
         let mut stream: &UnixStream = self.stream;
         stream.read(buf)
     }
@@ -341,8 +356,20 @@ fn read_to_cap<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Vec<u8>, I
     Ok(body)
 }
 
+/// Cuts a status message to at most 512 bytes, stepping back to a character boundary when the cut falls inside one.
+fn cap_message(mut message: String) -> String {
+    if message.len() > MAX_MESSAGE {
+        let mut end = MAX_MESSAGE;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
 /// The metadata of a success envelope. A non-success status is a `Status` error, whose message is the envelope's `error`
-/// text, or the reason phrase when the body is not an envelope. The body itself is never put in an error.
+/// text, or the reason phrase when the body is not an envelope. Only that text is kept, capped at 512 bytes.
 fn decode(response: RawResponse) -> Result<Value, IncusError> {
     if !(200..300).contains(&response.status) {
         let message = serde_json::from_slice::<Value>(&response.body)
@@ -357,7 +384,7 @@ fn decode(response: RawResponse) -> Result<Value, IncusError> {
             .unwrap_or(response.reason);
         return Err(IncusError::Status {
             code: response.status,
-            message,
+            message: cap_message(message),
         });
     }
     let envelope: Value =
@@ -377,7 +404,10 @@ fn decode(response: RawResponse) -> Result<Value, IncusError> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        return Err(IncusError::Status { code, message });
+        return Err(IncusError::Status {
+            code,
+            message: cap_message(message),
+        });
     }
     object
         .get("metadata")
@@ -653,5 +683,59 @@ mod tests {
         ] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_error_message_is_capped_at_512_bytes() {
+        let body = format!(
+            r#"{{"type":"error","error":"{}","error_code":500}}"#,
+            "a".repeat(2000)
+        );
+        let error = decode(raw(500, "Internal Server Error", body.as_bytes())).expect_err("a 500");
+        assert_eq!(
+            error,
+            IncusError::Status {
+                code: 500,
+                message: "a".repeat(512)
+            }
+        );
+    }
+
+    #[test]
+    fn the_message_cap_never_splits_a_character() {
+        // One ASCII byte, then two-byte characters: byte 512 falls inside a character, so the cap steps back to 511.
+        let text = format!("a{}", "é".repeat(300));
+        let body = format!(r#"{{"type":"error","error":"{text}","error_code":404}}"#);
+        let IncusError::Status { message, .. } =
+            decode(raw(404, "Not Found", body.as_bytes())).expect_err("a 404")
+        else {
+            panic!("expected a status error");
+        };
+        assert_eq!(message.len(), 511);
+        assert!(message.chars().all(|c| c == 'a' || c == 'é'));
+    }
+
+    #[test]
+    fn the_message_cap_applies_to_a_reason_phrase_and_to_a_success_status_envelope() {
+        let reason = decode(raw(502, &"r".repeat(2000), b"")).expect_err("a 502");
+        assert_eq!(
+            reason,
+            IncusError::Status {
+                code: 502,
+                message: "r".repeat(512)
+            }
+        );
+        let body = format!(
+            r#"{{"type":"error","error":"{}","error_code":403}}"#,
+            "d".repeat(2000)
+        );
+        let denied = decode(raw(200, "OK", body.as_bytes())).expect_err("a success status");
+        assert_eq!(
+            denied,
+            IncusError::Status {
+                code: 403,
+                message: "d".repeat(512)
+            }
+        );
     }
 }

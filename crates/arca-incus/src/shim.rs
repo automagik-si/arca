@@ -1,9 +1,10 @@
 //! The recording shim: a unix-socket proxy between a client and Incus. It forwards a GET and refuses everything else.
 //!
-//! A request is forwarded only when its method is exactly `GET` and its head declares no body (no `Transfer-Encoding`, and
-//! no `Content-Length` other than `0`). Only the head is forwarded, so bytes after it never reach Incus. Every other
-//! request, a malformed one included, is answered `405` or `400` and not forwarded. The log holds one JSON line per
-//! request with `method`, `path`, `status` and `forwarded`. It never holds a header or a body byte.
+//! A request is forwarded only when its method is exactly `GET`, its head declares no body (no `Transfer-Encoding`, and
+//! no `Content-Length` other than `0`), and it asks for no protocol upgrade (no `Upgrade` header). Every header name must
+//! be an HTTP token. Only the head is forwarded, so bytes after it never reach Incus. Every other request, a malformed one
+//! included, is answered `405` or `400` and not forwarded. The log holds one JSON line per request with `method`, `path`,
+//! `status` and `forwarded`. The path is the target without its query string. The log never holds a header or a body byte.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -29,7 +30,7 @@ const DRAIN_CAP: usize = 1024 * 1024;
 
 /// What the shim did. `get` counts GET requests whose head reached the upstream. `refused` counts requests answered without
 /// forwarding: a non-GET (405), a malformed or body-carrying request (400), and a GET the upstream could not take (502).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ShimSummary {
     pub get: u64,
     pub refused: u64,
@@ -157,7 +158,7 @@ fn handle(mut client: UnixStream, shared: &Shared) {
         refuse(&mut client, shared, request.method, request.target, 405);
         return;
     }
-    if request.has_body() {
+    if request.has_body() || request.upgrades() {
         refuse(&mut client, shared, request.method, request.target, 400);
         return;
     }
@@ -179,6 +180,22 @@ impl Request<'_> {
                 || (name.eq_ignore_ascii_case("content-length") && *value != "0")
         })
     }
+
+    /// True when the head asks to switch protocols: it carries an `Upgrade` header, whatever its value.
+    fn upgrades(&self) -> bool {
+        self.headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("upgrade"))
+    }
+}
+
+/// True for a non-empty HTTP token: the characters RFC 9110 allows in a header name, which are ASCII letters, digits and a
+/// fixed set of punctuation marks.
+fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 fn parse_request(head: &[u8]) -> Option<Request<'_>> {
@@ -193,7 +210,7 @@ fn parse_request(head: &[u8]) -> Option<Request<'_>> {
             break;
         }
         let (name, value) = line.split_once(':')?;
-        if name.is_empty() || name.bytes().any(|b| b.is_ascii_whitespace()) {
+        if !is_token(name) {
             return None;
         }
         headers.push((name, value.trim()));
@@ -382,7 +399,9 @@ struct LogLine<'a> {
 }
 
 fn log(shared: &Shared, method: &str, target: &str, status: u16, forwarded: bool) {
-    let path: String = target.chars().take(MAX_LOGGED).collect();
+    // The query string is dropped: it can carry credentials or other values a log must not keep.
+    let without_query = target.split(['?', '#']).next().unwrap_or("");
+    let path: String = without_query.chars().take(MAX_LOGGED).collect();
     let line = LogLine {
         method: logged_method(method),
         path: &path,
