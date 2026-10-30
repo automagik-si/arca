@@ -52,6 +52,12 @@ const SYSTEM_HOSTNAME: &str = "/proc/sys/kernel/hostname";
 
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let cfg = config::load(Path::new(flags.required("config")?))?;
+    if !cfg.kernel.adopt.is_empty() {
+        // An adoption is never a desired-state entry, so no reconciler may run over a config that names one.
+        return Err(Failure::Config(
+            "serve refuses a config whose kernel.adopt is not empty: such a config is for arca adopt alone".to_string(),
+        ));
+    }
     let started = Instant::now();
     check_state_dir(&cfg.state_dir)?;
 

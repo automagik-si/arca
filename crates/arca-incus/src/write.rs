@@ -644,8 +644,8 @@ impl UnixIncusWriter {
     /// Waits on operation `id` until it ends or the writer's deadline passes. Only status code 200 with the status `Success`
     /// is done. A running code (1xx) is waited on again. A 4xx or 5xx in the operation's metadata is the operation's own failure,
     /// and any other code is a failure too. An error answer to the wait request itself is not the operation's status: it is a
-    /// decode failure, so the outcome of the write stays unknown.
-    fn wait_on(&self, id: &str) -> Result<(), IncusError> {
+    /// decode failure, so the outcome of the write stays unknown. The adoption writer waits through this too.
+    pub(crate) fn wait_on(&self, id: &str) -> Result<(), IncusError> {
         let started = Instant::now();
         loop {
             if started.elapsed() >= self.deadline {
@@ -702,6 +702,20 @@ impl UnixIncusWriter {
         body: Option<&Value>,
     ) -> Result<Framed, IncusError> {
         self.send_within(method, url, if_match, body, TIMEOUT)
+    }
+
+    /// Sends one request the caller has already checked, under `timeout`, as [`Self::send_within`] sends it. It skips the
+    /// family and the ownership checks, so only the adoption writer calls it, for the requests of its closed step table. The
+    /// request still passes `exchange`, so its guard applies.
+    pub(crate) fn send_checked(
+        &self,
+        method: &str,
+        url: &str,
+        if_match: Option<&str>,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Framed, IncusError> {
+        self.send_within(method, url, if_match, body, timeout)
     }
 
     /// Builds the request and exchanges it under `timeout`. `method` is one of the four this module names, and `url` is
