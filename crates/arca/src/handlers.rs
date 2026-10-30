@@ -11,6 +11,7 @@ use arca_api::Scope;
 use arca_approval::{ApprovalRefusal, parse_statement};
 use arca_incus::{IncusRead, UnixIncus};
 use arca_kernel::canon::{Digest, params_digest};
+use arca_kernel::desired::EntryId;
 use arca_kernel::journal::DeletePlan;
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
@@ -95,8 +96,8 @@ pub fn new_sampler(cfg: &NodeConfig) -> Sampler<UnixIncus> {
 /// so a project created during the read has its rows dropped; the watch then runs again on the new set.
 const WATCH_ATTEMPTS: usize = 3;
 
-/// The watch report of the host now. Each attempt reads the project index (the scope), then runs the watch over that scope,
-/// then reads the index again. `complete` is set for the run, and the report is returned only when every project the second
+/// The watch report of the host now, with `live` as its live entries: the adopted instances' entries. Each attempt reads the
+/// project index (the scope), then runs the watch over that scope, then reads the index again. `complete` is set for the run, and the report is returned only when every project the second
 /// read lists is in the scope, so a report is never complete while a listed project's rows were dropped. Otherwise the
 /// attempt is run again on the new scope.
 ///
@@ -105,6 +106,7 @@ const WATCH_ATTEMPTS: usize = 3;
 pub fn watch_snapshot<R: IncusRead>(
     incus: R,
     phones: &BTreeSet<String>,
+    live: &BTreeSet<EntryId>,
     now: u64,
 ) -> Result<Value, CallError> {
     let mut provider = ReadOnlyIncusProvider::new(incus);
@@ -112,6 +114,7 @@ pub fn watch_snapshot<R: IncusRead>(
         let scope = listed_projects(&provider)?;
         let cfg = WatchConfig {
             identity_phones: phones.clone(),
+            live_entries: live.clone(),
             projects: scope.clone(),
             complete: true,
             ..WatchConfig::default()
@@ -262,27 +265,47 @@ pub const WATCH_MIN_INTERVAL: Duration = Duration::from_secs(30);
 /// A sweep sends a GET for every project and instance, so an answer is cached for [`WATCH_MIN_INTERVAL`], and only one
 /// sweep runs at a time: a call holds the cache lock across its sweep, so a call that arrives meanwhile waits and then
 /// reads the fresh answer. Every answer carries `ageMs`, the age of the sweep it reports. A failed sweep is not cached.
+///
+/// `adopted` gives the live entries of the adopted instances, `adopt-<instance>`; each sweep asks it again, so an adoption or a
+/// release made while the server runs shows at the next sweep.
 pub struct WatchHandler {
     pub socket: PathBuf,
     pub phones: BTreeSet<String>,
     pub cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    pub adopted: Arc<dyn Fn() -> BTreeSet<EntryId> + Send + Sync>,
 }
 
 impl WatchHandler {
-    /// A handler over the Incus socket at `socket`, with an empty cache.
+    /// A handler over the Incus socket at `socket`, with an empty cache and no adopted instance.
     pub fn new(socket: PathBuf, phones: BTreeSet<String>) -> Self {
         WatchHandler {
             socket,
             phones,
             cache: Arc::default(),
+            adopted: Arc::new(BTreeSet::new),
         }
+    }
+
+    /// The same handler, asking `adopted` for the adopted instances' entries on each sweep.
+    pub fn with_adopted(
+        mut self,
+        adopted: impl Fn() -> BTreeSet<EntryId> + Send + Sync + 'static,
+    ) -> Self {
+        self.adopted = Arc::new(adopted);
+        self
     }
 }
 
 impl ToolHandler for WatchHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
         cached_sweep(&self.cache, WATCH_MIN_INTERVAL, || {
-            watch_snapshot(UnixIncus::new(self.socket.clone()), &self.phones, now_ms())
+            let live = (self.adopted)();
+            watch_snapshot(
+                UnixIncus::new(self.socket.clone()),
+                &self.phones,
+                &live,
+                now_ms(),
+            )
         })
     }
 }
@@ -639,7 +662,8 @@ mod tests {
                 instance("b", "y1"),
             ]])),
         };
-        let report = watch_snapshot(incus, &BTreeSet::new(), 7).expect("the watch answers");
+        let report = watch_snapshot(incus, &BTreeSet::new(), &BTreeSet::new(), 7)
+            .expect("the watch answers");
         assert_eq!(
             rows_by_project(&report),
             vec![
@@ -659,7 +683,8 @@ mod tests {
                 instance("b", "y2"),
             ]])),
         };
-        let report = watch_snapshot(incus, &BTreeSet::new(), 7).expect("the watch answers");
+        let report = watch_snapshot(incus, &BTreeSet::new(), &BTreeSet::new(), 7)
+            .expect("the watch answers");
         assert_eq!(
             rows_by_project(&report),
             vec![

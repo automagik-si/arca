@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use arca_incus::UnixIncus;
 use serde_json::Value;
 
+use crate::adoptions::AdoptionRecord;
 use crate::config;
 use crate::handlers::{self, SAMPLE_INTERVAL};
 use crate::{Failure, Flags, call_failure};
@@ -20,7 +21,8 @@ const MAX_SAMPLE_SECONDS: u64 = 60;
 /// How long `metrics` samples when no `--sample-for` is given: long enough that the mean has two samples to average.
 const DEFAULT_SAMPLE_SECONDS: u64 = 5;
 
-/// `watch --once --json --config <file>`.
+/// `watch --once --json --config <file>`. The adoption record in the state directory names the adopted instances, which the
+/// watch counts as live entries, as the server's `watch_report` does.
 pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     if !flags.switch("once") {
         return Err(Failure::Usage(
@@ -32,9 +34,12 @@ pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     let cfg = config::load(Path::new(flags.required("config")?))?;
     let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
+    // The adopted instances are live entries, so each shows kernel-owned. A record that cannot be read fails the command.
+    let adopted = AdoptionRecord::open(&cfg.state_dir)?.adopted();
     let value = handlers::watch_snapshot(
         UnixIncus::new(cfg.incus.socket.clone()),
         &phones,
+        &adopted,
         handlers::now_ms(),
     )
     .map_err(call_failure)?;

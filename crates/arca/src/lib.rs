@@ -4,7 +4,8 @@
 //! Exit codes: 0 for success; 1 for a runtime failure (a socket, a read or a write that failed); 2 for a usage or config
 //! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error, whose
 //! JSON-RPC error object `call` prints on stdout; 4 for a token the node refuses, HTTP 401 or 403. `arca adopt` exits 2 too when
-//! it refuses before any write: a preflight check, a stale plan digest, or an instance the config does not list.
+//! it refuses before any write: a preflight check, a stale plan digest, an instance the config does not list, or a record that
+//! does not hold the adoption it is asked to resume, release or verify.
 
 pub mod adoptions;
 pub mod cmd_adopt;
@@ -37,6 +38,8 @@ const USAGE: &str = "usage: arca <command>
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
   adopt apply --instance <name> --plan-digest <hex> [--dry-run] --config <file>
+  adopt release --instance <name> [--dry-run] --config <file>
+  adopt verify --instance <name> --port <n> [--http-path <path>] --config <file>
   adopt status --instance <name> --json --config <file>";
 
 /// Why a command ended without a result. The message never carries a token, a secret or a key.

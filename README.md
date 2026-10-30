@@ -16,8 +16,13 @@ desired state with its own key. It talks to Incus over the local unix socket.
 - **As a service:** `deploy/systemd/` holds two user units that run `arca serve` read-only, reaching Incus only through
   the GET-only shim, with restart and memory limits. See "Running as a user service" in
   [`docs/OPERATING.md`](docs/OPERATING.md).
-- **Known gap:** a restart while an Incus operation is still running can leave a marked object the journal does not
-  know about.
+- **Running operations:** an intent stays open while an Incus operation still names its target, so a restart in the middle
+  of a create no longer leaves a marked object the journal does not know about (Rule 44 in
+  [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md)).
+- **Adoption:** `arca adopt` takes one listed container from the default project into a kernel project of its own and
+  back, keeping its MAC and IPv4 by pinning them on its NIC. It resumes from its record after a crash at any step, and
+  `arca adopt verify` checks that the service answers. Tested on the fake Incus. See "Adopting a container" in
+  [`docs/OPERATING.md`](docs/OPERATING.md).
 
 Hardening for shared or distributed hosts comes later.
 
@@ -25,7 +30,7 @@ Hardening for shared or distributed hosts comes later.
 
 | Crate | What it holds |
 |-------|---------------|
-| `arca` | the node binary: `watch`, `metrics`, `serve` (the MCP server), `call`, `token mint`, `shim` |
+| `arca` | the node binary: `watch`, `metrics`, `serve` (the MCP server), `call`, `token mint`, `shim`, `adopt` |
 | `arca-kernel` | canonical JSON, digests, node identity, signed desired state, the ownership model |
 | `arca-approval` | signed owner approvals, spent once |
 | `arca-incus` | the Incus client over the unix socket, a fake Incus, a GET-only recording shim, and the writer (feature `write`) |

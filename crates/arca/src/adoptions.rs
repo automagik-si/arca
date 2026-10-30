@@ -307,6 +307,16 @@ impl AdoptionRecord {
         None
     }
 
+    /// Whether the latest adoption of `instance` is complete: its Start is done.
+    pub fn complete(&self, instance: &str) -> bool {
+        self.last(instance) == Some((AdoptStep::Start, Phase::Done))
+    }
+
+    /// Whether the latest adoption of `instance` has been released in full: its ReleaseStart is done.
+    pub fn released(&self, instance: &str) -> bool {
+        self.last(instance) == Some((AdoptStep::ReleaseStart, Phase::Done))
+    }
+
     /// The instances whose latest adoption has neither completed nor been released in full.
     pub fn incomplete(&self) -> Vec<String> {
         let finished = [
@@ -370,6 +380,48 @@ impl AdoptionRecord {
         self.lines.push(line);
         Ok(())
     }
+}
+
+/// The adopt steps a resume runs, from the recorded last step: all of them before the first; from a step whose intent or
+/// failure is the last line, that step again; and after a done step, the ones after it. A release step, or a plan whose steps
+/// are not the adoption's own, leaves nothing to resume.
+pub fn resume_steps(plan: &AdoptionPlan, last: Option<(AdoptStep, Phase)>) -> Vec<AdoptStep> {
+    if plan.steps != AdoptStep::ADOPT {
+        return Vec::new();
+    }
+    let Some((step, phase)) = last else {
+        return plan.steps.clone();
+    };
+    match plan.steps.iter().position(|planned| *planned == step) {
+        Some(at) if phase == Phase::Done => plan.steps[at + 1..].to_vec(),
+        Some(at) => plan.steps[at..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+/// The release steps left after the recorded last step. Before the move, the instance never left `default`, so only
+/// ReleaseStart is left. After Move, MoveBack is the first; after Mark, Unmark comes before it; and after Start, the whole
+/// release runs. Within a release, a step whose intent or failure is the last line runs again. Each step still reads first and
+/// sends nothing when its outcome holds, so a step that may or may not have landed is safe to list.
+pub fn release_steps(last: Option<(AdoptStep, Phase)>) -> Vec<AdoptStep> {
+    use AdoptStep as S;
+    let from = match last {
+        None => 3,
+        Some((step, phase)) => {
+            let done = usize::from(phase == Phase::Done);
+            match step {
+                S::CreateProject | S::Stop | S::Snapshot | S::PinNic => 3,
+                S::Move => 2,
+                S::Mark => 1,
+                S::Start => 0,
+                S::ReleaseStop => done,
+                S::Unmark => 1 + done,
+                S::MoveBack => 2 + done,
+                S::ReleaseStart => 3 + done,
+            }
+        }
+    };
+    AdoptStep::RELEASE[from..].to_vec()
 }
 
 /// Refuses an opened file that is not the regular file the path names now, or that is not this user's at mode 0600, so a link
