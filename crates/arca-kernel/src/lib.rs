@@ -1,12 +1,17 @@
-//! The Arca kernel's contracts: canonical JSON, node identity, signed desired state and the ownership model.
+//! The Arca kernel's contracts: canonical JSON, node identity, signed desired state, the ownership model, the effect journal
+//! and the plugin contract.
 //!
 //! Nothing in this crate touches Incus or a host. The kernel's one-writer rule is stated here as
-//! [`ownership::kernel_may_write`]; the providers that write must ask it before they act.
+//! [`ownership::kernel_may_write`]; the providers that write must ask it before they act. Every effect is journalled as
+//! an intent before it runs and as its inverse once it applies ([`journal`]); a plugin reaches the host only through
+//! [`plugin::Ctx`].
 
 pub mod canon;
 pub mod desired;
 pub mod identity;
+pub mod journal;
 pub mod ownership;
+pub mod plugin;
 
 use std::fmt;
 
