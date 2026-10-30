@@ -7,15 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arca_incus::UnixIncus;
-use arca_metrics::node_metrics;
 use serde_json::Value;
 
 use crate::config;
 use crate::handlers::{self, SAMPLE_INTERVAL};
 use crate::{Failure, Flags, call_failure};
 
-/// The longest `metrics` may sample. The window of `node_metrics` is a minute, so the run stays inside it with room to spare.
-const MAX_SAMPLE_SECONDS: u64 = 30;
+/// The longest `metrics` may sample. A run of a minute is the most its one-minute result window can be read against, so the
+/// mean covers the whole run.
+const MAX_SAMPLE_SECONDS: u64 = 60;
 
 /// How long `metrics` samples when no `--sample-for` is given: long enough that the mean has two samples to average.
 const DEFAULT_SAMPLE_SECONDS: u64 = 5;
@@ -33,7 +33,7 @@ pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     let cfg = config::load(Path::new(flags.required("config")?))?;
     let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
     let value = handlers::watch_snapshot(
-        &UnixIncus::new(cfg.incus.socket.clone()),
+        UnixIncus::new(cfg.incus.socket.clone()),
         &phones,
         handlers::now_ms(),
     )
@@ -41,8 +41,8 @@ pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     Ok(Some(value))
 }
 
-/// `metrics --json [--sample-for <seconds>] --config <file>`. It samples at once and then every
-/// [`SAMPLE_INTERVAL`] until the time runs out, and prints the result with a one-minute window.
+/// `metrics --json [--sample-for <seconds>] --config <file>`. It samples at once and then every [`SAMPLE_INTERVAL`] until the
+/// time runs out, and prints the result. The mean covers every sample of the run.
 pub fn metrics(flags: &Flags) -> Result<Option<Value>, Failure> {
     if !flags.switch("json") {
         return Err(Failure::Usage(
@@ -70,5 +70,5 @@ pub fn metrics(flags: &Flags) -> Result<Option<Value>, Failure> {
         thread::sleep(SAMPLE_INTERVAL.min(span - start.elapsed()));
         sampler.sample(handlers::now_ms());
     }
-    Ok(Some(node_metrics(&sampler, Some(1), handlers::now_ms())))
+    Ok(Some(handlers::run_row(&sampler, handlers::now_ms())))
 }

@@ -6,7 +6,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -296,20 +296,28 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
         .expect("phone1 is listed");
     assert_eq!(phone["identity"], json!(true));
 
-    // node_metrics: the first sample is taken at start, so the latest row is present, and no renter gate exists.
-    let (status, text) = post(
-        &socket,
-        &[bearer(viewer)],
-        &call(3, "node_metrics", json!({ "minutes": 1 })),
-    );
-    assert_eq!(status, 200);
-    assert!(!text.contains("renterGate"), "no renter gate at any depth");
-    let metrics = tool_result(&text);
+    // node_metrics: the sampler takes its first sample on its own thread, so the first row is published a moment after the
+    // socket listens. The call is repeated until it is, and no renter gate exists at any point.
+    let deadline = Instant::now() + WAIT;
+    let metrics = loop {
+        let (status, text) = post(
+            &socket,
+            &[bearer(viewer)],
+            &call(3, "node_metrics", json!({ "minutes": 1 })),
+        );
+        assert_eq!(status, 200);
+        assert!(!text.contains("renterGate"), "no renter gate at any depth");
+        let metrics = tool_result(&text);
+        if !metrics["latest"].is_null() {
+            break metrics;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first sample is published within the deadline"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     conforming("node_metrics", &metrics);
-    assert!(
-        !metrics["latest"].is_null(),
-        "the server took its first sample at start"
-    );
 
     // arca_status: Incus answers through the shim.
     let (status, text) = post(
@@ -464,6 +472,53 @@ fn a_token_directory_that_is_unsafe_or_missing_exits_with_a_clear_code() {
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
 
     let _ = rig.shim.stop();
+}
+
+#[test]
+fn a_hanging_incus_does_not_hold_up_serve_or_node_metrics() {
+    // The Incus socket accepts a connection and never answers. `serve` must listen at once, and `node_metrics` must answer
+    // from the samples it has, which is none yet, so no call waits on Incus.
+    let scratch = Scratch::new("hang");
+    let hung_path = scratch.at("hung-incus.sock");
+    let hung = UnixListener::bind(&hung_path).expect("bind the hanging socket");
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in hung.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, &hung_path, &hash_dir);
+    let socket = scratch.at("arca.sock");
+
+    let started = Instant::now();
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "serve listens without waiting on Incus: {:?}",
+        started.elapsed()
+    );
+
+    let viewer = secret_of(&secrets, "viewer-1");
+    let asked = Instant::now();
+    let (status, text) = post(
+        &socket,
+        &[bearer(viewer)],
+        &call(1, "node_metrics", json!({ "minutes": 1 })),
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "node_metrics answers at once: {:?}",
+        asked.elapsed()
+    );
+    assert_eq!(status, 200);
+    let metrics = tool_result(&text);
+    conforming("node_metrics", &metrics);
+    assert!(metrics["latest"].is_null(), "no sample exists yet");
+    assert!(metrics["mean"].is_null(), "no mean exists yet");
+
+    assert_eq!(serve.terminate().code(), Some(0), "the server exits 0");
 }
 
 fn read_log(log: &Path) -> Vec<Value> {

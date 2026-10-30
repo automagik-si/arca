@@ -3,14 +3,14 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_api::Scope;
 use arca_incus::{IncusRead, UnixIncus};
 use arca_kernel::plugin::EffectRefusal;
 use arca_mcp::{CallError, Caller, ToolHandler};
-use arca_metrics::{Sampler, SamplerConfig, node_metrics};
+use arca_metrics::{DEFAULT_MINUTES, HostSample, Sampler, SamplerConfig, mean};
 use arca_providers::ReadOnlyIncusProvider;
 use arca_watch::{WatchConfig, watch_once};
 use serde_json::{Value, json};
@@ -48,29 +48,54 @@ pub fn new_sampler(cfg: &NodeConfig) -> Sampler<UnixIncus> {
     )
 }
 
-/// The watch report of the host now. The provider lists every project first; the watch covers all of them, so it is
-/// complete: a live entry with no object in any project is drift. A later narrower cover must set `complete` to false.
-pub fn watch_snapshot(
-    incus: &UnixIncus,
+/// How many times a watch reads the project index around its listing. The listing is filtered to the projects read before it,
+/// so a project created during the read has its rows dropped; the watch then runs again on the new set.
+const WATCH_ATTEMPTS: usize = 3;
+
+/// The watch report of the host now. Each attempt reads the project index (the scope), then runs the watch over that scope,
+/// then reads the index again. `complete` is set for the run, and the report is returned only when every project the second
+/// read lists is in the scope, so a report is never complete while a listed project's rows were dropped. Otherwise the
+/// attempt is run again on the new scope.
+///
+/// A project created and removed again inside one attempt is seen by neither index read. Its rows are dropped, and the attempt
+/// is still accepted. Closing that gap needs the provider to report the rows it drops.
+pub fn watch_snapshot<R: IncusRead>(
+    incus: R,
     phones: &BTreeSet<String>,
     now: u64,
 ) -> Result<Value, CallError> {
-    let mut provider = ReadOnlyIncusProvider::new(incus.clone());
-    let listed = provider
+    let mut provider = ReadOnlyIncusProvider::new(incus);
+    for _ in 0..WATCH_ATTEMPTS {
+        let scope = listed_projects(&provider)?;
+        let cfg = WatchConfig {
+            identity_phones: phones.clone(),
+            projects: scope.clone(),
+            complete: true,
+            ..WatchConfig::default()
+        };
+        let report = watch_once(&mut provider, &cfg, now)
+            .map_err(|e| CallError::Internal(format!("the watch failed: {e}")))?;
+        if listed_projects(&provider)?
+            .iter()
+            .all(|name| scope.contains(name))
+        {
+            return serde_json::to_value(&report)
+                .map_err(|_| CallError::Internal("the report does not serialize".to_string()));
+        }
+    }
+    Err(CallError::Internal(
+        "the projects changed on every attempt of the watch; read again".to_string(),
+    ))
+}
+
+/// The names of the projects the host lists now.
+fn listed_projects<R: IncusRead>(
+    provider: &ReadOnlyIncusProvider<R>,
+) -> Result<BTreeSet<String>, CallError> {
+    provider
         .project_names()
-        .map_err(|refusal| CallError::Internal(listing_reason(&refusal)))?;
-    let projects: BTreeSet<String> = listed.iter().cloned().collect();
-    let complete = listed.iter().all(|name| projects.contains(name));
-    let cfg = WatchConfig {
-        identity_phones: phones.clone(),
-        projects,
-        complete,
-        ..WatchConfig::default()
-    };
-    let report = watch_once(&mut provider, &cfg, now)
-        .map_err(|e| CallError::Internal(format!("the watch failed: {e}")))?;
-    serde_json::to_value(&report)
-        .map_err(|_| CallError::Internal("the report does not serialize".to_string()))
+        .map(|names| names.into_iter().collect())
+        .map_err(|refusal| CallError::Internal(listing_reason(&refusal)))
 }
 
 fn listing_reason(refusal: &EffectRefusal) -> String {
@@ -78,6 +103,68 @@ fn listing_reason(refusal: &EffectRefusal) -> String {
         EffectRefusal::Provider(reason) => format!("the projects could not be listed: {reason}"),
         _ => "the projects could not be listed".to_string(),
     }
+}
+
+/// The host samples the sampler last published, oldest first. The sampler swaps in a new list after each sample, and a reader
+/// takes the current list under a short lock, so no reader waits on a read of Incus. Before the first sample it is empty.
+#[derive(Clone, Default)]
+pub struct Published(Arc<RwLock<Arc<Vec<HostSample>>>>);
+
+impl Published {
+    /// Replaces the published samples with `samples`.
+    pub fn publish(&self, samples: Vec<HostSample>) {
+        let next = Arc::new(samples);
+        let mut slot = self.0.write().unwrap_or_else(PoisonError::into_inner);
+        *slot = next;
+    }
+
+    /// The samples published last.
+    pub fn current(&self) -> Arc<Vec<HostSample>> {
+        let slot = self.0.read().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(&slot)
+    }
+}
+
+/// Takes one host sample and publishes the ring: every sample of the last hour, oldest first.
+pub fn sample_and_publish(sampler: &mut Sampler<UnixIncus>, published: &Published) {
+    sampler.sample(now_ms());
+    published.publish(sampler.history(HISTORY_MINUTES));
+}
+
+/// The samples within `minutes` of the newest one, oldest first. The window is measured from the newest sample's time, as
+/// [`Sampler::history`] measures it.
+pub fn window_of(samples: &[HostSample], minutes: u32) -> Vec<HostSample> {
+    let Some(latest) = samples.last() else {
+        return Vec::new();
+    };
+    let since = latest.at.saturating_sub(u64::from(minutes) * 60_000);
+    samples
+        .iter()
+        .filter(|sample| sample.at >= since)
+        .cloned()
+        .collect()
+}
+
+/// The `node_metrics` result: the newest sample, and the mean of `window`. Before any sample exists both are null.
+pub fn metrics_row(
+    latest: Option<&HostSample>,
+    window: &[HostSample],
+    minutes: u32,
+    now: u64,
+) -> Value {
+    json!({
+        "at": now,
+        "minutes": minutes,
+        "latest": latest,
+        "mean": mean(window),
+    })
+}
+
+/// The `metrics --json` result of a run: the newest sample, and the mean over every sample the run took, so the mean covers
+/// the whole run even when the run is a minute long. The window it prints is one minute.
+pub fn run_row<R: IncusRead>(sampler: &Sampler<R>, now: u64) -> Value {
+    let samples = sampler.history(HISTORY_MINUTES);
+    metrics_row(samples.last(), &samples, DEFAULT_MINUTES, now)
 }
 
 /// `arca_status`: the node, whether Incus answers now, and how long the server has run.
@@ -101,9 +188,10 @@ impl ToolHandler for StatusHandler {
     }
 }
 
-/// `node_metrics`: the latest sample and the mean over the requested minutes.
+/// `node_metrics`: the latest published sample and the mean over the requested minutes. It reads the snapshot the sampler
+/// published, so it never waits on Incus.
 pub struct MetricsHandler {
-    pub sampler: Arc<Mutex<Sampler<UnixIncus>>>,
+    pub published: Published,
 }
 
 impl ToolHandler for MetricsHandler {
@@ -111,12 +199,15 @@ impl ToolHandler for MetricsHandler {
         let minutes = args
             .get("minutes")
             .and_then(Value::as_u64)
-            .and_then(|m| u32::try_from(m).ok());
-        let sampler = self
-            .sampler
-            .lock()
-            .map_err(|_| CallError::Internal("the sampler stopped".to_string()))?;
-        Ok(node_metrics(&sampler, minutes, now_ms()))
+            .and_then(|m| u32::try_from(m).ok())
+            .unwrap_or(DEFAULT_MINUTES);
+        let samples = self.published.current();
+        Ok(metrics_row(
+            samples.last(),
+            &window_of(&samples, minutes),
+            minutes,
+            now_ms(),
+        ))
     }
 }
 
@@ -128,7 +219,7 @@ pub struct WatchHandler {
 
 impl ToolHandler for WatchHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
-        watch_snapshot(&UnixIncus::new(self.socket.clone()), &self.phones, now_ms())
+        watch_snapshot(UnixIncus::new(self.socket.clone()), &self.phones, now_ms())
     }
 }
 
@@ -145,5 +236,198 @@ impl ToolHandler for TokenListHandler {
             .map(|(id, scope)| json!({ "id": id, "scope": scope.as_str() }))
             .collect();
         Ok(json!({ "tokens": tokens }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use arca_incus::IncusError;
+    use arca_metrics::node_metrics;
+    use arca_providers::INSTANCES_ALL_PROJECTS;
+
+    use super::*;
+
+    const PROJECTS_PATH: &str = "/1.0/projects?recursion=1";
+
+    /// An Incus that answers the project index and the instance listing from two scripts, one answer per read, the last
+    /// answer repeating.
+    struct Scripted {
+        index: Mutex<VecDeque<Vec<&'static str>>>,
+        instances: Mutex<VecDeque<Vec<Value>>>,
+    }
+
+    /// The next answer of a script: the front one, unless it is the last, which then repeats.
+    fn next_answer<T: Clone>(script: &Mutex<VecDeque<T>>) -> T {
+        let mut queue = script.lock().expect("the script lock");
+        if queue.len() > 1 {
+            queue.pop_front().expect("a queued answer")
+        } else {
+            queue.front().cloned().expect("a scripted answer")
+        }
+    }
+
+    impl IncusRead for Scripted {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if path == PROJECTS_PATH {
+                let names = next_answer(&self.index);
+                return Ok(Value::Array(
+                    names
+                        .into_iter()
+                        .map(|name| json!({ "name": name }))
+                        .collect(),
+                ));
+            }
+            if path == INSTANCES_ALL_PROJECTS {
+                return Ok(Value::Array(next_answer(&self.instances)));
+            }
+            Err(IncusError::Decode(format!("no script answer for {path}")))
+        }
+    }
+
+    fn instance(project: &str, name: &str) -> Value {
+        json!({
+            "name": name,
+            "project": project,
+            "type": "container",
+            "status": "Running",
+            "config": {},
+            "expanded_config": {},
+        })
+    }
+
+    /// The projects of a report and the instance names each one carries.
+    fn rows_by_project(report: &Value) -> Vec<(String, Vec<String>)> {
+        report["projects"]
+            .as_array()
+            .expect("the report lists projects")
+            .iter()
+            .map(|project| {
+                let name = project["project"]
+                    .as_str()
+                    .expect("a project name")
+                    .to_string();
+                let rows = project["instances"]
+                    .as_array()
+                    .expect("instances")
+                    .iter()
+                    .map(|row| row["name"].as_str().expect("a name").to_string())
+                    .collect();
+                (name, rows)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_project_created_between_the_index_read_and_the_listing_keeps_its_rows() {
+        // Project `b` appears after the first index read and before the listing. Its instance is in the listing, and the
+        // index read after the listing names `b`, so the report must carry `b`'s row rather than drop it.
+        let incus = Scripted {
+            index: Mutex::new(VecDeque::from(vec![vec!["a"], vec!["a", "b"]])),
+            instances: Mutex::new(VecDeque::from(vec![vec![
+                instance("a", "x1"),
+                instance("b", "y1"),
+            ]])),
+        };
+        let report = watch_snapshot(incus, &BTreeSet::new(), 7).expect("the watch answers");
+        assert_eq!(
+            rows_by_project(&report),
+            vec![
+                ("a".to_string(), vec!["x1".to_string()]),
+                ("b".to_string(), vec!["y1".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stable_project_index_reports_every_project_once() {
+        let incus = Scripted {
+            index: Mutex::new(VecDeque::from(vec![vec!["a", "b"]])),
+            instances: Mutex::new(VecDeque::from(vec![vec![
+                instance("a", "x1"),
+                instance("b", "y1"),
+                instance("b", "y2"),
+            ]])),
+        };
+        let report = watch_snapshot(incus, &BTreeSet::new(), 7).expect("the watch answers");
+        assert_eq!(
+            rows_by_project(&report),
+            vec![
+                ("a".to_string(), vec!["x1".to_string()]),
+                ("b".to_string(), vec!["y1".to_string(), "y2".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_metrics_mean_of_a_minute_long_run_covers_its_first_sample() {
+        // A 60-second `metrics` run takes samples at 0, 5, ..., 55 seconds and once more just past 60 seconds, 13 in all. The
+        // first sees no instance and the rest see thirteen, so the mean over the whole run is (0 + 12 * 13) / 13 = 12. A
+        // one-minute window measured from the last sample drops the first sample and reads 13, which the `metrics` command
+        // must not print for its own run.
+        let thirteen: Vec<Value> = (0..13).map(|n| instance("p", &format!("n{n}"))).collect();
+        let incus = Scripted {
+            index: Mutex::new(VecDeque::from(vec![Vec::new()])),
+            instances: Mutex::new(VecDeque::from(vec![Vec::new(), thirteen])),
+        };
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-test-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-test-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: HISTORY_MINUTES,
+            },
+            incus,
+        );
+        for at in (0..12u64)
+            .map(|step| 1_000_000 + step * 5_000)
+            .chain(std::iter::once(1_000_000 + 60_001))
+        {
+            sampler.sample(at);
+        }
+        let row = run_row(&sampler, 0);
+        assert_eq!(row["mean"]["projects"][0]["total"], json!(12));
+        assert_eq!(row["latest"]["projects"][0]["total"], json!(13));
+    }
+
+    #[test]
+    fn before_any_sample_the_metrics_row_has_no_latest_and_no_mean() {
+        let row = metrics_row(None, &[], DEFAULT_MINUTES, 5);
+        assert_eq!(row["at"], json!(5));
+        assert_eq!(row["minutes"], json!(1));
+        assert_eq!(row["latest"], Value::Null);
+        assert_eq!(row["mean"], Value::Null);
+    }
+
+    #[test]
+    fn a_published_snapshot_answers_the_same_row_as_the_sampler() {
+        let incus = Scripted {
+            index: Mutex::new(VecDeque::from(vec![Vec::new()])),
+            instances: Mutex::new(VecDeque::from(vec![vec![instance("p", "n0")]])),
+        };
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-test-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-test-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: HISTORY_MINUTES,
+            },
+            incus,
+        );
+        for step in 0..=3u64 {
+            sampler.sample(1_000_000 + step * 5_000);
+        }
+        let published = Published::default();
+        published.publish(sampler.history(HISTORY_MINUTES));
+        let snapshot = published.current();
+        for minutes in [1, 60] {
+            let from_snapshot =
+                metrics_row(snapshot.last(), &window_of(&snapshot, minutes), minutes, 9);
+            assert_eq!(from_snapshot, node_metrics(&sampler, Some(minutes), 9));
+        }
     }
 }

@@ -154,7 +154,7 @@ fn usage_errors_exit_2_and_say_what_was_wrong() {
             "metrics",
             "--json",
             "--sample-for",
-            "31",
+            "61",
             "--config",
             &config_arg,
         ],
@@ -202,6 +202,36 @@ fn usage_errors_exit_2_and_say_what_was_wrong() {
             !stderr_text(&out).is_empty(),
             "{args:?} says what was wrong"
         );
+    }
+}
+
+#[test]
+fn sample_for_takes_up_to_60_seconds_and_refuses_61() {
+    // A sampling run of 60 seconds would take a minute, so the test stops at the config: a refused config exits 2 before any
+    // sample is taken. The length is checked first, so a length the command accepts gets past it and reaches the config
+    // refusal, and a length it refuses says so on stderr.
+    let scratch = Scratch::new("sample-for");
+    let path = write_config(&scratch, "refused.json", &json!({ "bogus": 1 }));
+    for seconds in ["60", "61"] {
+        let out = arca()
+            .args(["metrics", "--json", "--sample-for", seconds, "--config"])
+            .arg(&path)
+            .output()
+            .expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{seconds}: exit 2");
+        assert!(out.stdout.is_empty(), "{seconds}: nothing on stdout");
+        let stderr = stderr_text(&out);
+        let refused_by_length = stderr.contains("--sample-for");
+        match seconds {
+            "60" => assert!(
+                !refused_by_length,
+                "60 seconds is accepted and the config is what refuses: {stderr}"
+            ),
+            _ => assert!(
+                refused_by_length,
+                "61 seconds is refused by its length: {stderr}"
+            ),
+        }
     }
 }
 
@@ -462,6 +492,146 @@ fn token_mint_refuses_what_it_must_not_write_and_leaks_nothing() {
         fs::read_to_string(&existing_out).expect("read"),
         "already here"
     );
+}
+
+/// A token directory at mode 0700 named `name` under `scratch`.
+fn token_dir(scratch: &Scratch, name: &str) -> PathBuf {
+    let dir = scratch.at(name);
+    fs::create_dir(&dir).expect("create the token directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    dir
+}
+
+/// A node config whose `tokens.hashDir` is `hash_dir`.
+fn config_naming_hash_dir(scratch: &Scratch, hash_dir: &Path) -> PathBuf {
+    let mut value = config(scratch, &scratch.at("incus.sock"));
+    value["tokens"]["hashDir"] = json!(hash_dir.display().to_string());
+    write_config(scratch, "mint.json", &value)
+}
+
+fn mode_of(path: &Path) -> u32 {
+    fs::metadata(path).expect("stat").permissions().mode() & 0o777
+}
+
+#[test]
+fn token_mint_takes_the_hash_dir_of_a_config_alone() {
+    let scratch = Scratch::new("mint-config");
+    let hash_dir = token_dir(&scratch, "tokens");
+    let config_path = config_naming_hash_dir(&scratch, &hash_dir);
+    let out_file = scratch.at("cfg-1.secret");
+    let out = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "cfg-1", "--config",
+        ])
+        .arg(&config_path)
+        .arg("--out")
+        .arg(&out_file)
+        .output()
+        .expect("run the binary");
+    assert!(
+        out.status.success(),
+        "the mint succeeds: {}",
+        stderr_text(&out)
+    );
+    assert_eq!(
+        mode_of(&hash_dir.join("cfg-1.hash")),
+        0o400,
+        "hash file 0400"
+    );
+    assert_eq!(mode_of(&out_file), 0o400, "secret file 0400");
+    let printed: Value = serde_json::from_str(stdout_text(&out).trim()).expect("stdout is JSON");
+    assert_eq!(printed, json!({ "id": "cfg-1", "scope": "viewer" }));
+}
+
+#[test]
+fn token_mint_accepts_a_hash_dir_that_matches_the_config() {
+    let scratch = Scratch::new("mint-match");
+    let hash_dir = token_dir(&scratch, "tokens");
+    let config_path = config_naming_hash_dir(&scratch, &hash_dir);
+    let out_file = scratch.at("match-1.secret");
+    let out = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "match-1", "--config",
+        ])
+        .arg(&config_path)
+        .arg("--hash-dir")
+        .arg(&hash_dir)
+        .arg("--out")
+        .arg(&out_file)
+        .output()
+        .expect("run the binary");
+    assert!(
+        out.status.success(),
+        "a matching hash-dir is accepted: {}",
+        stderr_text(&out)
+    );
+    assert_eq!(mode_of(&hash_dir.join("match-1.hash")), 0o400);
+}
+
+#[test]
+fn token_mint_refuses_a_hash_dir_that_differs_from_the_config_and_writes_nothing() {
+    let scratch = Scratch::new("mint-differ");
+    let configured = token_dir(&scratch, "tokens");
+    let other = token_dir(&scratch, "other-tokens");
+    let config_path = config_naming_hash_dir(&scratch, &configured);
+    let out_file = scratch.at("differ-1.secret");
+    let out = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "differ-1", "--config",
+        ])
+        .arg(&config_path)
+        .arg("--hash-dir")
+        .arg(&other)
+        .arg("--out")
+        .arg(&out_file)
+        .output()
+        .expect("run the binary");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a differing hash-dir is a usage error"
+    );
+    assert!(out.stdout.is_empty(), "nothing on stdout");
+    assert!(
+        stderr_text(&out).contains("differs"),
+        "the message says the directories differ: {}",
+        stderr_text(&out)
+    );
+    assert!(
+        !configured.join("differ-1.hash").exists(),
+        "no hash in the config's directory"
+    );
+    assert!(
+        !other.join("differ-1.hash").exists(),
+        "no hash in the given directory"
+    );
+    assert!(!out_file.exists(), "no secret file");
+}
+
+#[test]
+fn token_mint_needs_a_hash_dir_or_a_config() {
+    let scratch = Scratch::new("mint-neither");
+    let out_file = scratch.at("neither-1.secret");
+    let out = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "viewer",
+            "--id",
+            "neither-1",
+            "--out",
+        ])
+        .arg(&out_file)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2), "neither is a usage error");
+    assert!(out.stdout.is_empty(), "nothing on stdout");
+    assert!(
+        !stderr_text(&out).is_empty(),
+        "the message says what is missing"
+    );
+    assert!(!out_file.exists(), "no secret file");
 }
 
 #[test]

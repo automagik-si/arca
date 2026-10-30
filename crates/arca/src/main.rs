@@ -23,9 +23,9 @@ use crate::config::ConfigError;
 
 const USAGE: &str = "usage: arca <command>
   watch --once --json --config <file>
-  metrics --json [--sample-for <seconds, 0 to 30>] --config <file>
+  metrics --json [--sample-for <seconds, 0 to 60>] --config <file>
   serve --config <file>
-  token mint --scope <viewer|doctor|operator> --id <id> --hash-dir <dir> --out <file>
+  token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
   shim --upstream <socket> --listen <socket> --log <file>";
 
 /// Why a command ended without a result. The message never carries a token, a secret or a key.
@@ -150,7 +150,7 @@ fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "token" => match rest.split_first() {
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
                 rest,
-                &["scope", "id", "hash-dir", "out"],
+                &["scope", "id", "hash-dir", "out", "config"],
                 &[],
             )?),
             _ => Err(usage_failure()),

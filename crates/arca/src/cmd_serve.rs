@@ -7,7 +7,7 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
@@ -21,8 +21,8 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use crate::config;
 use crate::handlers::{
-    MetricsHandler, SAMPLE_INTERVAL, StatusHandler, TokenListHandler, WatchHandler, new_sampler,
-    now_ms,
+    MetricsHandler, Published, SAMPLE_INTERVAL, StatusHandler, TokenListHandler, WatchHandler,
+    new_sampler, sample_and_publish,
 };
 use crate::{Failure, Flags};
 
@@ -45,12 +45,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
 
-    let sampler = Arc::new(Mutex::new(new_sampler(&cfg)));
-    sampler
-        .lock()
-        .map_err(|_| Failure::Runtime("the sampler stopped".to_string()))?
-        .sample(now_ms());
-    spawn_sampler(Arc::clone(&sampler)).map_err(|e| Failure::Runtime(e.to_string()))?;
+    // The sampler takes its first sample on its own thread, so the listeners start without waiting on Incus. The handlers read
+    // the samples it publishes and never take part in a read.
+    let published = Published::default();
+    spawn_sampler(new_sampler(&cfg), published.clone())
+        .map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
     let server = Server::new(verbs(), tokens)
@@ -62,12 +61,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 socket: cfg.incus.socket.clone(),
             }),
         )
-        .handle(
-            "node_metrics",
-            Arc::new(MetricsHandler {
-                sampler: Arc::clone(&sampler),
-            }),
-        )
+        .handle("node_metrics", Arc::new(MetricsHandler { published }))
         .handle(
             "watch_report",
             Arc::new(WatchHandler {
@@ -129,17 +123,15 @@ fn token_failure(error: TokenStoreError) -> Failure {
     }
 }
 
-/// Samples the host every [`SAMPLE_INTERVAL`] on a background thread, until the lock is poisoned.
-fn spawn_sampler(sampler: Arc<Mutex<Sampler<UnixIncus>>>) -> io::Result<()> {
+/// Samples the host on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each
+/// sample is published as soon as it is taken.
+fn spawn_sampler(mut sampler: Sampler<UnixIncus>, published: Published) -> io::Result<()> {
     thread::Builder::new()
         .name("arca-sampler".to_string())
         .spawn(move || {
             loop {
+                sample_and_publish(&mut sampler, &published);
                 thread::sleep(SAMPLE_INTERVAL);
-                let Ok(mut guard) = sampler.lock() else {
-                    return;
-                };
-                guard.sample(now_ms());
             }
         })?;
     Ok(())

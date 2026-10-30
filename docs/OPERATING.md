@@ -10,7 +10,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
-| `arca token mint --scope <s> --id <id> --hash-dir <dir> --out <file>` | nothing | the id and the scope |
+| `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file>` | forwards GET, refuses the rest | the shim summary, on SIGTERM |
 
 `watch` and `metrics` print the same JSON as the MCP verb of the same name, so a command's output can be compared with the
@@ -20,8 +20,8 @@ Exit codes: `0` success; `1` a runtime failure (a socket, a read or a write fail
 command line, a refused config, or a token directory that is unsafe or missing). Messages go to stderr. A message never
 carries a token, a secret or a key.
 
-`metrics` samples once at start and then every 5 seconds for `--sample-for` seconds (default 5, from 0 to 30). Its `mean`
-covers the run, and the `node_metrics` window it prints is one minute.
+`metrics` samples once at start and then every 5 seconds for `--sample-for` seconds (default 5, from 0 to 60). Its `mean`
+covers every sample of the run, and the `node_metrics` window it prints is one minute.
 
 ## The config file
 
@@ -110,6 +110,13 @@ the directory and mint into it before the mode is tightened to 0500, because a 0
 arca token mint --scope viewer --id viewer-1 --hash-dir /etc/arca/tokens --out "$HOME/.config/arca/viewer-1.secret"
 ```
 
+`--config <file>` may name the token directory instead, as `tokens.hashDir` of the node config, and then `--hash-dir` is not
+needed. The config is loaded and checked first. When both are given, `--hash-dir` must name that same directory; a different
+one is refused with exit 2 and nothing is written. Giving neither is refused with exit 2.
+
+**Run `arca token mint` as the user that runs `serve`.** A mint run as another user writes hash files owned by that user, and
+the server refuses every file it does not own, so the load fails until those files are minted again as the server's user.
+
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
 
@@ -130,8 +137,13 @@ The secret file holds the secret and one newline. A client reads that file, stri
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report` and `token_list`.
 
+The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
+its request is read.
+
 - `arca_status` reports the node id, `watch-only` mode, uptime, whether Incus answers, and `appliedSeq` as `null`.
-- `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring.
+- `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
+  thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
+  `mean` are `null`.
 - `watch_report` reads every project and instance through Incus GET. Live desired-state entries do not exist yet, so the
   report has no entries to compare, and every kernel-marked object is reported as drift.
 - `token_list` lists each token's id and scope as they were when the server started. It never lists a secret or a digest.
