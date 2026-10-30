@@ -13,9 +13,24 @@ const LOOP_WAT: &str = include_str!("fixtures/loop.wat");
 /// is not enforced and not a slow machine.
 const TRAP_DEADLINE: Duration = Duration::from_secs(1);
 
+/// How long a test waits for the call before it fails. A fuel limit that is not enforced leaves the call looping, so the
+/// call runs on its own thread and the test fails here instead of hanging.
+const WAIT_LIMIT: Duration = Duration::from_secs(5);
+
+/// Runs `call_in_store` on its own thread and waits at most `WAIT_LIMIT` for its answer.
+fn call_run_with_fuel(fuel: u64) -> (wasmtime::Error, Duration) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(call_in_store(fuel));
+    });
+    receiver
+        .recv_timeout(WAIT_LIMIT)
+        .expect("the guest must trap before the wait limit; a call still running means fuel is not enforced")
+}
+
 /// Calls `run` of the fixture in a store that holds `fuel` units of fuel. Returns the error the call returned and how long
 /// the call took.
-fn call_run_with_fuel(fuel: u64) -> (wasmtime::Error, Duration) {
+fn call_in_store(fuel: u64) -> (wasmtime::Error, Duration) {
     let mut config = Config::new();
     config.consume_fuel(true);
     let engine = Engine::new(&config).expect("the engine is configured");
