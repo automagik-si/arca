@@ -7,6 +7,7 @@
 //! table makes true for every verb.
 
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 use crate::API_VERSION;
 use crate::verbs::{Verb, verbs};
@@ -67,7 +68,8 @@ fn descriptors(params: &Value) -> Vec<Value> {
 
 /// Whether a document has the shape the verb table promises: the version, the info version, and for every method a name,
 /// a params list, a result, and the three extensions with a legal value. A method without a class is refused, so a verb
-/// cannot reach the document unclassed.
+/// cannot reach the document unclassed. Method names are unique, and so are the parameter names of a method, and every
+/// parameter is named: the compatibility checker compares one entry per name, so a repeat would go unread.
 pub fn check_document(doc: &Value) -> Result<(), String> {
     if doc.get("openrpc").and_then(Value::as_str) != Some(OPENRPC_VERSION) {
         return Err(format!("openrpc must be {OPENRPC_VERSION}"));
@@ -80,11 +82,15 @@ pub fn check_document(doc: &Value) -> Result<(), String> {
         .get("methods")
         .and_then(Value::as_array)
         .ok_or_else(|| "methods must be an array".to_string())?;
+    let mut names = BTreeSet::new();
     for m in methods {
         let name = m
             .get("name")
             .and_then(Value::as_str)
             .ok_or_else(|| "a method has no name".to_string())?;
+        if !names.insert(name) {
+            return Err(format!("method {name} is listed twice"));
+        }
         let class = m.get("x-arca-class").and_then(Value::as_str);
         if !matches!(class, Some("L" | "B" | "Q")) {
             return Err(format!("method {name} has no legal x-arca-class"));
@@ -102,8 +108,18 @@ pub fn check_document(doc: &Value) -> Result<(), String> {
                 "method {name} is open: x-arca-additional-properties must be true"
             ));
         }
-        if !m.get("params").is_some_and(Value::is_array) {
+        let Some(params) = m.get("params").and_then(Value::as_array) else {
             return Err(format!("method {name} has no params list"));
+        };
+        let mut param_names = BTreeSet::new();
+        for p in params {
+            let param = p
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("method {name} has a parameter with no name"))?;
+            if !param_names.insert(param) {
+                return Err(format!("method {name} lists parameter {param} twice"));
+            }
         }
         if m.pointer("/result/schema").is_none() {
             return Err(format!("method {name} has no result schema"));

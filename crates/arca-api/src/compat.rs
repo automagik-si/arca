@@ -10,8 +10,9 @@
 //! admitted by the released one. A result may therefore gain fields and admit less; it may not admit more.
 //!
 //! The schema subset is the one `check.rs` reads: type, enum, bounds, properties, required, items, additionalProperties and
-//! anyOf. Where two schemas differ in a way this module cannot relate, it reports a break (fail closed). An `anyOf` that
-//! changes at all is such a case. The minimum scope is ranked in the order of [`crate::Scope`].
+//! anyOf. Where two schemas differ in a way this module cannot relate, it reports a break (fail closed). That covers an
+//! `anyOf` that changes as a value, a keyword outside the subset (annotations and `x-` extensions aside) that differs, and
+//! a schema that is not an object. The minimum scope is ranked in the order of [`crate::Scope`].
 //!
 //! The method's `x-arca-additional-properties` flag is not compared: the released document is closed by construction, and
 //! opening a params object only admits more arguments.
@@ -19,6 +20,8 @@
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fmt;
+
+use crate::check::outside_subset;
 
 /// One change that breaks a client built against a released document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,16 +239,20 @@ fn result_node(method: &str, old: &Value, new: &Value, path: &str, out: &mut Vec
         method: method.to_string(),
         path,
     };
+    let (Some(old_map), Some(new_map)) = (old.as_object(), new.as_object()) else {
+        // A schema that is not an object is not modelled: fail closed.
+        out.push(changed(path.to_string()));
+        return;
+    };
     if closed(new) && !closed(old) {
         out.push(Break::ResultClosed {
             method: method.to_string(),
             path: path.to_string(),
         });
     }
-    // Admitting fields the released result refuses is a broader result, whatever its fields are.
-    if closed(old) && !closed(new) {
-        out.push(changed(path.to_string()));
-    }
+    // A closed released object refuses every field it does not name, so a field the current result adds is a broader result,
+    // and so is an object the current result leaves open.
+    let widened = closed(old) && (!closed(new) || names_new_property(old, new));
     if let Some(old_fields) = properties(old) {
         for (field, old_field) in old_fields {
             let child = format!("{path}.{field}");
@@ -273,7 +280,11 @@ fn result_node(method: &str, old: &Value, new: &Value, path: &str, out: &mut Vec
             Some(new_items) => result_node(method, old_items, new_items, &child, out),
         }
     }
-    if old.get("anyOf") != new.get("anyOf") || covers_domain(old, new).is_err() {
+    if widened
+        || unmodelled_difference(old_map, new_map).is_some()
+        || old.get("anyOf") != new.get("anyOf")
+        || covers_domain(old, new).is_err()
+    {
         out.push(changed(path.to_string()));
     }
 }
@@ -284,7 +295,14 @@ fn covers(wide: &Value, narrow: &Value) -> Result<(), String> {
     if wide == narrow {
         return Ok(());
     }
-    if wide.get("anyOf").is_some() || narrow.get("anyOf").is_some() {
+    let (Some(wide_map), Some(narrow_map)) = (wide.as_object(), narrow.as_object()) else {
+        return Err("schema is not an object".to_string());
+    };
+    if let Some(key) = unmodelled_difference(wide_map, narrow_map) {
+        return Err(format!("{key} changed"));
+    }
+    // anyOf is compared as a value: an unchanged one is no reason to refuse, and a changed one cannot be related.
+    if wide.get("anyOf") != narrow.get("anyOf") {
         return Err("anyOf changed".to_string());
     }
     covers_domain(wide, narrow)?;
@@ -432,4 +450,30 @@ fn required_names(schema: &Value) -> Vec<&str> {
 
 fn closed(schema: &Value) -> bool {
     schema.get("additionalProperties") == Some(&Value::Bool(false))
+}
+
+/// Whether `new` names a property that `old` does not name.
+fn names_new_property(old: &Value, new: &Value) -> bool {
+    let old_fields = properties(old);
+    properties(new).is_some_and(|fields| {
+        fields
+            .keys()
+            .any(|name| !old_fields.is_some_and(|known| known.contains_key(name)))
+    })
+}
+
+/// The first keyword outside the subset, in name order, on which two schema objects differ. The checker does not model
+/// such a keyword, so a difference in it cannot be related and is a break.
+fn unmodelled_difference<'a>(
+    wide: &'a Map<String, Value>,
+    narrow: &'a Map<String, Value>,
+) -> Option<&'a str> {
+    let keys: BTreeSet<&str> = wide
+        .keys()
+        .chain(narrow.keys())
+        .map(String::as_str)
+        .filter(|key| outside_subset(key))
+        .collect();
+    keys.into_iter()
+        .find(|key| wide.get(*key) != narrow.get(*key))
 }

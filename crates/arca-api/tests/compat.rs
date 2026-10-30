@@ -1,6 +1,8 @@
 //! The OpenRPC compatibility checker against the released 0.1.0 document. Each break fixture is the released document with
-//! one edit and yields exactly one break. The additive fixture yields none. The enum and minLength fixtures start from a
-//! base that adds one optional string parameter, because no released parameter carries an enum or a string bound.
+//! one edit and yields exactly one break. The additive fixture yields none. Two fixtures start from a disclosed base instead:
+//! the minLength fixture and the shrunk-enum test add one optional string parameter, because no released parameter carries
+//! a string bound, and the frozen `minutes` has no enum to shrink. A closed-result fixture closes the base's result object,
+//! because every released result is open.
 
 use arca_api::Scope;
 use arca_api::compat::{Break, compatible};
@@ -90,8 +92,10 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 /// Checks every released document under `dir` against `current`. Returns how many it checked. An empty directory is an
-/// error, so the check cannot pass by checking nothing.
+/// error, so the check cannot pass by checking nothing. The current document must first pass `check_document`, the shape
+/// the compatibility check reads.
 fn check_released_dir(dir: &Path, current: &Value) -> Result<usize, String> {
+    check_document(current).map_err(|e| format!("the current document: {e}"))?;
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -193,7 +197,23 @@ fn a_lowered_maximum_is_one_parameter_narrowing() {
 }
 
 #[test]
-fn a_shrunk_enum_is_one_parameter_narrowing() {
+fn an_enum_added_to_a_released_parameter_is_one_narrowing() {
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["enum"] = json!([1, 5, 15, 60]);
+    });
+    assert_eq!(
+        got,
+        [Break::ParamNarrowed {
+            method: "node_metrics".into(),
+            param: "minutes".into(),
+            why: "enum added".into()
+        }]
+    );
+}
+
+/// Disclosed base: the frozen 0.1.0 has no enum on a parameter, so a shrink is reached from the probed base.
+#[test]
+fn a_shrunk_enum_on_an_added_parameter_is_one_narrowing() {
     let base = probed();
     let mut current = base.clone();
     param_mut(&mut current, "node_metrics", "sample")["schema"]["enum"] = json!(["alpha", "beta"]);
@@ -303,6 +323,185 @@ fn writes_turned_on_is_one_break() {
         [Break::WritesTurnedOn {
             method: "arca_status".into()
         }]
+    );
+}
+
+// Keywords outside the subset and schemas that are not objects. The module cannot relate them to the released schema, so
+// any difference is a break, and the first differing keyword is named.
+
+fn minutes_narrowed(why: &str) -> Break {
+    Break::ParamNarrowed {
+        method: "node_metrics".into(),
+        param: "minutes".into(),
+        why: why.into(),
+    }
+}
+
+#[test]
+fn a_parameter_schema_of_false_is_one_narrowing() {
+    let got =
+        breaks_after(|doc| param_mut(doc, "node_metrics", "minutes")["schema"] = json!(false));
+    assert_eq!(got, [minutes_narrowed("schema is not an object")]);
+}
+
+#[test]
+fn a_parameter_schema_that_is_a_string_is_one_narrowing() {
+    let got =
+        breaks_after(|doc| param_mut(doc, "node_metrics", "minutes")["schema"] = json!("integer"));
+    assert_eq!(got, [minutes_narrowed("schema is not an object")]);
+}
+
+#[test]
+fn an_exclusive_maximum_added_is_one_parameter_narrowing() {
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["exclusiveMaximum"] = json!(30)
+    });
+    assert_eq!(got, [minutes_narrowed("exclusiveMaximum changed")]);
+}
+
+#[test]
+fn a_multiple_of_added_is_one_parameter_narrowing() {
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["multipleOf"] = json!(5)
+    });
+    assert_eq!(got, [minutes_narrowed("multipleOf changed")]);
+}
+
+#[test]
+fn a_pattern_added_is_one_parameter_narrowing() {
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["pattern"] = json!("^[0-9]+$")
+    });
+    assert_eq!(got, [minutes_narrowed("pattern changed")]);
+}
+
+/// The released result admits any array length. A `maxItems` the module cannot relate is refused, even though it narrows.
+#[test]
+fn a_result_keyword_outside_the_subset_is_one_type_break() {
+    let got = breaks_after(|doc| {
+        result_mut(doc, "watch_report")["properties"]["projects"]["maxItems"] = json!(3);
+    });
+    assert_eq!(
+        got,
+        [Break::ResultTypeChanged {
+            method: "watch_report".into(),
+            path: "$.projects".into()
+        }]
+    );
+}
+
+#[test]
+fn an_annotation_or_extension_added_to_a_parameter_is_no_break() {
+    let got = breaks_after(|doc| {
+        let schema = &mut param_mut(doc, "node_metrics", "minutes")["schema"];
+        schema["title"] = json!("Minutes");
+        schema["description"] = json!("The window in minutes");
+        schema["x-note"] = json!("ignored by the checker");
+    });
+    assert!(
+        got.is_empty(),
+        "annotations and extensions are ignored: {got:?}"
+    );
+}
+
+#[test]
+fn a_parameter_schema_of_false_fails_the_released_gate() {
+    let mut current = openrpc();
+    param_mut(&mut current, "node_metrics", "minutes")["schema"] = json!(false);
+    let got = check_released_dir(Path::new(RELEASED_DIR), &current);
+    let message = got.expect_err("a parameter that admits nothing must fail the gate");
+    assert!(
+        message.contains("minutes narrowed"),
+        "the break is named: {message}"
+    );
+}
+
+// A closed released result gaining a field, and anyOf compared as a value.
+
+#[test]
+fn a_closed_result_that_gains_a_field_is_a_type_break() {
+    // Disclosed base: the frozen 0.1.0 leaves every result open, so this base closes arca_status's result object.
+    let mut base = released();
+    result_mut(&mut base, "arca_status")["additionalProperties"] = json!(false);
+    let mut current = base.clone();
+    result_mut(&mut current, "arca_status")["properties"]["extra"] = json!({ "type": "string" });
+    assert_eq!(
+        compatible(&base, &current),
+        [Break::ResultTypeChanged {
+            method: "arca_status".into(),
+            path: "$".into()
+        }]
+    );
+}
+
+#[test]
+fn an_unchanged_any_of_with_a_narrowed_sibling_names_the_sibling() {
+    // Disclosed base: an added optional parameter, as the probed base is.
+    let base = with_sample(json!({
+        "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "integer", "maximum": 60 }]
+    }));
+    let mut current = base.clone();
+    param_mut(&mut current, "node_metrics", "sample")["schema"]["minimum"] = json!(2);
+    assert_eq!(
+        compatible(&base, &current),
+        [Break::ParamNarrowed {
+            method: "node_metrics".into(),
+            param: "sample".into(),
+            why: "minimum raised".into()
+        }]
+    );
+}
+
+// Duplicate names: the compared entry is the first one, so a second entry must fail the gate instead.
+
+#[test]
+fn a_duplicate_method_name_fails_the_gate() {
+    let mut current = released();
+    let mut dup = method_mut(&mut current, "arca_status").clone();
+    dup["x-arca-scope"] = json!("operator");
+    current["methods"]
+        .as_array_mut()
+        .expect("methods")
+        .push(dup);
+    assert!(
+        check_document(&current).is_err(),
+        "a duplicate method is refused"
+    );
+    let got = check_released_dir(Path::new(RELEASED_DIR), &current);
+    let message = got.expect_err("a second arca_status must fail the gate");
+    assert!(
+        message.contains("arca_status"),
+        "the duplicate is named: {message}"
+    );
+}
+
+#[test]
+fn a_duplicate_parameter_name_fails_the_gate() {
+    let mut current = released();
+    let mut dup = param_mut(&mut current, "node_metrics", "minutes").clone();
+    dup["required"] = json!(true);
+    params_mut(&mut current, "node_metrics").push(dup);
+    assert!(
+        check_document(&current).is_err(),
+        "a duplicate parameter is refused"
+    );
+    let got = check_released_dir(Path::new(RELEASED_DIR), &current);
+    let message = got.expect_err("a second minutes must fail the gate");
+    assert!(
+        message.contains("minutes"),
+        "the duplicate is named: {message}"
+    );
+}
+
+#[test]
+fn a_current_document_that_fails_its_own_check_fails_the_gate() {
+    // The open params object is not compared by `compatible`, so only `check_document` refuses this current document.
+    let mut current = openrpc();
+    method_mut(&mut current, "node_metrics")["x-arca-additional-properties"] = json!(false);
+    let got = check_released_dir(Path::new(RELEASED_DIR), &current);
+    assert!(
+        got.is_err(),
+        "a current document that fails check_document must fail the gate"
     );
 }
 
