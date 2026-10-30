@@ -10,8 +10,8 @@
 //! them. A restricted project refuses an instance whose NIC names a network that its `restricted.networks.access` does not list.
 //!
 //! Writes: a POST to a collection creates an object, a PATCH or DELETE changes or removes one. These cover projects and the
-//! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance and a volume
-//! get a uuid, in their `volatile.uuid` key; no other kind has one. Each object's ETag is a digest of its JSON. A PATCH whose
+//! eight object kinds (instances, networks, ACLs, profiles, volumes, zones, forwards and buckets). An instance gets a uuid, in
+//! its `volatile.uuid` key; no other kind has one, a volume included, as on Incus 7.3. Each object's ETag is a digest of its JSON. A PATCH whose
 //! `If-Match` is not the current ETag is 412 and changes nothing. A DELETE ignores `If-Match`, as Incus does. An instance's or
 //! a volume's create and delete are answered 202 with an operation, whose URL the caller waits on. Every other write, and
 //! every PATCH, is answered sync: 201 for a create and 200 otherwise. A failed operation waits as a status error. A method a
@@ -822,8 +822,9 @@ fn create(
         body.insert("project".to_string(), Value::String(project.clone()));
     }
     body.entry("config").or_insert_with(|| json!({}));
-    if matches!(kind, "instance" | "volume") {
-        // Incus gives an instance and a volume a uuid, in its `volatile.uuid` config key. No other kind has one.
+    if kind == "instance" {
+        // Incus gives an instance a uuid, in its `volatile.uuid` config key. No other kind has one: Incus 7.3 gives a custom
+        // volume none.
         if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut) {
             config.insert("volatile.uuid".to_string(), Value::String(shared.next_id()));
         }

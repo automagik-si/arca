@@ -768,8 +768,8 @@ impl IncusProvider {
         object: &ObjectRef,
         plan: &Digest,
     ) -> Result<Retirement, EffectRefusal> {
-        // An instance or a volume is named by its uuid. A retirement that names none is refused before any request, since the
-        // object it would reach is not the one the approved plan names.
+        // An instance is named by its uuid. A retirement that names none is refused before any request, since the object it would
+        // reach is not the one the approved plan names. Every other kind, a volume included, is named by its place.
         if object.kind.has_uuid() && object.uuid.is_none() {
             return Err(EffectRefusal::Provider(
                 "a retirement names the object's uuid".to_string(),

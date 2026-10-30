@@ -666,7 +666,10 @@ fn a_volume_create_names_its_pool_and_its_inverse_names_the_same_pool() {
         panic!("a delete inverse: {:?}", live[0].inverse);
     };
     assert_eq!(named.parent.as_deref(), Some("fast"));
-    assert!(named.uuid.is_some(), "a volume's inverse carries its uuid");
+    assert_eq!(
+        named.uuid, None,
+        "a volume has no uuid, so its inverse deletes it by name"
+    );
 }
 
 #[test]
@@ -2320,27 +2323,71 @@ fn a_plain_patch_over_a_reference_shaped_value_that_no_secret_matches_is_refused
 // ---------------------------------------------------------------------------------------------------------------------------
 
 #[test]
-fn retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request() {
+fn retire_refuses_an_instance_named_without_its_uuid_before_any_request() {
     let (scratch, fake) = start("retire-no-uuid");
     let provider = provider(&fake, &secrets_dir(&scratch));
     let plan = Digest::of(b"approved");
-    for target in [
-        object(IncusKind::Instance, "svc", None, "k1"),
-        object(IncusKind::Volume, "svc", Some("fast"), "v1"),
-    ] {
-        assert!(
-            matches!(
-                provider.retire(&entry("toy"), &target, &plan),
-                Err(EffectRefusal::Provider(_))
-            ),
-            "{:?} without a uuid",
-            target.kind
-        );
-    }
+    let target = object(IncusKind::Instance, "svc", None, "k1");
+    assert!(
+        matches!(
+            provider.retire(&entry("toy"), &target, &plan),
+            Err(EffectRefusal::Provider(_))
+        ),
+        "an instance without a uuid"
+    );
     assert!(
         fake.requests().is_empty(),
         "no request was made: {:?}",
         fake.requests()
+    );
+}
+
+#[test]
+fn a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name() {
+    // Incus 7.3 gives a custom volume no uuid. Its create answers with none, its inverse deletes it by name, and its retirement
+    // tombstones and deletes it by name.
+    let (scratch, fake) = start("volume-by-name");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(IncusKind::Volume, "svc", Some("fast"), "v1", json!({}));
+    let planned = provider.plan(&entry("toy"), &op).expect("the plan");
+    let (made, inverse) = provider
+        .effect(&entry("toy"), &op, &planned)
+        .expect("the volume is made");
+    let by_name = object(IncusKind::Volume, "svc", Some("fast"), "v1");
+    assert_eq!(made, by_name, "a volume carries no uuid");
+    assert_eq!(
+        inverse,
+        Inverse::IncusDelete {
+            object: by_name.clone()
+        }
+    );
+    let volume = read(
+        &fake,
+        "/1.0/storage-pools/fast/volumes/custom/v1?project=svc",
+    );
+    assert!(volume["config"].get("volatile.uuid").is_none(), "{volume}");
+
+    let plan = Digest::of(b"approved");
+    assert_eq!(
+        provider.retire(&entry("toy"), &by_name, &plan),
+        Ok(Retirement::Deleted(by_name.clone()))
+    );
+    assert_eq!(
+        writes(&fake),
+        vec![
+            (
+                "POST".to_string(),
+                "/1.0/storage-pools/fast/volumes/custom?project=svc".to_string()
+            ),
+            (
+                "PATCH".to_string(),
+                "/1.0/storage-pools/fast/volumes/custom/v1?project=svc".to_string()
+            ),
+            (
+                "DELETE".to_string(),
+                "/1.0/storage-pools/fast/volumes/custom/v1?project=svc".to_string()
+            ),
+        ]
     );
 }
 

@@ -142,7 +142,7 @@ Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arc
 
 **Rule 18.** A destructive removal runs in five steps: read the object with its ETag and classify it; PATCH it with `If-Match`
 to set `user.arcakernel.retiring` to the plan's digest; read it back and require the entry's mark, the tombstone and, for an
-instance or a volume, the same uuid; read it again immediately before the delete and require the same; then DELETE. A DELETE
+instance, the same uuid; read it again immediately before the delete and require the same; then DELETE. A DELETE
 sends no `If-Match`, so a change that lands between the last read and the DELETE is not caught by Incus. That gap is the
 residual risk of this step. It is covered by the one-writer rule (only the entry's own writer changes its objects) and by the
 tombstone, which another writer would have to clear on purpose.
@@ -158,13 +158,21 @@ records drift for that object, and the plan becomes partial.
 Source: the refusals in `tombstone` and `delete`, and the read-back in `confirm`; test
 `a_tombstone_needs_a_uuid_where_incus_gives_one_and_a_delete_needs_its_tombstone`.
 
-**Rule 20.** Only the kinds Incus gives a uuid carry one: an instance and a volume, through their `volatile.uuid` config key. An
-instance or a volume without that key cannot be retired or deleted. Every other kind is identified by its name and ETag. Its
-tombstone is set under its ETag, and its delete follows a fresh read that shows the tombstone. A target that names a uuid reads
-only the object with that uuid, and a mismatch is refused before any write.
-Source: `write::{has_uuid, uuid_of}`, `UnixIncusWriter::{classed, tombstone, delete}`; tests
+**Rule 20.** Only the kind Incus gives a uuid carries one: an instance, through its `volatile.uuid` config key. An instance
+without that key cannot be retired or deleted. Every other kind is identified by its kind, project, parent and name, with its
+ETag, and that includes a custom volume: Incus 7.3 gives a volume no `volatile.uuid` and no uuid field, so a volume's create, its
+inverse and its retirement name it by its pool and name. Such an object's tombstone is set under its ETag, and its delete follows
+a fresh read that shows the tombstone. A target that names a uuid reads only the object with that uuid, and a mismatch is refused
+before any write. A journal record that an earlier kernel left open for a volume, because it refused a create answered without a
+uuid, is settled when the reconciler opens: the volume reads back owned and without a uuid, so it is adopted with a delete by name.
+Source: `arca_kernel::ownership::IncusKind::has_uuid`, `write::uuid_of`, `UnixIncusWriter::{classed, tombstone, delete}`; tests
+`only_an_instance_has_a_uuid` (`crates/arca-kernel/tests/ownership.rs`),
+`a_volume_answered_without_a_uuid_takes_a_delete_by_name_inverse` (`crates/arca-kernel/tests/inverse_by_name.rs`),
 `a_tombstone_needs_a_uuid_where_incus_gives_one_and_a_delete_needs_its_tombstone`,
-`a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid` and `each_kind_round_trips_through_create_patch_tombstone_and_delete`.
+`a_target_that_names_a_uuid_reads_only_the_object_with_that_uuid` and `each_kind_round_trips_through_create_patch_tombstone_and_delete`
+(`crates/arca-incus/tests/write.rs`), `a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name`
+(`crates/arca-providers/tests/incus_provider.rs`), and `the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name`
+(`crates/arca-reconcile/tests/probe.rs`, over the journal fixture `crates/arca-reconcile/tests/fixtures/journal-volume-without-uuid.jsonl`).
 
 **Rule 21.** A delete reaches an object only through a tombstone that the writer has read back. A plugin cannot ask the
 kernel to delete an object through its context.
@@ -188,7 +196,7 @@ Source: `arca_kernel::plugin::Ctx::effect` and `Provider`; tests
 and `a_plan_refusal_writes_no_record` in `crates/arca-kernel/tests/plugin.rs`.
 
 **Rule 24.** The inverse is data from a closed vocabulary, built when the effect applies. A create's inverse is an `IncusDelete`
-of the object the read-back showed. For a kind that carries a uuid (an instance or a volume) the inverse names the uuid. For any
+of the object the read-back showed. For the kind that carries a uuid (an instance) the inverse names the uuid. For any
 other kind it names the object by kind, project, parent and name, with no uuid: a delete by name. The kernel accepts a create's
 inverse only when the uuid it names is present exactly for the kinds that carry one (`required_inverse`). A create whose
 read-back does not fit its kind is refused by the kernel, and its intent stays open. A patch's inverse is an `IncusRestoreConfig`
@@ -315,8 +323,8 @@ in `crates/arca-providers/tests/incus_provider.rs`, and
 `a_wait_whose_own_answer_is_an_http_error_is_not_the_operations_status` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 34.** A retirement runs only through `IncusProvider::retire`, under a plan digest: an approved class-B plan (Rule 37), or
-the create's op digest for a class-A revert (Rule 18). An instance or a volume is
-named by its uuid, so a retirement that names none is refused before any request. The object is read, and it must be the entry's
+the create's op digest for a class-A revert (Rule 18). An instance is named by its
+uuid, so a retirement that names none is refused before any request; a volume has none and is named by its pool and name. The object is read, and it must be the entry's
 own with the plan's uuid. The writer tombstones it under its ETag and reads it back. The object is read again, and it is deleted
 only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
 `Retirement::Drift`, and no DELETE is sent. A 412 on the tombstone is `Stale`. A tombstone that landed but did not read back is
@@ -325,7 +333,8 @@ plan can continue. A DELETE the writer refuses is drift; any other failure of th
 when it is first read is already gone: the retirement is `Deleted`, and no DELETE is sent.
 Source: `IncusProvider::retire` in `crates/arca-providers/src/incus.rs`; tests
 `retire_tombstones_then_deletes_an_owned_instance_in_order`,
-`retire_refuses_an_instance_or_a_volume_named_without_its_uuid_before_any_request`,
+`retire_refuses_an_instance_named_without_its_uuid_before_any_request`,
+`a_volume_without_a_uuid_is_made_and_retired_by_its_pool_and_name`,
 `retire_skips_the_delete_as_drift_when_the_delete_read_back_shows_another_uuid`,
 `retire_skips_the_delete_as_drift_when_the_tombstone_is_gone_at_delete` and `retire_stops_on_a_stale_etag_and_sends_no_delete`,
 all in `crates/arca-providers/tests/incus_provider.rs`.
@@ -423,7 +432,8 @@ must run before any live write.
 
 - Incus checks `If-Match` only on PUT and PATCH, so a DELETE has no compare step, and the tombstone is the only one (Rule 18).
 - A PATCH merges the `config` map, and an empty value unsets a key (Rule 16).
-- An instance's and a volume's uuid is their `volatile.uuid` key, and no other kind has a uuid (Rule 20).
+- An instance's uuid is its `volatile.uuid` key, and no other kind has a uuid (Rule 20). Confirmed for a volume on Incus 7.3: a
+  custom volume has no `volatile.uuid` and no uuid field.
 - Incus answers sync to the project, network, profile, ACL, zone, forward and bucket writes, and to an instance's or a volume's
   PATCH. It answers an instance's or a volume's create and delete with an operation (Rule 14).
 - The wait's answer carries the operation's `id`, `status_code` and `status`, and 200 with `Success` is the only success (Rule 14).

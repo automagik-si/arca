@@ -78,7 +78,7 @@ impl Owned {
         &self.etag
     }
 
-    /// The object's uuid, for an instance or a volume: its `volatile.uuid` config key. Other kinds carry none, and they are
+    /// The object's uuid, for an instance: its `volatile.uuid` config key. Other kinds carry none, a volume included, and they are
     /// identified by name and ETag.
     pub fn uuid(&self) -> Option<&str> {
         self.uuid.as_deref()

@@ -99,9 +99,10 @@ fn project_target(name: &str) -> Target {
     target(IncusKind::Project, name, name, None)
 }
 
-/// Whether Incus gives an object of this kind a uuid: instances and volumes do, through their `volatile.uuid` key.
+/// Whether Incus gives an object of this kind a uuid: only an instance does, through its `volatile.uuid` key. Incus 7.3 gives a
+/// custom volume none.
 fn has_uuid(kind: IncusKind) -> bool {
-    matches!(kind, IncusKind::Instance | IncusKind::Volume)
+    matches!(kind, IncusKind::Instance)
 }
 
 /// A create body that marks the object as the entry `toy`.
@@ -430,12 +431,11 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
             has_uuid(kind),
             "{kind:?} has a uuid exactly when Incus gives one"
         );
-        if has_uuid(kind) {
-            assert!(
-                created.config().contains_key("volatile.uuid"),
-                "{kind:?} carries volatile.uuid"
-            );
-        }
+        assert_eq!(
+            created.config().contains_key("volatile.uuid"),
+            has_uuid(kind),
+            "{kind:?} carries volatile.uuid exactly when Incus gives one"
+        );
 
         let set = writer
             .patch(&created, &changes(&[("user.note", Some("first"))]))
@@ -1681,7 +1681,8 @@ fn the_ownership_document_carries_no_plan_cross_reference() {
 
 #[test]
 fn a_landed_write_names_its_full_target_and_the_uuid_it_read_back() {
-    // A volume is named by its pool, so the unconfirmed error must carry the pool and the uuid the read-back showed.
+    // A volume is named by its pool, so the unconfirmed error must carry the pool. A volume has no uuid, so a `volatile.uuid` a
+    // read-back shows is not taken as one.
     let mut posted = false;
     let canned = Canned::start("unconfirmed-volume", move |method, target| {
         if method == "POST" {
@@ -1701,12 +1702,36 @@ fn a_landed_write_names_its_full_target_and_the_uuid_it_read_back() {
     match canned.writer().create(&wanted, &marked()) {
         Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
             assert_eq!(unconfirmed.target, wanted, "the full target, pool included");
+            assert_eq!(unconfirmed.uuid, None, "a volume carries no uuid");
+            assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
+        }
+        other => panic!("expected AppliedUnconfirmed: {other:?}"),
+    }
+    // An instance has one, so the error carries the uuid the read-back showed.
+    let mut posted = false;
+    let canned = Canned::start("unconfirmed-instance", move |method, target| {
+        if method == "POST" {
+            posted = true;
+            return sync_reply(201, Value::Null);
+        }
+        if method == "GET" && target.starts_with("/1.0/instances/cn9") {
+            return if posted {
+                object_reply(&instance("cn9", json!({"volatile.uuid": OTHER_UUID})))
+            } else {
+                not_found()
+            };
+        }
+        not_found()
+    });
+    let wanted = target(IncusKind::Instance, "svc", "cn9", None);
+    match canned.writer().create(&wanted, &marked()) {
+        Err(IncusError::AppliedUnconfirmed(unconfirmed)) => {
+            assert_eq!(unconfirmed.target, wanted);
             assert_eq!(
                 unconfirmed.uuid.as_deref(),
                 Some(OTHER_UUID),
                 "the uuid read back"
             );
-            assert_eq!(unconfirmed.owner, Some(OwnerClass::Foreign));
         }
         other => panic!("expected AppliedUnconfirmed: {other:?}"),
     }

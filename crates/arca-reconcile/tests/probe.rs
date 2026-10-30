@@ -561,3 +561,88 @@ fn a_kind_on_a_failed_dependency_is_not_attempted_and_names_what_it_needs() {
         );
     }
 }
+
+/// A journal an earlier kernel wrote during a probe, before a custom volume was known to have no uuid. Its names are the test
+/// spec's. Its creates are the bridge and the project (applied), the instance (failed: its image was not in the project's
+/// store), the ACL (sent to the kernel project, which Incus served from `default`) and the profile (applied), and the volume,
+/// whose intent has no outcome: the volume landed and carries the mark, but the earlier kernel refused an answer without a uuid.
+const EARLIER_JOURNAL: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/journal-volume-without-uuid.jsonl"
+);
+
+/// Copies the earlier journal to `path`, with the mode a journal file has.
+fn earlier_journal_at(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::copy(EARLIER_JOURNAL, path).expect("the fixture is copied");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("mode 0600");
+}
+
+/// Makes on the fake what the earlier probe left on the host: each object it made, carrying the probe's mark. The ACL is sent
+/// to the kernel project, as the earlier kernel sent it.
+fn seed_earlier_objects(fake: &arca_incus::FakeIncus) {
+    let mark = json!(ENTRY);
+    let made = [
+        (
+            "/1.0/networks?project=default".to_string(),
+            json!({"name": PROBE_BRIDGE, "type": "bridge", "config": {
+                "ipv4.address": "203.0.113.1/24", "ipv6.address": "none", MARK: mark}}),
+        ),
+        (
+            "/1.0/projects".to_string(),
+            json!({"name": PROJECT, "config": {
+                MARK: mark, "restricted": "true", "restricted.networks.access": PROBE_BRIDGE,
+                "features.images": "true", "features.networks.zones": "true", "features.profiles": "true",
+                "features.storage.volumes": "true", "features.storage.buckets": "true"}}),
+        ),
+        (
+            format!("/1.0/network-acls?project={PROJECT}"),
+            json!({"name": "probe-acl", "config": {MARK: mark}}),
+        ),
+        (
+            format!("/1.0/profiles?project={PROJECT}"),
+            json!({"name": "probe-profile", "config": {MARK: mark}}),
+        ),
+        (
+            format!("/1.0/storage-pools/default/volumes/custom?project={PROJECT}"),
+            json!({"name": "probe-volume", "config": {MARK: mark}}),
+        ),
+    ];
+    for (path, body) in made {
+        let (status, _) = raw(fake, "POST", &path, Some(&body));
+        assert!((200..300).contains(&status), "{path}: {status}");
+    }
+}
+
+#[test]
+fn the_journal_an_earlier_probe_left_opens_with_its_volume_adopted_by_name() {
+    let scratch = Scratch::new("probe-earlier-open");
+    let fake = start_fake(&scratch);
+    seed_earlier_objects(&fake);
+    let journal = scratch.path("journal.jsonl");
+    earlier_journal_at(&journal);
+
+    let reconciler = reconciler_at(&scratch.dir, fake.socket(), &journal, None);
+    let volume = ObjectRef {
+        kind: IncusKind::Volume,
+        project: PROJECT.to_string(),
+        parent: Some("default".to_string()),
+        name: "probe-volume".to_string(),
+        uuid: None,
+    };
+    assert_eq!(
+        reconciler.resolution().adopted,
+        vec![volume.clone()],
+        "the volume is adopted by its pool and name"
+    );
+    let record = reconciler
+        .journal()
+        .live(&EntryId(ENTRY.to_string()))
+        .into_iter()
+        .find(|record| record.target.kind == IncusKind::Volume)
+        .expect("the volume's record is live");
+    assert_eq!(
+        record.inverse,
+        Some(Inverse::IncusDelete { object: volume })
+    );
+}
