@@ -1,0 +1,48 @@
+{
+  "params": [
+    {
+      "args": {
+        "plan": "a",
+        "nested": {
+          "z": [
+            1,
+            2,
+            true,
+            null
+          ],
+          "a": {
+            "y": "b",
+            "x": "c"
+          }
+        }
+      },
+      "digest": "3798f6ae57d2a2241c9d5f65b565ce76225225051fa41d97dfa47e8a95e34773"
+    },
+    {
+      "args": {
+        "note": "café, ☕ and 日本語",
+        "unit": "µg"
+      },
+      "digest": "9018654df8a1ffeba8124866310ce5611c19a3b77475daa1f87d2aee72cb5def"
+    },
+    {
+      "args": {
+        "plan": "p1",
+        "approval": "vector.approval"
+      },
+      "digest": "d11312cf4767e3b7b2b19992e4430fff38f5085e811651ede8ddbd57673e331e"
+    }
+  ],
+  "statement": {
+    "text": "{\"action\":\"delete\",\"expiresAt\":\"2026-10-30T12:10:00.000Z\",\"host\":\"node1\",\"issuedAt\":\"2026-10-30T12:00:00.000Z\",\"nonce\":\"0123456789abcdef0123456789abcdef\",\"paramsDigest\":\"7305e601e7af201642081fbd1a1f7574796e9cd0b9488b539d756318678c741d\",\"target\":\"plan-e39aa63ab2e4396ebd91016fbdad78d25c7ce79fac77aa248a494d93a52ffb10\"}",
+    "fields": {
+      "host": "node1",
+      "action": "delete",
+      "target": "plan-e39aa63ab2e4396ebd91016fbdad78d25c7ce79fac77aa248a494d93a52ffb10",
+      "paramsDigest": "7305e601e7af201642081fbd1a1f7574796e9cd0b9488b539d756318678c741d",
+      "issuedAt": "2026-10-30T12:00:00.000Z",
+      "expiresAt": "2026-10-30T12:10:00.000Z",
+      "nonce": "0123456789abcdef0123456789abcdef"
+    }
+  }
+}
