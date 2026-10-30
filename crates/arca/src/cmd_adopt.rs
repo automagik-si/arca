@@ -8,9 +8,9 @@
 //!   must be the one given, and runs no preflight. `--dry-run` takes no lock and sends no write: it prints the plan, or the steps
 //!   left, and their requests.
 //! - `release --instance <i> [--dry-run] --config <f>` returns the recorded adoption to the default project from wherever its
-//!   record stands, keeping the pin and the snapshot.
-//! - `verify --instance <i> --port <n> [--http-path <p>] --config <f>` checks the live MAC and IPv4 against the pre-image and
-//!   that the service answers below 500.
+//!   record stands, keeping the pin and the snapshot. It refuses before any step when the instance has lost its pin.
+//! - `verify --instance <i> --port <n> [--http-path <p>] [--wait <s>] --config <f>` checks the live MAC and IPv4 against the
+//!   pre-image and that the service answers below 500, trying again for up to `--wait` seconds (60 by default).
 //! - `status --instance <i> --json --config <f>` prints the record's plan and last step, and where the instance is now.
 //!
 //! A refusal before any write exits 2 ([`Failure::Refused`]): an instance the config does not list, a preflight check, a stale
@@ -21,11 +21,12 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::path::Path;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use arca_incus::adopt::{
     ADOPT_ENTRY_PREFIX, AdoptStep, AdoptTarget, AdoptWriter, NIC, PreImage, SOURCE_PROJECT,
-    adoption_project_body, devices_of, mac_ok,
+    adoption_project_body, devices_of, mac_ok, pin_device,
 };
 use arca_incus::{IncusError, IncusRead, UnixIncus, running_on};
 use arca_kernel::KernelError;
@@ -93,7 +94,7 @@ pub fn adopt_halting(argv: &[String], halt: Halt<'_>) -> Result<Option<Value>, F
         ),
         "verify" => verify_command(&parse_flags(
             rest,
-            &["instance", "port", "http-path", "config"],
+            &["instance", "port", "http-path", "wait", "config"],
             &[],
         )?),
         "status" => status(&parse_flags(rest, &["instance", "config"], &["json"])?),
@@ -267,6 +268,9 @@ fn release(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
     let last = record.last(&target.instance);
     let steps = release_steps(last);
     let writer = writer(&cfg, &target, &plan)?;
+    if steps.contains(&AdoptStep::MoveBack) {
+        pin_kept(&cfg, &target, &writer)?;
+    }
     if dry_run {
         return Ok(Some(dry_run_of(&writer, &plan, &steps, last)));
     }
@@ -291,6 +295,30 @@ fn release(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
         "instance": target.instance, "to": target.to, "digest": plan.digest,
         "steps": ran, "released": true,
     })))
+}
+
+/// Refuses, with GET alone and before any step, a release whose instance is in its adoption project without the pin. MoveBack
+/// refuses an unpinned instance, so the release would otherwise stop and unmark it and only then stop. An instance not in the
+/// adoption project is left to the steps, which read it again.
+fn pin_kept(cfg: &NodeConfig, target: &AdoptTarget, writer: &AdoptWriter) -> Result<(), Failure> {
+    let read = UnixIncus::new(cfg.incus.socket.clone());
+    let failed =
+        |error: IncusError| Failure::Runtime(format!("the release's pin read failed: {error}"));
+    let body = match read.get(&format!(
+        "/1.0/instances/{}?project={}",
+        target.instance, target.to
+    )) {
+        Ok(body) => body,
+        Err(IncusError::Status { code: 404, .. }) => return Ok(()),
+        Err(error) => return Err(failed(error)),
+    };
+    let eth0 = devices_of(body.get("devices")).map_err(failed)?.remove(NIC);
+    if eth0 != Some(pin_device(writer.pin())) {
+        return Err(refuse(
+            "the instance's eth0 in its adoption project is not the pin, so MoveBack would refuse it; the release stops before ReleaseStop and changes nothing",
+        ));
+    }
+    Ok(())
 }
 
 /// The recorded plan of `target`, which must be its own: its digest verifies, its steps are the adoption's, and it moves the
@@ -384,6 +412,11 @@ fn drive(
 
 /// How long the service has to accept the connection and answer the request.
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long `verify` keeps trying when no `--wait` is given, and the most `--wait` may name.
+pub const VERIFY_WAIT: Duration = Duration::from_secs(60);
+const MAX_VERIFY_WAIT_SECONDS: u64 = 3600;
+/// The pause between two attempts of a waiting `verify`.
+pub const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// What `verify` proved: the instance's live MAC and IPv4 are the pre-image's, and the service there answered this status.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,6 +510,31 @@ pub fn verify_with(
     })
 }
 
+/// [`verify_with`] again every `interval` while it fails at run time and `wait` has not run out, so a lease still being
+/// given or a service still starting is waited for. Once the time is out, the failure of the last attempt is the answer. With
+/// no wait, it is one attempt. A usage failure is never retried.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_until(
+    read: &dyn IncusRead,
+    plan: &AdoptionPlan,
+    project: &str,
+    port: u16,
+    path: &str,
+    wait: Duration,
+    interval: Duration,
+    probe: Probe<'_>,
+) -> Result<Verified, Failure> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match verify_with(read, plan, project, port, path, probe) {
+            Err(Failure::Runtime(_)) if Instant::now() < deadline => {
+                thread::sleep(interval.min(deadline.saturating_duration_since(Instant::now())));
+            }
+            answer => return answer,
+        }
+    }
+}
+
 /// Connects to `addr`, sends `GET <path> HTTP/1.1` and returns the status code of the answer's status line, all within
 /// `timeout`. A refused or timed-out connect, a closed connection and an answer that is not HTTP/1 are each an error.
 pub fn http_probe(addr: SocketAddrV4, path: &str, timeout: Duration) -> Result<u16, String> {
@@ -552,9 +610,10 @@ fn check_http_path(path: &str) -> Result<(), Failure> {
     }
 }
 
-/// `verify --instance <i> --port <n> [--http-path <p>] --config <f>`: runs [`verify`] where the record says the instance is,
-/// in its adoption project after an adoption and in `default` after a release. It takes no lock and sends no write. An
-/// adoption that is neither complete nor released in full is refused.
+/// `verify --instance <i> --port <n> [--http-path <p>] [--wait <s>] --config <f>`: runs [`verify_until`] where the record says
+/// the instance is, in its adoption project after an adoption and in `default` after a release, for up to `--wait` seconds
+/// (60 when not given, at most 3600). It takes no lock and sends no write. An adoption that is neither complete nor released
+/// in full is refused.
 fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
     let (cfg, target) = setup(flags)?;
     let port = flags
@@ -565,6 +624,19 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
         .ok_or_else(port_usage)?;
     let path = flags.value("http-path").unwrap_or("/");
     check_http_path(path)?;
+    let wait = match flags.value("wait") {
+        None => VERIFY_WAIT,
+        Some(text) => text
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds <= MAX_VERIFY_WAIT_SECONDS)
+            .map(Duration::from_secs)
+            .ok_or_else(|| {
+                Failure::Usage(format!(
+                    "--wait must be whole seconds from 0 to {MAX_VERIFY_WAIT_SECONDS}"
+                ))
+            })?,
+    };
     let record = AdoptionRecord::open(&cfg.state_dir)?;
     let plan = recorded_plan(&record, &target)?;
     let project = if record.complete(&target.instance) {
@@ -578,7 +650,16 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
         )));
     };
     let read = UnixIncus::new(cfg.incus.socket.clone());
-    let verified = verify(&read, &plan, project, port, path)?;
+    let verified = verify_until(
+        &read,
+        &plan,
+        project,
+        port,
+        path,
+        wait,
+        VERIFY_INTERVAL,
+        &http_probe,
+    )?;
     Ok(Some(json!({
         "instance": target.instance, "project": project, "mac": verified.mac,
         "ipv4": verified.ipv4.to_string(), "port": port, "httpPath": path,

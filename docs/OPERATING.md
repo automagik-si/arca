@@ -492,8 +492,10 @@ second file that names the service's `stateDir`, the adoption project in `kernel
    `--dry-run`. It takes `desired.lock` and runs CreateProject, Stop, Snapshot, PinNic, Move, Mark and Start. Each step
    writes an intent line before its request and an outcome line after it to `<stateDir>/adoptions.jsonl` (mode 0600,
    synced). A fresh plan's digest must be the one given.
-4. `arca adopt verify --instance svc1 --port 8080 [--http-path /] --config adopt.json` checks that the instance runs with the
-   pre-image's MAC and IPv4 on `eth0`, then connects to `<ipv4>:<port>` and needs an HTTP answer below 500 within 10 s.
+4. `arca adopt verify --instance svc1 --port 8080 [--http-path /] [--wait <s>] --config adopt.json` checks that the instance
+   runs with the pre-image's MAC and IPv4 on `eth0`, then connects to `<ipv4>:<port>` and needs an HTTP answer below 500
+   within 10 s. It tries again every 2 s for up to `--wait` seconds (60 by default, at most 3600), so a lease still being
+   given or a service still starting is waited for, and then reports the last failure.
 5. Start the service again. `watch_report` and `arca watch --once --json` count each adoption that is not released in full as
    a live entry, so the instance shows in its adoption project as kernel-owned (`adopt-svc1`) with no drift.
 
@@ -513,13 +515,15 @@ nothing.
 returns the instance to `default`, running and unmarked, from wherever its record stands. Before Move, only ReleaseStart is
 left; after Move, MoveBack comes first; after Mark, Unmark comes before it; after Start, ReleaseStop, Unmark, MoveBack and
 ReleaseStart all run. An adopt step left at its intent is closed as failed first, and each release step reads before it
-sends. The pin and the snapshot are kept, and nothing is deleted, the empty adoption project included. Once a release has
+sends. When the instance is in its adoption project without the pin, the release, and its dry run, refuse before any write,
+since MoveBack would refuse it only after the instance was stopped and unmarked. The pin and the snapshot are kept, and nothing is deleted, the empty adoption project included. Once a release has
 begun, `apply` refuses to resume and `release` finishes it. A release done in full, run again, sends nothing. `verify` then
 checks the instance in `default`.
 
 Exit codes: `2` for a refusal before any write: an instance the config does not list, a preflight check, a stale digest, a
 digest that is not the recorded plan's, a record that holds no such adoption, another open adoption, a resume after a
-release has begun, a verify before the adoption or release completed, or a bad `--port` or `--http-path`. `1` for a held
+release has begun, a release of an instance that lost its pin, a verify before the adoption or release completed, or a bad
+`--port`, `--http-path` or `--wait`. `1` for a held
 lock, a failed step (the record names it) or a failed verify.
 
 ## Tests

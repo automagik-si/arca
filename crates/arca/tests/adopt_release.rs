@@ -9,13 +9,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arca::Failure;
 use arca::adoptions::{AdoptionPlan, AdoptionRecord, Phase, release_steps, resume_steps};
-use arca::cmd_adopt::{Kill, adopt_halting, http_probe, verify_with};
+use arca::cmd_adopt::{Kill, adopt_halting, http_probe, verify_until, verify_with};
 use arca::cmd_serve::watch_handler;
 use arca::config;
 use arca::desired_store::lock_state_dir;
@@ -158,19 +159,7 @@ impl Run {
 
     /// A request sent straight to the fake, past every check, for a test's own setup.
     fn raw(&self, method: &str, path: &str, body: &Value) -> u16 {
-        let text = body.to_string();
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: incus\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
-            text.len()
-        );
-        let mut stream = UnixStream::connect(self.fake.socket()).expect("connect");
-        stream.write_all(request.as_bytes()).expect("send");
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).expect("read");
-        reply
-            .get(9..12)
-            .and_then(|code| code.parse().ok())
-            .unwrap_or(0)
+        raw_at(self.fake.socket(), method, path, body)
     }
 }
 
@@ -181,6 +170,23 @@ fn configured_mac(body: &Value) -> Value {
         .get("hwaddr")
         .cloned()
         .unwrap_or_else(|| body["config"]["volatile.eth0.hwaddr"].clone())
+}
+
+/// A request sent straight to the fake at `socket`, past every check, and the status it answered.
+fn raw_at(socket: &Path, method: &str, path: &str, body: &Value) -> u16 {
+    let text = body.to_string();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: incus\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    );
+    let mut stream = UnixStream::connect(socket).expect("connect");
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("read");
+    reply
+        .get(9..12)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
 }
 
 fn pin() -> Value {
@@ -787,9 +793,10 @@ fn a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled() {
 }
 
 #[test]
-fn a_release_whose_pin_was_removed_is_refused_at_move_back_and_never_moves_it() {
+fn a_release_whose_pin_was_removed_is_refused_before_any_write() {
     // The control for the pin: the pin's hwaddr replaced the volatile MAC key (deviceVolatileReset), so an eth0 unpinned in the
-    // adoption project leaves nothing in the instance's config that gives its MAC, and MoveBack refuses the unpinned instance.
+    // adoption project leaves nothing in the instance's config that gives its MAC. MoveBack would refuse it, so the release
+    // refuses before ReleaseStop: it neither stops nor unmarks the instance, and the dry run refuses too.
     let run = Run::new("unpinned");
     run.apply().expect("the adoption").expect("a result");
     let path = format!("/1.0/instances/svc1?project={ADOPT_TO}");
@@ -806,23 +813,32 @@ fn a_release_whose_pin_was_removed_is_refused_at_move_back_and_never_moves_it() 
         Value::Null,
         "the MAC is gone with the pin"
     );
-    let released = run.release();
-    assert!(
-        matches!(&released, Err(Failure::Runtime(why)) if why.contains("MoveBack") && why.contains("pinned")),
-        "{released:?}"
-    );
-    assert!(
-        !run.writes().iter().any(|(method, path)| method == "POST"
-            && path == &format!("/1.0/instances/svc1?project={ADOPT_TO}")),
-        "no MoveBack was sent"
-    );
-    assert!(
-        run.instance(ADOPT_TO).is_some(),
-        "the instance stays in its adoption project"
+    let before = run.writes().len();
+    for dry in [true, false] {
+        let mut args = vec!["release", "--instance", "svc1"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let released = adopt_run(&run.config, &args);
+        assert!(
+            matches!(&released, Err(failure @ Failure::Refused(why)) if why.contains("pin") && failure.code() == 2),
+            "dry run {dry}: {released:?}"
+        );
+    }
+    assert_eq!(run.writes().len(), before, "the release sent no write");
+    let body = run
+        .instance(ADOPT_TO)
+        .expect("the instance stays in its adoption project");
+    assert_eq!(body["status"], json!("Running"), "it was not stopped");
+    assert_eq!(
+        body["config"][MARK],
+        json!("adopt-svc1"),
+        "it was not unmarked"
     );
     assert_eq!(
         run.record().last("svc1"),
-        Some((AdoptStep::MoveBack, Phase::Failed))
+        Some((AdoptStep::Start, Phase::Done)),
+        "nothing was recorded"
     );
 }
 
@@ -1124,6 +1140,146 @@ fn after_adoption_the_watch_shows_the_instance_kernel_owned_with_no_drift() {
             drift,
             vec![json!({ "kind": "entryWithoutObject", "entry": "adopt-svc1" })],
             "{report}"
+        );
+    }
+}
+
+#[test]
+fn verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out() {
+    // The instance is still stopped when verify starts, and starts a moment later, as a service does after Start.
+    let run = Run::killed("verify-wait", AdoptStep::Mark, Kill::AfterOutcome);
+    let plan = run.record().plan("svc1").expect("the plan");
+    let read = UnixIncus::new(run.fake.socket().to_path_buf());
+    let socket = run.fake.socket().to_path_buf();
+    let starter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        let start = json!({ "action": "start" });
+        raw_at(
+            &socket,
+            "PUT",
+            &format!("/1.0/instances/svc1/state?project={ADOPT_TO}"),
+            &start,
+        )
+    });
+    // The probe fails twice once the instance runs, as a service still starting does.
+    let calls = AtomicUsize::new(0);
+    let slow = |_: SocketAddrV4, _: &str, _: Duration| -> Result<u16, String> {
+        match calls.fetch_add(1, Ordering::SeqCst) {
+            0 | 1 => Err("the TCP connect failed (connection refused)".to_string()),
+            _ => Ok(200),
+        }
+    };
+    let waited = verify_until(
+        &read,
+        &plan,
+        ADOPT_TO,
+        8080,
+        "/",
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        &slow,
+    );
+    assert_eq!(starter.join().expect("the starter"), 202);
+    let verified = waited.expect("verified once the instance runs and answers");
+    assert_eq!(verified.http_status, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    // With no wait, one attempt: its failure is the report.
+    let calls = AtomicUsize::new(0);
+    let failing = |_: SocketAddrV4, _: &str, _: Duration| -> Result<u16, String> {
+        Err(format!(
+            "attempt {}",
+            calls.fetch_add(1, Ordering::SeqCst) + 1
+        ))
+    };
+    let once = verify_until(
+        &read,
+        &plan,
+        ADOPT_TO,
+        8080,
+        "/",
+        Duration::ZERO,
+        Duration::from_millis(10),
+        &failing,
+    );
+    assert!(
+        matches!(&once, Err(Failure::Runtime(why)) if why.contains("attempt 1")),
+        "{once:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Out of time, the last failure is reported.
+    let calls = AtomicUsize::new(0);
+    let failing = |_: SocketAddrV4, _: &str, _: Duration| -> Result<u16, String> {
+        Err(format!(
+            "attempt {}",
+            calls.fetch_add(1, Ordering::SeqCst) + 1
+        ))
+    };
+    let started = Instant::now();
+    let late = verify_until(
+        &read,
+        &plan,
+        ADOPT_TO,
+        8080,
+        "/",
+        Duration::from_millis(200),
+        Duration::from_millis(20),
+        &failing,
+    );
+    let tries = calls.load(Ordering::SeqCst);
+    assert!(tries >= 2, "it tried again: {tries}");
+    assert!(
+        matches!(&late, Err(Failure::Runtime(why)) if why.contains(&format!("attempt {tries}"))),
+        "{late:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // A usage failure is not retried.
+    let never =
+        |_: SocketAddrV4, _: &str, _: Duration| -> Result<u16, String> { panic!("no probe") };
+    let started = Instant::now();
+    let bad = verify_until(
+        &read,
+        &plan,
+        ADOPT_TO,
+        8080,
+        "nope",
+        Duration::from_secs(10),
+        Duration::from_millis(10),
+        &never,
+    );
+    assert!(matches!(bad, Err(Failure::Usage(_))));
+    assert!(started.elapsed() < Duration::from_secs(1), "at once");
+}
+
+#[test]
+fn verify_takes_a_wait_in_whole_seconds() {
+    let run = Run::killed("verify-wait-flag", AdoptStep::Mark, Kill::AfterOutcome);
+    let verify = |wait: &str| {
+        adopt_run(
+            &run.config,
+            &[
+                "verify",
+                "--instance",
+                "svc1",
+                "--port",
+                "8080",
+                "--wait",
+                wait,
+            ],
+        )
+    };
+    let open = verify("5");
+    assert!(
+        matches!(&open, Err(Failure::Refused(why)) if why.contains("not complete")),
+        "{open:?}"
+    );
+    for bad in ["x", "-1", "1.5", "3601"] {
+        let refused = verify(bad);
+        assert!(
+            matches!(&refused, Err(failure @ Failure::Usage(text)) if text.contains("--wait") && failure.code() == 2),
+            "{bad}: {refused:?}"
         );
     }
 }

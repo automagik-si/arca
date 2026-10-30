@@ -589,7 +589,9 @@ open, and only one adoption may be open. A resume works from the recorded plan, 
 must be the one given, and the step whose intent is the last line runs again and closes it, so Foreign-in-`to`, the window
 between Move and Mark, is accepted only by the recorded uuid. A release computes its steps from the last recorded step
 (ReleaseStart alone before Move; MoveBack first after Move; Unmark first after Mark; all four after Start), closes an adopt
-step left at its intent as failed, and keeps the pin and the snapshot. The watch counts each adoption not released in full as
+step left at its intent as failed, and keeps the pin and the snapshot. A release whose steps include MoveBack first reads
+the instance in `to` and refuses, before any write, one whose local `eth0` is not the pin, since MoveBack would refuse it
+only after ReleaseStop and Unmark. The watch counts each adoption not released in full as
 a live entry, so an adopted instance is kernel-owned with no drift, and one that is gone is `EntryWithoutObject`. `serve`
 refuses a config that lists an adoption.
 Source: `adopt::{AdoptWriter, adoption_project_body, pin_patch, pin_device}` in `crates/arca-incus/src/adopt.rs`;
@@ -610,9 +612,10 @@ refusals and `plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and
 `the_move_mark_window_stopped_unmarked_in_to_is_resumed_and_released`,
 `foreign_in_to_is_accepted_only_for_the_uuid_the_record_holds`,
 `a_full_adopt_then_release_keeps_the_mac_with_volatile_reset_modelled`,
-`a_release_whose_pin_was_removed_is_refused_at_move_back_and_never_moves_it`,
+`a_release_whose_pin_was_removed_is_refused_before_any_write`,
 `a_held_operation_blocks_the_next_step_of_a_resume_and_of_a_release`,
-`verify_fails_on_a_changed_mac_a_changed_ipv4_a_closed_port_or_a_5xx` and
+`verify_fails_on_a_changed_mac_a_changed_ipv4_a_closed_port_or_a_5xx`,
+`verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out` and
 `after_adoption_the_watch_shows_the_instance_kernel_owned_with_no_drift`.
 
 ## Out of scope
