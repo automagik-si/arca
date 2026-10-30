@@ -94,6 +94,12 @@ from its bridge address rather than from a tailnet address. The listener binds `
 `peer`; an IPv4-mapped peer is compared as its IPv4 address. Every other peer is closed at accept with no bytes sent. The
 bearer and `Origin` rules are the same as on the unix socket, so the proxy's peer gets the same 401, 403 and 200 answers.
 
+The bridge may not be up yet when the server starts at boot. While `addr` is not assigned to the host, the bind is tried again
+for up to 120 seconds, after a pause of 1 second that doubles each time up to 16 seconds, and each try is logged on stderr
+(`arca: the proxy address <addr> cannot be bound yet ...`, then `arca: the proxy address <addr> is bound`). The unix socket
+and the tailnet listener serve meanwhile. An address still not assigned after 120 seconds stops the server with exit 1, and
+any other bind error, such as a port in use, stops it at once.
+
 The connection is plain HTTP on the bridge, and a host that can take the peer's address can reach the listener; the bearer
 token is still required. Serving on a proxy address is a separate step, approved by the owner like the tailnet listener.
 
@@ -298,9 +304,14 @@ unpadded base64url. The proof is at most 8192 bytes. A proof that is not its own
 kept one is 0 or there is none, because a synced passkey always reports 0. Otherwise the approval is refused with
 `SignCountRegressed`. The count is checked and kept in `passkey-counts.jsonl`, fsynced, before the nonce is read. So a replay of a
 counting passkey's approval is refused with `SignCountRegressed`. A replay of a synced passkey's approval (count 0) is refused
-with `Replayed`. A count kept for an approval that a later check refuses costs nothing, because a count only grows.
+with `Replayed`.
 
-`approval_submit` takes the plan digest and the approval. It refuses, and spends nothing, when:
+The count is kept before the host, action, target, arguments and time window below are checked. So a counting passkey's
+approval that one of those checks refuses is used up: its nonce is not spent, but sent again, even for the plan it names, it is
+refused with `SignCountRegressed`, and the owner signs the statement again. Later approvals are not affected, because the
+passkey's next assertion carries a higher count. A synced passkey's approval (count 0) is not used up.
+
+`approval_submit` takes the plan digest and the approval. It refuses, and spends no nonce, when:
 
 - the signature does not verify against a listed key (`BadSignature`), or no key is listed (`NoVerifier`);
 - a passkey assertion fails one of the checks above (`WrongOrigin`, `WrongRp`, `NoUserPresence`, `NoUserVerification`,
@@ -378,7 +389,7 @@ service user's uid, and `<home>` its home directory; the config file takes no sp
 
 ```json
 {
-  "stateDir": "<home>/.local/state/arca",
+  "stateDir": "<home>/.local/state/arca-node",
   "incus": { "socket": "/run/user/<uid>/arca-shim/incus.sock", "pools": ["default"] },
   "identityPhones": [],
   "listen": { "unix": "/run/user/<uid>/arca/arca.sock", "tailnet": null, "proxy": null },
@@ -387,7 +398,11 @@ service user's uid, and `<home>` its home directory; the config file takes no sp
 }
 ```
 
-`StateDirectory=arca` creates `~/.local/state/arca` at mode 0700, which `serve` requires. `RuntimeDirectory=arca` creates
+`StateDirectory=arca-node` creates `~/.local/state/arca-node` at mode 0700, which `serve` requires. The state directory is
+not named `arca`: systemd 254 and later turn a user unit's `StateDirectory=arca` into a link to `~/.config/arca`, the config's
+directory, when that exists and `~/.local/state/arca` does not, and `serve` refuses a state directory that is a link. An
+install whose config names `~/.local/state/arca` and holds a real directory there keeps working unchanged; the unit then only
+adds an empty `~/.local/state/arca-node`. `RuntimeDirectory=arca` creates
 `/run/user/<uid>/arca` for the socket, and removes it when the unit stops. The token directory is minted into at mode 0700
 and then set to 0500 (see Tokens).
 
@@ -512,8 +527,9 @@ The digest must be the recorded plan's. Only one adoption may be open at a time,
 nothing.
 
 **A move is a copy.** Incus 7.5.1 runs a stopped instance's project move as a copy, under a new `volatile.uuid`. The writer
-confirms a move under a new uuid only when the old uuid and the name are both gone from the project it left, exactly one
-instance of the name is in the new one, and that one is unmarked, carries the pin and holds the adoption snapshot. The record
+confirms a move under a new uuid only when the new uuid is a plain uuid, the old uuid is in no project, the name is gone from
+the project it left, exactly one instance of the name is in the new one, that one is unmarked, carries the pin and holds the
+adoption snapshot, and the adoption project still carries this adoption's mark. The record
 then holds the new uuid (a `uuid` line before the move's outcome), and every later step, `verify` and `adopt status` follow it.
 A Move that failed as landed but unconfirmed is resumed with the same `apply`: the copy is confirmed by the same rule and the
 move is not sent again. An instance started by hand in its adoption project meanwhile is marked as it runs, and Start then

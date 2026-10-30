@@ -897,3 +897,73 @@ fn a_copy_under_a_new_uuid_is_refused_while_the_old_uuid_is_in_default_or_two_of
     refused_naming(writer(&fake).run(AdoptStep::Move), "more than one");
     assert_eq!(fake.writes().len(), before);
 }
+
+#[test]
+fn a_copy_under_a_new_uuid_is_refused_while_the_old_uuid_is_in_any_project() {
+    // The old uuid in the adoption project itself, under another name: the project the instance left holds neither.
+    let (_dir, fake) = start("copy-old-uuid-to");
+    ran(&fake, &TO_MOVE);
+    let other = json!({ "name": "svc9", "type": "container", "config": {} });
+    let (status, _) = raw(
+        &fake,
+        "POST",
+        &format!("/1.0/instances?project={TO}"),
+        &other,
+    );
+    assert_eq!(status, 202);
+    let old = json!({ "config": { "volatile.uuid": UUID } });
+    let (status, _) = raw(
+        &fake,
+        "PATCH",
+        &format!("/1.0/instances/svc9?project={TO}"),
+        &old,
+    );
+    assert_eq!(status, 200);
+    let before = fake.writes().len();
+    refused_naming(self::writer(&fake).run(AdoptStep::Move), "old uuid");
+    refused_naming(self::writer(&fake).run(AdoptStep::MoveBack), "old uuid");
+    assert_eq!(fake.writes().len(), before);
+}
+
+#[test]
+fn a_copy_whose_new_uuid_is_not_plain_is_refused_and_not_followed() {
+    for (tag, uuid) in [("bad", "NOT-A-UUID"), ("empty", "")] {
+        let (_dir, fake) = start(&format!("copy-uuid-{tag}"));
+        ran(&fake, &TO_MOVE);
+        let bent = json!({ "config": { "volatile.uuid": uuid } });
+        let (status, _) = raw(
+            &fake,
+            "PATCH",
+            &format!("/1.0/instances/svc1?project={TO}"),
+            &bent,
+        );
+        assert_eq!(status, 200);
+        let before = fake.writes().len();
+        let resumed = self::writer(&fake);
+        refused_naming(resumed.run(AdoptStep::Move), "plain uuid");
+        assert_eq!(
+            resumed.uuid(),
+            UUID,
+            "{tag}: the writer still expects the old uuid"
+        );
+        assert_eq!(fake.writes().len(), before);
+    }
+}
+
+#[test]
+fn a_copy_under_a_new_uuid_is_refused_while_the_adoption_project_is_not_this_adoptions() {
+    let (_dir, fake) = start("copy-project-unmarked");
+    ran(&fake, &TO_MOVE);
+    let mut project = adoption_project_body(&target(), &["br1".to_string()]);
+    project["config"]
+        .as_object_mut()
+        .expect("a config")
+        .remove(MARK);
+    let (status, _) = raw(&fake, "PUT", &format!("/1.0/projects/{TO}"), &project);
+    assert_eq!(status, 200, "the project's mark is gone");
+    let before = fake.writes().len();
+    let resumed = self::writer(&fake);
+    refused_naming(resumed.run(AdoptStep::Move), "adoption project");
+    assert_eq!(resumed.uuid(), UUID);
+    assert_eq!(fake.writes().len(), before);
+}

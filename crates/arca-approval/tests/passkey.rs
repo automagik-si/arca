@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 
 use ApprovalRefusal::{
     BadSignature, Malformed, NoUserPresence, NoUserVerification, NoVerifier, NotCanonical,
-    Replayed, SignCountRegressed, Storage, Untrusted, WrongNamespace, WrongOrigin, WrongRp,
+    Replayed, SignCountRegressed, Storage, Untrusted, WrongNamespace, WrongOrigin, WrongParams,
+    WrongRp,
 };
 use arca_approval::{
     ARCA_NAMESPACE, ApprovalRefusal, ApprovalVerifier, ArcaAction, FileNonces, FileSignCounts,
@@ -460,6 +461,21 @@ fn a_count_must_rise_above_the_kept_one_and_zero_is_kept_only_until_the_passkey_
     }
     check(&mut v, &at(&one, NONCE_D, 6)).expect("6 verifies: the refusals spent nothing");
     check(&mut v, &at(&two, "4123456789abcdef0123456789abcdef", 1)).expect("each keeps its own");
+}
+
+#[test]
+fn a_counting_passkeys_approval_refused_for_its_arguments_is_used_up_and_a_synced_ones_is_not() {
+    // The count is kept once the signature verifies, before the host, the action, the target, the arguments and the time are
+    // checked. So the same approval sent again for the right call is a replay of its count.
+    let other = json!({ "plan": args()["plan"], "note": "another call" });
+    for (count, then) in [(5, Err(SignCountRegressed)), (0, Ok(()))] {
+        let key = SoftPasskey::from_seed(1);
+        let (_scratch, mut v) = verifier_of(&format!("pk-used-up-{count}"), &key);
+        let approval = approve(&key, &statement(NONCE), move |a| a.sign_count = count);
+        let wrong = v.check(ArcaAction::Delete, &target(), &other, &approval, NOW);
+        assert_eq!(wrong.map(|_| ()), Err(WrongParams), "count {count}");
+        assert_eq!(check(&mut v, &approval).map(|_| ()), then, "count {count}");
+    }
 }
 
 #[test]

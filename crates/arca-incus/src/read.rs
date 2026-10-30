@@ -615,13 +615,40 @@ fn decode(response: RawResponse) -> Result<Value, IncusError> {
 /// status in lower case (`running`, `success`, ...), and keeps an ended operation listed for a few seconds.
 pub const OPERATIONS_PATH: &str = "/1.0/operations?all-projects=true&recursion=1";
 
-/// An operation that has not ended: its id, its status code, and the URL of each object it names, as Incus renders them. Incus
-/// gives an operation pending (105), running (103) or cancelling (104) while it works, and 200, 400 or 401 once it ends.
+/// An operation that has not ended: its id, its status code, the URL of each object it names, its class and its description,
+/// as Incus renders them. Incus gives an operation pending (105), running (103) or cancelling (104) while it works, and 200, 400
+/// or 401 once it ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningOp {
     pub id: String,
     pub status_code: u16,
     pub resources: Vec<String>,
+    /// `task`, `websocket` or `token`, when the operation gives its class as text.
+    pub class: Option<String>,
+    /// Incus's name for the operation's type, such as `Creating instance`, when the operation gives it as text.
+    pub description: Option<String>,
+}
+
+/// The descriptions Incus gives the two operation types that only attach to a running instance: a command run in it
+/// (`CommandExec`, a websocket operation, or a task one when no websocket is asked for) and its console (`ConsoleShow`, a
+/// websocket operation). Neither creates, changes or deletes the instance, and an interactive one stays running for as long as
+/// its session is open. Incus's `internal/server/db/operationtype/operation_type.go` names them.
+pub const SESSION_DESCRIPTIONS: [&str; 2] = ["Executing command", "Showing console"];
+
+/// The class of an operation that runs nothing: Incus refuses a run hook for it, and holds it only to carry a token.
+pub const TOKEN_CLASS: &str = "token";
+
+impl RunningOp {
+    /// Whether the operation can still create, change or delete what it names. A session ([`SESSION_DESCRIPTIONS`], matched
+    /// exactly) and a token operation ([`TOKEN_CLASS`]) cannot. Every other operation can, one with no class or description
+    /// included, and so can a websocket one: Incus runs a push migration's create as a websocket operation.
+    pub fn may_write(&self) -> bool {
+        let session = self
+            .description
+            .as_deref()
+            .is_some_and(|description| SESSION_DESCRIPTIONS.contains(&description));
+        !session && self.class.as_deref() != Some(TOKEN_CLASS)
+    }
 }
 
 /// Whether an operation's status code says it has not ended. Every 1xx code counts, which covers the three Incus gives an
@@ -636,7 +663,8 @@ fn plain_operation_id(id: &str) -> bool {
 }
 
 /// One operation's body: its id, which must be plain, its status code, and its resources, a map of lists of URLs. An absent or
-/// null `resources` names nothing. Any other shape is a decode error.
+/// null `resources` names nothing. Any other shape is a decode error. A class or a description that is not text is read as
+/// none, which leaves the operation free to write ([`RunningOp::may_write`]).
 fn parse_operation(body: &Value) -> Result<RunningOp, IncusError> {
     let object = body
         .as_object()
@@ -672,10 +700,13 @@ fn parse_operation(body: &Value) -> Result<RunningOp, IncusError> {
         }
         Some(_) => return Err(decode_error("an operation's resources are not a map")),
     }
+    let text = |key: &str| object.get(key).and_then(Value::as_str).map(str::to_string);
     Ok(RunningOp {
         id: id.to_string(),
         status_code,
         resources,
+        class: text("class"),
+        description: text("description"),
     })
 }
 
@@ -801,6 +832,21 @@ pub fn running_on(
     Ok(running_operations(read)?
         .into_iter()
         .filter(|op| operation_names(op, kind, project, parent, name))
+        .collect())
+}
+
+/// Every operation Incus is still working on that names the object and may still create, change or delete it
+/// ([`RunningOp::may_write`]), from one GET of the listing: [`running_on`] without the sessions and the token operations.
+pub fn writing_on(
+    read: &dyn IncusRead,
+    kind: IncusKind,
+    project: &str,
+    parent: Option<&str>,
+    name: &str,
+) -> Result<Vec<RunningOp>, IncusError> {
+    Ok(running_on(read, kind, project, parent, name)?
+        .into_iter()
+        .filter(RunningOp::may_write)
         .collect())
 }
 

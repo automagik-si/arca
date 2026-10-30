@@ -70,7 +70,8 @@ pub struct Spent {
     pub key: String,
 }
 
-/// Checks an approval for one call and spends it. Nothing is spent on any refusal.
+/// Checks an approval for one call and spends it. No nonce is spent on any refusal; a counting passkey's sign count is advanced
+/// once its signature verifies, before the bound fields and the time window are checked (see `PasskeyVerifier`).
 pub struct ApprovalVerifier<V: SignatureVerifier, N: NonceStore> {
     host: String,
     verifier: V,

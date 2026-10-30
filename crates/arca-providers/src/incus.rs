@@ -9,9 +9,10 @@
 //! still running proves nothing. It reports a failure only when the object shows the write did not happen, and reports
 //! [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
 //!
-//! The read-back that settles an intent after a restart reads the object only once no operation Incus still runs names it: it
-//! waits on each such operation up to the operation deadline, and an operation still running then, or an operations listing that
-//! cannot be read, is [`EffectRefusal::Unresolved`].
+//! The read-back that settles an intent after a restart, or finds a removed entry's object gone, reads the object only once no
+//! operation Incus still runs that may write it names it: it waits on each such operation up to the operation deadline, and an
+//! operation still running then, or an operations listing that cannot be read, is [`EffectRefusal::Unresolved`]. An exec or a
+//! console session, and a token operation, write nothing and hold nothing (`arca_incus::RunningOp::may_write`).
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -26,8 +27,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_incus::write::OPERATION_DEADLINE;
 use arca_incus::{
-    IncusError, IncusRead, Owned, ProjectFamily, Reading, UnixIncus, UnixIncusWriter, running_on,
-    wait_operation,
+    IncusError, IncusRead, Owned, ProjectFamily, Reading, UnixIncus, UnixIncusWriter,
+    wait_operation, writing_on,
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
@@ -76,7 +77,7 @@ const RESTRICTED_KEY: &str = "restricted";
 const READ_BACK_HOLD: Duration = Duration::from_secs(5);
 /// How much longer than its hold one wait request may take before it is a timeout.
 const READ_BACK_MARGIN: Duration = Duration::from_secs(25);
-/// The pause before an operation that was still running is looked at again, so a server that answers at once is not spun on.
+/// The pause before the operations are listed again after a wait, so a server that answers at once is not spun on.
 const READ_BACK_PAUSE: Duration = Duration::from_millis(100);
 /// The restriction key a plugin may set on a project create: the bridges the project's instances may use. Each name must be a
 /// bridge in the default project that carries the entry's mark.
@@ -816,16 +817,18 @@ impl IncusProvider {
         }
     }
 
-    /// Waits until no operation Incus still runs names `place`, for at most the operation deadline from the call. The operations
-    /// listing is read, and the first operation that names the place is waited on, a few seconds per wait, until it ends; then the
-    /// listing is read again, so an operation that started meanwhile is waited on too. Only GETs are sent. An operation still
-    /// running at the deadline, a listing that cannot be read and a wait that cannot be answered are each
-    /// [`EffectRefusal::Unresolved`], and the place is not read.
+    /// Waits until no operation Incus still runs that may write `place` names it, for at most the operation deadline from the
+    /// call. An exec or a console session and a token operation are left out ([`writing_on`]): a session stays running for as
+    /// long as it is open and writes nothing. The operations listing is read, and the first operation left that names the place
+    /// is waited on, a few seconds per wait; then, after a short pause, the listing is read again, so an operation that started
+    /// meanwhile is waited on too, and one the wait says has ended but the listing still shows is not spun on. Only GETs are
+    /// sent. An operation still running at the deadline, a listing that cannot be read and a wait that cannot be answered are
+    /// each [`EffectRefusal::Unresolved`], and the place is not read.
     fn settle_operations(&self, place: &ObjectRef) -> Result<(), EffectRefusal> {
         let deadline = self.deadline.unwrap_or(OPERATION_DEADLINE);
         let started = Instant::now();
         loop {
-            let running = running_on(
+            let running = writing_on(
                 &self.reader,
                 place.kind,
                 &place.project,
@@ -843,8 +846,8 @@ impl IncusProvider {
             let hold = left.min(READ_BACK_HOLD);
             let waiter = UnixIncus::new(self.socket.clone()).with_timeout(hold + READ_BACK_MARGIN);
             match wait_operation(&waiter, &operation.id, hold) {
-                Ok(true) => thread::sleep(READ_BACK_PAUSE.min(left)),
-                Ok(false) => {}
+                // Ended or still running, the listing is read again only after the pause.
+                Ok(_) => thread::sleep(READ_BACK_PAUSE.min(left)),
                 Err(_) => return Err(EffectRefusal::Unresolved),
             }
         }

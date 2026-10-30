@@ -522,36 +522,55 @@ journal fixture `crates/arca-reconcile/tests/fixtures/journal-project-tombstone-
 
 ## Running operations
 
-**Rule 44.** An intent is never settled while an operation that Incus still runs names its target. Before the read-back that settles
-an intent after a restart (Rule 39) reads the object, it lists `/1.0/operations?all-projects=true&recursion=1` and keeps each
-operation whose `status_code` is 1xx: pending (105), running (103) or cancelling (104), and any other code that has not ended.
-An operation names the target when one of its `resources` URLs is the target's path, or a path under it such as a snapshot,
-percent-decoded, in the target's project: a URL without a `project` query names `default`, as Incus renders a resource in
-`default` without one. A network, a forward and an ACL are compared in `default` (Rule 40), so their URL's project is not
-compared, and a project is named by its path alone. The read-back waits on each operation that names the target with
-`/1.0/operations/<id>/wait?timeout=<s>`, at most 5 s per wait, until it ends, and lists the operations again; the whole wait is
-bounded by the provider's operation deadline (`OPERATION_DEADLINE`, 600 s, unless the provider is given another). Then it reads
-the object. An operation still running at the deadline, an operations listing that cannot be read and a wait that cannot be
-answered are each `EffectRefusal::Unresolved`: the object is not read, the intent stays open, and `open` refuses with
-`KernelError::Unresolved`. So a create whose operation still runs is not read as absent and reverted, which would leave the
-object it then makes marked and unknown to the journal, and a create that shows its object while it runs and then fails is not
-journalled as made. An operation on any other object holds nothing. Only GETs are sent. `running_on` is the same check for any
-other caller that must not act on an object while an operation names it.
-Source: `read::{running_operations, operation_names, running_on, wait_operation, OPERATIONS_PATH, RunningOp}` in
-`crates/arca-incus/src/read.rs`; `IncusProvider::{read_back, settle_operations}` in `crates/arca-providers/src/incus.rs`; the
-fake's held operations (`FakeIncus::{hold_operation, hold_create, release_operation, fail_operation, set_operations_unreadable}`,
+**Rule 44.** An intent is never settled while an operation that Incus still runs, and that may still create, change or delete
+its target, names the target. Before a read-back reads the object, it lists `/1.0/operations?all-projects=true&recursion=1` and
+keeps each operation whose `status_code` is 1xx: pending (105), running (103) or cancelling (104), and any other code that has
+not ended. Two read-backs do this: the one that settles an intent after a restart (Rule 39), and the one a removal makes of each
+class-B object before it asks the owner, which settles an object already gone instead of asking about it (`settle_gone`). It
+then leaves out each operation that cannot write the target. One is an operation whose `description` is exactly
+`Executing command` (Incus's `CommandExec`, of class `websocket`, or `task` when no websocket is asked for) or `Showing console`
+(`ConsoleShow`, class `websocket`), as Incus's `internal/server/db/operationtype/operation_type.go` names them: such a session
+only attaches to a running instance, and an interactive one stays at 103 for as long as it is open. The other is an operation of
+`class` `token`, for which Incus refuses a run hook. Every other operation is kept, a `websocket` one included, since Incus runs
+a push migration's create (`Creating instance`) as a websocket operation, and so is one with no class or description, or a
+description in any other spelling. An operation names the target when one of its `resources` URLs is the target's path, or a
+path under it such as a snapshot, percent-decoded, in the target's project: a URL without a `project` query names `default`, as
+Incus renders a resource in `default` without one. A network, a forward and an ACL are compared in `default` (Rule 40), so their
+URL's project is not compared, and a project is named by its path alone. The read-back waits on each kept operation that names
+the target with `/1.0/operations/<id>/wait?timeout=<s>`, at most 5 s per wait, and lists the operations again after a pause of
+100 ms, whether the wait said the operation ended or still runs, so a listing that still shows an operation its wait says has
+ended is not spun on. The whole wait is bounded by the provider's operation deadline (`OPERATION_DEADLINE`, 600 s, unless the
+provider is given another). Then it reads the object. An operation still running at the deadline, an operations listing that
+cannot be read and a wait that cannot be answered are each `EffectRefusal::Unresolved`: the object is not read, the intent stays
+open, and `open` refuses with `KernelError::Unresolved`. So a create whose operation still runs is not read as absent and
+reverted, which would leave the object it then makes marked and unknown to the journal, and a create that shows its object while
+it runs and then fails is not journalled as made. An operation on any other object holds nothing. Only GETs are sent.
+`running_on` is the same check, sessions included, for any other caller that must not act on an object while an operation names
+it, such as the adoption writer, whose stop would end an open session; `writing_on` is `running_on` without the sessions and the
+token operations, and is the read-backs' check.
+Source: `read::{running_operations, operation_names, running_on, writing_on, wait_operation, OPERATIONS_PATH, RunningOp,
+RunningOp::may_write, SESSION_DESCRIPTIONS, TOKEN_CLASS}` in `crates/arca-incus/src/read.rs`; `IncusProvider::{read_back,
+settle_operations}` in `crates/arca-providers/src/incus.rs`; `Reconciler::settle_gone` in `crates/arca-reconcile/src/lib.rs`; the
+fake's held operations (`FakeIncus::{hold_operation, hold_operation_as, hold_create, release_operation, fail_operation,
+answer_wait_ended, set_operations_unreadable}`,
 with a create whose object shows only when its operation is released, `Appears::OnCompletion`, or while it runs,
-`Appears::WhileRunning`) in `crates/arca-incus/src/fake.rs`; tests in `crates/arca-incus/tests/operations.rs`;
+`Appears::WhileRunning`) in `crates/arca-incus/src/fake.rs`; tests in `crates/arca-incus/tests/operations.rs`, among them
+`only_an_operation_that_can_still_create_change_or_delete_its_object_may_write_it` and
+`writing_on_leaves_out_the_sessions_running_on_an_object`;
 `a_read_back_while_a_create_still_runs_on_its_target_is_unresolved_and_reads_no_object`,
 `a_read_back_waits_for_an_operation_that_ends_before_the_deadline_and_then_reads_the_object`,
 `a_read_back_whose_operation_fails_before_the_deadline_reads_the_object_as_absent`,
-`a_read_back_whose_operations_listing_fails_is_unresolved_and_reads_no_object` and
-`a_read_back_with_no_deadline_left_is_unresolved_at_once_while_an_operation_runs` in
+`a_read_back_whose_operations_listing_fails_is_unresolved_and_reads_no_object`,
+`a_read_back_with_no_deadline_left_is_unresolved_at_once_while_an_operation_runs`,
+`a_read_back_reads_its_object_at_once_while_only_an_exec_or_a_console_session_runs_on_it`,
+`a_read_back_still_waits_for_a_websocket_create_on_its_object` and
+`a_read_back_pauses_between_listings_when_a_wait_says_an_operation_ended_that_is_still_listed` in
 `crates/arca-providers/tests/incus_provider.rs`; and the kill-restart cases
 `a_restart_while_a_create_still_runs_keeps_its_intent_open_and_the_open_refuses`,
 `a_create_that_completes_while_the_restart_waits_is_adopted_by_that_open`,
 `a_create_whose_operation_fails_while_the_restart_waits_is_reverted_and_leaves_nothing`,
-`a_running_operation_on_another_object_holds_no_intent` and
+`a_running_operation_on_another_object_holds_no_intent`,
+`an_exec_session_on_a_removed_entrys_instance_does_not_hold_the_removal` and
 `a_failed_operations_read_holds_every_intent_and_the_open_refuses_with_no_write` in `crates/arca-reconcile/tests/restart.rs`.
 
 ## Adoption
@@ -597,14 +616,15 @@ a live entry, so an adopted instance is kernel-owned with no drift, and one that
 refuses a config that lists an adoption.
 
 Incus 7.5.1 runs a stopped instance's project move as a copy: the instance gets a new `volatile.uuid`, a new `created_at` and
-`volatile.apply_template=copy`. A Move or a MoveBack is confirmed under a new uuid only by the copy rule: the old uuid and the
-name are both gone from the project it left; exactly one instance of the name is in its new project; that one is Foreign, its
-local `eth0` is the recorded pin and it holds the snapshot `arca-adopt-<digest[0..12]>`. Otherwise the step refuses, and after
-its request it fails as landed but unconfirmed. The record writes the new uuid in a `uuid` line before the step's outcome, and
-every later step, `verify` and a later run expect the uuid the record holds last. A Move whose copy was not recorded is
-confirmed by the same rule when the run is resumed, and nothing is sent again. A MoveBack whose writer still expects the
-pre-image's uuid takes such a copy in `to` by the same rule. Mark also takes a Running instance, which is one started by hand
-in `to` after a Move whose outcome was not recorded; Start then finds its outcome already holds.
+`volatile.apply_template=copy`. A Move or a MoveBack is confirmed under a new uuid only by the copy rule: the new uuid is a
+plain uuid other than the old one; the old uuid is in no project of the instance listing; the name is gone from the project it
+left; exactly one instance of the name is in its new project; that one is Foreign, its local `eth0` is the recorded pin and it
+holds the snapshot `arca-adopt-<digest[0..12]>`; and the adoption project carries this adoption's mark. Otherwise the step
+refuses, and after its request it fails as landed but unconfirmed. The record writes the new uuid in a `uuid` line before the
+step's outcome, and every later step, `verify` and a later run expect the uuid the record holds last. A Move whose copy was not
+recorded is confirmed by the same rule when the run is resumed, and nothing is sent again. A MoveBack whose writer still expects
+the pre-image's uuid takes such a copy in `to` by the same rule. Mark also takes a Running instance, which is one started by
+hand in `to` after a Move whose outcome was not recorded; Start then finds its outcome already holds.
 Source: `adopt::{AdoptWriter, adoption_project_body, pin_patch, pin_device}` in `crates/arca-incus/src/adopt.rs`;
 `adoptions::{AdoptionPlan, AdoptionRecord, resume_steps, release_steps}` in `crates/arca/src/adoptions.rs`;
 `cmd_adopt::{preflight, verify, verify_with, http_probe}` in `crates/arca/src/cmd_adopt.rs`; `cmd_serve::watch_handler` in
@@ -618,6 +638,9 @@ and `deviceVolatileReset` in
 `a_move_that_copies_the_instance_under_a_new_uuid_is_confirmed_and_the_new_uuid_is_followed`,
 `a_copy_under_a_new_uuid_is_refused_when_the_snapshot_is_missing_or_the_pin_differs`,
 `a_copy_under_a_new_uuid_is_refused_while_the_old_uuid_is_in_default_or_two_of_the_name_are_in_to`,
+`a_copy_under_a_new_uuid_is_refused_while_the_old_uuid_is_in_any_project`,
+`a_copy_whose_new_uuid_is_not_plain_is_refused_and_not_followed`,
+`a_copy_under_a_new_uuid_is_refused_while_the_adoption_project_is_not_this_adoptions`,
 `every_step_out_of_its_expected_project_class_or_status_is_refused_with_no_write` and
 `a_running_operation_on_the_instance_holds_every_step_with_no_write`; in `crates/arca/tests/adopt_apply.rs`, the preflight
 refusals and `plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and_config`; in

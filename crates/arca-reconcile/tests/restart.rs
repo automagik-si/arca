@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arca_incus::{Appears, FakeIncus};
 use arca_kernel::KernelError;
@@ -2089,6 +2089,51 @@ fn a_running_operation_on_another_object_holds_no_intent() {
             .iter()
             .any(|request| request.path.contains("/wait")),
         "no operation was waited on"
+    );
+}
+
+#[test]
+fn an_exec_session_on_a_removed_entrys_instance_does_not_hold_the_removal() {
+    // The removal reads each class-B object back before it asks the owner (settle_gone), and an open exec session stays running
+    // on the instance. The session writes nothing, so it is not waited on, and the plan asks about the instance at once.
+    let scratch = Scratch::new("op-session-removal");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    let mut r = restarted(
+        &scratch,
+        &key,
+        Box::new(within(&scratch, &fake, &retained, LONG)),
+        plugins(),
+        &retained,
+        None,
+    )
+    .expect("opens");
+    r.reconcile(&first, NOW);
+    fake.hold_operation_as(
+        &instance_object("toy-box-t1", None),
+        "websocket",
+        "Executing command",
+    );
+    let from = fake.requests().len();
+    let started = Instant::now();
+    let removal = r.reconcile(&second, NOW);
+    assert_eq!(
+        names(&asked(&removal)[0].objects),
+        vec!["toy-box-t1"],
+        "the instance waits for the owner: {removal:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the removal did not wait on the session"
+    );
+    assert!(
+        !fake.requests()[from..]
+            .iter()
+            .any(|request| request.path.contains("/wait")),
+        "no session was waited on"
     );
 }
 
