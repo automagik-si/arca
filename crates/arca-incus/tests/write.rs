@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arca_incus::write::{IMAGE_PROTOCOL, IMAGE_SERVER};
 use arca_incus::{
     FakeIncus, FakeState, IncusError, IncusRead, Owned, ProjectFamily, Reading, Target,
     Unconfirmed, UnixIncus, UnixIncusWriter,
@@ -974,6 +975,151 @@ fn a_create_takes_only_an_image_source_and_sends_nothing_else() {
         .create(&target(IncusKind::Instance, "svc", "img1", None), &body)
         .expect("an image source is sent");
     assert_eq!(write_count(&fake), before + 1);
+}
+
+#[test]
+fn a_create_may_name_the_one_image_server_and_no_other() {
+    // An instance may be made from an image on the public image server Incus ships as its `images:` remote, over simplestreams.
+    // Any other server, any other protocol, and one without the other are refused before any request.
+    let (_dir, fake) = start("image-server");
+    let writer = writer(&fake, "toy");
+    let before = write_count(&fake);
+    let requests = fake.requests().len();
+    let refused_sources = [
+        json!({"type": "image", "alias": "alpine/edge", "server": "https://images.example.org", "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": format!("{IMAGE_SERVER}/"), "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER.to_uppercase(), "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": "incus"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER}),
+        json!({"type": "image", "alias": "alpine/edge", "protocol": "simplestreams"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": "simplestreams", "secret": "x"}),
+        json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": "simplestreams", "certificate": "x"}),
+    ];
+    for (n, source) in refused_sources.into_iter().enumerate() {
+        let mut body = marked();
+        body["source"] = source.clone();
+        let refused = writer
+            .create(
+                &target(IncusKind::Instance, "svc", &format!("srv{n}"), None),
+                &body,
+            )
+            .expect_err("a source that names another server");
+        assert!(
+            matches!(refused, IncusError::Refused(_)),
+            "{source}: {refused:?}"
+        );
+    }
+    assert_eq!(
+        write_count(&fake),
+        before,
+        "no refused source reached the fake"
+    );
+    assert_eq!(fake.requests().len(), requests, "not even a read was sent");
+
+    let mut body = marked();
+    body["source"] = json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": IMAGE_PROTOCOL});
+    writer
+        .create(&target(IncusKind::Instance, "svc", "srv-ok", None), &body)
+        .expect("an image on the image server is sent");
+    assert_eq!(write_count(&fake), before + 1);
+    assert_eq!(IMAGE_PROTOCOL, "simplestreams");
+}
+
+#[test]
+fn an_instance_from_the_image_server_pulls_its_image_into_the_store_its_project_reads() {
+    // Incus pulls the image into the project's own store when the project sets `features.images`, and into the default project's
+    // store otherwise. The fake does the same, so a kernel project, which sets it, holds the image it pulled.
+    let (_dir, fake) = start("image-pull");
+    let writer = writer(&fake, "toy");
+    writer
+        .create(
+            &project_target("kproj1"),
+            &json!({"config": {MARK: "toy", "features.images": "true"}}),
+        )
+        .expect("a project with its own image store");
+    let mut body = marked();
+    body["source"] = json!({"type": "image", "alias": "alpine/edge", "server": IMAGE_SERVER, "protocol": IMAGE_PROTOCOL});
+    writer
+        .create(&target(IncusKind::Instance, "kproj1", "pull1", None), &body)
+        .expect("the instance is made");
+    let images = fake.images();
+    assert_eq!(images.len(), 1, "{images:?}");
+    assert_eq!(
+        images[0].0, "kproj1",
+        "the image is in the project's own store"
+    );
+}
+
+#[test]
+fn a_retiring_project_deletes_the_images_in_its_own_store_and_then_itself() {
+    // An image inside a kernel project's own store is the project's by containment: it carries no mark, and only the project's
+    // retirement removes it, after the tombstone and before the project's own delete. An image in another store is not touched.
+    let (_dir, fake) = start("project-images");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kproj1");
+    let owned = writer
+        .create(
+            &project,
+            &json!({"config": {MARK: "toy", "features.images": "true"}}),
+        )
+        .expect("a project with its own image store");
+    let inside = fake.add_image("kproj1", "alpine/edge");
+    let elsewhere = fake.add_image("default", "alpine/edge");
+    let early = writer
+        .delete(&owned)
+        .expect_err("no image is deleted before the tombstone");
+    assert!(matches!(early, IncusError::Refused(_)), "{early:?}");
+    assert_eq!(fake.images().len(), 2, "nothing was deleted");
+
+    let retiring = writer.tombstone(&owned, &plan()).expect("tombstone");
+    writer
+        .delete(&retiring)
+        .expect("the project and its image are deleted");
+    assert_eq!(
+        status_of(&writer.get_etag(&project).expect_err("gone")),
+        Some(404)
+    );
+    assert_eq!(
+        fake.images(),
+        vec![("default".to_string(), elsewhere)],
+        "only the project's own image was deleted"
+    );
+    let deletes: Vec<String> = fake
+        .writes()
+        .into_iter()
+        .filter(|w| w.method == "DELETE")
+        .map(|w| w.path)
+        .collect();
+    assert_eq!(
+        deletes,
+        vec![
+            format!("/1.0/images/{inside}?project=kproj1"),
+            "/1.0/projects/kproj1".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_project_that_reads_the_default_image_store_deletes_no_image() {
+    // A project without `features.images` has no store of its own: every image it lists is the default project's, so its
+    // retirement lists none and deletes none.
+    let (_dir, fake) = start("project-shared-images");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kcan");
+    let owned = writer
+        .create(&project, &marked())
+        .expect("a project that reads the default store");
+    let shared = fake.add_image("default", "alpine/edge");
+    let retiring = writer.tombstone(&owned, &plan()).expect("tombstone");
+    writer.delete(&retiring).expect("the project is deleted");
+    assert_eq!(fake.images(), vec![("default".to_string(), shared)]);
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|r| !r.path.starts_with("/1.0/images")),
+        "no image was listed or deleted: {:?}",
+        fake.requests()
+    );
 }
 
 #[test]

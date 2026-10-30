@@ -603,6 +603,11 @@ fn a_project_create_carries_the_mark_the_features_restricted_and_the_op_config()
     assert_eq!(config["features.profiles"], json!("true"));
     assert_eq!(config["features.storage.volumes"], json!("true"));
     assert_eq!(config["features.storage.buckets"], json!("true"));
+    assert_eq!(
+        config["features.images"],
+        json!("true"),
+        "a kernel project keeps its own image store, which its retirement clears: {config}"
+    );
     assert_eq!(config["restricted"], json!("true"));
     assert_eq!(config["limits.virtual-machines"], json!("4"));
 }

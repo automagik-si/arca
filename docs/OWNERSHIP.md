@@ -76,7 +76,9 @@ Source: `write::urls` in `crates/arca-incus/src/write.rs`; test
 `an_object_name_that_is_not_a_plain_path_segment_is_refused_before_any_write`.
 
 **Rule 10.** A non-empty project is not deleted: Incus refuses the DELETE, and the project stays. The writer sends the DELETE
-and returns Incus's answer as `IncusError::Status`. It does not count the project's objects first.
+and returns Incus's answer as `IncusError::Status`. It does not count the project's objects first. The images in a kernel project's
+own store are the one exception: they are the project's by containment, and the project's retirement deletes them before the
+project (Rule 42).
 Source: `UnixIncusWriter::delete` returns the status error from `mutate`. The refusal is Incus's, and it is listed under
 "Assumptions to confirm". Test `a_non_empty_project_is_not_deleted` models it on the fake (`crates/arca-incus/src/fake.rs`,
 `delete`).
@@ -85,11 +87,16 @@ Source: `UnixIncusWriter::delete` returns the status error from `mutate`. The re
 
 **Rule 11.** A create carries this entry's mark and no other owner's key, and it names an image source only. The body's config
 must classify as the writer's entry's own, with no retiring mark. A `source`, when the body has one, must be an image named by
-alias, fingerprint or properties. A copy, a migration, a refresh, a server, a remote or a protocol is refused. The name must be
-free: the object's GET must answer 404 before the POST is sent. Every refusal happens before any write.
-Source: `UnixIncusWriter::create` and `write::check_source` in `crates/arca-incus/src/write.rs`; tests
-`a_create_is_refused_unless_its_config_classes_as_the_entrys_own`, `a_create_takes_only_an_image_source_and_sends_nothing_else`
-and `a_create_whose_name_is_taken_is_refused_and_nothing_is_written`.
+alias, fingerprint or properties. A copy, a migration, a refresh and a remote are refused, and so is a server, with one exception:
+the image server `https://images.linuxcontainers.org` named with the protocol `simplestreams`, exactly and together, and with no
+secret or certificate. Incus then pulls the image into the store the instance's project reads, which for a kernel project is its
+own (Rules 30, 42), so a probe makes its instance with no copy by hand. Any other server, any other protocol, and either one without
+the other are refused. The name must be free: the object's GET must answer 404 before the POST is sent. Every refusal happens
+before any write.
+Source: `UnixIncusWriter::create`, `write::check_source` and `write::{IMAGE_SERVER, IMAGE_PROTOCOL}` in
+`crates/arca-incus/src/write.rs`; tests `a_create_is_refused_unless_its_config_classes_as_the_entrys_own`,
+`a_create_takes_only_an_image_source_and_sends_nothing_else`, `a_create_may_name_the_one_image_server_and_no_other` and
+`a_create_whose_name_is_taken_is_refused_and_nothing_is_written`.
 
 **Rule 12.** A write that Incus accepted is confirmed by a read-back. After a create, a PATCH or a tombstone, the writer reads
 the object again. The read must class as the writer's entry's own, and it must show the write: the change, or the tombstone on
@@ -242,9 +249,12 @@ Source: `IncusProvider::check_features` in `crates/arca-providers/src/incus.rs`;
 `a_non_instance_write_is_refused_before_any_write_when_its_project_lacks_the_feature` and
 `a_zone_write_is_refused_before_any_write_in_a_project_without_the_zones_key`, in `crates/arca-providers/tests/incus_provider.rs`.
 
-**Rule 30.** Every kernel project is created with `features.networks.zones`, `features.profiles`, `features.storage.volumes` and
-`features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's mark. `features.networks` is
-not set: a kernel project has no networks of its own (Rule 40). A plugin may set a `restricted`, `restricted.*` or `features.*` key
+**Rule 30.** Every kernel project is created with `features.images`, `features.networks.zones`, `features.profiles`,
+`features.storage.volumes` and `features.storage.buckets` set to `"true"`, with `restricted` set to `"true"`, and with the kernel's
+mark. `features.networks` is not set: a kernel project has no networks of its own (Rule 40). `features.images` gives the project its
+own image store, so an image an instance pulls lands inside the project and never in the default project's store, and the
+project's retirement deletes it (Rule 42). Incus 7.3 sets it to `"true"` by default; the kernel sets it so that nothing depends on
+that default. A plugin may set a `restricted`, `restricted.*` or `features.*` key
 on a project create only to the value the kernel pins it at, with one exception: `restricted.networks.access`, which names the
 bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
 whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
@@ -425,6 +435,24 @@ Source: `IncusProvider::check_network_access` in `crates/arca-providers/src/incu
 `a_nic_on_a_network_the_restricted_project_does_not_list_is_refused_by_incus` in `crates/arca-incus/tests/write.rs`, which runs
 against the fake's restriction (`FakeIncus` answers 403 to such a NIC).
 
+## Images in a kernel project
+
+**Rule 42.** An image carries no mark. An image in a kernel project's own store is the project's by containment: only a write into
+the project puts one there (an instance the kernel makes from the image server, or a copy by hand), and it goes with the project.
+A project's DELETE is preceded, in the writer, by the DELETE of each image in its own store: the project must be the entry's own and
+carry its tombstone (Rule 18), its own config must set `features.images` to `"true"`, the listing is
+`/1.0/images?project=<project>&recursion=1`, each image must name a plain fingerprint, and an image whose `project` names another
+project refuses the whole step before any image is deleted. A project whose config does not set `features.images` reads the
+default project's store, none of whose images is the project's, so nothing is listed or deleted for it. The project is then read
+again and deleted as Rule 18 states. A failed image DELETE leaves the project tombstoned, and a retirement under the same plan
+continues it.
+Source: `UnixIncusWriter::{delete, clear_images}` in `crates/arca-incus/src/write.rs`, and `PROJECT_KEYS` in
+`crates/arca-providers/src/incus.rs`; tests `a_retiring_project_deletes_the_images_in_its_own_store_and_then_itself`,
+`a_project_that_reads_the_default_image_store_deletes_no_image` and
+`an_instance_from_the_image_server_pulls_its_image_into_the_store_its_project_reads` in `crates/arca-incus/tests/write.rs`, which run
+against the fake's image stores, and `an_uninterrupted_probe_creates_and_removes_every_object` and
+`the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_then_runs` in `crates/arca-reconcile/tests/probe.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -465,9 +493,14 @@ must run before any live write.
 - Incus refuses to delete a bridge that an instance still attaches to (Rule 17).
 - Incus refuses to delete an ACL that a NIC still names. An ACL is class `A`, so a revert of an ACL that an instance's NIC names
   runs before the plan deletes the instance, and Incus keeps the ACL; the removal reports it, and nothing is lost (Rule 17).
-- The probe's image alias resolves in the probe's project. A kernel project does not enable `features.images` (Rule 30), so it
-  reads the image store that Incus gives it, and the host imports the alias there before a live probe. The kernel imports nothing.
-- Incus accepts `restricted` and the four `features.*` keys on a project create (Rule 30).
+- Incus 7.3 creates a project with `features.images` set to `"true"` when the create does not name it, and an image in the project's
+  own store keeps Incus from deleting the project. Both were seen on a live host, which superseded the earlier assumption that a
+  kernel project reads another project's image store (Rules 30, 42).
+- An instance whose source names the image server and `simplestreams` pulls its image into the store its project reads, as a cached
+  image (Rules 11, 42). The probe's alias `alpine/edge` is on that server.
+- An image listing in a project with its own store names only that project's images, each with its 64-hex fingerprint, and Incus
+  answers an image's DELETE with an operation (Rule 42).
+- Incus accepts `restricted` and the five `features.*` keys on a project create (Rule 30).
 - Incus accepts `ipv6.address` set to `none` on a bridge create (Rule 31).
 - Incus accepts `ipv4.nat` on a bridge create, and reports a network's config with the keys that were set on it and no others.
   A key Incus adds on read would refuse a patch of that network, which fails closed (Rule 31).

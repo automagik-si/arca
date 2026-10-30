@@ -17,7 +17,7 @@ use arca_kernel::ownership::{IncusKind, ObjectRef};
 use arca_kernel::plugin::{
     EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
 };
-use arca_providers::incus::{Family, IncusProvider, RetainedSet};
+use arca_providers::incus::{Family, IMAGE_PROTOCOL, IMAGE_SERVER, IncusProvider, RetainedSet};
 use arca_reconcile::probe::{
     DEFAULT_PROBE_IMAGE, PROBE_BRIDGE, PROBE_PLUGIN, ProbeOutcome, ProbeSpec,
 };
@@ -343,6 +343,14 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
         .expect("the probe completes after the restart");
     assert_agree(&fake, &reconciler, &targets);
     assert_eq!(live_places(&reconciler).len(), CREATES);
+    assert_eq!(
+        fake.images()
+            .iter()
+            .map(|(project, _)| project.as_str())
+            .collect::<Vec<_>>(),
+        vec![PROJECT],
+        "the instance's image was pulled into the probe project's own store"
+    );
 
     // Removal goes through the journalled retirement: class-A objects revert at once and class-B objects run under an approval.
     let key = SkKey::from_seed(7);
@@ -370,6 +378,11 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
             target.name
         );
     }
+    assert!(
+        fake.images().is_empty(),
+        "the project's image went with it: {:?}",
+        fake.images()
+    );
     assert!(
         reconciler
             .journal()
@@ -414,7 +427,8 @@ fn the_probe_instance_has_an_image_source_a_root_disk_and_a_nic_on_the_probe_bri
     let instance = body_of(&spec, IncusKind::Instance);
     assert_eq!(
         instance["source"],
-        json!({"type": "image", "alias": DEFAULT_PROBE_IMAGE})
+        json!({"type": "image", "alias": DEFAULT_PROBE_IMAGE, "server": IMAGE_SERVER, "protocol": IMAGE_PROTOCOL}),
+        "the image is pulled from the image server into the project's own store, with no copy by hand"
     );
     assert_eq!(
         instance["devices"]["root"],
@@ -660,6 +674,8 @@ fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_the
     let scratch = Scratch::new("probe-earlier-remove");
     let fake = start_fake(&scratch);
     seed_earlier_objects(&fake);
+    // The image copied by hand into the project's own store, after the instance's create was refused.
+    fake.add_image(PROJECT, DEFAULT_PROBE_IMAGE);
     assert!(
         get(&fake, "/1.0/network-acls/probe-acl?project=default").is_some(),
         "the ACL sent to the kernel project is held in default"
@@ -696,6 +712,11 @@ fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_the
         assert!(get(&fake, &path).is_none(), "{path} is gone");
     }
     assert!(
+        fake.images().is_empty(),
+        "the image inside the project went with it: {:?}",
+        fake.images()
+    );
+    assert!(
         reconciler
             .journal()
             .live(&EntryId(ENTRY.to_string()))
@@ -728,6 +749,7 @@ fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_the
             target.name
         );
     }
+    assert!(fake.images().is_empty(), "{:?}", fake.images());
     assert!(
         reconciler
             .journal()

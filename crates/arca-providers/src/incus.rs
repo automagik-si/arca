@@ -36,6 +36,8 @@ use serde_json::{Map, Value, json};
 /// The project a network, a forward and an ACL are addressed in. The kernel's bridges live here, a forward hangs off its network,
 /// and Incus 7.3 keeps a kernel project's ACLs here.
 pub use arca_incus::write::NETWORK_HOME;
+/// The one image server, and its protocol, an instance's source may name. Incus pulls the image into the project's own store.
+pub use arca_incus::write::{IMAGE_PROTOCOL, IMAGE_SERVER};
 /// The two projects the kernel never writes, whatever its family names. Incus gives them to nobody else, and droidd and the
 /// host use them. The one exception is a network, a forward and an ACL, which the kernel addresses in `default` (Rule 40 of the
 /// ownership document) and nowhere else.
@@ -49,9 +51,12 @@ const SECRET_MAX_BYTES: u64 = 64 * 1024;
 /// How deep the provider looks for secret files under its directory.
 const SECRET_MAX_DEPTH: usize = 4;
 /// The project keys every kernel project is created with. A plugin may not set any `restricted*` or `features*` key another way.
-/// `features.networks` is not among them: the kernel's bridges and forwards live in the default project, which Incus shares
-/// with a project that does not enable networks.
-const PROJECT_KEYS: [(&str, &str); 4] = [
+/// `features.networks` is not among them: the kernel's bridges, forwards and ACLs live in the default project, which Incus
+/// shares with a project that does not enable networks. `features.images` is: a kernel project keeps its own image store, so an
+/// image an instance pulls lands inside the project and never in the default project's store, and the project's retirement
+/// deletes it. Incus 7.3 sets it by default; the kernel sets it so it never depends on that.
+const PROJECT_KEYS: [(&str, &str); 5] = [
+    ("features.images", "true"),
     ("features.networks.zones", "true"),
     ("features.profiles", "true"),
     ("features.storage.volumes", "true"),

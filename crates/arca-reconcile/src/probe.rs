@@ -12,7 +12,7 @@ use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::journal::{JournalStore, removal};
 use arca_kernel::ownership::{IncusKind, ObjectRef};
 use arca_kernel::plugin::{Ctx, EffectOp, EffectRefusal, Manifest};
-use arca_providers::incus::{NETWORK_ACCESS_KEY, NETWORK_HOME};
+use arca_providers::incus::{IMAGE_PROTOCOL, IMAGE_SERVER, NETWORK_ACCESS_KEY, NETWORK_HOME};
 use serde_json::{Value, json};
 
 use crate::{BLOCKED_WHY, Gate, Pending, PlanRun, Reconciler, same_place};
@@ -24,9 +24,10 @@ pub const PROBE_PLUGIN: &str = "probe.scratch";
 /// `restricted.networks.access`, and the probe's forward hangs off it.
 pub const PROBE_BRIDGE: &str = "probe-net";
 
-/// The image alias the probe's instance is made from when a spec names none. It is a small Alpine root filesystem. The kernel
-/// imports no image: the host imports the alias into the store the probe's project reads before a live probe runs. A spec may name
-/// another alias, such as a busybox one.
+/// The image alias the probe's instance is made from when a spec names none. It is a small Alpine root filesystem on the image
+/// server ([`IMAGE_SERVER`]). The instance names that server, so Incus pulls the image into the probe project's own store as the
+/// instance is made, with no copy by hand, and the project's retirement deletes it. A spec may name another alias on that server,
+/// such as a busybox one.
 pub const DEFAULT_PROBE_IMAGE: &str = "alpine/edge";
 
 /// Where a probe writes: its entry, its scratch project, the bridge's IPv4 range, the forward's listen address inside that range,
@@ -123,8 +124,8 @@ pub enum ProbeError {
 
 impl ProbeSpec {
     /// The creates, in the order they are made. The bridge comes first, since the project grants it and the forward hangs off it.
-    /// The project comes next, then one object of each remaining kind: the instance from an image, with a root disk on the pool and
-    /// a NIC on the bridge.
+    /// The project comes next, then one object of each remaining kind: the instance from an image on the image server, with a root
+    /// disk on the pool and a NIC on the bridge.
     pub fn ops(&self) -> Vec<EffectOp> {
         let create =
             |kind: IncusKind, project: &str, parent: Option<&str>, name: &str, body: Value| {
@@ -163,7 +164,12 @@ impl ProbeSpec {
                 json!({
                     "name": "probe-box",
                     "config": {},
-                    "source": { "type": "image", "alias": self.image },
+                    "source": {
+                        "type": "image",
+                        "alias": self.image,
+                        "server": IMAGE_SERVER,
+                        "protocol": IMAGE_PROTOCOL,
+                    },
                     "devices": {
                         "root": { "type": "disk", "path": "/", "pool": self.pool },
                         "eth0": { "type": "nic", "network": PROBE_BRIDGE },
