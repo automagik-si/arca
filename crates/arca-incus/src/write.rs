@@ -371,9 +371,8 @@ impl UnixIncusWriter {
         })
     }
 
-    /// Deletes an object that carries its tombstone. A project first has the images in its own store deleted (see
-    /// [`Self::clear_images`]). The object is then read again, and it must show the same tombstone, and the same uuid where Incus
-    /// gives one. The DELETE carries no `If-Match`, because Incus checks ETags only on PUT and PATCH.
+    /// Deletes an object that carries its tombstone. The object is first read again, and it must show the same tombstone, and the same uuid where Incus gives one. A
+    /// project then has the images in its own store deleted (see [`Self::clear_images`]). The DELETE carries no `If-Match`, because Incus checks ETags only on PUT and PATCH.
     pub fn delete(&self, owned: &Owned) -> Result<(), IncusError> {
         self.check(owned)?;
         let Some(plan) = owned.tombstone.as_deref() else {
@@ -382,12 +381,12 @@ impl UnixIncusWriter {
         if owned.uuid.is_none() && owned.target.kind.has_uuid() {
             return Err(refused("an object without a uuid cannot be deleted"));
         }
-        if owned.target.kind == IncusKind::Project {
-            self.clear_images(owned)?;
-        }
         let fresh = self.read_owned(&owned.target)?;
         if fresh.uuid != owned.uuid || fresh.tombstone.as_deref() != Some(plan) {
             return Err(refused("the object changed after its tombstone"));
+        }
+        if owned.target.kind == IncusKind::Project {
+            self.clear_images(&fresh)?;
         }
         let urls = urls(&owned.target)?;
         self.mutate("DELETE", &urls.object, None, None)
@@ -397,8 +396,8 @@ impl UnixIncusWriter {
     /// one in a kernel project's own store is the project's by containment, since only a write into the project could have put it
     /// there, and it goes with the project. The project must be this entry's own and carry its tombstone. Its own config must set
     /// `features.images` to `"true"`; otherwise the project reads the default project's store, no image in it is the project's,
-    /// and nothing is listed or deleted. Each listed image must name a plain fingerprint, and an image that names another project
-    /// is refused, so nothing outside the project is deleted.
+    /// and nothing is listed or deleted. Each listed image must name a plain fingerprint and name this project; any other image,
+    /// including one that names no project, is refused, so nothing outside the project is deleted.
     fn clear_images(&self, project: &Owned) -> Result<(), IncusError> {
         self.check(project)?;
         if project.target.kind != IncusKind::Project || project.tombstone.is_none() {
@@ -426,12 +425,12 @@ impl UnixIncusWriter {
                 .and_then(Value::as_str)
                 .filter(|fingerprint| image_fingerprint(fingerprint))
                 .ok_or_else(|| decode("an image names no plain fingerprint"))?;
-            match image.get("project").and_then(Value::as_str) {
-                Some(owner) if !owner.is_empty() && owner != name => {
-                    return Err(refused("the listing names an image of another project"));
-                }
-                _ => fingerprints.push(fingerprint.to_string()),
+            if image.get("project").and_then(Value::as_str) != Some(name) {
+                return Err(refused(
+                    "the listing names an image that is not the project's own",
+                ));
             }
+            fingerprints.push(fingerprint.to_string());
         }
         for fingerprint in fingerprints {
             self.mutate(
