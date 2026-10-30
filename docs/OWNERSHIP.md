@@ -140,6 +140,8 @@ instance or a volume, the same uuid; read it again immediately before the delete
 sends no `If-Match`, so a change that lands between the last read and the DELETE is not caught by Incus. That gap is the
 residual risk of this step. It is covered by the one-writer rule (only the entry's own writer changes its objects) and by the
 tombstone, which another writer would have to clear on purpose.
+The tombstone digest is the plan digest of an approved class-B plan (Rule 37). A class-A revert of a create has no
+approval, so its tombstone is the create's own op digest, which the journal already records.
 Source: `UnixIncusWriter::{tombstone, delete}` in `crates/arca-incus/src/write.rs`; tests
 `a_delete_is_refused_when_the_tombstone_was_removed_after_it_was_set` and
 `a_tombstone_with_a_stale_etag_is_412_and_sets_nothing`.
@@ -300,7 +302,8 @@ Source: `IncusProvider::{settle_create, settle_patch}` in `crates/arca-providers
 in `crates/arca-providers/tests/incus_provider.rs`, and
 `a_wait_whose_own_answer_is_an_http_error_is_not_the_operations_status` in `crates/arca-incus/tests/write.rs`.
 
-**Rule 34.** A retirement runs only through `IncusProvider::retire`, under an approved plan digest. An instance or a volume is
+**Rule 34.** A retirement runs only through `IncusProvider::retire`, under a plan digest: an approved class-B plan (Rule 37), or
+the create's op digest for a class-A revert (Rule 18). An instance or a volume is
 named by its uuid, so a retirement that names none is refused before any request. The object is read, and it must be the entry's
 own with the plan's uuid. The writer tombstones it under its ETag and reads it back. The object is read again, and it is deleted
 only while it still shows the tombstone and the uuid. A change that a read shows, or a tombstone the writer refuses, is
@@ -327,6 +330,27 @@ as empty.
 Source: `RetainedSet` and `IncusProvider::{new, writer}` in `crates/arca-providers/src/incus.rs`; tests
 `a_write_is_refused_once_the_retained_set_is_updated_through_a_handle_the_boxed_provider_shares` and
 `a_retained_entrys_object_is_refused_for_a_patch_and_a_retirement_and_nothing_is_written`.
+
+**Rule 37.** The reconciler is the only caller of `retire` for a class-B object. A class-B delete runs only under a plan the owner
+approved: the approval is an `arca-kernel-approve` `delete` over the target `plan-<digest>` with the arguments `{"plan": digest}`,
+checked by `ApprovalVerifier`. A pending plan runs only while it is at most `PLAN_TTL_MS` (15 minutes) old. A plan older than that,
+or a plan whose live objects are not all named in it (a new step, or a new uuid), needs a new approval over a plan made now. A run
+deletes only the live objects the plan names. A partial run keeps its plan, and a retry under the same approval is refused as
+replayed. A declined plan's objects are retained: no run and no removal writes them again, and a later document that carries the
+entry does not adopt them. An unresolved intent blocks every new effect, including every run. A suspended (disabled) entry keeps
+its objects. A class-C emission is never reverted.
+Source: `arca_reconcile::Reconciler::{reconcile, run_plan, decline}`; tests `removal_leaves_zero_objects_with_the_entry_mark_and_an_empty_journal`,
+`the_container_delete_waits_for_an_approval_over_the_plan_digest`,
+`an_object_changed_between_plan_and_run_survives_is_drift_and_a_retry_without_approval_is_refused`,
+`a_plan_older_than_fifteen_minutes_needs_a_new_approval` and `a_declined_plan_retains_its_objects_and_cannot_run` in
+`crates/arca-reconcile/tests/`, and the unit tests in `crates/arca-reconcile/src/tests.rs`.
+
+**Rule 38.** A class-A patch's undo (`IncusRestoreConfig`) runs through the plugin's own manifest, as a `Ctx::effect` of the
+restore, and then settles the restore and the record it undoes. A removal needs the plugin that applied the entry. The applied map
+is held by one process, so after a restart a removal that needs a plugin fails closed as "plugin not known" until applied state is
+persisted.
+Source: `arca_reconcile::Reconciler::{restore, plan_removal}`; test `a_live_class_b_record_without_an_applied_entry_fails_closed`
+in `crates/arca-reconcile/src/tests.rs`.
 
 ## Out of scope
 

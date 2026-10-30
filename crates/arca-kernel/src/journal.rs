@@ -97,6 +97,14 @@ impl From<InverseWire> for Inverse {
     }
 }
 
+/// What an intent is for, when it is not a plain create or patch. The marker is what tells a delete apart from a create whose
+/// pre-image is absent, so recovery never reads one as the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentKind {
+    /// The intent retires an object: a class-A revert of a create, or a class-B delete under an approved plan.
+    Delete,
+}
+
 /// Where an effect stands. `Intent` is written before the provider applies anything; the other states are written after.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectState {
@@ -108,8 +116,8 @@ pub enum EffectState {
 }
 
 /// One journal record. A record names its effect by `id`; each state change writes a full copy of the record, so the newest
-/// record for an id is the effect's state. The intent fields (`target`, `pre_image`) are copied unchanged to every later
-/// record of the effect. An `Intent` has no object and no inverse; every later state of an applied effect carries both.
+/// record for an id is the effect's state. The intent fields (`target`, `pre_image`, `intent`) are copied unchanged to every
+/// later record of the effect. An `Intent` has no object and no inverse; every later state of an applied effect carries both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectRecord {
@@ -123,6 +131,10 @@ pub struct EffectRecord {
     /// For a patch, the values its keys held when the plan was made, with `None` for a key that was absent. `None` for a
     /// create, so recovery can tell the two apart from the intent alone.
     pub pre_image: Option<BTreeMap<String, Option<String>>>,
+    /// Set on the intent of a retirement and on every record of it. It is omitted when absent, so a record without it keeps the
+    /// bytes it always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<IntentKind>,
     #[serde(default, deserialize_with = "closed::optional")]
     pub object: Option<ObjectRef>,
     pub inverse: Option<Inverse>,
@@ -375,6 +387,18 @@ impl<S: JournalStore> Journal<S> {
             .collect()
     }
 
+    /// Every entry with at least one effect that still counts, in id order. Recovery and removal start from this list, so an
+    /// entry the desired state no longer carries is found from the journal alone.
+    pub fn live_entries(&self) -> Vec<EntryId> {
+        let entries: std::collections::BTreeSet<EntryId> = self
+            .latest
+            .values()
+            .filter(|r| !matches!(r.state, EffectState::Reverted | EffectState::Failed))
+            .map(|r| r.entry.clone())
+            .collect();
+        entries.into_iter().collect()
+    }
+
     /// Every intent with no applied, failed or reverted record, in id order.
     pub fn unresolved(&self) -> Vec<EffectRecord> {
         self.latest
@@ -420,6 +444,7 @@ impl<S: JournalStore> Journal<S> {
             op_digest: prev.op_digest.clone(),
             target: prev.target.clone(),
             pre_image: prev.pre_image.clone(),
+            intent: prev.intent,
             object,
             inverse,
             state: to,
@@ -439,14 +464,38 @@ impl<S: JournalStore> Journal<S> {
     }
 }
 
-impl<S: JournalStore> JournalSink for Journal<S> {
-    fn intend(
+/// The parts of an intent that a create, a patch and a retirement do not share: a patch's pre-image, and the marker a retirement
+/// carries.
+struct IntentShape {
+    pre_image: Option<BTreeMap<String, Option<String>>>,
+    intent: Option<IntentKind>,
+}
+
+impl<S: JournalStore> Journal<S> {
+    /// Records the intent of a retirement, marked as one, before the provider retires anything. It is refused on the same terms
+    /// as [`JournalSink::intend`].
+    pub fn intend_delete(
         &mut self,
         entry: &EntryId,
         class: EffectClass,
         op_digest: Digest,
         target: ObjectRef,
-        pre_image: Option<BTreeMap<String, Option<String>>>,
+        now_ms: u64,
+    ) -> Result<u64, KernelError> {
+        let shape = IntentShape {
+            pre_image: None,
+            intent: Some(IntentKind::Delete),
+        };
+        self.intend_as(entry, class, op_digest, target, shape, now_ms)
+    }
+
+    fn intend_as(
+        &mut self,
+        entry: &EntryId,
+        class: EffectClass,
+        op_digest: Digest,
+        target: ObjectRef,
+        shape: IntentShape,
         now_ms: u64,
     ) -> Result<u64, KernelError> {
         let id = self.next_id;
@@ -465,7 +514,8 @@ impl<S: JournalStore> JournalSink for Journal<S> {
             class,
             op_digest,
             target,
-            pre_image,
+            pre_image: shape.pre_image,
+            intent: shape.intent,
             object: None,
             inverse: None,
             state: EffectState::Intent,
@@ -473,6 +523,24 @@ impl<S: JournalStore> JournalSink for Journal<S> {
         })?;
         self.next_id = following;
         Ok(id)
+    }
+}
+
+impl<S: JournalStore> JournalSink for Journal<S> {
+    fn intend(
+        &mut self,
+        entry: &EntryId,
+        class: EffectClass,
+        op_digest: Digest,
+        target: ObjectRef,
+        pre_image: Option<BTreeMap<String, Option<String>>>,
+        now_ms: u64,
+    ) -> Result<u64, KernelError> {
+        let shape = IntentShape {
+            pre_image,
+            intent: None,
+        };
+        self.intend_as(entry, class, op_digest, target, shape, now_ms)
     }
 
     fn applied(&mut self, id: u64, object: ObjectRef, inverse: Inverse) -> Result<(), KernelError> {
@@ -569,6 +637,7 @@ fn refusal_to_follow(prev: &EffectRecord, next: &EffectRecord) -> Option<&'stati
         || prev.at_ms != next.at_ms
         || prev.target != next.target
         || prev.pre_image != next.pre_image
+        || prev.intent != next.intent
     {
         return Some("changes what its intent says");
     }
