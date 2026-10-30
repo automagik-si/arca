@@ -6,8 +6,11 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
-use arca_incus::FakeIncus;
+use arca_incus::{Appears, FakeIncus};
 use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{Applied, DesiredStateGate, EntryId, PluginId, SignedDocument};
@@ -268,15 +271,27 @@ fn run_killed(
     kill: Kill,
     doc: &SignedDocument,
 ) {
-    let mut r = restarted(
+    run_killed_by(
         scratch,
         key,
-        killing(scratch, fake, retained, kill),
-        plugins(),
         retained,
         applied,
-    )
-    .expect("the journal opens before the kill");
+        killing(scratch, fake, retained, kill),
+        doc,
+    );
+}
+
+/// Runs `doc` on a reconciler over `provider`, which must unwind at its kill point, then drops it.
+fn run_killed_by(
+    scratch: &Scratch,
+    key: &NodeKey,
+    retained: &RetainedSet,
+    applied: Option<Applied>,
+    provider: Box<dyn Provider + Send>,
+    doc: &SignedDocument,
+) {
+    let mut r = restarted(scratch, key, provider, plugins(), retained, applied)
+        .expect("the journal opens before the kill");
     let ran = catch_unwind(AssertUnwindSafe(|| r.reconcile(doc, NOW)));
     assert!(ran.is_err(), "the simulated kill reached the reconciler");
     drop(r);
@@ -1824,4 +1839,313 @@ fn a_plan_whose_instance_is_gone_before_the_next_removal_is_withdrawn_and_nothin
     assert!(r.journal().live_entries().is_empty());
     nothing_left(&fake);
     assert_eq!(deletes_for(&fake, "toy-box-t1"), 1);
+}
+
+// Running operations: an intent is never settled while an operation still names its target.
+
+/// How long a write or a read-back waits on a running operation in these cases: short, so a held operation outlasts it.
+const SHORT: Duration = Duration::from_millis(200);
+/// A deadline no held operation in these cases reaches, so a wait ends with its operation.
+const LONG: Duration = Duration::from_secs(20);
+
+/// The Incus provider over `fake` with every operation's deadline at `deadline`, for the create and for the read-back alike.
+fn within(
+    scratch: &Scratch,
+    fake: &FakeIncus,
+    retained: &RetainedSet,
+    deadline: Duration,
+) -> IncusProvider {
+    provider(scratch, fake, retained).with_operation_deadline(deadline)
+}
+
+/// Runs the toy's document and kills the process right after the instance's create was sent, while Incus still runs it: the
+/// writer gives up waiting at [`SHORT`], and the kill lands before anything else. The ACL's create is journalled as applied and
+/// the instance's intent is left open.
+fn kill_while_the_instance_create_runs(
+    scratch: &Scratch,
+    fake: &FakeIncus,
+    key: &NodeKey,
+    retained: &RetainedSet,
+    doc: &SignedDocument,
+) -> u64 {
+    run_killed_by(
+        scratch,
+        key,
+        retained,
+        None,
+        Box::new(Killing {
+            inner: within(scratch, fake, retained, SHORT),
+            kill: Kill::EffectAfter(2),
+            effects: 0,
+            retires: 0,
+        }),
+        doc,
+    );
+    let ids = open_ids(scratch);
+    assert_eq!(ids.len(), 1, "the instance's intent is open: {ids:?}");
+    ids[0]
+}
+
+/// The ids of the intents the journal file holds open.
+fn open_ids(scratch: &Scratch) -> Vec<u64> {
+    Journal::open(FileJournal::open(&scratch.path("journal.jsonl")).expect("the journal opens"))
+        .expect("the journal folds")
+        .unresolved()
+        .iter()
+        .map(|record| record.id)
+        .collect()
+}
+
+/// Every instance that carries the toy's mark is an object the journal holds live for the toy.
+fn every_marked_instance_is_journalled(fake: &FakeIncus, r: &Reconciler<FileJournal>) {
+    let live = r.journal().live(&toy_id());
+    for name in instances_marked(fake, MARK, TOY) {
+        assert!(
+            live.iter().any(|record| record
+                .object
+                .as_ref()
+                .is_some_and(|object| object.name == name)),
+            "{name} carries the mark and the journal knows it"
+        );
+    }
+}
+
+#[test]
+fn a_restart_while_a_create_still_runs_keeps_its_intent_open_and_the_open_refuses() {
+    let scratch = Scratch::new("op-running");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let held = fake.hold_create(&instance_object("toy-box-t1", None), Appears::OnCompletion);
+    let open = kill_while_the_instance_create_runs(&scratch, &fake, &key, &retained, &first);
+    assert!(
+        get(&fake, &instance_path("toy-box-t1")).is_none(),
+        "the instance is not visible while its create runs"
+    );
+    let writes = fake.writes().len();
+
+    // Before this rule, one GET saw nothing at the name and settled the create as reverted, and the instance then landed with
+    // the toy's mark and no record of it.
+    let refused = match restarted(
+        &scratch,
+        &key,
+        Box::new(within(&scratch, &fake, &retained, SHORT)),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    ) {
+        Ok(_) => panic!("an intent whose create still runs must not settle"),
+        Err(error) => error,
+    };
+    assert_eq!(refused, KernelError::Unresolved { ids: vec![open] });
+    assert_eq!(open_ids(&scratch), vec![open], "the intent is still open");
+    assert_eq!(fake.writes().len(), writes, "the open sent no write");
+
+    // The operation completes. The next open journals the instance the create made.
+    fake.release_operation(&held);
+    let r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("the journal opens once the create has ended");
+    let uuid = toy_instance_uuid(&fake);
+    assert_eq!(
+        r.resolution().adopted,
+        vec![instance_object("toy-box-t1", Some(&uuid))]
+    );
+    assert!(r.resolution().reverted.is_empty());
+    every_marked_instance_is_journalled(&fake, &r);
+}
+
+#[test]
+fn a_create_that_completes_while_the_restart_waits_is_adopted_by_that_open() {
+    let scratch = Scratch::new("op-completes");
+    let fake = Arc::new(start_fake(&scratch));
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let held = fake.hold_create(&instance_object("toy-box-t1", None), Appears::OnCompletion);
+    kill_while_the_instance_create_runs(&scratch, &fake, &key, &retained, &first);
+
+    let releaser = {
+        let fake = Arc::clone(&fake);
+        thread::spawn(move || {
+            thread::sleep(SHORT);
+            fake.release_operation(&held);
+        })
+    };
+    let r = restarted(
+        &scratch,
+        &key,
+        Box::new(within(&scratch, &fake, &retained, LONG)),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("the open waits for the create, then settles it");
+    releaser.join().expect("the releaser ends");
+    let uuid = toy_instance_uuid(&fake);
+    assert_eq!(
+        r.resolution().adopted,
+        vec![instance_object("toy-box-t1", Some(&uuid))]
+    );
+    assert!(r.resolution().reverted.is_empty() && r.journal().unresolved().is_empty());
+    every_marked_instance_is_journalled(&fake, &r);
+}
+
+#[test]
+fn a_create_whose_operation_fails_while_the_restart_waits_is_reverted_and_leaves_nothing() {
+    // The instance shows while its create runs, and Incus removes it when the create fails. Before this rule, the open read it
+    // while it ran and journalled an instance that never landed.
+    let scratch = Scratch::new("op-fails");
+    let fake = Arc::new(start_fake(&scratch));
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    let first = signed(&key, 1, None, vec![toy_entry("t1")]);
+    let held = fake.hold_create(&instance_object("toy-box-t1", None), Appears::WhileRunning);
+    let open = kill_while_the_instance_create_runs(&scratch, &fake, &key, &retained, &first);
+    assert!(
+        get(&fake, &instance_path("toy-box-t1")).is_some(),
+        "the instance shows while its create runs"
+    );
+
+    let failer = {
+        let fake = Arc::clone(&fake);
+        thread::spawn(move || {
+            thread::sleep(SHORT);
+            fake.fail_operation(&held, "the create failed");
+        })
+    };
+    let mut r = restarted(
+        &scratch,
+        &key,
+        Box::new(within(&scratch, &fake, &retained, LONG)),
+        plugins(),
+        &retained,
+        applied_of(&first),
+    )
+    .expect("the open waits for the create, then settles it");
+    failer.join().expect("the failer ends");
+    assert_eq!(r.resolution().reverted, vec![open]);
+    assert!(r.resolution().adopted.is_empty());
+    assert!(instances_marked(&fake, MARK, TOY).is_empty());
+
+    let second = signed(&key, 2, Some(first.document.digest()), vec![]);
+    assert_eq!(
+        r.reconcile(&second, NOW),
+        vec![Outcome::Reverted {
+            entry: toy_id(),
+            effects: 1
+        }],
+        "only the ACL is left to revert; nothing is asked about an instance that never landed"
+    );
+    nothing_left(&fake);
+    assert!(r.journal().live_entries().is_empty());
+}
+
+#[test]
+fn a_running_operation_on_another_object_holds_no_intent() {
+    let scratch = Scratch::new("op-other");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    intend_by_hand(
+        &scratch,
+        &toy_id(),
+        EffectClass::B,
+        Digest::of(b"a create"),
+        instance_object("toy-box-t1", None),
+        None,
+    );
+    fake.hold_operation(&instance_object("toy-box-t2", None));
+    fake.hold_operation(&ObjectRef {
+        project: "default".to_string(),
+        ..instance_object("toy-box-t1", None)
+    });
+    fake.hold_operation(&acl("toy-box-t1"));
+    fake.hold_operation(&ObjectRef {
+        kind: IncusKind::Profile,
+        ..instance_object("toy-box-t1", None)
+    });
+
+    let r = restarted(
+        &scratch,
+        &key,
+        Box::new(within(&scratch, &fake, &retained, LONG)),
+        plugins(),
+        &retained,
+        None,
+    )
+    .expect("an operation on another object holds nothing");
+    assert_eq!(r.resolution().reverted, vec![1]);
+    assert!(
+        !fake
+            .requests()
+            .iter()
+            .any(|request| request.path.contains("/wait")),
+        "no operation was waited on"
+    );
+}
+
+#[test]
+fn a_failed_operations_read_holds_every_intent_and_the_open_refuses_with_no_write() {
+    let scratch = Scratch::new("op-unreadable");
+    let fake = start_fake(&scratch);
+    let key = node_key();
+    let retained = RetainedSet::empty();
+    intend_by_hand(
+        &scratch,
+        &toy_id(),
+        EffectClass::A,
+        Digest::of(b"a create"),
+        acl("toy-acl-t1"),
+        None,
+    );
+    intend_by_hand(
+        &scratch,
+        &toy_id(),
+        EffectClass::B,
+        Digest::of(b"another create"),
+        instance_object("toy-box-t1", None),
+        None,
+    );
+    fake.set_operations_unreadable(true);
+
+    let refused = match restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        None,
+    ) {
+        Ok(_) => panic!("an intent whose operations cannot be read must not settle"),
+        Err(error) => error,
+    };
+    assert_eq!(refused, KernelError::Unresolved { ids: vec![1, 2] });
+    assert!(fake.writes().is_empty(), "nothing was written");
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|request| request.path == arca_incus::OPERATIONS_PATH),
+        "no object was read while the operations could not be: {:?}",
+        fake.requests()
+    );
+
+    fake.set_operations_unreadable(false);
+    let r = restarted(
+        &scratch,
+        &key,
+        plain(&scratch, &fake, &retained),
+        plugins(),
+        &retained,
+        None,
+    )
+    .expect("the open settles once the operations read");
+    assert_eq!(r.resolution().reverted, vec![1, 2]);
 }

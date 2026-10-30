@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arca_incus::{FakeIncus, FakeState, IncusRead, UnixIncus};
+use arca_incus::{Appears, FakeIncus, FakeState, IncusRead, OPERATIONS_PATH, UnixIncus};
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::journal::{
@@ -2909,7 +2909,7 @@ fn an_acl_an_earlier_kernel_named_in_its_kernel_project_is_read_and_retired_in_d
 fn project_patches(fake: &FakeIncus) -> Vec<(String, String)> {
     writes(fake)
         .into_iter()
-        .filter(|(method, path)| method == "PATCH" && path.starts_with("/1.0/projects/"))
+        .filter(|(method, path)| method == "PATCH" && path.starts_with("/1.0/projects"))
         .collect()
 }
 
@@ -3105,4 +3105,181 @@ fn a_tombstone_that_reads_back_after_a_4xx_or_is_answered_5xx_stays_unresolved()
         Err(EffectRefusal::Unresolved)
     );
     assert_eq!(failed.count("DELETE"), 0);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// Running operations: a read-back is never judged while Incus still works on its target
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/// An instance in `svc`, the project the provider tests write in.
+fn svc_instance(name: &str) -> ObjectRef {
+    object(IncusKind::Instance, "svc", None, name)
+}
+
+/// Sends a create to the fake outside the provider, as a killed process left it, and returns the status.
+fn post_create(fake: &FakeIncus, name: &str) -> u16 {
+    let mut stream = UnixStream::connect(fake.socket()).expect("the fake accepts");
+    let body = json!({ "name": name, "config": { MARK: "toy" } }).to_string();
+    let request = format!(
+        "POST /1.0/instances?project=svc HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .expect("the request is written");
+    let mut answer = String::new();
+    stream
+        .read_to_string(&mut answer)
+        .expect("the answer is read");
+    answer
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status")
+}
+
+/// Whether every request the fake received from the `from`th on was a GET.
+fn only_gets_since(fake: &FakeIncus, from: usize) -> bool {
+    fake.requests()[from..]
+        .iter()
+        .all(|request| request.method == "GET")
+}
+
+/// The paths of the requests the fake received from the `from`th on.
+fn paths_since(fake: &FakeIncus, from: usize) -> Vec<String> {
+    fake.requests()[from..]
+        .iter()
+        .map(|request| request.path.clone())
+        .collect()
+}
+
+#[test]
+fn a_read_back_while_a_create_still_runs_on_its_target_is_unresolved_and_reads_no_object() {
+    let (scratch, fake) = start("op-running");
+    let provider =
+        provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::from_millis(300));
+    let target = svc_instance("new1");
+    let held = fake.hold_create(&target, Appears::OnCompletion);
+    assert_eq!(post_create(&fake, "new1"), 202);
+    let from = fake.requests().len();
+
+    let started = Instant::now();
+    assert_eq!(
+        Provider::read_back(&provider, &entry("toy"), &target, None),
+        Err(EffectRefusal::Unresolved),
+        "a create whose operation still runs is not read as absent"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(300),
+        "the read-back waited for the operation up to the deadline"
+    );
+    let paths = paths_since(&fake, from);
+    assert!(only_gets_since(&fake, from), "{paths:?}");
+    assert_eq!(paths[0], OPERATIONS_PATH);
+    assert!(
+        paths
+            .iter()
+            .any(|path| path
+                .starts_with(&format!("/1.0/operations/{}/wait?timeout=", held.as_str()))),
+        "{paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|path| path.starts_with("/1.0/instances/")),
+        "the object was not read while its create ran: {paths:?}"
+    );
+
+    fake.release_operation(&held);
+    assert!(
+        matches!(
+            Provider::read_back(&provider, &entry("toy"), &target, None),
+            Ok(ReadBack::Present { owned: true, ref object, .. }) if object.uuid.is_some()
+        ),
+        "once the operation ends the object is read"
+    );
+}
+
+#[test]
+fn a_read_back_waits_for_an_operation_that_ends_before_the_deadline_and_then_reads_the_object() {
+    let (scratch, fake) = start("op-completes");
+    let provider =
+        provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::from_secs(20));
+    let target = svc_instance("new2");
+    let held = fake.hold_create(&target, Appears::OnCompletion);
+    assert_eq!(post_create(&fake, "new2"), 202);
+    let from = fake.requests().len();
+    let fake = Arc::new(fake);
+    let releaser = {
+        let fake = Arc::clone(&fake);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            fake.release_operation(&held);
+        })
+    };
+
+    let answer = Provider::read_back(&provider, &entry("toy"), &target, None);
+    releaser.join().expect("the releaser ends");
+    assert!(
+        matches!(&answer, Ok(ReadBack::Present { owned: true, object, .. }) if object.uuid.is_some()),
+        "the object the create made is read once its operation ends: {answer:?}"
+    );
+    assert!(only_gets_since(&fake, from));
+}
+
+#[test]
+fn a_read_back_whose_operation_fails_before_the_deadline_reads_the_object_as_absent() {
+    // The object shows while its create runs, and Incus removes it when the create fails. A read taken while it ran would have
+    // reported an object that never landed.
+    let (scratch, fake) = start("op-fails");
+    let provider =
+        provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::from_secs(20));
+    let target = svc_instance("new3");
+    let held = fake.hold_create(&target, Appears::WhileRunning);
+    assert_eq!(post_create(&fake, "new3"), 202);
+    let fake = Arc::new(fake);
+    let failer = {
+        let fake = Arc::clone(&fake);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            fake.fail_operation(&held, "the create failed");
+        })
+    };
+
+    let answer = Provider::read_back(&provider, &entry("toy"), &target, None);
+    failer.join().expect("the failer ends");
+    assert_eq!(answer, Ok(ReadBack::Absent));
+}
+
+#[test]
+fn a_read_back_whose_operations_listing_fails_is_unresolved_and_reads_no_object() {
+    let (scratch, fake) = start("op-unreadable");
+    let provider = provider(&fake, &secrets_dir(&scratch));
+    fake.set_operations_unreadable(true);
+    let target = svc_instance("k1");
+    assert_eq!(
+        Provider::read_back(&provider, &entry("toy"), &target, None),
+        Err(EffectRefusal::Unresolved)
+    );
+    assert_eq!(paths_since(&fake, 0), vec![OPERATIONS_PATH.to_string()]);
+
+    fake.set_operations_unreadable(false);
+    assert!(
+        matches!(
+            Provider::read_back(&provider, &entry("toy"), &target, None),
+            Ok(ReadBack::Present { .. })
+        ),
+        "a listing that reads again lets the object be read"
+    );
+}
+
+#[test]
+fn a_read_back_with_no_deadline_left_is_unresolved_at_once_while_an_operation_runs() {
+    let (scratch, fake) = start("op-zero");
+    let provider = provider(&fake, &secrets_dir(&scratch)).with_operation_deadline(Duration::ZERO);
+    let target = svc_instance("k1");
+    fake.hold_operation(&target);
+    assert_eq!(
+        Provider::read_back(&provider, &entry("toy"), &target, None),
+        Err(EffectRefusal::Unresolved)
+    );
+    assert_eq!(paths_since(&fake, 0), vec![OPERATIONS_PATH.to_string()]);
 }

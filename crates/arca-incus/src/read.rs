@@ -5,6 +5,12 @@
 //! connection. A body over [`MAX_BODY`] is refused as [`IncusError::TooLarge`], and an answer that does not finish by the
 //! request's deadline is refused as [`IncusError::Timeout`]. No error carries a header byte or a raw body byte. A status
 //! error keeps only the envelope's `error` text, or the reason phrase, cut to 512 bytes.
+//!
+//! Every request in this crate, the writer's included, is sent through one function, `exchange`, which refuses a PATCH to a
+//! project before any byte is written (see `guard_request`).
+//!
+//! The operations reads ([`running_operations`], [`running_on`] and [`wait_operation`]) tell whether Incus is still working on
+//! an object, so a caller does not judge the object from a read taken while an operation can still change it.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -12,7 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use arca_kernel::ownership::{ObjectRef, OwnerClass};
+use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass};
 use serde_json::Value;
 
 /// The largest response body the client accepts, in bytes.
@@ -45,8 +51,8 @@ pub enum IncusError {
     /// The answer is over [`MAX_BODY`].
     TooLarge,
     /// The writer refused before it sent any write, because the object is not the caller's to change, the target is outside
-    /// the kernel's project family, or the request is not a plain one. A read may have been made. The text names the reason
-    /// and never a value of the object.
+    /// the kernel's project family, or the request is not a plain one; or the guard every request passes refused a PATCH to a
+    /// project. A read may have been made. The text names the reason and never a value of the object.
     Refused(String),
     /// The write was accepted and applied, but reading the object back did not confirm it. Boxed, so the error stays small.
     AppliedUnconfirmed(Box<Unconfirmed>),
@@ -165,12 +171,14 @@ impl Framed {
 }
 
 /// Sends one request over the socket and reads the answer, under one deadline of `timeout` from the connect. The caller
-/// builds the request bytes; [`UnixIncus::get`] is the only caller that builds a GET.
+/// builds the request bytes; [`UnixIncus::get`] is the only caller that builds a GET. Every request any client in this crate
+/// sends passes here, and [`guard_request`] runs first, so a PATCH to a project is refused before the socket is touched.
 pub(crate) fn exchange(
     socket: &Path,
     timeout: Duration,
     request: &[u8],
 ) -> Result<Framed, IncusError> {
+    guard_request(request)?;
     if timeout.is_zero() {
         return Err(IncusError::Timeout);
     }
@@ -183,6 +191,106 @@ pub(crate) fn exchange(
         deadline,
     });
     read_framed(&mut reader, MAX_BODY)
+}
+
+/// Why [`exchange`] refuses a PATCH to a project.
+const PROJECT_PATCH: &str = "a project is never sent a PATCH";
+
+/// Refuses a request no client may send, before any byte of it is written: a PATCH to a project. Incus 7.3's project PATCH
+/// replaces the whole config with the keys it names (`docs/OWNERSHIP.md`, Rule 43), so one PATCH would erase the kernel's mark,
+/// `restricted` and every feature; a project's config is written only as a PUT of the whole config.
+///
+/// The request line is read as `<method> <origin-form target> HTTP/1.x`, after any line breaks before it. The method is compared
+/// without regard to case. A PATCH is refused when the target's path names `/1.0/projects` or anything under it: the query and
+/// the fragment are cut off, the path is percent-decoded until it no longer changes, its empty and `.` segments are dropped, its
+/// `..` segments are applied, and its first two segments are compared without regard to case. A request line that cannot be
+/// read this way is refused too, since every client in this crate builds a plain one.
+pub(crate) fn guard_request(request: &[u8]) -> Result<(), IncusError> {
+    let unreadable = || IncusError::Refused("the request line is not a plain one".to_string());
+    let start = request
+        .iter()
+        .position(|b| *b != b'\r' && *b != b'\n')
+        .unwrap_or(request.len());
+    let rest = &request[start..];
+    let end = rest
+        .iter()
+        .position(|b| *b == b'\r' || *b == b'\n')
+        .ok_or_else(unreadable)?;
+    let line = std::str::from_utf8(&rest[..end]).map_err(|_| unreadable())?;
+    let mut parts = line.split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(unreadable());
+    };
+    let token = !method.is_empty() && method.bytes().all(|b| b.is_ascii_alphabetic());
+    let origin_form = target.starts_with('/') && target.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    if !token || !origin_form || !version.starts_with("HTTP/1.") {
+        return Err(unreadable());
+    }
+    if method.eq_ignore_ascii_case("PATCH") && names_projects(target) {
+        return Err(IncusError::Refused(PROJECT_PATCH.to_string()));
+    }
+    Ok(())
+}
+
+/// Whether a request target's path is `/1.0/projects` or a path under it, read as [`guard_request`] states.
+fn names_projects(target: &str) -> bool {
+    let mut path = cut_query(target).to_string();
+    loop {
+        let decoded = percent_decode(&path);
+        let decoded = cut_query(&decoded).to_string();
+        if decoded == path {
+            break;
+        }
+        path = decoded;
+    }
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    matches!(
+        segments.as_slice(),
+        [api, projects, ..] if api.eq_ignore_ascii_case("1.0") && projects.eq_ignore_ascii_case("projects")
+    )
+}
+
+/// A target without its query and its fragment.
+fn cut_query(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or("")
+}
+
+/// Decodes each `%XX` escape once. An escape that is not two hex digits is kept as it is, and bytes that are not UTF-8 are
+/// replaced, so the result is always text.
+pub(crate) fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escape = (bytes[at] == b'%')
+            .then(|| bytes.get(at + 1..at + 3))
+            .flatten()
+            .filter(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The request target must be a plain origin-form path: ASCII, no spaces or controls, no fragment, and short. Anything else
@@ -503,6 +611,227 @@ fn decode(response: RawResponse) -> Result<Value, IncusError> {
         .ok_or_else(|| decode_error("the answer has no metadata"))
 }
 
+/// The listing of every operation Incus holds, in every project, each with its body. Incus keys the listing by each operation's
+/// status in lower case (`running`, `success`, ...), and keeps an ended operation listed for a few seconds.
+pub const OPERATIONS_PATH: &str = "/1.0/operations?all-projects=true&recursion=1";
+
+/// An operation that has not ended: its id, its status code, and the URL of each object it names, as Incus renders them. Incus
+/// gives an operation pending (105), running (103) or cancelling (104) while it works, and 200, 400 or 401 once it ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningOp {
+    pub id: String,
+    pub status_code: u16,
+    pub resources: Vec<String>,
+}
+
+/// Whether an operation's status code says it has not ended. Every 1xx code counts, which covers the three Incus gives an
+/// operation at work (105, 103 and 104), so a code Incus adds later holds an object rather than freeing it.
+fn not_ended(code: u16) -> bool {
+    (100..200).contains(&code)
+}
+
+/// An operation id: the characters of a uuid.
+fn plain_operation_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// One operation's body: its id, which must be plain, its status code, and its resources, a map of lists of URLs. An absent or
+/// null `resources` names nothing. Any other shape is a decode error.
+fn parse_operation(body: &Value) -> Result<RunningOp, IncusError> {
+    let object = body
+        .as_object()
+        .ok_or_else(|| decode_error("an operation is not an object"))?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| plain_operation_id(id))
+        .ok_or_else(|| decode_error("an operation has no plain id"))?;
+    let status_code = object
+        .get("status_code")
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .ok_or_else(|| decode_error("an operation has no status code"))?;
+    let mut resources = Vec::new();
+    match object.get("resources") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(kinds)) => {
+            for urls in kinds.values() {
+                match urls {
+                    Value::Null => {}
+                    Value::Array(urls) => {
+                        for url in urls {
+                            let url = url
+                                .as_str()
+                                .ok_or_else(|| decode_error("an operation resource is not text"))?;
+                            resources.push(url.to_string());
+                        }
+                    }
+                    _ => return Err(decode_error("an operation's resources are not lists")),
+                }
+            }
+        }
+        Some(_) => return Err(decode_error("an operation's resources are not a map")),
+    }
+    Ok(RunningOp {
+        id: id.to_string(),
+        status_code,
+        resources,
+    })
+}
+
+/// Every operation Incus is still working on, in every project, from one GET of [`OPERATIONS_PATH`]. An operation that has
+/// ended is left out. A listing that is not a map of lists of operations, or an operation that does not parse, is a decode
+/// error, so a caller that cannot read the listing learns nothing from it and holds what it was about to judge.
+pub fn running_operations(read: &dyn IncusRead) -> Result<Vec<RunningOp>, IncusError> {
+    let listing = read.get(OPERATIONS_PATH)?;
+    let groups = listing
+        .as_object()
+        .ok_or_else(|| decode_error("the operations listing is not a map"))?;
+    let mut running = Vec::new();
+    for group in groups.values() {
+        let operations = match group {
+            Value::Null => continue,
+            Value::Array(operations) => operations,
+            _ => return Err(decode_error("an operations group is not a list")),
+        };
+        for operation in operations {
+            let operation = parse_operation(operation)?;
+            if not_ended(operation.status_code) {
+                running.push(operation);
+            }
+        }
+    }
+    running.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(running)
+}
+
+/// The path segments, after `/1.0`, that name an object of `kind`. `None` stands for any one segment: a volume's, a bucket's
+/// or a forward's parent when the caller names none. An instance is named under `instances`, and under the `containers` and
+/// `virtual-machines` paths Incus also accepts.
+fn object_patterns<'a>(
+    kind: IncusKind,
+    parent: Option<&'a str>,
+    name: &'a str,
+) -> Vec<Vec<Option<&'a str>>> {
+    let name = Some(name);
+    match kind {
+        IncusKind::Project => vec![vec![Some("projects"), name]],
+        IncusKind::Instance => ["instances", "containers", "virtual-machines"]
+            .into_iter()
+            .map(|collection| vec![Some(collection), name])
+            .collect(),
+        IncusKind::Network => vec![vec![Some("networks"), name]],
+        IncusKind::Acl => vec![vec![Some("network-acls"), name]],
+        IncusKind::Profile => vec![vec![Some("profiles"), name]],
+        IncusKind::Zone => vec![vec![Some("network-zones"), name]],
+        IncusKind::Volume => vec![vec![
+            Some("storage-pools"),
+            parent,
+            Some("volumes"),
+            Some("custom"),
+            name,
+        ]],
+        IncusKind::Bucket => vec![vec![Some("storage-pools"), parent, Some("buckets"), name]],
+        IncusKind::Forward => vec![vec![Some("networks"), parent, Some("forwards"), name]],
+    }
+}
+
+/// The values of a query's `project` parameter, percent-decoded.
+fn query_projects(query: &str) -> Vec<String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.strip_prefix("project="))
+        .map(percent_decode)
+        .collect()
+}
+
+/// Whether `op` names the object of `kind` called `name` in `project` (with `parent` for a volume, a bucket or a forward).
+///
+/// Incus renders a resource URL with `?project=<p>` unless the operation's project is `default`, so a URL without a `project`
+/// query names an object in `default`. The URL's path is percent-decoded and its empty segments dropped. It names the object when
+/// it is the object's path or a path under it, such as a snapshot of the instance. A network, a forward and an ACL are compared in
+/// `default` (`docs/OWNERSHIP.md`, Rule 40): Incus keeps them there for a kernel project, so their URL's project is not compared. A
+/// project is named by its path alone.
+pub fn operation_names(
+    op: &RunningOp,
+    kind: IncusKind,
+    project: &str,
+    parent: Option<&str>,
+    name: &str,
+) -> bool {
+    let patterns = object_patterns(kind, parent, name);
+    let any_project = matches!(
+        kind,
+        IncusKind::Project | IncusKind::Network | IncusKind::Forward | IncusKind::Acl
+    );
+    op.resources.iter().any(|url| {
+        let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+        let query = query.split('#').next().unwrap_or("");
+        let path = percent_decode(path);
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let Some(("1.0", rest)) = segments.split_first().map(|(first, rest)| (*first, rest)) else {
+            return false;
+        };
+        let projects = query_projects(query);
+        let in_project = any_project
+            || if projects.is_empty() {
+                project == "default"
+            } else {
+                projects.iter().any(|named| named == project)
+            };
+        in_project
+            && patterns.iter().any(|pattern| {
+                rest.len() >= pattern.len()
+                    && pattern
+                        .iter()
+                        .zip(rest)
+                        .all(|(want, got)| want.is_none_or(|want| want == *got))
+            })
+    })
+}
+
+/// Every operation Incus is still working on that names the object (see [`operation_names`]), from one GET of the listing.
+pub fn running_on(
+    read: &dyn IncusRead,
+    kind: IncusKind,
+    project: &str,
+    parent: Option<&str>,
+    name: &str,
+) -> Result<Vec<RunningOp>, IncusError> {
+    Ok(running_operations(read)?
+        .into_iter()
+        .filter(|op| operation_names(op, kind, project, parent, name))
+        .collect())
+}
+
+/// Waits on operation `id` for at most `timeout`, in whole seconds, with one GET of `/1.0/operations/<id>/wait?timeout=<s>`.
+/// Incus answers when the operation ends or the timeout passes, with the operation as it is then. Returns whether it is still
+/// running. An operation Incus no longer holds (404) has ended. The answer must name `id`. The read client's own deadline must be
+/// longer than `timeout`, or the hold reads as [`IncusError::Timeout`]. An id that is not plain is refused before any request.
+pub fn wait_operation(
+    read: &dyn IncusRead,
+    id: &str,
+    timeout: Duration,
+) -> Result<bool, IncusError> {
+    if !plain_operation_id(id) {
+        return Err(IncusError::Refused(
+            "an operation id that is not plain".to_string(),
+        ));
+    }
+    let path = format!("/1.0/operations/{id}/wait?timeout={}", timeout.as_secs());
+    match read.get(&path) {
+        Ok(body) => {
+            let operation = parse_operation(&body)?;
+            if operation.id != id {
+                return Err(decode_error("the wait answered for another operation"));
+            }
+            Ok(not_ended(operation.status_code))
+        }
+        Err(IncusError::Status { code: 404, .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -771,6 +1100,103 @@ mod tests {
         ] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
+    }
+
+    fn project_patch_refusal() -> IncusError {
+        IncusError::Refused("a project is never sent a PATCH".to_string())
+    }
+
+    /// Exchanges `request` with a socket path nothing listens on. A request the guard let through fails to connect, as
+    /// `IncusError::Io`, so a `Refused` answer shows the guard ran before any connection was made.
+    fn sent(request: &[u8]) -> Result<(), IncusError> {
+        let socket = std::env::temp_dir().join(format!("arca-guard-{}.sock", std::process::id()));
+        exchange(&socket, Duration::from_millis(200), request).map(|_| ())
+    }
+
+    #[test]
+    fn a_patch_to_a_project_path_is_refused_by_exchange_before_any_byte_is_sent() {
+        for target in [
+            "/1.0/projects/p1",
+            "/1.0/projects",
+            "/1.0/projects/",
+            "/1.0/projects/p1/",
+            "/1.0/projects?recursion=1",
+            "/1.0/projects/p1?project=p1",
+            "/1.0/projects/?x=1",
+            "/1.0/%70rojects/p1",
+            "/1.0/PROJECTS/p1",
+            "/1.0%2Fprojects/p1",
+            "/1.0/projects%2Fp1",
+            "/1.0/projects%2fp1",
+            "/1.0/%2570rojects/p1",
+            "//1.0/projects/p1",
+            "/1.0//projects/p1",
+            "/1.0/./projects/p1",
+            "/1.0/x/../projects/p1",
+            "/1.0/projects#x",
+            "/1.0/projects%3Fx",
+        ] {
+            for method in ["PATCH", "patch", "Patch"] {
+                let request = format!(
+                    "{method} {target} HTTP/1.1\r\nHost: incus\r\nContent-Length: 2\r\n\r\n{{}}"
+                );
+                assert_eq!(
+                    sent(request.as_bytes()),
+                    Err(project_patch_refusal()),
+                    "{method} {target}"
+                );
+            }
+            let leading = format!("\r\nPATCH {target} HTTP/1.1\r\nHost: incus\r\n\r\n");
+            assert_eq!(
+                sent(leading.as_bytes()),
+                Err(project_patch_refusal()),
+                "a leading line break before PATCH {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_whose_line_cannot_be_read_is_refused_before_any_byte_is_sent() {
+        for request in [
+            &b""[..],
+            b"\r\n\r\n",
+            b"PATCH\r\n\r\n",
+            b"PATCH http://incus/1.0/projects/p1 HTTP/1.1\r\n\r\n",
+            b"PATCH /1.0/\xffprojects HTTP/1.1\r\n\r\n",
+            b"PATCH\t/1.0/projects/p1 HTTP/1.1\r\n\r\n",
+            b"PATCH /1.0/projects/p1 HTTP/1.1",
+        ] {
+            assert!(
+                matches!(sent(request), Err(IncusError::Refused(_))),
+                "{request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_passes_every_other_method_and_every_patch_outside_the_projects_path() {
+        for line in [
+            "GET /1.0/projects/p1 HTTP/1.1",
+            "PUT /1.0/projects/p1 HTTP/1.1",
+            "POST /1.0/projects HTTP/1.1",
+            "DELETE /1.0/projects/p1 HTTP/1.1",
+            "PATCH /1.0/instances/c1?project=p1 HTTP/1.1",
+            "PATCH /1.0/profiles/default?project=projects HTTP/1.1",
+            "PATCH /1.0/network-acls/projects?project=default HTTP/1.1",
+            "PATCH /1.0/projectsx HTTP/1.1",
+            "PATCH /1.0/storage-pools/projects/volumes/custom/v1?project=p1 HTTP/1.1",
+            "PATCH /2.0/projects/p1 HTTP/1.1",
+        ] {
+            let request = format!("{line}\r\nHost: incus\r\n\r\n");
+            assert_eq!(guard_request(request.as_bytes()), Ok(()), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_percent_escape_is_decoded_only_when_it_is_two_hex_digits() {
+        assert_eq!(percent_decode("/a%2Fb%70"), "/a/bp");
+        assert_eq!(percent_decode("%+f%zz%4"), "%+f%zz%4");
+        assert_eq!(percent_decode("%2570"), "%70");
     }
 
     #[test]

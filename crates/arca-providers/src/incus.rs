@@ -8,6 +8,10 @@
 //! before it decides the outcome, unless the answer could not be read at all: then it makes no read, since a read after a write
 //! still running proves nothing. It reports a failure only when the object shows the write did not happen, and reports
 //! [`EffectRefusal::Unresolved`] for anything it cannot prove either way.
+//!
+//! The read-back that settles an intent after a restart reads the object only once no operation Incus still runs names it: it
+//! waits on each such operation up to the operation deadline, and an operation still running then, or an operations listing that
+//! cannot be read, is [`EffectRefusal::Unresolved`].
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -17,10 +21,13 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arca_incus::write::OPERATION_DEADLINE;
 use arca_incus::{
-    IncusError, IncusRead, Owned, ProjectFamily, Reading, UnixIncus, UnixIncusWriter,
+    IncusError, IncusRead, Owned, ProjectFamily, Reading, UnixIncus, UnixIncusWriter, running_on,
+    wait_operation,
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
@@ -65,6 +72,12 @@ const PROJECT_KEYS: [(&str, &str); 5] = [
 ];
 /// The key every kernel project is created restricted with.
 const RESTRICTED_KEY: &str = "restricted";
+/// The longest one wait on a running operation is held by Incus while a read-back waits for it.
+const READ_BACK_HOLD: Duration = Duration::from_secs(5);
+/// How much longer than its hold one wait request may take before it is a timeout.
+const READ_BACK_MARGIN: Duration = Duration::from_secs(25);
+/// The pause before an operation that was still running is looked at again, so a server that answers at once is not spun on.
+const READ_BACK_PAUSE: Duration = Duration::from_millis(100);
 /// The restriction key a plugin may set on a project create: the bridges the project's instances may use. Each name must be a
 /// bridge in the default project that carries the entry's mark.
 pub const NETWORK_ACCESS_KEY: &str = "restricted.networks.access";
@@ -803,6 +816,40 @@ impl IncusProvider {
         }
     }
 
+    /// Waits until no operation Incus still runs names `place`, for at most the operation deadline from the call. The operations
+    /// listing is read, and the first operation that names the place is waited on, a few seconds per wait, until it ends; then the
+    /// listing is read again, so an operation that started meanwhile is waited on too. Only GETs are sent. An operation still
+    /// running at the deadline, a listing that cannot be read and a wait that cannot be answered are each
+    /// [`EffectRefusal::Unresolved`], and the place is not read.
+    fn settle_operations(&self, place: &ObjectRef) -> Result<(), EffectRefusal> {
+        let deadline = self.deadline.unwrap_or(OPERATION_DEADLINE);
+        let started = Instant::now();
+        loop {
+            let running = running_on(
+                &self.reader,
+                place.kind,
+                &place.project,
+                place.parent.as_deref(),
+                &place.name,
+            )
+            .map_err(|_| EffectRefusal::Unresolved)?;
+            let Some(operation) = running.first() else {
+                return Ok(());
+            };
+            let left = deadline.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(EffectRefusal::Unresolved);
+            }
+            let hold = left.min(READ_BACK_HOLD);
+            let waiter = UnixIncus::new(self.socket.clone()).with_timeout(hold + READ_BACK_MARGIN);
+            match wait_operation(&waiter, &operation.id, hold) {
+                Ok(true) => thread::sleep(READ_BACK_PAUSE.min(left)),
+                Ok(false) => {}
+                Err(_) => return Err(EffectRefusal::Unresolved),
+            }
+        }
+    }
+
     /// Retires an object the entry owns, through an approved plan. The object is read, then tombstoned under its ETag and read
     /// back; the delete reads it again and sends nothing unless it still shows the tombstone and the same uuid. A change the reads
     /// show is drift, and skips the delete. A stale ETag stops the sequence. A tombstone Incus refused with another 4xx is read
@@ -1023,8 +1070,9 @@ impl Provider for IncusProvider {
 
     /// Reads the object an unresolved intent names, with one GET. A target outside the family is refused before any request, and so
     /// is a target whose project does not enable its kind's feature, as a write to it is: Incus would answer for the default project
-    /// instead. An object that answers 404 is absent. Any other answer that is not a read of the object is an error, so the intent
-    /// stays open.
+    /// instead. The object is read only once no operation Incus still runs names it (see [`IncusProvider::settle_operations`]), so a
+    /// create still running is not read as absent, nor one about to fail as present. An object that answers 404 is absent. Any other
+    /// answer that is not a read of the object is an error, so the intent stays open.
     fn read_back(
         &self,
         entry: &EntryId,
@@ -1034,6 +1082,7 @@ impl Provider for IncusProvider {
         let place = self.served_at(entry, target)?;
         self.check_family(place.kind, &place.project)?;
         self.check_features(entry, place.kind, &place.project)?;
+        self.settle_operations(&place)?;
         let reading = match self.writer(entry)?.read_class(&place) {
             Ok(reading) => reading,
             Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),

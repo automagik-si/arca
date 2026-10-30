@@ -3,7 +3,7 @@
 //! server is bound under a fresh temporary directory, and no test connects to a real Incus socket. Each refusal is checked
 //! twice: the writer returns `IncusError::Refused`, and the server sees no write.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -2294,4 +2294,85 @@ fn a_project_put_that_reads_back_without_a_key_it_sent_is_applied_unconfirmed() 
         "the PUT landed and its read-back lost keys it sent: {result:?}"
     );
     assert_eq!(canned.count("PUT"), 1, "{:?}", canned.seen());
+}
+
+/// Every request the fake received that is a PATCH, in any letter case, to a path under `/1.0/projects`.
+fn project_patches(fake: &FakeIncus) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter(|request| {
+            request.method.eq_ignore_ascii_case("PATCH")
+                && request
+                    .path
+                    .to_ascii_lowercase()
+                    .starts_with("/1.0/projects")
+        })
+        .map(|request| request.path)
+        .collect()
+}
+
+#[test]
+fn no_public_writer_method_sends_a_patch_to_a_project() {
+    // Every public method of the writer, on a project target: while the project is empty and while it is in use, from a stale
+    // read, and on each refusal. Each project config write is a PUT, and the fake never sees a PATCH to a project.
+    let (_dir, fake) = start("guard-every-method");
+    let other = writer(&fake, "other");
+    let writer = writer(&fake, "toy");
+    let project = project_target("kproj1");
+    let created = writer
+        .create(
+            &project,
+            &json!({"description": "kept", "config": kernel_project_config()}),
+        )
+        .expect("a kernel project");
+    writer.get_etag(&project).expect("the project reads");
+    writer.read_class(&project).expect("the project classes");
+    assert!(matches!(
+        other.read_owned(&project),
+        Err(IncusError::Refused(_))
+    ));
+    let owned = writer.read_owned(&project).expect("the project is toy's");
+    let noted = writer
+        .patch(&owned, &changes(&[("user.note", Some("one"))]))
+        .expect("the patch lands as a PUT");
+    assert_eq!(
+        status_of(
+            &writer
+                .patch(&created, &changes(&[("user.note", Some("two"))]))
+                .expect_err("a stale read")
+        ),
+        Some(412)
+    );
+    assert_eq!(
+        status_of(
+            &writer
+                .tombstone(&created, &plan())
+                .expect_err("a stale read")
+        ),
+        Some(412)
+    );
+    fake.add_image("kproj1", "alpine/edge");
+    let cleared = writer
+        .patch(&noted, &changes(&[("user.note", None)]))
+        .expect("a patch of a project in use lands as a PUT");
+    assert!(matches!(
+        writer.delete(&cleared),
+        Err(IncusError::Refused(_))
+    ));
+    let retiring = writer
+        .tombstone(&cleared, &plan())
+        .expect("the tombstone lands as a PUT");
+    writer.delete(&retiring).expect("the project is deleted");
+
+    assert_eq!(project_patches(&fake), Vec::<String>::new());
+    let methods: BTreeSet<String> = fake
+        .writes()
+        .into_iter()
+        .filter(|write| write.path.starts_with("/1.0/projects"))
+        .map(|write| write.method)
+        .collect();
+    assert_eq!(
+        methods,
+        BTreeSet::from(["DELETE".to_string(), "POST".to_string(), "PUT".to_string()])
+    );
 }
