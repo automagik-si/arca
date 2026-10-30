@@ -1,0 +1,19 @@
+[package]
+name = "arca-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Arca MCP server: the verb table as MCP tools over streamable HTTP, behind hashed bearer tokens and two listeners"
+
+[dependencies]
+arca-api.workspace = true
+axum.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true
