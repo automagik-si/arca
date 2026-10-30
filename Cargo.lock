@@ -30,6 +30,7 @@ dependencies = [
 name = "arca-incus"
 version = "0.1.0"
 dependencies = [
+ "arca-kernel",
  "serde",
  "serde_json",
 ]

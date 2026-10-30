@@ -9,7 +9,7 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -39,6 +39,9 @@ pub enum IncusError {
     Timeout,
     /// The answer is over [`MAX_BODY`].
     TooLarge,
+    /// The writer refused a write before it sent anything, because the object is not the caller's to change or the
+    /// request is not a plain one. The text names the reason and never a value of the object.
+    Refused(String),
 }
 
 impl fmt::Display for IncusError {
@@ -49,6 +52,7 @@ impl fmt::Display for IncusError {
             Self::Decode(message) => write!(f, "could not read the Incus answer: {message}"),
             Self::Timeout => f.write_str("Incus did not answer by the deadline"),
             Self::TooLarge => f.write_str("the Incus answer is over the size cap"),
+            Self::Refused(reason) => write!(f, "refused before any write: {reason}"),
         }
     }
 }
@@ -92,30 +96,66 @@ fn deadline_for(timeout: Duration) -> Option<Instant> {
 impl IncusRead for UnixIncus {
     fn get(&self, path: &str) -> Result<Value, IncusError> {
         check_path(path)?;
-        if self.timeout.is_zero() {
-            return Err(IncusError::Timeout);
-        }
-        let deadline = deadline_for(self.timeout);
-        let mut stream = UnixStream::connect(&self.socket).map_err(io_error)?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(io_error)?;
+        // The one method this client writes is the constant below. The writer module builds its own requests.
         let request = format!(
             "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
         );
-        stream.write_all(request.as_bytes()).map_err(io_error)?;
-        let mut reader = BufReader::new(Deadline {
-            stream: &stream,
-            deadline,
-        });
-        let response = read_response(&mut reader, MAX_BODY)?;
-        decode(response)
+        let framed = exchange(&self.socket, self.timeout, request.as_bytes())?;
+        decode(framed.into_raw())
     }
+}
+
+/// One answer off the wire, with its headers kept for the writer's ETags.
+#[derive(Debug)]
+pub(crate) struct Framed {
+    pub(crate) status: u16,
+    pub(crate) reason: String,
+    headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+}
+
+impl Framed {
+    /// The first value of a header whose lower-case name is `name`.
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub(crate) fn into_raw(self) -> RawResponse {
+        RawResponse {
+            status: self.status,
+            reason: self.reason,
+            body: self.body,
+        }
+    }
+}
+
+/// Sends one request over the socket and reads the answer, under one deadline of `timeout` from the connect. The caller
+/// builds the request bytes; [`UnixIncus::get`] is the only caller that builds a GET.
+pub(crate) fn exchange(
+    socket: &Path,
+    timeout: Duration,
+    request: &[u8],
+) -> Result<Framed, IncusError> {
+    if timeout.is_zero() {
+        return Err(IncusError::Timeout);
+    }
+    let deadline = deadline_for(timeout);
+    let mut stream = UnixStream::connect(socket).map_err(io_error)?;
+    stream.set_write_timeout(Some(timeout)).map_err(io_error)?;
+    stream.write_all(request).map_err(io_error)?;
+    let mut reader = BufReader::new(Deadline {
+        stream: &stream,
+        deadline,
+    });
+    read_framed(&mut reader, MAX_BODY)
 }
 
 /// The request target must be a plain origin-form path: ASCII, no spaces or controls, no fragment, and short. Anything else
 /// could split the request line, so it is refused before the socket is touched.
-fn check_path(path: &str) -> Result<(), IncusError> {
+pub(crate) fn check_path(path: &str) -> Result<(), IncusError> {
     let plain = path.len() <= MAX_PATH
         && path.starts_with('/')
         && path
@@ -175,15 +215,22 @@ fn decode_error(message: &str) -> IncusError {
 
 /// One HTTP/1.1 answer, read off the wire with its body already framed.
 #[derive(Debug, PartialEq, Eq)]
-struct RawResponse {
-    status: u16,
-    reason: String,
-    body: Vec<u8>,
+pub(crate) struct RawResponse {
+    pub(crate) status: u16,
+    pub(crate) reason: String,
+    pub(crate) body: Vec<u8>,
+}
+
+/// Reads one answer and drops its headers. The unit tests use it; the clients read the headers too, through
+/// [`read_framed`].
+#[cfg(test)]
+fn read_response<R: BufRead>(reader: &mut R, max_body: usize) -> Result<RawResponse, IncusError> {
+    read_framed(reader, max_body).map(Framed::into_raw)
 }
 
 /// Reads one answer. The head shares one byte budget. The body is framed by a chunked coding, a `Content-Length`, or the
 /// connection's end, in that order, and never grows past `max_body`.
-fn read_response<R: BufRead>(reader: &mut R, max_body: usize) -> Result<RawResponse, IncusError> {
+fn read_framed<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Framed, IncusError> {
     let mut budget = MAX_HEAD;
     let status_line = read_line(reader, &mut budget)?;
     let (status, reason) = parse_status_line(&status_line)?;
@@ -214,9 +261,10 @@ fn read_response<R: BufRead>(reader: &mut R, max_body: usize) -> Result<RawRespo
     } else {
         read_to_cap(reader, max_body)?
     };
-    Ok(RawResponse {
+    Ok(Framed {
         status,
         reason,
+        headers,
         body,
     })
 }
@@ -357,7 +405,7 @@ fn read_to_cap<R: BufRead>(reader: &mut R, max_body: usize) -> Result<Vec<u8>, I
 }
 
 /// Cuts a status message to at most 512 bytes, stepping back to a character boundary when the cut falls inside one.
-fn cap_message(mut message: String) -> String {
+pub(crate) fn cap_message(mut message: String) -> String {
     if message.len() > MAX_MESSAGE {
         let mut end = MAX_MESSAGE;
         while !message.is_char_boundary(end) {
@@ -368,9 +416,10 @@ fn cap_message(mut message: String) -> String {
     message
 }
 
-/// The metadata of a success envelope. A non-success status is a `Status` error, whose message is the envelope's `error`
-/// text, or the reason phrase when the body is not an envelope. Only that text is kept, capped at 512 bytes.
-fn decode(response: RawResponse) -> Result<Value, IncusError> {
+/// The envelope of a success answer. A non-success status is a `Status` error, whose message is the envelope's `error` text,
+/// or the reason phrase when the body is not an envelope. An error envelope under any status is a `Status` error too. Only
+/// that text is kept, capped at 512 bytes.
+pub(crate) fn checked_envelope(response: &RawResponse) -> Result<Value, IncusError> {
     if !(200..300).contains(&response.status) {
         let message = serde_json::from_slice::<Value>(&response.body)
             .ok()
@@ -381,7 +430,7 @@ fn decode(response: RawResponse) -> Result<Value, IncusError> {
                     .map(str::to_string)
             })
             .filter(|message| !message.is_empty())
-            .unwrap_or(response.reason);
+            .unwrap_or_else(|| response.reason.clone());
         return Err(IncusError::Status {
             code: response.status,
             message: cap_message(message),
@@ -409,7 +458,13 @@ fn decode(response: RawResponse) -> Result<Value, IncusError> {
             message: cap_message(message),
         });
     }
-    object
+    Ok(envelope)
+}
+
+/// The metadata of a success envelope.
+fn decode(response: RawResponse) -> Result<Value, IncusError> {
+    let envelope = checked_envelope(&response)?;
+    envelope
         .get("metadata")
         .cloned()
         .ok_or_else(|| decode_error("the answer has no metadata"))

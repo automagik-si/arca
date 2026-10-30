@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Arca's Incus access: a GET-only client over the unix socket, a fake Incus and a recording shim"
 
 [dependencies]
+arca-kernel.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

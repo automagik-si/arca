@@ -1,10 +1,13 @@
-//! Arca's Incus access. Every request this crate can send is a GET. The client has no other method, and the recording
-//! shim answers any other method with 405 without forwarding it. The fake Incus serves fixed routes from a fixture.
+//! Arca's Incus access. The read client sends only GET. The writer is the one module that sends POST, PATCH or DELETE, and every
+//! write it sends is gated by the ownership classifier. The recording shim answers any method other than GET with 405 without
+//! forwarding it. The fake Incus serves a fixture and accepts the writer's requests in memory.
 
 pub mod fake;
 pub mod read;
 pub mod shim;
+pub mod write;
 
-pub use fake::{FakeIncus, FakeState, RecordedRequest};
+pub use fake::{FakeIncus, FakeState, RecordedRequest, WriteRecord};
 pub use read::{IncusError, IncusRead, UnixIncus};
 pub use shim::{RecordingShim, ShimHandle, ShimSummary};
+pub use write::{Owned, Target, UnixIncusWriter};
