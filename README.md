@@ -4,7 +4,7 @@ Arca is a Rust kernel for a node's own infrastructure. The kernel reads what it 
 change only after the node's owner has approved it and the change is written to a journal. Each node signs its own
 desired state with its own key. It talks to Incus over the local unix socket.
 
-**Status: `0.1.0-alpha.3`, for private single-host use.**
+**Status: `0.1.0-alpha.4`, for private single-host use.**
 
 - **Reads** run against a real Incus host (7.3, now 7.5.1): every project and instance is classed by owner, and drift is reported.
 - **Writes** are tested live, one object kind at a time, in a scratch project: network, project, ACL, profile, volume,
@@ -21,11 +21,12 @@ desired state with its own key. It talks to Incus over the local unix socket.
   [`docs/OWNERSHIP.md`](docs/OWNERSHIP.md)).
 - **Adoption:** `arca adopt` takes one listed container from the default project into a kernel project of its own and
   back, keeping its MAC and IPv4 by pinning them on its NIC. It resumes from its record after a crash at any step, and
-  `arca adopt verify` checks that the service answers. Done live on Incus 7.5.1 for two real services, where a project
+  `arca adopt verify` checks that the service answers. Done live on Incus 7.5.1 for three real services, two running and one stopped, where a project
   move runs as a copy, sometimes with a new uuid; adoption accepts that copy only when its pin and adoption snapshot match.
   The plan lists what the container already uses (host paths, devices, nesting, low-level keys, another bridge) as
   allowances, the digest covers them, and the kernel project allows exactly those. Privileged containers and a NIC other
-  than eth0 are refused. See "Adopting a container" in
+  than eth0 are refused. A stopped container is adopted with its saved MAC and stays stopped; `adopt verify --url`
+  checks a service through an http address, for a container whose firewall admits only its proxy. See "Adopting a container" in
   [`docs/OPERATING.md`](docs/OPERATING.md).
 
 Hardening for shared or distributed hosts comes later.
