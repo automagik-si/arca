@@ -800,7 +800,7 @@ impl AdoptWriter {
 
     /// Where, in which class and in which status `step` of a plan that found the instance running expects it (Decision table
     /// in `docs/OWNERSHIP.md`). The status is the one the step's request is sent in; Mark also takes the instance running (see
-    /// `before`). [`AdoptWriter::expects`] is this writer's own table.
+    /// `before`), in this table only. [`AdoptWriter::expects`] is this writer's own table.
     pub fn expect(step: AdoptStep) -> Expect {
         use AdoptStep as S;
         use ExpectClass::{Adopted, Foreign};
@@ -1122,14 +1122,20 @@ impl AdoptWriter {
         seen.devices.get(NIC) == Some(&pin_device(&self.pin))
     }
 
-    /// Refuses a read that is not in the class and the status `step` expects. Mark also takes a running instance: one started
-    /// by hand in its adoption project after a move whose outcome was not recorded is marked as it runs, and Start then finds
-    /// its outcome already holds.
+    /// Refuses a read that is not in the class and the status `step` expects. A running plan's Mark also takes a running
+    /// instance: one started by hand in its adoption project after a move whose outcome was not recorded is marked as it runs,
+    /// and Start then finds its outcome already holds. A stopped plan's Mark does not, since Mark completes its adoption: one
+    /// started since its move is stopped by hand before Mark, or released.
     fn before(&self, step: AdoptStep, seen: &Seen) -> Result<(), IncusError> {
         let expect = self.expects(step);
         if !self.class_is(seen, expect.class) {
             return Err(refused(
                 "the instance is not in the owner class the step expects",
+            ));
+        }
+        if self.pre.stopped && step == AdoptStep::Mark && seen.status != expect.status {
+            return Err(refused(
+                "the plan found the instance stopped and it is not stopped now, so Mark would complete the adoption with it running: stop it by hand first",
             ));
         }
         let running_mark = step == AdoptStep::Mark && seen.status == "Running";
