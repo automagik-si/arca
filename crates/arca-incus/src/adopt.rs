@@ -22,6 +22,10 @@
 //!
 //! Incus 7.5 runs a stopped instance's project move as a copy, which gets a new `volatile.uuid`. A move is confirmed under a
 //! new uuid only by the copy rule ([`AdoptWriter::uuid`]), and the writer then follows the new uuid.
+//!
+//! A plan that found the instance stopped ([`PreImage::stopped`]) neither stops nor starts it: its steps leave out Stop and
+//! Start, and its release ReleaseStop and ReleaseStart ([`AdoptStep::STOP_START`]). Those steps have no request in its table,
+//! so no stop or start can be sent, and every step it runs expects the instance stopped ([`AdoptWriter::expects`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -368,6 +372,15 @@ pub struct PreImage {
     pub config: BTreeMap<String, String>,
     pub devices: BTreeMap<String, BTreeMap<String, String>>,
     pub config_hash: String,
+    /// Whether the plan found the instance stopped. Its MAC is then the one Incus starts it with, and its IPv4 the one the
+    /// owner named; the adoption neither stops nor starts it, and its release leaves it stopped. Left out when false, so a
+    /// running instance's plan keeps the bytes and the digest it had before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stopped: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl PreImage {
@@ -500,21 +513,45 @@ impl AdoptStep {
         AdoptStep::ReleaseStart,
         AdoptStep::DeleteProject,
     ];
+    /// The steps that stop or start the instance. A plan that found it stopped has none of them.
+    pub const STOP_START: [AdoptStep; 4] = [
+        AdoptStep::Stop,
+        AdoptStep::Start,
+        AdoptStep::ReleaseStop,
+        AdoptStep::ReleaseStart,
+    ];
 
-    /// The adoption steps of a plan: LocalizeRoot only when the plan localizes a device.
+    /// The adoption steps of a plan that found the instance running: LocalizeRoot only when the plan localizes a device.
     pub fn adopt_steps(localize: bool) -> Vec<AdoptStep> {
+        Self::adopt_steps_of(localize, false)
+    }
+
+    /// The release steps of a plan that found the instance running: RestoreRoot only when the plan localizes a device.
+    pub fn release_steps(localize: bool) -> Vec<AdoptStep> {
+        Self::release_steps_of(localize, false)
+    }
+
+    /// The adoption steps of a plan: LocalizeRoot only when it localizes a device, and Stop and Start only when it found the
+    /// instance running.
+    pub fn adopt_steps_of(localize: bool, stopped: bool) -> Vec<AdoptStep> {
         Self::ADOPT
             .into_iter()
-            .filter(|step| localize || *step != AdoptStep::LocalizeRoot)
+            .filter(|step| step.in_plan(localize, stopped))
             .collect()
     }
 
-    /// The release steps of a plan: RestoreRoot only when the plan localizes a device.
-    pub fn release_steps(localize: bool) -> Vec<AdoptStep> {
+    /// The release steps of a plan: RestoreRoot only when it localizes a device, and ReleaseStop and ReleaseStart only when
+    /// it found the instance running.
+    pub fn release_steps_of(localize: bool, stopped: bool) -> Vec<AdoptStep> {
         Self::RELEASE
             .into_iter()
-            .filter(|step| localize || *step != AdoptStep::RestoreRoot)
+            .filter(|step| step.in_plan(localize, stopped))
             .collect()
+    }
+
+    fn in_plan(self, localize: bool, stopped: bool) -> bool {
+        let root = matches!(self, AdoptStep::LocalizeRoot | AdoptStep::RestoreRoot);
+        (localize || !root) && !(stopped && Self::STOP_START.contains(&self))
     }
 }
 
@@ -684,12 +721,17 @@ impl AdoptWriter {
 
     /// The adoption steps this writer's plan runs, in order.
     pub fn adopt_steps(&self) -> Vec<AdoptStep> {
-        AdoptStep::adopt_steps(!self.allowances.localize.is_empty())
+        AdoptStep::adopt_steps_of(!self.allowances.localize.is_empty(), self.pre.stopped)
     }
 
     /// The release steps this writer's plan runs, in order.
     pub fn release_steps(&self) -> Vec<AdoptStep> {
-        AdoptStep::release_steps(!self.allowances.localize.is_empty())
+        AdoptStep::release_steps_of(!self.allowances.localize.is_empty(), self.pre.stopped)
+    }
+
+    /// Whether this writer's plan found the instance stopped, so that it neither stops nor starts it.
+    pub fn stopped(&self) -> bool {
+        self.pre.stopped
     }
 
     /// The plan's allowances.
@@ -756,8 +798,9 @@ impl AdoptWriter {
         &self.pin
     }
 
-    /// Where, in which class and in which status `step` expects the instance (Decision table in `docs/OWNERSHIP.md`). The status
-    /// is the one the step's request is sent in; Mark also takes the instance running (see `before`).
+    /// Where, in which class and in which status `step` of a plan that found the instance running expects it (Decision table
+    /// in `docs/OWNERSHIP.md`). The status is the one the step's request is sent in; Mark also takes the instance running (see
+    /// `before`). [`AdoptWriter::expects`] is this writer's own table.
     pub fn expect(step: AdoptStep) -> Expect {
         use AdoptStep as S;
         use ExpectClass::{Adopted, Foreign};
@@ -780,10 +823,25 @@ impl AdoptWriter {
         }
     }
 
-    /// Every request `step` may send, in the order it sends them. A step sends the forced stop only under its condition.
+    /// Where, in which class and in which status `step` of this writer's plan expects the instance: [`AdoptWriter::expect`],
+    /// but a plan that found the instance stopped expects it stopped at CreateProject and DeleteProject too, since none of its
+    /// steps stops or starts it.
+    pub fn expects(&self, step: AdoptStep) -> Expect {
+        let mut expect = Self::expect(step);
+        if self.pre.stopped {
+            expect.status = "Stopped";
+        }
+        expect
+    }
+
+    /// Every request `step` may send, in the order it sends them. A step sends the forced stop only under its condition. A plan
+    /// that found the instance stopped has no request for a step that stops or starts it.
     pub fn requests(&self, step: AdoptStep) -> Vec<AdoptRequest> {
+        if self.pre.stopped && AdoptStep::STOP_START.contains(&step) {
+            return Vec::new();
+        }
         let i = &self.target.instance;
-        let project = self.side(Self::expect(step).project);
+        let project = self.side(self.expects(step).project);
         let instance = format!("/1.0/instances/{i}?project={project}");
         let state = format!("/1.0/instances/{i}/state?project={project}");
         let request = |method, path: &str, if_match, body| AdoptRequest {
@@ -879,6 +937,11 @@ impl AdoptWriter {
     /// Otherwise the step's expected project, class and status are checked, then its request is sent and its operation waited
     /// on, and the instance is read back. [`IncusError::Refused`] means nothing was sent by this step.
     pub fn run(&self, step: AdoptStep) -> Result<StepOutcome, IncusError> {
+        if self.pre.stopped && AdoptStep::STOP_START.contains(&step) {
+            return Err(refused(
+                "the plan found the instance stopped, and it neither stops nor starts it",
+            ));
+        }
         self.idle()?;
         let localizes = !self.allowances.localize.is_empty();
         match step {
@@ -1063,7 +1126,7 @@ impl AdoptWriter {
     /// by hand in its adoption project after a move whose outcome was not recorded is marked as it runs, and Start then finds
     /// its outcome already holds.
     fn before(&self, step: AdoptStep, seen: &Seen) -> Result<(), IncusError> {
-        let expect = Self::expect(step);
+        let expect = self.expects(step);
         if !self.class_is(seen, expect.class) {
             return Err(refused(
                 "the instance is not in the owner class the step expects",
@@ -1080,7 +1143,7 @@ impl AdoptWriter {
 
     /// The instance read in the step's own project, which it must be in.
     fn located(&self, step: AdoptStep) -> Result<Seen, IncusError> {
-        self.read_in(self.side(Self::expect(step).project))?
+        self.read_in(self.side(self.expects(step).project))?
             .ok_or_else(|| refused("the instance is not in the project the step expects"))
     }
 
@@ -1173,8 +1236,8 @@ impl AdoptWriter {
         }
     }
 
-    /// DeleteProject, the release's last step: deletes the adoption project once the instance is back in `default` and
-    /// running, and the project holds no instance. A project already gone is the step done; one that is not this adoption's,
+    /// DeleteProject, the release's last step: deletes the adoption project once the instance is back in `default`, running
+    /// (stopped, for a plan that found it stopped), and the project holds no instance. A project already gone is the step done; one that is not this adoption's,
     /// or that still holds an instance, is refused.
     fn delete_project(&self) -> Result<StepOutcome, IncusError> {
         match self.project_is_ours()? {
@@ -1457,7 +1520,7 @@ impl AdoptWriter {
             AdoptStep::RestoreRoot => self.send_all(step, Some(&seen.etag), Some(&seen.body))?,
             _ => self.send_all(step, None, None)?,
         }
-        let project = self.side(Self::expect(step).project).to_string();
+        let project = self.side(self.expects(step).project).to_string();
         let back = self.read_in(&project);
         let confirmed = match &back {
             Ok(Some(seen)) => self.done(step, seen).unwrap_or(false),
@@ -1489,7 +1552,7 @@ impl AdoptWriter {
                 Err(error) => return Err(error),
             }
         }
-        let project = self.side(Self::expect(step).project).to_string();
+        let project = self.side(self.expects(step).project).to_string();
         match self.read_in(&project) {
             Ok(Some(seen)) if self.done(step, &seen)? => Ok(StepOutcome::Sent),
             _ => Err(self.unconfirmed(
@@ -1763,6 +1826,11 @@ mod tests {
     use crate::fake::{FakeIncus, FakeState};
 
     fn writer(socket: PathBuf) -> AdoptWriter {
+        writer_of(socket, false)
+    }
+
+    /// The writer of a plan that found the instance running, or, when `stopped`, stopped.
+    fn writer_of(socket: PathBuf, stopped: bool) -> AdoptWriter {
         let device = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs
                 .iter()
@@ -1781,6 +1849,7 @@ mod tests {
                 device(&[("type", "nic"), ("name", NIC), ("network", "br1")]),
             )]),
             config_hash: String::new(),
+            stopped,
         };
         let target = AdoptTarget {
             instance: "svc1".to_string(),
@@ -1922,6 +1991,48 @@ mod tests {
         // root is in its table.
         assert!(writer.requests(AdoptStep::LocalizeRoot).is_empty());
         assert!(writer.requests(AdoptStep::RestoreRoot).is_empty());
+        assert!(
+            fake.requests().is_empty(),
+            "no byte reached the fake: {:?}",
+            fake.requests()
+        );
+        drop(fake);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stopped_plan_refuses_a_running_plans_stop_and_start_requests_before_any_byte_is_sent() {
+        let dir = std::env::temp_dir().join(format!("arca-adopt-stopped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the directory");
+        let state = FakeState {
+            server: json!({}),
+            projects: vec![json!({ "name": "default", "config": {} })],
+            instances: Vec::new(),
+            pools: Vec::new(),
+            networks: Vec::new(),
+        };
+        let fake = FakeIncus::start(&dir, state).expect("the fake");
+        let running = writer(fake.socket().to_path_buf());
+        let stopped = writer_of(fake.socket().to_path_buf(), true);
+        let mut checked = 0;
+        for step in [
+            AdoptStep::Stop,
+            AdoptStep::Start,
+            AdoptStep::ReleaseStop,
+            AdoptStep::ReleaseStart,
+        ] {
+            assert!(stopped.requests(step).is_empty(), "{step:?}");
+            for request in running.requests(step) {
+                let sent = stopped.send(&request, None, None);
+                assert!(
+                    matches!(sent, Err(IncusError::Refused(_))),
+                    "{request:?}: {sent:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 6, "two stops and a start, adopting and releasing");
         assert!(
             fake.requests().is_empty(),
             "no byte reached the fake: {:?}",

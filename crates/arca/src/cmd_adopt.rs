@@ -1,19 +1,22 @@
 //! `arca adopt`: takes one allowlisted container from the default project into its own kernel project, and back.
 //!
 //! - `plan --instance <i> --expect-ip <ipv4> --json --config <f>` runs the preflight with GET alone and prints the plan, its
-//!   digest and every request the adoption would send.
-//! - `apply --instance <i> --plan-digest <hex> [--dry-run] --config <f>` takes a fresh plan, whose digest must be the one given,
-//!   then takes the state directory's lock and runs the steps through the adoption writer, recording each in the adoption
-//!   record. When the record holds this instance's adoption unfinished, it resumes from the recorded plan instead, whose digest
-//!   must be the one given, and runs no preflight. `--dry-run` takes no lock and sends no write: it prints the plan, or the steps
-//!   left, and their requests.
+//!   digest and every request the adoption would send. A running instance's IPv4 is its live one, which `--expect-ip` must
+//!   name; a stopped instance shows none, so its plan pins the one `--expect-ip` names, and neither stops nor starts it.
+//! - `apply --instance <i> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] --config <f>` takes a fresh plan, whose digest
+//!   must be the one given, then takes the state directory's lock and runs the steps through the adoption writer, recording
+//!   each in the adoption record. A fresh plan of a stopped instance needs `--expect-ip`. When the record holds this instance's
+//!   adoption unfinished, it resumes from the recorded plan instead, whose digest must be the one given, and runs no preflight.
+//!   `--dry-run` takes no lock and sends no write: it prints the plan, or the steps left, and their requests.
 //! - `release --instance <i> [--dry-run] --config <f>` returns the recorded adoption to the default project from wherever its
 //!   record stands, keeping the pin and the snapshot, takes back off a root the adoption made the instance's own, and deletes
 //!   the adoption project. It refuses before any step when the instance has lost its pin, or when the profiles no longer give
 //!   the root it would take off.
 //! - `verify --instance <i> (--port <n> [--http-path <p>] | --url <http url>) [--wait <s>] --config <f>` checks the live MAC
 //!   and IPv4 against the pre-image and that the service answers: below 500 on `<ipv4>:<port>`, or 2xx or 3xx through the
-//!   URL, trying again for up to `--wait` seconds (60 by default).
+//!   URL, trying again for up to `--wait` seconds (60 by default). An adoption whose plan found the instance stopped takes
+//!   neither `--port` nor `--url` and probes nothing: it checks the move, the mark and the pin, and that the instance is
+//!   stopped ([`verify_stopped`]). A URL's query is never shown, since it may carry a secret.
 //! - `status --instance <i> --json --config <f>` prints the record's plan and last step, and where the instance is now.
 //!
 //! A refusal before any write exits 2 ([`Failure::Refused`]): an instance the config does not list, a preflight check, a stale
@@ -78,7 +81,11 @@ pub fn adopt_halting(argv: &[String], halt: Halt<'_>) -> Result<Option<Value>, F
             &["json"],
         )?),
         "apply" => apply(
-            &parse_flags(rest, &["instance", "plan-digest", "config"], &["dry-run"])?,
+            &parse_flags(
+                rest,
+                &["instance", "plan-digest", "expect-ip", "config"],
+                &["dry-run"],
+            )?,
             halt,
         ),
         "release" => release(
@@ -140,9 +147,21 @@ fn plan(flags: &Flags) -> Result<Option<Value>, Failure> {
     describe(&cfg, &target, &found, false)
 }
 
+/// The IPv4 `--expect-ip` names, when it is given.
+fn expect_ip(flags: &Flags) -> Result<Option<Ipv4Addr>, Failure> {
+    flags
+        .value("expect-ip")
+        .map(|text| {
+            text.parse()
+                .map_err(|_| Failure::Usage("--expect-ip is an IPv4 address".to_string()))
+        })
+        .transpose()
+}
+
 fn apply(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
     let (cfg, target) = setup(flags)?;
     let digest = flags.required("plan-digest")?;
+    let expect = expect_ip(flags)?;
     let dry_run = flags.switch("dry-run");
     // The lock is taken before anything is judged, so no server or second apply changes the state directory meanwhile.
     let _lock = if dry_run {
@@ -160,10 +179,10 @@ fn apply(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
     // An open adoption goes on from its record, and a complete one is complete again with no write: a run killed after its
     // last outcome line cannot tell it finished.
     if !open.is_empty() || record.complete(&target.instance) {
-        return resume(&cfg, &target, record, digest, dry_run, halt);
+        return resume(&cfg, &target, record, digest, expect, dry_run, halt);
     }
     let read = UnixIncus::new(cfg.incus.socket.clone());
-    let found = preflight(&read, &cfg, &target, None)?;
+    let found = preflight(&read, &cfg, &target, expect)?;
     if found.plan.digest != digest {
         return Err(refuse(
             "the plan digest is stale: it is not the digest of the plan the instance gives now",
@@ -190,13 +209,15 @@ fn apply(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
 }
 
 /// Goes on with the open adoption of `target` from its recorded plan, never a fresh preflight: once the instance has moved,
-/// a preflight would refuse it. The digest must be the recorded plan's, and a release that has begun is finished by
-/// `release`, not undone here. Each step is checked by the writer against the recorded pre-image and the step table.
+/// a preflight would refuse it. The digest must be the recorded plan's, and so must the IPv4 `expect` names, when given; a
+/// release that has begun is finished by `release`, not undone here. Each step is checked by the writer against the recorded
+/// pre-image and the step table.
 fn resume(
     cfg: &NodeConfig,
     target: &AdoptTarget,
     mut record: AdoptionRecord,
     digest: &str,
+    expect: Option<Ipv4Addr>,
     dry_run: bool,
     halt: Halt<'_>,
 ) -> Result<Option<Value>, Failure> {
@@ -204,6 +225,11 @@ fn resume(
     if plan.digest != digest {
         return Err(refuse(
             "the plan digest is not the digest of the recorded plan this adoption resumes",
+        ));
+    }
+    if expect.is_some_and(|ip| ip != plan.pre_image.ipv4) {
+        return Err(refuse(
+            "--expect-ip names an IPv4 other than the one the recorded plan this adoption resumes pins",
         ));
     }
     let last = record.last(&target.instance);
@@ -261,6 +287,9 @@ fn release(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
     let last = record.last(&target.instance);
     let steps = release_steps(&plan, last);
     let writer = writer(&cfg, &target, &plan, &recorded_uuid(&record, &plan))?;
+    if plan.stopped() && !steps.is_empty() {
+        still_stopped(&cfg, &target, steps.contains(&AdoptStep::MoveBack))?;
+    }
     if steps.contains(&AdoptStep::MoveBack) {
         pin_kept(&cfg, &target, &writer)?;
         // The instance is still in its adoption project, so Move found its root localized: RestoreRoot will take it off,
@@ -299,6 +328,36 @@ fn release(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
         "instance": target.instance, "to": target.to, "digest": plan.digest,
         "steps": ran, "released": true,
     })))
+}
+
+/// Refuses, with GET alone and before any step, a release of an adoption planned stopped while the instance is not stopped
+/// where the release finds it: in its adoption project when `moves_back`, else in `default`. Such a release neither stops nor
+/// starts the instance, so Unmark or DeleteProject would refuse it part way. An instance not there is left to the steps.
+fn still_stopped(cfg: &NodeConfig, target: &AdoptTarget, moves_back: bool) -> Result<(), Failure> {
+    let project = if moves_back {
+        target.to.as_str()
+    } else {
+        SOURCE_PROJECT
+    };
+    let read = UnixIncus::new(cfg.incus.socket.clone());
+    let body = match read.get(&format!(
+        "/1.0/instances/{}?project={project}",
+        target.instance
+    )) {
+        Ok(body) => body,
+        Err(IncusError::Status { code: 404, .. }) => return Ok(()),
+        Err(error) => {
+            return Err(Failure::Runtime(format!(
+                "the release's status read failed: {error}"
+            )));
+        }
+    };
+    if body["status"] != "Stopped" {
+        return Err(refuse(format!(
+            "the instance is not stopped in {project}, and the release of an adoption planned stopped neither stops nor starts it: stop it, then release; the release changes nothing"
+        )));
+    }
+    Ok(())
 }
 
 /// Refuses, with GET alone and before any step, a release whose instance is in its adoption project without the pin. MoveBack
@@ -575,6 +634,67 @@ fn verify_failed(why: String) -> Failure {
     Failure::Runtime(format!("verify failed: {why}"))
 }
 
+/// Checks, with GET alone, an adoption whose plan found the instance stopped. A stopped instance answers nothing, so nothing is
+/// probed. The instance is a container in `project` under `uuid`, the one the record holds last: the move. It carries this
+/// adoption's mark in its adoption project, and no key in the kernel's namespace in `default` after a release: the mark. Its
+/// own `eth0` is the pin of the pre-image's MAC and IPv4: the pin. And it is still stopped, as the adoption left it. Every
+/// failed check is a runtime failure that names it.
+pub fn verify_stopped(
+    read: &dyn IncusRead,
+    plan: &AdoptionPlan,
+    uuid: &str,
+    project: &str,
+) -> Result<(), Failure> {
+    let failed = |why: &str| verify_failed(why.to_string());
+    let read_failed =
+        |error: IncusError| Failure::Runtime(format!("the verify read failed: {error}"));
+    let i = &plan.instance;
+    let body = match read.get(&format!("/1.0/instances/{i}?project={project}")) {
+        Ok(body) => body,
+        Err(IncusError::Status { code: 404, .. }) => {
+            return Err(verify_failed(format!(
+                "the instance is not in project {project}"
+            )));
+        }
+        Err(error) => return Err(read_failed(error)),
+    };
+    if body["type"] != "container" || body["config"]["volatile.uuid"].as_str() != Some(uuid) {
+        return Err(failed("the instance is not the one the plan recorded"));
+    }
+    let config = text_map(&body["config"]).unwrap_or_default();
+    let entry = format!("{ADOPT_ENTRY_PREFIX}{i}");
+    let class = classify(&config, &BTreeMap::new());
+    if project == plan.to {
+        if !matches!(&class, OwnerClass::Kernel { entry: owner } if owner.0 == entry) {
+            return Err(failed(
+                "the instance does not carry this adoption's mark in its adoption project",
+            ));
+        }
+    } else if class != OwnerClass::Foreign
+        || config.keys().any(|key| key.starts_with(KERNEL_NAMESPACE))
+    {
+        return Err(failed("the released instance still carries a kernel mark"));
+    }
+    let pin = plan
+        .pre_image
+        .pin()
+        .ok_or_else(|| failed("the plan names no network on eth0"))?;
+    let eth0 = devices_of(body.get("devices"))
+        .map_err(read_failed)?
+        .remove(NIC);
+    if eth0 != Some(pin_device(&pin)) {
+        return Err(failed(
+            "the instance's own eth0 is not the pin of the pre-image's MAC and IPv4",
+        ));
+    }
+    if body["status"] != "Stopped" {
+        return Err(failed(
+            "the instance is not stopped, as its adoption left it, and verify probes nothing for an adoption planned stopped",
+        ));
+    }
+    Ok(())
+}
+
 fn verified(plan: &AdoptionPlan, http_status: u16) -> Verified {
     Verified {
         mac: plan.pre_image.mac.clone(),
@@ -585,7 +705,8 @@ fn verified(plan: &AdoptionPlan, http_status: u16) -> Verified {
 
 /// An `http://` URL that `verify --url` gets: the host as given (a name, an IPv4 address or a bracketed IPv6 address), the
 /// port (80 when the URL names none) and the path with its query (`/` when the URL names none). It holds no user info and no
-/// fragment, and the path is visible ASCII only, so nothing past the request line can reach the request.
+/// fragment, and the path is visible ASCII only, so nothing past the request line can reach the request. The request carries
+/// the query, but the URL as shown, in a message or an answer, gives it as `?…`, since it may carry a secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpUrl {
     pub host: String,
@@ -680,8 +801,12 @@ impl HttpUrl {
 }
 
 impl fmt::Display for HttpUrl {
+    /// The URL with its query, when it has one, shown as `?…`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "http://{}{}", self.authority(), self.path)
+        match self.path.split_once('?') {
+            Some((path, _)) => write!(f, "http://{}{path}?…", self.authority()),
+            None => write!(f, "http://{}{}", self.authority(), self.path),
+        }
     }
 }
 
@@ -878,17 +1003,21 @@ fn check_http_path(path: &str) -> Result<(), Failure> {
     }
 }
 
-/// `verify --instance <i> (--port <n> [--http-path <p>] | --url <http url>) [--wait <s>] --config <f>`: runs [`verify_until`],
-/// or [`verify_url_until`] for a URL, where the record says
-/// the instance is, in its adoption project after an adoption and in `default` after a release, for up to `--wait` seconds
-/// (60 when not given, at most 3600). It takes no lock and sends no write. An adoption that is neither complete nor released
-/// in full is refused.
 /// What `verify` probes after the instance checks: a port of the instance's IPv4 and a path, or a URL.
 enum Service<'a> {
     Port(u16, &'a str),
     Url(HttpUrl),
 }
 
+fn one_of_port_and_url() -> Failure {
+    Failure::Usage("exactly one of --port and --url is required".to_string())
+}
+
+/// `verify --instance <i> [--port <n> [--http-path <p>] | --url <http url>] [--wait <s>] --config <f>`: runs [`verify_until`],
+/// or [`verify_url_until`] for a URL, where the record says the instance is, in its adoption project after an adoption and in
+/// `default` after a release, for up to `--wait` seconds (60 when not given, at most 3600). An adoption whose plan found the
+/// instance stopped is checked by [`verify_stopped`] instead, once, and takes neither `--port` nor `--url`; any other takes
+/// exactly one. It takes no lock and sends no write. An adoption that is neither complete nor released in full is refused.
 fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
     let (cfg, target) = setup(flags)?;
     let service = match (flags.value("port"), flags.value("url")) {
@@ -900,7 +1029,7 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
                 .ok_or_else(port_usage)?;
             let path = flags.value("http-path").unwrap_or("/");
             check_http_path(path)?;
-            Service::Port(port, path)
+            Some(Service::Port(port, path))
         }
         (None, Some(url)) => {
             if flags.value("http-path").is_some() {
@@ -908,13 +1037,10 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
                     "--http-path goes with --port: a --url carries its own path".to_string(),
                 ));
             }
-            Service::Url(HttpUrl::parse(url)?)
+            Some(Service::Url(HttpUrl::parse(url)?))
         }
-        _ => {
-            return Err(Failure::Usage(
-                "exactly one of --port and --url is required".to_string(),
-            ));
-        }
+        (None, None) if flags.value("http-path").is_none() => None,
+        _ => return Err(one_of_port_and_url()),
     };
     let wait = match flags.value("wait") {
         None => VERIFY_WAIT,
@@ -931,6 +1057,16 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     let record = AdoptionRecord::open(&cfg.state_dir)?;
     let plan = recorded_plan(&record, &target)?;
+    let service = match (service, plan.stopped()) {
+        (Some(service), false) => Some(service),
+        (None, false) => return Err(one_of_port_and_url()),
+        (Some(_), true) => {
+            return Err(Failure::Usage(
+                "the adoption left the instance stopped, so verify probes nothing: leave out --port and --url".to_string(),
+            ));
+        }
+        (None, true) => None,
+    };
     let project = if record.complete(&target.instance) {
         target.to.as_str()
     } else if record.released(&target.instance) {
@@ -943,6 +1079,13 @@ fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     let read = UnixIncus::new(cfg.incus.socket.clone());
     let uuid = recorded_uuid(&record, &plan);
+    let Some(service) = service else {
+        verify_stopped(&read, &plan, &uuid, project)?;
+        return Ok(Some(json!({
+            "instance": target.instance, "project": project, "mac": plan.pre_image.mac,
+            "ipv4": plan.pre_image.ipv4.to_string(), "stopped": true, "probed": false, "verified": true,
+        })));
+    };
     let mut answer = match &service {
         Service::Port(port, path) => {
             let verified = verify_until(
@@ -1092,6 +1235,11 @@ fn lock_failure(error: KernelError) -> Failure {
 /// ([`needed_allowances`]); that has a backup; that an operation is running on; or whose adoption project exists but is not
 /// empty and marked for it.
 ///
+/// A stopped instance has no running MAC or IPv4 ([`stopped_ipv4`]): its MAC is the one Incus starts it with, eth0's own
+/// `hwaddr`, else its `volatile.eth0.hwaddr`; its IPv4 is `expect_ip`, which is required, and which must be eth0's
+/// `ipv4.address` when it sets one and the address of each static lease the network lists for the MAC. Its plan says it was
+/// stopped, so the adoption neither stops nor starts it. Any other status is judged as a running instance is.
+///
 /// The plan's allowances are what the instance already uses: the `restricted.*` keys [`needed_allowances`] maps its config and
 /// devices to, the grant of `eth0`'s network when `kernel.attachNetworks` does not list it, and its root, when the default
 /// profile gives it, to localize.
@@ -1196,43 +1344,21 @@ pub fn preflight(
     // The MAC is eth0's own hwaddr when it sets one, for which Incus keeps no volatile key, else its volatile key.
     let volatile = own.get(&format!("volatile.{NIC}.hwaddr"));
     let mac = nic.get("hwaddr").or(volatile).cloned().unwrap_or_default();
-    let state = read
+    let stopped = body["status"] == "Stopped";
+    let ipv4 = if stopped {
+        stopped_ipv4(nic, volatile, &mac, expect_ip)?
+    } else {
+        running_ipv4(read, i, nic, volatile, &mac, expect_ip)?
+    };
+    let leases = read
         .get(&format!(
-            "/1.0/instances/{i}/state?project={SOURCE_PROJECT}"
+            "/1.0/networks/{network}/leases?project={SOURCE_PROJECT}"
         ))
         .map_err(read_failure)?;
-    let live = &state["network"][NIC];
-    if !mac_ok(&mac) || live["hwaddr"].as_str() != Some(mac.as_str()) {
-        return Err(refuse(
-            "the instance has no MAC: neither eth0's hwaddr nor its volatile.eth0.hwaddr is set and is its running MAC",
-        ));
+    if stopped {
+        static_lease_agrees(&leases, &network, &mac, ipv4)?;
     }
-    let addresses: Vec<Ipv4Addr> = live["addresses"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|address| address["family"] == "inet" && address["scope"] == "global")
-        .filter_map(|address| address["address"].as_str()?.parse().ok())
-        .collect();
-    let ipv4 = match (addresses.as_slice(), expect_ip) {
-        ([one], Some(expect)) if *one == expect => *one,
-        ([one], None) => *one,
-        _ => {
-            return Err(refuse(
-                "the instance's IPv4 is not the one --expect-ip names",
-            ));
-        }
-    };
-    if volatile.is_some_and(|hwaddr| *hwaddr != mac)
-        || nic
-            .get("ipv4.address")
-            .is_some_and(|address| *address != ipv4.to_string())
-    {
-        return Err(refuse(
-            "the instance's eth0 sets a hwaddr or an ipv4.address other than its running MAC and IPv4",
-        ));
-    }
-    claimed(read, target, &network, &mac, ipv4)?;
+    claimed(read, target, &leases, &mac, ipv4)?;
     if !running_on(read, IncusKind::Instance, SOURCE_PROJECT, None, i)
         .map_err(read_failure)?
         .is_empty()
@@ -1261,6 +1387,7 @@ pub fn preflight(
         config_hash: arca_watch::config_hash(&own),
         config,
         devices: expanded.clone(),
+        stopped,
     };
     let facts = Facts {
         snapshots,
@@ -1305,20 +1432,123 @@ fn moved_intact(
     Ok(())
 }
 
-/// Refuses an IPv4 that another MAC's lease, or another instance's device, claims.
-fn claimed(
+/// A running instance's IPv4, and the checks that its live MAC is `mac`: `eth0`'s state must show `mac` and exactly one global
+/// IPv4, which `expect_ip` must name when given, and `eth0`'s volatile MAC and `ipv4.address`, when set, must be those.
+fn running_ipv4(
     read: &dyn IncusRead,
-    target: &AdoptTarget,
+    i: &str,
+    nic: &BTreeMap<String, String>,
+    volatile: Option<&String>,
+    mac: &str,
+    expect_ip: Option<Ipv4Addr>,
+) -> Result<Ipv4Addr, Failure> {
+    let state = read
+        .get(&format!(
+            "/1.0/instances/{i}/state?project={SOURCE_PROJECT}"
+        ))
+        .map_err(read_failure)?;
+    let live = &state["network"][NIC];
+    if !mac_ok(mac) || live["hwaddr"].as_str() != Some(mac) {
+        return Err(refuse(
+            "the instance has no MAC: neither eth0's hwaddr nor its volatile.eth0.hwaddr is set and is its running MAC",
+        ));
+    }
+    let addresses: Vec<Ipv4Addr> = live["addresses"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|address| address["family"] == "inet" && address["scope"] == "global")
+        .filter_map(|address| address["address"].as_str()?.parse().ok())
+        .collect();
+    let ipv4 = match (addresses.as_slice(), expect_ip) {
+        ([one], Some(expect)) if *one == expect => *one,
+        ([one], None) => *one,
+        _ => {
+            return Err(refuse(
+                "the instance's IPv4 is not the one --expect-ip names",
+            ));
+        }
+    };
+    if volatile.is_some_and(|hwaddr| hwaddr != mac)
+        || nic
+            .get("ipv4.address")
+            .is_some_and(|address| *address != ipv4.to_string())
+    {
+        return Err(refuse(
+            "the instance's eth0 sets a hwaddr or an ipv4.address other than its running MAC and IPv4",
+        ));
+    }
+    Ok(ipv4)
+}
+
+/// A stopped instance's IPv4, and the checks that `mac` is the MAC Incus starts it with: `eth0`'s own `hwaddr`, else its
+/// `volatile.eth0.hwaddr`, which must agree when both are set. A stopped instance shows no address, so the IPv4 is
+/// `expect_ip`, which is required, and which `eth0`'s `ipv4.address` must be when it sets one.
+fn stopped_ipv4(
+    nic: &BTreeMap<String, String>,
+    volatile: Option<&String>,
+    mac: &str,
+    expect_ip: Option<Ipv4Addr>,
+) -> Result<Ipv4Addr, Failure> {
+    if !mac_ok(mac) {
+        return Err(refuse(
+            "the stopped instance has no MAC: neither eth0's hwaddr nor its volatile.eth0.hwaddr is a plain MAC",
+        ));
+    }
+    if volatile.is_some_and(|hwaddr| hwaddr != mac) {
+        return Err(refuse(
+            "the stopped instance's eth0 sets a hwaddr other than its volatile.eth0.hwaddr",
+        ));
+    }
+    let ipv4 = expect_ip.ok_or_else(|| {
+        refuse(
+            "the instance is stopped and shows no IPv4: pass --expect-ip with the address its adoption pins",
+        )
+    })?;
+    if nic
+        .get("ipv4.address")
+        .is_some_and(|address| *address != ipv4.to_string())
+    {
+        return Err(refuse(
+            "the stopped instance's eth0 sets an ipv4.address other than the one --expect-ip names",
+        ));
+    }
+    Ok(ipv4)
+}
+
+/// Refuses a static lease that `network` lists for a stopped instance's `mac` at an IPv4 other than `ipv4`, which Incus would
+/// give it. A dynamic lease, or none, is no claim on its address: the pin's `ipv4.address` is what its next start leases.
+fn static_lease_agrees(
+    leases: &Value,
     network: &str,
     mac: &str,
     ipv4: Ipv4Addr,
 ) -> Result<(), Failure> {
+    let other = leases.as_array().into_iter().flatten().any(|lease| {
+        lease["hwaddr"].as_str() == Some(mac)
+            && lease["type"] == "static"
+            && lease["address"]
+                .as_str()
+                .and_then(|address| address.parse::<Ipv4Addr>().ok())
+                .is_some_and(|address| address != ipv4)
+    });
+    if other {
+        return Err(refuse(format!(
+            "a static lease on {network} gives the stopped instance's MAC an IPv4 other than the one --expect-ip names"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses an IPv4 that another MAC's lease, among the network's `leases`, or another instance's device, claims.
+fn claimed(
+    read: &dyn IncusRead,
+    target: &AdoptTarget,
+    leases: &Value,
+    mac: &str,
+    ipv4: Ipv4Addr,
+) -> Result<(), Failure> {
     let ip = ipv4.to_string();
-    let leases = read
-        .get(&format!(
-            "/1.0/networks/{network}/leases?project={SOURCE_PROJECT}"
-        ))
-        .map_err(read_failure)?;
     let leased = leases.as_array().into_iter().flatten().any(|lease| {
         lease["address"].as_str() == Some(ip.as_str()) && lease["hwaddr"].as_str() != Some(mac)
     });

@@ -35,7 +35,8 @@ pub const ADOPTIONS_FILE: &str = "adoptions.jsonl";
 /// snapshot's name and the steps. The digest is the hex SHA-256 of the plan's canonical JSON without `digest` and `snapshot`,
 /// and the snapshot's name is `arca-adopt-` and the digest's first 12 characters. So the owner who approves the digest approves
 /// the allowances with it. A plan that allows and localizes nothing leaves `allowances` out, so its digest is the one it had
-/// before plans carried them.
+/// before plans carried them. A plan that found the instance stopped says so in its pre-image ([`PreImage::stopped`]): its
+/// steps neither stop nor start it, and Mark is its last.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdoptionPlan {
@@ -52,13 +53,13 @@ pub struct AdoptionPlan {
 
 impl AdoptionPlan {
     /// The plan that adopts `target` from `pre_image` with `allowances`, with its digest and its snapshot's name. Its steps
-    /// hold LocalizeRoot only when it localizes a device.
+    /// hold LocalizeRoot only when it localizes a device, and Stop and Start only when the pre-image is of a running instance.
     pub fn new(
         target: &AdoptTarget,
         pre_image: PreImage,
         allowances: Allowances,
     ) -> Result<Self, Failure> {
-        let steps = AdoptStep::adopt_steps(!allowances.localize.is_empty());
+        let steps = AdoptStep::adopt_steps_of(!allowances.localize.is_empty(), pre_image.stopped);
         let mut plan = AdoptionPlan {
             instance: target.instance.clone(),
             from: SOURCE_PROJECT.to_string(),
@@ -99,14 +100,19 @@ impl AdoptionPlan {
         !self.allowances.localize.is_empty()
     }
 
-    /// The adoption steps a plan with these allowances runs.
-    pub fn adopt_steps(&self) -> Vec<AdoptStep> {
-        AdoptStep::adopt_steps(self.localizes())
+    /// Whether the plan found the instance stopped, so that neither its adoption nor its release stops or starts it.
+    pub fn stopped(&self) -> bool {
+        self.pre_image.stopped
     }
 
-    /// The release steps a plan with these allowances runs, in full.
+    /// The adoption steps a plan with these allowances and this pre-image runs.
+    pub fn adopt_steps(&self) -> Vec<AdoptStep> {
+        AdoptStep::adopt_steps_of(self.localizes(), self.stopped())
+    }
+
+    /// The release steps a plan with these allowances and this pre-image runs, in full.
     pub fn release_steps(&self) -> Vec<AdoptStep> {
-        AdoptStep::release_steps(self.localizes())
+        AdoptStep::release_steps_of(self.localizes(), self.stopped())
     }
 }
 
@@ -377,9 +383,16 @@ impl AdoptionRecord {
         None
     }
 
-    /// Whether the latest adoption of `instance` is complete: its Start is done.
+    /// Whether the latest adoption of `instance` is complete: the last of its plan's adoption steps is done. That is Start, or
+    /// Mark for a plan that found the instance stopped.
     pub fn complete(&self, instance: &str) -> bool {
-        self.last(instance) == Some((AdoptStep::Start, Phase::Done))
+        let Some(plan) = self.plan(instance) else {
+            return false;
+        };
+        let last = self.last(instance);
+        plan.adopt_steps()
+            .last()
+            .is_some_and(|step| last == Some((*step, Phase::Done)))
     }
 
     /// Whether the latest adoption of `instance` has been released in full: its DeleteProject is done. A release recorded
@@ -390,13 +403,9 @@ impl AdoptionRecord {
 
     /// The instances whose latest adoption has neither completed nor been released in full.
     pub fn incomplete(&self) -> Vec<String> {
-        let finished = [
-            Some((AdoptStep::Start, Phase::Done)),
-            Some((AdoptStep::DeleteProject, Phase::Done)),
-        ];
         self.instances()
             .into_iter()
-            .filter(|instance| !finished.contains(&self.last(instance)))
+            .filter(|instance| !self.complete(instance) && !self.released(instance))
             .collect()
     }
 
@@ -455,8 +464,8 @@ impl AdoptionRecord {
 }
 
 /// The adopt steps a resume runs, from the recorded last step: all of them before the first; from a step whose intent or
-/// failure is the last line, that step again; and after a done step, the ones after it. A release step, or a plan whose steps
-/// are not the ones its allowances give, leaves nothing to resume.
+/// failure is the last line, that step again; and after a done step, the ones after it. A release step, a step the plan does not
+/// have, or a plan whose steps are not the ones its allowances and its pre-image give, leaves nothing to resume.
 pub fn resume_steps(plan: &AdoptionPlan, last: Option<(AdoptStep, Phase)>) -> Vec<AdoptStep> {
     if plan.steps != plan.adopt_steps() {
         return Vec::new();
@@ -475,8 +484,8 @@ pub fn resume_steps(plan: &AdoptionPlan, last: Option<(AdoptStep, Phase)>) -> Ve
 /// RestoreRoot, ReleaseStart and DeleteProject are left: a root LocalizeRoot may have made its own comes back off, and the
 /// project goes. After Move, MoveBack is the first; after Mark, Unmark comes before it; and after Start, the whole release
 /// runs. Within a release, a step whose intent or failure is the last line runs again. A plan that localizes nothing has no
-/// RestoreRoot. Each step still reads first and sends nothing when its outcome holds, so a step that may or may not have
-/// landed is safe to list.
+/// RestoreRoot, and one that found the instance stopped has no ReleaseStop and no ReleaseStart. Each step still reads first and
+/// sends nothing when its outcome holds, so a step that may or may not have landed is safe to list.
 pub fn release_steps(plan: &AdoptionPlan, last: Option<(AdoptStep, Phase)>) -> Vec<AdoptStep> {
     use AdoptStep as S;
     let from = match last {
@@ -497,11 +506,11 @@ pub fn release_steps(plan: &AdoptionPlan, last: Option<(AdoptStep, Phase)>) -> V
             }
         }
     };
-    let localizes = plan.localizes();
+    let planned = plan.release_steps();
     AdoptStep::RELEASE[from..]
         .iter()
         .copied()
-        .filter(|step| localizes || *step != S::RestoreRoot)
+        .filter(|step| planned.contains(step))
         .collect()
 }
 
@@ -553,6 +562,7 @@ mod tests {
             config: BTreeMap::new(),
             devices: BTreeMap::new(),
             config_hash: String::new(),
+            stopped: false,
         };
         let target = AdoptTarget {
             instance: "svc1".to_string(),
@@ -702,5 +712,67 @@ mod tests {
                 .expect("decodes");
         assert_eq!(decoded, localizing);
         assert!(decoded.verify());
+    }
+
+    /// A running instance's plan, as the record held it before stopped instances could be planned: one that localizes nothing
+    /// and one that localizes the root.
+    const RECORDED_PLAIN: &str = r#"{"instance":"svc1","from":"default","to":"arcak-adopt-svc1","preImage":{"uuid":"00000000-0000-4000-8000-0000000000a1","createdAt":"2026-01-01T00:00:00Z","mac":"10:66:6a:00:00:01","ipv4":"192.0.2.131","profiles":["default"],"config":{"image.os":"debian"},"devices":{"eth0":{"name":"eth0","network":"br1","type":"nic"},"root":{"path":"/","pool":"pool1","size":"60GiB","type":"disk"}},"configHash":"0000000000000000000000000000000000000000000000000000000000000000"},"snapshot":"arca-adopt-e7f71f3818da","steps":["createProject","stop","snapshot","pinNic","move","mark","start"],"digest":"e7f71f3818da2cbfb2e83ab0eb739b683a129f5301e521a16b83a7bb708bd90a"}"#;
+    const RECORDED_ROOTED: &str = r#"{"instance":"svc1","from":"default","to":"arcak-adopt-svc1","preImage":{"uuid":"00000000-0000-4000-8000-0000000000a1","createdAt":"2026-01-01T00:00:00Z","mac":"10:66:6a:00:00:01","ipv4":"192.0.2.131","profiles":["default"],"config":{"image.os":"debian"},"devices":{"eth0":{"name":"eth0","network":"br1","type":"nic"},"root":{"path":"/","pool":"pool1","size":"60GiB","type":"disk"}},"configHash":"0000000000000000000000000000000000000000000000000000000000000000"},"allowances":{"localize":{"root":{"path":"/","pool":"pool1","size":"60GiB","type":"disk"}}},"snapshot":"arca-adopt-b4cd1ab66f2f","steps":["createProject","stop","snapshot","pinNic","localizeRoot","move","mark","start"],"digest":"b4cd1ab66f2fda0460301b182e1a0b499cabd817f710681b0a4a69b348f64a2a"}"#;
+
+    #[test]
+    fn a_running_plan_keeps_its_digest_and_a_recorded_plan_stays_valid() {
+        let target = AdoptTarget {
+            instance: "svc1".to_string(),
+            to: "arcak-adopt-svc1".to_string(),
+        };
+        for recorded in [RECORDED_PLAIN, RECORDED_ROOTED] {
+            let old: AdoptionPlan =
+                serde_json::from_str(recorded).expect("the recorded plan decodes");
+            assert!(old.verify(), "its digest is still its own");
+            assert!(!old.pre_image.stopped);
+            assert_eq!(
+                old.steps,
+                old.adopt_steps(),
+                "its steps are still the ones it runs"
+            );
+            assert!(old.steps.contains(&AdoptStep::Stop) && old.steps.contains(&AdoptStep::Start));
+            // The same pre-image and allowances plan again to the same bytes and the same digest.
+            let again = AdoptionPlan::new(&target, old.pre_image.clone(), old.allowances.clone())
+                .expect("the plan");
+            assert_eq!(serde_json::to_string(&again).expect("serializes"), recorded);
+            assert_eq!(again.digest, old.digest);
+        }
+
+        // A record that holds the old plan line and its steps through Start reads as complete, and a release of it runs in full.
+        let state = dir("old-record");
+        let path = state.join(ADOPTIONS_FILE);
+        let mut lines = format!("{{\"kind\":\"plan\",\"plan\":{RECORDED_PLAIN}}}\n");
+        for step in [
+            "createProject",
+            "stop",
+            "snapshot",
+            "pinNic",
+            "move",
+            "mark",
+            "start",
+        ] {
+            for phase in ["intent", "done"] {
+                lines.push_str(&format!(
+                    "{{\"kind\":\"step\",\"instance\":\"svc1\",\"step\":\"{step}\",\"phase\":\"{phase}\"}}\n"
+                ));
+            }
+        }
+        fs::write(&path, lines).expect("the record");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+        let record = AdoptionRecord::open(&state).expect("the old record opens");
+        let plan = record.plan("svc1").expect("the plan");
+        assert!(plan.verify());
+        assert!(record.complete("svc1"));
+        assert!(record.incomplete().is_empty());
+        assert_eq!(
+            release_steps(&plan, record.last("svc1")),
+            AdoptStep::release_steps(false)
+        );
+        let _ = fs::remove_dir_all(&state);
     }
 }

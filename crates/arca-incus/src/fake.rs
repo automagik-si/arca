@@ -46,7 +46,9 @@
 //! or stops the instance as an operation. A graceful stop can be made to outlast its timeout ([`FakeIncus::hang_stop`]), and
 //! then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`, else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
-//! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). Snapshots and backups are
+//! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). A lease a start pins, or one
+//! [`FakeIncus::set_static_lease`] gives, is listed as static, as Incus lists the lease a NIC's `ipv4.address` names; any other
+//! as dynamic. Snapshots and backups are
 //! served under `/1.0/instances/<i>/snapshots` and `/1.0/instances/<i>/backups`. A POST to an instance moves it to the project
 //! its body names: it must be stopped, the target project must exist, and, as on Incus 7.5, the move is a copy that gets a new
 //! `volatile.uuid`. When a PATCH or a move takes a device out of the expanded devices, or changes it in more than its addresses, the fake clears that device's `volatile.<dev>.*` keys as Incus's `deviceVolatileReset`
@@ -522,6 +524,12 @@ impl FakeIncus {
     /// Gives `mac` the lease of `address` on `network`, replacing any lease the MAC held.
     pub fn set_lease(&self, network: &str, mac: &str, address: &str) {
         lock(&self.shared.store).lease(network, mac, address, false);
+    }
+
+    /// Gives `mac` the static lease of `address` on `network`, as Incus lists one for a NIC whose `ipv4.address` names the
+    /// address, replacing any lease the MAC held. It shows as `"type": "static"` in the network's lease listing.
+    pub fn set_static_lease(&self, network: &str, mac: &str, address: &str) {
+        lock(&self.shared.store).lease(network, mac, address, true);
     }
 
     /// Every lease, as its network, its MAC and its address, in the order they were made.

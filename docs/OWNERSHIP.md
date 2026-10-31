@@ -604,6 +604,17 @@ adoption project (Rule 44). Foreign means no owner's mark and no key in the kern
 | ReleaseStart | as Start, in `default` | `default`, Foreign, Stopped | Running |
 | DeleteProject | `DELETE /1.0/projects/<to>` | `default`, Foreign, Running; the project marked for this adoption and holding no instance | the project is gone |
 
+A plan that found the instance stopped says so in its pre-image (`stopped`, left out of a running instance's plan, so that
+plan keeps the bytes and the digest it had before). It has no Stop, Start, ReleaseStop or ReleaseStart: those steps have no
+request in its table, so a stop or a start is refused before any byte is sent, and the writer refuses to run them. Every step
+it runs expects the instance Stopped, CreateProject and DeleteProject included (`AdoptWriter::expects`), so a plan of a stopped
+instance refuses one started since, and a plan of a running one refuses one stopped since. Mark is its last adoption step, and
+the adoption is complete once Mark is done. Its pin is the MAC Incus starts the instance with, `eth0`'s own `hwaddr` or else
+its `volatile.eth0.hwaddr`, and the IPv4 the owner names with `--expect-ip`, which `eth0`'s `ipv4.address` and any static lease
+the network lists for that MAC must agree with; a dynamic lease, or none, is no claim. A release of it refuses, before any
+step, an instance that is not stopped where the release finds it, and leaves the instance stopped in `default`. `verify` probes
+nothing for it: it checks the move, the mark and the pin, and that the instance is stopped.
+
 The plan's allowances are what the container already uses, mapped to Incus 7.5's `restricted.*` keys by
 `adopt::needed_allowances` (the table is in [`OPERATING.md`](OPERATING.md), "Adopting a container"): the project is created
 with `restricted=true`, the base keys and exactly those, and the writer refuses allowances that are not exactly the
@@ -642,7 +653,7 @@ hand in `to` after a Move whose outcome was not recorded; Start then finds its o
 Source: `adopt::{AdoptWriter, Allowances, needed_allowances, adoption_project_body, pin_patch, pin_device}` in
 `crates/arca-incus/src/adopt.rs`;
 `adoptions::{AdoptionPlan, AdoptionRecord, resume_steps, release_steps}` in `crates/arca/src/adoptions.rs`;
-`cmd_adopt::{preflight, verify, verify_with, http_probe}` in `crates/arca/src/cmd_adopt.rs`; `cmd_serve::watch_handler` in
+`cmd_adopt::{preflight, verify, verify_with, verify_stopped, http_probe}` in `crates/arca/src/cmd_adopt.rs`; `cmd_serve::watch_handler` in
 `crates/arca/src/cmd_serve.rs`; the fake's stop and start, snapshots, backups, moves (copies under a new uuid), restricted
 project checks on a moved-in instance, ACL lookup, lease table and `deviceVolatileReset` in
 `crates/arca-incus/src/fake.rs`. Tests: in `crates/arca-incus/tests/adopt.rs`,
@@ -670,8 +681,13 @@ project checks on a moved-in instance, ACL lookup, lease table and `deviceVolati
 refusals, `each_thing_the_instance_already_uses_is_planned_as_exactly_its_allowance_and_the_adoption_runs`,
 `a_nic_on_a_network_attach_networks_does_not_list_is_planned_as_its_grant`,
 `an_instance_whose_nic_sets_its_ip_and_acls_and_whose_root_a_profile_gives_is_adopted_verified_and_released`,
-`an_eth0_hwaddr_that_agrees_with_the_running_mac_is_kept_and_the_adoption_runs` and
-`plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and_config`; in
+`an_eth0_hwaddr_that_agrees_with_the_running_mac_is_kept_and_the_adoption_runs`,
+`plan_then_apply_adopts_the_instance_and_keeps_its_mac_ip_lease_and_config`,
+`a_stopped_instance_whose_mac_or_ipv4_cannot_be_settled_is_refused_with_no_write`,
+`a_stopped_instance_is_adopted_verified_and_released_stopped_with_its_mac_and_the_named_ipv4_pinned`,
+`a_stopped_adoption_verify_fails_on_a_lost_pin_or_a_running_instance`,
+`a_stopped_adoption_killed_before_its_move_and_started_by_hand_is_not_released_until_stopped` and
+`apply_takes_an_expect_ip_for_a_running_instance_only_as_its_running_ipv4_and_the_digest_is_the_same`; in
 `crates/arca/tests/adopt_release.rs`,
 `every_kill_point_of_an_apply_resumes_to_a_complete_adoption_with_no_step_sent_twice`,
 `every_kill_point_of_an_apply_releases_to_the_pre_image_location_class_mac_and_ipv4`,
@@ -684,8 +700,17 @@ refusals, `each_thing_the_instance_already_uses_is_planned_as_exactly_its_allowa
 `a_rooted_release_whose_profile_root_or_own_root_changed_is_refused_before_any_write`,
 `a_held_operation_blocks_the_next_step_of_a_resume_and_of_a_release`,
 `verify_fails_on_a_changed_mac_a_changed_ipv4_a_closed_port_or_a_5xx`,
-`verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out` and
-`after_adoption_the_watch_shows_the_instance_kernel_owned_with_no_drift`.
+`verify_waits_for_a_slow_start_and_reports_the_last_failure_when_time_runs_out`,
+`verify_through_a_url_never_shows_its_query_which_may_carry_a_secret`,
+`the_steps_left_of_a_stopped_plan_follow_the_recorded_last_step`,
+`every_kill_point_of_a_stopped_apply_resumes_to_a_stopped_adoption_with_no_step_sent_twice`,
+`every_kill_point_of_a_stopped_apply_releases_to_default_still_stopped` and
+`after_adoption_the_watch_shows_the_instance_kernel_owned_with_no_drift`; in `crates/arca-incus/tests/adopt.rs`,
+`a_stopped_instance_is_adopted_and_released_with_no_stop_or_start_and_stays_stopped`,
+`a_stopped_plan_has_no_stop_or_start_request_and_expects_the_instance_stopped_at_every_step`,
+`a_stopped_plan_refuses_an_instance_started_since_and_a_running_plan_refuses_a_stopped_one` and
+`a_stopped_adoption_started_by_hand_is_released_only_once_it_is_stopped_again`; and in `crates/arca/src/adoptions.rs`,
+`a_running_plan_keeps_its_digest_and_a_recorded_plan_stays_valid`.
 
 ## Out of scope
 

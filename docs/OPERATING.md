@@ -501,12 +501,15 @@ second file that names the service's `stateDir`, the adoption project in `kernel
 
 1. `arca adopt plan --instance svc1 --expect-ip 192.0.2.131 --json --config adopt.json` runs the preflight with GET alone
    and prints the plan, its digest, its allowances and every request. The preflight refuses, naming the reason, any
-   container the move would change or that needs what no allowance admits (see `cmd_adopt::preflight`).
+   container the move would change or that needs what no allowance admits (see `cmd_adopt::preflight`). For a running
+   container `--expect-ip` must be its live IPv4; a stopped one shows none, so `--expect-ip` names the IPv4 its adoption
+   pins (see "A stopped container" below).
 2. `arca adopt apply --instance svc1 --plan-digest <digest> --dry-run --config adopt.json` takes no lock and sends no write.
    It prints the same allowances.
 3. Stop the service that holds the state directory (`systemctl --user stop arca-watch.service`), then run `apply` without
    `--dry-run`. It takes `desired.lock` and runs CreateProject, Stop, Snapshot, PinNic, LocalizeRoot (only when the plan
-   localizes the root), Move, Mark and Start. Each step
+   localizes the root), Move, Mark and Start; a stopped container's plan has no Stop and no Start, and its `apply` needs the
+   same `--expect-ip` as its plan. Each step
    writes an intent line before its request and an outcome line after it to `<stateDir>/adoptions.jsonl` (mode 0600,
    synced). A fresh plan's digest must be the one given.
 4. `arca adopt verify --instance svc1 --port 8080 [--http-path /] [--wait <s>] --config adopt.json` checks that the instance
@@ -518,7 +521,9 @@ second file that names the service's `stateDir`, the adoption project in `kernel
    goes with `--port` only). The instance checks are the same; the port probe is replaced by one GET of the URL, which must
    answer 2xx or 3xx within 10 s, retried within `--wait` as above. A redirect is not followed: a 3xx is the answer. Only
    `http://` is supported, since arca carries no TLS client, so point it at a plain-HTTP listener of the proxy. The URL may
-   not carry user info or a fragment, and the host name is resolved by the system resolver, outside the 10 s.
+   not carry user info or a fragment, and the host name is resolved by the system resolver, outside the 10 s. The request
+   carries the URL's query, but no message and no answer shows it: it is given as `?…`, since it may carry a secret. An
+   adoption that left a stopped container stopped takes neither `--port` nor `--url`; see "A stopped container" below.
 5. Start the service again. `watch_report` and `arca watch --once --json` count each adoption that is not released in full as
    a live entry, so the instance shows in its adoption project as kernel-owned (`adopt-svc1`) with no drift.
 
@@ -542,7 +547,8 @@ An `eth0` ACL needs no allowance: a bridged NIC looks its ACLs up in the project
 for an adoption project, and no `restricted.*` key governs an ACL. The preflight refuses, naming the reason,
 `security.privileged` true (the adoption never grants `restricted.containers.privilege`), a NIC other than `eth0`, an `eth0`
 with no managed network, an `eth0` key other than `type`, `name`, `network`, `hwaddr`, `ipv4.address` and the
-`security.acls*` keys, a `hwaddr` or `ipv4.address` other than the running MAC and IPv4, a disk on a pool other than the
+`security.acls*` keys, a `hwaddr` or `ipv4.address` other than the running MAC and IPv4 (for a stopped container, a `hwaddr`
+other than its volatile one, or an `ipv4.address` other than `--expect-ip`), a disk on a pool other than the
 root, a host path a comma-separated list cannot hold exactly, a host-path disk with `shift` set (Incus refuses it once
 `restricted.devices.disk.paths` is set), any other device type, and any device or config key but
 `eth0` and the root that a profile gives.
@@ -568,11 +574,25 @@ bare root on the pool with no `size`, and restoring it later drops the root's si
 snapshots: after restoring one, set the size on the instance again (`incus config device set <instance> root
 size=<size>`). `plan` and the dry run say so under `allowances.why`, keyed `localize.root`, with the size the profile gives.
 
+**A stopped container.** A container that is stopped when it is planned has no running MAC or IPv4 to read. Its plan pins the
+MAC Incus starts it with, `eth0`'s own `hwaddr`, else its `volatile.eth0.hwaddr` (the two must agree when both are set), and
+the IPv4 that `--expect-ip` names, which `plan` and `apply` both need. That IPv4 must be `eth0`'s `ipv4.address` when it sets
+one, and the address of every static lease the network lists for the MAC; a dynamic lease of another address, or no lease,
+is no claim, since the pin's `ipv4.address` is what its next start leases. Another MAC's lease or another device's
+`ipv4.address` on it is refused, as for a running container. The plan says `stopped` in its pre-image, which the digest
+covers, and its steps are CreateProject, Snapshot, PinNic, LocalizeRoot (when it localizes the root), Move and Mark: nothing
+stops or starts it, and it is still stopped, in its adoption project, once `apply` completes. Its release is Unmark,
+MoveBack, RestoreRoot (when it localizes) and DeleteProject, and leaves it stopped in `default`. A release refuses, before any
+step, while it is not stopped where the release finds it: stop it by hand first. `verify` takes neither `--port` nor `--url`
+for it and probes nothing: it checks that the instance is in its project under the recorded uuid, carries the adoption's mark
+(or, after a release, no kernel mark), has the pin as its own `eth0` and is stopped, and prints `"stopped": true` and
+`"probed": false`. A running container's plan is the one it was before: it says nothing of `stopped`, and keeps its digest.
+
 **Resume.** When `apply` stops at any point, whether a kill, a crash or a failed step, run the same `apply` with the same
 digest again. It goes on from the plan in the record, never from a fresh preflight, which would refuse an instance that has
 moved. A step whose intent is the last line runs again without a second intent, and a step that had landed sends nothing.
-The digest must be the recorded plan's. Only one adoption may be open at a time, and a complete adoption applied again sends
-nothing.
+The digest must be the recorded plan's, and so must an `--expect-ip` given to it. Only one adoption may be open at a time,
+and a complete adoption applied again sends nothing.
 
 **A move is a copy.** Incus 7.5.1 runs a stopped instance's project move as a copy, under a new `volatile.uuid`. The writer
 confirms a move under a new uuid only when the new uuid is a plain uuid, the old uuid is in no project, the name is gone from
@@ -588,7 +608,8 @@ instance runs, and records the failure, so only `release` can finish it after th
 returns the instance to `default`, running and unmarked, from wherever its record stands, then deletes the adoption project.
 Before Move, RestoreRoot (when the plan localizes the root), ReleaseStart and DeleteProject are left; after Move, MoveBack
 comes first; after Mark, Unmark comes before it; after Start, ReleaseStop, Unmark, MoveBack, RestoreRoot, ReleaseStart and
-DeleteProject all run. An adopt step left at its intent is closed as failed first, and each release step reads before it
+DeleteProject all run. A stopped container's release has no ReleaseStop and no ReleaseStart. An adopt step left at its intent
+is closed as failed first, and each release step reads before it
 sends. When the instance is in its adoption project without the pin, or with a localized root that RestoreRoot would not
 take off, the release, and its dry run, refuse before any write, since those steps would refuse only after the instance was
 stopped and unmarked. The pin and the snapshot are kept. DeleteProject is the adoption's one DELETE: it deletes the adoption
@@ -599,9 +620,11 @@ nothing. `verify` then checks the instance in `default`.
 
 Exit codes: `2` for a refusal before any write: an instance the config does not list, a preflight check, a stale digest, a
 digest that is not the recorded plan's, a record that holds no such adoption, another open adoption, a resume after a
-release has begun, a release of an instance that lost its pin or whose localized root RestoreRoot would keep, a verify before
-the adoption or release completed, or a bad
-`--port`, `--http-path`, `--url` or `--wait` (or both or neither of `--port` and `--url`). `1` for a held
+release has begun, a release of an instance that lost its pin or whose localized root RestoreRoot would keep, a release of an
+adoption planned stopped while the instance is not stopped, a stopped container planned or applied afresh without
+`--expect-ip`, a resume whose `--expect-ip` is not the recorded plan's, a verify before the adoption or release completed, or a
+bad `--port`, `--http-path`, `--url` or `--wait` (or both or neither of `--port` and `--url`, or either of them for an
+adoption planned stopped). `1` for a held
 lock, a failed step (the record names it) or a failed verify.
 
 ## Tests

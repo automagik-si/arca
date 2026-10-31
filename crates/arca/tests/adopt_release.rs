@@ -38,12 +38,14 @@ const KILLS: [Kill; 3] = [Kill::AfterIntent, Kill::BeforeOutcome, Kill::AfterOut
 const MARK: &str = "user.arcakernel.entry";
 
 /// One adoption's fake, config and plan digest. The fake is dropped before its scratch directory. A rooted run's instance has
-/// no root of its own: the default profile gives it, so the plan localizes it.
+/// no root of its own: the default profile gives it, so the plan localizes it. A stopped run's instance is stopped when it is
+/// planned, so its plan neither stops nor starts it, and its apply names the IPv4 with `--expect-ip`.
 struct Run {
     fake: FakeIncus,
     config: PathBuf,
     digest: String,
     rooted: bool,
+    stopped: bool,
     scratch: Scratch,
 }
 
@@ -63,10 +65,22 @@ impl Run {
     }
 
     fn of(tag: &str, rooted: bool) -> Run {
+        Run::built(tag, rooted, false)
+    }
+
+    /// A run whose instance is stopped when it is planned.
+    fn stopped(tag: &str, rooted: bool) -> Run {
+        Run::built(tag, rooted, true)
+    }
+
+    fn built(tag: &str, rooted: bool, stopped: bool) -> Run {
         let scratch = Scratch::new(tag);
         let mut instance = adopt_instance("default", json!({}));
         if rooted {
             instance["devices"] = json!({});
+        }
+        if stopped {
+            instance["status"] = json!("Stopped");
         }
         let fake = adopt_fake(&scratch, vec![instance]);
         if rooted {
@@ -83,6 +97,7 @@ impl Run {
             config,
             digest,
             rooted,
+            stopped,
             scratch,
         }
     }
@@ -112,6 +127,11 @@ impl Run {
         run
     }
 
+    /// The status the instance has once an apply or a release completes: Running, or Stopped for a stopped run.
+    fn status(&self) -> &'static str {
+        if self.stopped { "Stopped" } else { "Running" }
+    }
+
     fn record_path(&self) -> PathBuf {
         self.scratch.path("state/adoptions.jsonl")
     }
@@ -131,21 +151,24 @@ impl Run {
         adopt_halting(&argv, halt)
     }
 
+    /// The arguments of this run's apply: a stopped run names the IPv4, which a stopped instance does not show.
+    fn apply_args(&self) -> Vec<&str> {
+        let mut args = vec!["apply", "--instance", "svc1", "--plan-digest", &self.digest];
+        if self.stopped {
+            args.extend_from_slice(&["--expect-ip", ADOPT_IP]);
+        }
+        args
+    }
+
     fn apply_halting(
         &self,
         halt: &mut dyn FnMut(AdoptStep, Kill) -> bool,
     ) -> Result<Option<Value>, Failure> {
-        self.adopt(
-            &["apply", "--instance", "svc1", "--plan-digest", &self.digest],
-            halt,
-        )
+        self.adopt(&self.apply_args(), halt)
     }
 
     fn apply(&self) -> Result<Option<Value>, Failure> {
-        adopt_run(
-            &self.config,
-            &["apply", "--instance", "svc1", "--plan-digest", &self.digest],
-        )
+        adopt_run(&self.config, &self.apply_args())
     }
 
     fn release(&self) -> Result<Option<Value>, Failure> {
@@ -234,6 +257,15 @@ fn adoption_writes() -> Vec<(String, String)> {
     adoption_writes_of(false)
 }
 
+/// The writes of a whole adoption of a stopped run, each once, in order: those of [`adoption_writes_of`] but the stop and the
+/// start.
+fn stopped_adoption_writes_of(rooted: bool) -> Vec<(String, String)> {
+    adoption_writes_of(rooted)
+        .into_iter()
+        .filter(|(method, path)| !(method == "PUT" && path.contains("/state")))
+        .collect()
+}
+
 /// The writes of a whole adoption, each once, in order: seven, and LocalizeRoot's PATCH after the pin's when `rooted`.
 fn adoption_writes_of(rooted: bool) -> Vec<(String, String)> {
     let at = |path: &str, project: &str| format!("{path}?project={project}");
@@ -274,7 +306,7 @@ fn assert_adopted(run: &Run, tag: &str) {
     let body = run
         .instance(ADOPT_TO)
         .expect("the instance is in its adoption project");
-    assert_eq!(body["status"], json!("Running"), "{tag}");
+    assert_eq!(body["status"], json!(run.status()), "{tag}");
     assert_eq!(body["config"][MARK], json!("adopt-svc1"), "{tag}");
     let uuid = run.record().uuid("svc1").expect("the recorded uuid");
     assert_ne!(
@@ -292,21 +324,30 @@ fn assert_adopted(run: &Run, tag: &str) {
         root(),
         "{tag}: the root is the instance's own"
     );
-    assert_eq!(
-        run.nic(ADOPT_TO),
-        (ADOPT_MAC.to_string(), ADOPT_IP.to_string()),
-        "{tag}"
-    );
+    if !run.stopped {
+        assert_eq!(
+            run.nic(ADOPT_TO),
+            (ADOPT_MAC.to_string(), ADOPT_IP.to_string()),
+            "{tag}"
+        );
+    }
     assert!(run.snapshot_in(ADOPT_TO), "{tag}: the snapshot");
+    let last = if run.stopped {
+        AdoptStep::Mark
+    } else {
+        AdoptStep::Start
+    };
     assert_eq!(
         run.record().last("svc1"),
-        Some((AdoptStep::Start, Phase::Done)),
+        Some((last, Phase::Done)),
         "{tag}"
     );
+    assert!(run.record().complete("svc1"), "{tag}");
 }
 
 /// The instance is back in `default`, running and unmarked, with the pre-image MAC and IPv4, and its adoption project is gone.
-/// The pin and the snapshot are there when their steps ran before the kill. A rooted run's root is the profile's again.
+/// The pin and the snapshot are there when their steps ran before the kill. A rooted run's root is the profile's again. A
+/// stopped run's instance is stopped, as it was planned, and shows no live MAC: its configured MAC is the pre-image's.
 fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
     assert!(
         run.instance(ADOPT_TO).is_none(),
@@ -315,7 +356,7 @@ fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
     let body = run
         .instance("default")
         .expect("the instance is back in default");
-    assert_eq!(body["status"], json!("Running"), "{tag}");
+    assert_eq!(body["status"], json!(run.status()), "{tag}");
     let config = body["config"].as_object().expect("config");
     assert!(
         !config.keys().any(|key| key.starts_with("user.arcakernel.")),
@@ -324,11 +365,13 @@ fn assert_released(run: &Run, tag: &str, pinned: bool, snapshotted: bool) {
     let uuid = run.record().uuid("svc1").expect("the recorded uuid");
     assert_eq!(body["config"]["volatile.uuid"], json!(uuid), "{tag}");
     assert_eq!(configured_mac(&body), json!(ADOPT_MAC), "{tag}");
-    assert_eq!(
-        run.nic("default"),
-        (ADOPT_MAC.to_string(), ADOPT_IP.to_string()),
-        "{tag}"
-    );
+    if !run.stopped {
+        assert_eq!(
+            run.nic("default"),
+            (ADOPT_MAC.to_string(), ADOPT_IP.to_string()),
+            "{tag}"
+        );
+    }
     if pinned {
         assert_eq!(body["devices"]["eth0"], pin(), "{tag}: the pin is kept");
     } else {
@@ -1735,7 +1778,11 @@ fn a_url_is_plain_http_with_a_host_an_optional_port_and_a_plain_path() {
         (url.host.as_str(), url.port, url.path.as_str()),
         ("Proxy.example", 8443, "/x?y=1")
     );
-    assert_eq!(url.to_string(), "http://Proxy.example:8443/x?y=1");
+    assert_eq!(
+        url.to_string(),
+        "http://Proxy.example:8443/x?…",
+        "the query, which may carry a secret, is never shown"
+    );
     let url = HttpUrl::parse("http://192.0.2.10").expect("parsed");
     assert_eq!(
         (url.host.as_str(), url.port, url.path.as_str()),
@@ -2030,3 +2077,282 @@ fn verify_through_a_url_reports_the_url_and_the_status_it_answered() {
         "{failed:?}"
     );
 }
+
+// A stopped run: its plan has no Stop and no Start, Mark completes it, and its release leaves it stopped.
+
+#[test]
+fn the_steps_left_of_a_stopped_plan_follow_the_recorded_last_step() {
+    use AdoptStep as S;
+    let target = AdoptTarget {
+        instance: "svc1".to_string(),
+        to: ADOPT_TO.to_string(),
+    };
+    let mut pre = pre_image();
+    pre.stopped = true;
+    let plan = AdoptionPlan::new(&target, pre.clone(), Allowances::default()).expect("a plan");
+    let running =
+        AdoptionPlan::new(&target, pre_image(), Allowances::default()).expect("a running plan");
+    assert_ne!(
+        plan.digest, running.digest,
+        "the digest covers that the instance was stopped"
+    );
+    assert!(plan.verify());
+    let all = vec![S::CreateProject, S::Snapshot, S::PinNic, S::Move, S::Mark];
+    assert_eq!(plan.steps, all);
+    assert_eq!(plan.adopt_steps(), all);
+    assert_eq!(
+        plan.release_steps(),
+        vec![S::Unmark, S::MoveBack, S::DeleteProject]
+    );
+    assert_eq!(resume_steps(&plan, None), all);
+    assert_eq!(
+        resume_steps(&plan, Some((S::CreateProject, Phase::Done))),
+        vec![S::Snapshot, S::PinNic, S::Move, S::Mark]
+    );
+    assert_eq!(
+        resume_steps(&plan, Some((S::Move, Phase::Intent))),
+        vec![S::Move, S::Mark]
+    );
+    assert_eq!(
+        resume_steps(&plan, Some((S::Mark, Phase::Failed))),
+        vec![S::Mark]
+    );
+    assert_eq!(
+        resume_steps(&plan, Some((S::Mark, Phase::Done))),
+        Vec::<S>::new()
+    );
+    assert_eq!(
+        resume_steps(&plan, Some((S::Stop, Phase::Done))),
+        Vec::<S>::new(),
+        "a step the plan does not have leaves nothing to resume"
+    );
+
+    let left = |last: Option<(S, Phase)>| release_steps(&plan, last);
+    for step in [S::CreateProject, S::Snapshot, S::PinNic] {
+        for phase in [Phase::Intent, Phase::Done, Phase::Failed] {
+            assert_eq!(
+                left(Some((step, phase))),
+                vec![S::DeleteProject],
+                "{step:?} {phase:?}"
+            );
+        }
+    }
+    assert_eq!(left(None), vec![S::DeleteProject]);
+    for phase in [Phase::Intent, Phase::Done, Phase::Failed] {
+        assert_eq!(
+            left(Some((S::Move, phase))),
+            vec![S::MoveBack, S::DeleteProject]
+        );
+        assert_eq!(
+            left(Some((S::Mark, phase))),
+            vec![S::Unmark, S::MoveBack, S::DeleteProject]
+        );
+    }
+    assert_eq!(
+        left(Some((S::Unmark, Phase::Failed))),
+        vec![S::Unmark, S::MoveBack, S::DeleteProject]
+    );
+    assert_eq!(
+        left(Some((S::Unmark, Phase::Done))),
+        vec![S::MoveBack, S::DeleteProject]
+    );
+    assert_eq!(
+        left(Some((S::MoveBack, Phase::Done))),
+        vec![S::DeleteProject]
+    );
+    assert_eq!(left(Some((S::DeleteProject, Phase::Done))), Vec::<S>::new());
+
+    let mut allowances = Allowances::default();
+    allowances.localize.insert(
+        "root".to_string(),
+        serde_json::from_value(root()).expect("a device"),
+    );
+    let rooted = AdoptionPlan::new(&target, pre, allowances).expect("a rooted plan");
+    assert_eq!(
+        rooted.steps,
+        vec![
+            S::CreateProject,
+            S::Snapshot,
+            S::PinNic,
+            S::LocalizeRoot,
+            S::Move,
+            S::Mark
+        ]
+    );
+    let left = |last: Option<(S, Phase)>| release_steps(&rooted, last);
+    assert_eq!(left(None), vec![S::RestoreRoot, S::DeleteProject]);
+    assert_eq!(
+        left(Some((S::Mark, Phase::Done))),
+        vec![S::Unmark, S::MoveBack, S::RestoreRoot, S::DeleteProject]
+    );
+
+    // A stopped plan whose steps are a running plan's resumes nothing.
+    let mut bent = plan.clone();
+    bent.steps = S::adopt_steps(false);
+    assert_eq!(resume_steps(&bent, None), Vec::<S>::new());
+}
+
+/// Each adoption step of each stopped fixture's plan: the instance's own root, and a root the default profile gives.
+fn stopped_kill_steps() -> Vec<(bool, AdoptStep)> {
+    [false, true]
+        .into_iter()
+        .flat_map(|rooted| {
+            AdoptStep::adopt_steps_of(rooted, true)
+                .into_iter()
+                .map(move |step| (rooted, step))
+        })
+        .collect()
+}
+
+#[test]
+fn every_kill_point_of_a_stopped_apply_resumes_to_a_stopped_adoption_with_no_step_sent_twice() {
+    for (rooted, step) in stopped_kill_steps() {
+        for kill in KILLS {
+            let tag = format!("stopped-resume-{rooted}-{step:?}-{kill:?}");
+            let run = Run::stopped(&tag, rooted).halted(&tag, step, kill);
+            let from = run.fake.requests().len();
+            let resumed = run
+                .apply()
+                .unwrap_or_else(|f| panic!("{tag}: {f:?}"))
+                .expect("a result");
+            assert_eq!(resumed["complete"], json!(true), "{tag}");
+            assert_eq!(resumed["resumed"], json!(true), "{tag}");
+            assert_adopted(&run, &tag);
+            assert_eq!(
+                run.writes(),
+                stopped_adoption_writes_of(rooted),
+                "{tag}: every step's request is sent once, in order, and none stops or starts it"
+            );
+            assert!(
+                preflight_reads(&run, from).is_empty(),
+                "{tag}: the resume ran no preflight"
+            );
+            assert_writes_in_table(&run, &tag);
+        }
+    }
+}
+
+#[test]
+fn every_kill_point_of_a_stopped_apply_releases_to_default_still_stopped() {
+    for (rooted, step) in stopped_kill_steps() {
+        for kill in KILLS {
+            let tag = format!("stopped-release-{rooted}-{step:?}-{kill:?}");
+            let run = Run::stopped(&tag, rooted).halted(&tag, step, kill);
+            let before = run.writes().len();
+            let released = run
+                .release()
+                .unwrap_or_else(|f| panic!("{tag}: {f:?}"))
+                .expect("a result");
+            assert_eq!(released["released"], json!(true), "{tag}");
+            let pinned = sent_before(AdoptStep::PinNic, step, kill);
+            let snapshotted = sent_before(AdoptStep::Snapshot, step, kill);
+            assert_released(&run, &tag, pinned, snapshotted);
+            let mine = run.writes()[before..].to_vec();
+            let mut once = mine.clone();
+            once.sort();
+            once.dedup();
+            assert_eq!(
+                once.len(),
+                mine.len(),
+                "{tag}: no release step is sent twice: {mine:?}"
+            );
+            assert!(
+                run.writes()
+                    .iter()
+                    .all(|(method, path)| !(method == "PUT" && path.contains("/state"))),
+                "{tag}: nothing stopped or started it: {:?}",
+                run.writes()
+            );
+            assert_writes_in_table(&run, &tag);
+        }
+    }
+}
+
+#[test]
+fn verify_through_a_url_never_shows_its_query_which_may_carry_a_secret() {
+    const SECRET: &str = "s3cret";
+    let url = HttpUrl::parse(&format!("http://proxy.example:8443/health?token={SECRET}"))
+        .expect("a plain http URL");
+    assert_eq!(
+        url.path,
+        format!("/health?token={SECRET}"),
+        "the request still carries the query"
+    );
+    assert_eq!(url.to_string(), "http://proxy.example:8443/health?…");
+    let bare = HttpUrl::parse(&format!("http://proxy.example?{SECRET}")).expect("parsed");
+    assert_eq!(bare.to_string(), "http://proxy.example/?…");
+    let plain = HttpUrl::parse("http://proxy.example/health").expect("parsed");
+    assert_eq!(
+        plain.to_string(),
+        "http://proxy.example/health",
+        "no query, nothing hidden"
+    );
+
+    let run = Run::new("verify-url-secret");
+    run.apply().expect("the adoption").expect("a result");
+    let plan = run.record().plan("svc1").expect("the plan");
+    let uuid = run.record().uuid("svc1").expect("the uuid");
+    let read = UnixIncus::new(run.fake.socket().to_path_buf());
+    let silent = |_: &HttpUrl, _: Duration| -> Result<u16, String> { Err("no answer".to_string()) };
+    let failing = |_: &HttpUrl, _: Duration| -> Result<u16, String> { Ok(503) };
+    for probe in [&silent as UrlProbeRef<'_>, &failing] {
+        let failed = verify_url_with(&read, &plan, &uuid, ADOPT_TO, &url, probe);
+        match &failed {
+            Err(Failure::Runtime(why)) => {
+                assert!(!why.contains(SECRET), "the query is not shown: {why}");
+                assert!(why.contains("/health?…"), "{why}");
+            }
+            other => panic!("the verify fails: {other:?}"),
+        }
+    }
+
+    // Through the command: the request carries the query, and neither the answer nor a failure shows it.
+    let (port, server) = answer_once("200 OK");
+    let text = format!("http://127.0.0.1:{port}/health?token={SECRET}");
+    let verified = adopt_run(
+        &run.config,
+        &[
+            "verify",
+            "--instance",
+            "svc1",
+            "--url",
+            &text,
+            "--wait",
+            "0",
+        ],
+    )
+    .expect("verified")
+    .expect("a result");
+    let request = server.join().expect("the server");
+    assert!(
+        request.starts_with(&format!("GET /health?token={SECRET} HTTP/1.1\r\n")),
+        "{request}"
+    );
+    assert_eq!(
+        verified["url"],
+        json!(format!("http://127.0.0.1:{port}/health?…"))
+    );
+    assert!(!verified.to_string().contains(SECRET), "{verified}");
+    let (port, server) = answer_once("503 Service Unavailable");
+    let text = format!("http://127.0.0.1:{port}/health?token={SECRET}");
+    let failed = adopt_run(
+        &run.config,
+        &[
+            "verify",
+            "--instance",
+            "svc1",
+            "--url",
+            &text,
+            "--wait",
+            "0",
+        ],
+    );
+    server.join().expect("the server");
+    assert!(
+        matches!(&failed, Err(Failure::Runtime(why)) if why.contains("answered 503") && !why.contains(SECRET)),
+        "{failed:?}"
+    );
+}
+
+/// A URL probe, as a reference.
+type UrlProbeRef<'a> = &'a dyn Fn(&HttpUrl, Duration) -> Result<u16, String>;
