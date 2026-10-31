@@ -609,7 +609,8 @@ plan keeps the bytes and the digest it had before). It has no Stop, Start, Relea
 request in its table, so a stop or a start is refused before any byte is sent, and the writer refuses to run them. Every step
 it runs expects the instance Stopped, CreateProject and DeleteProject included (`AdoptWriter::expects`), so a plan of a stopped
 instance refuses one started since, and a plan of a running one refuses one stopped since. Mark is its last adoption step, and
-the adoption is complete once Mark is done. Its pin is the MAC Incus starts the instance with, `eth0`'s own `hwaddr` or else
+the adoption is complete once Mark is done, so its Mark refuses, with no write, an instance started by hand after its Move,
+which the running table's Mark takes: stop it by hand, then Mark, or release it. Its pin is the MAC Incus starts the instance with, `eth0`'s own `hwaddr` or else
 its `volatile.eth0.hwaddr`, and the IPv4 the owner names with `--expect-ip`, which `eth0`'s `ipv4.address` and any static lease
 the network lists for that MAC must agree with; a dynamic lease, or none, is no claim. A release of it refuses, before any
 step, an instance that is not stopped where the release finds it, and leaves the instance stopped in `default`. `verify` probes

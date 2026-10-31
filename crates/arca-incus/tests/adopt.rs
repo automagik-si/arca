@@ -2062,3 +2062,62 @@ fn a_stopped_adoption_started_by_hand_is_released_only_once_it_is_stopped_again(
     let back = instance_in(&fake, "default").expect("back in default");
     assert_eq!(back["status"], json!("Stopped"));
 }
+
+#[test]
+fn a_stopped_plans_mark_refuses_an_instance_started_after_the_move_and_its_release_runs_once_it_is_stopped()
+ {
+    use AdoptStep as S;
+    let (_dir, fake) = start_with("stopped-mark-running", stopped_svc1());
+    let writer = stopped_writer(&fake);
+    for step in [S::CreateProject, S::Snapshot, S::PinNic, S::Move] {
+        assert_eq!(writer.run(step), Ok(StepOutcome::Sent), "{step:?}");
+    }
+    let state = format!("/1.0/instances/svc1/state?project={TO}");
+    assert_eq!(
+        raw(&fake, "PUT", &state, &json!({ "action": "start" })).0,
+        202
+    );
+    let sent = fake.writes().len();
+    // Mark is the stopped plan's last step: it does not complete the adoption of a running instance.
+    refused_naming(writer.run(S::Mark), "stopped");
+    assert_eq!(fake.writes().len(), sent, "no write");
+    let seen = instance_in(&fake, TO).expect("still in its adoption project");
+    assert!(seen["config"].get(MARK).is_none(), "not marked");
+    assert_eq!(seen["status"], json!("Running"));
+
+    // The release refuses it while it runs, and takes it back once the owner stops it.
+    refused_naming(writer.run(S::MoveBack), "status");
+    assert_eq!(fake.writes().len(), sent, "no write");
+    let stop = json!({ "action": "stop", "force": true });
+    assert_eq!(raw(&fake, "PUT", &state, &stop).0, 202);
+    for step in writer.release_steps() {
+        writer.run(step).expect("the release");
+    }
+    let back = instance_in(&fake, "default").expect("back in default");
+    assert_eq!(back["status"], json!("Stopped"));
+    assert!(back["config"].get(MARK).is_none(), "no mark");
+    assert!(
+        instance_in(&fake, TO).is_none(),
+        "gone from its adoption project"
+    );
+
+    // A running plan's Mark still takes an instance started by hand after its move.
+    let (_dir, fake) = start("running-mark-running");
+    let writer = self::writer(&fake);
+    for step in [
+        S::CreateProject,
+        S::Stop,
+        S::Snapshot,
+        S::PinNic,
+        S::LocalizeRoot,
+        S::Move,
+    ] {
+        writer.run(step).expect("the adoption up to Mark");
+    }
+    assert_eq!(
+        raw(&fake, "PUT", &state, &json!({ "action": "start" })).0,
+        202
+    );
+    assert_eq!(writer.run(S::Mark), Ok(StepOutcome::Sent));
+    assert_eq!(writer.run(S::Start), Ok(StepOutcome::AlreadyDone));
+}
