@@ -4,7 +4,7 @@ Arca is a Rust kernel for a node's own infrastructure. The kernel reads what it 
 change only after the node's owner has approved it and the change is written to a journal. Each node signs its own
 desired state with its own key. It talks to Incus over the local unix socket.
 
-**Status: `0.1.0-alpha.4`, for private single-host use.**
+**Status: `0.1.0-alpha.5`, for private single-host use.**
 
 - **Reads** run against a real Incus host (7.3, now 7.5.1): every project and instance is classed by owner, and drift is reported.
 - **Writes** are tested live, one object kind at a time, in a scratch project: network, project, ACL, profile, volume,
