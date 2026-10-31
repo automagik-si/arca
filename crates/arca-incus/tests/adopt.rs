@@ -131,6 +131,7 @@ fn pre() -> PreImage {
             ),
         ]),
         config_hash: "0".repeat(64),
+        stopped: false,
     }
 }
 
@@ -1840,4 +1841,224 @@ fn restore_ready_refuses_while_adopted_when_the_instances_own_root_changed_since
     );
     assert_eq!(status, 200);
     assert_eq!(writer.restore_ready(), Ok(()));
+}
+
+// A stopped instance. Incus starts it with eth0's own hwaddr, else its volatile.eth0.hwaddr, so the plan pins that MAC and the
+// IPv4 the owner names. The adoption neither stops nor starts it, and the release leaves it stopped.
+
+/// `svc1`, stopped: its MAC is its volatile key, and the fixture's lease of `IP` for it is dynamic.
+fn stopped_svc1() -> Value {
+    let mut instance = svc1(json!({}));
+    instance["status"] = json!("Stopped");
+    instance
+}
+
+/// The pre-image of `svc1` as a plan finds it stopped.
+fn stopped_pre() -> PreImage {
+    PreImage {
+        stopped: true,
+        ..pre()
+    }
+}
+
+fn stopped_writer(fake: &FakeIncus) -> AdoptWriter {
+    AdoptWriter::new(
+        fake.socket().to_path_buf(),
+        target(),
+        vec!["br1".to_string()],
+        stopped_pre(),
+    )
+    .expect("the writer")
+    .with_snapshot(SNAPSHOT)
+    .expect("the snapshot name")
+}
+
+/// Whether any write the fake has seen is a PUT of an instance's state: a stop or a start.
+fn sent_a_state_change(fake: &FakeIncus) -> bool {
+    writes(fake)
+        .iter()
+        .any(|(method, path)| method == "PUT" && path.contains("/state"))
+}
+
+#[test]
+fn a_stopped_instance_is_adopted_and_released_with_no_stop_or_start_and_stays_stopped() {
+    use AdoptStep as S;
+    let (_dir, fake) = start_with("stopped", stopped_svc1());
+    let writer = stopped_writer(&fake);
+    let before = instance_in(&fake, "default").expect("the instance is in default");
+    assert_eq!(
+        writer.adopt_steps(),
+        [S::CreateProject, S::Snapshot, S::PinNic, S::Move, S::Mark],
+        "a plan that found the instance stopped has no Stop and no Start"
+    );
+    for step in writer.adopt_steps() {
+        let sent = fake.writes().len();
+        assert_eq!(writer.run(step), Ok(StepOutcome::Sent), "{step:?} runs");
+        let table: Vec<(String, String)> = writer
+            .requests(step)
+            .into_iter()
+            .map(|request| (request.method.to_string(), request.path))
+            .collect();
+        assert_eq!(writes(&fake)[sent..].to_vec(), table, "{step:?}");
+        let sent = fake.writes().len();
+        assert_eq!(
+            writer.run(step),
+            Ok(StepOutcome::AlreadyDone),
+            "{step:?} again"
+        );
+        assert_eq!(fake.writes().len(), sent, "{step:?} again sends nothing");
+    }
+    assert!(instance_in(&fake, "default").is_none(), "it left default");
+    let after = instance_in(&fake, TO).expect("the instance is in its adoption project");
+    assert_eq!(
+        after["status"],
+        json!("Stopped"),
+        "the adoption leaves it stopped"
+    );
+    assert_eq!(after["config"][MARK], json!("adopt-svc1"));
+    let copied = after["config"]["volatile.uuid"].as_str().expect("a uuid");
+    assert_ne!(copied, UUID, "the move is a copy, under a new uuid");
+    assert_eq!(writer.uuid(), copied);
+    assert_eq!(
+        after["devices"]["eth0"],
+        pin_patch(writer.pin())["devices"]["eth0"],
+        "the local eth0 pins the MAC it starts with and the IPv4 the plan names"
+    );
+    assert_eq!(writer.pin().mac, MAC);
+    assert_eq!(after["devices"]["root"], before["devices"]["root"]);
+    assert!(
+        read(
+            &fake,
+            &format!("/1.0/instances/svc1/snapshots/{SNAPSHOT}?project={TO}")
+        )
+        .is_ok(),
+        "the snapshot moved with the instance"
+    );
+
+    assert_eq!(
+        writer.release_steps(),
+        [S::Unmark, S::MoveBack, S::DeleteProject],
+        "the release neither stops nor starts it"
+    );
+    for step in writer.release_steps() {
+        assert_eq!(writer.run(step), Ok(StepOutcome::Sent), "{step:?} runs");
+        let sent = fake.writes().len();
+        assert_eq!(
+            writer.run(step),
+            Ok(StepOutcome::AlreadyDone),
+            "{step:?} again"
+        );
+        assert_eq!(fake.writes().len(), sent, "{step:?} again sends nothing");
+    }
+    let back = instance_in(&fake, "default").expect("the instance is back in default");
+    assert_eq!(
+        back["status"],
+        json!("Stopped"),
+        "the release leaves it stopped"
+    );
+    assert!(back["config"].get(MARK).is_none(), "the mark is gone");
+    assert_eq!(
+        back["devices"]["eth0"],
+        pin_patch(writer.pin())["devices"]["eth0"],
+        "the pin stays"
+    );
+    assert!(
+        matches!(
+            read(&fake, &format!("/1.0/projects/{TO}")),
+            Err(IncusError::Status { code: 404, .. })
+        ),
+        "the emptied adoption project is deleted"
+    );
+    assert!(
+        !sent_a_state_change(&fake),
+        "nothing stopped or started it: {:?}",
+        writes(&fake)
+    );
+    assert_eq!(
+        fake.leases(),
+        vec![("br1".to_string(), MAC.to_string(), IP.to_string())],
+        "no start leased anything"
+    );
+}
+
+#[test]
+fn a_stopped_plan_has_no_stop_or_start_request_and_expects_the_instance_stopped_at_every_step() {
+    use AdoptStep as S;
+    let (_dir, fake) = start_with("stopped-table", stopped_svc1());
+    let writer = stopped_writer(&fake);
+    for step in [S::Stop, S::Start, S::ReleaseStop, S::ReleaseStart] {
+        assert!(writer.requests(step).is_empty(), "{step:?} has no request");
+        refused_naming(writer.run(step), "stopped");
+    }
+    for step in S::ADOPT.iter().chain(S::RELEASE.iter()) {
+        for request in writer.requests(*step) {
+            assert!(
+                !request.path.contains("/state"),
+                "{step:?}: {}",
+                request.path
+            );
+        }
+    }
+    for step in writer
+        .adopt_steps()
+        .into_iter()
+        .chain(writer.release_steps())
+    {
+        let (running, stopped) = (AdoptWriter::expect(step), writer.expects(step));
+        assert_eq!(
+            (stopped.project, stopped.class),
+            (running.project, running.class),
+            "{step:?}: the project and the class are the running plan's"
+        );
+        assert_eq!(stopped.status, "Stopped", "{step:?}");
+    }
+    // A running plan's own table is unchanged.
+    let running = self::writer(&fake);
+    assert_eq!(running.expects(S::CreateProject).status, "Running");
+    assert_eq!(running.expects(S::DeleteProject).status, "Running");
+    assert_eq!(running.requests(S::Stop).len(), 2);
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+}
+
+#[test]
+fn a_stopped_plan_refuses_an_instance_started_since_and_a_running_plan_refuses_a_stopped_one() {
+    use AdoptStep as S;
+    // The plan found the instance stopped, and it runs now: no step of the stopped plan takes it.
+    let (_dir, fake) = start("stopped-plan-running");
+    let writer = stopped_writer(&fake);
+    for step in [S::CreateProject, S::Snapshot, S::PinNic, S::Move] {
+        refused_naming(writer.run(step), "status");
+    }
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+
+    // The plan found it running, and it is stopped now: CreateProject, the first step, refuses it.
+    let (_dir, fake) = start_with("running-plan-stopped", stopped_svc1());
+    refused_naming(self::writer(&fake).run(S::CreateProject), "status");
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+}
+
+#[test]
+fn a_stopped_adoption_started_by_hand_is_released_only_once_it_is_stopped_again() {
+    use AdoptStep as S;
+    let (_dir, fake) = start_with("stopped-started", stopped_svc1());
+    let writer = stopped_writer(&fake);
+    for step in writer.adopt_steps() {
+        writer.run(step).expect("the adoption");
+    }
+    let state = format!("/1.0/instances/svc1/state?project={TO}");
+    assert_eq!(
+        raw(&fake, "PUT", &state, &json!({ "action": "start" })).0,
+        202
+    );
+    let sent = fake.writes().len();
+    // The release has no stop: Unmark refuses a running instance, and nothing is sent.
+    refused_naming(writer.run(S::Unmark), "status");
+    assert_eq!(fake.writes().len(), sent, "no write");
+    let stop = json!({ "action": "stop", "force": true });
+    assert_eq!(raw(&fake, "PUT", &state, &stop).0, 202);
+    for step in writer.release_steps() {
+        assert_eq!(writer.run(step), Ok(StepOutcome::Sent), "{step:?}");
+    }
+    let back = instance_in(&fake, "default").expect("back in default");
+    assert_eq!(back["status"], json!("Stopped"));
 }

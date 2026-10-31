@@ -183,8 +183,8 @@ fn every_other_preflight_refusal_names_its_reason_and_sends_no_write() {
             "hwaddr",
         ),
         (
-            "stopped",
-            svc1_with(|i| i["status"] = json!("Stopped")),
+            "frozen",
+            svc1_with(|i| i["status"] = json!("Frozen")),
             "running MAC",
         ),
         (
@@ -1125,4 +1125,494 @@ fn an_eth0_hwaddr_that_agrees_with_the_running_mac_is_kept_and_the_adoption_runs
     )
     .expect("the state");
     assert_eq!(state["network"]["eth0"]["hwaddr"], json!(ADOPT_MAC));
+}
+
+// A stopped instance. It shows no running MAC or IPv4: the plan pins the MAC Incus starts it with, eth0's own hwaddr or else its
+// volatile.eth0.hwaddr, and the IPv4 --expect-ip names. The adoption neither stops nor starts it.
+
+/// A MAC no lease names.
+const NO_LEASE_MAC: &str = "10:66:6a:00:00:07";
+
+/// `svc1`, stopped, with `edit` applied.
+fn stopped_svc1(edit: impl Fn(&mut Value)) -> Vec<Value> {
+    svc1_with(move |i| {
+        i["status"] = json!("Stopped");
+        edit(i);
+    })
+}
+
+/// The pin of a stopped fixture whose MAC is `mac`.
+fn stopped_pin(mac: &str) -> Value {
+    json!({ "type": "nic", "name": "eth0", "network": "br1", "hwaddr": mac, "ipv4.address": ADOPT_IP })
+}
+
+/// Whether the fake saw a stop or a start.
+fn state_changed(fake: &FakeIncus) -> bool {
+    fake.writes()
+        .iter()
+        .any(|write| write.method == "PUT" && write.path.contains("/state"))
+}
+
+#[test]
+fn a_stopped_instance_whose_mac_or_ipv4_cannot_be_settled_is_refused_with_no_write() {
+    let own_nic = |extra: Value| {
+        move |i: &mut Value| {
+            let mut eth0 = json!({ "type": "nic", "name": "eth0", "network": "br1" });
+            if let (Some(eth0), Value::Object(extra)) = (eth0.as_object_mut(), extra.clone()) {
+                eth0.extend(extra);
+            }
+            i["devices"]["eth0"] = eth0;
+        }
+    };
+    let cases: Vec<(&str, Vec<Value>, &str)> = vec![
+        (
+            "stopped-no-mac",
+            stopped_svc1(|i| {
+                i["config"]
+                    .as_object_mut()
+                    .expect("config")
+                    .remove("volatile.eth0.hwaddr");
+            }),
+            "has no MAC",
+        ),
+        (
+            "stopped-bad-mac",
+            stopped_svc1(|i| i["config"]["volatile.eth0.hwaddr"] = json!("10:66:6A:00:00:01")),
+            "has no MAC",
+        ),
+        (
+            "stopped-hwaddr",
+            stopped_svc1(own_nic(json!({ "hwaddr": "10:66:6a:00:00:02" }))),
+            "a hwaddr other than its volatile.eth0.hwaddr",
+        ),
+        (
+            "stopped-nic-ip",
+            stopped_svc1(own_nic(json!({ "ipv4.address": "192.0.2.132" }))),
+            "an ipv4.address other than the one --expect-ip names",
+        ),
+    ];
+    for (tag, instances, reason) in cases {
+        refused_with_no_write(tag, instances, reason);
+    }
+    refused_after(
+        "stopped-static-lease",
+        stopped_svc1(|_| {}),
+        &|fake, _| fake.set_static_lease("br1", ADOPT_MAC, "192.0.2.132"),
+        &[],
+        "static lease",
+    );
+    refused_after(
+        "stopped-claimed",
+        stopped_svc1(|_| {}),
+        &|fake, _| fake.set_lease("br1", "10:66:6a:00:00:99", ADOPT_IP),
+        &[],
+        "claimed",
+    );
+    refused_after(
+        "stopped-device-claim",
+        stopped_svc1(|_| {}),
+        &|fake, _| {
+            let other = json!({ "name": "other", "type": "container", "config": {},
+                "devices": { "eth0": { "type": "nic", "network": "br1", "ipv4.address": ADOPT_IP } } });
+            assert_eq!(
+                raw(fake, "POST", "/1.0/instances?project=default", &other),
+                202
+            );
+        },
+        &[],
+        "claimed",
+    );
+
+    // apply plans afresh, and a stopped instance shows no IPv4 for it to take: --expect-ip is required, and it is in the
+    // digest.
+    let scratch = Scratch::new("stopped-apply-ip");
+    let fake = adopt_fake(&scratch, stopped_svc1(|_| {}));
+    let config = adopt_config(&scratch, &fake);
+    let digest = adopt_digest(&config);
+    let missing = apply(&config, &digest, &[]);
+    assert!(
+        matches!(&missing, Err(failure @ Failure::Refused(why)) if why.contains("--expect-ip") && failure.code() == 2),
+        "{missing:?}"
+    );
+    let other = apply(&config, &digest, &["--expect-ip", "192.0.2.132"]);
+    assert!(
+        matches!(&other, Err(Failure::Refused(why)) if why.contains("stale")),
+        "another IPv4 is another plan: {other:?}"
+    );
+    let bad = apply(&config, &digest, &["--expect-ip", "x"]);
+    assert!(matches!(&bad, Err(Failure::Usage(_))), "{bad:?}");
+    assert!(fake.writes().is_empty(), "{:?}", fake.writes());
+    assert!(
+        !scratch.path("state/adoptions.jsonl").exists(),
+        "nothing was recorded"
+    );
+}
+
+/// One stopped fixture: its tag, the MAC Incus starts it with, its edit, and the lease setup after the fake's own.
+type StoppedCase = (&'static str, &'static str, Edit, Box<dyn Fn(&FakeIncus)>);
+
+#[test]
+fn a_stopped_instance_is_adopted_verified_and_released_stopped_with_its_mac_and_the_named_ipv4_pinned()
+ {
+    let own_ip =
+        json!({ "type": "nic", "name": "eth0", "network": "br1", "ipv4.address": ADOPT_IP });
+    let cases: Vec<StoppedCase> = vec![
+        // eth0 from the profile, and a dynamic lease of another address for its MAC, which the pin's IPv4 replaces at start.
+        (
+            "stopped-dynamic",
+            ADOPT_MAC,
+            Box::new(|_: &mut Value| {}),
+            Box::new(|fake: &FakeIncus| fake.set_lease("br1", ADOPT_MAC, "192.0.2.140")),
+        ),
+        // eth0 from the profile, and no lease for its MAC.
+        (
+            "stopped-no-lease",
+            NO_LEASE_MAC,
+            Box::new(|i: &mut Value| i["config"]["volatile.eth0.hwaddr"] = json!(NO_LEASE_MAC)),
+            Box::new(|fake: &FakeIncus| fake.set_lease("br1", ADOPT_MAC, "192.0.2.150")),
+        ),
+        // eth0 of its own that sets the IPv4, and the static lease Incus lists for it.
+        (
+            "stopped-nic-ip",
+            ADOPT_MAC,
+            Box::new(move |i: &mut Value| i["devices"]["eth0"] = own_ip.clone()),
+            Box::new(|fake: &FakeIncus| fake.set_static_lease("br1", ADOPT_MAC, ADOPT_IP)),
+        ),
+    ];
+    for (tag, mac, edit, leases) in cases {
+        let scratch = Scratch::new(tag);
+        let fake = adopt_fake(&scratch, stopped_svc1(&*edit));
+        leases(&fake);
+        let config = adopt_config(&scratch, &fake);
+        let leased = fake.leases();
+        let before = get(&fake, "/1.0/instances/svc1?project=default").expect("the instance");
+
+        let planned = plan_of(&config);
+        let pre = &planned["plan"]["preImage"];
+        assert_eq!(pre["stopped"], json!(true), "{tag}");
+        assert_eq!(
+            (&pre["mac"], &pre["ipv4"]),
+            (&json!(mac), &json!(ADOPT_IP)),
+            "{tag}"
+        );
+        let steps = json!(["createProject", "snapshot", "pinNic", "move", "mark"]);
+        assert_eq!(
+            planned["plan"]["steps"], steps,
+            "{tag}: no stop and no start"
+        );
+        let requests = planned["requests"].as_array().expect("the requests");
+        let listed: Vec<&Value> = requests.iter().map(|request| &request["step"]).collect();
+        assert_eq!(json!(listed), steps, "{tag}: one request a step");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request["path"].as_str().unwrap_or("").contains("/state")),
+            "{tag}: {requests:?}"
+        );
+        assert_eq!(
+            request_body(&planned, "pinNic"),
+            json!({ "devices": { "eth0": stopped_pin(mac) } }),
+            "{tag}"
+        );
+        let digest = planned["digest"].as_str().expect("a digest").to_string();
+
+        let missing = apply(&config, &digest, &[]);
+        assert!(
+            matches!(&missing, Err(Failure::Refused(why)) if why.contains("--expect-ip")),
+            "{tag}: {missing:?}"
+        );
+        assert!(fake.writes().is_empty(), "{tag}");
+        let applied = apply(&config, &digest, &["--expect-ip", ADOPT_IP])
+            .unwrap_or_else(|failure| panic!("{tag}: {failure:?}"))
+            .expect("a result");
+        assert_eq!(applied["complete"], json!(true), "{tag}");
+        assert_eq!(applied["steps"].as_array().map(Vec::len), Some(5), "{tag}");
+        assert!(
+            get(&fake, "/1.0/instances/svc1?project=default").is_none(),
+            "{tag}"
+        );
+        let after =
+            get(&fake, &format!("/1.0/instances/svc1?project={ADOPT_TO}")).expect("adopted");
+        assert_eq!(
+            after["status"],
+            json!("Stopped"),
+            "{tag}: the adoption leaves it stopped"
+        );
+        assert_eq!(
+            after["config"]["user.arcakernel.entry"],
+            json!("adopt-svc1"),
+            "{tag}"
+        );
+        assert_eq!(after["devices"]["eth0"], stopped_pin(mac), "{tag}");
+        assert_eq!(after["devices"]["root"], before["devices"]["root"], "{tag}");
+        let record = AdoptionRecord::open(&scratch.path("state")).expect("the record");
+        assert_eq!(
+            record.last("svc1"),
+            Some((AdoptStep::Mark, Phase::Done)),
+            "{tag}"
+        );
+        assert!(
+            record.complete("svc1"),
+            "{tag}: Mark is a stopped plan's last step"
+        );
+        assert!(record.incomplete().is_empty(), "{tag}");
+        let status = adopt_run(&config, &["status", "--instance", "svc1", "--json"])
+            .expect("status")
+            .expect("a result");
+        assert_eq!(status["complete"], json!(true), "{tag}");
+        assert_eq!(status["live"]["status"], json!("Stopped"), "{tag}");
+
+        // A complete adoption applied again sends nothing.
+        let writes = fake.writes().len();
+        let again = apply(&config, &digest, &[])
+            .expect("again")
+            .expect("a result");
+        assert_eq!(again["resumed"], json!(true), "{tag}");
+        assert_eq!(fake.writes().len(), writes, "{tag}");
+
+        // verify checks the move, the mark and the pin, and probes nothing: the instance is stopped.
+        let verify = |more: &[&str]| {
+            let mut args = vec!["verify", "--instance", "svc1"];
+            args.extend_from_slice(more);
+            adopt_run(&config, &args)
+        };
+        let verified = verify(&[]).expect("verified").expect("a result");
+        assert_eq!(
+            verified,
+            json!({ "instance": "svc1", "project": ADOPT_TO, "mac": mac, "ipv4": ADOPT_IP,
+                "stopped": true, "probed": false, "verified": true }),
+            "{tag}"
+        );
+        for probe in [
+            vec!["--port", "8080"],
+            vec!["--url", "http://proxy.example/health"],
+        ] {
+            let refused = verify(&probe);
+            assert!(
+                matches!(&refused, Err(failure @ Failure::Usage(why)) if why.contains("stopped") && failure.code() == 2),
+                "{tag} {probe:?}: {refused:?}"
+            );
+        }
+
+        let released = adopt_run(&config, &["release", "--instance", "svc1"])
+            .unwrap_or_else(|failure| panic!("{tag}: {failure:?}"))
+            .expect("a result");
+        assert_eq!(released["released"], json!(true), "{tag}");
+        assert_eq!(released["steps"].as_array().map(Vec::len), Some(3), "{tag}");
+        let back = get(&fake, "/1.0/instances/svc1?project=default").expect("released");
+        assert_eq!(
+            back["status"],
+            json!("Stopped"),
+            "{tag}: the release leaves it stopped"
+        );
+        assert!(
+            !back["config"]
+                .as_object()
+                .expect("config")
+                .keys()
+                .any(|key| key.starts_with("user.arcakernel.")),
+            "{tag}: Foreign again"
+        );
+        assert_eq!(
+            back["devices"]["eth0"],
+            stopped_pin(mac),
+            "{tag}: the pin stays"
+        );
+        assert!(
+            get(&fake, &format!("/1.0/projects/{ADOPT_TO}")).is_none(),
+            "{tag}"
+        );
+        let verified = verify(&[]).expect("verified").expect("a result");
+        assert_eq!(verified["project"], json!("default"), "{tag}");
+        assert_eq!(verified["stopped"], json!(true), "{tag}");
+
+        assert!(
+            !state_changed(&fake),
+            "{tag}: nothing stopped or started it"
+        );
+        for write in fake.writes() {
+            assert!(
+                write.method != "DELETE" || write.path == format!("/1.0/projects/{ADOPT_TO}"),
+                "{tag}: {}",
+                write.path
+            );
+            assert!(
+                !write.path.starts_with("/1.0/networks")
+                    && !write.path.starts_with("/1.0/profiles"),
+                "{tag}: {}",
+                write.path
+            );
+        }
+        assert_eq!(fake.leases(), leased, "{tag}: no lease changed");
+    }
+}
+
+#[test]
+fn a_stopped_adoption_verify_fails_on_a_lost_pin_or_a_running_instance() {
+    let scratch = Scratch::new("stopped-verify");
+    let fake = adopt_fake(&scratch, stopped_svc1(|_| {}));
+    let config = adopt_config(&scratch, &fake);
+    let digest = adopt_digest(&config);
+    apply(&config, &digest, &["--expect-ip", ADOPT_IP])
+        .expect("the adoption")
+        .expect("a result");
+    let verify = || adopt_run(&config, &["verify", "--instance", "svc1"]);
+    let path = format!("/1.0/instances/svc1?project={ADOPT_TO}");
+    let mut moved = stopped_pin(ADOPT_MAC);
+    moved["ipv4.address"] = json!("192.0.2.133");
+    assert_eq!(
+        raw(
+            &fake,
+            "PATCH",
+            &path,
+            &json!({ "devices": { "eth0": moved } })
+        ),
+        200
+    );
+    let lost = verify();
+    assert!(
+        matches!(&lost, Err(failure @ Failure::Runtime(why)) if why.contains("pin") && failure.code() == 1),
+        "{lost:?}"
+    );
+    let pinned = json!({ "devices": { "eth0": stopped_pin(ADOPT_MAC) } });
+    assert_eq!(raw(&fake, "PATCH", &path, &pinned), 200);
+    verify().expect("pinned again").expect("a result");
+    let unmarked = json!({ "config": { "user.arcakernel.entry": "" } });
+    assert_eq!(raw(&fake, "PATCH", &path, &unmarked), 200);
+    let foreign = verify();
+    assert!(
+        matches!(&foreign, Err(Failure::Runtime(why)) if why.contains("mark")),
+        "{foreign:?}"
+    );
+    let marked = json!({ "config": { "user.arcakernel.entry": "adopt-svc1" } });
+    assert_eq!(raw(&fake, "PATCH", &path, &marked), 200);
+    let state = format!("/1.0/instances/svc1/state?project={ADOPT_TO}");
+    assert_eq!(
+        raw(&fake, "PUT", &state, &json!({ "action": "start" })),
+        202
+    );
+    let running = verify();
+    assert!(
+        matches!(&running, Err(Failure::Runtime(why)) if why.contains("stopped")),
+        "{running:?}"
+    );
+
+    // Started by hand, it is not released: the release neither stops nor starts it, so it refuses before any step.
+    let writes = fake.writes().len();
+    for args in [
+        vec!["release", "--instance", "svc1"],
+        vec!["release", "--instance", "svc1", "--dry-run"],
+    ] {
+        let refused = adopt_run(&config, &args);
+        assert!(
+            matches!(&refused, Err(failure @ Failure::Refused(why)) if why.contains("not stopped") && failure.code() == 2),
+            "{args:?}: {refused:?}"
+        );
+    }
+    assert_eq!(fake.writes().len(), writes, "no write");
+    let record = AdoptionRecord::open(&scratch.path("state")).expect("the record");
+    assert_eq!(
+        record.last("svc1"),
+        Some((AdoptStep::Mark, Phase::Done)),
+        "nothing recorded"
+    );
+    let stop = json!({ "action": "stop", "force": true });
+    assert_eq!(raw(&fake, "PUT", &state, &stop), 202);
+    adopt_run(&config, &["release", "--instance", "svc1"])
+        .expect("the release")
+        .expect("a result");
+    let back = get(&fake, "/1.0/instances/svc1?project=default").expect("released");
+    assert_eq!(back["status"], json!("Stopped"));
+}
+
+#[test]
+fn a_stopped_adoption_killed_before_its_move_and_started_by_hand_is_not_released_until_stopped() {
+    let scratch = Scratch::new("stopped-early-start");
+    let fake = adopt_fake(&scratch, stopped_svc1(|_| {}));
+    let config = adopt_config(&scratch, &fake);
+    let digest = adopt_digest(&config);
+    let halted = arca::cmd_adopt::adopt_halting(
+        &[
+            "apply",
+            "--instance",
+            "svc1",
+            "--plan-digest",
+            &digest,
+            "--expect-ip",
+            ADOPT_IP,
+            "--config",
+            &config.display().to_string(),
+        ]
+        .map(str::to_string),
+        &mut |step, kill| step == AdoptStep::PinNic && kill == arca::cmd_adopt::Kill::AfterOutcome,
+    );
+    assert!(
+        matches!(&halted, Err(Failure::Runtime(why)) if why.contains("halted")),
+        "{halted:?}"
+    );
+    let state = "/1.0/instances/svc1/state?project=default";
+    assert_eq!(raw(&fake, "PUT", state, &json!({ "action": "start" })), 202);
+    let writes = fake.writes().len();
+    let refused = adopt_run(&config, &["release", "--instance", "svc1"]);
+    assert!(
+        matches!(&refused, Err(Failure::Refused(why)) if why.contains("not stopped in default")),
+        "{refused:?}"
+    );
+    assert_eq!(fake.writes().len(), writes, "no write");
+    assert_eq!(
+        raw(
+            &fake,
+            "PUT",
+            state,
+            &json!({ "action": "stop", "force": true })
+        ),
+        202
+    );
+    let released = adopt_run(&config, &["release", "--instance", "svc1"])
+        .expect("the release")
+        .expect("a result");
+    assert_eq!(released["released"], json!(true));
+    assert!(
+        get(&fake, &format!("/1.0/projects/{ADOPT_TO}")).is_none(),
+        "the project is deleted"
+    );
+    let back = get(&fake, "/1.0/instances/svc1?project=default").expect("in default");
+    assert_eq!(back["status"], json!("Stopped"));
+    assert_eq!(
+        back["devices"]["eth0"],
+        stopped_pin(ADOPT_MAC),
+        "the pin stays"
+    );
+}
+
+#[test]
+fn apply_takes_an_expect_ip_for_a_running_instance_only_as_its_running_ipv4_and_the_digest_is_the_same()
+ {
+    let scratch = Scratch::new("running-apply-ip");
+    let fake = adopt_fake(&scratch, vec![adopt_instance("default", json!({}))]);
+    let config = adopt_config(&scratch, &fake);
+    let planned = plan_of(&config);
+    assert!(
+        planned["plan"]["preImage"].get("stopped").is_none(),
+        "a running instance's pre-image is the one it had before stopped instances were planned"
+    );
+    let digest = planned["digest"].as_str().expect("a digest").to_string();
+    let other = apply(&config, &digest, &["--expect-ip", "192.0.2.99"]);
+    assert!(
+        matches!(&other, Err(Failure::Refused(why)) if why.contains("--expect-ip")),
+        "{other:?}"
+    );
+    assert!(fake.writes().is_empty());
+    let applied = apply(&config, &digest, &["--expect-ip", ADOPT_IP])
+        .expect("the adoption")
+        .expect("a result");
+    assert_eq!(applied["complete"], json!(true));
+    let after = get(&fake, &format!("/1.0/instances/svc1?project={ADOPT_TO}")).expect("adopted");
+    assert_eq!(after["status"], json!("Running"));
+    // A resume takes the recorded plan: an --expect-ip that is not its IPv4 is refused.
+    let resumed = apply(&config, &digest, &["--expect-ip", "192.0.2.99"]);
+    assert!(
+        matches!(&resumed, Err(Failure::Refused(why)) if why.contains("--expect-ip")),
+        "{resumed:?}"
+    );
 }
