@@ -10,6 +10,8 @@ description = "Arca's node alerts: the fixed rules, the evaluator on the sampler
 arca-incus.workspace = true
 arca-metrics.workspace = true
 arca-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

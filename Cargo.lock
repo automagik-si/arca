@@ -61,6 +61,8 @@ dependencies = [
  "arca-incus",
  "arca-metrics",
  "arca-store",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
