@@ -11,6 +11,7 @@ pub mod adoptions;
 pub mod cmd_adopt;
 pub mod cmd_call;
 pub mod cmd_serve;
+pub mod cmd_store;
 pub mod cmd_token;
 pub mod cmd_watch;
 pub mod config;
@@ -35,6 +36,7 @@ const USAGE: &str = "usage: arca <command>
   serve --config <file>
   call <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
+  store check --config <file>
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
   adopt apply --instance <name> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] --config <file>
@@ -181,6 +183,12 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),
         "call" => cmd_call::call(rest),
         "adopt" => cmd_adopt::adopt(rest),
+        "store" => match rest.split_first() {
+            Some((action, rest)) if action == "check" => {
+                cmd_store::check(&parse_flags(rest, &["config"], &[])?)
+            }
+            _ => Err(usage_failure()),
+        },
         "token" => match rest.split_first() {
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
                 rest,
