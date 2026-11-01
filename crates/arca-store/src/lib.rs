@@ -11,8 +11,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, Transaction, params};
 use serde_json::{Value, json};
+
+mod rollup;
 
 /// The store's file name in the state directory.
 pub const DB_FILE: &str = "arca.db";
@@ -49,7 +51,8 @@ pub struct Store {
 /// A store just opened for writing, with the pragmas it read back.
 pub struct Opened {
     pub store: Store,
-    /// The `.corrupt-<ms>` suffix the files of a corrupt store were renamed with. Never set yet: a corrupt file is refused.
+    /// The `.corrupt-<ms>` suffix that `arca.db`, `arca.db-wal` and `arca.db-shm` (each one that existed) were renamed with
+    /// when the file was corrupt. `None` when the file opened as it was.
     pub reset: Option<String>,
     pub pragmas: Pragmas,
 }
@@ -196,41 +199,78 @@ impl AlertEvent {
     }
 }
 
-/// What a rollup did.
+/// What a rollup did: the rows it wrote to each tier, and the rows and events its retention deleted.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RollupReport {
+    /// Minute buckets written to tier 1.
     pub minutes_rolled: u64,
+    /// Hour buckets written to tier 2.
     pub hours_rolled: u64,
+    /// Points deleted from any tier.
     pub deleted_points: u64,
+    /// Alert events deleted: resolved alerts past their retention, with their firing events.
     pub deleted_events: u64,
+}
+
+/// A tier of the store: the raw points, the one-minute rollup or the one-hour rollup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Raw = 0,
+    Minute = 1,
+    Hour = 2,
+}
+
+/// One stored point of one series. A raw point has `avg == min == max`. A counter's rollup holds its last value in all three.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredPoint {
+    pub at: u64,
+    pub labels: BTreeMap<String, String>,
+    pub avg: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+/// A failed writer open: a file that is corrupt, which is renamed aside, or any other failure, which is reported as it is.
+enum Failure {
+    Corrupt,
+    Other(StoreError),
+}
+
+impl From<rusqlite::Error> for Failure {
+    fn from(error: rusqlite::Error) -> Self {
+        match error {
+            rusqlite::Error::SqliteFailure(failure, _)
+                if matches!(
+                    failure.code,
+                    ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt
+                ) =>
+            {
+                Failure::Corrupt
+            }
+            other => Failure::Other(other.into()),
+        }
+    }
 }
 
 impl Store {
     /// Opens `<state_dir>/arca.db` for writing, creating it at schema version 1 when it is new. `auto_vacuum` is set before
-    /// any table exists, then the WAL and durability pragmas, which are read back. A file whose quick check fails is refused.
-    pub fn open(state_dir: &Path, _now_ms: u64) -> Result<Opened, StoreError> {
+    /// any table exists, then the WAL and durability pragmas, which are read back. A file that is not a database, or fails
+    /// its quick check, is renamed aside with its `-wal` and `-shm` and replaced by a new file whose first `seq` is at least
+    /// `now_ms`. A file of a newer schema, or a connection with the wrong pragmas, is refused and never renamed.
+    pub fn open(state_dir: &Path, now_ms: u64) -> Result<Opened, StoreError> {
         let path = state_dir.join(DB_FILE);
-        let mut conn = Connection::open(&path)?;
-        conn.pragma_update(None, "auto_vacuum", 2)?;
-        conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
-        conn.pragma_update(None, "synchronous", 2)?;
-        conn.pragma_update(None, "wal_autocheckpoint", 1_000)?;
-        conn.pragma_update(None, "journal_size_limit", 67_108_864)?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
-        conn.pragma_update(None, "foreign_keys", true)?;
-        let pragmas = Store::check_pragmas(&conn)?;
-        let check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        if check != "ok" {
-            return Err(StoreError::Sqlite(
-                "the database failed its quick check".to_string(),
-            ));
+        if is_corrupt(&path) {
+            return reset_corrupt(state_dir, path, now_ms);
         }
-        migrate(&mut conn)?;
-        Ok(Opened {
-            store: Store { conn, path },
-            reset: None,
-            pragmas,
-        })
+        match open_writer(&path) {
+            Ok((conn, pragmas)) => Ok(Opened {
+                store: Store { conn, path },
+                reset: None,
+                pragmas,
+            }),
+            Err(Failure::Corrupt) => reset_corrupt(state_dir, path, now_ms),
+            Err(Failure::Other(error)) => Err(error),
+        }
     }
 
     /// Opens `<state_dir>/arca.db` to read only. The pragmas are read back as for the writer.
@@ -375,9 +415,39 @@ impl Store {
         size(&self.path) + size(Path::new(&wal))
     }
 
-    /// Rolls the closed buckets up and applies retention. Not built yet: it rolls nothing.
-    pub fn rollup(&mut self, _now_ms: u64) -> Result<RollupReport, StoreError> {
-        Ok(RollupReport::default())
+    /// The points of `tier` for the series named `name` with `from_ms <= at < to_ms`, oldest first, then by labels.
+    pub fn points(
+        &self,
+        tier: Tier,
+        name: &str,
+        from_ms: u64,
+        to_ms: u64,
+    ) -> Result<Vec<StoredPoint>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT p.at, s.labels, p.avg, p.min, p.max FROM points p JOIN series s ON s.id = p.series_id
+             WHERE p.tier = ?1 AND s.name = ?2 AND p.at >= ?3 AND p.at < ?4 ORDER BY p.at, s.labels",
+        )?;
+        let rows = stmt.query_map(
+            params![tier as i64, name, int(from_ms)?, int(to_ms)?],
+            |row| {
+                let labels: String = row.get(1)?;
+                let labels = serde_json::from_str(&labels).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        "an unknown value".into(),
+                    )
+                })?;
+                Ok(StoredPoint {
+                    at: uint(row, 0)?,
+                    labels,
+                    avg: row.get(2)?,
+                    min: row.get(3)?,
+                    max: row.get(4)?,
+                })
+            },
+        )?;
+        rows.map(|row| row.map_err(StoreError::from)).collect()
     }
 
     fn events(
@@ -389,6 +459,95 @@ impl Store {
         let rows = stmt.query_map(args, event_of)?;
         rows.map(|row| row.map_err(StoreError::from)).collect()
     }
+}
+
+/// Opens the writer's connection to `path` with its pragmas, checks it and migrates it. A file that is not a database, or
+/// fails its quick check, is `Failure::Corrupt`.
+fn open_writer(path: &Path) -> Result<(Connection, Pragmas), Failure> {
+    let mut conn = Connection::open(path)?;
+    conn.pragma_update(None, "auto_vacuum", 2)?;
+    conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
+    conn.pragma_update(None, "synchronous", 2)?;
+    conn.pragma_update(None, "wal_autocheckpoint", 1_000)?;
+    conn.pragma_update(None, "journal_size_limit", 67_108_864)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    let pragmas = Store::check_pragmas(&conn).map_err(Failure::Other)?;
+    let check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if check != "ok" {
+        return Err(Failure::Corrupt);
+    }
+    migrate(&mut conn).map_err(Failure::Other)?;
+    Ok((conn, pragmas))
+}
+
+/// Whether the file at `path` is corrupt, as a read-only connection judges it. A writable connection that closes on a
+/// corrupt file deletes its `-wal` and `-shm`, so the probe must be read-only: it never deletes or checkpoints them on close.
+/// A file that cannot be probed is not judged here, and the writer open reports the failure.
+fn is_corrupt(path: &Path) -> bool {
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return false;
+    };
+    match conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)) {
+        Ok(check) => check != "ok",
+        Err(error) => matches!(Failure::from(error), Failure::Corrupt),
+    }
+}
+
+/// Renames the files of a corrupt store aside with one `.corrupt-<ms>` suffix, then creates a new file. Its first `seq` is the
+/// larger of the old highest `seq` plus one and `now_ms`, so a reader's cursor never sees a `seq` go backwards.
+fn reset_corrupt(state_dir: &Path, path: PathBuf, now_ms: u64) -> Result<Opened, StoreError> {
+    let old_max = old_max_seq(&path);
+    let suffix = format!(".corrupt-{now_ms}");
+    for name in [
+        DB_FILE.to_string(),
+        format!("{DB_FILE}-wal"),
+        format!("{DB_FILE}-shm"),
+    ] {
+        let from = state_dir.join(&name);
+        if from.exists() {
+            fs::rename(&from, state_dir.join(format!("{name}{suffix}")))
+                .map_err(|error| StoreError::Io(error.to_string()))?;
+        }
+    }
+    let (conn, pragmas) = open_writer(&path).map_err(|failure| match failure {
+        Failure::Other(error) => error,
+        Failure::Corrupt => StoreError::Sqlite("a new store failed its quick check".to_string()),
+    })?;
+    let start = (old_max + 1).max(now_ms);
+    conn.execute(
+        "INSERT INTO sqlite_sequence (name, seq) VALUES ('alert_events', ?1)",
+        params![int(start - 1)?],
+    )?;
+    Ok(Opened {
+        store: Store { conn, path },
+        reset: Some(suffix),
+        pragmas,
+    })
+}
+
+/// The highest sequence number that a corrupt file still answers for, or 0 when it answers for none.
+fn old_max_seq(path: &Path) -> u64 {
+    let Ok(conn) = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return 0;
+    };
+    let meta: Option<i64> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'max_seq'", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten();
+    let events: Option<i64> = conn
+        .query_row("SELECT max(seq) FROM alert_events", [], |row| row.get(0))
+        .ok()
+        .flatten();
+    [meta, events]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| u64::try_from(value).ok())
+        .max()
+        .unwrap_or(0)
 }
 
 /// Creates schema version 1 on a new file. A file of a newer version is refused.
