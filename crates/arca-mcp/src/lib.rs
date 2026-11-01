@@ -13,8 +13,8 @@ pub mod tools;
 
 pub use auth::{Caller, TokenStore, TokenStoreError, mint};
 pub use http::{
-    Server, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy, serve_tailnet, serve_unix,
-    tailnet_addr_ok,
+    GetHandler, GetReply, Server, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy,
+    serve_tailnet, serve_unix, tailnet_addr_ok,
 };
 pub use tools::{CallError, ToolHandler};
 

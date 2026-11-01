@@ -248,10 +248,16 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
         .iter()
         .map(|t| t["name"].as_str().expect("a name").to_string())
         .collect();
-    // The viewer's reads of the table: the watch verbs and the read-only plan listing. No write verb is listed.
+    // The viewer's reads of the table: the watch verbs, the read-only plan listing and the alerts. No write verb is listed.
     assert_eq!(
         names,
-        vec!["arca_status", "node_metrics", "watch_report", "plan_list"]
+        vec![
+            "arca_status",
+            "node_metrics",
+            "watch_report",
+            "plan_list",
+            "alerts_list"
+        ]
     );
 }
 

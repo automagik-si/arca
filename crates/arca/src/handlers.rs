@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arca_alerts::{AlertSnapshot, Engine, TickStore, export, inputs};
 use arca_api::Scope;
 use arca_approval::{ApprovalRefusal, parse_statement};
 use arca_incus::{IncusRead, UnixIncus};
@@ -15,10 +16,11 @@ use arca_kernel::desired::EntryId;
 use arca_kernel::journal::DeletePlan;
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
-use arca_mcp::{CallError, Caller, ToolHandler};
+use arca_mcp::{CallError, Caller, GetHandler, GetReply, ToolHandler};
 use arca_metrics::{DEFAULT_MINUTES, HostSample, Sampler, SamplerConfig, mean};
 use arca_providers::ReadOnlyIncusProvider;
 use arca_reconcile::PLAN_TTL_MS;
+use arca_store::Store;
 use arca_watch::{WatchConfig, watch_once};
 use serde_json::{Value, json};
 
@@ -171,10 +173,57 @@ impl Published {
     }
 }
 
-/// Takes one host sample and publishes the ring: every sample of the last hour, oldest first.
-pub fn sample_and_publish(sampler: &mut Sampler<UnixIncus>, published: &Published) {
-    sampler.sample(now_ms());
-    published.publish(sampler.history(HISTORY_MINUTES));
+/// The alert snapshot the sampler's tick last published, swapped in as [`Published`] swaps its samples. Before the first
+/// tick it is empty.
+#[derive(Clone, Default)]
+pub struct AlertsPublished(Arc<RwLock<Arc<AlertSnapshot>>>);
+
+impl AlertsPublished {
+    pub fn publish(&self, snapshot: AlertSnapshot) {
+        let next = Arc::new(snapshot);
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = next;
+    }
+
+    pub fn current(&self) -> Arc<AlertSnapshot> {
+        Arc::clone(&self.0.read().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+/// The sampler thread's tick: one host sample, the alert engine over it, and both published.
+pub struct Ticker<S: TickStore> {
+    sampler: Sampler<UnixIncus>,
+    engine: Engine<S>,
+    published: Published,
+    alerts: AlertsPublished,
+}
+
+impl<S: TickStore> Ticker<S> {
+    pub fn new(
+        sampler: Sampler<UnixIncus>,
+        engine: Engine<S>,
+        published: Published,
+        alerts: AlertsPublished,
+    ) -> Self {
+        Ticker {
+            sampler,
+            engine,
+            published,
+            alerts,
+        }
+    }
+
+    /// Takes one host sample and publishes the ring, every sample of the last hour, oldest first. Then evaluates the
+    /// alerts, commits the tick to the store, and publishes the alert snapshot, whether the commit worked or not.
+    pub fn tick(&mut self, now_ms: u64) {
+        self.sampler.sample(now_ms);
+        self.published
+            .publish(self.sampler.history(HISTORY_MINUTES));
+        let inputs = inputs::from_sampler(&self.sampler);
+        let points = export::points(&self.sampler, &inputs);
+        let mut snapshot = self.engine.tick(&inputs, points, now_ms);
+        snapshot.sample_at = self.sampler.latest().map(|sample| sample.at);
+        self.alerts.publish(snapshot);
+    }
 }
 
 /// The samples within `minutes` of the newest one, oldest first. The window is measured from the newest sample's time, as
@@ -254,6 +303,69 @@ impl ToolHandler for MetricsHandler {
             minutes,
             now_ms(),
         ))
+    }
+}
+
+/// `alerts_list`: the firing alerts of the newest published tick, and the store's size, read on a read-only connection.
+pub struct AlertsHandler {
+    pub alerts: AlertsPublished,
+    pub published: Published,
+    pub store: Arc<Mutex<Store>>,
+    pub node: String,
+}
+
+impl ToolHandler for AlertsHandler {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let snapshot = self.alerts.current();
+        let now = now_ms();
+        let firing: Vec<Value> = snapshot
+            .firing
+            .iter()
+            .map(|alert| {
+                let mut event = alert.event.to_json(&self.node);
+                event["unknown"] = json!(alert.unknown);
+                event
+            })
+            .collect();
+        let sample_age = self
+            .published
+            .current()
+            .last()
+            .map(|sample| now.saturating_sub(sample.at));
+        let store_bytes = self
+            .store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bytes();
+        Ok(json!({
+            "firing": firing,
+            "unknown": [],
+            "disabled": snapshot.disabled,
+            "resolvedRecent": [],
+            "sampleAgeMs": sample_age,
+            "watchAgeMs": null,
+            "commitMs": null,
+            "storeError": null,
+            "storeReset": snapshot.store_reset,
+            "storeBytes": store_bytes,
+            "healthLine": "",
+        }))
+    }
+}
+
+/// `GET /metrics`: the newest published alert snapshot in the Prometheus text format.
+pub struct MetricsExport {
+    pub node: String,
+    pub alerts: AlertsPublished,
+}
+
+impl GetHandler for MetricsExport {
+    fn get(&self, _query: Option<&str>, _caller: &Caller) -> Result<GetReply, CallError> {
+        let body = export::render_metrics(&self.node, &self.alerts.current());
+        Ok(GetReply {
+            content_type: "text/plain; version=0.0.4",
+            body: body.into_bytes(),
+        })
     }
 }
 

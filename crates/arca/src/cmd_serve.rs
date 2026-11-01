@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
+use arca_alerts::Engine;
+use arca_alerts::eval::Rules;
 use arca_api::verbs;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE,
@@ -23,18 +25,19 @@ use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
 use arca_mcp::{Server, TokenStore, TokenStoreError, serve_proxy, serve_tailnet, serve_unix};
-use arca_metrics::Sampler;
 use arca_providers::ReadOnlyIncusProvider;
 use arca_providers::incus::{Family, IncusProvider, RetainedSet};
 use arca_reconcile::PluginSet;
+use arca_store::Store;
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    Clock, MetricsHandler, Published, SAMPLE_INTERVAL, StatusHandler, TokenListHandler,
-    WatchHandler, new_sampler, now_ms, plan_handlers, sample_and_publish,
+    AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler, Published,
+    SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
+    plan_handlers,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -109,24 +112,52 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     .map_err(kernel_failure)?;
     let kernel = Arc::new(Mutex::new(kernel));
 
+    // The store opens before anything listens, so a store that refuses its pragmas stops the start with exit 1. The sampler
+    // thread is its only writer; the handlers read it on their own read-only connection.
+    let opened = Store::open(&cfg.state_dir, now_ms()).map_err(store_failure)?;
+    let reader = Store::open_read_only(&cfg.state_dir).map_err(store_failure)?;
+    let engine = Engine::start(
+        opened.store,
+        Rules::default(),
+        opened.reset.is_some(),
+        now_ms(),
+    )
+    .map_err(store_failure)?;
+
     // The sampler takes its first sample on its own thread, so the listeners start without waiting on Incus. The handlers read
-    // the samples it publishes and never take part in a read.
+    // the samples and the alerts it publishes and never take part in a read.
     let published = Published::default();
-    spawn_sampler(new_sampler(&cfg), published.clone())
-        .map_err(|e| Failure::Runtime(e.to_string()))?;
+    let alerts = AlertsPublished::default();
+    let ticker = Ticker::new(new_sampler(&cfg), engine, published.clone(), alerts.clone());
+    spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let mut server = Server::new(verbs(), tokens)
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
-                node,
+                node: node.clone(),
                 started,
                 socket: cfg.incus.socket.clone(),
             }),
         )
-        .handle("node_metrics", Arc::new(MetricsHandler { published }))
+        .handle(
+            "node_metrics",
+            Arc::new(MetricsHandler {
+                published: published.clone(),
+            }),
+        )
         .handle("watch_report", Arc::new(watch_handler(&cfg)))
-        .handle("token_list", Arc::new(TokenListHandler { ids }));
+        .handle("token_list", Arc::new(TokenListHandler { ids }))
+        .handle(
+            "alerts_list",
+            Arc::new(AlertsHandler {
+                alerts: alerts.clone(),
+                published,
+                store: Arc::new(Mutex::new(reader)),
+                node: node.clone(),
+            }),
+        )
+        .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
     let clock: Clock = Arc::new(now_ms);
     for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock) {
         server = server.handle(verb, handler);
@@ -316,14 +347,19 @@ fn token_failure(error: TokenStoreError) -> Failure {
     }
 }
 
-/// Samples the host on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each
-/// sample is published as soon as it is taken.
-fn spawn_sampler(mut sampler: Sampler<UnixIncus>, published: Published) -> io::Result<()> {
+/// A store that refuses to open or start, as a failure of start (exit 1).
+fn store_failure(error: arca_store::StoreError) -> Failure {
+    Failure::Runtime(error.to_string())
+}
+
+/// Ticks on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each tick's
+/// sample and alerts are published as soon as they are taken.
+fn spawn_sampler(mut ticker: Ticker<Store>) -> io::Result<()> {
     thread::Builder::new()
         .name("arca-sampler".to_string())
         .spawn(move || {
             loop {
-                sample_and_publish(&mut sampler, &published);
+                ticker.tick(now_ms());
                 thread::sleep(SAMPLE_INTERVAL);
             }
         })?;

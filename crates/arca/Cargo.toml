@@ -14,6 +14,7 @@ name = "arca"
 path = "src/main.rs"
 
 [dependencies]
+arca-alerts.workspace = true
 arca-api.workspace = true
 arca-approval.workspace = true
 arca-incus.workspace = true
@@ -22,6 +23,7 @@ arca-mcp.workspace = true
 arca-metrics.workspace = true
 arca-providers.workspace = true
 arca-reconcile.workspace = true
+arca-store.workspace = true
 arca-watch.workspace = true
 getrandom.workspace = true
 serde.workspace = true

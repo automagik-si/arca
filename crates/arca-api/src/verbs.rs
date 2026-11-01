@@ -61,7 +61,7 @@ pub struct Verb {
     pub result: fn() -> Value,
 }
 
-static VERBS: [Verb; 7] = [
+static VERBS: [Verb; 8] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -131,6 +131,16 @@ static VERBS: [Verb; 7] = [
         destructive: true,
         params: approval_submit_params,
         result: approval_submit_result,
+    },
+    Verb {
+        name: "alerts_list",
+        summary: "The node's alerts: the firing ones, those whose data is unknown, the disabled rules, the recent resolves, and the store's health.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        params: alerts_list_params,
+        result: alerts_list_result,
     },
 ];
 
@@ -480,4 +490,75 @@ fn approval_submit_result() -> Value {
         ("drift", true, array(object_ref())),
         ("partial", true, boolean()),
     ])
+}
+
+fn alerts_list_params() -> Value {
+    params(vec![])
+}
+
+fn alerts_list_result() -> Value {
+    result(vec![
+        (
+            "firing",
+            true,
+            array(alert_event(vec![("unknown", true, boolean())])),
+        ),
+        (
+            "unknown",
+            true,
+            array(result(vec![
+                ("rule", true, string()),
+                ("labels", true, labels()),
+                ("state", true, one_of(&["ok", "pending", "firing"])),
+                ("reason", true, one_of(&["missing", "stale"])),
+            ])),
+        ),
+        ("disabled", true, array(string())),
+        ("resolvedRecent", true, array(alert_event(vec![]))),
+        ("sampleAgeMs", true, nullable(int())),
+        ("watchAgeMs", true, nullable(int())),
+        ("commitMs", true, nullable(int())),
+        (
+            "storeError",
+            true,
+            nullable(result(vec![
+                ("at", true, int()),
+                ("message", true, string()),
+            ])),
+        ),
+        ("storeReset", true, boolean()),
+        ("storeBytes", true, int()),
+        ("healthLine", true, string()),
+    ])
+}
+
+/// An `arca.alert.v1` event, with `extra` fields. Only a resolve carries `reason`.
+fn alert_event(extra: Vec<Field>) -> Value {
+    let mut fields = vec![
+        ("schema", true, string()),
+        ("seq", true, nullable(int())),
+        ("alertId", true, nullable(int())),
+        ("node", true, string()),
+        ("rule", true, string()),
+        ("severity", true, one_of(&["critical", "warning"])),
+        ("state", true, one_of(&["firing", "resolved"])),
+        ("labels", true, labels()),
+        ("value", true, nullable(num())),
+        ("threshold", true, nullable(num())),
+        ("startedAt", true, int()),
+        ("resolvedAt", true, nullable(int())),
+        ("at", true, int()),
+        (
+            "reason",
+            false,
+            one_of(&["cleared", "rule-disabled", "subject-gone"]),
+        ),
+    ];
+    fields.extend(extra);
+    result(fields)
+}
+
+/// An alert's own labels: an open object of names to strings, which the subset checks only as an object.
+fn labels() -> Value {
+    result(vec![])
 }
