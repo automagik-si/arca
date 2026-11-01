@@ -14,14 +14,15 @@ use crate::procfs::{self, CpuTotals, NicTotals};
 /// The window `node_metrics` reads when the caller names no minutes.
 pub const DEFAULT_MINUTES: u32 = 1;
 
-/// Where the sampler reads, which pools it asks Incus about, and how many samples it keeps.
+/// Where the sampler reads, which pools it reports, and how many samples it keeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamplerConfig {
     /// The root of the procfs tree (`/proc` on a host).
     pub proc_root: PathBuf,
     /// The root of the sysfs tree (`/sys` on a host).
     pub sys_root: PathBuf,
-    /// The storage pools whose space is read, by name.
+    /// The allow-filter over the pools Incus lists, by name. An empty list admits every pool Incus lists. A name Incus does
+    /// not list has no row.
     pub pools: Vec<String>,
     /// How often the caller samples, in milliseconds. The ring holds `history_minutes` of samples at this period.
     pub interval_ms: u64,
@@ -92,6 +93,18 @@ pub struct Pool {
     pub free_bytes: Option<u64>,
 }
 
+impl Pool {
+    /// A pool row whose space is not known: the name, and null fields.
+    fn unread(name: String) -> Pool {
+        Pool {
+            name,
+            used_bytes: None,
+            total_bytes: None,
+            free_bytes: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Network {
@@ -105,6 +118,25 @@ pub struct ProjectCount {
     pub project: String,
     pub total: u64,
     pub running: u64,
+}
+
+/// The NIC byte counters of the physical NICs, as the sampler read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NicCounters {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// What Incus and the NICs answered at the latest sample. A `None` is a read that failed: the sampler never turns a failure
+/// into an empty answer here. The sample's own `pools` and `projects` lists are the `node_metrics` view of the same reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Readings {
+    /// The pools the allow-filter admits, from Incus's own pool list, with each one's space. `None` when the listing failed.
+    pub pools: Option<Vec<Pool>>,
+    /// The instances per project. `None` when the instance list cannot be read.
+    pub projects: Option<Vec<ProjectCount>>,
+    /// The NIC byte counters, `None` when `/proc/net/dev` cannot be read.
+    pub nic: Option<NicCounters>,
 }
 
 /// The counters a sample is measured against: when they were read, and the CPU and NIC totals.
@@ -122,6 +154,9 @@ pub struct Sampler<R: IncusRead> {
     capacity: usize,
     ring: VecDeque<HostSample>,
     previous: Option<Previous>,
+    readings: Readings,
+    /// The pool names the last successful listing admitted, in its order. `None` until a listing has succeeded.
+    listed_pools: Option<Vec<String>>,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -133,15 +168,36 @@ impl<R: IncusRead> Sampler<R> {
             capacity,
             ring: VecDeque::new(),
             previous: None,
+            readings: Readings::default(),
+            listed_pools: None,
         }
     }
 
     /// Reads the host and Incus, appends the sample to the ring, and returns it. The ring drops its oldest sample past its
     /// capacity.
+    ///
+    /// When the pool listing fails, the sample's pool rows are the last listing's names with null fields, or, before any
+    /// listing has succeeded, the allow-filter's names with null fields. When the instance list fails, the sample has no project
+    /// rows. [`Sampler::readings`] keeps the `None`s, which the alerts read as unknown.
     pub fn sample(&mut self, now_ms: u64) -> &HostSample {
         let previous = self.previous;
         let cpu = procfs::read_cpu(&self.cfg.proc_root);
         let nic = procfs::read_nic_totals(&self.cfg.proc_root, &self.cfg.sys_root);
+        let pools = incus::read_pools(&self.incus, &self.cfg.pools);
+        let projects = incus::read_projects(&self.incus);
+        let rows = match &pools {
+            Some(listed) => {
+                self.listed_pools = Some(listed.iter().map(|pool| pool.name.clone()).collect());
+                listed.clone()
+            }
+            None => self
+                .listed_pools
+                .clone()
+                .unwrap_or_else(|| self.cfg.pools.clone())
+                .into_iter()
+                .map(Pool::unread)
+                .collect(),
+        };
         let sample = HostSample {
             at: now_ms,
             cpu: Cpu {
@@ -156,9 +212,17 @@ impl<R: IncusRead> Sampler<R> {
             psi: procfs::read_psi(&self.cfg.proc_root),
             cpu_temp_c: procfs::read_cpu_temp_c(&self.cfg.sys_root),
             gpu_busy_pct: procfs::read_gpu_busy_pct(&self.cfg.sys_root),
-            pools: incus::read_pools(&self.incus, &self.cfg.pools),
+            pools: rows,
             network: previous.and_then(|before| network_rates(before, nic, now_ms)),
-            projects: incus::read_projects(&self.incus),
+            projects: projects.clone().unwrap_or_default(),
+        };
+        self.readings = Readings {
+            pools,
+            projects,
+            nic: nic.map(|totals| NicCounters {
+                rx_bytes: totals.rx_bytes,
+                tx_bytes: totals.tx_bytes,
+            }),
         };
         self.previous = Some(Previous {
             at: now_ms,
@@ -177,6 +241,11 @@ impl<R: IncusRead> Sampler<R> {
     /// The most recent sample, or `None` before the first one.
     pub fn latest(&self) -> Option<&HostSample> {
         self.ring.back()
+    }
+
+    /// What Incus and the NICs answered at the latest sample. Before the first sample every field is `None`.
+    pub fn readings(&self) -> &Readings {
+        &self.readings
     }
 
     /// The samples from the last `minutes` before the latest sample, oldest first. The window is measured from the latest
