@@ -44,8 +44,17 @@ mod tests {
     use arca_metrics::{Sampler, SamplerConfig};
     use serde_json::{Value, json};
 
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use arca_store::{EventState, ResolveReason};
+
     use super::from_sampler;
-    use crate::eval::{Inputs, PoolUse, Timed};
+    use crate::UnknownReason;
+    use crate::eval::{Evaluator, Inputs, PoolUse, Rules, Timed};
+
+    /// The pools an Incus lists: each name with its used and total bytes.
+    type PoolList = Vec<(&'static str, u64, u64)>;
 
     /// An Incus that answers nothing, as an absent socket does.
     struct Offline;
@@ -57,7 +66,7 @@ mod tests {
     }
 
     /// An Incus that lists the given pools, each with its `(used, total)` space, and answers no instance list.
-    struct Pools(Vec<(&'static str, u64, u64)>);
+    struct Pools(PoolList);
 
     impl IncusRead for Pools {
         fn get(&self, path: &str) -> Result<Value, IncusError> {
@@ -227,5 +236,77 @@ mod tests {
         let inputs = from_sampler(&sampler);
         assert_eq!(inputs.memory_some_avg10, None);
         assert_eq!(inputs.cpu_temp_c, None);
+    }
+
+    /// An Incus whose pool list the test changes, and which can be switched off as an absent socket is.
+    #[derive(Clone)]
+    struct Live {
+        down: Arc<AtomicBool>,
+        pools: Arc<Mutex<PoolList>>,
+    }
+
+    impl IncusRead for Live {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if self.down.load(Ordering::SeqCst) {
+                return Err(IncusError::Decode(format!("offline: {path}")));
+            }
+            let listed = self
+                .pools
+                .lock()
+                .expect("the pool list is not poisoned")
+                .clone();
+            Pools(listed).get(path)
+        }
+    }
+
+    #[test]
+    fn an_outage_stays_unknown_to_the_evaluator_and_a_pool_removed_after_it_resolves() {
+        const T0: u64 = 1_000_000;
+        let live = Live {
+            down: Arc::new(AtomicBool::new(false)),
+            pools: Arc::new(Mutex::new(vec![("default", 95, 100)])),
+        };
+        let mut sampler = sampler(live.clone(), &[]);
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+        let tick = |sampler: &mut Sampler<Live>, eval: &mut Evaluator, at: u64| {
+            sampler.sample(at);
+            eval.step(&rules, &from_sampler(sampler), at)
+        };
+
+        // The pool is over 90 % from the first tick, so it fires once it has held 60 s.
+        let mut fired = 0;
+        for t in (0..=60_000).step_by(5_000) {
+            fired += tick(&mut sampler, &mut eval, T0 + t).len();
+        }
+        assert_eq!(fired, 1, "the pool alert fires at 60 s");
+
+        // Incus is unreachable for ten minutes: no event, the alert stays firing, and its data is missing, not zero.
+        live.down.store(true, Ordering::SeqCst);
+        for t in (65_000..=665_000).step_by(5_000) {
+            assert!(
+                tick(&mut sampler, &mut eval, T0 + t).is_empty(),
+                "no event at {t} ms"
+            );
+        }
+        assert_eq!(eval.firing().len(), 1, "the alert stays firing");
+        assert!(eval.firing()[0].unknown, "and is marked unknown");
+        assert_eq!(
+            eval.unknown().first().map(|alert| alert.reason),
+            Some(UnknownReason::Missing),
+            "an unreachable Incus is missing data"
+        );
+
+        // Incus answers again without the pool: the removed pool resolves its alert once, as subject-gone.
+        live.down.store(false, Ordering::SeqCst);
+        live.pools
+            .lock()
+            .expect("the pool list is not poisoned")
+            .clear();
+        let events = tick(&mut sampler, &mut eval, T0 + 670_000);
+        assert_eq!(events.len(), 1, "exactly one resolve");
+        assert_eq!(events[0].state, EventState::Resolved);
+        assert_eq!(events[0].reason, Some(ResolveReason::SubjectGone));
+        assert!(eval.firing().is_empty());
     }
 }
