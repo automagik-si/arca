@@ -13,7 +13,7 @@ use std::thread;
 use std::time::Instant;
 
 use arca_alerts::Engine;
-use arca_alerts::eval::Rules;
+use arca_alerts::rules::{self, RulesError};
 use arca_api::verbs;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE,
@@ -85,6 +85,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let started = Instant::now();
     check_state_dir(&cfg.state_dir)?;
 
+    // The alert rules are read before anything listens. A malformed alerts.json stops the start with exit 2.
+    let alerts_file = rules::load(&cfg.state_dir).map_err(rules_failure)?;
+
     // The token store is read before anything listens. Its ids are copied out first, because the server takes the store.
     let tokens = TokenStore::load(&cfg.tokens.hash_dir).map_err(token_failure)?;
     let ids = tokens.ids();
@@ -118,7 +121,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let reader = Store::open_read_only(&cfg.state_dir).map_err(store_failure)?;
     let engine = Engine::start(
         opened.store,
-        Rules::default(),
+        alerts_file.rules.clone(),
         opened.reset.is_some(),
         now_ms(),
     )
@@ -350,6 +353,11 @@ fn token_failure(error: TokenStoreError) -> Failure {
 /// A store that refuses to open or start, as a failure of start (exit 1).
 fn store_failure(error: arca_store::StoreError) -> Failure {
     Failure::Runtime(error.to_string())
+}
+
+/// An `alerts.json` that cannot be read or is refused, as a config failure (exit 2). The message names a key, never a value.
+fn rules_failure(error: RulesError) -> Failure {
+    Failure::Config(error.to_string())
 }
 
 /// Ticks on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each tick's
