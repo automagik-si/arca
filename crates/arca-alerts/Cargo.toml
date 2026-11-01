@@ -1,0 +1,15 @@
+[package]
+name = "arca-alerts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arca's node alerts: the fixed rules, the evaluator on the sampler's tick, and the Prometheus text export"
+
+[dependencies]
+arca-incus.workspace = true
+arca-metrics.workspace = true
+arca-store.workspace = true
+
+[lints]
+workspace = true
