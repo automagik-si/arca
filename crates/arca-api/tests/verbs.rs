@@ -28,7 +28,7 @@ fn names() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_table_holds_the_four_initial_verbs_then_the_three_plan_verbs_in_order() {
+fn the_table_holds_the_four_initial_verbs_the_three_plan_verbs_then_alerts_list_in_order() {
     assert_eq!(
         names(),
         [
@@ -39,6 +39,7 @@ fn the_table_holds_the_four_initial_verbs_then_the_three_plan_verbs_in_order() {
             "plan_list",
             "plan_decline",
             "approval_submit",
+            "alerts_list",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -54,6 +55,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_list", Scope::Viewer, false, false),
         ("plan_decline", Scope::Doctor, true, false),
         ("approval_submit", Scope::Doctor, true, true),
+        ("alerts_list", Scope::Viewer, false, false),
     ];
     for (name, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -174,6 +176,74 @@ fn arca_status_schemas_equal_its_table_row() {
                 "appliedSeq"
             ]
         )
+    );
+}
+
+#[test]
+fn alerts_list_takes_no_argument_and_requires_every_key_of_its_result_and_events() {
+    let v = verb("alerts_list").expect("present");
+    assert_eq!((v.params)(), closed(json!({})));
+    let result = (v.result)();
+    let event = &result["properties"]["resolvedRecent"]["items"];
+    let firing = &result["properties"]["firing"]["items"];
+    let fields = [
+        "schema",
+        "seq",
+        "alertId",
+        "node",
+        "rule",
+        "severity",
+        "state",
+        "labels",
+        "value",
+        "threshold",
+        "startedAt",
+        "resolvedAt",
+        "at",
+    ];
+    assert_eq!(event["required"], json!(fields), "reason is optional");
+    assert_eq!(
+        event["properties"]["reason"]["enum"],
+        json!(["cleared", "rule-disabled", "subject-gone"])
+    );
+    assert_eq!(
+        event["properties"]["labels"],
+        json!({ "type": "object", "properties": {} })
+    );
+    assert_eq!(
+        firing["required"].as_array().map(Vec::len),
+        Some(fields.len() + 1)
+    );
+    assert_eq!(
+        firing["properties"]["unknown"],
+        json!({ "type": "boolean" })
+    );
+    assert_eq!(
+        result["required"],
+        json!([
+            "firing",
+            "unknown",
+            "disabled",
+            "resolvedRecent",
+            "sampleAgeMs",
+            "watchAgeMs",
+            "commitMs",
+            "storeError",
+            "storeReset",
+            "storeBytes",
+            "healthLine"
+        ])
+    );
+    for key in ["sampleAgeMs", "watchAgeMs", "commitMs"] {
+        assert_eq!(
+            result["properties"][key],
+            json!({ "type": ["integer", "null"] }),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        result["properties"]["storeError"]["type"],
+        json!(["object", "null"])
     );
 }
 

@@ -1024,6 +1024,315 @@
       "x-arca-class": "L",
       "x-arca-scope": "doctor",
       "x-arca-writes": true
+    },
+    {
+      "name": "alerts_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "commitMs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "disabled": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "firing": {
+              "items": {
+                "properties": {
+                  "alertId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "at": {
+                    "type": "integer"
+                  },
+                  "labels": {
+                    "properties": {},
+                    "type": "object"
+                  },
+                  "node": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "enum": [
+                      "cleared",
+                      "rule-disabled",
+                      "subject-gone"
+                    ],
+                    "type": "string"
+                  },
+                  "resolvedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "rule": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "seq": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "severity": {
+                    "enum": [
+                      "critical",
+                      "warning"
+                    ],
+                    "type": "string"
+                  },
+                  "startedAt": {
+                    "type": "integer"
+                  },
+                  "state": {
+                    "enum": [
+                      "firing",
+                      "resolved"
+                    ],
+                    "type": "string"
+                  },
+                  "threshold": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "unknown": {
+                    "type": "boolean"
+                  },
+                  "value": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "schema",
+                  "seq",
+                  "alertId",
+                  "node",
+                  "rule",
+                  "severity",
+                  "state",
+                  "labels",
+                  "value",
+                  "threshold",
+                  "startedAt",
+                  "resolvedAt",
+                  "at",
+                  "unknown"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "healthLine": {
+              "type": "string"
+            },
+            "resolvedRecent": {
+              "items": {
+                "properties": {
+                  "alertId": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "at": {
+                    "type": "integer"
+                  },
+                  "labels": {
+                    "properties": {},
+                    "type": "object"
+                  },
+                  "node": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "enum": [
+                      "cleared",
+                      "rule-disabled",
+                      "subject-gone"
+                    ],
+                    "type": "string"
+                  },
+                  "resolvedAt": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "rule": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  },
+                  "seq": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "severity": {
+                    "enum": [
+                      "critical",
+                      "warning"
+                    ],
+                    "type": "string"
+                  },
+                  "startedAt": {
+                    "type": "integer"
+                  },
+                  "state": {
+                    "enum": [
+                      "firing",
+                      "resolved"
+                    ],
+                    "type": "string"
+                  },
+                  "threshold": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  },
+                  "value": {
+                    "type": [
+                      "number",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "schema",
+                  "seq",
+                  "alertId",
+                  "node",
+                  "rule",
+                  "severity",
+                  "state",
+                  "labels",
+                  "value",
+                  "threshold",
+                  "startedAt",
+                  "resolvedAt",
+                  "at"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "sampleAgeMs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "storeBytes": {
+              "type": "integer"
+            },
+            "storeError": {
+              "properties": {
+                "at": {
+                  "type": "integer"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "at",
+                "message"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "storeReset": {
+              "type": "boolean"
+            },
+            "unknown": {
+              "items": {
+                "properties": {
+                  "labels": {
+                    "properties": {},
+                    "type": "object"
+                  },
+                  "reason": {
+                    "enum": [
+                      "missing",
+                      "stale"
+                    ],
+                    "type": "string"
+                  },
+                  "rule": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "enum": [
+                      "ok",
+                      "pending",
+                      "firing"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "rule",
+                  "labels",
+                  "state",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "watchAgeMs": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "firing",
+            "unknown",
+            "disabled",
+            "resolvedRecent",
+            "sampleAgeMs",
+            "watchAgeMs",
+            "commitMs",
+            "storeError",
+            "storeReset",
+            "storeBytes",
+            "healthLine"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The node's alerts: the firing ones, those whose data is unknown, the disabled rules, the recent resolves, and the store's health.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
     }
   ],
   "openrpc": "1.3.2"

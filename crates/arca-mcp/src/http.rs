@@ -1,5 +1,5 @@
-//! The HTTP surface: the `POST /mcp` route, the unix socket listener, the tailnet listener with its peer filter, and the
-//! proxy listener with its exact-peer filter.
+//! The HTTP surface: the `POST /mcp` route, the read-only GET routes, the unix socket listener, the tailnet listener with
+//! its peer filter, and the proxy listener with its exact-peer filter.
 //!
 //! A request carrying any `Origin` header is refused `403` before its body is read, whatever its method or path: a browser
 //! page is never a client. The unix socket is bound inside a fresh private directory, chmodded 0600 and renamed into place,
@@ -26,15 +26,15 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::auth::TokenStore;
+use crate::auth::{Caller, TokenStore};
 use crate::fresh::fresh_dir;
 use crate::jsonrpc;
 use crate::tools::{CallError, ToolHandler};
@@ -55,11 +55,24 @@ const PROXY_BIND: Backoff = Backoff {
     max: Duration::from_secs(16),
 };
 
-/// The server: the verb table, the token store and one handler per verb.
+/// The server: the verb table, the token store, one handler per verb and the GET routes.
 pub struct Server {
     pub(crate) verbs: &'static [Verb],
     pub(crate) tokens: TokenStore,
     pub(crate) handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
+    gets: Vec<(&'static str, Arc<dyn GetHandler>)>,
+}
+
+/// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
+pub trait GetHandler: Send + Sync {
+    /// The reply to a GET with the query string `query`, by `caller`. `CallError::Invalid` is answered 400.
+    fn get(&self, query: Option<&str>, caller: &Caller) -> Result<GetReply, CallError>;
+}
+
+/// A GET route's reply: its content type and its body.
+pub struct GetReply {
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
 }
 
 impl Server {
@@ -81,6 +94,7 @@ impl Server {
             verbs,
             tokens,
             handlers: HashMap::new(),
+            gets: Vec::new(),
         }
     }
 
@@ -99,10 +113,36 @@ impl Server {
         self
     }
 
-    /// The router: `POST /mcp`, with the body limit. Any request with an `Origin` is refused before the body is read.
-    pub fn router(self) -> Router {
-        Router::new()
-            .route("/mcp", post(mcp))
+    /// Answers `GET <path>` with `h`, behind the same bearer check and `Origin` refusal as `/mcp`, for a token of any
+    /// stored scope. A request without a valid bearer is 401, and one with an `Origin` is 403.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `path` is `/mcp`, does not start with `/`, or already has a route: a wiring error, found at start.
+    pub fn get_route(mut self, path: &'static str, h: Arc<dyn GetHandler>) -> Self {
+        assert!(
+            path.starts_with('/') && path != "/mcp" && self.gets.iter().all(|(p, _)| *p != path),
+            "the GET route {path} is not a new path"
+        );
+        self.gets.push((path, h));
+        self
+    }
+
+    /// The router: `POST /mcp`, with the body limit, and the GET routes. Any request with an `Origin` is refused before the
+    /// body is read.
+    pub fn router(mut self) -> Router {
+        let mut router = Router::new().route("/mcp", post(mcp));
+        for (path, handler) in std::mem::take(&mut self.gets) {
+            router = router.route(
+                path,
+                get(
+                    move |state: State<Arc<Server>>, uri: Uri, headers: HeaderMap| {
+                        serve_get(state, handler, uri, headers)
+                    },
+                ),
+            );
+        }
+        router
             .fallback(not_found)
             .layer(middleware::from_fn(refuse_origin))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -132,6 +172,27 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
         Err(CallError::Forbidden { .. }) => StatusCode::FORBIDDEN.into_response(),
         Err(CallError::Unauthenticated) => unauthorized(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn serve_get(
+    State(server): State<Arc<Server>>,
+    handler: Arc<dyn GetHandler>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let Some(caller) = bearer(&headers).and_then(|token| server.tokens.lookup(token)) else {
+        return unauthorized();
+    };
+    let query = uri.query().map(str::to_string);
+    let outcome = tokio::task::spawn_blocking(move || handler.get(query.as_deref(), &caller)).await;
+    match outcome {
+        Ok(Ok(reply)) => ([(header::CONTENT_TYPE, reply.content_type)], reply.body).into_response(),
+        Ok(Err(CallError::Invalid(_))) => StatusCode::BAD_REQUEST.into_response(),
+        Ok(Err(CallError::Forbidden { .. })) => StatusCode::FORBIDDEN.into_response(),
+        Ok(Err(CallError::Unauthenticated)) => unauthorized(),
+        Ok(Err(CallError::NotFound)) => StatusCode::NOT_FOUND.into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

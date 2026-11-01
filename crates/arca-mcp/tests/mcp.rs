@@ -391,10 +391,16 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
     let fx = Fixture::start("list-viewer");
     let reply = fx.call(&fx.viewer, "tools/list", json!({}));
     assert_eq!(reply.status, 200);
-    // The viewer's reads of the table, in table order: the watch verbs and the read-only plan listing.
+    // The viewer's reads of the table, in table order: the watch verbs, the read-only plan listing and the alerts.
     assert_eq!(
         names_of(&reply),
-        vec!["arca_status", "node_metrics", "watch_report", "plan_list"]
+        vec![
+            "arca_status",
+            "node_metrics",
+            "watch_report",
+            "plan_list",
+            "alerts_list"
+        ]
     );
 }
 
@@ -404,6 +410,7 @@ fn a_doctor_tools_list_adds_the_write_verb_but_not_token_list() {
     let reply = fx.call(&fx.doctor, "tools/list", json!({}));
     let names = names_of(&reply);
     assert!(names.contains(&"write_probe".to_string()));
+    assert!(names.contains(&"alerts_list".to_string()));
     assert!(!names.contains(&"token_list".to_string()));
 }
 
@@ -414,6 +421,7 @@ fn an_operator_tools_list_holds_every_verb() {
     let names = names_of(&reply);
     assert_eq!(names.len(), table().len());
     assert!(names.contains(&"token_list".to_string()));
+    assert!(names.contains(&"alerts_list".to_string()));
 }
 
 #[test]
