@@ -1,6 +1,7 @@
-//! The Incus readings a host sample carries: each configured pool's space, and the instances per project. Both are GET
-//! requests through [`IncusRead`]. An answer that fails gives null pool fields and no project rows: the sample's schema has
-//! no nullable list, so an unreachable Incus reads as no instances, and the `arca_status` verb's `incusReachable` says so.
+//! The Incus readings a host sample carries: the storage pools the allow-filter admits, with each one's space, and the
+//! instances per project. Both are GET requests through [`IncusRead`]. An answer that fails is `None`, so the caller can tell
+//! an unreachable Incus from an empty one. The sample's own lists stay empty on a failure, because the `node_metrics` schema
+//! has no nullable list; the alerts read the `None` through [`crate::Readings`].
 
 use std::collections::BTreeMap;
 
@@ -12,16 +13,31 @@ use crate::sample::{Pool, ProjectCount};
 /// The instance list the project counts come from: every project, recursed.
 pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=1";
 
-/// The space of each configured pool, from its `resources` document, in configuration order. A name that is not a plain
-/// name is never sent to Incus, so its fields stay null.
-pub fn read_pools<R: IncusRead>(incus: &R, pools: &[String]) -> Vec<Pool> {
-    pools.iter().map(|name| read_pool(incus, name)).collect()
+/// The storage pool list Incus answers, recursed so that each entry carries its name.
+pub const POOLS_PATH: &str = "/1.0/storage-pools?recursion=1";
+
+/// The storage pools Incus lists that the allow-filter admits, in Incus's order, each with its `resources` space. An empty
+/// filter admits every pool, and a filter name Incus does not list has no row. `None` when the listing fails. A pool whose
+/// `resources` read fails keeps its row with null fields.
+pub fn read_pools<R: IncusRead>(incus: &R, filter: &[String]) -> Option<Vec<Pool>> {
+    let Ok(Value::Array(listed)) = incus.get(POOLS_PATH) else {
+        return None;
+    };
+    Some(
+        listed
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+            .filter(|name| admits(filter, name))
+            .map(|name| read_pool(incus, name))
+            .collect(),
+    )
 }
 
-/// The instances per project, sorted by project name. A project appears only when it holds an instance.
-pub fn read_projects<R: IncusRead>(incus: &R) -> Vec<ProjectCount> {
+/// The instances per project, sorted by project name. A project appears only when it holds an instance. `None` when the
+/// instance list cannot be read.
+pub fn read_projects<R: IncusRead>(incus: &R) -> Option<Vec<ProjectCount>> {
     let Ok(Value::Array(instances)) = incus.get(INSTANCES_PATH) else {
-        return Vec::new();
+        return None;
     };
     let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for instance in &instances {
@@ -34,14 +50,21 @@ pub fn read_projects<R: IncusRead>(incus: &R) -> Vec<ProjectCount> {
             entry.1 += 1;
         }
     }
-    counts
-        .into_iter()
-        .map(|(project, (total, running))| ProjectCount {
-            project,
-            total,
-            running,
-        })
-        .collect()
+    Some(
+        counts
+            .into_iter()
+            .map(|(project, (total, running))| ProjectCount {
+                project,
+                total,
+                running,
+            })
+            .collect(),
+    )
+}
+
+/// Whether the allow-filter admits a pool. An empty filter admits every pool.
+fn admits(filter: &[String], name: &str) -> bool {
+    filter.is_empty() || filter.iter().any(|allowed| allowed == name)
 }
 
 fn read_pool<R: IncusRead>(incus: &R, name: &str) -> Pool {

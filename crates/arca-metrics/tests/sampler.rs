@@ -15,6 +15,7 @@ use arca_metrics::{
 use serde_json::{Value, json};
 
 const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=1";
+const POOLS: &str = "/1.0/storage-pools?recursion=1";
 
 /// A fresh temporary directory, removed when the test ends.
 struct Scratch(PathBuf);
@@ -359,7 +360,8 @@ fn an_unparseable_aggregate_line_reads_no_percentage_but_still_counts_cores() {
 }
 
 #[test]
-fn the_fake_incus_records_only_get_and_one_request_per_pool_plus_the_list() {
+fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_per_admitted_pool()
+{
     let scratch = Scratch::new("gets");
     write_first_tree(scratch.path());
     let fake = FakeIncus::start(scratch.path(), fake_state()).expect("start the fake Incus");
@@ -376,55 +378,50 @@ fn the_fake_incus_records_only_get_and_one_request_per_pool_plus_the_list() {
     assert_eq!(
         requests.len(),
         3,
-        "the instance list and one resources read per pool"
+        "the pool list, the instance list and one resources read for the admitted pool"
     );
     assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
     let mut paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
     paths.sort_unstable();
     assert_eq!(
         paths,
-        vec![
-            INSTANCES,
-            "/1.0/storage-pools/default/resources",
-            "/1.0/storage-pools/missing/resources",
-        ]
+        vec![INSTANCES, "/1.0/storage-pools/default/resources", POOLS,]
     );
-    let missing = requests
-        .iter()
-        .find(|r| r.path.contains("missing"))
-        .expect("the missing pool was asked about");
-    assert_eq!(missing.status, 404);
 
-    assert_eq!(sample.pools.len(), 2, "one pool entry per configured name");
-    assert_eq!(sample.pools[1].name, "missing");
     assert_eq!(
-        sample.pools[1].used_bytes, None,
-        "a pool Incus does not answer for reads null"
+        sample.pools.len(),
+        1,
+        "a filter name Incus does not list has no row"
     );
-    assert_eq!(sample.pools[1].free_bytes, None);
+    assert_eq!(sample.pools[0].name, "default");
 }
 
 #[test]
 fn a_pool_name_that_is_not_plain_is_never_sent_to_incus() {
     let scratch = Scratch::new("names");
     write_first_tree(scratch.path());
-    let fake = FakeIncus::start(scratch.path(), fake_state()).expect("start the fake Incus");
-    let mut sampler = sampler_for(
-        scratch.path(),
-        fake.socket(),
-        &["x/../default", "default?all=1", ".."],
-        5_000,
-        60,
-    );
+    let mut state = fake_state();
+    state.pools = ["x/../default", "default?all=1", ".."]
+        .iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                json!({ "space": { "used": 1, "total": 2 } }),
+            )
+        })
+        .collect();
+    let fake = FakeIncus::start(scratch.path(), state).expect("start the fake Incus");
+    let mut sampler = sampler_for(scratch.path(), fake.socket(), &[], 5_000, 60);
     let sample = sampler.sample(1_000).clone();
 
-    let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+    let mut paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+    paths.sort_unstable();
     assert_eq!(
         paths,
-        vec![INSTANCES.to_string()],
-        "only the instance list was sent"
+        vec![INSTANCES.to_string(), POOLS.to_string()],
+        "the pool list and the instance list were sent, and no resources read"
     );
-    assert_eq!(sample.pools.len(), 3);
+    assert_eq!(sample.pools.len(), 3, "every listed name keeps its row");
     assert!(
         sample
             .pools
@@ -662,4 +659,284 @@ fn node_metrics_reads_one_minute_when_none_is_named_and_nulls_when_empty() {
         .result)();
     conforms(&schema, &filled).expect("a one-sample result conforms too");
     assert_eq!(filled["minutes"], json!(1));
+}
+
+/// The pools Incus lists, read from the sampler's Incus client. The listing is the only source of a pool row, so the allow-filter
+/// and an outage are checked against the same listing a node has.
+mod pools_from_incus {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use arca_incus::{IncusError, IncusRead};
+
+    use super::*;
+
+    /// Incus holds two pools: `default` (used 1073741824 of 10737418240) and `pool1` (used 500 of 1000).
+    fn two_pools() -> FakeState {
+        let mut state = fake_state();
+        state.pools.push((
+            "pool1".to_string(),
+            json!({ "space": { "used": 500, "total": 1000 } }),
+        ));
+        state
+    }
+
+    fn default_row() -> Pool {
+        Pool {
+            name: "default".to_string(),
+            used_bytes: Some(1_073_741_824),
+            total_bytes: Some(10_737_418_240),
+            free_bytes: Some(9_663_676_416),
+        }
+    }
+
+    fn pool1_row() -> Pool {
+        Pool {
+            name: "pool1".to_string(),
+            used_bytes: Some(500),
+            total_bytes: Some(1000),
+            free_bytes: Some(500),
+        }
+    }
+
+    fn unread(name: &str) -> Pool {
+        Pool {
+            name: name.to_string(),
+            used_bytes: None,
+            total_bytes: None,
+            free_bytes: None,
+        }
+    }
+
+    fn sampler_over<R: IncusRead>(root: &Path, incus: R, pools: &[&str]) -> Sampler<R> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: root.join("proc"),
+                sys_root: root.join("sys"),
+                pools: pools.iter().map(|pool| pool.to_string()).collect(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            incus,
+        )
+    }
+
+    /// The fake's client, with two switches: every request fails while `down` is set, and the `resources` read of `refused`
+    /// fails while the listing still names that pool.
+    struct Switchable {
+        inner: UnixIncus,
+        down: Arc<AtomicBool>,
+        refused: Option<&'static str>,
+    }
+
+    impl IncusRead for Switchable {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            let refused = self
+                .refused
+                .is_some_and(|pool| path == format!("/1.0/storage-pools/{pool}/resources"));
+            if self.down.load(Ordering::SeqCst) || refused {
+                return Err(IncusError::Decode(format!("refused for the test: {path}")));
+            }
+            self.inner.get(path)
+        }
+    }
+
+    fn switchable(socket: &Path, down: bool, refused: Option<&'static str>) -> Switchable {
+        Switchable {
+            inner: UnixIncus::new(socket.to_path_buf()),
+            down: Arc::new(AtomicBool::new(down)),
+            refused,
+        }
+    }
+
+    fn sorted_paths(fake: &FakeIncus) -> Vec<String> {
+        let mut paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    #[test]
+    fn lists_every_pool() {
+        let scratch = Scratch::new("lists-every");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), two_pools()).expect("start the fake Incus");
+        let mut sampler = sampler_over(
+            scratch.path(),
+            UnixIncus::new(fake.socket().to_path_buf()),
+            &[],
+        );
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert_eq!(
+            sampler.readings().pools,
+            Some(vec![default_row(), pool1_row()]),
+            "an empty filter admits every pool Incus lists"
+        );
+        assert_eq!(sample.pools, vec![default_row(), pool1_row()]);
+        assert!(
+            fake.requests().iter().all(|r| r.method == "GET"),
+            "only GET requests"
+        );
+        assert_eq!(
+            sorted_paths(&fake),
+            vec![
+                INSTANCES.to_string(),
+                "/1.0/storage-pools/default/resources".to_string(),
+                "/1.0/storage-pools/pool1/resources".to_string(),
+                POOLS.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter() {
+        let scratch = Scratch::new("filter");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), two_pools()).expect("start the fake Incus");
+        let mut sampler = sampler_over(
+            scratch.path(),
+            UnixIncus::new(fake.socket().to_path_buf()),
+            &["pool1"],
+        );
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert_eq!(
+            sample.pools,
+            vec![pool1_row()],
+            "only the admitted pool has a row"
+        );
+        assert_eq!(sampler.readings().pools, Some(vec![pool1_row()]));
+        assert_eq!(
+            sorted_paths(&fake),
+            vec![
+                INSTANCES.to_string(),
+                "/1.0/storage-pools/pool1/resources".to_string(),
+                POOLS.to_string(),
+            ],
+            "a pool the filter drops is not read"
+        );
+    }
+
+    #[test]
+    fn filtered_name_not_listed() {
+        let scratch = Scratch::new("filtered-out");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), two_pools()).expect("start the fake Incus");
+        let mut sampler = sampler_over(
+            scratch.path(),
+            UnixIncus::new(fake.socket().to_path_buf()),
+            &["pool9"],
+        );
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert!(
+            sample.pools.is_empty(),
+            "pool9 is not listed, so it has no row"
+        );
+        assert_eq!(
+            sampler.readings().pools,
+            Some(Vec::new()),
+            "a listing that worked with no admitted pool is known to be empty"
+        );
+        assert_eq!(
+            sorted_paths(&fake),
+            vec![INSTANCES.to_string(), POOLS.to_string()],
+            "no resources read for a name Incus does not list"
+        );
+    }
+
+    #[test]
+    fn incus_down() {
+        let scratch = Scratch::new("incus-down");
+        write_first_tree(scratch.path());
+        let absent = scratch.path().join("absent.sock");
+        let mut sampler = sampler_over(
+            scratch.path(),
+            UnixIncus::new(absent),
+            &["default", "pool1"],
+        );
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert_eq!(
+            sampler.readings().pools,
+            None,
+            "a failed listing is unknown"
+        );
+        assert_eq!(
+            sampler.readings().projects,
+            None,
+            "a failed instance list is unknown"
+        );
+        assert!(
+            sampler.readings().nic.is_some(),
+            "the NIC counters come from the host, not from Incus"
+        );
+        assert!(
+            sample.projects.is_empty(),
+            "the sample's own list stays empty"
+        );
+        assert_eq!(
+            sample.pools,
+            vec![unread("default"), unread("pool1")],
+            "before any listing, the filter's names carry null fields"
+        );
+        assert_eq!(sample.at, 1_000);
+    }
+
+    #[test]
+    fn incus_down_after_a_listing_keeps_the_listed_names() {
+        let scratch = Scratch::new("incus-down-after");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), two_pools()).expect("start the fake Incus");
+        let down = Arc::new(AtomicBool::new(false));
+        let incus = Switchable {
+            inner: UnixIncus::new(fake.socket().to_path_buf()),
+            down: Arc::clone(&down),
+            refused: None,
+        };
+        let mut sampler = sampler_over(scratch.path(), incus, &[]);
+        sampler.sample(1_000);
+        down.store(true, Ordering::SeqCst);
+
+        let sample = sampler.sample(6_000).clone();
+
+        assert_eq!(sampler.readings().pools, None);
+        assert_eq!(sampler.readings().projects, None);
+        assert_eq!(
+            sample.pools,
+            vec![unread("default"), unread("pool1")],
+            "the last listing's names stay, with null fields"
+        );
+        assert!(sample.projects.is_empty());
+    }
+
+    #[test]
+    fn resources_fail() {
+        let scratch = Scratch::new("resources-fail");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), two_pools()).expect("start the fake Incus");
+        let mut sampler = sampler_over(
+            scratch.path(),
+            switchable(fake.socket(), false, Some("pool1")),
+            &[],
+        );
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert_eq!(
+            sampler.readings().pools,
+            Some(vec![default_row(), unread("pool1")]),
+            "the listing worked, so pool1 keeps its row with null fields"
+        );
+        assert_eq!(sample.pools, vec![default_row(), unread("pool1")]);
+        assert_eq!(
+            sample.projects.len(),
+            2,
+            "the instance list is still read on this tick"
+        );
+    }
 }

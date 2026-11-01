@@ -40,7 +40,8 @@ pub struct NodeConfig {
     pub approval_host: Option<String>,
 }
 
-/// Where Incus listens, and the storage pools the sampler reads.
+/// Where Incus listens, and which storage pools the sampler reports. The pools come from Incus's own pool list. `pools` is an
+/// allow-filter over that list: an absent key or `[]` admits every pool Incus lists, and a name Incus does not list has no row.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IncusConfig {
