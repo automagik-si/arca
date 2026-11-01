@@ -1,14 +1,28 @@
 //! The rules, the inputs a tick reads, and the evaluator: one state machine per rule and label set.
 //!
-//! A rule fires when `value > threshold` has held for `for_s`, and clears when `value <= threshold - clear_margin` has held
-//! for `clear_for_s`. A reading that is missing is unknown: the alert keeps its state, its timer restarts, and no event is
-//! written. Only `disk-pool-full` is evaluated so far; the other rules have no reading yet.
+//! A rule fires when `value > threshold` has held for `for_s`, and clears when `value <= threshold - clear_margin` has held for
+//! `clear_for_s`. A reading that is missing, not finite or older than its source's maximum age is unknown: the alert keeps its
+//! state, its timers restart, and no event is written. A fresh, known reading that no longer has an alert's label set resolves
+//! that alert with `subject-gone`, once.
 
 use std::collections::BTreeMap;
 
 use arca_store::{AlertEvent, EventState, ResolveReason};
 
 use crate::{AlertState, FiringAlert, UnknownAlert, UnknownReason};
+
+/// The most recent host sample may be this old, in milliseconds, before its readings are unknown.
+pub const SAMPLE_MAX_AGE_MS: u64 = 15_000;
+/// The health checks may be this old, in milliseconds, before they are unknown.
+pub const HEALTH_MAX_AGE_MS: u64 = 15_000;
+/// The watch sweep may be this old, in milliseconds, before its drift is unknown.
+pub const WATCH_MAX_AGE_MS: u64 = 90_000;
+/// A latency probe may be this old, in milliseconds, before it is unknown.
+pub const PROBE_MAX_AGE_MS: u64 = 90_000;
+/// The incus-osd update status may be this old, in milliseconds, before it is unknown (15 minutes).
+pub const OSD_MAX_AGE_MS: u64 = 900_000;
+/// A SMART reading may be this old, in milliseconds, before it is unknown (2 hours).
+pub const SMART_MAX_AGE_MS: u64 = 7_200_000;
 
 /// An alert's own labels, such as `pool`.
 pub type Labels = BTreeMap<String, String>;
@@ -169,6 +183,17 @@ pub enum ComponentName {
     Shim,
 }
 
+impl ComponentName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Incus => "incus",
+            Self::Arca => "arca",
+            Self::Watch => "watch",
+            Self::Shim => "shim",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Component {
     pub name: ComponentName,
@@ -211,85 +236,116 @@ struct Track {
     unknown: Option<UnknownReason>,
 }
 
+impl Track {
+    fn ok() -> Track {
+        Track {
+            state: AlertState::Ok,
+            timer: None,
+            firing: None,
+            unknown: None,
+        }
+    }
+}
+
 /// The alert states of every rule and label set.
 #[derive(Debug, Default)]
 pub struct Evaluator {
     tracks: BTreeMap<(RuleId, Labels), Track>,
+    /// The rules whose source is unknown at the last tick, with why. A rule that has no alert shows here as one unknown entry.
+    unknown_rules: BTreeMap<RuleId, UnknownReason>,
 }
 
 impl Evaluator {
-    /// An evaluator holding the stored firing alerts as firing, with fresh timers, unknown until their first reading.
-    pub fn load(firing: Vec<AlertEvent>) -> Evaluator {
-        let mut tracks = BTreeMap::new();
+    /// An evaluator holding the stored firing alerts as firing, with fresh timers, unknown until their first reading. A firing
+    /// alert of a rule that `rules` disables, or that this build lacks, is not loaded: its resolve, `rule-disabled`, is returned
+    /// at `now` instead.
+    pub fn load(rules: &Rules, firing: Vec<AlertEvent>, now: u64) -> (Evaluator, Vec<AlertEvent>) {
+        let mut evaluator = Evaluator::default();
+        let mut resolves = Vec::new();
         for event in firing {
-            let Some(id) = RuleId::parse(&event.rule) else {
+            // A rule this build does not have, or a disabled one, can never evaluate its alert: it resolves once.
+            let id = RuleId::parse(&event.rule)
+                .filter(|id| rules.0.iter().any(|rule| rule.id == *id && rule.enabled));
+            let Some(id) = id else {
+                resolves.push(resolution(event, None, ResolveReason::RuleDisabled, now));
                 continue;
             };
             let key = (id, event.labels.clone());
-            let track = Track {
-                state: AlertState::Firing,
-                timer: None,
-                firing: Some(event),
-                unknown: Some(UnknownReason::Missing),
-            };
-            tracks.insert(key, track);
+            evaluator.tracks.insert(
+                key,
+                Track {
+                    state: AlertState::Firing,
+                    timer: None,
+                    firing: Some(event),
+                    unknown: Some(UnknownReason::Missing),
+                },
+            );
         }
-        Evaluator { tracks }
+        (evaluator, resolves)
     }
 
-    /// Evaluates every enabled rule that has a reading at `now`, and returns the transitions as events, in order.
+    /// Evaluates every enabled rule at `now`, and returns the transitions as events, in order.
     pub fn step(&mut self, rules: &Rules, inputs: &Inputs, now: u64) -> Vec<AlertEvent> {
         let mut events = Vec::new();
         for rule in rules.0.iter().filter(|rule| rule.enabled) {
-            let readings = match source(rule.id, inputs) {
-                Source::NotRead => continue,
-                Source::Unknown => BTreeMap::new(),
+            match source(rule.id, inputs, now) {
+                Source::Unknown(reason) => {
+                    self.unknown_rules.insert(rule.id, reason);
+                    for ((id, _), track) in self.tracks.iter_mut() {
+                        if *id == rule.id {
+                            unknown(track, reason);
+                        }
+                    }
+                }
                 Source::Known(readings) => {
-                    // A subject that is no longer read drops out while it is ok.
-                    self.tracks.retain(|(id, labels), track| {
-                        *id != rule.id
-                            || readings.contains_key(labels)
-                            || track.state != AlertState::Ok
-                    });
-                    readings
+                    self.unknown_rules.remove(&rule.id);
+                    // A subject the fresh reading no longer has. A firing alert resolves once, `subject-gone`; any other
+                    // track is dropped, so a pending alert simply starts over if its subject returns.
+                    let gone: Vec<Labels> = self
+                        .tracks
+                        .keys()
+                        .filter(|(id, labels)| *id == rule.id && !readings.contains_key(labels))
+                        .map(|(_, labels)| labels.clone())
+                        .collect();
+                    for labels in gone {
+                        if let Some(firing) = self
+                            .tracks
+                            .remove(&(rule.id, labels))
+                            .and_then(|track| track.firing)
+                        {
+                            events.push(resolution(firing, None, ResolveReason::SubjectGone, now));
+                        }
+                    }
+                    for (labels, value) in readings {
+                        let track = self
+                            .tracks
+                            .entry((rule.id, labels.clone()))
+                            .or_insert_with(Track::ok);
+                        events.extend(apply(rule, &labels, track, value, now));
+                    }
                 }
-            };
-            // Every alert of the rule without a reading keeps its state, unknown.
-            for ((id, labels), track) in self.tracks.iter_mut() {
-                if *id == rule.id && !readings.contains_key(labels) {
-                    unknown(track);
-                }
-            }
-            for (labels, value) in readings {
-                let track = self
-                    .tracks
-                    .entry((rule.id, labels.clone()))
-                    .or_insert(Track {
-                        state: AlertState::Ok,
-                        timer: None,
-                        firing: None,
-                        unknown: None,
-                    });
-                events.extend(apply(rule, &labels, track, value, now));
             }
         }
         events
     }
 
-    /// Gives the firing events among `events` the sequence numbers they were committed with.
+    /// Gives the firing events among `events` the sequence numbers they were committed with. A firing event matches the track
+    /// whose firing has the same rule, labels and start, and that has no sequence number yet.
     pub fn committed(&mut self, events: &[AlertEvent], seqs: &[u64]) {
         for (event, seq) in events.iter().zip(seqs) {
-            let Some(id) = RuleId::parse(&event.rule) else {
-                continue;
-            };
             if event.state != EventState::Firing {
                 continue;
             }
-            if let Some(firing) = self
-                .tracks
-                .get_mut(&(id, event.labels.clone()))
-                .and_then(|track| track.firing.as_mut())
-                .filter(|firing| firing.seq.is_none())
+            let Some(id) = RuleId::parse(&event.rule) else {
+                continue;
+            };
+            let Some(track) = self.tracks.get_mut(&(id, event.labels.clone())) else {
+                continue;
+            };
+            if let Some(firing) = track
+                .firing
+                .as_mut()
+                .filter(|firing| firing.seq.is_none() && firing.started_at == event.started_at)
             {
                 firing.seq = Some(*seq);
                 firing.alert_id = Some(*seq);
@@ -314,9 +370,10 @@ impl Evaluator {
         firing
     }
 
-    /// The alerts whose newest reading is unknown.
+    /// The alerts whose newest reading is unknown, and each unknown rule that has no alert of its own.
     pub fn unknown(&self) -> Vec<UnknownAlert> {
-        self.tracks
+        let mut unknown: Vec<UnknownAlert> = self
+            .tracks
             .iter()
             .filter_map(|((id, labels), track)| {
                 track.unknown.map(|reason| UnknownAlert {
@@ -326,35 +383,130 @@ impl Evaluator {
                     reason,
                 })
             })
-            .collect()
+            .collect();
+        for (id, reason) in &self.unknown_rules {
+            if !self.tracks.keys().any(|(track_id, _)| track_id == id) {
+                unknown.push(UnknownAlert {
+                    rule: id.as_str().to_string(),
+                    labels: Labels::new(),
+                    state: AlertState::Ok,
+                    reason: *reason,
+                });
+            }
+        }
+        unknown
     }
 }
 
-/// What a rule reads this tick.
+/// What a rule reads at one tick.
+type Readings = BTreeMap<Labels, Option<f64>>;
+
 enum Source {
-    /// The rule has no reading in this build.
-    NotRead,
-    /// The whole source is unknown.
-    Unknown,
-    /// Each label set read, with its value, which is `None` when unknown.
-    Known(BTreeMap<Labels, Option<f64>>),
+    /// The source is missing or too old, so every alert of the rule is unknown.
+    Unknown(UnknownReason),
+    /// Each label set the fresh reading has, with its value, which is `None` when that one value is unknown.
+    Known(Readings),
 }
 
-fn source(id: RuleId, inputs: &Inputs) -> Source {
-    match (id, &inputs.pools) {
-        (RuleId::DiskPoolFull, None) => Source::Unknown,
-        (RuleId::DiskPoolFull, Some(pools)) => Source::Known(
+fn source(id: RuleId, inputs: &Inputs, now: u64) -> Source {
+    match id {
+        RuleId::DiskPoolFull => read(&inputs.pools, SAMPLE_MAX_AGE_MS, now, |pools| {
             pools
-                .value
                 .iter()
                 .map(|pool| {
-                    let labels = Labels::from([("pool".to_string(), pool.name.clone())]);
-                    (labels, percent_used(pool))
+                    (
+                        labels_of([("pool", pool.name.as_str())]),
+                        percent_used(pool),
+                    )
                 })
-                .collect(),
-        ),
-        _ => Source::NotRead,
+                .collect()
+        }),
+        RuleId::MemPsiHigh => read(&inputs.memory_some_avg10, SAMPLE_MAX_AGE_MS, now, |value| {
+            single(Some(*value))
+        }),
+        RuleId::CpuHot => read(&inputs.cpu_temp_c, SAMPLE_MAX_AGE_MS, now, |value| {
+            single(Some(*value))
+        }),
+        RuleId::ServiceDown => read(&inputs.components, HEALTH_MAX_AGE_MS, now, |components| {
+            components
+                .iter()
+                .map(|c| {
+                    (
+                        labels_of([("component", c.name.as_str())]),
+                        Some(bad_as(!c.ok)),
+                    )
+                })
+                .collect()
+        }),
+        RuleId::Drift => read(&inputs.watch, WATCH_MAX_AGE_MS, now, |watch| {
+            let total = watch
+                .drift
+                .values()
+                .fold(0u64, |sum, count| sum.saturating_add(*count));
+            single(Some(total as f64))
+        }),
+        RuleId::UpdateFailed => read(&inputs.update, OSD_MAX_AGE_MS, now, |update| {
+            single(Some(bad_as(update.failed)))
+        }),
+        RuleId::CrashLoop => read(&inputs.instances, SAMPLE_MAX_AGE_MS, now, |instances| {
+            instances
+                .iter()
+                .map(|instance| {
+                    (
+                        labels_of([
+                            ("project", instance.project.as_str()),
+                            ("incus_instance", instance.name.as_str()),
+                        ]),
+                        Some(instance.starts_10m as f64),
+                    )
+                })
+                .collect()
+        }),
+        RuleId::SmartWarning => read(&inputs.drives, SMART_MAX_AGE_MS, now, |drives| {
+            drives
+                .iter()
+                .map(|drive| {
+                    (
+                        labels_of([("device", drive.device.as_str())]),
+                        Some(bad_as(!drive.passed)),
+                    )
+                })
+                .collect()
+        }),
     }
+}
+
+/// A source's readings when it is present and not older than `max_age`, else why it is unknown.
+fn read<T>(
+    reading: &Option<Timed<T>>,
+    max_age: u64,
+    now: u64,
+    known: impl FnOnce(&T) -> Readings,
+) -> Source {
+    match reading {
+        None => Source::Unknown(UnknownReason::Missing),
+        Some(timed) if now.saturating_sub(timed.at) > max_age => {
+            Source::Unknown(UnknownReason::Stale)
+        }
+        Some(timed) => Source::Known(known(&timed.value)),
+    }
+}
+
+/// The readings of a rule with one subject, which has no labels of its own.
+fn single(value: Option<f64>) -> Readings {
+    BTreeMap::from([(Labels::new(), value)])
+}
+
+fn labels_of<const N: usize>(pairs: [(&str, &str); N]) -> Labels {
+    pairs
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// 1 when `bad`, else 0: the reading of a yes-or-no rule.
+fn bad_as(bad: bool) -> f64 {
+    if bad { 1.0 } else { 0.0 }
 }
 
 /// Used over total, in percent. `None` when either is unknown or the pool has no size.
@@ -364,9 +516,13 @@ fn percent_used(pool: &PoolUse) -> Option<f64> {
 }
 
 /// Unknown data: the state is kept, the timer restarts and no event is written.
-fn unknown(track: &mut Track) {
+fn unknown(track: &mut Track, reason: UnknownReason) {
     track.timer = None;
-    track.unknown = Some(UnknownReason::Missing);
+    track.unknown = Some(reason);
+}
+
+fn held(now: u64, since: u64, seconds: u64) -> bool {
+    now.saturating_sub(since) >= seconds.saturating_mul(1_000)
 }
 
 /// One reading of one alert at `now`, and the event it causes, if any.
@@ -377,18 +533,16 @@ fn apply(
     value: Option<f64>,
     now: u64,
 ) -> Option<AlertEvent> {
-    let Some(value) = value else {
-        unknown(track);
+    let Some(value) = value.filter(|value| value.is_finite()) else {
+        unknown(track, UnknownReason::Missing);
         return None;
     };
     track.unknown = None;
-    let held =
-        |since: u64, seconds: u64| now.saturating_sub(since) >= seconds.saturating_mul(1_000);
     match track.state {
         AlertState::Ok | AlertState::Pending if value > rule.threshold => {
             track.state = AlertState::Pending;
             let since = *track.timer.get_or_insert(now);
-            if !held(since, rule.for_s) {
+            if !held(now, since, rule.for_s) {
                 return None;
             }
             let event = AlertEvent {
@@ -417,26 +571,35 @@ fn apply(
         }
         AlertState::Firing if value <= rule.threshold - rule.clear_margin => {
             let since = *track.timer.get_or_insert(now);
-            if !held(since, rule.clear_for_s) {
+            if !held(now, since, rule.clear_for_s) {
                 return None;
             }
             let firing = track.firing.take()?;
             track.state = AlertState::Ok;
             track.timer = None;
-            Some(AlertEvent {
-                seq: None,
-                state: EventState::Resolved,
-                value: Some(value),
-                threshold: Some(rule.threshold),
-                resolved_at: Some(now),
-                reason: Some(ResolveReason::Cleared),
-                at: now,
-                ..firing
-            })
+            Some(resolution(firing, Some(value), ResolveReason::Cleared, now))
         }
         AlertState::Firing => {
             track.timer = None;
             None
         }
+    }
+}
+
+/// The resolve of `firing`: the same alert with its own time and reason. It has no `seq` until it is committed.
+fn resolution(
+    firing: AlertEvent,
+    value: Option<f64>,
+    reason: ResolveReason,
+    now: u64,
+) -> AlertEvent {
+    AlertEvent {
+        seq: None,
+        state: EventState::Resolved,
+        value,
+        resolved_at: Some(now),
+        reason: Some(reason),
+        at: now,
+        ..firing
     }
 }

@@ -1,0 +1,1302 @@
+//! The alert evaluator, the rules file, the store-failure queue and the read-only tick, on a synthetic clock. Every file is in a
+//! temporary directory. Incus is a fake that records every request.
+//!
+//! Test names are module paths, so `cargo test -p arca-alerts <module path>` selects exactly the tests under it.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
+
+use arca_alerts::eval::{
+    Component, ComponentName, DriveUse, Evaluator, HEALTH_MAX_AGE_MS, Inputs, InstanceUse,
+    OSD_MAX_AGE_MS, PoolUse, RuleId, Rules, SAMPLE_MAX_AGE_MS, SMART_MAX_AGE_MS, Severity, Timed,
+    UpdateUse, WATCH_MAX_AGE_MS, WatchReading,
+};
+use arca_alerts::rules::{AlertsFile, Probes, RulesError};
+use arca_alerts::{
+    Engine, QUEUE_LIMIT, STORE_WRITE_FAILED, TickStore, UnknownReason, export, inputs,
+};
+use arca_incus::{FakeIncus, FakeState, UnixIncus};
+use arca_metrics::{Sampler, SamplerConfig};
+use arca_store::{AlertEvent, EventState, Point, ResolveReason, RollupReport, Store, StoreError};
+use serde_json::json;
+
+/// The synthetic clock's start: 2026-11-01T00:00:00Z, in epoch milliseconds.
+const T0: u64 = 1_793_491_200_000;
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+/// A directory under the default temporary directory, removed when the test ends.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("arca-alerts-{}-{n}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("the scratch directory is created");
+        Scratch(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The maximum age of a rule's source, in milliseconds.
+fn max_age(id: RuleId) -> u64 {
+    match id {
+        RuleId::DiskPoolFull | RuleId::MemPsiHigh | RuleId::CpuHot | RuleId::CrashLoop => {
+            SAMPLE_MAX_AGE_MS
+        }
+        RuleId::ServiceDown => HEALTH_MAX_AGE_MS,
+        RuleId::Drift => WATCH_MAX_AGE_MS,
+        RuleId::UpdateFailed => OSD_MAX_AGE_MS,
+        RuleId::SmartWarning => SMART_MAX_AGE_MS,
+    }
+}
+
+fn pool(name: &str, used: u64) -> PoolUse {
+    PoolUse {
+        name: name.to_string(),
+        used_bytes: Some(used),
+        total_bytes: Some(100),
+    }
+}
+
+fn instance(project: &str, name: &str, starts_10m: u64) -> InstanceUse {
+    InstanceUse {
+        project: project.to_string(),
+        name: name.to_string(),
+        starts_10m,
+    }
+}
+
+/// The inputs of one rule at a reading of `value`, taken at `at`. Every other source is missing.
+fn reading_of(id: RuleId, value: f64, at: u64) -> Inputs {
+    let mut inputs = Inputs {
+        at,
+        ..Inputs::default()
+    };
+    match id {
+        RuleId::DiskPoolFull => {
+            inputs.pools = Some(Timed {
+                at,
+                value: vec![pool("default", value as u64)],
+            });
+        }
+        RuleId::MemPsiHigh => inputs.memory_some_avg10 = Some(Timed { at, value }),
+        RuleId::CpuHot => inputs.cpu_temp_c = Some(Timed { at, value }),
+        RuleId::ServiceDown => {
+            inputs.components = Some(Timed {
+                at,
+                value: vec![Component {
+                    name: ComponentName::Incus,
+                    ok: value == 0.0,
+                }],
+            });
+        }
+        RuleId::Drift => {
+            inputs.watch = Some(Timed {
+                at,
+                value: WatchReading {
+                    drift: BTreeMap::from([("marked_without_entry".to_string(), value as u64)]),
+                },
+            });
+        }
+        RuleId::UpdateFailed => {
+            inputs.update = Some(Timed {
+                at,
+                value: UpdateUse {
+                    failed: value != 0.0,
+                },
+            });
+        }
+        RuleId::CrashLoop => {
+            inputs.instances = Some(Timed {
+                at,
+                value: vec![instance("proj1", "db1", value as u64)],
+            });
+        }
+        RuleId::SmartWarning => {
+            inputs.drives = Some(Timed {
+                at,
+                value: vec![DriveUse {
+                    device: "disk1".to_string(),
+                    passed: value == 0.0,
+                }],
+            });
+        }
+    }
+    inputs
+}
+
+/// The same reading as [`reading_of`], taken so old that the rule's source is stale.
+fn stale_of(id: RuleId, value: f64, now: u64) -> Inputs {
+    reading_of(id, value, now - max_age(id) - 1_000)
+}
+
+/// A rule's reading kinds for the table tests: a value over the threshold, one inside the clearing band (`None` when the rule
+/// has none), and one at or below the clear margin.
+struct Case {
+    id: RuleId,
+    high: f64,
+    band: Option<f64>,
+    low: f64,
+}
+
+const CASES: [Case; 8] = [
+    Case {
+        id: RuleId::DiskPoolFull,
+        high: 95.0,
+        band: Some(88.0),
+        low: 84.0,
+    },
+    Case {
+        id: RuleId::MemPsiHigh,
+        high: 30.0,
+        band: Some(22.0),
+        low: 20.0,
+    },
+    Case {
+        id: RuleId::CpuHot,
+        high: 90.0,
+        band: Some(82.0),
+        low: 80.0,
+    },
+    Case {
+        id: RuleId::ServiceDown,
+        high: 1.0,
+        band: None,
+        low: 0.0,
+    },
+    Case {
+        id: RuleId::Drift,
+        high: 3.0,
+        band: None,
+        low: 0.0,
+    },
+    Case {
+        id: RuleId::UpdateFailed,
+        high: 1.0,
+        band: None,
+        low: 0.0,
+    },
+    Case {
+        id: RuleId::CrashLoop,
+        high: 3.0,
+        band: Some(1.0),
+        low: 0.0,
+    },
+    Case {
+        id: RuleId::SmartWarning,
+        high: 1.0,
+        band: None,
+        low: 0.0,
+    },
+];
+
+/// The reason the newest reading of `id` is unknown, if it is.
+fn unknown_of(eval: &Evaluator, id: RuleId) -> Option<UnknownReason> {
+    eval.unknown()
+        .into_iter()
+        .find(|alert| alert.rule == id.as_str())
+        .map(|alert| alert.reason)
+}
+
+/// A stored firing event, as the store gives it back before any resolve.
+fn firing_event(rule: &str, labels: &[(&str, &str)], at: u64) -> AlertEvent {
+    AlertEvent {
+        seq: None,
+        alert_id: None,
+        rule: rule.to_string(),
+        severity: "critical".to_string(),
+        state: EventState::Firing,
+        labels: labels
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        value: Some(95.0),
+        threshold: Some(90.0),
+        started_at: at,
+        resolved_at: None,
+        reason: None,
+        at,
+    }
+}
+
+/// The default rules with one rule disabled.
+fn rules_with_disabled(id: RuleId) -> Rules {
+    let mut rules = Rules::default();
+    for rule in rules.0.iter_mut().filter(|rule| rule.id == id) {
+        rule.enabled = false;
+    }
+    rules
+}
+
+/// Every alert event of a store, oldest first, read on a read-only connection.
+fn events_of(dir: &Path) -> Vec<AlertEvent> {
+    Store::open_read_only(dir)
+        .expect("a reader opens")
+        .events_after(0, 10_000)
+        .expect("the events are read")
+}
+
+/// A store that fails or takes too long on demand, and is otherwise the real store.
+#[derive(Clone, Default)]
+struct Switches {
+    fail: std::sync::Arc<AtomicBool>,
+    slow: std::sync::Arc<AtomicBool>,
+}
+
+fn set(flag: &AtomicBool, on: bool) {
+    flag.store(on, Ordering::SeqCst);
+}
+
+struct Flaky {
+    inner: Store,
+    switches: Switches,
+}
+
+impl TickStore for Flaky {
+    fn commit_tick(
+        &mut self,
+        at: u64,
+        points: &[Point],
+        events: &[AlertEvent],
+    ) -> Result<Vec<u64>, StoreError> {
+        if self.switches.fail.load(Ordering::SeqCst) {
+            return Err(StoreError::Io("no space left on device".to_string()));
+        }
+        if self.switches.slow.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(1_100));
+        }
+        self.inner.commit_tick(at, points, events)
+    }
+
+    fn firing(&self) -> Result<Vec<AlertEvent>, StoreError> {
+        self.inner.firing()
+    }
+
+    fn rollup(&mut self, now_ms: u64) -> Result<RollupReport, StoreError> {
+        self.inner.rollup(now_ms)
+    }
+}
+
+/// An engine over a new store in `dir`, started at [`T0`].
+fn engine_on(dir: &Path, switches: &Switches, rules: Rules) -> Engine<Flaky> {
+    let inner = Store::open(dir, T0).expect("the store opens").store;
+    let flaky = Flaky {
+        inner,
+        switches: switches.clone(),
+    };
+    Engine::start(flaky, rules, false, T0).expect("the engine starts")
+}
+
+/// `count` pools named `pool0000`.., each at `used` of 100 bytes.
+fn many_pools(count: u64, used: impl Fn(u64) -> u64, at: u64) -> Inputs {
+    Inputs {
+        at,
+        pools: Some(Timed {
+            at,
+            value: (0..count)
+                .map(|i| pool(&format!("pool{i:04}"), used(i)))
+                .collect(),
+        }),
+        ..Inputs::default()
+    }
+}
+
+mod eval {
+    use super::*;
+
+    mod hysteresis {
+        use super::*;
+
+        #[test]
+        fn each_default_rule_fires_at_60_s_and_clears_at_120_s_with_hysteresis() {
+            assert_eq!(CASES.len(), RuleId::ALL.len(), "every rule has a case");
+            let rules = Rules::default();
+            for case in CASES {
+                let id = case.id;
+                let mut eval = Evaluator::default();
+                let feed = |eval: &mut Evaluator, t: u64, value: f64| {
+                    eval.step(&rules, &reading_of(id, value, T0 + t), T0 + t)
+                };
+                // Over the threshold from 0 s: pending, not firing at 55 s, firing at 60 s.
+                for t in (0..=55_000).step_by(5_000) {
+                    assert!(feed(&mut eval, t, case.high).is_empty(), "{id:?} at {t} ms");
+                }
+                let fired = feed(&mut eval, 60_000, case.high);
+                assert_eq!(fired.len(), 1, "{id:?} fires at 60 s");
+                assert_eq!(fired[0].rule, id.as_str());
+                assert_eq!(fired[0].state, EventState::Firing);
+                // Inside the clearing band the alert keeps firing. A rule without a band stays over its threshold.
+                for t in (65_000..=180_000).step_by(5_000) {
+                    let value = case.band.unwrap_or(case.high);
+                    assert!(feed(&mut eval, t, value).is_empty(), "{id:?} at {t} ms");
+                }
+                // At or below the margin from 185 s: not cleared at 115 s, cleared at 120 s, with one resolve.
+                for t in (185_000..=300_000).step_by(5_000) {
+                    assert!(
+                        feed(&mut eval, t, case.low).is_empty(),
+                        "{id:?} cleared early at {t} ms"
+                    );
+                }
+                let cleared = feed(&mut eval, 305_000, case.low);
+                assert_eq!(cleared.len(), 1, "{id:?} clears at 120 s");
+                assert_eq!(cleared[0].state, EventState::Resolved);
+                assert_eq!(cleared[0].reason, Some(ResolveReason::Cleared));
+                assert!(eval.firing().is_empty(), "{id:?} is no longer firing");
+            }
+        }
+    }
+
+    mod unknown {
+        use super::*;
+
+        #[test]
+        fn a_pending_alert_keeps_its_state_through_a_gap_and_its_timer_restarts() {
+            let rules = Rules::default();
+            for case in CASES {
+                let id = case.id;
+                for stale in [false, true] {
+                    let mut eval = Evaluator::default();
+                    assert!(
+                        eval.step(&rules, &reading_of(id, case.high, T0), T0)
+                            .is_empty()
+                    );
+                    // A gap at 20 s, missing or stale: no event, the alert is still pending, and the reason is shown.
+                    let gap = if stale {
+                        stale_of(id, case.high, T0 + 20_000)
+                    } else {
+                        Inputs::default()
+                    };
+                    assert!(eval.step(&rules, &gap, T0 + 20_000).is_empty(), "{id:?}");
+                    let reason = if stale {
+                        UnknownReason::Stale
+                    } else {
+                        UnknownReason::Missing
+                    };
+                    assert_eq!(unknown_of(&eval, id), Some(reason), "{id:?}");
+                    assert!(eval.firing().is_empty(), "{id:?} is pending, not firing");
+                    // The timer restarted at the gap: a known reading at 30 s fires at 90 s, not at 60 s.
+                    for t in [30_000, 40_000, 50_000, 60_000] {
+                        let reading = reading_of(id, case.high, T0 + t);
+                        assert!(
+                            eval.step(&rules, &reading, T0 + t).is_empty(),
+                            "{id:?} at {t} ms"
+                        );
+                    }
+                    let fired =
+                        eval.step(&rules, &reading_of(id, case.high, T0 + 90_000), T0 + 90_000);
+                    assert_eq!(
+                        fired.len(),
+                        1,
+                        "{id:?} fires 60 s after the reading resumes"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_firing_alert_stays_firing_and_shows_unknown_through_a_gap_and_its_clear_timer_restarts()
+         {
+            let rules = Rules::default();
+            for case in CASES {
+                let id = case.id;
+                let mut eval = Evaluator::default();
+                for t in (0..=60_000).step_by(5_000) {
+                    eval.step(&rules, &reading_of(id, case.high, T0 + t), T0 + t);
+                }
+                assert_eq!(eval.firing().len(), 1, "{id:?} fires at 60 s");
+                // Missing at 70 s, then stale at 80 s: firing, unknown, no event, the reason shown each time.
+                assert!(
+                    eval.step(&rules, &Inputs::default(), T0 + 70_000)
+                        .is_empty()
+                );
+                assert!(eval.firing()[0].unknown);
+                assert_eq!(unknown_of(&eval, id), Some(UnknownReason::Missing));
+                assert!(
+                    eval.step(&rules, &stale_of(id, case.high, T0 + 80_000), T0 + 80_000)
+                        .is_empty()
+                );
+                assert_eq!(unknown_of(&eval, id), Some(UnknownReason::Stale));
+                // A known reading over the threshold at 90 s clears the unknown, still no event.
+                assert!(
+                    eval.step(&rules, &reading_of(id, case.high, T0 + 90_000), T0 + 90_000)
+                        .is_empty()
+                );
+                assert!(!eval.firing()[0].unknown);
+                assert_eq!(unknown_of(&eval, id), None);
+                // The clear timer starts at 100 s, and a gap at 145 s restarts it. Clearing at 220 s would be the early bug.
+                for t in (100_000..=140_000).step_by(5_000) {
+                    assert!(
+                        eval.step(&rules, &reading_of(id, case.low, T0 + t), T0 + t)
+                            .is_empty()
+                    );
+                }
+                assert!(
+                    eval.step(&rules, &Inputs::default(), T0 + 145_000)
+                        .is_empty()
+                );
+                for t in (150_000..=260_000).step_by(5_000) {
+                    assert!(
+                        eval.step(&rules, &reading_of(id, case.low, T0 + t), T0 + t)
+                            .is_empty(),
+                        "{id:?} at {t} ms"
+                    );
+                }
+                let cleared = eval.step(
+                    &rules,
+                    &reading_of(id, case.low, T0 + 270_000),
+                    T0 + 270_000,
+                );
+                assert_eq!(cleared.len(), 1, "{id:?} clears 120 s after the restart");
+                assert_eq!(cleared[0].reason, Some(ResolveReason::Cleared));
+            }
+        }
+
+        #[test]
+        fn after_a_restart_a_stored_firing_alert_is_firing_and_unknown_until_its_first_reading() {
+            let rules = Rules::default();
+            let stored = firing_event("disk-pool-full", &[("pool", "default")], T0);
+            let (mut eval, resolves) = Evaluator::load(&rules, vec![stored], T0 + 500_000);
+            assert!(resolves.is_empty(), "an enabled rule resolves nothing");
+            assert_eq!(eval.firing().len(), 1);
+            assert!(eval.firing()[0].unknown);
+            assert_eq!(
+                unknown_of(&eval, RuleId::DiskPoolFull),
+                Some(UnknownReason::Missing)
+            );
+            let first = reading_of(RuleId::DiskPoolFull, 95.0, T0 + 500_000);
+            assert!(eval.step(&rules, &first, T0 + 500_000).is_empty());
+            assert!(
+                !eval.firing()[0].unknown,
+                "the first reading clears the unknown"
+            );
+        }
+    }
+
+    mod rule_disabled {
+        use super::*;
+
+        #[test]
+        fn a_stored_firing_alert_of_a_disabled_rule_resolves_once_at_start() {
+            let scratch = Scratch::new("rule-disabled");
+            let mut store = Store::open(scratch.path(), T0)
+                .expect("the store opens")
+                .store;
+            store
+                .commit_tick(T0, &[], &[firing_event("cpu-hot", &[], T0)])
+                .expect("the firing commits");
+            drop(store);
+
+            let store = Store::open(scratch.path(), T0 + 1_000)
+                .expect("the store opens")
+                .store;
+            let mut engine = Engine::start(
+                store,
+                rules_with_disabled(RuleId::CpuHot),
+                false,
+                T0 + 1_000,
+            )
+            .expect("the engine starts");
+            let events = events_of(scratch.path());
+            let firing = events
+                .iter()
+                .find(|event| event.state == EventState::Firing)
+                .expect("the firing is stored");
+            let resolves: Vec<&AlertEvent> = events
+                .iter()
+                .filter(|event| event.state == EventState::Resolved)
+                .collect();
+            assert_eq!(resolves.len(), 1, "exactly one resolve");
+            assert_eq!(resolves[0].reason, Some(ResolveReason::RuleDisabled));
+            assert_eq!(resolves[0].rule, "cpu-hot");
+            assert_eq!(
+                resolves[0].alert_id, firing.alert_id,
+                "it closes the stored firing"
+            );
+
+            let snapshot = engine.tick(&Inputs::default(), Vec::new(), T0 + 6_000);
+            assert_eq!(snapshot.disabled, vec!["cpu-hot".to_string()]);
+            assert!(snapshot.firing.is_empty());
+            assert_eq!(events_of(scratch.path()).len(), 2, "no later event for it");
+        }
+    }
+
+    mod rule_missing {
+        use super::*;
+
+        #[test]
+        fn a_stored_firing_alert_of_a_rule_this_build_lacks_resolves_once_at_load() {
+            let rules = Rules::default();
+            let stored = firing_event("retired-rule", &[], T0);
+            let (eval, resolves) = Evaluator::load(&rules, vec![stored], T0 + 1_000);
+            assert_eq!(resolves.len(), 1, "it cannot stay firing forever");
+            assert_eq!(resolves[0].reason, Some(ResolveReason::RuleDisabled));
+            assert!(eval.firing().is_empty());
+        }
+    }
+
+    mod subject_gone {
+        use super::*;
+
+        #[test]
+        fn a_firing_pool_alert_resolves_once_when_a_fresh_reading_lacks_its_pool() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::DiskPoolFull, 95.0, T0 + t),
+                    T0 + t,
+                );
+            }
+            let gone = Inputs {
+                at: T0 + 65_000,
+                pools: Some(Timed {
+                    at: T0 + 65_000,
+                    value: Vec::new(),
+                }),
+                ..Inputs::default()
+            };
+            let resolved = eval.step(&rules, &gone, T0 + 65_000);
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].state, EventState::Resolved);
+            assert_eq!(resolved[0].reason, Some(ResolveReason::SubjectGone));
+            assert_eq!(
+                resolved[0].labels.get("pool").map(String::as_str),
+                Some("default")
+            );
+            assert!(eval.step(&rules, &gone, T0 + 70_000).is_empty(), "once");
+            assert!(eval.firing().is_empty());
+        }
+
+        #[test]
+        fn a_firing_crash_loop_alert_resolves_once_when_its_instance_is_gone() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
+                eval.step(&rules, &reading_of(RuleId::CrashLoop, 3.0, T0 + t), T0 + t);
+            }
+            let gone = Inputs {
+                at: T0 + 65_000,
+                instances: Some(Timed {
+                    at: T0 + 65_000,
+                    value: Vec::new(),
+                }),
+                ..Inputs::default()
+            };
+            let resolved = eval.step(&rules, &gone, T0 + 65_000);
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].reason, Some(ResolveReason::SubjectGone));
+            assert_eq!(
+                resolved[0].labels.get("project").map(String::as_str),
+                Some("proj1")
+            );
+            assert_eq!(
+                resolved[0].labels.get("incus_instance").map(String::as_str),
+                Some("db1")
+            );
+            assert!(eval.step(&rules, &gone, T0 + 70_000).is_empty());
+        }
+
+        #[test]
+        fn a_stale_or_missing_reading_that_lacks_the_subject_resolves_nothing() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::DiskPoolFull, 95.0, T0 + t),
+                    T0 + t,
+                );
+            }
+            let stale = Inputs {
+                at: T0 + 80_000,
+                pools: Some(Timed {
+                    at: T0 + 80_000 - SAMPLE_MAX_AGE_MS - 1_000,
+                    value: Vec::new(),
+                }),
+                ..Inputs::default()
+            };
+            assert!(
+                eval.step(&rules, &stale, T0 + 80_000).is_empty(),
+                "a stale list is not a fresh one"
+            );
+            assert_eq!(eval.firing().len(), 1);
+            assert!(
+                eval.step(&rules, &Inputs::default(), T0 + 85_000)
+                    .is_empty()
+            );
+            assert_eq!(eval.firing().len(), 1, "still firing");
+        }
+
+        #[test]
+        fn a_pending_alert_whose_pool_is_gone_starts_over_without_an_event() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            assert!(
+                eval.step(&rules, &reading_of(RuleId::DiskPoolFull, 95.0, T0), T0)
+                    .is_empty()
+            );
+            let gone = Inputs {
+                at: T0 + 10_000,
+                pools: Some(Timed {
+                    at: T0 + 10_000,
+                    value: Vec::new(),
+                }),
+                ..Inputs::default()
+            };
+            assert!(
+                eval.step(&rules, &gone, T0 + 10_000).is_empty(),
+                "no event for a pending alert"
+            );
+            assert!(
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::DiskPoolFull, 95.0, T0 + 20_000),
+                    T0 + 20_000
+                )
+                .is_empty()
+            );
+            assert!(
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::DiskPoolFull, 95.0, T0 + 70_000),
+                    T0 + 70_000
+                )
+                .is_empty(),
+                "60 s not yet held from 20 s"
+            );
+            assert_eq!(
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::DiskPoolFull, 95.0, T0 + 80_000),
+                    T0 + 80_000
+                )
+                .len(),
+                1
+            );
+        }
+    }
+
+    mod incus_down {
+        use super::*;
+
+        #[test]
+        fn pools_and_instances_unreadable_for_10_min_write_no_event_and_keep_the_alerts_firing_and_unknown()
+         {
+            let rules = Rules::default();
+            let both = |at: u64| Inputs {
+                at,
+                pools: Some(Timed {
+                    at,
+                    value: vec![pool("default", 95)],
+                }),
+                instances: Some(Timed {
+                    at,
+                    value: vec![instance("proj1", "db1", 3)],
+                }),
+                ..Inputs::default()
+            };
+            let mut eval = Evaluator::default();
+            let mut fired = 0;
+            for t in (0..=60_000).step_by(5_000) {
+                fired += eval.step(&rules, &both(T0 + t), T0 + t).len();
+            }
+            assert_eq!(fired, 2, "the pool and the crash loop fire at 60 s");
+            for t in (65_000..=665_000).step_by(5_000) {
+                let down = Inputs {
+                    at: T0 + t,
+                    ..Inputs::default()
+                };
+                assert!(
+                    eval.step(&rules, &down, T0 + t).is_empty(),
+                    "no event at {t} ms"
+                );
+            }
+            let firing = eval.firing();
+            assert_eq!(firing.len(), 2, "both stay firing");
+            assert!(firing.iter().all(|alert| alert.unknown), "both are unknown");
+            assert_eq!(
+                unknown_of(&eval, RuleId::DiskPoolFull),
+                Some(UnknownReason::Missing)
+            );
+            assert_eq!(
+                unknown_of(&eval, RuleId::CrashLoop),
+                Some(UnknownReason::Missing)
+            );
+        }
+    }
+
+    mod crash_loop {
+        use super::*;
+
+        #[test]
+        fn three_starts_held_60_s_fire_and_none_held_120_s_clear() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=55_000).step_by(5_000) {
+                assert!(
+                    eval.step(&rules, &reading_of(RuleId::CrashLoop, 3.0, T0 + t), T0 + t)
+                        .is_empty()
+                );
+            }
+            let fired = eval.step(
+                &rules,
+                &reading_of(RuleId::CrashLoop, 3.0, T0 + 60_000),
+                T0 + 60_000,
+            );
+            assert_eq!(fired.len(), 1, "3 starts held 60 s fire");
+            assert_eq!(
+                fired[0].labels.get("project").map(String::as_str),
+                Some("proj1")
+            );
+            assert_eq!(
+                fired[0].labels.get("incus_instance").map(String::as_str),
+                Some("db1")
+            );
+            assert_eq!(fired[0].value, Some(3.0));
+            for t in (65_000..=180_000).step_by(5_000) {
+                assert!(
+                    eval.step(&rules, &reading_of(RuleId::CrashLoop, 0.0, T0 + t), T0 + t)
+                        .is_empty()
+                );
+            }
+            let cleared = eval.step(
+                &rules,
+                &reading_of(RuleId::CrashLoop, 0.0, T0 + 185_000),
+                T0 + 185_000,
+            );
+            assert_eq!(cleared.len(), 1, "0 starts held 120 s clear");
+            assert_eq!(cleared[0].reason, Some(ResolveReason::Cleared));
+        }
+
+        #[test]
+        fn two_starts_is_not_over_the_threshold() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=300_000).step_by(5_000) {
+                assert!(
+                    eval.step(&rules, &reading_of(RuleId::CrashLoop, 2.0, T0 + t), T0 + t)
+                        .is_empty()
+                );
+            }
+        }
+    }
+}
+
+mod rules {
+    use super::*;
+
+    fn parse(text: &str) -> Result<AlertsFile, RulesError> {
+        arca_alerts::rules::parse(text.as_bytes())
+    }
+
+    fn rule(file: &AlertsFile, id: RuleId) -> arca_alerts::eval::Rule {
+        file.rules
+            .0
+            .iter()
+            .find(|rule| rule.id == id)
+            .expect("every rule id has a rule")
+            .clone()
+    }
+
+    mod disabled {
+        use super::*;
+
+        #[test]
+        fn a_disabled_disk_pool_full_writes_no_event_and_exports_no_series() {
+            let scratch = Scratch::new("disabled");
+            let mut engine = engine_on(
+                scratch.path(),
+                &Switches::default(),
+                rules_with_disabled(RuleId::DiskPoolFull),
+            );
+            let mut last = None;
+            for t in (0..=600_000).step_by(5_000) {
+                let snapshot = engine.tick(&many_pools(1, |_| 99, T0 + t), Vec::new(), T0 + t);
+                assert!(snapshot.firing.is_empty(), "no firing at {t} ms");
+                last = Some(snapshot);
+            }
+            assert!(events_of(scratch.path()).is_empty(), "no event is written");
+            let snapshot = last.expect("ticks ran");
+            assert_eq!(snapshot.disabled, vec!["disk-pool-full".to_string()]);
+            let body = export::render_metrics("node-test", &snapshot);
+            assert!(!body.contains("rule=\"disk-pool-full\""), "{body}");
+        }
+    }
+
+    mod file {
+        use super::*;
+
+        #[test]
+        fn a_missing_file_gives_the_defaults() {
+            let scratch = Scratch::new("missing");
+            let file =
+                arca_alerts::rules::load(scratch.path()).expect("a missing file is not an error");
+            assert_eq!(file, AlertsFile::default());
+            assert_eq!(file.rules, Rules::default());
+        }
+
+        #[test]
+        fn a_file_in_the_state_directory_is_read() {
+            let scratch = Scratch::new("present");
+            fs::write(
+                scratch.join(arca_alerts::rules::ALERTS_FILE),
+                r#"{"rules":[{"id":"disk-pool-full","threshold":85}]}"#,
+            )
+            .expect("write the file");
+            let file = arca_alerts::rules::load(scratch.path()).expect("the file loads");
+            assert_eq!(rule(&file, RuleId::DiskPoolFull).threshold, 85.0);
+        }
+
+        #[test]
+        fn a_partial_rule_keeps_its_other_defaults() {
+            let file = parse(r#"{"rules":[{"id":"disk-pool-full","threshold":85}]}"#)
+                .expect("the file parses");
+            let disk = rule(&file, RuleId::DiskPoolFull);
+            assert_eq!(disk.threshold, 85.0);
+            assert!(disk.enabled);
+            assert_eq!((disk.for_s, disk.clear_for_s), (60, 120));
+            assert_eq!(disk.clear_margin, 5.0);
+            assert_eq!(disk.severity, Severity::Critical);
+            assert_eq!(
+                &file.rules.0[1..],
+                &Rules::default().0[1..],
+                "the other rules are unchanged"
+            );
+            assert_eq!(file.shim_socket, None);
+            assert_eq!(file.probes, Probes::default());
+        }
+
+        #[test]
+        fn every_field_of_a_rule_and_the_probes_and_shim_socket_are_read() {
+            let file = parse(
+                r#"{"rules":[{"id":"cpu-hot","enabled":false,"threshold":70,"forS":30,"clearForS":90,"clearMargin":2.5,"severity":"critical"}],
+                    "shimSocket":"/run/example/shim.sock",
+                    "probes":{"gateway":"192.0.2.1:9","relay":"198.51.100.7:443"}}"#,
+            )
+            .expect("the file parses");
+            let cpu = rule(&file, RuleId::CpuHot);
+            assert!(!cpu.enabled);
+            assert_eq!(
+                (cpu.threshold, cpu.for_s, cpu.clear_for_s, cpu.clear_margin),
+                (70.0, 30, 90, 2.5)
+            );
+            assert_eq!(cpu.severity, Severity::Critical);
+            assert_eq!(
+                file.shim_socket,
+                Some(PathBuf::from("/run/example/shim.sock"))
+            );
+            assert_eq!(
+                file.probes.gateway,
+                Some("192.0.2.1:9".parse().expect("an address"))
+            );
+            assert_eq!(file.probes.internet, None);
+            assert_eq!(
+                file.probes.relay,
+                Some("198.51.100.7:443".parse().expect("an address"))
+            );
+        }
+
+        #[test]
+        fn an_unknown_rule_id_is_refused_by_its_key_and_its_value_is_never_echoed() {
+            let err = parse(r#"{"rules":[{"id":"zz-secret-rule"}]}"#)
+                .expect_err("an unknown id is refused");
+            assert!(matches!(err, RulesError::UnknownRule(_)));
+            let text = err.to_string();
+            assert!(text.contains("rules[0].id"), "{text}");
+            assert!(!text.contains("zz-secret-rule"), "{text}");
+        }
+
+        #[test]
+        fn an_unknown_key_is_refused_by_name_and_its_value_is_never_echoed() {
+            let err = parse(r#"{"rules":[{"id":"cpu-hot","bogusKey":"VALUE-qq-1"}]}"#)
+                .expect_err("an unknown key is refused");
+            let text = err.to_string();
+            assert!(text.contains("bogusKey"), "{text}");
+            assert!(!text.contains("VALUE-qq-1"), "{text}");
+            assert!(parse(r#"{"surprise":"VALUE-qq-2"}"#).is_err());
+        }
+
+        #[test]
+        fn invalid_json_wrong_types_and_bad_values_are_refused_without_an_echo() {
+            let cases = [
+                (r#"{"rules": [ VALUE-zz"#, "VALUE-zz"),
+                (
+                    r#"{"rules":[{"id":"cpu-hot","threshold":"VALUE-ww"}]}"#,
+                    "VALUE-ww",
+                ),
+                (
+                    r#"{"rules":[{"id":"cpu-hot","severity":"VALUE-vv"}]}"#,
+                    "VALUE-vv",
+                ),
+                (r#"{"probes":{"gateway":"VALUE-pp"}}"#, "VALUE-pp"),
+                (r#"{"rules":[{"id":"cpu-hot","clearMargin":-1}]}"#, ""),
+                (r#"{"rules":[{"id":"cpu-hot"},{"id":"cpu-hot"}]}"#, ""),
+                (r#"{"rules":[{"threshold":1}]}"#, ""),
+            ];
+            for (text, secret) in cases {
+                let err = parse(text).expect_err(text);
+                let shown = err.to_string();
+                assert!(matches!(err, RulesError::Parse(_)), "{shown}");
+                if !secret.is_empty() {
+                    assert!(!shown.contains(secret), "{shown}");
+                }
+            }
+            let repeated =
+                parse(r#"{"rules":[{"id":"cpu-hot"},{"id":"cpu-hot"}]}"#).expect_err("repeats");
+            assert!(repeated.to_string().contains("rules[1].id"));
+            let missing = parse(r#"{"rules":[{"threshold":1}]}"#).expect_err("no id");
+            assert!(missing.to_string().contains("`id`"), "{missing}");
+        }
+    }
+}
+
+mod store_failure {
+    use super::*;
+
+    #[test]
+    fn a_failed_commit_still_publishes_and_fires_store_write_failed_at_once() {
+        let scratch = Scratch::new("fails-on-demand");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        let snapshot = engine.tick(&Inputs::default(), Vec::new(), T0);
+        let error = snapshot.store_error.expect("the failed commit is marked");
+        assert_eq!(error.at, T0);
+        assert!(
+            error.message.contains("no space left on device"),
+            "{}",
+            error.message
+        );
+        let failed: Vec<_> = snapshot
+            .firing
+            .iter()
+            .filter(|alert| alert.event.rule == STORE_WRITE_FAILED)
+            .collect();
+        assert_eq!(failed.len(), 1, "store-write-failed fires at once");
+        assert_eq!(failed[0].event.started_at, T0);
+        assert!(
+            failed[0].event.seq.is_none(),
+            "the in-memory alert has no seq"
+        );
+        assert_eq!(snapshot.store_write_failures, 1);
+    }
+
+    #[test]
+    fn queued_events_commit_on_the_next_success_with_their_original_time() {
+        let scratch = Scratch::new("queued-commit");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        for t in (0..=60_000).step_by(5_000) {
+            engine.tick(&many_pools(1, |_| 95, T0 + t), Vec::new(), T0 + t);
+        }
+        assert!(
+            events_of(scratch.path()).is_empty(),
+            "nothing is committed while the store fails"
+        );
+        set(&switches.fail, false);
+        let snapshot = engine.tick(&many_pools(1, |_| 95, T0 + 65_000), Vec::new(), T0 + 65_000);
+        assert!(snapshot.store_error.is_none(), "the next commit works");
+        let events = events_of(scratch.path());
+        assert_eq!(events.len(), 1, "the queued firing is written once");
+        assert_eq!(events[0].at, T0 + 60_000, "with its original time");
+        assert_eq!(events[0].started_at, T0 + 60_000);
+        assert_eq!(events[0].alert_id, events[0].seq);
+    }
+
+    #[test]
+    fn a_resolve_is_committed_with_its_firing_when_the_firing_was_queued() {
+        let scratch = Scratch::new("resolve-queued");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        for t in (0..=60_000).step_by(5_000) {
+            engine.tick(&many_pools(1, |_| 95, T0 + t), Vec::new(), T0 + t);
+        }
+        // The pool drops to 50 %, and the resolve is due at 185 s. Both stay queued while the store fails.
+        for t in (65_000..=185_000).step_by(5_000) {
+            engine.tick(&many_pools(1, |_| 50, T0 + t), Vec::new(), T0 + t);
+        }
+        set(&switches.fail, false);
+        let snapshot = engine.tick(
+            &many_pools(1, |_| 50, T0 + 190_000),
+            Vec::new(),
+            T0 + 190_000,
+        );
+        assert!(
+            snapshot.store_error.is_none(),
+            "the resolve did not fail the batch: {:?}",
+            snapshot.store_error
+        );
+        let events = events_of(scratch.path());
+        let firing = events
+            .iter()
+            .find(|event| event.state == EventState::Firing)
+            .expect("the firing is written");
+        let resolve = events
+            .iter()
+            .find(|event| event.state == EventState::Resolved)
+            .expect("the resolve is written");
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            resolve.alert_id, firing.seq,
+            "the resolve closes its firing"
+        );
+        assert_eq!(resolve.reason, Some(ResolveReason::Cleared));
+        // store-write-failed is still firing: its 120 s clock only starts at this success.
+        assert!(
+            snapshot
+                .firing
+                .iter()
+                .all(|alert| alert.event.rule != "disk-pool-full"),
+            "the disk alert is closed in memory too"
+        );
+    }
+
+    #[test]
+    fn a_queue_past_the_limit_drops_the_oldest_and_the_failure_counts_them() {
+        let scratch = Scratch::new("queue-limit");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        let mut at_60 = None;
+        for t in (0..=60_000).step_by(5_000) {
+            at_60 = Some(engine.tick(&many_pools(1_100, |_| 95, T0 + t), Vec::new(), T0 + t));
+        }
+        let message = at_60
+            .and_then(|snapshot| snapshot.store_error)
+            .expect("the failure is marked")
+            .message;
+        assert!(message.contains("100 alert events dropped"), "{message}");
+        set(&switches.fail, false);
+        let snapshot = engine.tick(
+            &many_pools(1_100, |_| 95, T0 + 65_000),
+            Vec::new(),
+            T0 + 65_000,
+        );
+        assert!(
+            snapshot.store_error.is_none(),
+            "the queue commits: {:?}",
+            snapshot.store_error
+        );
+        let stored = events_of(scratch.path());
+        assert_eq!(
+            stored.len(),
+            QUEUE_LIMIT,
+            "the queue keeps the newest {QUEUE_LIMIT}"
+        );
+        assert_eq!(
+            stored[0].labels.get("pool").map(String::as_str),
+            Some("pool0100")
+        );
+    }
+
+    #[test]
+    fn a_resolve_whose_firing_was_dropped_is_pruned_and_the_batch_still_commits() {
+        let scratch = Scratch::new("orphan-resolve");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        // 1,100 pools fire at 60 s while the store fails. The 100 oldest firings are dropped from the queue.
+        let mut at_60 = None;
+        for t in (0..=60_000).step_by(5_000) {
+            at_60 = Some(engine.tick(&many_pools(1_100, |_| 95, T0 + t), Vec::new(), T0 + t));
+        }
+        let dropped = at_60
+            .and_then(|snapshot| snapshot.store_error)
+            .expect("the failure is marked")
+            .message;
+        assert!(dropped.contains("100 alert events dropped"), "{dropped}");
+        // pool0000, whose firing was dropped, clears: its resolve has nothing to link to, so it is pruned.
+        for t in (65_000..=185_000).step_by(5_000) {
+            engine.tick(
+                &many_pools(1_100, |i| if i == 0 { 50 } else { 95 }, T0 + t),
+                Vec::new(),
+                T0 + t,
+            );
+        }
+        set(&switches.fail, false);
+        let snapshot = engine.tick(
+            &many_pools(1_100, |i| if i == 0 { 50 } else { 95 }, T0 + 190_000),
+            Vec::new(),
+            T0 + 190_000,
+        );
+        assert!(
+            snapshot.store_error.is_none(),
+            "the batch commits: {:?}",
+            snapshot.store_error
+        );
+        let events = events_of(scratch.path());
+        assert_eq!(events.len(), 1000, "the 1,000 queued firings are written");
+        assert!(events.iter().all(|event| event.state == EventState::Firing));
+        let pools: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event.labels.get("pool").map(String::as_str))
+            .collect();
+        assert_eq!(
+            pools.first().copied(),
+            Some("pool0100"),
+            "the oldest 100 were dropped"
+        );
+    }
+
+    #[test]
+    fn store_write_failed_clears_after_120_s_of_successful_commits() {
+        let scratch = Scratch::new("clears");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        engine.tick(&Inputs::default(), Vec::new(), T0);
+        set(&switches.fail, false);
+        let failed = |snapshot: &arca_alerts::AlertSnapshot| {
+            snapshot
+                .firing
+                .iter()
+                .any(|alert| alert.event.rule == STORE_WRITE_FAILED)
+        };
+        // The first success at 5 s starts the clock: firing at 120 s, cleared at 125 s.
+        for t in (5_000..=120_000).step_by(5_000) {
+            assert!(
+                failed(&engine.tick(&Inputs::default(), Vec::new(), T0 + t)),
+                "still firing at {t} ms"
+            );
+        }
+        assert!(
+            !failed(&engine.tick(&Inputs::default(), Vec::new(), T0 + 125_000)),
+            "cleared at 125 s"
+        );
+    }
+
+    #[test]
+    fn store_write_failures_counts_each_failed_commit() {
+        let scratch = Scratch::new("counts");
+        let switches = Switches::default();
+        set(&switches.fail, true);
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        for t in [0, 5_000, 10_000] {
+            engine.tick(&Inputs::default(), Vec::new(), T0 + t);
+        }
+        set(&switches.fail, false);
+        let snapshot = engine.tick(&Inputs::default(), Vec::new(), T0 + 15_000);
+        assert_eq!(
+            snapshot.store_write_failures, 3,
+            "three failures, and the success does not count"
+        );
+    }
+
+    #[test]
+    fn a_commit_over_1_s_counts_as_slow_and_its_events_are_never_queued_again() {
+        let scratch = Scratch::new("slow");
+        let switches = Switches::default();
+        let mut engine = engine_on(scratch.path(), &switches, Rules::default());
+        for t in (0..=55_000).step_by(5_000) {
+            engine.tick(&many_pools(1, |_| 95, T0 + t), Vec::new(), T0 + t);
+        }
+        // The commit at 60 s takes 1.1 s. It is committed, and it counts as a failure.
+        set(&switches.slow, true);
+        let slow = engine.tick(&many_pools(1, |_| 95, T0 + 60_000), Vec::new(), T0 + 60_000);
+        set(&switches.slow, false);
+        assert_eq!(slow.store_write_failures, 1, "the slow commit counts");
+        assert!(
+            slow.store_error.is_none(),
+            "its events are committed, so no error is marked"
+        );
+        assert!(
+            slow.firing
+                .iter()
+                .any(|alert| alert.event.rule == STORE_WRITE_FAILED),
+            "store-write-failed fires"
+        );
+        for t in (65_000..=120_000).step_by(5_000) {
+            engine.tick(&many_pools(1, |_| 95, T0 + t), Vec::new(), T0 + t);
+        }
+        let events = events_of(scratch.path());
+        let firings: Vec<&AlertEvent> = events
+            .iter()
+            .filter(|event| event.state == EventState::Firing)
+            .collect();
+        assert_eq!(firings.len(), 1, "one copy of the firing");
+        let copies = events
+            .iter()
+            .filter(|event| event.alert_id == firings[0].alert_id)
+            .count();
+        assert_eq!(copies, 1, "the store holds exactly one event for the alert");
+    }
+}
+
+mod get_only {
+    use super::*;
+
+    fn fake_state() -> FakeState {
+        FakeState {
+            server: json!({ "api_version": "1.0" }),
+            projects: Vec::new(),
+            instances: Vec::new(),
+            networks: Vec::new(),
+            pools: vec![(
+                "default".to_string(),
+                json!({ "space": { "used": 95, "total": 100 } }),
+            )],
+        }
+    }
+
+    #[test]
+    fn a_sampler_and_an_engine_run_30_ticks_on_get_requests_only() {
+        let scratch = Scratch::new("get-only");
+        let state = scratch.join("state");
+        fs::create_dir(&state).expect("the state directory is created");
+        let fake = FakeIncus::start(scratch.path(), fake_state()).expect("the fake Incus starts");
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.join("proc"),
+                sys_root: scratch.join("sys"),
+                pools: vec!["default".to_string()],
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            UnixIncus::new(fake.socket().to_path_buf()),
+        );
+        let store = Store::open(&state, T0).expect("the store opens").store;
+        let mut engine =
+            Engine::start(store, Rules::default(), false, T0).expect("the engine starts");
+        for tick in 0..30u64 {
+            let now = T0 + tick * 5_000;
+            sampler.sample(now);
+            let readings = inputs::from_sampler(&sampler);
+            let points = export::points(&sampler, &readings);
+            engine.tick(&readings, points, now);
+        }
+        let requests = fake.requests();
+        assert!(!requests.is_empty(), "the sampler read Incus");
+        assert!(
+            requests.iter().all(|request| request.method == "GET"),
+            "{requests:?}"
+        );
+        assert!(fake.writes().is_empty(), "no write reached Incus");
+        assert!(
+            !state.join("desired.json").exists(),
+            "no desired state was written"
+        );
+    }
+}
