@@ -567,6 +567,23 @@ mod corrupt_rename {
             "the old highest seq was 5, so the new file starts at 6"
         );
     }
+
+    #[test]
+    fn a_fresh_store_starts_its_seq_at_the_wall_clock() {
+        let dir = StateDir::new("fresh-floor");
+        let now: u64 = 1_700_000_000_000;
+        let mut opened = Store::open(dir.path(), now).expect("open");
+        assert_eq!(opened.reset, None, "a new directory has no corrupt file");
+        let seqs = opened
+            .store
+            .commit_tick(now, &[], &[event(EventState::Firing, now)])
+            .expect("commit");
+        assert!(
+            seqs[0] >= now,
+            "the first seq {} is below the wall clock {now}",
+            seqs[0]
+        );
+    }
 }
 
 mod durability {

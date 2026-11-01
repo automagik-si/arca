@@ -262,7 +262,7 @@ impl Store {
         if is_corrupt(&path) {
             return reset_corrupt(state_dir, path, now_ms);
         }
-        match open_writer(&path) {
+        match open_writer(&path, now_ms) {
             Ok((conn, pragmas)) => Ok(Opened {
                 store: Store { conn, path },
                 reset: None,
@@ -462,8 +462,9 @@ impl Store {
 }
 
 /// Opens the writer's connection to `path` with its pragmas, checks it and migrates it. A file that is not a database, or
-/// fails its quick check, is `Failure::Corrupt`.
-fn open_writer(path: &Path) -> Result<(Connection, Pragmas), Failure> {
+/// fails its quick check, is `Failure::Corrupt`. A new schema seeds the `alert_events` sequence so its first `seq` is at
+/// least `floor`.
+fn open_writer(path: &Path, floor: u64) -> Result<(Connection, Pragmas), Failure> {
     let mut conn = Connection::open(path)?;
     conn.pragma_update(None, "auto_vacuum", 2)?;
     conn.pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()))?;
@@ -477,7 +478,7 @@ fn open_writer(path: &Path) -> Result<(Connection, Pragmas), Failure> {
     if check != "ok" {
         return Err(Failure::Corrupt);
     }
-    migrate(&mut conn).map_err(Failure::Other)?;
+    migrate(&mut conn, floor).map_err(Failure::Other)?;
     Ok((conn, pragmas))
 }
 
@@ -510,15 +511,11 @@ fn reset_corrupt(state_dir: &Path, path: PathBuf, now_ms: u64) -> Result<Opened,
                 .map_err(|error| StoreError::Io(error.to_string()))?;
         }
     }
-    let (conn, pragmas) = open_writer(&path).map_err(|failure| match failure {
+    let start = (old_max + 1).max(now_ms);
+    let (conn, pragmas) = open_writer(&path, start).map_err(|failure| match failure {
         Failure::Other(error) => error,
         Failure::Corrupt => StoreError::Sqlite("a new store failed its quick check".to_string()),
     })?;
-    let start = (old_max + 1).max(now_ms);
-    conn.execute(
-        "INSERT INTO sqlite_sequence (name, seq) VALUES ('alert_events', ?1)",
-        params![int(start - 1)?],
-    )?;
     Ok(Opened {
         store: Store { conn, path },
         reset: Some(suffix),
@@ -550,13 +547,21 @@ fn old_max_seq(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Creates schema version 1 on a new file. A file of a newer version is refused.
-fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
+/// Creates schema version 1 on a new file, and seeds its `alert_events` sequence to `floor` in the same transaction, so a new
+/// file never starts below `floor`. A file of a newer version is refused.
+fn migrate(conn: &mut Connection, floor: u64) -> Result<(), StoreError> {
     let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 => {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA)?;
+            if floor > 0 {
+                // The sequence's last value is the one before the first `seq`.
+                tx.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('alert_events', ?1)",
+                    params![int(floor - 1)?],
+                )?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             Ok(())
