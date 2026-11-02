@@ -976,7 +976,50 @@ fn free_loopback_port() -> std::net::SocketAddr {
     probe.local_addr().expect("the probe's address")
 }
 
+/// Whether process `pid` holds a listening IPv4 or IPv6 TCP socket on `port`, read from procfs (Linux). A socket is in the
+/// process's descriptor table with its inode, and the kernel lists it as LISTEN in `/proc/net/tcp*`, only once its own `bind`
+/// and `listen` have succeeded. So this holds for the server under test and never for another process's listener.
+#[cfg(target_os = "linux")]
+fn child_listens_on(pid: u32, port: u16) -> bool {
+    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    let sockets: std::collections::BTreeSet<String> = fds
+        .filter_map(|fd| fs::read_link(fd.ok()?.path()).ok())
+        .filter_map(|link| {
+            let text = link.to_str()?;
+            Some(
+                text.strip_prefix("socket:[")?
+                    .trim_end_matches(']')
+                    .to_string(),
+            )
+        })
+        .collect();
+    ["/proc/net/tcp", "/proc/net/tcp6"].iter().any(|table| {
+        fs::read_to_string(table)
+            .unwrap_or_default()
+            .lines()
+            .skip(1)
+            .any(|line| {
+                // The columns are: slot, local address, remote address, state (`0A` is LISTEN), queues, timers, retransmits,
+                // uid, timeout, and the inode, which is the tenth.
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                let Some(local_port) = fields
+                    .get(1)
+                    .and_then(|local| local.rsplit(':').next())
+                    .and_then(|hex| u16::from_str_radix(hex, 16).ok())
+                else {
+                    return false;
+                };
+                local_port == port
+                    && fields.get(3) == Some(&"0A")
+                    && fields.get(9).is_some_and(|inode| sockets.contains(*inode))
+            })
+    })
+}
+
 #[test]
+#[cfg(target_os = "linux")]
 fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     let scratch = Scratch::new("serve-proxy");
     let rig = rig(&scratch);
@@ -986,9 +1029,11 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     let tokens = scratch.at("tokens");
     fs::create_dir_all(&tokens).expect("create the token directory");
     fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    // A port is free when it is probed, but another process can take it before `serve` binds it. A `serve` that exits before it
-    // listens because the address is already in use is started again on a fresh port, at most five times. Any other early exit
-    // fails at once with the server's stderr.
+    // A port is free when it is probed, but another process can take it before `serve` binds it. Then `serve` exits with
+    // "Address already in use", and a connect to that port reaches the other process's listener, so a connect proves nothing
+    // about the owner. The loop waits for the child's own listening socket on the port (`child_listens_on`). A `serve` that
+    // exits first, because the address is already in use, is started again on a fresh port, at most five times. Any other
+    // early exit fails at once with the server's stderr.
     let mut attempts = 0;
     let (mut child, at, mut stream) = loop {
         attempts += 1;
@@ -1005,9 +1050,9 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
             .expect("start arca serve");
 
         let deadline = Instant::now() + WAIT;
-        let stream = loop {
-            if let Ok(stream) = std::net::TcpStream::connect(at) {
-                break Some(stream);
+        let owned = loop {
+            if child_listens_on(child.id(), at.port()) {
+                break true;
             }
             if let Some(status) = child.try_wait().expect("poll the server") {
                 let mut stderr = String::new();
@@ -1022,12 +1067,13 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
                     attempts < 5,
                     "the proxy port was taken five times: {status}\n{stderr}"
                 );
-                break None;
+                break false;
             }
             assert!(Instant::now() < deadline, "the proxy listener comes up");
             thread::sleep(Duration::from_millis(20));
         };
-        if let Some(stream) = stream {
+        if owned {
+            let stream = std::net::TcpStream::connect(at).expect("connect to the proxy listener");
             break (child, at, stream);
         }
     };
