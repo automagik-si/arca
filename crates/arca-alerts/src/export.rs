@@ -228,7 +228,7 @@ const FAMILIES: [Family; 31] = [
     Family {
         name: SMART_PASSED,
         kind: "gauge",
-        help: "1 when the drive's SMART health check passed, 0 when it failed. Only drives with SMART enabled are listed.",
+        help: "1 when the drive's SMART health check passed, 0 when it failed. A drive with no usable SMART result has no series.",
         labels: &["device"],
     },
     Family {
@@ -472,14 +472,8 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
     {
         for drive in &drives.drives {
             let labels = [("device", drive.device.as_str())];
-            let passed = if drive.passed { 1.0 } else { 0.0 };
-            push(
-                &mut out,
-                SMART_PASSED,
-                SeriesKind::Gauge,
-                &labels,
-                Some(passed),
-            );
+            let passed = drive.passed.map(|passed| if passed { 1.0 } else { 0.0 });
+            push(&mut out, SMART_PASSED, SeriesKind::Gauge, &labels, passed);
         }
     }
     if let Some(components) = fresh(&inputs.components, HEALTH_MAX_AGE_MS, inputs.at) {
@@ -834,6 +828,38 @@ mod tests {
     }
 
     #[test]
+    fn a_drive_with_no_smart_result_writes_no_smart_passed_series() {
+        let sampler = sampled(None);
+        let sample = sampler.latest().expect("one sample was taken");
+        let readings = Readings {
+            drives: Some(DrivesReading {
+                at: AT,
+                drives: vec![
+                    DriveReading {
+                        device: "drive-000000000001".to_string(),
+                        passed: None,
+                    },
+                    DriveReading {
+                        device: "drive-000000000002".to_string(),
+                        passed: Some(true),
+                    },
+                ],
+            }),
+            ..Readings::default()
+        };
+        let inputs = Inputs {
+            at: AT,
+            ..Inputs::default()
+        };
+        let smart: Vec<String> = points_of(sample, &readings, &inputs)
+            .iter()
+            .filter(|point| point.name == SMART_PASSED)
+            .map(|point| point.labels["device"].clone())
+            .collect();
+        assert_eq!(smart, vec!["drive-000000000002".to_string()]);
+    }
+
+    #[test]
     fn a_smart_reading_is_written_per_drive_and_left_out_once_older_than_its_max_age() {
         let sampler = sampled(None);
         let sample = sampler.latest().expect("one sample was taken");
@@ -843,11 +869,11 @@ mod tests {
                 drives: vec![
                     DriveReading {
                         device: "drive-000000000001".to_string(),
-                        passed: true,
+                        passed: Some(true),
                     },
                     DriveReading {
                         device: "drive-000000000002".to_string(),
-                        passed: false,
+                        passed: Some(false),
                     },
                 ],
             }),

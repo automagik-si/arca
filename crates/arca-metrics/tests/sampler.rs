@@ -2021,7 +2021,7 @@ mod smart_readings {
     }
 
     #[test]
-    fn smart_readings_one_reading_per_drive_with_smart_and_none_for_the_rest() {
+    fn smart_readings_one_reading_per_listed_drive_and_unknown_for_one_without_a_result() {
         let storage = Storage::default();
         storage.serve(storage_document());
         let mut sampler = sampler_over(&storage);
@@ -2029,9 +2029,9 @@ mod smart_readings {
 
         let read = drives(&sampler).expect("the storage document was read");
         assert_eq!(read.at, 0);
-        assert_eq!(read.drives.len(), 2, "disk3 has no SMART block");
-        let passed: Vec<bool> = read.drives.iter().map(|drive| drive.passed).collect();
-        assert_eq!(passed, vec![true, false]);
+        assert_eq!(read.drives.len(), 3, "disk3 is listed with no SMART block");
+        let passed: Vec<Option<bool>> = read.drives.iter().map(|drive| drive.passed).collect();
+        assert_eq!(passed, vec![Some(true), Some(false), None]);
         for drive in &read.drives {
             assert!(drive.device.starts_with("drive-"), "{}", drive.device);
             assert_eq!(drive.device.len(), 18, "a prefix and twelve hex digits");

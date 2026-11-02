@@ -214,11 +214,11 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
                 // Real labels: `drive-` and twelve hex digits, the hash of each incus-osd ID (see `smart.rs`).
                 DriveReading {
                     device: "drive-2743af5e20a8".to_string(),
-                    passed: true,
+                    passed: Some(true),
                 },
                 DriveReading {
                     device: "drive-2a43af5e25c1".to_string(),
-                    passed: false,
+                    passed: Some(false),
                 },
             ],
         }),

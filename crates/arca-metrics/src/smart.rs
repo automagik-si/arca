@@ -1,5 +1,5 @@
-//! The SMART readings of the drives incus-osd lists: whether each drive with SMART enabled passed, from one GET of the storage
-//! document every 10 min.
+//! The SMART readings of the drives incus-osd lists: whether each listed drive passed, from one GET of the storage document every
+//! 10 min. A drive with no usable SMART result is listed with its pass unknown.
 //!
 //! incus-osd names a drive by its `/dev/disk/by-id/` link, and that link holds the model and the serial number. So a drive's
 //! reading carries a label made from a hash of that name, never the name itself. The model, the serial, the WWN and every other
@@ -14,17 +14,18 @@ pub const STORAGE_PATH: &str = "/os/1.0/system/storage";
 /// The prefix of every drive label.
 const LABEL_PREFIX: &str = "drive-";
 
-/// One drive with SMART enabled, as the label the export and the alerts carry, and whether its SMART health check passed.
+/// One listed drive, as the label the export and the alerts carry, and whether its SMART health check passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveReading {
     /// `drive-` and twelve hex digits: a hash of the drive's incus-osd ID. It is stable across reads and carries no part of the ID.
     pub device: String,
-    /// Whether incus-osd reports the SMART health check as passed.
-    pub passed: bool,
+    /// Whether incus-osd reports the SMART health check as passed. `None` when the drive has no usable SMART result: its SMART
+    /// block is missing, null or disabled.
+    pub passed: Option<bool>,
 }
 
-/// The SMART state of the drives that have SMART enabled, read at `at`. A drive with no SMART block, or with SMART disabled, has
-/// no entry.
+/// The SMART state of the listed drives, read at `at`. A listed drive with an ID has an entry, with `passed` unknown when it has
+/// no usable SMART result. A drive with no ID and no usable SMART result has no entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrivesReading {
     /// Epoch milliseconds when the read ran.
@@ -41,35 +42,43 @@ pub fn read<R: IncusRead>(incus: &R, at: u64) -> Option<DrivesReading> {
 
 /// The reading the storage document gives at `at`. A drive with SMART enabled needs an ID and a boolean `passed`; when one is
 /// missing or the wrong type the whole reading is `None`, so a failing drive is never hidden as absent. A SMART block with a
-/// non-empty `error` (incus-osd could not read the drive's SMART data) makes the whole reading `None` too. A drive with no SMART
-/// block, or with SMART disabled, is skipped. A document without a drive list is `None`.
-///
-/// Known gap: a listed drive whose SMART block is missing, null or disabled has no entry, so a firing `smart-warning` on that
-/// drive resolves as `subject-gone`. Carrying it as unknown needs a per-drive unknown value in `arca_alerts::eval::DriveUse`,
-/// which is outside this module.
+/// non-empty `error` (incus-osd could not read the drive's SMART data) makes the whole reading `None` too. A listed drive with an
+/// ID whose SMART block is missing, null or disabled has `passed: None`, so its alert is held as unknown until the drive leaves
+/// the listing. A drive with no ID and no usable SMART block is skipped. A document without a drive list is `None`.
 pub fn from_document(document: &Value, at: u64) -> Option<DrivesReading> {
     let drives = document.pointer("/state/drives")?.as_array()?;
     let mut readings = Vec::new();
     for drive in drives {
         let Some(smart) = drive.get("smart").filter(|smart| !smart.is_null()) else {
+            readings.extend(without_result(drive));
             continue;
         };
         if !error_is_empty(smart)? {
             return None;
         }
         if !smart.get("enabled")?.as_bool()? {
+            readings.extend(without_result(drive));
             continue;
         }
         let id = drive.get("id")?.as_str()?;
         let passed = smart.get("passed")?.as_bool()?;
         readings.push(DriveReading {
             device: device_label(id),
-            passed,
+            passed: Some(passed),
         });
     }
     Some(DrivesReading {
         at,
         drives: readings,
+    })
+}
+
+/// The reading of a listed drive that has no usable SMART result: `passed` unknown when the drive has an ID, else no reading.
+fn without_result(drive: &Value) -> Option<DriveReading> {
+    let id = drive.get("id")?.as_str()?;
+    Some(DriveReading {
+        device: device_label(id),
+        passed: None,
     })
 }
 
@@ -121,11 +130,40 @@ mod tests {
     }
 
     #[test]
-    fn a_drive_without_smart_or_with_smart_off_has_no_entry() {
+    fn a_listed_drive_without_a_usable_smart_result_reads_as_unknown() {
         let document = json!({ "state": { "drives": [
             { "id": "disk1", "smart": { "enabled": false, "passed": false } },
             { "id": "disk2" },
             { "id": "disk3", "smart": null },
+        ] } });
+        assert_eq!(
+            from_document(&document, 7),
+            Some(DrivesReading {
+                at: 7,
+                drives: vec![
+                    DriveReading {
+                        device: device_label("disk1"),
+                        passed: None,
+                    },
+                    DriveReading {
+                        device: device_label("disk2"),
+                        passed: None,
+                    },
+                    DriveReading {
+                        device: device_label("disk3"),
+                        passed: None,
+                    },
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a_drive_without_an_id_and_without_a_smart_result_is_skipped() {
+        let document = json!({ "state": { "drives": [
+            { "smart": { "enabled": false, "passed": false } },
+            { "smart": null },
+            { },
         ] } });
         assert_eq!(
             from_document(&document, 7),
@@ -185,8 +223,8 @@ mod tests {
             { "id": "disk2", "smart": { "enabled": true, "passed": false } },
         ] } });
         let read = from_document(&document, 1).expect("both drives read");
-        let passed: Vec<bool> = read.drives.iter().map(|drive| drive.passed).collect();
-        assert_eq!(passed, vec![true, false]);
+        let passed: Vec<Option<bool>> = read.drives.iter().map(|drive| drive.passed).collect();
+        assert_eq!(passed, vec![Some(true), Some(false)]);
     }
 
     #[test]

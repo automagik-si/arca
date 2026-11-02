@@ -140,7 +140,7 @@ fn reading_of(id: RuleId, value: f64, at: u64) -> Inputs {
                 at,
                 value: vec![DriveUse {
                     device: "disk1".to_string(),
-                    passed: value == 0.0,
+                    passed: Some(value == 0.0),
                 }],
             });
         }
@@ -622,6 +622,85 @@ mod eval {
             );
             assert!(eval.step(&rules, &gone, T0 + 70_000).is_empty(), "once");
             assert!(eval.firing().is_empty());
+        }
+
+        #[test]
+        fn a_firing_smart_alert_stays_firing_and_unknown_while_its_drive_has_no_result() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::SmartWarning, 1.0, T0 + t),
+                    T0 + t,
+                );
+            }
+            assert_eq!(eval.firing().len(), 1, "the failed drive fires at 60 s");
+            let no_result = |t: u64| Inputs {
+                at: T0 + t,
+                drives: Some(Timed {
+                    at: T0 + t,
+                    value: vec![DriveUse {
+                        device: "disk1".to_string(),
+                        passed: None,
+                    }],
+                }),
+                ..Inputs::default()
+            };
+            for t in (65_000..=180_000).step_by(5_000) {
+                assert!(
+                    eval.step(&rules, &no_result(t), T0 + t).is_empty(),
+                    "no event while the drive has no result, at {t} ms"
+                );
+            }
+            let firing = eval.firing();
+            assert_eq!(firing.len(), 1, "still firing");
+            assert!(firing[0].unknown, "held as unknown");
+            assert_eq!(
+                unknown_of(&eval, RuleId::SmartWarning),
+                Some(UnknownReason::Missing)
+            );
+            let gone = Inputs {
+                at: T0 + 185_000,
+                drives: Some(Timed {
+                    at: T0 + 185_000,
+                    value: Vec::new(),
+                }),
+                ..Inputs::default()
+            };
+            let resolved = eval.step(&rules, &gone, T0 + 185_000);
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].state, EventState::Resolved);
+            assert_eq!(resolved[0].reason, Some(ResolveReason::SubjectGone));
+            assert!(eval.firing().is_empty());
+        }
+
+        #[test]
+        fn a_drive_with_no_smart_result_from_the_start_creates_no_track_and_no_event() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=180_000).step_by(5_000) {
+                let inputs = Inputs {
+                    at: T0 + t,
+                    drives: Some(Timed {
+                        at: T0 + t,
+                        value: vec![DriveUse {
+                            device: "disk1".to_string(),
+                            passed: None,
+                        }],
+                    }),
+                    ..Inputs::default()
+                };
+                assert!(eval.step(&rules, &inputs, T0 + t).is_empty(), "{t} ms");
+            }
+            assert!(eval.firing().is_empty(), "nothing fires");
+            assert_eq!(unknown_of(&eval, RuleId::SmartWarning), None, "no track");
+            assert!(
+                eval.unknown()
+                    .iter()
+                    .all(|alert| alert.rule != "smart-warning"),
+                "no smart-warning entry is shown"
+            );
         }
 
         #[test]

@@ -221,7 +221,8 @@ pub struct UpdateUse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveUse {
     pub device: String,
-    pub passed: bool,
+    /// `None` when the drive has no usable SMART result.
+    pub passed: Option<bool>,
 }
 
 /// The state of one rule and label set.
@@ -333,6 +334,14 @@ impl Evaluator {
                         }
                     }
                     for (labels, value) in readings {
+                        // A drive that never had a SMART result is not tracked. One that already is keeps its track, which
+                        // holds it as unknown.
+                        if rule.id == RuleId::SmartWarning
+                            && value.is_none()
+                            && !self.tracks.contains_key(&(rule.id, labels.clone()))
+                        {
+                            continue;
+                        }
                         let track = self
                             .tracks
                             .entry((rule.id, labels.clone()))
@@ -484,7 +493,7 @@ fn source(id: RuleId, inputs: &Inputs, now: u64) -> Source {
                 .map(|drive| {
                     (
                         labels_of([("device", drive.device.as_str())]),
-                        Some(bad_as(!drive.passed)),
+                        drive.passed.map(|passed| bad_as(!passed)),
                     )
                 })
                 .collect()
