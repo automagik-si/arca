@@ -9,6 +9,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 |---------|-------|--------|
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
+| `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
 | `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
@@ -51,7 +52,7 @@ refused without the value being echoed back.
 |-----|----------|---------|
 | `stateDir` | yes | An existing directory, mode 0700. The node key and the desired-state files live in it. See the state section below. |
 | `incus.socket` | yes | The Incus unix socket. Reads only. |
-| `incus.pools` | no | Storage pools whose space the sampler reads. |
+| `incus.pools` | no | An allow-filter on the storage pools Incus lists. Absent, or `[]`, means every pool Incus lists. A non-empty list samples and alerts only the listed pools that Incus also lists. A listed name that Incus does not list has no row, so its firing alert resolves with `subject-gone`. A pool entry with no name makes the pool reading unknown for that tick. See "Alerts". |
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
@@ -163,7 +164,7 @@ The secret file holds the secret and one newline. A client reads that file, stri
 ## The MCP server
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
-in this build are `arca_status`, `node_metrics`, `watch_report`, `token_list`, `plan_list`, `plan_decline` and
+in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `plan_list`, `plan_decline` and
 `approval_submit`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
@@ -173,11 +174,15 @@ its request is read.
 - `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
   `mean` are `null`.
-- `watch_report` reads every project and instance through Incus GET. Live desired-state entries do not exist yet, so the
-  report has no entries to compare, and every kernel-marked object is reported as drift. A sweep sends a GET for every
-  project and instance, so the server keeps its answer for 30 seconds and runs one sweep at a time: a call within 30
-  seconds of the last sweep gets that sweep's report, and calls that arrive during a sweep wait for it. Every answer
-  carries `ageMs`, the milliseconds since its sweep ended. A failed sweep is not kept.
+- `watch_report` reads every project and instance through Incus GET, but a call never starts a sweep. The `arca-watcher`
+  thread sweeps once when `serve` starts and then every 30 seconds, so the GETs do not depend on how often the report is
+  asked for. A call answers from the newest successful sweep, and every answer carries `ageMs`, the milliseconds since that
+  sweep started. A failed sweep leaves the previous report in place. Before the first sweep has finished, a call waits up to
+  35 seconds for it. If no sweep has ever succeeded, the call answers the last sweep error, or `no watch sweep has finished
+  yet`. Live desired-state entries do not exist yet, so the report has no entries to compare, and every kernel-marked
+  object is reported as drift.
+- `alerts_list` answers the node's alerts: the firing ones, the unknown ones, the disabled rules, the resolves of the last
+  24 hours and the store's health. It reads the newest published tick and never waits on Incus. See "Alerts".
 - `token_list` lists each token's id and scope as they were when the server started. It never lists a secret or a digest.
 - `plan_list` lists each waiting delete plan with the statement its owner signs. See the next section.
 - `plan_decline` retains a waiting plan's objects. A decline is final and survives a restart.
@@ -430,8 +435,9 @@ arca call watch_report --config ~/.config/arca/node.json --token-file ~/.config/
 ```
 
 `arca-watch` reads back `MemoryMax=268435456`, `MemorySwapMax=0` and `StartLimitBurst=5`, and `arca-shim` reads back
-`MemoryMax=67108864`. A second `watch_report` within 30 seconds carries an `ageMs` above 0. The service is stable after 24
-hours active with `NRestarts=0`, a `MemoryPeak` under `MemoryHigh`, and a live shim summary of `refused: 0`.
+`MemoryMax=67108864`. Once the watcher has finished a sweep, `watch_report` carries an `ageMs` above 0, which is the age of
+that sweep. The service is stable after 24 hours active with `NRestarts=0`, a `MemoryPeak` under `MemoryHigh`, and a live
+shim summary of `refused: 0`.
 
 ### Publishing through a reverse proxy (each step approved by the owner at that moment)
 
@@ -626,6 +632,321 @@ adoption planned stopped while the instance is not stopped, a stopped container 
 bad `--port`, `--http-path`, `--url` or `--wait` (or both or neither of `--port` and `--url`, or either of them for an
 adoption planned stopped). `1` for a held
 lock, a failed step (the record names it) or a failed verify.
+
+## Alerts
+
+On every 5-second tick, `serve` reads the node, evaluates eight rules and writes the points and any alert events to
+`arca.db` (see "The store"). The thresholds come from `alerts.json` in the state directory. Alerts never write anything to
+Incus or to the desired state.
+
+### alerts.json
+
+The file is optional, and a missing file gives the defaults. It is read once, when `serve` starts, so an edit takes effect at
+the next restart. Its keys are camelCase. An unknown key, an unknown or repeated rule id, a value of the wrong type or range,
+or a file that is not JSON stops `serve` with exit 2. The error names a key and a position, never a value.
+
+- `rules`: a list of `{id, enabled, threshold, forS, clearForS, clearMargin, severity}`. Only `id` is required. An omitted
+  field keeps that rule's default. `severity` is `critical` or `warning`.
+- `shimSocket`: the socket of the recording shim. With it, the `shim` health component is checked. Without it, there is no
+  `shim` component.
+- `probes`: `{gateway, internet, relay}`, each an `ip:port` literal. A named target is probed; an unnamed one is not.
+
+```json
+{
+  "rules": [
+    { "id": "disk-pool-full", "threshold": 85 },
+    { "id": "cpu-hot", "enabled": false }
+  ],
+  "probes": { "gateway": "192.0.2.1:443" }
+}
+```
+
+Set `"enabled": false` for a sensor the node lacks, such as a CPU without a temperature sensor, or a node with no SMART
+drive. A disabled rule is never evaluated or exported, and `alerts_list` lists it under `disabled`. If a rule that has a
+firing alert is disabled, that alert resolves at the next start with reason `rule-disabled`.
+
+### The rules
+
+Every rule uses one comparison. It fires when its value stays above `threshold` for `forS` seconds, and it clears when its
+value stays at or below `threshold - clearMargin` for `clearForS` seconds. Every rule's default is `forS` 60 and `clearForS`
+120, so a condition that lasts 59 seconds never fires.
+
+| Rule | Reads | Default threshold | Clear margin | Severity |
+|------|-------|-------------------|--------------|----------|
+| `disk-pool-full` | the used space of each pool, in percent of its size | 90 | 5 | critical |
+| `mem-psi-high` | memory pressure, the kernel's `some` average over 10 s, in percent | 25 | 5 | warning |
+| `cpu-hot` | the CPU temperature, in °C | 85 | 5 | warning |
+| `service-down` | each health component: `incus`, `arca`, `watch`, and `shim` when configured | 0 | 0 | critical |
+| `drift` | every drift entry of the newest watch sweep, of every kind | 0 | 0 | warning |
+| `update-failed` | the incus-osd update status: a failed check, or no completed check for 14 days | 0 | 0 | warning |
+| `crash-loop` | the starts of one instance in the last 600 seconds | 2 | 2 | critical |
+| `smart-warning` | a drive's SMART health check, failed when it reports false | 0 | 0 | critical |
+
+A yes-or-no rule reads 1 when it is bad and 0 when it is fine, so its threshold of 0 fires on 1. The thresholds are a
+starting point. Tune them after a week of data.
+
+The pools that `disk-pool-full` reads come from Incus's own pool list on every tick. The `incus.pools` key of the config
+file filters that list (see the config table), so a pool that is left out is never evaluated.
+
+`store-write-failed` is built in. It is not in `alerts.json`, it is critical, and it lives only in memory. It fires at the
+first failed commit, or at the first commit that takes over one second, and it clears after 120 seconds of commits that work.
+It shows in `alerts_list`, in the HEALTH line and as `arca_alert_firing`.
+
+### Unknown data
+
+A reading is unknown when its source gave none or it is too old. The maximum ages are: the host sample and the health
+components, 15 seconds; the watch sweep and the latency probes, 90 seconds; the incus-osd update status, 15 minutes; the SMART
+result, 2 hours.
+
+- Unknown data never starts or ends an alert. A firing alert stays firing and is marked `unknown: true`, its timers restart,
+  and no event is written.
+- `alerts_list.unknown` lists each unknown rule and label set, with reason `missing` (no reading yet) or `stale` (too old).
+- The one exception is `subject-gone`. A fresh, known reading that no longer has a firing alert's label set (a deleted pool
+  or instance, or a drive that left the drive list) resolves that alert once.
+- When Incus does not answer, the instance and pool readings are unknown, and no alert ends. `node_metrics` still lists
+  `projects` and `pools` as empty arrays, because its released schema has no null, so those lists alone do not show an
+  outage.
+- A drive listed with an ID but no usable SMART result (its SMART block is missing, null or disabled) is unknown, not passed.
+  A firing `smart-warning` for it is held as unknown. A drive that was OK and then loses its SMART result stays listed as
+  unknown, and it resolves only when it leaves the drive list. A SMART block with a non-empty `error` makes the whole SMART
+  reading unknown.
+- When incus-osd hangs, one tick can take about 20 seconds. The HEALTH line then reads `alerts stale`, and it recovers at
+  the next tick that finishes.
+
+### incus-osd readings
+
+Every 300 seconds, `serve` reads two incus-osd documents with GETs: the security state and the update status. Every 600
+seconds it reads the storage document for SMART. A node without incus-osd gives no reading for these, so their rules are
+unknown there.
+
+- **Secure Boot.** `arca_secureboot_enabled` is 1 when Secure Boot is on.
+- **TPM.** `arca_tpm_present` is 1 only when incus-osd reports the TPM status `ok`, a physical TPM whose measured boot state
+  matches. It is 0 for these other statuses:
+  - `pcr mismatch`: PCR 7, the Secure Boot measurement, differs from the value incus-osd computes from its event log.
+    incus-osd then reports that a PCR update is pending before the encrypted volumes can unlock with the TPM.
+  - `swtpm`: no physical TPM was found, so incus-osd runs on a software TPM. incus-osd reports this as a degraded security
+    state.
+  - Any other status is also 0.
+- **Update.** The update status is read by its text. A status that starts with `Failed` is a failed check. A status that ends
+  with ` update check completed`, or contains ` has been updated to version `, is a completed check. Any other status, such
+  as a check in progress, a skipped check outside the maintenance window, or an error text, keeps the previous result.
+  `update-failed` is 1 after a failed check and until a later completed one, and it is 1 when no check has completed for 14
+  days. A node that incus-osd has never given a check time for, and that has no completed check, has no reading, so the rule
+  does not fire. `arca_update_last_success_timestamp_seconds` is the time of the last completed check, and it is absent
+  until one completes. `arca_update_failed` is absent while the rule has no reading.
+- **Recovery keys.** The security document holds recovery keys. Each read takes only the Secure Boot and TPM fields, and it
+  drops the body when the read returns. The keys are therefore held in memory, as a JSON value, for the length of each read.
+  They are never stored, logged, put in an error or exported.
+
+### Latency probes
+
+`probes` names up to three TCP targets. Every 30 seconds `serve` opens a TCP connection to each named target and times it,
+with a 1-second timeout. `arca_latency_seconds` carries that connect time, which is not a ping. A failed or timed-out connect
+has no series, not a zero. A target that is not named has no series.
+
+### Instances and crash loops
+
+Each tick makes one listing of every instance, with its state, CPU, memory and last-use time. A start is counted when an
+instance's last-use time changes. Three starts in 10 minutes fire `crash-loop`. Two starts inside one 5-second tick count as
+one, which only delays the alert, because the rule needs three. A stopped instance has no CPU or memory series, and an
+instance with no `type` in the listing counts as a container. The listing loads full state, so a slow Incus can stretch a
+tick.
+
+### Drift
+
+`drift` is the total of all drift entries in the newest watch sweep. Its value includes entries of a kind that the export
+does not name (they are counted as `other`), so the sum of `arca_drift_entries` can be lower than the alert's value.
+
+### SMART drive labels
+
+`arca_smart_passed` and the SMART alerts name a drive by its `device` label. The label is `drive-` and 12 hex digits. It is the
+low 48 bits of a 64-bit FNV-1a hash of the drive's incus-osd ID, which is its first `/dev/disk/by-id/` link. The model and
+serial are never in a label, a log, an error or a metric.
+
+The label is a pseudonym, not protection. Anyone who has the ID can compute it, and it changes when the first by-id link that
+incus-osd records for the drive changes. To map a label to a physical drive:
+
+1. Read the storage document with one GET on the Incus socket, which is read-only:
+   `curl --unix-socket <incus.socket> http://localhost/os/1.0/system/storage`. Its output holds serial numbers, so keep it in
+   your terminal.
+2. For each entry in `state.drives`, compute its label from its `id`:
+
+   ```sh
+   python3 -I -c 'import sys
+   h = 0xcbf29ce484222325
+   for b in sys.argv[1].encode():
+       h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+   print("drive-%012x" % (h & 0xFFFFFFFFFFFF))' "<the drive's id>"
+   ```
+
+3. The entry whose label matches the `device` label of the alert, or of `arca_smart_passed`, is the drive. Its `id` names it:
+   `readlink -f "<the drive's id>"` gives the device node.
+
+### The HEALTH line
+
+`alerts_list` returns `healthLine`, which the console footer shows too. It reads one of these:
+
+- `alerts none`
+- `alerts <n> firing: <rule>, <rule>`, with one name per firing alert in firing order, so two full pools read
+  `disk-pool-full, disk-pool-full`
+- ` · <m> unknown` appended when `m` unknown entries exist, for example `alerts none · 1 unknown`
+- `alerts stale <s>s` when the newest host sample is older than 15 seconds, or `alerts stale` before the first sample
+
+The four health components feed `service-down`. Each one is checked on every tick:
+
+- `incus`: `GET /1.0` on the Incus socket returns 200 within 2 seconds.
+- `arca`: a `POST /mcp` with no token to the node's own unix socket returns 401 within 2 seconds. This is the one request
+  `arca-alerts` makes that is not a GET. It carries no token and changes nothing.
+- `watch`: the newest successful watch sweep is no older than 90 seconds. Sweeps are timed by the clock, so if the clock is set
+  back, sweeps pause until it has passed the last sweep's start by 30 seconds.
+- `shim`: with `shimSocket` set, `GET /1.0` through the recording shim answers 200 within 2 seconds.
+
+### Restarts
+
+- A firing alert loads as firing, with fresh timers and unknown until its first reading.
+- If two open firings of one rule and label set are stored (a lost resolve), the newer stays firing and the older resolves
+  once at start with reason `cleared`.
+
+## Export
+
+`GET /metrics` and `GET /alerts` are served on every listener of `serve`, and each needs a bearer token of any stored scope,
+the same token as the MCP calls. Without a valid bearer the answer is 401. A request with an `Origin` header is 403, and any
+other path is 404. Pass the token in the `Authorization` header:
+
+```sh
+curl --unix-socket /run/arca/arca.sock -H "Authorization: Bearer $(cat <token file>)" http://arca/metrics
+```
+
+### Metrics
+
+`/metrics` is the Prometheus text format, version 0.0.4, with the content type `text/plain; version=0.0.4`. Every series
+carries `node`, the node's id. A `null` reading is left out, never written as 0. No series uses the label `instance`, because
+a scraper sets that label itself. The names, types and labels below are fixed.
+
+| Metric | Type | Labels besides `node` | Meaning |
+|--------|------|-----------------------|---------|
+| `arca_node_cpu_used_ratio` | gauge | | the share of all CPUs busy since the previous sample, 0 to 1 |
+| `arca_node_cpu_cores` | gauge | | the number of CPUs |
+| `arca_node_load` | gauge | `window` (`15m`, `1m`, `5m`) | the load average |
+| `arca_node_memory_total_bytes` | gauge | | the memory of the node |
+| `arca_node_memory_available_bytes` | gauge | | the memory available to start applications |
+| `arca_node_swap_total_bytes` | gauge | | the swap space |
+| `arca_node_swap_free_bytes` | gauge | | the free swap space |
+| `arca_node_psi_avg10_ratio` | gauge | `resource` (`memory`, `cpu`), `kind` (`some`, `full`) | the share of time tasks stalled, averaged over 10 seconds, 0 to 1 |
+| `arca_node_cpu_temperature_celsius` | gauge | | the CPU temperature |
+| `arca_node_gpu_busy_ratio` | gauge | | the share of time the GPU is busy, 0 to 1 |
+| `arca_node_network_receive_bytes_total` | counter | | the bytes the physical NICs received |
+| `arca_node_network_transmit_bytes_total` | counter | | the bytes the physical NICs sent |
+| `arca_pool_size_bytes` | gauge | `pool` | the size of a storage pool |
+| `arca_pool_used_bytes` | gauge | `pool` | the bytes a storage pool uses |
+| `arca_project_instances` | gauge | `project` | the instances in a project |
+| `arca_project_instances_running` | gauge | `project` | the running instances in a project |
+| `arca_component_up` | gauge | `component` (`arca`, `incus`, `watch`, `shim`) | 1 when a health component is ok |
+| `arca_drift_entries` | gauge | `kind` (`marked_without_entry`, `entry_without_object`) | the drift entries of the newest watch sweep |
+| `arca_instance_running` | gauge | `project`, `incus_instance`, `type` (`container`, `vm`) | 1 when an instance runs |
+| `arca_instance_starts_total` | counter | `project`, `incus_instance` | the starts of an instance since the server started |
+| `arca_instance_cpu_seconds_total` | counter | `project`, `incus_instance` | the CPU time an instance has used |
+| `arca_instance_memory_used_bytes` | gauge | `project`, `incus_instance` | the memory an instance uses |
+| `arca_latency_seconds` | gauge | `target` (`gateway`, `internet`, `relay`) | the TCP connect time to a probe target |
+| `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |
+| `arca_tpm_present` | gauge | | 1 only when incus-osd reports the TPM status `ok`; see "incus-osd readings" |
+| `arca_update_last_success_timestamp_seconds` | gauge | | when incus-osd last completed an update check, in epoch seconds |
+| `arca_update_failed` | gauge | | 1 for a failed update or no completed check in 14 days, 0 otherwise |
+| `arca_smart_passed` | gauge | `device` | 1 when the drive's SMART check passed, 0 when it failed; see "SMART drive labels" |
+| `arca_alert_firing` | gauge | `rule`, `severity`, and the alert's own labels | 1 for each firing alert |
+| `arca_store_write_failures_total` | counter | | the failed writes since the server started |
+| `arca_sample_timestamp_seconds` | gauge | | when the newest host sample was taken, in epoch seconds |
+
+Notes on the names above:
+
+- **PSI is a ratio.** `arca_node_psi_avg10_ratio` is the kernel's percentage divided by 100. The `mem-psi-high` threshold in
+  `alerts.json` is still in percent, so a threshold of 25 is `0.25` on `/metrics`. There is no `cpu` `full` series.
+- **Drift.** See "Drift" above. `arca_drift_entries` has two kinds only.
+- **TPM and update.** See "incus-osd readings" above.
+- **Alerts.** A firing alert has one series, with its rule, its severity and its own labels. A pending, resolved or disabled
+  alert has no series, so an absent series means the alert is not firing. The `store-write-failed` alert appears here too.
+- **Instances.** A stopped instance has `arca_instance_running` 0 and no CPU or memory series.
+- **Ordering.** Series are written in order of their label values as text, so the `load` windows read `15m`, `1m`, `5m`.
+
+### The alert events: `GET /alerts?after=<seq>`
+
+`/alerts` returns one `arca.alert.v1` object per line (`application/x-ndjson`), oldest first. It returns the events whose `seq`
+is above `after`, which defaults to 0, and at most 500 of them per page. To read all of them, start with `after=0` and
+then ask again with `after` set to the largest `seq` of the last page, until a page is empty. A value that is not a whole
+number is refused with 400.
+
+Each event has these keys: `schema` (`arca.alert.v1`), `seq`, `alertId`, `node`, `rule`, `severity`, `state` (`firing` or
+`resolved`), `labels`, `value` and `threshold` (in the rule's own units), `startedAt`, `resolvedAt` (null while firing), `at`
+(when this event was written), and `reason` on resolved events only: `cleared`, `rule-disabled` or `subject-gone`. A firing
+event's `alertId` is its own `seq`, and its resolve is a new event with the same `alertId`.
+
+```json
+{"alertId":1793361600000,"at":1793361785000,"labels":{"pool":"default"},"node":"<node id>","reason":"cleared","resolvedAt":1793361785000,"rule":"disk-pool-full","schema":"arca.alert.v1","seq":1793361600003,"severity":"critical","startedAt":1793361660000,"state":"resolved","threshold":90.0,"value":50.0}
+```
+
+Events are written only when their commit works, so an event that waits after a failed commit is not in `/alerts` until the
+next commit that works (see "Store failure").
+
+## The store
+
+`<stateDir>/arca.db` holds the points and the alert events. It is SQLite, built into `arca`, so it needs no system library.
+
+### Durability and writes
+
+- The file is in WAL mode with `synchronous=FULL`. A commit is on disk when it returns, so a tick that committed survives a
+  crash or a power loss. `NORMAL` is not used, because it could lose the last commits.
+- Each 5-second tick is one transaction: the tick's points, about 125 series on a typical node, and its alert events.
+- The WAL is checkpointed automatically every 1000 pages, and after a checkpoint its file is cut back to at most 64 MiB. When
+  an hour closes, the rollup checkpoints the WAL fully and returns free pages, which can stall one tick by up to 5 seconds.
+- Each connection reads back its journal mode and `synchronous` value. If they are not `wal` and 2, the store refuses to open,
+  and `serve` stops with exit 1.
+- `alerts_list.commitMs` is the time of the last commit, and `storeBytes` is the size of `arca.db` with its `-wal` file.
+
+### Tiers and retention
+
+| Tier | Resolution | Kept | Rows per series at full retention |
+|------|------------|------|-----------------------------------|
+| raw | the 5-second points | 1 hour | 720 |
+| minute | 1 minute: average, minimum and maximum | 7 days | 10,080 |
+| hour | 1 hour: average, minimum and maximum | 90 days | 2,160 |
+
+A counter rolls up by its last value. The rollup runs at start and at the first tick of each minute. It rolls every closed
+bucket since its last mark, so a stop of several hours is caught up, and then it deletes the rows past their retention. A
+bucket with no data stays a gap. Resolved alerts are kept 90 days, and a firing alert is never deleted.
+
+### Sizing
+
+Measured at full retention with 125 series, the store holds 1,620,000 rows in 70.8 MiB, which is about 0.6 MiB per series. The
+test `size_estimate` in `arca-store` checks that 125 series stay under 128 MiB. To estimate a node, multiply its series count
+by 0.6 MiB.
+
+### Checking the store
+
+`arca store check --config <file>` opens a scratch store in a new directory inside the state directory, through the same open
+path as `arca.db`, and removes the directory. It never opens `arca.db`. It prints one JSON object with `sqlite_version`,
+`journal_mode`, `synchronous` and `auto_vacuum`. On a working node `journal_mode` is `wal`, `synchronous` is 2 and
+`auto_vacuum` is 2 (incremental). It exits 1 if the scratch store cannot be opened or removed.
+
+### A corrupt file
+
+Each open runs `quick_check`. When the file is corrupt, `arca.db`, `arca.db-wal` and `arca.db-shm` (the ones that exist) are
+renamed with the suffix `.corrupt-<ms>`, and a new empty store is created. `arca` never deletes the renamed files, so an
+operator can read them first. `alerts_list` then reports `storeReset: true`, and the history in the renamed files is not in the
+new store. The rename is not followed by a sync of the state directory.
+
+The first `seq` of the new store is the larger of the old highest `seq` plus one, and the reset time in milliseconds. A
+client's `after` cursor therefore never sees `seq` go backwards.
+
+### Store failure
+
+When a commit fails, for example on a full disk:
+
+- The tick still publishes, with `storeError: {at, message}` in `alerts_list`, and that tick's points are dropped.
+- Its alert events wait in memory, at most 1,000. Past that the oldest are dropped, and the message counts them.
+- The next commit that works writes the waiting events with their original times. Until then they appear in `alerts_list`
+  without a `seq`, and they are not in `/alerts`.
+- `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure. A commit that takes over one
+  second also counts as a failure, although its events are kept.
 
 ## Tests
 
