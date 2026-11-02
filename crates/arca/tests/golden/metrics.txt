@@ -46,10 +46,10 @@ arca_pool_size_bytes{node="00000000000000000000000000000000000000000000000000000
 arca_pool_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",pool="default"} 50
 # HELP arca_project_instances The instances in a project.
 # TYPE arca_project_instances gauge
-arca_project_instances{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1"} 2
+arca_project_instances{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1"} 3
 # HELP arca_project_instances_running The running instances in a project.
 # TYPE arca_project_instances_running gauge
-arca_project_instances_running{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1"} 1
+arca_project_instances_running{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1"} 2
 # HELP arca_component_up 1 when a health component is ok, 0 when it is not.
 # TYPE arca_component_up gauge
 arca_component_up{node="0000000000000000000000000000000000000000000000000000000000000000",component="arca"} 1
@@ -59,6 +59,24 @@ arca_component_up{node="00000000000000000000000000000000000000000000000000000000
 # TYPE arca_drift_entries gauge
 arca_drift_entries{node="0000000000000000000000000000000000000000000000000000000000000000",kind="entry_without_object"} 2
 arca_drift_entries{node="0000000000000000000000000000000000000000000000000000000000000000",kind="marked_without_entry"} 0
+# HELP arca_instance_running 1 when an instance runs, 0 when it does not.
+# TYPE arca_instance_running gauge
+arca_instance_running{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1",type="container"} 1
+arca_instance_running{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1",type="vm"} 1
+arca_instance_running{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="web1",type="container"} 0
+# HELP arca_instance_starts_total The times an instance has started since the server started.
+# TYPE arca_instance_starts_total counter
+arca_instance_starts_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 2
+arca_instance_starts_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1"} 0
+arca_instance_starts_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="web1"} 1
+# HELP arca_instance_cpu_seconds_total The CPU time an instance has used, in seconds.
+# TYPE arca_instance_cpu_seconds_total counter
+arca_instance_cpu_seconds_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 4.5
+arca_instance_cpu_seconds_total{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1"} 120
+# HELP arca_instance_memory_used_bytes The memory an instance uses, in bytes.
+# TYPE arca_instance_memory_used_bytes gauge
+arca_instance_memory_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 1073741824
+arca_instance_memory_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1"} 2147483648
 # HELP arca_alert_firing 1 for each firing alert.
 # TYPE arca_alert_firing gauge
 arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="cpu-hot",severity="warning"} 1

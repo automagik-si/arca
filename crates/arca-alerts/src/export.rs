@@ -32,6 +32,10 @@ pub const PROJECT_INSTANCES: &str = "arca_project_instances";
 pub const PROJECT_INSTANCES_RUNNING: &str = "arca_project_instances_running";
 pub const COMPONENT_UP: &str = "arca_component_up";
 pub const DRIFT_ENTRIES: &str = "arca_drift_entries";
+pub const INSTANCE_RUNNING: &str = "arca_instance_running";
+pub const INSTANCE_STARTS: &str = "arca_instance_starts_total";
+pub const INSTANCE_CPU: &str = "arca_instance_cpu_seconds_total";
+pub const INSTANCE_MEMORY: &str = "arca_instance_memory_used_bytes";
 pub const ALERT_FIRING: &str = "arca_alert_firing";
 pub const STORE_WRITE_FAILURES: &str = "arca_store_write_failures_total";
 pub const SAMPLE_TIMESTAMP: &str = "arca_sample_timestamp_seconds";
@@ -49,7 +53,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 21] = [
+const FAMILIES: [Family; 25] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -157,6 +161,30 @@ const FAMILIES: [Family; 21] = [
         kind: "gauge",
         help: "The drift entries of the newest watch sweep, by kind.",
         labels: &["kind"],
+    },
+    Family {
+        name: INSTANCE_RUNNING,
+        kind: "gauge",
+        help: "1 when an instance runs, 0 when it does not.",
+        labels: &["project", "incus_instance", "type"],
+    },
+    Family {
+        name: INSTANCE_STARTS,
+        kind: "counter",
+        help: "The times an instance has started since the server started.",
+        labels: &["project", "incus_instance"],
+    },
+    Family {
+        name: INSTANCE_CPU,
+        kind: "counter",
+        help: "The CPU time an instance has used, in seconds.",
+        labels: &["project", "incus_instance"],
+    },
+    Family {
+        name: INSTANCE_MEMORY,
+        kind: "gauge",
+        help: "The memory an instance uses, in bytes.",
+        labels: &["project", "incus_instance"],
     },
     Family {
         name: ALERT_FIRING,
@@ -305,6 +333,42 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             SeriesKind::Gauge,
             &labels,
             Some(project.running as f64),
+        );
+    }
+    for instance in readings.instances.iter().flatten() {
+        let labels = [
+            ("project", instance.project.as_str()),
+            ("incus_instance", instance.name.as_str()),
+        ];
+        let running = if instance.running { 1.0 } else { 0.0 };
+        let typed = [labels[0], labels[1], ("type", instance.kind.as_str())];
+        push(
+            &mut out,
+            INSTANCE_RUNNING,
+            SeriesKind::Gauge,
+            &typed,
+            Some(running),
+        );
+        push(
+            &mut out,
+            INSTANCE_STARTS,
+            SeriesKind::Counter,
+            &labels,
+            Some(instance.starts_total as f64),
+        );
+        push(
+            &mut out,
+            INSTANCE_CPU,
+            SeriesKind::Counter,
+            &labels,
+            instance.cpu_seconds,
+        );
+        push(
+            &mut out,
+            INSTANCE_MEMORY,
+            SeriesKind::Gauge,
+            &labels,
+            instance.memory_bytes.map(|bytes| bytes as f64),
         );
     }
     if let Some(components) = fresh(&inputs.components, HEALTH_MAX_AGE_MS, inputs.at) {

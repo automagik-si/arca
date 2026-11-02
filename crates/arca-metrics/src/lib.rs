@@ -6,6 +6,7 @@ mod incus;
 mod procfs;
 mod sample;
 
+pub use incus::{InstanceKind, InstanceReading};
 pub use sample::{
     Cpu, DEFAULT_MINUTES, HostSample, Load, Memory, Network, NicCounters, Pool, ProjectCount, Psi,
     Readings, Sampler, SamplerConfig, mean, node_metrics,
