@@ -12,7 +12,7 @@ use arca_metrics::{HostSample, Readings, Sampler};
 use arca_store::{AlertEvent, Point, SeriesKind};
 
 use crate::AlertSnapshot;
-use crate::eval::{HEALTH_MAX_AGE_MS, Inputs, Timed, WATCH_MAX_AGE_MS};
+use crate::eval::{HEALTH_MAX_AGE_MS, Inputs, PROBE_MAX_AGE_MS, Timed, WATCH_MAX_AGE_MS};
 
 pub const CPU_USED: &str = "arca_node_cpu_used_ratio";
 pub const CPU_CORES: &str = "arca_node_cpu_cores";
@@ -36,6 +36,7 @@ pub const INSTANCE_RUNNING: &str = "arca_instance_running";
 pub const INSTANCE_STARTS: &str = "arca_instance_starts_total";
 pub const INSTANCE_CPU: &str = "arca_instance_cpu_seconds_total";
 pub const INSTANCE_MEMORY: &str = "arca_instance_memory_used_bytes";
+pub const LATENCY: &str = "arca_latency_seconds";
 pub const ALERT_FIRING: &str = "arca_alert_firing";
 pub const STORE_WRITE_FAILURES: &str = "arca_store_write_failures_total";
 pub const SAMPLE_TIMESTAMP: &str = "arca_sample_timestamp_seconds";
@@ -53,7 +54,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 25] = [
+const FAMILIES: [Family; 26] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -185,6 +186,12 @@ const FAMILIES: [Family; 25] = [
         kind: "gauge",
         help: "The memory an instance uses, in bytes.",
         labels: &["project", "incus_instance"],
+    },
+    Family {
+        name: LATENCY,
+        kind: "gauge",
+        help: "The TCP connect time to a latency target, in seconds.",
+        labels: &["target"],
     },
     Family {
         name: ALERT_FIRING,
@@ -370,6 +377,18 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             &labels,
             instance.memory_bytes.map(|bytes| bytes as f64),
         );
+    }
+    // A probe round is read only while it is no older than its source's maximum age, and each target is a point only when its
+    // connect time is known: a failed probe is left out, never written as 0.
+    if let Some(latency) = readings
+        .latency
+        .as_ref()
+        .filter(|latency| inputs.at.saturating_sub(latency.at) <= PROBE_MAX_AGE_MS)
+    {
+        for (target, seconds) in &latency.targets {
+            let labels = [("target", target.as_str())];
+            push(&mut out, LATENCY, SeriesKind::Gauge, &labels, *seconds);
+        }
     }
     if let Some(components) = fresh(&inputs.components, HEALTH_MAX_AGE_MS, inputs.at) {
         for component in &components.value {

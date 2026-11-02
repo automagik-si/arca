@@ -2,13 +2,17 @@
 //! mean, and the `node_metrics` result row. Field names are the camel-case keys of the `node_metrics` result schema.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
 
 use arca_incus::IncusRead;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::incus::{self, InstanceReading};
+use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
 
 /// The window `node_metrics` reads when the caller names no minutes.
@@ -16,6 +20,12 @@ pub const DEFAULT_MINUTES: u32 = 1;
 
 /// The window `starts_10m` counts, in milliseconds: a start counts while it is less than this old.
 const START_WINDOW_MS: u64 = 600_000;
+
+/// How often a latency probe round runs, in milliseconds.
+const PROBE_EVERY_MS: u64 = 30_000;
+
+/// How long one latency probe may take to connect before it reads `None`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Where the sampler reads, which pools it reports, and how many samples it keeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,8 +140,18 @@ pub struct NicCounters {
     pub tx_bytes: u64,
 }
 
-/// What Incus and the NICs answered at the latest sample. A `None` is a read that failed: the sampler never turns a failure
-/// into an empty answer here. The sample's own `pools` and `projects` lists are the `node_metrics` view of the same reads.
+/// One latency probe round: the time it ran, and each named target's TCP connect time in seconds, or `None` when its probe
+/// failed. A target that is not named has no entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatencyReading {
+    /// Epoch milliseconds when the round ran.
+    pub at: u64,
+    pub targets: Vec<(ProbeTarget, Option<f64>)>,
+}
+
+/// What Incus, the NICs and the latency probes answered at the latest sample. A `None` is a read that failed: the sampler never
+/// turns a failure into an empty answer here. The sample's own `pools` and `projects` lists are the `node_metrics` view of the
+/// same reads.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Readings {
     /// The pools the allow-filter admits, from Incus's own pool list, with each one's space. `None` when the listing failed.
@@ -143,6 +163,8 @@ pub struct Readings {
     /// The instances, from the same list GET as `projects`. `None` when the list cannot be read, which is unknown, never no
     /// instances.
     pub instances: Option<Vec<InstanceReading>>,
+    /// The newest latency probe round. `None` before the first round, and always when no target is named.
+    pub latency: Option<LatencyReading>,
 }
 
 /// What the sampler keeps of one instance between ticks: its `last_used_at` on the previous listing, its starts since the
@@ -174,6 +196,10 @@ pub struct Sampler<R: IncusRead> {
     listed_pools: Option<Vec<String>>,
     /// Each instance the last successful instance listing held, by project and name.
     starts: BTreeMap<(String, String), StartTrack>,
+    /// The latency targets, each with its TCP address. Empty until [`Sampler::with_probes`] names one.
+    probes: Vec<(ProbeTarget, SocketAddr)>,
+    /// When the last probe round ran, in epoch milliseconds. `None` until the first round.
+    probed_at: Option<u64>,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -188,11 +214,20 @@ impl<R: IncusRead> Sampler<R> {
             readings: Readings::default(),
             listed_pools: None,
             starts: BTreeMap::new(),
+            probes: Vec::new(),
+            probed_at: None,
         }
     }
 
+    /// Names the latency targets to probe, each with its TCP address. A sampler with no target never probes, and a target that
+    /// is not listed has no entry in [`Readings::latency`].
+    pub fn with_probes(mut self, probes: Vec<(ProbeTarget, SocketAddr)>) -> Self {
+        self.probes = probes;
+        self
+    }
+
     /// Reads the host and Incus, appends the sample to the ring, and returns it. The ring drops its oldest sample past its
-    /// capacity.
+    /// capacity. A latency probe round runs in the same call when one is due, so a round is at most 30 s old at its sample.
     ///
     /// When the pool listing fails, the sample's pool rows are the last listing's names with null fields, or, before any
     /// listing has succeeded, the allow-filter's names with null fields. When the instance list fails, the sample has no project
@@ -205,6 +240,11 @@ impl<R: IncusRead> Sampler<R> {
         let instances =
             incus::read_instances(&self.incus).map(|listed| self.count_starts(listed, now_ms));
         let projects = instances.as_deref().map(incus::project_counts);
+        let latency = if self.probe_due(now_ms) {
+            Some(self.probe_round(now_ms))
+        } else {
+            self.readings.latency.clone()
+        };
         let rows = match &pools {
             Some(listed) => {
                 self.listed_pools = Some(listed.iter().map(|pool| pool.name.clone()).collect());
@@ -244,6 +284,7 @@ impl<R: IncusRead> Sampler<R> {
                 tx_bytes: totals.tx_bytes,
             }),
             instances,
+            latency,
         };
         self.previous = Some(Previous {
             at: now_ms,
@@ -296,6 +337,40 @@ impl<R: IncusRead> Sampler<R> {
                 reading
             })
             .collect()
+    }
+
+    /// Whether a probe round is due: none has run yet, or 30 s have passed since the last one in either direction, so a clock
+    /// that steps back does not stop the probes. A sampler with no target never probes.
+    fn probe_due(&self, now_ms: u64) -> bool {
+        if self.probes.is_empty() {
+            return false;
+        }
+        self.probed_at
+            .is_none_or(|at| now_ms.abs_diff(at) >= PROBE_EVERY_MS)
+    }
+
+    /// Probes every named target at once, each with [`PROBE_TIMEOUT`], and returns the round. A probe whose thread cannot start,
+    /// or panics, reads `None`, as a refused connect does.
+    fn probe_round(&mut self, now_ms: u64) -> LatencyReading {
+        self.probed_at = Some(now_ms);
+        let probes = &self.probes;
+        let targets = thread::scope(|scope| {
+            let handles: Vec<_> = probes
+                .iter()
+                .map(|&(target, addr)| (target, spawn_probe(scope, addr)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|(target, handle)| {
+                    let seconds = handle.and_then(|handle| handle.join().ok()).flatten();
+                    (target, seconds)
+                })
+                .collect()
+        });
+        LatencyReading {
+            at: now_ms,
+            targets,
+        }
     }
 
     /// The most recent sample, or `None` before the first one.
@@ -459,6 +534,18 @@ fn network_rates(before: Previous, now: Option<NicTotals>, now_ms: u64) -> Optio
         rx_bytes_per_sec: later.rx_bytes.saturating_sub(earlier.rx_bytes) as f64 / seconds,
         tx_bytes_per_sec: later.tx_bytes.saturating_sub(earlier.tx_bytes) as f64 / seconds,
     })
+}
+
+/// Starts one probe on its own thread, or `None` when the thread cannot start.
+fn spawn_probe<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    addr: SocketAddr,
+) -> Option<thread::ScopedJoinHandle<'scope, Option<f64>>> {
+    thread::Builder::new()
+        .spawn_scoped(scope, move || {
+            probe::tcp_connect_seconds(addr, PROBE_TIMEOUT)
+        })
+        .ok()
 }
 
 /// The mean of the finite values, or `None` when there are none.

@@ -33,8 +33,8 @@ use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
 use arca_metrics::{
-    Cpu, HostSample, InstanceKind, InstanceReading, Load, Memory, NicCounters, Pool, ProjectCount,
-    Psi, Readings,
+    Cpu, HostSample, InstanceKind, InstanceReading, LatencyReading, Load, Memory, NicCounters,
+    Pool, ProbeTarget, ProjectCount, Psi, Readings,
 };
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
@@ -192,6 +192,14 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
             tx_bytes: 2_000,
         }),
         instances: Some(scenario_instances()),
+        latency: Some(LatencyReading {
+            at,
+            targets: vec![
+                (ProbeTarget::Gateway, Some(0.002)),
+                (ProbeTarget::Internet, None),
+                (ProbeTarget::Relay, Some(0.045)),
+            ],
+        }),
     };
     (sample, readings)
 }
@@ -414,6 +422,31 @@ fn metrics_and_alerts_refuse_no_token_an_unknown_token_and_an_origin() {
     }
     let no_token_origin = "Origin: https://192.0.2.1\r\n";
     assert_eq!(send(&socket, "GET", "/metrics", no_token_origin, "").0, 403);
+}
+
+#[test]
+fn a_latency_round_is_left_out_once_older_than_its_max_age() {
+    let (sample, readings) = sample_at(NOW, 50);
+    let names = |at: u64| -> Vec<String> {
+        export::points_of(&sample, &readings, &inputs_at(at, &sample))
+            .into_iter()
+            .map(|point| point.name)
+            .collect()
+    };
+    assert_eq!(
+        names(NOW + 90_000)
+            .iter()
+            .filter(|name| name.as_str() == export::LATENCY)
+            .count(),
+        2,
+        "the two known targets are exported while the round is 90 s old"
+    );
+    assert!(
+        !names(NOW + 90_001)
+            .iter()
+            .any(|name| name == export::LATENCY),
+        "a round older than 90 s is unknown, and nothing is written for it"
+    );
 }
 
 #[test]
