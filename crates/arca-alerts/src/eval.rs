@@ -271,6 +271,21 @@ impl Evaluator {
                 continue;
             };
             let key = (id, event.labels.clone());
+            // Two stored firings of one key exist when a dropped resolve left the older one open (a queue overflow). The newer is
+            // kept and the older resolves once, now, so no open firing is lost without its resolve.
+            let event = match evaluator.tracks.remove(&key).and_then(|track| track.firing) {
+                None => event,
+                Some(held) => {
+                    let (keep, drop) =
+                        if (held.seq, held.started_at) >= (event.seq, event.started_at) {
+                            (held, event)
+                        } else {
+                            (event, held)
+                        };
+                    resolves.push(resolution(drop, None, ResolveReason::Cleared, now));
+                    keep
+                }
+            };
             evaluator.tracks.insert(
                 key,
                 Track {

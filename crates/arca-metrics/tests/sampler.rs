@@ -18,6 +18,7 @@ const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=2";
 const POOLS: &str = "/1.0/storage-pools?recursion=1";
 /// The incus-osd documents the sampler reads at its first tick and every 5 min after.
 const OSD_SECURITY: &str = "/os/1.0/system/security";
+const OSD_STORAGE: &str = "/os/1.0/system/storage";
 const OSD_UPDATE: &str = "/os/1.0/system/update";
 
 /// A fresh temporary directory, removed when the test ends.
@@ -380,8 +381,8 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
     let requests = fake.requests();
     assert_eq!(
         requests.len(),
-        5,
-        "the pool list, the instance list, one resources read for the admitted pool and the two incus-osd documents"
+        6,
+        "the pool list, the instance list, one resources read for the admitted pool and the three incus-osd documents"
     );
     assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
     let mut paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
@@ -393,6 +394,7 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
             "/1.0/storage-pools/default/resources",
             POOLS,
             OSD_SECURITY,
+            OSD_STORAGE,
             OSD_UPDATE,
         ]
     );
@@ -431,6 +433,7 @@ fn a_pool_name_that_is_not_plain_is_never_sent_to_incus() {
             INSTANCES.to_string(),
             POOLS.to_string(),
             OSD_SECURITY.to_string(),
+            OSD_STORAGE.to_string(),
             OSD_UPDATE.to_string(),
         ],
         "the pool list and the instance list were sent, and no resources read"
@@ -800,6 +803,7 @@ mod pools_from_incus {
                 "/1.0/storage-pools/pool1/resources".to_string(),
                 POOLS.to_string(),
                 OSD_SECURITY.to_string(),
+                OSD_STORAGE.to_string(),
                 OSD_UPDATE.to_string(),
             ]
         );
@@ -831,6 +835,7 @@ mod pools_from_incus {
                 "/1.0/storage-pools/pool1/resources".to_string(),
                 POOLS.to_string(),
                 OSD_SECURITY.to_string(),
+                OSD_STORAGE.to_string(),
                 OSD_UPDATE.to_string(),
             ],
             "a pool the filter drops is not read"
@@ -865,6 +870,7 @@ mod pools_from_incus {
                 INSTANCES.to_string(),
                 POOLS.to_string(),
                 OSD_SECURITY.to_string(),
+                OSD_STORAGE.to_string(),
                 OSD_UPDATE.to_string(),
             ],
             "no resources read for a name Incus does not list"
@@ -1911,5 +1917,184 @@ mod osd_readings {
             "a fake key reached the readings"
         );
         assert!(reading(&sampler).is_some());
+    }
+}
+
+mod smart_readings {
+    use std::sync::{Arc, Mutex};
+
+    use arca_incus::{IncusError, IncusRead};
+    use arca_metrics::DrivesReading;
+
+    use super::*;
+
+    const STORAGE: &str = "/os/1.0/system/storage";
+
+    /// The storage document the fake serves, or nothing served, which answers 404 as a plain Incus does. Each read is counted.
+    #[derive(Clone, Default)]
+    struct Storage {
+        served: Arc<Mutex<Option<Value>>>,
+        reads: Arc<Mutex<usize>>,
+    }
+
+    impl Storage {
+        fn serve(&self, document: Value) {
+            *self.served.lock().expect("the document is not poisoned") = Some(document);
+        }
+
+        fn reads(&self) -> usize {
+            *self.reads.lock().expect("the count is not poisoned")
+        }
+    }
+
+    impl IncusRead for Storage {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if path != STORAGE {
+                return Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                });
+            }
+            *self.reads.lock().expect("the count is not poisoned") += 1;
+            match self
+                .served
+                .lock()
+                .expect("the document is not poisoned")
+                .as_ref()
+            {
+                Some(document) => Ok(document.clone()),
+                None => Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                }),
+            }
+        }
+    }
+
+    /// Two drives with SMART enabled, one passed and one failed, and a drive with no SMART block. The model and serial are fake,
+    /// and no reading may carry them.
+    fn storage_document() -> Value {
+        json!({
+            "config": { "scrub_schedule": "", "trim_schedule": "" },
+            "state": {
+                "drives": [
+                    {
+                        "id": "disk1",
+                        "model_name": "FAKE-MODEL-NOT-REAL",
+                        "serial_number": "FAKE-SERIAL-NOT-REAL-0001",
+                        "smart": { "enabled": true, "passed": true },
+                    },
+                    {
+                        "id": "disk2",
+                        "model_name": "FAKE-MODEL-NOT-REAL",
+                        "serial_number": "FAKE-SERIAL-NOT-REAL-0002",
+                        "smart": { "enabled": true, "passed": false, "error": "" },
+                    },
+                    {
+                        "id": "disk3",
+                        "model_name": "FAKE-MODEL-NOT-REAL",
+                        "serial_number": "FAKE-SERIAL-NOT-REAL-0003",
+                    },
+                ],
+                "root_partition": {},
+            },
+        })
+    }
+
+    /// A sampler over roots that do not exist and no pools, so only the storage document has a reading.
+    fn sampler_over(storage: &Storage) -> Sampler<Storage> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-smart-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-smart-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            storage.clone(),
+        )
+    }
+
+    /// The drives reading the sampler holds at its latest sample.
+    fn drives(sampler: &Sampler<Storage>) -> Option<DrivesReading> {
+        sampler.readings().drives.clone()
+    }
+
+    #[test]
+    fn smart_readings_one_reading_per_drive_with_smart_and_none_for_the_rest() {
+        let storage = Storage::default();
+        storage.serve(storage_document());
+        let mut sampler = sampler_over(&storage);
+        sampler.sample(0);
+
+        let read = drives(&sampler).expect("the storage document was read");
+        assert_eq!(read.at, 0);
+        assert_eq!(read.drives.len(), 2, "disk3 has no SMART block");
+        let passed: Vec<bool> = read.drives.iter().map(|drive| drive.passed).collect();
+        assert_eq!(passed, vec![true, false]);
+        for drive in &read.drives {
+            assert!(drive.device.starts_with("drive-"), "{}", drive.device);
+            assert_eq!(drive.device.len(), 18, "a prefix and twelve hex digits");
+            assert!(!drive.device.contains("disk"), "the label is not the ID");
+        }
+        assert_ne!(read.drives[0].device, read.drives[1].device);
+    }
+
+    #[test]
+    fn smart_readings_no_model_serial_or_id_text_reaches_the_readings_or_their_debug_form() {
+        let storage = Storage::default();
+        storage.serve(storage_document());
+        let mut sampler = sampler_over(&storage);
+        sampler.sample(0);
+
+        let shown = format!("{:?}", sampler.readings().drives);
+        for secret in ["FAKE-SERIAL", "FAKE-MODEL", "disk1", "disk2", "disk3"] {
+            assert!(!shown.contains(secret), "{secret} reached the readings");
+        }
+    }
+
+    #[test]
+    fn smart_readings_the_read_happens_at_zero_and_600_seconds_and_not_between() {
+        let storage = Storage::default();
+        storage.serve(storage_document());
+        let mut sampler = sampler_over(&storage);
+        let mut read_at = Vec::new();
+        let mut seen = 0;
+        for at in (0..=900_000).step_by(5_000) {
+            sampler.sample(at);
+            if storage.reads() != seen {
+                read_at.push(at);
+                seen = storage.reads();
+            }
+            if at == 300_000 {
+                assert_eq!(
+                    drives(&sampler).map(|read| read.at),
+                    Some(0),
+                    "between reads the last reading holds"
+                );
+            }
+        }
+        assert_eq!(read_at, vec![0, 600_000], "reads at 0 s and 600 s only");
+    }
+
+    #[test]
+    fn smart_readings_a_404_gives_none_and_so_does_an_enabled_drive_without_a_result() {
+        let storage = Storage::default();
+        let mut sampler = sampler_over(&storage);
+        sampler.sample(0);
+        assert_eq!(drives(&sampler), None, "404 is unknown, never a reading");
+
+        let mut malformed = storage_document();
+        malformed["state"]["drives"][1]["smart"]
+            .as_object_mut()
+            .expect("the SMART block is an object")
+            .remove("passed");
+        storage.serve(malformed);
+        sampler.sample(600_000);
+        assert_eq!(
+            drives(&sampler),
+            None,
+            "a failing drive is never hidden as absent"
+        );
     }
 }

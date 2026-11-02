@@ -495,6 +495,38 @@ mod eval {
         }
     }
 
+    mod duplicate_firings {
+        use super::*;
+
+        #[test]
+        fn two_stored_firings_of_one_key_keep_the_newer_and_resolve_the_older_once() {
+            let rules = Rules::default();
+            let mut older = firing_event("disk-pool-full", &[("pool", "default")], T0);
+            older.seq = Some(4);
+            let mut newer = firing_event("disk-pool-full", &[("pool", "default")], T0 + 300_000);
+            newer.seq = Some(9);
+            let now = T0 + 600_000;
+            // The stored order is not fixed, so both orders must give the same result.
+            for stored in [
+                vec![older.clone(), newer.clone()],
+                vec![newer.clone(), older.clone()],
+            ] {
+                let (eval, resolves) = Evaluator::load(&rules, stored, now);
+                assert_eq!(resolves.len(), 1, "exactly one resolve for the older");
+                assert_eq!(resolves[0].state, EventState::Resolved);
+                assert_eq!(resolves[0].reason, Some(ResolveReason::Cleared));
+                assert_eq!(resolves[0].started_at, T0, "the older firing's start");
+                assert_eq!(resolves[0].resolved_at, Some(now));
+                assert_eq!(eval.firing().len(), 1, "one open firing is kept");
+                assert_eq!(
+                    eval.firing()[0].event.started_at,
+                    T0 + 300_000,
+                    "the newer one"
+                );
+            }
+        }
+    }
+
     mod rule_disabled {
         use super::*;
 
@@ -559,6 +591,38 @@ mod eval {
 
     mod subject_gone {
         use super::*;
+
+        #[test]
+        fn a_firing_smart_alert_resolves_once_when_its_drive_is_gone() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::SmartWarning, 1.0, T0 + t),
+                    T0 + t,
+                );
+            }
+            assert_eq!(eval.firing().len(), 1, "the failed drive fires at 60 s");
+            let gone = Inputs {
+                at: T0 + 65_000,
+                drives: Some(Timed {
+                    at: T0 + 65_000,
+                    value: Vec::new(),
+                }),
+                ..Inputs::default()
+            };
+            let resolved = eval.step(&rules, &gone, T0 + 65_000);
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].state, EventState::Resolved);
+            assert_eq!(resolved[0].reason, Some(ResolveReason::SubjectGone));
+            assert_eq!(
+                resolved[0].labels.get("device").map(String::as_str),
+                Some("disk1")
+            );
+            assert!(eval.step(&rules, &gone, T0 + 70_000).is_empty(), "once");
+            assert!(eval.firing().is_empty());
+        }
 
         #[test]
         fn a_firing_pool_alert_resolves_once_when_a_fresh_reading_lacks_its_pool() {

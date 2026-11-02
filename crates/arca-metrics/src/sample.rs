@@ -15,6 +15,7 @@ use crate::incus::{self, InstanceReading};
 use crate::osd::{self, OsdReading, UpdateMemory};
 use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
+use crate::smart::{self, DrivesReading};
 
 /// The window `node_metrics` reads when the caller names no minutes.
 pub const DEFAULT_MINUTES: u32 = 1;
@@ -30,6 +31,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How often the incus-osd security and update documents are read, in milliseconds.
 const OSD_EVERY_MS: u64 = 300_000;
+
+/// How often the incus-osd storage document is read for SMART, in milliseconds.
+const SMART_EVERY_MS: u64 = 600_000;
 
 /// Where the sampler reads, which pools it reports, and how many samples it keeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +176,9 @@ pub struct Readings {
     /// The incus-osd reading, taken every 5 min. `None` when either document cannot be read, as on a plain Incus that answers
     /// 404, and before the first read.
     pub osd: Option<OsdReading>,
+    /// The SMART state of the drives with SMART enabled, taken every 10 min. `None` when the storage document cannot be read, as
+    /// on a plain Incus that answers 404, and before the first read.
+    pub drives: Option<DrivesReading>,
 }
 
 /// What the sampler keeps of one instance between ticks: its `last_used_at` on the previous listing, its starts since the
@@ -212,6 +219,8 @@ pub struct Sampler<R: IncusRead> {
     /// The update result and last success time carried between incus-osd reads, so an in-progress or skipped status keeps the
     /// previous result. A failed read leaves it as it was.
     osd_memory: UpdateMemory,
+    /// When the incus-osd storage document was last read for SMART, in epoch milliseconds. `None` until the first read.
+    smart_read_at: Option<u64>,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -230,6 +239,7 @@ impl<R: IncusRead> Sampler<R> {
             probed_at: None,
             osd_read_at: None,
             osd_memory: UpdateMemory::default(),
+            smart_read_at: None,
         }
     }
 
@@ -264,6 +274,12 @@ impl<R: IncusRead> Sampler<R> {
             osd::read(&self.incus, now_ms, &mut self.osd_memory)
         } else {
             self.readings.osd.clone()
+        };
+        let drives = if self.smart_due(now_ms) {
+            self.smart_read_at = Some(now_ms);
+            smart::read(&self.incus, now_ms)
+        } else {
+            self.readings.drives.clone()
         };
         let rows = match &pools {
             Some(listed) => {
@@ -306,6 +322,7 @@ impl<R: IncusRead> Sampler<R> {
             instances,
             latency,
             osd,
+            drives,
         };
         self.previous = Some(Previous {
             at: now_ms,
@@ -375,6 +392,13 @@ impl<R: IncusRead> Sampler<R> {
     fn osd_due(&self, now_ms: u64) -> bool {
         self.osd_read_at
             .is_none_or(|at| now_ms.abs_diff(at) >= OSD_EVERY_MS)
+    }
+
+    /// Whether the incus-osd storage document is due for SMART: none has been read yet, or 10 min have passed since the last read
+    /// in either direction, so a clock that steps back does not stop the reads.
+    fn smart_due(&self, now_ms: u64) -> bool {
+        self.smart_read_at
+            .is_none_or(|at| now_ms.abs_diff(at) >= SMART_EVERY_MS)
     }
 
     /// Probes every named target at once, each with [`PROBE_TIMEOUT`], and returns the round. A probe whose thread cannot start,

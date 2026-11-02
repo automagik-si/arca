@@ -13,7 +13,8 @@ use arca_store::{AlertEvent, Point, SeriesKind};
 
 use crate::AlertSnapshot;
 use crate::eval::{
-    HEALTH_MAX_AGE_MS, Inputs, OSD_MAX_AGE_MS, PROBE_MAX_AGE_MS, Timed, WATCH_MAX_AGE_MS,
+    HEALTH_MAX_AGE_MS, Inputs, OSD_MAX_AGE_MS, PROBE_MAX_AGE_MS, SMART_MAX_AGE_MS, Timed,
+    WATCH_MAX_AGE_MS,
 };
 
 pub const CPU_USED: &str = "arca_node_cpu_used_ratio";
@@ -43,6 +44,7 @@ pub const SECURE_BOOT: &str = "arca_secureboot_enabled";
 pub const TPM_PRESENT: &str = "arca_tpm_present";
 pub const UPDATE_LAST_SUCCESS: &str = "arca_update_last_success_timestamp_seconds";
 pub const UPDATE_FAILED: &str = "arca_update_failed";
+pub const SMART_PASSED: &str = "arca_smart_passed";
 pub const ALERT_FIRING: &str = "arca_alert_firing";
 pub const STORE_WRITE_FAILURES: &str = "arca_store_write_failures_total";
 pub const SAMPLE_TIMESTAMP: &str = "arca_sample_timestamp_seconds";
@@ -60,7 +62,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 30] = [
+const FAMILIES: [Family; 31] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -222,6 +224,12 @@ const FAMILIES: [Family; 30] = [
         kind: "gauge",
         help: "1 when incus-osd reports an update failure, or no update check has completed in 14 days, 0 when not.",
         labels: &[],
+    },
+    Family {
+        name: SMART_PASSED,
+        kind: "gauge",
+        help: "1 when the drive's SMART health check passed, 0 when it failed. Only drives with SMART enabled are listed.",
+        labels: &["device"],
     },
     Family {
         name: ALERT_FIRING,
@@ -456,6 +464,24 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             osd.update_failed.and_then(flag),
         );
     }
+    // The SMART state is written only while it is no older than its maximum age at the tick, one point per drive with SMART enabled.
+    if let Some(drives) = readings
+        .drives
+        .as_ref()
+        .filter(|drives| inputs.at.saturating_sub(drives.at) <= SMART_MAX_AGE_MS)
+    {
+        for drive in &drives.drives {
+            let labels = [("device", drive.device.as_str())];
+            let passed = if drive.passed { 1.0 } else { 0.0 };
+            push(
+                &mut out,
+                SMART_PASSED,
+                SeriesKind::Gauge,
+                &labels,
+                Some(passed),
+            );
+        }
+    }
     if let Some(components) = fresh(&inputs.components, HEALTH_MAX_AGE_MS, inputs.at) {
         for component in &components.value {
             let ok = if component.ok { 1.0 } else { 0.0 };
@@ -637,7 +663,7 @@ mod tests {
     use std::path::PathBuf;
 
     use arca_incus::{IncusError, IncusRead};
-    use arca_metrics::{Sampler, SamplerConfig};
+    use arca_metrics::{DriveReading, DrivesReading, Sampler, SamplerConfig};
     use serde_json::{Value, json};
 
     use super::*;
@@ -750,6 +776,56 @@ mod tests {
         );
         assert!(!text.contains("arca_secureboot_enabled"), "{text}");
         assert!(!text.contains("arca_update_failed"), "{text}");
+    }
+
+    #[test]
+    fn a_smart_reading_is_written_per_drive_and_left_out_once_older_than_its_max_age() {
+        let sampler = sampled(None);
+        let sample = sampler.latest().expect("one sample was taken");
+        let readings = Readings {
+            drives: Some(DrivesReading {
+                at: AT,
+                drives: vec![
+                    DriveReading {
+                        device: "drive-000000000001".to_string(),
+                        passed: true,
+                    },
+                    DriveReading {
+                        device: "drive-000000000002".to_string(),
+                        passed: false,
+                    },
+                ],
+            }),
+            ..Readings::default()
+        };
+        let at = |at: u64| Inputs {
+            at,
+            ..Inputs::default()
+        };
+        let smart = |points: &[Point]| -> Vec<(String, f64)> {
+            points
+                .iter()
+                .filter(|point| point.name == SMART_PASSED)
+                .map(|point| (point.labels["device"].clone(), point.value))
+                .collect()
+        };
+        assert_eq!(
+            smart(&points_of(sample, &readings, &at(AT + SMART_MAX_AGE_MS))),
+            vec![
+                ("drive-000000000001".to_string(), 1.0),
+                ("drive-000000000002".to_string(), 0.0),
+            ],
+            "at the boundary each drive is a point, 1 when passed and 0 when not"
+        );
+        assert!(
+            smart(&points_of(
+                sample,
+                &readings,
+                &at(AT + SMART_MAX_AGE_MS + 1)
+            ))
+            .is_empty(),
+            "one millisecond past it is not"
+        );
     }
 
     #[test]

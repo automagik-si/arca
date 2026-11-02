@@ -33,8 +33,8 @@ use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
 use arca_metrics::{
-    Cpu, HostSample, InstanceKind, InstanceReading, LatencyReading, Load, Memory, NicCounters,
-    OsdReading, Pool, ProbeTarget, ProjectCount, Psi, Readings,
+    Cpu, DriveReading, DrivesReading, HostSample, InstanceKind, InstanceReading, LatencyReading,
+    Load, Memory, NicCounters, OsdReading, Pool, ProbeTarget, ProjectCount, Psi, Readings,
 };
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
@@ -207,6 +207,19 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
             update_failed: Some(false),
             last_check_ms: Some(at - 60_000),
             last_success_ms: Some(at - 60_000),
+        }),
+        drives: Some(DrivesReading {
+            at,
+            drives: vec![
+                DriveReading {
+                    device: "disk1".to_string(),
+                    passed: true,
+                },
+                DriveReading {
+                    device: "disk2".to_string(),
+                    passed: false,
+                },
+            ],
         }),
     };
     (sample, readings)

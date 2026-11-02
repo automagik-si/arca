@@ -385,8 +385,6 @@ fn rules_failure(error: RulesError) -> Failure {
     Failure::Config(error.to_string())
 }
 
-/// Ticks on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each tick's
-/// sample and alerts are published as soon as they are taken.
 /// The latency targets `alerts.json` names, in the order the gauge writes them. A target that is not named is not probed.
 fn probe_targets(probes: &Probes) -> Vec<(ProbeTarget, SocketAddr)> {
     [
@@ -399,6 +397,8 @@ fn probe_targets(probes: &Probes) -> Vec<(ProbeTarget, SocketAddr)> {
     .collect()
 }
 
+/// Ticks on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each tick's
+/// sample and alerts are published as soon as they are taken.
 fn spawn_sampler(mut ticker: Ticker<Store>) -> io::Result<()> {
     thread::Builder::new()
         .name("arca-sampler".to_string())

@@ -57,16 +57,20 @@ pub struct Listed {
 pub const POOLS_PATH: &str = "/1.0/storage-pools?recursion=1";
 
 /// The storage pools Incus lists that the allow-filter admits, in Incus's order, each with its `resources` space. An empty
-/// filter admits every pool, and a filter name Incus does not list has no row. `None` when the listing fails. A pool whose
+/// filter admits every pool, and a filter name Incus does not list has no row. `None` when the listing fails, or when any entry
+/// has no string name: a malformed listing is unknown, never a shorter list that could read as known-empty. A pool whose
 /// `resources` read fails keeps its row with null fields.
 pub fn read_pools<R: IncusRead>(incus: &R, filter: &[String]) -> Option<Vec<Pool>> {
     let Ok(Value::Array(listed)) = incus.get(POOLS_PATH) else {
         return None;
     };
+    let names = listed
+        .iter()
+        .map(|entry| entry.get("name").and_then(Value::as_str))
+        .collect::<Option<Vec<&str>>>()?;
     Some(
-        listed
-            .iter()
-            .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        names
+            .into_iter()
             .filter(|name| admits(filter, name))
             .map(|name| read_pool(incus, name))
             .collect(),
@@ -186,6 +190,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_pool_entry_without_a_name_makes_the_whole_listing_unknown() {
+        struct Listing(Value);
+        impl IncusRead for Listing {
+            fn get(&self, path: &str) -> Result<Value, arca_incus::IncusError> {
+                if path == POOLS_PATH {
+                    return Ok(self.0.clone());
+                }
+                Err(arca_incus::IncusError::Decode(format!(
+                    "no answer for {path}"
+                )))
+            }
+        }
+        let filter: Vec<String> = Vec::new();
+        let named = Listing(json!([{ "name": "default" }, { "name": "pool1" }]));
+        assert_eq!(
+            read_pools(&named, &filter).map(|pools| pools.len()),
+            Some(2)
+        );
+        let nameless = Listing(json!([{ "name": "default" }, { "driver": "zfs" }]));
+        assert_eq!(read_pools(&nameless, &filter), None);
+        let not_text = Listing(json!([{ "name": 7 }]));
+        assert_eq!(read_pools(&not_text, &filter), None);
+    }
 
     #[test]
     fn stopped_instance_reports_no_usage_even_with_zero_state_object() {

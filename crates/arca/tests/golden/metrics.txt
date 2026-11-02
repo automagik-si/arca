@@ -93,6 +93,10 @@ arca_update_last_success_timestamp_seconds{node="0000000000000000000000000000000
 # HELP arca_update_failed 1 when incus-osd reports an update failure, or no update check has completed in 14 days, 0 when not.
 # TYPE arca_update_failed gauge
 arca_update_failed{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
+# HELP arca_smart_passed 1 when the drive's SMART health check passed, 0 when it failed. Only drives with SMART enabled are listed.
+# TYPE arca_smart_passed gauge
+arca_smart_passed{node="0000000000000000000000000000000000000000000000000000000000000000",device="disk1"} 1
+arca_smart_passed{node="0000000000000000000000000000000000000000000000000000000000000000",device="disk2"} 0
 # HELP arca_alert_firing 1 for each firing alert.
 # TYPE arca_alert_firing gauge
 arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="cpu-hot",severity="warning"} 1
