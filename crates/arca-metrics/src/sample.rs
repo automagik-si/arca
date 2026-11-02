@@ -1,18 +1,21 @@
 //! The host sample: its shape, the sampler that reads the host and Incus, the ring that keeps the recent samples, the window
 //! mean, and the `node_metrics` result row. Field names are the camel-case keys of the `node_metrics` result schema.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use arca_incus::IncusRead;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::incus;
+use crate::incus::{self, InstanceReading};
 use crate::procfs::{self, CpuTotals, NicTotals};
 
 /// The window `node_metrics` reads when the caller names no minutes.
 pub const DEFAULT_MINUTES: u32 = 1;
+
+/// The window `starts_10m` counts, in milliseconds: a start counts while it is less than this old.
+const START_WINDOW_MS: u64 = 600_000;
 
 /// Where the sampler reads, which pools it reports, and how many samples it keeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +136,22 @@ pub struct NicCounters {
 pub struct Readings {
     /// The pools the allow-filter admits, from Incus's own pool list, with each one's space. `None` when the listing failed.
     pub pools: Option<Vec<Pool>>,
-    /// The instances per project. `None` when the instance list cannot be read.
+    /// The instances per project, counted from `instances`. `None` when the instance list cannot be read.
     pub projects: Option<Vec<ProjectCount>>,
     /// The NIC byte counters, `None` when `/proc/net/dev` cannot be read.
     pub nic: Option<NicCounters>,
+    /// The instances, from the same list GET as `projects`. `None` when the list cannot be read, which is unknown, never no
+    /// instances.
+    pub instances: Option<Vec<InstanceReading>>,
+}
+
+/// What the sampler keeps of one instance between ticks: its `last_used_at` on the previous listing, its starts since the
+/// process began, and the times of the starts inside [`START_WINDOW_MS`].
+#[derive(Debug, Clone)]
+struct StartTrack {
+    last_used: Option<String>,
+    starts_total: u64,
+    starts: VecDeque<u64>,
 }
 
 /// The counters a sample is measured against: when they were read, and the CPU and NIC totals.
@@ -157,6 +172,8 @@ pub struct Sampler<R: IncusRead> {
     readings: Readings,
     /// The pool names the last successful listing admitted, in its order. `None` until a listing has succeeded.
     listed_pools: Option<Vec<String>>,
+    /// Each instance the last successful instance listing held, by project and name.
+    starts: BTreeMap<(String, String), StartTrack>,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -170,6 +187,7 @@ impl<R: IncusRead> Sampler<R> {
             previous: None,
             readings: Readings::default(),
             listed_pools: None,
+            starts: BTreeMap::new(),
         }
     }
 
@@ -184,7 +202,9 @@ impl<R: IncusRead> Sampler<R> {
         let cpu = procfs::read_cpu(&self.cfg.proc_root);
         let nic = procfs::read_nic_totals(&self.cfg.proc_root, &self.cfg.sys_root);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
-        let projects = incus::read_projects(&self.incus);
+        let instances =
+            incus::read_instances(&self.incus).map(|listed| self.count_starts(listed, now_ms));
+        let projects = instances.as_deref().map(incus::project_counts);
         let rows = match &pools {
             Some(listed) => {
                 self.listed_pools = Some(listed.iter().map(|pool| pool.name.clone()).collect());
@@ -223,6 +243,7 @@ impl<R: IncusRead> Sampler<R> {
                 rx_bytes: totals.rx_bytes,
                 tx_bytes: totals.tx_bytes,
             }),
+            instances,
         };
         self.previous = Some(Previous {
             at: now_ms,
@@ -236,6 +257,45 @@ impl<R: IncusRead> Sampler<R> {
         self.ring
             .back()
             .expect("the sample just pushed is in the ring")
+    }
+
+    /// Counts each instance's starts against the previous listing and returns the readings with the counts filled in. A start is
+    /// a change of `last_used_at` since the previous successful listing. An instance seen for the first time counts none. An
+    /// instance this listing does not hold is forgotten, so an instance that returns is seen for the first time again, and a
+    /// tick whose listing failed never reaches this method, so the outage keeps each count.
+    fn count_starts(&mut self, listed: Vec<incus::Listed>, now_ms: u64) -> Vec<InstanceReading> {
+        let mut earlier = std::mem::take(&mut self.starts);
+        listed
+            .into_iter()
+            .map(|row| {
+                let key = (row.reading.project.clone(), row.reading.name.clone());
+                let mut track = match earlier.remove(&key) {
+                    Some(mut track) => {
+                        if track.last_used != row.last_used {
+                            track.starts_total += 1;
+                            track.starts.push_back(now_ms);
+                        }
+                        track
+                    }
+                    None => StartTrack {
+                        last_used: row.last_used.clone(),
+                        starts_total: 0,
+                        starts: VecDeque::new(),
+                    },
+                };
+                track.last_used = row.last_used;
+                track
+                    .starts
+                    .retain(|at| now_ms.saturating_sub(*at) < START_WINDOW_MS);
+                let reading = InstanceReading {
+                    starts_total: track.starts_total,
+                    starts_10m: track.starts.len() as u64,
+                    ..row.reading
+                };
+                self.starts.insert(key, track);
+                reading
+            })
+            .collect()
     }
 
     /// The most recent sample, or `None` before the first one.

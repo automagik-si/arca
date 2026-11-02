@@ -1,7 +1,7 @@
 //! The Incus readings a host sample carries: the storage pools the allow-filter admits, with each one's space, and the
-//! instances per project. Both are GET requests through [`IncusRead`]. An answer that fails is `None`, so the caller can tell
-//! an unreachable Incus from an empty one. The sample's own lists stay empty on a failure, because the `node_metrics` schema
-//! has no nullable list; the alerts read the `None` through [`crate::Readings`].
+//! instances, with each one's state, starts and usage. Both are GET requests through [`IncusRead`]. An answer that fails is
+//! `None`, so the caller can tell an unreachable Incus from an empty one. The sample's own lists stay empty on a failure,
+//! because the `node_metrics` schema has no nullable list; the alerts read the `None` through [`crate::Readings`].
 
 use std::collections::BTreeMap;
 
@@ -10,8 +10,48 @@ use serde_json::Value;
 
 use crate::sample::{Pool, ProjectCount};
 
-/// The instance list the project counts come from: every project, recursed.
-pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=1";
+/// The instance list every tick reads: every project, recursed twice, so that each row carries its `state`. One GET serves the
+/// instance readings and the project counts.
+pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=2";
+
+/// The kind of an instance. Incus has two: a container, and a virtual machine (`virtual-machine` on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceKind {
+    Container,
+    Vm,
+}
+
+impl InstanceKind {
+    /// The `type` label the export writes: `container` or `vm`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::Vm => "vm",
+        }
+    }
+}
+
+/// One instance as the tick's list read it. `starts_total` and `starts_10m` are the sampler's counts, zero until it counts.
+/// `cpu_seconds` and `memory_bytes` are `None` when the row carries no usage, as a stopped instance's `state` does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceReading {
+    pub project: String,
+    pub name: String,
+    pub kind: InstanceKind,
+    pub running: bool,
+    pub starts_total: u64,
+    pub starts_10m: u64,
+    pub cpu_seconds: Option<f64>,
+    pub memory_bytes: Option<u64>,
+}
+
+/// One row of the instance list, with the `last_used_at` the sampler compares between ticks. A row without a project or a name
+/// is not an instance and is dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Listed {
+    pub reading: InstanceReading,
+    pub last_used: Option<String>,
+}
 
 /// The storage pool list Incus answers, recursed so that each entry carries its name.
 pub const POOLS_PATH: &str = "/1.0/storage-pools?recursion=1";
@@ -33,33 +73,66 @@ pub fn read_pools<R: IncusRead>(incus: &R, filter: &[String]) -> Option<Vec<Pool
     )
 }
 
-/// The instances per project, sorted by project name. A project appears only when it holds an instance. `None` when the
-/// instance list cannot be read.
-pub fn read_projects<R: IncusRead>(incus: &R) -> Option<Vec<ProjectCount>> {
-    let Ok(Value::Array(instances)) = incus.get(INSTANCES_PATH) else {
+/// The instance rows of the one list GET every tick makes. `None` when the list cannot be read, so the caller can tell an
+/// unreachable Incus from an empty one. A row without a project or a name is dropped.
+pub fn read_instances<R: IncusRead>(incus: &R) -> Option<Vec<Listed>> {
+    let Ok(Value::Array(rows)) = incus.get(INSTANCES_PATH) else {
         return None;
     };
-    let mut counts: BTreeMap<String, (u64, u64)> = BTreeMap::new();
-    for instance in &instances {
-        let Some(project) = instance.get("project").and_then(Value::as_str) else {
-            continue;
-        };
-        let entry = counts.entry(project.to_string()).or_default();
+    Some(rows.iter().filter_map(listed).collect())
+}
+
+/// One row as an instance. The starts are zero here: the sampler counts them against the previous tick.
+fn listed(row: &Value) -> Option<Listed> {
+    let project = row.get("project")?.as_str()?;
+    let name = row.get("name")?.as_str()?;
+    let kind = match row.get("type").and_then(Value::as_str) {
+        Some("virtual-machine") => InstanceKind::Vm,
+        _ => InstanceKind::Container,
+    };
+    let state = row.get("state").filter(|state| !state.is_null());
+    Some(Listed {
+        reading: InstanceReading {
+            project: project.to_string(),
+            name: name.to_string(),
+            kind,
+            running: row.get("status").and_then(Value::as_str) == Some("Running"),
+            starts_total: 0,
+            starts_10m: 0,
+            cpu_seconds: state
+                .and_then(|state| state.pointer("/cpu/usage"))
+                .and_then(Value::as_u64)
+                .map(|nanoseconds| nanoseconds as f64 / 1e9),
+            memory_bytes: state
+                .and_then(|state| state.pointer("/memory/usage"))
+                .and_then(Value::as_u64),
+        },
+        last_used: row
+            .get("last_used_at")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// The instances per project, sorted by project name, from the instance readings of one tick. A project appears only when it
+/// holds an instance.
+pub fn project_counts(instances: &[InstanceReading]) -> Vec<ProjectCount> {
+    let mut counts: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for instance in instances {
+        let entry = counts.entry(instance.project.as_str()).or_default();
         entry.0 += 1;
-        if instance.get("status").and_then(Value::as_str) == Some("Running") {
+        if instance.running {
             entry.1 += 1;
         }
     }
-    Some(
-        counts
-            .into_iter()
-            .map(|(project, (total, running))| ProjectCount {
-                project,
-                total,
-                running,
-            })
-            .collect(),
-    )
+    counts
+        .into_iter()
+        .map(|(project, (total, running))| ProjectCount {
+            project: project.to_string(),
+            total,
+            running,
+        })
+        .collect()
 }
 
 /// Whether the allow-filter admits a pool. An empty filter admits every pool.

@@ -3,7 +3,7 @@
 //! Incus is read. Tokens and stores are in temporary directories.
 //!
 //! The scenario runs an engine every 5 s for 185 s: a pool is full until 60 s and half full after 65 s, the CPU is hot throughout,
-//! and three rules have no input, so they are unknown.
+//! and two rules have no input, so they are unknown.
 
 mod common;
 
@@ -22,7 +22,9 @@ use arca::handlers::{
     AlertsExport, AlertsHandler, AlertsPublished, MetricsExport, Published, WatchHandler, now_ms,
     watcher_step,
 };
-use arca_alerts::eval::{Component, ComponentName, Inputs, PoolUse, Rules, Timed, WatchReading};
+use arca_alerts::eval::{
+    Component, ComponentName, Inputs, InstanceUse, PoolUse, Rules, Timed, WatchReading,
+};
 use arca_alerts::health::alerts_line;
 use arca_alerts::{AlertSnapshot, Engine, export};
 use arca_api::{Scope, conforms, verb, verbs};
@@ -30,7 +32,10 @@ use arca_incus::{FakeIncus, FakeState};
 use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
-use arca_metrics::{Cpu, HostSample, Load, Memory, NicCounters, Pool, ProjectCount, Psi, Readings};
+use arca_metrics::{
+    Cpu, HostSample, InstanceKind, InstanceReading, Load, Memory, NicCounters, Pool, ProjectCount,
+    Psi, Readings,
+};
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
 use serde_json::{Value, json};
@@ -179,15 +184,53 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         pools: Some(sample.pools.clone()),
         projects: Some(vec![ProjectCount {
             project: "proj1".to_string(),
-            total: 2,
-            running: 1,
+            total: 3,
+            running: 2,
         }]),
         nic: Some(NicCounters {
             rx_bytes: 1_000,
             tx_bytes: 2_000,
         }),
+        instances: Some(scenario_instances()),
     };
     (sample, readings)
+}
+
+/// The instances of the scenario: a running container that has started twice, a stopped container that has started once, and a
+/// running virtual machine. The stopped one reads no usage, so its CPU and memory series are left out.
+fn scenario_instances() -> Vec<InstanceReading> {
+    vec![
+        InstanceReading {
+            project: "proj1".to_string(),
+            name: "db1".to_string(),
+            kind: InstanceKind::Container,
+            running: true,
+            starts_total: 2,
+            starts_10m: 0,
+            cpu_seconds: Some(4.5),
+            memory_bytes: Some(1_073_741_824),
+        },
+        InstanceReading {
+            project: "proj1".to_string(),
+            name: "web1".to_string(),
+            kind: InstanceKind::Container,
+            running: false,
+            starts_total: 1,
+            starts_10m: 0,
+            cpu_seconds: None,
+            memory_bytes: None,
+        },
+        InstanceReading {
+            project: "proj1".to_string(),
+            name: "vm1".to_string(),
+            kind: InstanceKind::Vm,
+            running: true,
+            starts_total: 0,
+            starts_10m: 0,
+            cpu_seconds: Some(120.0),
+            memory_bytes: Some(2_147_483_648),
+        },
+    ]
 }
 
 /// The tick's inputs for the scenario at `at`. The watch sweep reports two `entry_without_object` drifts and one `other`, which is
@@ -243,7 +286,18 @@ fn run(state: &Path) -> AlertSnapshot {
     for at in (NOW..=NOW + 185_000).step_by(5_000) {
         let used = if at - NOW <= 60_000 { 95 } else { 50 };
         let (sample, readings) = sample_at(at, used);
-        let inputs = inputs_at(at, &sample);
+        let mut inputs = inputs_at(at, &sample);
+        inputs.instances = readings.instances.as_ref().map(|list| Timed {
+            at,
+            value: list
+                .iter()
+                .map(|instance| InstanceUse {
+                    project: instance.project.clone(),
+                    name: instance.name.clone(),
+                    starts_10m: instance.starts_10m,
+                })
+                .collect(),
+        });
         let points = export::points_of(&sample, &readings, &inputs);
         let mut snapshot = engine.tick(&inputs, points, at);
         snapshot.sample_at = Some(at);
@@ -375,8 +429,8 @@ fn metrics_is_the_golden_text_and_parses_as_exposition() {
     );
     assert_exposition(&body);
     assert!(
-        !body.contains("instance="),
-        "no series is labelled instance"
+        !body.contains("{instance=") && !body.contains(",instance="),
+        "no series is labelled instance; incus_instance is a different label"
     );
     assert!(
         !body.contains("kind=\"other\""),
@@ -390,10 +444,10 @@ fn the_scenario_health_line_shows_its_unknown_rules_as_a_count() {
     let scratch = Scratch::new("scenario-line");
     let state = state_dir(&scratch);
     let snapshot = run(&state);
-    // The three rules with no input (crash-loop, update-failed, smart-warning) stay unknown, and the line counts them.
+    // The two rules with no input (update-failed, smart-warning) stay unknown, and the line counts them.
     assert_eq!(
         alerts_line(&snapshot, NOW + 185_000),
-        "alerts 2 firing: cpu-hot, drift · 3 unknown"
+        "alerts 2 firing: cpu-hot, drift · 2 unknown"
     );
 }
 
@@ -834,7 +888,7 @@ fn watch_report_ages_from_its_sweep_and_alerts_list_conforms_over_the_server() {
     );
     assert_eq!(
         list["unknown"].as_array().map(Vec::len),
-        Some(3),
-        "three rules have no input"
+        Some(2),
+        "two rules have no input"
     );
 }

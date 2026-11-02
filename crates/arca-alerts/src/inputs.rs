@@ -3,7 +3,7 @@
 use arca_incus::IncusRead;
 use arca_metrics::Sampler;
 
-use crate::eval::{Inputs, PoolUse, Timed};
+use crate::eval::{Inputs, InstanceUse, PoolUse, Timed};
 
 /// The inputs of the sampler's newest sample, stamped with its time. A read that failed in the sampler is `None` here, so
 /// the rule reads it as unknown. Before the first sample every source is unknown.
@@ -30,6 +30,21 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
             .memory_some_avg10
             .map(|value| Timed { at, value }),
         cpu_temp_c: sample.cpu_temp_c.map(|value| Timed { at, value }),
+        instances: sampler
+            .readings()
+            .instances
+            .as_ref()
+            .map(|instances| Timed {
+                at,
+                value: instances
+                    .iter()
+                    .map(|instance| InstanceUse {
+                        project: instance.project.clone(),
+                        name: instance.name.clone(),
+                        starts_10m: instance.starts_10m,
+                    })
+                    .collect(),
+            }),
         ..Inputs::default()
     }
 }
@@ -51,7 +66,7 @@ mod tests {
 
     use super::from_sampler;
     use crate::UnknownReason;
-    use crate::eval::{Evaluator, Inputs, PoolUse, Rules, Timed};
+    use crate::eval::{Evaluator, Inputs, InstanceUse, PoolUse, Rules, Timed};
 
     /// The pools an Incus lists: each name with its used and total bytes.
     type PoolList = Vec<(&'static str, u64, u64)>;
@@ -225,6 +240,63 @@ mod tests {
                 at: 4_000,
                 value: 85.5,
             })
+        );
+    }
+
+    /// An Incus that lists the instance rows the test sets, at recursion two.
+    #[derive(Clone, Default)]
+    struct Rows(Arc<Mutex<Vec<Value>>>);
+
+    impl IncusRead for Rows {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if path == "/1.0/instances?all-projects=true&recursion=2" {
+                let rows = self.0.lock().expect("the rows are not poisoned").clone();
+                return Ok(Value::Array(rows));
+            }
+            Err(IncusError::Decode(format!("no answer for {path}")))
+        }
+    }
+
+    #[test]
+    fn instances_map_to_their_starts_in_ten_minutes_and_a_failed_list_to_unknown() {
+        let rows = Rows::default();
+        *rows.0.lock().expect("the rows are not poisoned") = vec![json!({
+            "name": "db1", "project": "proj1", "status": "Running", "type": "container",
+            "last_used_at": "2026-11-01T10:00:00Z"
+        })];
+        let mut tracked = sampler(rows.clone(), &[]);
+        tracked.sample(1_000);
+        assert_eq!(
+            from_sampler(&tracked).instances,
+            Some(Timed {
+                at: 1_000,
+                value: vec![InstanceUse {
+                    project: "proj1".to_string(),
+                    name: "db1".to_string(),
+                    starts_10m: 0,
+                }],
+            }),
+            "the first tick counts no start"
+        );
+
+        rows.0.lock().expect("the rows are not poisoned")[0]["last_used_at"] =
+            json!("2026-11-01T10:00:06Z");
+        tracked.sample(6_000);
+        assert_eq!(
+            from_sampler(&tracked).instances.map(|timed| timed.value),
+            Some(vec![InstanceUse {
+                project: "proj1".to_string(),
+                name: "db1".to_string(),
+                starts_10m: 1,
+            }])
+        );
+
+        let mut offline = sampler(Offline, &[]);
+        offline.sample(7_000);
+        assert_eq!(
+            from_sampler(&offline).instances,
+            None,
+            "an unreachable Incus is unknown, never no instances"
         );
     }
 

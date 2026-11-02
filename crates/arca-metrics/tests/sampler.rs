@@ -14,7 +14,7 @@ use arca_metrics::{
 };
 use serde_json::{Value, json};
 
-const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=1";
+const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=2";
 const POOLS: &str = "/1.0/storage-pools?recursion=1";
 
 /// A fresh temporary directory, removed when the test ends.
@@ -937,6 +937,327 @@ mod pools_from_incus {
             sample.projects.len(),
             2,
             "the instance list is still read on this tick"
+        );
+    }
+}
+
+mod instance_readings {
+    use std::sync::{Arc, Mutex};
+
+    use arca_incus::{IncusError, IncusRead};
+    use arca_metrics::{InstanceKind, InstanceReading, ProjectCount};
+
+    use super::*;
+
+    const LISTED: &str = "/1.0/instances?all-projects=true&recursion=2";
+
+    /// Incus holds one project with a running container `db1`, a running virtual machine `vm1` and a stopped container `web1`.
+    /// `db1` was last used at 10:00:00 UTC.
+    fn proj1_state() -> FakeState {
+        FakeState {
+            server: json!({ "api_version": "1.0" }),
+            projects: vec![json!({ "name": "proj1" })],
+            instances: vec![
+                json!({
+                    "name": "db1", "project": "proj1", "status": "Running", "type": "container",
+                    "last_used_at": "2026-11-01T10:00:00Z"
+                }),
+                json!({ "name": "vm1", "project": "proj1", "status": "Running", "type": "virtual-machine" }),
+                json!({ "name": "web1", "project": "proj1", "status": "Stopped", "type": "container" }),
+            ],
+            networks: Vec::new(),
+            pools: Vec::new(),
+        }
+    }
+
+    /// An instance row as the scripted listing serves it.
+    fn row(name: &str, last_used: Option<&str>) -> Value {
+        let mut row =
+            json!({ "name": name, "project": "proj1", "status": "Running", "type": "container" });
+        if let Some(last_used) = last_used {
+            row["last_used_at"] = json!(last_used);
+        }
+        row
+    }
+
+    /// An Incus whose instance list the test sets: `None` makes the list fail, as an absent socket does. Every other path fails.
+    #[derive(Clone, Default)]
+    struct Listing(Arc<Mutex<Option<Vec<Value>>>>);
+
+    impl Listing {
+        fn answer(&self, rows: Option<Vec<Value>>) {
+            *self.0.lock().expect("the listing is not poisoned") = rows;
+        }
+    }
+
+    impl IncusRead for Listing {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if path != LISTED {
+                return Err(IncusError::Decode(format!("no answer for {path}")));
+            }
+            match self.0.lock().expect("the listing is not poisoned").clone() {
+                Some(rows) => Ok(Value::Array(rows)),
+                None => Err(IncusError::Decode("the listing is down".to_string())),
+            }
+        }
+    }
+
+    fn sampler_over<R: IncusRead>(root: &Path, incus: R) -> Sampler<R> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: root.join("proc"),
+                sys_root: root.join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            incus,
+        )
+    }
+
+    /// The reading of the instance `name` at the latest sample. The list must have been read.
+    fn reading_of<R: IncusRead>(sampler: &Sampler<R>, name: &str) -> InstanceReading {
+        sampler
+            .readings()
+            .instances
+            .as_ref()
+            .expect("the instance list was read")
+            .iter()
+            .find(|instance| instance.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("no reading for {name}"))
+    }
+
+    #[test]
+    fn the_instance_list_is_one_get_per_tick_at_recursion_two() {
+        let scratch = Scratch::new("one-get");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), proj1_state()).expect("start the fake Incus");
+        let mut sampler = sampler_over(scratch.path(), UnixIncus::new(fake.socket().to_path_buf()));
+
+        for at in [1_000, 6_000, 11_000] {
+            sampler.sample(at);
+        }
+
+        let paths: Vec<String> = fake.requests().into_iter().map(|r| r.path).collect();
+        let listed = paths
+            .iter()
+            .filter(|path| path.starts_with("/1.0/instances"))
+            .count();
+        assert_eq!(listed, 3, "one instance list per tick: {paths:?}");
+        assert!(
+            paths
+                .iter()
+                .all(|path| path == LISTED || !path.starts_with("/1.0/instances"))
+        );
+    }
+
+    #[test]
+    fn an_instance_reading_carries_its_kind_running_state_and_usage() {
+        let scratch = Scratch::new("kind-usage");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), proj1_state()).expect("start the fake Incus");
+        fake.set_instance_usage("proj1", "db1", 2_500_000_000, 1_048_576);
+        fake.set_instance_usage("proj1", "vm1", 7_000_000_000, 2_147_483_648);
+        let mut sampler = sampler_over(scratch.path(), UnixIncus::new(fake.socket().to_path_buf()));
+
+        let sample = sampler.sample(1_000).clone();
+
+        let instances = sampler
+            .readings()
+            .instances
+            .clone()
+            .expect("the list was read");
+        let plain = |project: &str, name: &str, kind, running, cpu, memory| InstanceReading {
+            project: project.to_string(),
+            name: name.to_string(),
+            kind,
+            running,
+            starts_total: 0,
+            starts_10m: 0,
+            cpu_seconds: cpu,
+            memory_bytes: memory,
+        };
+        assert_eq!(
+            instances,
+            vec![
+                plain(
+                    "proj1",
+                    "db1",
+                    InstanceKind::Container,
+                    true,
+                    Some(2.5),
+                    Some(1_048_576)
+                ),
+                plain(
+                    "proj1",
+                    "vm1",
+                    InstanceKind::Vm,
+                    true,
+                    Some(7.0),
+                    Some(2_147_483_648)
+                ),
+                plain("proj1", "web1", InstanceKind::Container, false, None, None),
+            ],
+            "a stopped instance has no usage, so its series is left out, not written as zero"
+        );
+        assert_eq!(
+            sample.projects,
+            vec![ProjectCount {
+                project: "proj1".to_string(),
+                total: 3,
+                running: 2,
+            }],
+            "the project counts come from the same list"
+        );
+        assert_eq!(sampler.readings().projects, Some(sample.projects.clone()));
+    }
+
+    #[test]
+    fn starts_are_changes_of_last_used_inside_ten_minutes_and_the_first_tick_counts_none() {
+        let scratch = Scratch::new("starts");
+        write_first_tree(scratch.path());
+        let fake = FakeIncus::start(scratch.path(), proj1_state()).expect("start the fake Incus");
+        let mut sampler = sampler_over(scratch.path(), UnixIncus::new(fake.socket().to_path_buf()));
+
+        sampler.sample(0);
+        let first = reading_of(&sampler, "db1");
+        assert_eq!(
+            (first.starts_total, first.starts_10m),
+            (0, 0),
+            "the first tick counts nothing"
+        );
+
+        for (at, used) in [
+            (5_000, "2026-11-01T10:00:05Z"),
+            (10_000, "2026-11-01T10:00:10Z"),
+            (15_000, "2026-11-01T10:00:15Z"),
+        ] {
+            fake.set_last_used("proj1", "db1", used);
+            sampler.sample(at);
+        }
+        let burst = reading_of(&sampler, "db1");
+        assert_eq!((burst.starts_total, burst.starts_10m), (3, 3));
+
+        sampler.sample(300_000);
+        let inside = reading_of(&sampler, "db1");
+        assert_eq!(
+            (inside.starts_total, inside.starts_10m),
+            (3, 3),
+            "still inside ten minutes"
+        );
+
+        // The last start was at 15 s. Ten minutes after it, the window no longer holds it.
+        sampler.sample(615_000);
+        let later = reading_of(&sampler, "db1");
+        assert_eq!(
+            (later.starts_total, later.starts_10m),
+            (3, 0),
+            "the total stays for the life of the process, the window empties"
+        );
+    }
+
+    #[test]
+    fn an_absent_socket_reads_no_instances_and_no_project_counts() {
+        let scratch = Scratch::new("absent");
+        write_first_tree(scratch.path());
+        let absent = scratch.path().join("absent.sock");
+        let mut sampler = sampler_over(scratch.path(), UnixIncus::new(absent));
+
+        let sample = sampler.sample(1_000).clone();
+        assert_eq!(
+            sampler.readings().instances,
+            None,
+            "unknown, never no instances"
+        );
+        assert_eq!(sampler.readings().projects, None);
+        assert!(sample.projects.is_empty());
+    }
+
+    #[test]
+    fn a_failed_listing_keeps_each_count_and_the_next_one_counts_from_the_last_success() {
+        let scratch = Scratch::new("outage");
+        write_first_tree(scratch.path());
+        let listing = Listing::default();
+        let mut sampler = sampler_over(scratch.path(), listing.clone());
+
+        listing.answer(Some(vec![row("db1", Some("A"))]));
+        sampler.sample(0);
+        listing.answer(Some(vec![row("db1", Some("B"))]));
+        sampler.sample(5_000);
+        assert_eq!(reading_of(&sampler, "db1").starts_total, 1);
+
+        listing.answer(None);
+        sampler.sample(10_000);
+        assert_eq!(
+            sampler.readings().instances,
+            None,
+            "a failed list is unknown"
+        );
+
+        listing.answer(Some(vec![row("db1", Some("C"))]));
+        sampler.sample(15_000);
+        let after = reading_of(&sampler, "db1");
+        assert_eq!(
+            (after.starts_total, after.starts_10m),
+            (2, 2),
+            "B to C counts, though the tick between them failed"
+        );
+    }
+
+    #[test]
+    fn an_instance_the_list_drops_is_forgotten_so_its_return_counts_no_start() {
+        let scratch = Scratch::new("forgotten");
+        write_first_tree(scratch.path());
+        let listing = Listing::default();
+        let mut sampler = sampler_over(scratch.path(), listing.clone());
+
+        listing.answer(Some(vec![row("db1", Some("A"))]));
+        sampler.sample(0);
+        listing.answer(Some(vec![row("db1", Some("B"))]));
+        sampler.sample(5_000);
+        assert_eq!(reading_of(&sampler, "db1").starts_total, 1);
+
+        listing.answer(Some(Vec::new()));
+        sampler.sample(10_000);
+        assert_eq!(
+            sampler.readings().instances,
+            Some(Vec::new()),
+            "an empty list is known"
+        );
+
+        // The instance returns with no last use: it is seen for the first time, so the change from B to none counts nothing.
+        listing.answer(Some(vec![row("db1", None)]));
+        sampler.sample(15_000);
+        let back = reading_of(&sampler, "db1");
+        assert_eq!((back.starts_total, back.starts_10m), (0, 0));
+    }
+
+    #[test]
+    fn a_row_without_a_project_or_a_name_is_no_instance() {
+        let scratch = Scratch::new("malformed");
+        write_first_tree(scratch.path());
+        let listing = Listing::default();
+        let mut sampler = sampler_over(scratch.path(), listing.clone());
+        listing.answer(Some(vec![
+            json!({ "name": "db1", "status": "Running", "type": "container" }),
+            json!({ "project": "proj1", "status": "Running", "type": "container" }),
+            row("web1", None),
+        ]));
+
+        let sample = sampler.sample(1_000).clone();
+        let names: Vec<String> = sampler
+            .readings()
+            .instances
+            .clone()
+            .expect("the list was read")
+            .into_iter()
+            .map(|instance| instance.name)
+            .collect();
+        assert_eq!(names, vec!["web1".to_string()]);
+        assert_eq!(
+            sample.projects[0].total, 1,
+            "the project count drops the same rows"
         );
     }
 }

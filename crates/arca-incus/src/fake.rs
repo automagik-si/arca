@@ -2,9 +2,14 @@
 //! request it receives.
 //!
 //! GET routes: `/1.0`, `/1.0/projects?recursion=1`, `/1.0/instances?all-projects=true&recursion=1`,
-//! `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<pool>/resources`, `/1.0/networks?recursion=1` and
-//! `/1.0/networks/<name>/state` (the host's interfaces, set by [`FakeIncus::set_host_interfaces`]), every object path,
-//! `/1.0/operations?all-projects=true&recursion=1`, and `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
+//! `/1.0/instances?all-projects=true&recursion=2`, `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<pool>/resources`,
+//! `/1.0/networks?recursion=1` and `/1.0/networks/<name>/state` (the host's interfaces, set by
+//! [`FakeIncus::set_host_interfaces`]), every object path, `/1.0/operations?all-projects=true&recursion=1`, and
+//! `/1.0/operations/<id>` with its `/wait`. Any other GET is 404.
+//!
+//! The `recursion=2` instance listing is the `recursion=1` rows, each with a `state` object. A running instance's `state` holds
+//! `cpu.usage` (nanoseconds) and `memory.usage` (bytes), set by [`FakeIncus::set_instance_usage`] and zero until a test sets them.
+//! A stopped instance's `state` is `null`. [`FakeIncus::set_last_used`] sets an instance's `last_used_at`, as a start does.
 //!
 //! Operations: the listing groups every operation the fake holds by its status in lower case, as Incus does. A held operation
 //! ([`FakeIncus::hold_operation`], [`FakeIncus::hold_create`]) stays running (status code 103) and names its object in
@@ -215,6 +220,8 @@ struct Store {
     leases: Vec<Lease>,
     /// The instances whose graceful stop outlasts its timeout, by name, and whether a forced stop fails too.
     hung: BTreeMap<String, bool>,
+    /// The CPU time (nanoseconds) and memory (bytes) a running instance reports, by project and name.
+    usage: BTreeMap<(String, String), (u64, u64)>,
 }
 
 /// One DHCP lease: the network, the MAC that holds it and its address, and whether a device's `ipv4.address` pinned it.
@@ -274,6 +281,7 @@ enum Route {
     ListProjects,
     ListImages(String),
     ListInstances,
+    ListInstancesWithState,
     ListPools,
     HostInterfaces,
     HostInterfaceState(String),
@@ -355,6 +363,7 @@ impl Shared {
             armed: Vec::new(),
             leases: Vec::new(),
             hung: BTreeMap::new(),
+            usage: BTreeMap::new(),
         };
         for index in 0..store.objects.len() {
             store.expand(index, false);
@@ -553,6 +562,36 @@ impl FakeIncus {
         lock(&self.shared.store)
             .hung
             .insert(name.to_string(), forced_too);
+    }
+
+    /// Sets the CPU time, in nanoseconds, and the memory, in bytes, that the instance `name` in `project` reports in its `state`
+    /// on the `recursion=2` listing. Panics when no such instance is held. It records no write.
+    pub fn set_instance_usage(&self, project: &str, name: &str, cpu_ns: u64, memory_bytes: u64) {
+        let mut store = lock(&self.shared.store);
+        assert!(
+            store.instance_held(project, name),
+            "no instance {project}/{name} to set the usage of"
+        );
+        store.usage.insert(
+            (project.to_string(), name.to_string()),
+            (cpu_ns, memory_bytes),
+        );
+    }
+
+    /// Sets the `last_used_at` of the instance `name` in `project`, as a start does. Panics when no such instance is held. It
+    /// records no write.
+    pub fn set_last_used(&self, project: &str, name: &str, rfc3339: &str) {
+        let mut store = lock(&self.shared.store);
+        let object = store
+            .objects
+            .iter_mut()
+            .find(|object| {
+                object.kind == "instance" && object.project == project && object.name == name
+            })
+            .unwrap_or_else(|| panic!("no instance {project}/{name} to set last_used_at of"));
+        if let Some(map) = object.body.as_object_mut() {
+            map.insert("last_used_at".to_string(), json!(rfc3339));
+        }
     }
 
     fn end_operation(&self, id: &OpId, failure: Option<&str>) {
@@ -923,6 +962,7 @@ fn parse(target: &str) -> Option<Route> {
             name: (*name).to_string(),
         }),
         ["instances"] if query == "all-projects=true&recursion=1" => Route::ListInstances,
+        ["instances"] if query == "all-projects=true&recursion=2" => Route::ListInstancesWithState,
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
         ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
@@ -1004,6 +1044,7 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
             ),
         },
         ("GET", Route::ListInstances) => sync(Value::Array(store.bodies("instance"))),
+        ("GET", Route::ListInstancesWithState) => sync(Value::Array(store.instances_with_state())),
         ("GET", Route::HostInterfaces) => {
             let interfaces = lock(&shared.host_interfaces);
             sync(Value::Array(
@@ -1257,6 +1298,39 @@ impl Store {
             .iter()
             .filter(|object| object.kind == kind)
             .map(|object| object.body.clone())
+            .collect()
+    }
+
+    /// Whether the instance `name` in `project` is held.
+    fn instance_held(&self, project: &str, name: &str) -> bool {
+        self.objects.iter().any(|object| {
+            object.kind == "instance" && object.project == project && object.name == name
+        })
+    }
+
+    /// Every instance, as the `recursion=2` listing serves it: its body and a `state`. A running instance's `state` holds its
+    /// usage, which is zero until a test sets it; a stopped instance's `state` is `null`.
+    fn instances_with_state(&self) -> Vec<Value> {
+        self.objects
+            .iter()
+            .filter(|object| object.kind == "instance")
+            .map(|object| {
+                let mut body = object.body.clone();
+                let state = if text_of(&body, "status") == "Running" {
+                    let (cpu_ns, memory) = self
+                        .usage
+                        .get(&(object.project.clone(), object.name.clone()))
+                        .copied()
+                        .unwrap_or((0, 0));
+                    json!({ "cpu": { "usage": cpu_ns }, "memory": { "usage": memory } })
+                } else {
+                    Value::Null
+                };
+                if let Some(map) = body.as_object_mut() {
+                    map.insert("state".to_string(), state);
+                }
+                body
+            })
             .collect()
     }
 }
@@ -2499,6 +2573,22 @@ mod tests {
         assert_eq!(query_param("project=svc&x=1", "project"), Some("svc"));
         assert_eq!(query_param("xproject=svc", "project"), None);
         assert_eq!(query_param("", "project"), None);
+    }
+
+    #[test]
+    fn the_instance_listing_is_served_at_recursion_one_and_two_only() {
+        assert!(matches!(
+            parse("/1.0/instances?all-projects=true&recursion=1"),
+            Some(Route::ListInstances)
+        ));
+        assert!(matches!(
+            parse("/1.0/instances?all-projects=true&recursion=2"),
+            Some(Route::ListInstancesWithState)
+        ));
+        assert_eq!(
+            parse("/1.0/instances?all-projects=true&recursion=2").map(|r| r.methods()),
+            Some(&["GET"][..])
+        );
     }
 
     #[test]
