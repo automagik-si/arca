@@ -8,6 +8,7 @@ mod osd;
 pub mod probe;
 mod procfs;
 mod sample;
+mod smart;
 
 pub use incus::{InstanceKind, InstanceReading};
 pub use osd::OsdReading;
@@ -16,3 +17,4 @@ pub use sample::{
     Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, Memory, Network, NicCounters, Pool,
     ProjectCount, Psi, Readings, Sampler, SamplerConfig, mean, node_metrics,
 };
+pub use smart::{DriveReading, DrivesReading};

@@ -3,7 +3,7 @@
 use arca_incus::IncusRead;
 use arca_metrics::Sampler;
 
-use crate::eval::{Inputs, InstanceUse, PoolUse, Timed, UpdateUse};
+use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, Timed, UpdateUse};
 
 /// The inputs of the sampler's newest sample, stamped with its time. A read that failed in the sampler is `None` here, so
 /// the rule reads it as unknown. Before the first sample every source is unknown.
@@ -50,6 +50,17 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
                 at: osd.at,
                 value: UpdateUse { failed },
             })
+        }),
+        drives: sampler.readings().drives.as_ref().map(|drives| Timed {
+            at: drives.at,
+            value: drives
+                .drives
+                .iter()
+                .map(|drive| DriveUse {
+                    device: drive.device.clone(),
+                    passed: drive.passed,
+                })
+                .collect(),
         }),
         ..Inputs::default()
     }

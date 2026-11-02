@@ -221,7 +221,8 @@ pub struct UpdateUse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriveUse {
     pub device: String,
-    pub passed: bool,
+    /// `None` when the drive has no usable SMART result.
+    pub passed: Option<bool>,
 }
 
 /// The state of one rule and label set.
@@ -258,7 +259,8 @@ pub struct Evaluator {
 impl Evaluator {
     /// An evaluator holding the stored firing alerts as firing, with fresh timers, unknown until their first reading. A firing
     /// alert of a rule that `rules` disables, or that this build lacks, is not loaded: its resolve, `rule-disabled`, is returned
-    /// at `now` instead.
+    /// at `now` instead. Two stored firings of one rule and label set (a dropped resolve left the older one open) keep the newer
+    /// one; the older resolves once at `now` with `cleared`, not `rule-disabled` or `subject-gone`.
     pub fn load(rules: &Rules, firing: Vec<AlertEvent>, now: u64) -> (Evaluator, Vec<AlertEvent>) {
         let mut evaluator = Evaluator::default();
         let mut resolves = Vec::new();
@@ -271,6 +273,21 @@ impl Evaluator {
                 continue;
             };
             let key = (id, event.labels.clone());
+            // Two stored firings of one key exist when a dropped resolve left the older one open (a queue overflow). The newer is
+            // kept and the older resolves once, now, so no open firing is lost without its resolve.
+            let event = match evaluator.tracks.remove(&key).and_then(|track| track.firing) {
+                None => event,
+                Some(held) => {
+                    let (keep, drop) =
+                        if (held.seq, held.started_at) >= (event.seq, event.started_at) {
+                            (held, event)
+                        } else {
+                            (event, held)
+                        };
+                    resolves.push(resolution(drop, None, ResolveReason::Cleared, now));
+                    keep
+                }
+            };
             evaluator.tracks.insert(
                 key,
                 Track {
@@ -317,6 +334,14 @@ impl Evaluator {
                         }
                     }
                     for (labels, value) in readings {
+                        // A drive that never had a SMART result is not tracked. One that already is keeps its track, which
+                        // holds it as unknown.
+                        if rule.id == RuleId::SmartWarning
+                            && value.is_none()
+                            && !self.tracks.contains_key(&(rule.id, labels.clone()))
+                        {
+                            continue;
+                        }
                         let track = self
                             .tracks
                             .entry((rule.id, labels.clone()))
@@ -468,7 +493,7 @@ fn source(id: RuleId, inputs: &Inputs, now: u64) -> Source {
                 .map(|drive| {
                     (
                         labels_of([("device", drive.device.as_str())]),
-                        Some(bad_as(!drive.passed)),
+                        drive.passed.map(|passed| bad_as(!passed)),
                     )
                 })
                 .collect()

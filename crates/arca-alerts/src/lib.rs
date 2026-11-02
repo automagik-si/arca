@@ -163,7 +163,8 @@ pub struct Engine<S: TickStore> {
 
 impl<S: TickStore> Engine<S> {
     /// Loads the stored firing alerts, runs the rollup's catch-up, and resolves the stored firing alerts of disabled rules with
-    /// `rule-disabled`. A failed commit of those resolves queues them for the first tick.
+    /// `rule-disabled`. A failed commit of those resolves queues them for the first tick. Two stored firings of one rule and label
+    /// set resolve the older once with `cleared` (see [`Evaluator::load`]).
     pub fn start(
         mut store: S,
         rules: Rules,
