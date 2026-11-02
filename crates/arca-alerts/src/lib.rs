@@ -7,6 +7,7 @@
 //! the tick's events together, oldest first, so a resolve is always committed with the firing it closes. The in-memory
 //! `store-write-failed` alert reports the failures, because the store cannot hold it.
 
+pub mod checks;
 pub mod eval;
 pub mod export;
 pub mod inputs;

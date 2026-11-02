@@ -2,11 +2,15 @@
 //! and `metrics` commands call the same functions, so a command's JSON output equals the MCP result of its verb. The three
 //! plan verbs run over the kernel, through one lock and one clock.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arca_alerts::checks::{self, CheckTargets};
+use arca_alerts::eval::{Timed, WatchReading};
 use arca_alerts::{AlertSnapshot, Engine, TickStore, export, inputs};
 use arca_api::Scope;
 use arca_approval::{ApprovalRefusal, parse_statement};
@@ -189,12 +193,15 @@ impl AlertsPublished {
     }
 }
 
-/// The sampler thread's tick: one host sample, the alert engine over it, and both published.
+/// The sampler thread's tick: one host sample, the health checks and the newest watch sweep, the alert engine over them, and
+/// the alert snapshot published. The checks and the watch are optional, so a ticker with neither reads only the host.
 pub struct Ticker<S: TickStore> {
     sampler: Sampler<UnixIncus>,
     engine: Engine<S>,
     published: Published,
     alerts: AlertsPublished,
+    checks: Option<CheckTargets>,
+    watch: Option<Arc<WatchHandler>>,
 }
 
 impl<S: TickStore> Ticker<S> {
@@ -209,16 +216,43 @@ impl<S: TickStore> Ticker<S> {
             engine,
             published,
             alerts,
+            checks: None,
+            watch: None,
         }
     }
 
-    /// Takes one host sample and publishes the ring, every sample of the last hour, oldest first. Then evaluates the
-    /// alerts, commits the tick to the store, and publishes the alert snapshot, whether the commit worked or not.
+    /// The same ticker, which runs the health checks of `targets` on each tick and fills `Inputs.components` with them.
+    pub fn with_checks(mut self, targets: CheckTargets) -> Self {
+        self.checks = Some(targets);
+        self
+    }
+
+    /// The same ticker, which reads the newest watch sweep of `handler` on each tick. The sweep fills `Inputs.watch`, and its end
+    /// time is the `watch` component's reading.
+    pub fn with_watch(mut self, handler: Arc<WatchHandler>) -> Self {
+        self.watch = Some(handler);
+        self
+    }
+
+    /// Takes one host sample and publishes the ring, every sample of the last hour, oldest first. Then reads the health checks
+    /// and the newest watch sweep, evaluates the alerts, commits the tick to the store, and publishes the alert snapshot, whether
+    /// the commit worked or not.
     pub fn tick(&mut self, now_ms: u64) {
         self.sampler.sample(now_ms);
         self.published
             .publish(self.sampler.history(HISTORY_MINUTES));
-        let inputs = inputs::from_sampler(&self.sampler);
+        let mut inputs = inputs::from_sampler(&self.sampler);
+        let swept = self.watch.as_ref().and_then(|handler| handler.newest());
+        if let Some(targets) = &self.checks {
+            let watch_end = swept.as_ref().map(|(taken, _)| *taken);
+            inputs.components = Some(checks::components(targets, watch_end, now_ms));
+        }
+        if let Some((taken, report)) = &swept {
+            inputs.watch = Some(Timed {
+                at: *taken,
+                value: watch_reading(report),
+            });
+        }
         let points = export::points(&self.sampler, &inputs);
         let mut snapshot = self.engine.tick(&inputs, points, now_ms);
         snapshot.sample_at = self.sampler.latest().map(|sample| sample.at);
@@ -369,32 +403,49 @@ impl GetHandler for MetricsExport {
     }
 }
 
-/// How long a `watch_report` answer is served from the cache before the next call sweeps the host again.
-pub const WATCH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// The interval between sweeps, in milliseconds. A sweep starts once this long has passed since the last one started.
+const WATCH_INTERVAL_MS: u64 = 30_000;
+/// How often the `arca-watcher` thread asks whether a sweep is due. Far shorter than the interval, so a sweep starts within a
+/// second of its due time.
+const WATCH_POLL: Duration = Duration::from_secs(1);
+/// The interval between watch sweeps.
+pub const WATCH_INTERVAL: Duration = Duration::from_millis(WATCH_INTERVAL_MS);
+/// How long a `watch_report` call waits for the first sweep to end before it answers that none has.
+pub const WATCH_WAIT: Duration = Duration::from_secs(35);
 
-/// `watch_report`: the watch of every project, with the identity flags of the configured phones.
-///
-/// A sweep sends a GET for every project and instance, so an answer is cached for [`WATCH_MIN_INTERVAL`], and only one
-/// sweep runs at a time: a call holds the cache lock across its sweep, so a call that arrives meanwhile waits and then
-/// reads the fresh answer. Every answer carries `ageMs`, the age of the sweep it reports. A failed sweep is not cached.
+/// What the watch thread last recorded: the newest successful sweep, and the most recent failure.
+#[derive(Default)]
+struct WatchState {
+    /// The newest successful sweep: the epoch milliseconds it was taken at, and its report.
+    newest: Option<(u64, Value)>,
+    /// The error of the most recent sweep that failed.
+    last_error: Option<CallError>,
+}
+
+/// `watch_report`: the watch of every project, with the identity flags of the configured phones. The `arca-watcher` thread runs
+/// the sweeps ([`watcher_step`]); `watch_report` never sweeps. It answers from the newest successful sweep, with `ageMs`, the
+/// milliseconds since that sweep was taken. Before the first sweep has ended, a call waits up to [`WATCH_WAIT`] for it. If no
+/// sweep has ever succeeded, a call answers the last error, or `no watch sweep has finished yet` when none has ended.
 ///
 /// `adopted` gives the live entries of the adopted instances, `adopt-<instance>`; each sweep asks it again, so an adoption or a
 /// release made while the server runs shows at the next sweep.
 pub struct WatchHandler {
     pub socket: PathBuf,
     pub phones: BTreeSet<String>,
-    pub cache: Arc<Mutex<Option<(Instant, Value)>>>,
     pub adopted: Arc<dyn Fn() -> BTreeSet<EntryId> + Send + Sync>,
+    state: Mutex<WatchState>,
+    finished: Condvar,
 }
 
 impl WatchHandler {
-    /// A handler over the Incus socket at `socket`, with an empty cache and no adopted instance.
+    /// A handler over the Incus socket at `socket`, with no sweep yet and no adopted instance.
     pub fn new(socket: PathBuf, phones: BTreeSet<String>) -> Self {
         WatchHandler {
             socket,
             phones,
-            cache: Arc::default(),
             adopted: Arc::new(BTreeSet::new),
+            state: Mutex::default(),
+            finished: Condvar::new(),
         }
     }
 
@@ -406,50 +457,106 @@ impl WatchHandler {
         self.adopted = Arc::new(adopted);
         self
     }
+
+    /// The newest successful sweep: the epoch milliseconds it was taken at, and its report. `None` before one has succeeded.
+    pub fn newest(&self) -> Option<(u64, Value)> {
+        self.lock().newest.clone()
+    }
+
+    /// Runs one sweep taken at `now_ms` and records its outcome, then wakes the calls that wait for a first sweep. The state lock
+    /// is not held during the sweep, so a call never waits on Incus.
+    fn sweep(&self, now_ms: u64) {
+        let live = (self.adopted)();
+        let outcome = watch_snapshot(
+            UnixIncus::new(self.socket.clone()),
+            &self.phones,
+            &live,
+            now_ms,
+        );
+        let mut state = self.lock();
+        match outcome {
+            Ok(report) => state.newest = Some((now_ms, report)),
+            Err(error) => state.last_error = Some(error),
+        }
+        drop(state);
+        self.finished.notify_all();
+    }
+
+    fn lock(&self) -> MutexGuard<'_, WatchState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The answer at `now_ms`, after waiting up to `wait` for the first sweep to end.
+    fn answer(&self, wait: Duration, now_ms: u64) -> Result<Value, CallError> {
+        let state = self.lock();
+        let (state, _) = self
+            .finished
+            .wait_timeout_while(state, wait, |s| {
+                s.newest.is_none() && s.last_error.is_none()
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((taken, report)) = &state.newest {
+            let mut answer = report.clone();
+            if let Some(object) = answer.as_object_mut() {
+                object.insert("ageMs".to_string(), json!(now_ms.saturating_sub(*taken)));
+            }
+            return Ok(answer);
+        }
+        Err(state
+            .last_error
+            .clone()
+            .unwrap_or_else(|| CallError::Internal("no watch sweep has finished yet".to_string())))
+    }
 }
 
 impl ToolHandler for WatchHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
-        cached_sweep(&self.cache, WATCH_MIN_INTERVAL, || {
-            let live = (self.adopted)();
-            watch_snapshot(
-                UnixIncus::new(self.socket.clone()),
-                &self.phones,
-                &live,
-                now_ms(),
-            )
-        })
+        self.answer(WATCH_WAIT, now_ms())
     }
 }
 
-/// The cached answer when it is younger than `interval`, else the answer of a new `sweep`, which then replaces it. The lock
-/// is held across the sweep, so concurrent callers share one sweep. The answer gains `ageMs`, the milliseconds since its
-/// sweep ended.
-fn cached_sweep(
-    cache: &Mutex<Option<(Instant, Value)>>,
-    interval: Duration,
-    sweep: impl FnOnce() -> Result<Value, CallError>,
-) -> Result<Value, CallError> {
-    let mut slot = cache.lock().unwrap_or_else(PoisonError::into_inner);
-    let fresh = slot
-        .as_ref()
-        .filter(|(taken, _)| taken.elapsed() < interval)
-        .cloned();
-    let (taken, mut report) = match fresh {
-        Some(cached) => cached,
-        None => {
-            let report = sweep()?;
-            let taken = Instant::now();
-            *slot = Some((taken, report.clone()));
-            (taken, report)
-        }
-    };
-    drop(slot);
-    let age = u64::try_from(taken.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if let Some(object) = report.as_object_mut() {
-        object.insert("ageMs".to_string(), json!(age));
+/// Runs a sweep of `h` at `now_ms` when [`WATCH_INTERVAL`] has passed since `last_start_ms`, or when no sweep has started yet.
+/// Records the start in `last_start_ms`, whatever the sweep's outcome. Returns whether it swept.
+pub fn watcher_step(h: &WatchHandler, now_ms: u64, last_start_ms: &mut Option<u64>) -> bool {
+    let due = last_start_ms.is_none_or(|last| now_ms.saturating_sub(last) >= WATCH_INTERVAL_MS);
+    if !due {
+        return false;
     }
-    Ok(report)
+    *last_start_ms = Some(now_ms);
+    h.sweep(now_ms);
+    true
+}
+
+/// Starts the `arca-watcher` thread: a sweep at once, then one each [`WATCH_INTERVAL`], for the life of the process.
+pub fn spawn_watcher(h: Arc<WatchHandler>, clock: Clock) -> io::Result<()> {
+    thread::Builder::new()
+        .name("arca-watcher".to_string())
+        .spawn(move || {
+            let mut last_start = None;
+            loop {
+                watcher_step(&h, clock(), &mut last_start);
+                thread::sleep(WATCH_POLL);
+            }
+        })?;
+    Ok(())
+}
+
+/// The drift of a watch report, by kind, for the evaluator's drift input. `marked_without_entry` and `entry_without_object` are
+/// always present, at 0 when none is drift. A kind the report's closed set does not name counts as `other`.
+pub fn watch_reading(report: &Value) -> WatchReading {
+    let mut drift = BTreeMap::from([
+        ("marked_without_entry".to_string(), 0u64),
+        ("entry_without_object".to_string(), 0u64),
+    ]);
+    for entry in report["drift"].as_array().into_iter().flatten() {
+        let kind = match entry["kind"].as_str() {
+            Some("markedWithoutEntry") => "marked_without_entry",
+            Some("entryWithoutObject") => "entry_without_object",
+            _ => "other",
+        };
+        *drift.entry(kind.to_string()).or_insert(0) += 1;
+    }
+    WatchReading { drift }
 }
 
 /// `token_list`: the id and scope of each token, as they were when the server started. No secret and no digest.
@@ -878,10 +985,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod watch_cache_tests {
+mod watch_newest_tests {
     use std::path::Path;
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     use arca_incus::{FakeIncus, FakeState};
@@ -902,7 +1007,7 @@ mod watch_cache_tests {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.subsec_nanos());
             let dir = std::env::temp_dir().join(format!(
-                "arca-watch-cache-{}-{nanos}-{tag}",
+                "arca-watch-newest-{}-{nanos}-{tag}",
                 std::process::id()
             ));
             std::fs::create_dir_all(&dir).expect("create the scratch directory");
@@ -932,101 +1037,155 @@ mod watch_cache_tests {
         }
     }
 
-    #[test]
-    fn two_calls_within_the_interval_make_one_sweep_and_the_second_has_an_age() {
-        let scratch = Scratch::new("twice");
-        let fake = fake(&scratch);
-        let handler = WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new());
-
-        let first = handler.call(json!({}), &viewer()).expect("the first call");
-        let after_first = gets(&fake);
-        assert!(after_first > 0, "the first call sweeps the host");
-        thread::sleep(Duration::from_millis(5));
-        let second = handler.call(json!({}), &viewer()).expect("the second call");
-
-        assert_eq!(gets(&fake), after_first, "the second call sends no GET");
-        assert!(first["ageMs"].as_u64().is_some(), "every answer has ageMs");
-        assert!(
-            second["ageMs"].as_u64().expect("ageMs") > 0,
-            "the cached answer has aged"
-        );
-        let strip = |mut v: Value| {
-            v.as_object_mut().expect("an object").remove("ageMs");
-            v
-        };
-        assert_eq!(
-            strip(first),
-            strip(second),
-            "the second call reports the same sweep"
-        );
+    fn without_age(mut report: Value) -> Value {
+        report.as_object_mut().expect("an object").remove("ageMs");
+        report
     }
 
     #[test]
-    fn concurrent_calls_make_one_sweep() {
-        let scratch = Scratch::new("concurrent");
+    fn watch_report_never_sweeps_and_answers_the_newest_sweep_with_its_age() {
+        let scratch = Scratch::new("newest");
         let fake = fake(&scratch);
-        // A handler with its own cache measures what one sweep sends.
-        WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new())
-            .call(json!({}), &viewer())
-            .expect("the measuring call");
-        let one_sweep = gets(&fake);
+        let handler = WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new());
+        let mut last = None;
+        assert!(
+            watcher_step(&handler, 1_000, &mut last),
+            "the first step sweeps"
+        );
+        let after_sweep = gets(&fake);
+        assert!(after_sweep > 0, "the sweep read the host");
 
+        let early = handler.answer(Duration::ZERO, 1_500).expect("the answer");
+        let late = handler.answer(Duration::ZERO, 3_000).expect("the answer");
+        assert_eq!(gets(&fake), after_sweep, "answering sends no GET");
+        assert_eq!(early["ageMs"], json!(500));
+        assert_eq!(late["ageMs"], json!(2_000));
+        assert_eq!(
+            without_age(early),
+            without_age(late),
+            "both report the same sweep"
+        );
+
+        let through_the_verb = handler
+            .call(json!({}), &viewer())
+            .expect("the verb answers");
+        assert!(
+            through_the_verb["ageMs"].is_u64(),
+            "the verb's answer has ageMs"
+        );
+        assert_eq!(gets(&fake), after_sweep, "the verb sends no GET");
+    }
+
+    #[test]
+    fn a_step_inside_the_interval_does_not_sweep_and_one_at_the_interval_does() {
+        let scratch = Scratch::new("interval");
+        let fake = fake(&scratch);
+        let handler = WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new());
+        let mut last = None;
+        assert!(watcher_step(&handler, 0, &mut last));
+        let after_first = gets(&fake);
+        assert!(!watcher_step(&handler, WATCH_INTERVAL_MS - 1, &mut last));
+        assert_eq!(gets(&fake), after_first, "no sweep inside the interval");
+        assert!(watcher_step(&handler, WATCH_INTERVAL_MS, &mut last));
+        assert!(gets(&fake) > after_first, "a sweep at the interval");
+    }
+
+    #[test]
+    fn a_call_before_the_first_sweep_waits_for_it_and_then_answers() {
+        let scratch = Scratch::new("waits");
+        let fake = fake(&scratch);
         let handler = Arc::new(WatchHandler::new(
             fake.socket().to_path_buf(),
             BTreeSet::new(),
         ));
-        let callers = 8;
-        let start = Arc::new(Barrier::new(callers));
-        let threads: Vec<_> = (0..callers)
-            .map(|_| {
-                let handler = Arc::clone(&handler);
-                let start = Arc::clone(&start);
-                thread::spawn(move || {
-                    start.wait();
-                    handler.call(json!({}), &viewer())
-                })
-            })
-            .collect();
-        for thread in threads {
-            thread
-                .join()
-                .expect("the caller thread")
-                .expect("every concurrent call answers");
-        }
+        let waiter = Arc::clone(&handler);
+        let caller = thread::spawn(move || waiter.answer(Duration::from_secs(10), 2_000));
+        thread::sleep(Duration::from_millis(50));
+        let mut last = None;
+        assert!(watcher_step(&handler, 1_000, &mut last));
+        let answer = caller
+            .join()
+            .expect("the caller thread")
+            .expect("the call answers once the sweep has ended");
+        assert_eq!(answer["ageMs"], json!(1_000));
+    }
+
+    #[test]
+    fn before_any_sweep_ends_a_call_answers_that_none_has_after_its_wait() {
+        let scratch = Scratch::new("none");
+        let handler = WatchHandler::new(scratch.0.join("absent.sock"), BTreeSet::new());
+        let error = handler
+            .answer(Duration::from_millis(20), 0)
+            .expect_err("no sweep has ended");
         assert_eq!(
-            gets(&fake),
-            2 * one_sweep,
-            "eight concurrent calls made one sweep"
+            error,
+            CallError::Internal("no watch sweep has finished yet".to_string())
         );
     }
 
     #[test]
-    fn an_expired_answer_is_swept_again_and_a_failed_sweep_is_not_cached() {
-        let cache = Mutex::new(None);
-        let sweeps = AtomicUsize::new(0);
-        let ok = || {
-            sweeps.fetch_add(1, Ordering::SeqCst);
-            Ok(json!({ "at": 1 }))
-        };
-        cached_sweep(&cache, Duration::ZERO, ok).expect("a sweep");
-        cached_sweep(&cache, Duration::ZERO, ok).expect("a sweep");
-        assert_eq!(
-            sweeps.load(Ordering::SeqCst),
-            2,
-            "an answer older than the interval is swept again"
-        );
-
-        let empty = Mutex::new(None);
-        let failed = cached_sweep(&empty, WATCH_MIN_INTERVAL, || {
-            Err(CallError::Internal("no answer".to_string()))
-        });
-        assert!(failed.is_err());
+    fn a_failed_first_sweep_answers_its_error_at_once() {
+        let scratch = Scratch::new("failed");
+        let handler = WatchHandler::new(scratch.0.join("absent.sock"), BTreeSet::new());
+        let mut last = None;
+        assert!(watcher_step(&handler, 0, &mut last));
         assert!(
-            empty.lock().expect("the cache lock").is_none(),
-            "a failed sweep leaves the cache empty"
+            handler.newest().is_none(),
+            "a failed sweep is not an answer"
         );
-        cached_sweep(&empty, WATCH_MIN_INTERVAL, ok).expect("the next call sweeps");
-        assert_eq!(sweeps.load(Ordering::SeqCst), 3);
+        let started = Instant::now();
+        let error = handler
+            .answer(WATCH_WAIT, 0)
+            .expect_err("the failed sweep is the answer");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a call does not wait out its window once a sweep has failed"
+        );
+        assert!(
+            matches!(&error, CallError::Internal(text) if text.starts_with("the projects could not be listed")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_later_sweep_leaves_the_newest_success_in_place() {
+        let scratch = Scratch::new("later");
+        let fake = fake(&scratch);
+        let handler = WatchHandler::new(fake.socket().to_path_buf(), BTreeSet::new());
+        let mut last = None;
+        assert!(watcher_step(&handler, 1_000, &mut last));
+        std::fs::remove_file(fake.socket()).expect("remove the socket");
+        assert!(watcher_step(&handler, WATCH_INTERVAL_MS + 1_000, &mut last));
+
+        assert_eq!(handler.newest().map(|(taken, _)| taken), Some(1_000));
+        let answer = handler
+            .answer(Duration::ZERO, 3_000)
+            .expect("the newest success still answers");
+        assert_eq!(answer["ageMs"], json!(2_000));
+    }
+
+    #[test]
+    fn the_watch_reading_counts_each_drift_kind_and_keeps_both_kinds() {
+        let report = json!({ "drift": [
+            { "kind": "markedWithoutEntry", "project": "svc", "name": "k1", "entry": "" },
+            { "kind": "markedWithoutEntry", "project": "svc", "name": "x1", "entry": "toy" },
+            { "kind": "entryWithoutObject", "entry": "toy" },
+            { "kind": "somethingNew" }
+        ]});
+        assert_eq!(
+            watch_reading(&report).drift,
+            BTreeMap::from([
+                ("entry_without_object".to_string(), 1),
+                ("marked_without_entry".to_string(), 2),
+                ("other".to_string(), 1),
+            ])
+        );
+        let clean = BTreeMap::from([
+            ("entry_without_object".to_string(), 0),
+            ("marked_without_entry".to_string(), 0),
+        ]);
+        assert_eq!(watch_reading(&json!({ "drift": [] })).drift, clean);
+        assert_eq!(watch_reading(&json!({})).drift, clean);
     }
 }
 

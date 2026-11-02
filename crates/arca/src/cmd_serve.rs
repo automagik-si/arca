@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Instant;
 
 use arca_alerts::Engine;
+use arca_alerts::checks::CheckTargets;
 use arca_alerts::rules::{self, RulesError};
 use arca_api::verbs;
 use arca_approval::{
@@ -37,7 +38,7 @@ use crate::config::{self, NodeConfig};
 use crate::handlers::{
     AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler, Published,
     SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers,
+    plan_handlers, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -129,9 +130,23 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
 
     // The sampler takes its first sample on its own thread, so the listeners start without waiting on Incus. The handlers read
     // the samples and the alerts it publishes and never take part in a read.
+    // The watch sweep runs on its own thread, so a slow sweep never delays the tick. The tick reads its newest answer, and
+    // `watch_report` answers from the same handler, so neither starts a sweep.
+    let clock: Clock = Arc::new(now_ms);
+    let watch = Arc::new(watch_handler(&cfg));
+    spawn_watcher(Arc::clone(&watch), Arc::clone(&clock))
+        .map_err(|e| Failure::Runtime(e.to_string()))?;
+
     let published = Published::default();
     let alerts = AlertsPublished::default();
-    let ticker = Ticker::new(new_sampler(&cfg), engine, published.clone(), alerts.clone());
+    let targets = CheckTargets {
+        incus: cfg.incus.socket.clone(),
+        arca: cfg.listen.unix.clone(),
+        shim: alerts_file.shim_socket.clone(),
+    };
+    let ticker = Ticker::new(new_sampler(&cfg), engine, published.clone(), alerts.clone())
+        .with_checks(targets)
+        .with_watch(Arc::clone(&watch));
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let mut server = Server::new(verbs(), tokens)
@@ -149,7 +164,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 published: published.clone(),
             }),
         )
-        .handle("watch_report", Arc::new(watch_handler(&cfg)))
+        .handle("watch_report", watch)
         .handle("token_list", Arc::new(TokenListHandler { ids }))
         .handle(
             "alerts_list",
@@ -161,7 +176,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
-    let clock: Clock = Arc::new(now_ms);
     for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock) {
         server = server.handle(verb, handler);
     }
