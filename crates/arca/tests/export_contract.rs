@@ -211,12 +211,13 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         drives: Some(DrivesReading {
             at,
             drives: vec![
+                // Real labels: `drive-` and twelve hex digits, the hash of each incus-osd ID (see `smart.rs`).
                 DriveReading {
-                    device: "disk1".to_string(),
+                    device: "drive-2743af5e20a8".to_string(),
                     passed: true,
                 },
                 DriveReading {
-                    device: "disk2".to_string(),
+                    device: "drive-2a43af5e25c1".to_string(),
                     passed: false,
                 },
             ],

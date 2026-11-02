@@ -95,8 +95,8 @@ arca_update_last_success_timestamp_seconds{node="0000000000000000000000000000000
 arca_update_failed{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
 # HELP arca_smart_passed 1 when the drive's SMART health check passed, 0 when it failed. Only drives with SMART enabled are listed.
 # TYPE arca_smart_passed gauge
-arca_smart_passed{node="0000000000000000000000000000000000000000000000000000000000000000",device="disk1"} 1
-arca_smart_passed{node="0000000000000000000000000000000000000000000000000000000000000000",device="disk2"} 0
+arca_smart_passed{node="0000000000000000000000000000000000000000000000000000000000000000",device="drive-2743af5e20a8"} 1
+arca_smart_passed{node="0000000000000000000000000000000000000000000000000000000000000000",device="drive-2a43af5e25c1"} 0
 # HELP arca_alert_firing 1 for each firing alert.
 # TYPE arca_alert_firing gauge
 arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="cpu-hot",severity="warning"} 1

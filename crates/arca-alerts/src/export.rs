@@ -693,6 +693,26 @@ mod tests {
         }
     }
 
+    /// An Incus that answers the storage document with one SMART drive whose model and serial are fake, or 404 for any other path.
+    struct Storage;
+
+    impl IncusRead for Storage {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if path != "/os/1.0/system/storage" {
+                return Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                });
+            }
+            Ok(json!({ "state": { "drives": [{
+                "id": "/dev/disk/by-id/ata-FAKE-MODEL-NOT-REAL_FAKE-SERIAL-0001",
+                "model_name": "FAKE-MODEL-NOT-REAL",
+                "serial_number": "FAKE-SERIAL-NOT-REAL-0001",
+                "smart": { "enabled": true, "passed": false },
+            }] } }))
+        }
+    }
+
     /// A sampler that has read the documents once at `AT`, over roots that do not exist.
     fn sampled(served: Option<(Value, Value)>) -> Sampler<Osd> {
         let mut sampler = Sampler::new(
@@ -759,6 +779,41 @@ mod tests {
                 "arca_update_last_success_timestamp_seconds{node=\"node1\"} 1793527200\n"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_smart_label_is_a_hash_and_no_fake_model_or_serial_reaches_metrics() {
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-export-smart-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-export-smart-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            Storage,
+        );
+        sampler.sample(AT);
+        let inputs = from_sampler(&sampler);
+        let text = render_metrics(
+            "node1",
+            &AlertSnapshot {
+                at: AT,
+                sample_at: Some(AT),
+                points: points(&sampler, &inputs),
+                ..AlertSnapshot::default()
+            },
+        );
+        // Checked first, so the messages below that show the text never show a fake value.
+        for fake in ["FAKE", "SERIAL", "MODEL", "by-id", "disk/"] {
+            assert!(!text.contains(fake), "{fake} reached /metrics");
+        }
+        assert!(
+            text.lines().any(|line| {
+                line.starts_with("arca_smart_passed{") && line.contains(",device=\"drive-")
+            }),
+            "the drive is written under a drive- label"
         );
     }
 

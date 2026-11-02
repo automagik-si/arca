@@ -258,7 +258,8 @@ pub struct Evaluator {
 impl Evaluator {
     /// An evaluator holding the stored firing alerts as firing, with fresh timers, unknown until their first reading. A firing
     /// alert of a rule that `rules` disables, or that this build lacks, is not loaded: its resolve, `rule-disabled`, is returned
-    /// at `now` instead.
+    /// at `now` instead. Two stored firings of one rule and label set (a dropped resolve left the older one open) keep the newer
+    /// one; the older resolves once at `now` with `cleared`, not `rule-disabled` or `subject-gone`.
     pub fn load(rules: &Rules, firing: Vec<AlertEvent>, now: u64) -> (Evaluator, Vec<AlertEvent>) {
         let mut evaluator = Evaluator::default();
         let mut resolves = Vec::new();
