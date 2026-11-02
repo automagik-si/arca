@@ -90,7 +90,11 @@ fn listed(row: &Value) -> Option<Listed> {
         Some("virtual-machine") => InstanceKind::Vm,
         _ => InstanceKind::Container,
     };
-    let state = row.get("state").filter(|state| !state.is_null());
+    // A stopped instance's `state` is an object of zeros on the wire, so it is ignored here: it has no usage to read.
+    let stopped = row.get("status").and_then(Value::as_str) == Some("Stopped");
+    let state = row
+        .get("state")
+        .filter(|state| !state.is_null() && !stopped);
     Some(Listed {
         reading: InstanceReading {
             project: project.to_string(),
@@ -175,4 +179,25 @@ fn is_plain_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn stopped_instance_reports_no_usage_even_with_zero_state_object() {
+        let row = json!({
+            "project": "default",
+            "name": "web1",
+            "type": "container",
+            "status": "Stopped",
+            "state": { "cpu": { "usage": 0 }, "memory": { "usage": 0 } },
+        });
+        let reading = listed(&row).expect("a named instance is listed").reading;
+        assert_eq!(reading.cpu_seconds, None);
+        assert_eq!(reading.memory_bytes, None);
+    }
 }

@@ -1308,24 +1308,23 @@ impl Store {
         })
     }
 
-    /// Every instance, as the `recursion=2` listing serves it: its body and a `state`. A running instance's `state` holds its
-    /// usage, which is zero until a test sets it; a stopped instance's `state` is `null`.
+    /// Every instance, as the `recursion=2` listing serves it: its body and a `state`. A running or frozen instance's `state` holds its
+    /// usage, which is zero until a test sets it; a stopped instance's `state` is an object of zeros, as Incus 7.5.1 answers.
     fn instances_with_state(&self) -> Vec<Value> {
         self.objects
             .iter()
             .filter(|object| object.kind == "instance")
             .map(|object| {
                 let mut body = object.body.clone();
-                let state = if text_of(&body, "status") == "Running" {
-                    let (cpu_ns, memory) = self
-                        .usage
+                let (cpu_ns, memory) = if text_of(&body, "status") != "Stopped" {
+                    self.usage
                         .get(&(object.project.clone(), object.name.clone()))
                         .copied()
-                        .unwrap_or((0, 0));
-                    json!({ "cpu": { "usage": cpu_ns }, "memory": { "usage": memory } })
+                        .unwrap_or((0, 0))
                 } else {
-                    Value::Null
+                    (0, 0)
                 };
+                let state = json!({ "cpu": { "usage": cpu_ns }, "memory": { "usage": memory } });
                 if let Some(map) = body.as_object_mut() {
                     map.insert("state".to_string(), state);
                 }
