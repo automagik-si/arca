@@ -1,0 +1,71 @@
+# HELP arca_node_cpu_used_ratio The share of all CPUs busy since the previous sample, from 0 to 1.
+# TYPE arca_node_cpu_used_ratio gauge
+arca_node_cpu_used_ratio{node="0000000000000000000000000000000000000000000000000000000000000000"} 0.125
+# HELP arca_node_cpu_cores The number of CPUs.
+# TYPE arca_node_cpu_cores gauge
+arca_node_cpu_cores{node="0000000000000000000000000000000000000000000000000000000000000000"} 4
+# HELP arca_node_load The load average over 1, 5 and 15 minutes.
+# TYPE arca_node_load gauge
+arca_node_load{node="0000000000000000000000000000000000000000000000000000000000000000",window="15m"} 0.125
+arca_node_load{node="0000000000000000000000000000000000000000000000000000000000000000",window="1m"} 0.5
+arca_node_load{node="0000000000000000000000000000000000000000000000000000000000000000",window="5m"} 0.25
+# HELP arca_node_memory_total_bytes The memory of the node, in bytes.
+# TYPE arca_node_memory_total_bytes gauge
+arca_node_memory_total_bytes{node="0000000000000000000000000000000000000000000000000000000000000000"} 8589934592
+# HELP arca_node_memory_available_bytes The memory available to start applications, in bytes.
+# TYPE arca_node_memory_available_bytes gauge
+arca_node_memory_available_bytes{node="0000000000000000000000000000000000000000000000000000000000000000"} 4294967296
+# HELP arca_node_swap_total_bytes The swap space of the node, in bytes.
+# TYPE arca_node_swap_total_bytes gauge
+arca_node_swap_total_bytes{node="0000000000000000000000000000000000000000000000000000000000000000"} 2147483648
+# HELP arca_node_swap_free_bytes The free swap space, in bytes.
+# TYPE arca_node_swap_free_bytes gauge
+arca_node_swap_free_bytes{node="0000000000000000000000000000000000000000000000000000000000000000"} 2147483648
+# HELP arca_node_psi_avg10_ratio The share of time tasks stalled on a resource, averaged over 10 seconds, from 0 to 1.
+# TYPE arca_node_psi_avg10_ratio gauge
+arca_node_psi_avg10_ratio{node="0000000000000000000000000000000000000000000000000000000000000000",resource="cpu",kind="some"} 0.02
+arca_node_psi_avg10_ratio{node="0000000000000000000000000000000000000000000000000000000000000000",resource="memory",kind="full"} 0.005
+arca_node_psi_avg10_ratio{node="0000000000000000000000000000000000000000000000000000000000000000",resource="memory",kind="some"} 0.015
+# HELP arca_node_cpu_temperature_celsius The CPU temperature, in degrees Celsius.
+# TYPE arca_node_cpu_temperature_celsius gauge
+arca_node_cpu_temperature_celsius{node="0000000000000000000000000000000000000000000000000000000000000000"} 90
+# HELP arca_node_gpu_busy_ratio The share of time the GPU is busy, from 0 to 1.
+# TYPE arca_node_gpu_busy_ratio gauge
+arca_node_gpu_busy_ratio{node="0000000000000000000000000000000000000000000000000000000000000000"} 0.1
+# HELP arca_node_network_receive_bytes_total The bytes the physical NICs have received.
+# TYPE arca_node_network_receive_bytes_total counter
+arca_node_network_receive_bytes_total{node="0000000000000000000000000000000000000000000000000000000000000000"} 1000
+# HELP arca_node_network_transmit_bytes_total The bytes the physical NICs have sent.
+# TYPE arca_node_network_transmit_bytes_total counter
+arca_node_network_transmit_bytes_total{node="0000000000000000000000000000000000000000000000000000000000000000"} 2000
+# HELP arca_pool_size_bytes The size of a storage pool, in bytes.
+# TYPE arca_pool_size_bytes gauge
+arca_pool_size_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",pool="default"} 100
+# HELP arca_pool_used_bytes The bytes a storage pool uses.
+# TYPE arca_pool_used_bytes gauge
+arca_pool_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",pool="default"} 50
+# HELP arca_project_instances The instances in a project.
+# TYPE arca_project_instances gauge
+arca_project_instances{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1"} 2
+# HELP arca_project_instances_running The running instances in a project.
+# TYPE arca_project_instances_running gauge
+arca_project_instances_running{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1"} 1
+# HELP arca_component_up 1 when a health component is ok, 0 when it is not.
+# TYPE arca_component_up gauge
+arca_component_up{node="0000000000000000000000000000000000000000000000000000000000000000",component="arca"} 1
+arca_component_up{node="0000000000000000000000000000000000000000000000000000000000000000",component="incus"} 1
+arca_component_up{node="0000000000000000000000000000000000000000000000000000000000000000",component="watch"} 1
+# HELP arca_drift_entries The drift entries of the newest watch sweep, by kind.
+# TYPE arca_drift_entries gauge
+arca_drift_entries{node="0000000000000000000000000000000000000000000000000000000000000000",kind="entry_without_object"} 2
+arca_drift_entries{node="0000000000000000000000000000000000000000000000000000000000000000",kind="marked_without_entry"} 0
+# HELP arca_alert_firing 1 for each firing alert.
+# TYPE arca_alert_firing gauge
+arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="cpu-hot",severity="warning"} 1
+arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="drift",severity="warning"} 1
+# HELP arca_store_write_failures_total The node store's failed writes since the server started.
+# TYPE arca_store_write_failures_total counter
+arca_store_write_failures_total{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
+# HELP arca_sample_timestamp_seconds When the newest host sample was taken, in epoch seconds.
+# TYPE arca_sample_timestamp_seconds gauge
+arca_sample_timestamp_seconds{node="0000000000000000000000000000000000000000000000000000000000000000"} 1793361785

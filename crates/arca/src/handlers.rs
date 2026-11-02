@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_alerts::checks::{self, CheckTargets};
 use arca_alerts::eval::{Timed, WatchReading};
-use arca_alerts::{AlertSnapshot, Engine, TickStore, export, inputs};
+use arca_alerts::{AlertSnapshot, Engine, TickStore, export, health, inputs};
 use arca_api::Scope;
 use arca_approval::{ApprovalRefusal, parse_statement};
 use arca_incus::{IncusRead, UnixIncus};
@@ -256,6 +256,7 @@ impl<S: TickStore> Ticker<S> {
         let points = export::points(&self.sampler, &inputs);
         let mut snapshot = self.engine.tick(&inputs, points, now_ms);
         snapshot.sample_at = self.sampler.latest().map(|sample| sample.at);
+        snapshot.watch_at = swept.as_ref().map(|(taken, _)| *taken);
         self.alerts.publish(snapshot);
     }
 }
@@ -366,24 +367,91 @@ impl ToolHandler for AlertsHandler {
             .current()
             .last()
             .map(|sample| now.saturating_sub(sample.at));
-        let store_bytes = self
+        let unknown: Vec<Value> = snapshot
+            .unknown
+            .iter()
+            .map(|alert| {
+                json!({
+                    "rule": alert.rule,
+                    "labels": alert.labels,
+                    "state": alert.state.as_str(),
+                    "reason": alert.reason.as_str(),
+                })
+            })
+            .collect();
+        let store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = store
+            .resolved_since(now.saturating_sub(RESOLVED_WINDOW_MS), RESOLVED_LIMIT)
+            .map_err(|error| {
+                CallError::Internal(format!("the resolved alerts could not be read: {error}"))
+            })?;
+        let store_bytes = store.bytes();
+        drop(store);
+        let resolved: Vec<Value> = resolved
+            .iter()
+            .map(|event| event.to_json(&self.node))
+            .collect();
+        Ok(json!({
+            "firing": firing,
+            "unknown": unknown,
+            "disabled": snapshot.disabled,
+            "resolvedRecent": resolved,
+            "sampleAgeMs": sample_age,
+            "watchAgeMs": snapshot.watch_at.map(|taken| now.saturating_sub(taken)),
+            "commitMs": snapshot.commit_ms,
+            "storeError": snapshot.store_error.as_ref().map(|error| {
+                json!({ "at": error.at, "message": error.message })
+            }),
+            "storeReset": snapshot.store_reset,
+            "storeBytes": store_bytes,
+            "healthLine": health::alerts_line(&snapshot, now),
+        }))
+    }
+}
+
+/// How far back `resolvedRecent` reaches, in milliseconds.
+const RESOLVED_WINDOW_MS: u64 = 24 * 60 * 60 * 1_000;
+/// The most resolves `resolvedRecent` lists.
+const RESOLVED_LIMIT: usize = 20;
+/// The most alert events one `GET /alerts` page carries.
+pub const EXPORT_PAGE: usize = 500;
+
+/// `GET /alerts?after=<seq>`: the alert events with a `seq` above `after`, oldest first, one page of at most [`EXPORT_PAGE`].
+/// A missing `after` is 0. A value that is not a whole number is refused as invalid.
+pub struct AlertsExport {
+    pub node: String,
+    pub store: Arc<Mutex<Store>>,
+}
+
+impl GetHandler for AlertsExport {
+    fn get(&self, query: Option<&str>, _caller: &Caller) -> Result<GetReply, CallError> {
+        let after = after_of(query)?;
+        let events = self
             .store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .bytes();
-        Ok(json!({
-            "firing": firing,
-            "unknown": [],
-            "disabled": snapshot.disabled,
-            "resolvedRecent": [],
-            "sampleAgeMs": sample_age,
-            "watchAgeMs": null,
-            "commitMs": null,
-            "storeError": null,
-            "storeReset": snapshot.store_reset,
-            "storeBytes": store_bytes,
-            "healthLine": "",
-        }))
+            .events_after(after, EXPORT_PAGE)
+            .map_err(|error| {
+                CallError::Internal(format!("the alert events could not be read: {error}"))
+            })?;
+        Ok(GetReply {
+            content_type: "application/x-ndjson",
+            body: export::render_events(&self.node, &events).into_bytes(),
+        })
+    }
+}
+
+/// The `after` of a query string: the value of its first `after=` pair, or 0 when there is none.
+fn after_of(query: Option<&str>) -> Result<u64, CallError> {
+    let value = query
+        .unwrap_or("")
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("after="));
+    match value {
+        None => Ok(0),
+        Some(text) => text
+            .parse()
+            .map_err(|_| CallError::Invalid("after must be a whole number".to_string())),
     }
 }
 

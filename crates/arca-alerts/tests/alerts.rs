@@ -1622,3 +1622,106 @@ mod get_only {
         );
     }
 }
+
+mod health {
+    use super::*;
+    use arca_alerts::health::alerts_line;
+    use arca_alerts::{AlertSnapshot, AlertState, FiringAlert, UnknownAlert};
+
+    /// The instant the snapshots are read at.
+    const NOW: u64 = T0 + 600_000;
+
+    fn firing(rule: &str) -> FiringAlert {
+        FiringAlert {
+            event: firing_event(rule, &[], NOW - 60_000),
+            unknown: false,
+        }
+    }
+
+    fn unknown(rule: &str) -> UnknownAlert {
+        UnknownAlert {
+            rule: rule.to_string(),
+            labels: BTreeMap::new(),
+            state: AlertState::Ok,
+            reason: UnknownReason::Missing,
+        }
+    }
+
+    /// A snapshot whose newest sample was taken `age_ms` before [`NOW`].
+    fn snapshot(
+        age_ms: u64,
+        firing: Vec<FiringAlert>,
+        unknown: Vec<UnknownAlert>,
+    ) -> AlertSnapshot {
+        AlertSnapshot {
+            at: NOW,
+            sample_at: Some(NOW - age_ms),
+            firing,
+            unknown,
+            ..AlertSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn the_four_snapshots_give_the_four_lines() {
+        assert_eq!(
+            alerts_line(&snapshot(0, vec![], vec![]), NOW),
+            "alerts none"
+        );
+        assert_eq!(
+            alerts_line(
+                &snapshot(0, vec![firing("disk-pool-full"), firing("cpu-hot")], vec![]),
+                NOW
+            ),
+            "alerts 2 firing: disk-pool-full, cpu-hot"
+        );
+        assert_eq!(
+            alerts_line(
+                &snapshot(
+                    0,
+                    vec![firing("disk-pool-full")],
+                    vec![unknown("update-failed")]
+                ),
+                NOW
+            ),
+            "alerts 1 firing: disk-pool-full · 1 unknown"
+        );
+        assert_eq!(
+            alerts_line(
+                &snapshot(42_000, vec![firing("disk-pool-full")], vec![]),
+                NOW
+            ),
+            "alerts stale 42s"
+        );
+    }
+
+    #[test]
+    fn unknown_entries_show_as_a_count_when_nothing_fires() {
+        let unknowns = vec![
+            unknown("crash-loop"),
+            unknown("update-failed"),
+            unknown("smart-warning"),
+        ];
+        assert_eq!(
+            alerts_line(&snapshot(0, vec![], unknowns), NOW),
+            "alerts none · 3 unknown"
+        );
+    }
+
+    #[test]
+    fn the_sample_is_stale_only_past_fifteen_seconds_and_before_any_sample() {
+        assert_eq!(
+            alerts_line(&snapshot(SAMPLE_MAX_AGE_MS, vec![], vec![]), NOW),
+            "alerts none"
+        );
+        assert_eq!(
+            alerts_line(&snapshot(SAMPLE_MAX_AGE_MS + 1, vec![], vec![]), NOW),
+            "alerts stale 15s"
+        );
+        let unsampled = AlertSnapshot {
+            at: NOW,
+            ..AlertSnapshot::default()
+        };
+        assert_eq!(alerts_line(&unsampled, NOW), "alerts stale");
+    }
+}
