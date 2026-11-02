@@ -45,11 +45,11 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
                     })
                     .collect(),
             }),
-        update: sampler.readings().osd.as_ref().map(|osd| Timed {
-            at: osd.at,
-            value: UpdateUse {
-                failed: osd.update_failed,
-            },
+        update: sampler.readings().osd.as_ref().and_then(|osd| {
+            osd.update_failed.map(|failed| Timed {
+                at: osd.at,
+                value: UpdateUse { failed },
+            })
         }),
         ..Inputs::default()
     }

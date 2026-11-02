@@ -987,7 +987,8 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     fs::create_dir_all(&tokens).expect("create the token directory");
     fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     // A port is free when it is probed, but another process can take it before `serve` binds it. A `serve` that exits before it
-    // listens is started again on a fresh port, at most five times.
+    // listens because the address is already in use is started again on a fresh port, at most five times. Any other early exit
+    // fails at once with the server's stderr.
     let mut attempts = 0;
     let (mut child, at, mut stream) = loop {
         attempts += 1;
@@ -1009,7 +1010,18 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
                 break Some(stream);
             }
             if let Some(status) = child.try_wait().expect("poll the server") {
-                assert!(attempts < 5, "the server exited before listening: {status}");
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    pipe.read_to_string(&mut stderr).expect("read stderr");
+                }
+                assert!(
+                    stderr.contains("Address already in use"),
+                    "the server exited before listening: {status}\n{stderr}"
+                );
+                assert!(
+                    attempts < 5,
+                    "the proxy port was taken five times: {status}\n{stderr}"
+                );
                 break None;
             }
             assert!(Instant::now() < deadline, "the proxy listener comes up");

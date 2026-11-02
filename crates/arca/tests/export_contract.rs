@@ -204,7 +204,7 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
             at,
             secure_boot: true,
             tpm_ok: true,
-            update_failed: false,
+            update_failed: Some(false),
             last_check_ms: Some(at - 60_000),
             last_success_ms: Some(at - 60_000),
         }),

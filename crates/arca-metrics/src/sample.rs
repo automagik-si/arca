@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::incus::{self, InstanceReading};
-use crate::osd::{self, OsdReading};
+use crate::osd::{self, OsdReading, UpdateMemory};
 use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
 
@@ -209,6 +209,9 @@ pub struct Sampler<R: IncusRead> {
     probed_at: Option<u64>,
     /// When the incus-osd documents were last read, in epoch milliseconds. `None` until the first read.
     osd_read_at: Option<u64>,
+    /// The update result and last success time carried between incus-osd reads, so an in-progress or skipped status keeps the
+    /// previous result. A failed read leaves it as it was.
+    osd_memory: UpdateMemory,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -226,6 +229,7 @@ impl<R: IncusRead> Sampler<R> {
             probes: Vec::new(),
             probed_at: None,
             osd_read_at: None,
+            osd_memory: UpdateMemory::default(),
         }
     }
 
@@ -257,7 +261,7 @@ impl<R: IncusRead> Sampler<R> {
         };
         let osd = if self.osd_due(now_ms) {
             self.osd_read_at = Some(now_ms);
-            osd::read(&self.incus, now_ms)
+            osd::read(&self.incus, now_ms, &mut self.osd_memory)
         } else {
             self.readings.osd.clone()
         };

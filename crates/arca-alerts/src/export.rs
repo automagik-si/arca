@@ -214,13 +214,13 @@ const FAMILIES: [Family; 30] = [
     Family {
         name: UPDATE_LAST_SUCCESS,
         kind: "gauge",
-        help: "When incus-osd last checked for updates without a reported failure, in epoch seconds.",
+        help: "When incus-osd last completed an update check, in epoch seconds.",
         labels: &[],
     },
     Family {
         name: UPDATE_FAILED,
         kind: "gauge",
-        help: "1 when incus-osd reports an update failure, or its last check is 14 days old, 0 when not.",
+        help: "1 when incus-osd reports an update failure, or no update check has completed in 14 days, 0 when not.",
         labels: &[],
     },
     Family {
@@ -453,7 +453,7 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             UPDATE_FAILED,
             SeriesKind::Gauge,
             &[],
-            flag(osd.update_failed),
+            osd.update_failed.and_then(flag),
         );
     }
     if let Some(components) = fresh(&inputs.components, HEALTH_MAX_AGE_MS, inputs.at) {
@@ -714,6 +714,8 @@ mod tests {
             ..AlertSnapshot::default()
         };
         let text = render_metrics("node1", &snapshot);
+        // Checked first, so the messages below that show the text never show a key.
+        assert!(!text.contains(FAKE_KEY), "a fake key reached /metrics");
         assert!(
             text.contains("arca_secureboot_enabled{node=\"node1\"} 1\n"),
             "{text}"
@@ -732,7 +734,6 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(!text.contains(FAKE_KEY), "{text}");
     }
 
     #[test]

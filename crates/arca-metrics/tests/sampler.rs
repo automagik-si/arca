@@ -1588,7 +1588,7 @@ mod osd_readings {
         );
         sampler.sample(CHECKED);
         let failed = reading(&sampler).expect("both documents read");
-        assert!(failed.update_failed, "a failed status");
+        assert_eq!(failed.update_failed, Some(true), "a failed status");
         assert_eq!(
             failed.last_success_ms, None,
             "a failed status has no success time"
@@ -1600,8 +1600,9 @@ mod osd_readings {
         );
         sampler.sample(CHECKED + 15 * DAY);
         let stale = reading(&sampler).expect("both documents read");
-        assert!(
+        assert_eq!(
             stale.update_failed,
+            Some(true),
             "a check 15 days old with no failed status"
         );
         assert_eq!(stale.last_check_ms, Some(CHECKED));
@@ -1617,7 +1618,7 @@ mod osd_readings {
         let mut sampler = sampler_over(&docs);
         sampler.sample(CHECKED + DAY);
         let fresh = reading(&sampler).expect("both documents read");
-        assert!(!fresh.update_failed);
+        assert_eq!(fresh.update_failed, Some(false));
         assert!(fresh.secure_boot);
         assert!(fresh.tpm_ok);
         assert_eq!(fresh.last_success_ms, Some(CHECKED));
@@ -1655,7 +1656,7 @@ mod osd_readings {
     }
 
     #[test]
-    fn a_missing_check_time_is_no_staleness_and_no_success_but_the_status_still_reads() {
+    fn a_missing_check_time_leaves_staleness_unknown_and_no_success_but_the_status_still_reads() {
         let docs = Docs::default();
         let mut sampler = sampler_over(&docs);
         docs.serve(
@@ -1665,9 +1666,221 @@ mod osd_readings {
         sampler.sample(CHECKED + 30 * DAY);
         let reading =
             reading(&sampler).expect("both documents answer with the fields the status needs");
-        assert!(!reading.update_failed, "no check time means no staleness");
+        assert_eq!(
+            reading.update_failed, None,
+            "no check time and no earlier success: the 14-day leg is unknown, never ok"
+        );
         assert_eq!(reading.last_check_ms, None);
         assert_eq!(reading.last_success_ms, None);
+    }
+
+    /// The RFC 3339 check time `day` days after the fixtures' check time.
+    fn checked_on(day: u64) -> String {
+        format!("2026-11-{:02}T10:00:00Z", 1 + day)
+    }
+
+    /// Serves an update document with `status` checked on `day`, and samples at `at`.
+    fn read_at(
+        sampler: &mut Sampler<Docs>,
+        docs: &Docs,
+        status: &str,
+        day: u64,
+        at: u64,
+    ) -> OsdReading {
+        docs.serve(security(), update(status, &checked_on(day)));
+        sampler.sample(at);
+        reading(sampler).expect("both documents read")
+    }
+
+    #[test]
+    fn a_failure_followed_by_a_skipping_status_stays_failed_even_across_a_failed_read() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        let failed = read_at(
+            &mut sampler,
+            &docs,
+            "Failed to check for OS updates",
+            0,
+            CHECKED,
+        );
+        assert_eq!(failed.update_failed, Some(true));
+        docs.down();
+        sampler.sample(CHECKED + 300_000);
+        assert_eq!(reading(&sampler), None, "the read failed");
+        let skipped = read_at(
+            &mut sampler,
+            &docs,
+            "Skipping update check outside of maintenance window(s), will check at the beginning of the next maintenance window in 2h0m0s",
+            0,
+            CHECKED + 600_000,
+        );
+        assert_eq!(
+            skipped.update_failed,
+            Some(true),
+            "a skip says nothing new, so the failure holds"
+        );
+        assert_eq!(skipped.last_success_ms, None, "a skip is not a success");
+    }
+
+    #[test]
+    fn a_checking_status_mid_check_does_not_clear_a_firing_alert() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        let failed = read_at(
+            &mut sampler,
+            &docs,
+            "Failed to refresh system extensions",
+            0,
+            CHECKED,
+        );
+        assert_eq!(failed.update_failed, Some(true));
+        let checking = read_at(
+            &mut sampler,
+            &docs,
+            "Checking for application updates",
+            1,
+            CHECKED + DAY,
+        );
+        assert_eq!(
+            checking.update_failed,
+            Some(true),
+            "a check in progress keeps the failure"
+        );
+        assert_eq!(checking.last_check_ms, Some(CHECKED + DAY));
+        let done = read_at(
+            &mut sampler,
+            &docs,
+            "Application update check completed",
+            1,
+            CHECKED + DAY + 300_000,
+        );
+        assert_eq!(
+            done.update_failed,
+            Some(false),
+            "a completed check clears it"
+        );
+        assert_eq!(done.last_success_ms, Some(CHECKED + DAY));
+    }
+
+    #[test]
+    fn a_checking_status_with_no_earlier_result_is_unknown_not_ok() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        let checking = read_at(&mut sampler, &docs, "Checking for OS updates", 0, CHECKED);
+        assert_eq!(checking.update_failed, None);
+        assert_eq!(checking.last_success_ms, None);
+    }
+
+    #[test]
+    fn the_success_time_holds_the_last_success_across_a_failure() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        let ok = read_at(&mut sampler, &docs, "OS update check completed", 0, CHECKED);
+        assert_eq!(ok.last_success_ms, Some(CHECKED));
+        let failed = read_at(
+            &mut sampler,
+            &docs,
+            "Failed to check for OS updates",
+            1,
+            CHECKED + DAY,
+        );
+        assert_eq!(failed.update_failed, Some(true));
+        assert_eq!(failed.last_check_ms, Some(CHECKED + DAY));
+        assert_eq!(
+            failed.last_success_ms,
+            Some(CHECKED),
+            "the gauge keeps the last success"
+        );
+        let checking = read_at(
+            &mut sampler,
+            &docs,
+            "Checking for OS updates",
+            2,
+            CHECKED + 2 * DAY,
+        );
+        assert_eq!(checking.last_success_ms, Some(CHECKED));
+        let updated = read_at(
+            &mut sampler,
+            &docs,
+            "IncusOS has been updated to version 202611030000",
+            2,
+            CHECKED + 2 * DAY + 300_000,
+        );
+        assert_eq!(updated.update_failed, Some(false));
+        assert_eq!(updated.last_success_ms, Some(CHECKED + 2 * DAY));
+    }
+
+    #[test]
+    fn the_14_day_leg_fires_while_checks_keep_failing_and_the_check_time_moves_forward() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        read_at(&mut sampler, &docs, "OS update check completed", 0, CHECKED);
+        // An error's own text is not a known status, so it carries the earlier ok; only the age of the last success can
+        // catch a node stuck like this.
+        for day in 1..=13 {
+            let carried = read_at(
+                &mut sampler,
+                &docs,
+                "lookup of installed applications broke",
+                day,
+                CHECKED + day * DAY,
+            );
+            assert_eq!(
+                carried.update_failed,
+                Some(false),
+                "day {day} is inside 14 days"
+            );
+            assert_eq!(carried.last_check_ms, Some(CHECKED + day * DAY));
+        }
+        for day in 14..=16 {
+            let stale = read_at(
+                &mut sampler,
+                &docs,
+                "lookup of installed applications broke",
+                day,
+                CHECKED + day * DAY,
+            );
+            assert_eq!(
+                stale.update_failed,
+                Some(true),
+                "day {day}: no success for 14 days"
+            );
+            assert_eq!(stale.last_success_ms, Some(CHECKED));
+            assert_eq!(
+                stale.last_check_ms,
+                Some(CHECKED + day * DAY),
+                "the check time kept moving"
+            );
+        }
+        // Failed statuses with a moving check time keep the same last success.
+        let failed = read_at(
+            &mut sampler,
+            &docs,
+            "Failed to check for OS updates",
+            17,
+            CHECKED + 17 * DAY,
+        );
+        assert_eq!(failed.update_failed, Some(true));
+        assert_eq!(failed.last_success_ms, Some(CHECKED));
+    }
+
+    #[test]
+    fn an_unparseable_check_time_does_not_turn_off_staleness() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        read_at(&mut sampler, &docs, "OS update check completed", 0, CHECKED);
+        docs.serve(security(), update("Checking for OS updates", "not a time"));
+        sampler.sample(CHECKED + 15 * DAY);
+        let reading = reading(&sampler).expect("both documents read");
+        assert_eq!(
+            reading.last_check_ms, None,
+            "an unparseable time is no time"
+        );
+        assert_eq!(
+            reading.update_failed,
+            Some(true),
+            "staleness still runs from the last success"
+        );
     }
 
     #[test]
@@ -1692,8 +1905,11 @@ mod osd_readings {
         let mut sampler = sampler_over(&docs);
         sampler.sample(CHECKED);
         let debug = format!("{:?}", sampler.readings());
-        assert!(!debug.contains(FAKE_KEY), "{debug}");
-        assert!(!debug.contains("FAKE-PUBLIC-KEY"), "{debug}");
+        assert!(!debug.contains(FAKE_KEY), "a fake key reached the readings");
+        assert!(
+            !debug.contains("FAKE-PUBLIC-KEY"),
+            "a fake key reached the readings"
+        );
         assert!(reading(&sampler).is_some());
     }
 }
