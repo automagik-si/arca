@@ -23,6 +23,7 @@ use arca::cmd_adopt::{
 use arca::cmd_serve::watch_handler;
 use arca::config;
 use arca::desired_store::lock_state_dir;
+use arca::handlers::{now_ms, watcher_step};
 use arca_api::Scope;
 use arca_incus::adopt::{AdoptStep, AdoptTarget, Allowances};
 use arca_incus::{FakeIncus, UnixIncus};
@@ -1334,9 +1335,11 @@ fn after_adoption_the_watch_shows_the_instance_kernel_owned_with_no_drift() {
         .expect("a report")
     };
     let served = || {
-        watch_handler(&cfg)
-            .call(json!({}), &viewer())
-            .expect("watch_report")
+        // watch_report never sweeps: one sweep runs first, as the watcher thread's would.
+        let handler = watch_handler(&cfg);
+        let mut last = None;
+        watcher_step(&handler, now_ms(), &mut last);
+        handler.call(json!({}), &viewer()).expect("watch_report")
     };
     for report in [once(), served()] {
         assert_eq!(

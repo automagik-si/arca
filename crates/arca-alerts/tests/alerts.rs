@@ -5,8 +5,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -1245,6 +1248,313 @@ mod store_failure {
     }
 }
 
+/// What a stub socket answers each connection with.
+#[derive(Clone, Copy)]
+enum Answer {
+    /// A status line and no body.
+    Status(&'static str),
+    /// Incus's answer to `GET /1.0`: a sync envelope with status 200.
+    Incus,
+    /// No answer for longer than a check waits.
+    Hang,
+}
+
+/// A unix socket that answers every connection the same way and records each request line. Dropping it stops the listener.
+struct Stub {
+    socket: PathBuf,
+    lines: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Stub {
+    fn start(socket: PathBuf, answer: Answer) -> Stub {
+        let listener = UnixListener::bind(&socket).expect("bind the stub socket");
+        listener
+            .set_nonblocking(true)
+            .expect("the listener is nonblocking");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (log, halt) = (Arc::clone(&lines), Arc::clone(&stop));
+        let thread = thread::spawn(move || {
+            while !halt.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => answer_once(stream, answer, &log),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Stub {
+            socket,
+            lines,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// The request line of each connection so far, in order.
+    fn requests(&self) -> Vec<String> {
+        self.lines.lock().expect("the log").clone()
+    }
+}
+
+impl Drop for Stub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Reads one request's head, answers it, and logs its request line.
+fn answer_once(mut stream: UnixStream, answer: Answer, log: &Mutex<Vec<String>>) {
+    stream
+        .set_nonblocking(false)
+        .expect("the connection is blocking");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("a read deadline");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => break,
+        }
+    }
+    let line = String::from_utf8_lossy(&head)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    log.lock().expect("the log").push(line);
+    let reply = match answer {
+        Answer::Status(status) => {
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        }
+        Answer::Incus => {
+            let body = r#"{"type":"sync","status":"Success","status_code":200,"metadata":{}}"#;
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+        Answer::Hang => {
+            thread::sleep(Duration::from_secs(3));
+            return;
+        }
+    };
+    let _ = stream.write_all(reply.as_bytes());
+}
+
+mod checks {
+    use super::*;
+    use arca_alerts::checks::{CHECK_TIMEOUT, CheckTargets, components};
+    use std::time::Instant;
+
+    /// The reading of one component, or `None` when the reading has no such component.
+    fn ok_of(reading: &Timed<Vec<Component>>, name: ComponentName) -> Option<bool> {
+        reading
+            .value
+            .iter()
+            .find(|component| component.name == name)
+            .map(|component| component.ok)
+    }
+
+    fn targets(incus: PathBuf, arca: PathBuf, shim: Option<PathBuf>) -> CheckTargets {
+        CheckTargets { incus, arca, shim }
+    }
+
+    #[test]
+    fn a_socket_answering_401_to_a_tokenless_post_is_arca_ok() {
+        let scratch = Scratch::new("checks-arca-401");
+        let arca = Stub::start(
+            scratch.join("arca.sock"),
+            Answer::Status("401 Unauthorized"),
+        );
+        let t = targets(
+            scratch.join("incus.sock"),
+            arca.socket().to_path_buf(),
+            None,
+        );
+        let reading = components(&t, None, T0);
+        assert_eq!(ok_of(&reading, ComponentName::Arca), Some(true));
+        assert_eq!(arca.requests(), ["POST /mcp HTTP/1.1"]);
+    }
+
+    #[test]
+    fn a_socket_answering_200_to_the_tokenless_post_is_not_arca_ok() {
+        let scratch = Scratch::new("checks-arca-200");
+        let arca = Stub::start(scratch.join("arca.sock"), Answer::Status("200 OK"));
+        let t = targets(
+            scratch.join("incus.sock"),
+            arca.socket().to_path_buf(),
+            None,
+        );
+        assert_eq!(
+            ok_of(&components(&t, None, T0), ComponentName::Arca),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn an_absent_socket_is_not_ok_for_incus_or_arca() {
+        let scratch = Scratch::new("checks-absent");
+        let t = targets(scratch.join("incus.sock"), scratch.join("arca.sock"), None);
+        let reading = components(&t, None, T0);
+        assert_eq!(ok_of(&reading, ComponentName::Incus), Some(false));
+        assert_eq!(ok_of(&reading, ComponentName::Arca), Some(false));
+    }
+
+    #[test]
+    fn a_socket_that_never_answers_is_not_arca_ok_within_the_check_timeout() {
+        let scratch = Scratch::new("checks-hang");
+        let arca = Stub::start(scratch.join("arca.sock"), Answer::Hang);
+        let t = targets(
+            scratch.join("incus.sock"),
+            arca.socket().to_path_buf(),
+            None,
+        );
+        let started = Instant::now();
+        let reading = components(&t, None, T0);
+        let took = started.elapsed();
+        assert_eq!(ok_of(&reading, ComponentName::Arca), Some(false));
+        assert!(
+            took < CHECK_TIMEOUT + Duration::from_secs(1),
+            "the check gives up within its timeout, not after {took:?}"
+        );
+    }
+
+    #[test]
+    fn incus_is_ok_only_when_get_1_0_answers_200() {
+        let scratch = Scratch::new("checks-incus");
+        let incus = Stub::start(scratch.join("incus.sock"), Answer::Incus);
+        let broken = Stub::start(
+            scratch.join("broken.sock"),
+            Answer::Status("500 Internal Server Error"),
+        );
+        let arca = scratch.join("arca.sock");
+        let good = components(
+            &targets(incus.socket().to_path_buf(), arca.clone(), None),
+            None,
+            T0,
+        );
+        assert_eq!(ok_of(&good, ComponentName::Incus), Some(true));
+        assert_eq!(incus.requests(), ["GET /1.0 HTTP/1.1"]);
+        let bad = components(
+            &targets(broken.socket().to_path_buf(), arca, None),
+            None,
+            T0,
+        );
+        assert_eq!(ok_of(&bad, ComponentName::Incus), Some(false));
+    }
+
+    #[test]
+    fn the_shim_component_exists_only_when_a_shim_socket_is_named() {
+        let scratch = Scratch::new("checks-shim");
+        let shim = Stub::start(scratch.join("shim.sock"), Answer::Incus);
+        let arca = scratch.join("arca.sock");
+        let unnamed = components(
+            &targets(scratch.join("incus.sock"), arca.clone(), None),
+            None,
+            T0,
+        );
+        assert_eq!(
+            ok_of(&unnamed, ComponentName::Shim),
+            None,
+            "no shim without shimSocket"
+        );
+        assert_eq!(unnamed.value.len(), 3);
+
+        let named = components(
+            &targets(
+                scratch.join("incus.sock"),
+                arca.clone(),
+                Some(shim.socket().to_path_buf()),
+            ),
+            None,
+            T0,
+        );
+        assert_eq!(ok_of(&named, ComponentName::Shim), Some(true));
+        assert_eq!(shim.requests(), ["GET /1.0 HTTP/1.1"]);
+
+        let missing = components(
+            &targets(
+                scratch.join("incus.sock"),
+                arca,
+                Some(scratch.join("no-shim.sock")),
+            ),
+            None,
+            T0,
+        );
+        assert_eq!(ok_of(&missing, ComponentName::Shim), Some(false));
+    }
+
+    #[test]
+    fn the_watch_component_is_ok_while_the_newest_sweep_is_within_90_s() {
+        let scratch = Scratch::new("checks-watch");
+        let t = targets(scratch.join("incus.sock"), scratch.join("arca.sock"), None);
+        assert_eq!(
+            ok_of(&components(&t, None, T0), ComponentName::Watch),
+            Some(false),
+            "no sweep has succeeded"
+        );
+        assert_eq!(
+            ok_of(&components(&t, Some(T0), T0), ComponentName::Watch),
+            Some(true)
+        );
+        assert_eq!(
+            ok_of(
+                &components(&t, Some(T0), T0 + WATCH_MAX_AGE_MS),
+                ComponentName::Watch
+            ),
+            Some(true),
+            "a sweep 90 s old is still ok, the boundary the evaluator reads the drift with"
+        );
+        assert_eq!(
+            ok_of(
+                &components(&t, Some(T0), T0 + WATCH_MAX_AGE_MS + 1),
+                ComponentName::Watch
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn the_components_are_stamped_with_the_tick_time_in_name_order() {
+        let scratch = Scratch::new("checks-order");
+        let t = targets(
+            scratch.join("incus.sock"),
+            scratch.join("arca.sock"),
+            Some(scratch.join("shim.sock")),
+        );
+        let reading = components(&t, Some(T0), T0 + 5);
+        assert_eq!(reading.at, T0 + 5);
+        let names: Vec<ComponentName> = reading
+            .value
+            .iter()
+            .map(|component| component.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ComponentName::Incus,
+                ComponentName::Arca,
+                ComponentName::Watch,
+                ComponentName::Shim
+            ]
+        );
+    }
+}
+
 mod get_only {
     use super::*;
 
@@ -1280,10 +1590,20 @@ mod get_only {
         let store = Store::open(&state, T0).expect("the store opens").store;
         let mut engine =
             Engine::start(store, Rules::default(), false, T0).expect("the engine starts");
+        let arca = Stub::start(
+            scratch.join("arca.sock"),
+            Answer::Status("401 Unauthorized"),
+        );
+        let targets = arca_alerts::checks::CheckTargets {
+            incus: fake.socket().to_path_buf(),
+            arca: arca.socket().to_path_buf(),
+            shim: None,
+        };
         for tick in 0..30u64 {
             let now = T0 + tick * 5_000;
             sampler.sample(now);
-            let readings = inputs::from_sampler(&sampler);
+            let mut readings = inputs::from_sampler(&sampler);
+            readings.components = Some(arca_alerts::checks::components(&targets, None, now));
             let points = export::points(&sampler, &readings);
             engine.tick(&readings, points, now);
         }
@@ -1293,6 +1613,8 @@ mod get_only {
             requests.iter().all(|request| request.method == "GET"),
             "{requests:?}"
         );
+        // The health check's one non-GET goes to arca's own socket, once per tick, and nowhere else.
+        assert_eq!(arca.requests(), vec!["POST /mcp HTTP/1.1".to_string(); 30]);
         assert!(fake.writes().is_empty(), "no write reached Incus");
         assert!(
             !state.join("desired.json").exists(),
