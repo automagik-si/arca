@@ -1261,3 +1261,146 @@ mod instance_readings {
         );
     }
 }
+
+mod latency_probe {
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use arca_metrics::ProbeTarget;
+    use arca_metrics::probe::tcp_connect_seconds;
+
+    use super::*;
+
+    const ONE_SECOND: Duration = Duration::from_secs(1);
+
+    /// A listener on a loopback port the kernel picks. Each connection it accepts is sent on the returned channel. The accepting
+    /// thread ends with the test process.
+    fn listener() -> (SocketAddr, Receiver<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the listener has an address");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+                let _ = tx.send(());
+            }
+        });
+        (addr, rx)
+    }
+
+    /// A loopback port with nothing listening on it: the listener is bound, its address kept, and the listener closed.
+    fn closed_port() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the listener has an address");
+        drop(listener);
+        addr
+    }
+
+    /// A sampler over a host with no files and an Incus with no socket, so only the probes have readings, with the given targets.
+    fn probing(scratch: &Scratch, probes: Vec<(ProbeTarget, SocketAddr)>) -> Sampler<UnixIncus> {
+        sampler_for(
+            scratch.path(),
+            &scratch.path().join("incus.sock"),
+            &[],
+            5_000,
+            60,
+        )
+        .with_probes(probes)
+    }
+
+    /// The time of the newest probe round, or `None` when no round has run.
+    fn round_at(sampler: &Sampler<UnixIncus>) -> Option<u64> {
+        sampler.readings().latency.as_ref().map(|round| round.at)
+    }
+
+    #[test]
+    fn a_listener_on_loopback_gives_the_connect_time_in_seconds() {
+        let (addr, _accepted) = listener();
+        let seconds = tcp_connect_seconds(addr, ONE_SECOND).expect("the connect completes");
+        assert!(
+            seconds.is_finite() && (0.0..1.0).contains(&seconds),
+            "a loopback connect is quick: {seconds}"
+        );
+    }
+
+    #[test]
+    fn a_closed_port_gives_none_within_one_point_one_seconds() {
+        let started = Instant::now();
+        assert_eq!(tcp_connect_seconds(closed_port(), ONE_SECOND), None);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_100),
+            "the refused connect returns within the timeout's margin: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn probes_run_at_zero_and_thirty_seconds_and_not_at_five() {
+        let scratch = Scratch::new("latency-due");
+        let (addr, accepted) = listener();
+        let mut sampler = probing(&scratch, vec![(ProbeTarget::Gateway, addr)]);
+
+        sampler.sample(0);
+        assert_eq!(round_at(&sampler), Some(0), "the first sample probes");
+        accepted
+            .recv_timeout(ONE_SECOND)
+            .expect("the round at 0 s connects");
+
+        sampler.sample(5_000);
+        assert_eq!(round_at(&sampler), Some(0), "no round is due at 5 s");
+        assert!(
+            accepted.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing connects at 5 s"
+        );
+
+        sampler.sample(30_000);
+        assert_eq!(round_at(&sampler), Some(30_000), "a round is due 30 s on");
+        accepted
+            .recv_timeout(ONE_SECOND)
+            .expect("the round at 30 s connects");
+    }
+
+    #[test]
+    fn a_clock_that_steps_back_still_runs_a_round() {
+        let scratch = Scratch::new("latency-clock");
+        let (addr, _accepted) = listener();
+        let mut sampler = probing(&scratch, vec![(ProbeTarget::Gateway, addr)]);
+        sampler.sample(60_000);
+        sampler.sample(10_000);
+        assert_eq!(round_at(&sampler), Some(10_000));
+    }
+
+    #[test]
+    fn an_unnamed_target_has_no_entry_and_a_failed_one_reads_none() {
+        let scratch = Scratch::new("latency-entries");
+        let (addr, _accepted) = listener();
+        let mut sampler = probing(
+            &scratch,
+            vec![
+                (ProbeTarget::Gateway, addr),
+                (ProbeTarget::Relay, closed_port()),
+            ],
+        );
+        sampler.sample(0);
+        let round = sampler.readings().latency.clone().expect("a round ran");
+        assert_eq!(round.at, 0);
+        assert_eq!(round.targets.len(), 2, "internet was not named");
+        assert_eq!(round.targets[0].0, ProbeTarget::Gateway);
+        assert!(round.targets[0].1.is_some(), "the listener answers");
+        assert_eq!(round.targets[1], (ProbeTarget::Relay, None));
+    }
+
+    #[test]
+    fn a_sampler_with_no_named_target_never_probes() {
+        let scratch = Scratch::new("latency-none");
+        let mut sampler = probing(&scratch, Vec::new());
+        for at in [0, 30_000, 60_000] {
+            sampler.sample(at);
+        }
+        assert_eq!(sampler.readings().latency, None);
+    }
+}

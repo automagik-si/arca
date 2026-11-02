@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
+use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ use std::time::Instant;
 
 use arca_alerts::Engine;
 use arca_alerts::checks::CheckTargets;
-use arca_alerts::rules::{self, RulesError};
+use arca_alerts::rules::{self, Probes, RulesError};
 use arca_api::verbs;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE,
@@ -26,6 +27,7 @@ use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
 use arca_mcp::{Server, TokenStore, TokenStoreError, serve_proxy, serve_tailnet, serve_unix};
+use arca_metrics::ProbeTarget;
 use arca_providers::ReadOnlyIncusProvider;
 use arca_providers::incus::{Family, IncusProvider, RetainedSet};
 use arca_reconcile::PluginSet;
@@ -144,7 +146,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         arca: cfg.listen.unix.clone(),
         shim: alerts_file.shim_socket.clone(),
     };
-    let ticker = Ticker::new(new_sampler(&cfg), engine, published.clone(), alerts.clone())
+    let sampler = new_sampler(&cfg).with_probes(probe_targets(&alerts_file.probes));
+    let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
         .with_watch(Arc::clone(&watch));
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
@@ -384,6 +387,18 @@ fn rules_failure(error: RulesError) -> Failure {
 
 /// Ticks on a background thread, first at once and then every [`SAMPLE_INTERVAL`], for the life of the process. Each tick's
 /// sample and alerts are published as soon as they are taken.
+/// The latency targets `alerts.json` names, in the order the gauge writes them. A target that is not named is not probed.
+fn probe_targets(probes: &Probes) -> Vec<(ProbeTarget, SocketAddr)> {
+    [
+        (ProbeTarget::Gateway, probes.gateway),
+        (ProbeTarget::Internet, probes.internet),
+        (ProbeTarget::Relay, probes.relay),
+    ]
+    .into_iter()
+    .filter_map(|(target, addr)| addr.map(|addr| (target, addr)))
+    .collect()
+}
+
 fn spawn_sampler(mut ticker: Ticker<Store>) -> io::Result<()> {
     thread::Builder::new()
         .name("arca-sampler".to_string())
@@ -431,6 +446,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn only_the_named_probe_targets_are_probed_and_in_the_gauge_order() {
+        let gateway: SocketAddr = "127.0.0.1:9".parse().expect("a socket address");
+        let relay: SocketAddr = "127.0.0.2:9".parse().expect("a socket address");
+        let probes = Probes {
+            gateway: Some(gateway),
+            internet: None,
+            relay: Some(relay),
+        };
+        assert_eq!(
+            probe_targets(&probes),
+            vec![(ProbeTarget::Gateway, gateway), (ProbeTarget::Relay, relay)]
+        );
+        assert!(probe_targets(&Probes::default()).is_empty());
     }
 
     #[test]

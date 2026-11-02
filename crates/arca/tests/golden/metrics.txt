@@ -77,6 +77,10 @@ arca_instance_cpu_seconds_total{node="000000000000000000000000000000000000000000
 # TYPE arca_instance_memory_used_bytes gauge
 arca_instance_memory_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="db1"} 1073741824
 arca_instance_memory_used_bytes{node="0000000000000000000000000000000000000000000000000000000000000000",project="proj1",incus_instance="vm1"} 2147483648
+# HELP arca_latency_seconds The TCP connect time to a latency target, in seconds.
+# TYPE arca_latency_seconds gauge
+arca_latency_seconds{node="0000000000000000000000000000000000000000000000000000000000000000",target="gateway"} 0.002
+arca_latency_seconds{node="0000000000000000000000000000000000000000000000000000000000000000",target="relay"} 0.045
 # HELP arca_alert_firing 1 for each firing alert.
 # TYPE arca_alert_firing gauge
 arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="cpu-hot",severity="warning"} 1
