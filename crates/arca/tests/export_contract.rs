@@ -34,7 +34,7 @@ use arca_mcp::{
 };
 use arca_metrics::{
     Cpu, HostSample, InstanceKind, InstanceReading, LatencyReading, Load, Memory, NicCounters,
-    Pool, ProbeTarget, ProjectCount, Psi, Readings,
+    OsdReading, Pool, ProbeTarget, ProjectCount, Psi, Readings,
 };
 use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
@@ -199,6 +199,14 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
                 (ProbeTarget::Internet, None),
                 (ProbeTarget::Relay, Some(0.045)),
             ],
+        }),
+        osd: Some(OsdReading {
+            at,
+            secure_boot: true,
+            tpm_ok: true,
+            update_failed: Some(false),
+            last_check_ms: Some(at - 60_000),
+            last_success_ms: Some(at - 60_000),
         }),
     };
     (sample, readings)

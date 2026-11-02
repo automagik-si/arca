@@ -1,14 +1,16 @@
 //! Arca's host sampler. It reads the node's procfs and sysfs trees, and asks Incus for the storage pools its allow-filter admits
 //! and the instances per project with GET requests only. Each sample is served in the `node_metrics` shape, and no sample carries
-//! a renter gate. [`Readings`] keeps what Incus answered at the latest sample, with a `None` for each read that failed, and the
-//! newest latency probe round.
+//! a renter gate. [`Readings`] keeps what Incus answered at the latest sample, with a `None` for each read that failed, the newest latency probe
+//! round, and the incus-osd update and Secure Boot reading.
 
 mod incus;
+mod osd;
 pub mod probe;
 mod procfs;
 mod sample;
 
 pub use incus::{InstanceKind, InstanceReading};
+pub use osd::OsdReading;
 pub use probe::ProbeTarget;
 pub use sample::{
     Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, Memory, Network, NicCounters, Pool,

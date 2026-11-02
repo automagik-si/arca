@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::incus::{self, InstanceReading};
+use crate::osd::{self, OsdReading, UpdateMemory};
 use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
 
@@ -26,6 +27,9 @@ const PROBE_EVERY_MS: u64 = 30_000;
 
 /// How long one latency probe may take to connect before it reads `None`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How often the incus-osd security and update documents are read, in milliseconds.
+const OSD_EVERY_MS: u64 = 300_000;
 
 /// Where the sampler reads, which pools it reports, and how many samples it keeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +169,9 @@ pub struct Readings {
     pub instances: Option<Vec<InstanceReading>>,
     /// The newest latency probe round. `None` before the first round, and always when no target is named.
     pub latency: Option<LatencyReading>,
+    /// The incus-osd reading, taken every 5 min. `None` when either document cannot be read, as on a plain Incus that answers
+    /// 404, and before the first read.
+    pub osd: Option<OsdReading>,
 }
 
 /// What the sampler keeps of one instance between ticks: its `last_used_at` on the previous listing, its starts since the
@@ -200,6 +207,11 @@ pub struct Sampler<R: IncusRead> {
     probes: Vec<(ProbeTarget, SocketAddr)>,
     /// When the last probe round ran, in epoch milliseconds. `None` until the first round.
     probed_at: Option<u64>,
+    /// When the incus-osd documents were last read, in epoch milliseconds. `None` until the first read.
+    osd_read_at: Option<u64>,
+    /// The update result and last success time carried between incus-osd reads, so an in-progress or skipped status keeps the
+    /// previous result. A failed read leaves it as it was.
+    osd_memory: UpdateMemory,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -216,6 +228,8 @@ impl<R: IncusRead> Sampler<R> {
             starts: BTreeMap::new(),
             probes: Vec::new(),
             probed_at: None,
+            osd_read_at: None,
+            osd_memory: UpdateMemory::default(),
         }
     }
 
@@ -244,6 +258,12 @@ impl<R: IncusRead> Sampler<R> {
             Some(self.probe_round(now_ms))
         } else {
             self.readings.latency.clone()
+        };
+        let osd = if self.osd_due(now_ms) {
+            self.osd_read_at = Some(now_ms);
+            osd::read(&self.incus, now_ms, &mut self.osd_memory)
+        } else {
+            self.readings.osd.clone()
         };
         let rows = match &pools {
             Some(listed) => {
@@ -285,6 +305,7 @@ impl<R: IncusRead> Sampler<R> {
             }),
             instances,
             latency,
+            osd,
         };
         self.previous = Some(Previous {
             at: now_ms,
@@ -347,6 +368,13 @@ impl<R: IncusRead> Sampler<R> {
         }
         self.probed_at
             .is_none_or(|at| now_ms.abs_diff(at) >= PROBE_EVERY_MS)
+    }
+
+    /// Whether the incus-osd documents are due: none has been read yet, or 5 min have passed since the last read in either
+    /// direction, so a clock that steps back does not stop the reads.
+    fn osd_due(&self, now_ms: u64) -> bool {
+        self.osd_read_at
+            .is_none_or(|at| now_ms.abs_diff(at) >= OSD_EVERY_MS)
     }
 
     /// Probes every named target at once, each with [`PROBE_TIMEOUT`], and returns the round. A probe whose thread cannot start,
