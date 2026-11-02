@@ -986,28 +986,38 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     let tokens = scratch.at("tokens");
     fs::create_dir_all(&tokens).expect("create the token directory");
     fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
-    let at = free_loopback_port();
-    let mut value = config(&scratch, rig.shim.socket());
-    value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
-    let path = write_config(&scratch, "node.json", &value);
-    let mut child = arca()
-        .args(["serve", "--config"])
-        .arg(&path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start arca serve");
+    // A port is free when it is probed, but another process can take it before `serve` binds it. A `serve` that exits before it
+    // listens is started again on a fresh port, at most five times.
+    let mut attempts = 0;
+    let (mut child, at, mut stream) = loop {
+        attempts += 1;
+        let at = free_loopback_port();
+        let mut value = config(&scratch, rig.shim.socket());
+        value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
+        let path = write_config(&scratch, "node.json", &value);
+        let mut child = arca()
+            .args(["serve", "--config"])
+            .arg(&path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start arca serve");
 
-    let deadline = Instant::now() + WAIT;
-    let mut stream = loop {
-        if let Ok(stream) = std::net::TcpStream::connect(at) {
-            break stream;
+        let deadline = Instant::now() + WAIT;
+        let stream = loop {
+            if let Ok(stream) = std::net::TcpStream::connect(at) {
+                break Some(stream);
+            }
+            if let Some(status) = child.try_wait().expect("poll the server") {
+                assert!(attempts < 5, "the server exited before listening: {status}");
+                break None;
+            }
+            assert!(Instant::now() < deadline, "the proxy listener comes up");
+            thread::sleep(Duration::from_millis(20));
+        };
+        if let Some(stream) = stream {
+            break (child, at, stream);
         }
-        if let Some(status) = child.try_wait().expect("poll the server") {
-            panic!("the server exited before listening: {status}");
-        }
-        assert!(Instant::now() < deadline, "the proxy listener comes up");
-        thread::sleep(Duration::from_millis(20));
     };
     stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;

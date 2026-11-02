@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 
 const INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=2";
 const POOLS: &str = "/1.0/storage-pools?recursion=1";
+/// The incus-osd documents the sampler reads at its first tick and every 5 min after.
+const OSD_SECURITY: &str = "/os/1.0/system/security";
+const OSD_UPDATE: &str = "/os/1.0/system/update";
 
 /// A fresh temporary directory, removed when the test ends.
 struct Scratch(PathBuf);
@@ -377,15 +380,21 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
     let requests = fake.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "the pool list, the instance list and one resources read for the admitted pool"
+        5,
+        "the pool list, the instance list, one resources read for the admitted pool and the two incus-osd documents"
     );
     assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
     let mut paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
     paths.sort_unstable();
     assert_eq!(
         paths,
-        vec![INSTANCES, "/1.0/storage-pools/default/resources", POOLS,]
+        vec![
+            INSTANCES,
+            "/1.0/storage-pools/default/resources",
+            POOLS,
+            OSD_SECURITY,
+            OSD_UPDATE,
+        ]
     );
 
     assert_eq!(
@@ -418,7 +427,12 @@ fn a_pool_name_that_is_not_plain_is_never_sent_to_incus() {
     paths.sort_unstable();
     assert_eq!(
         paths,
-        vec![INSTANCES.to_string(), POOLS.to_string()],
+        vec![
+            INSTANCES.to_string(),
+            POOLS.to_string(),
+            OSD_SECURITY.to_string(),
+            OSD_UPDATE.to_string(),
+        ],
         "the pool list and the instance list were sent, and no resources read"
     );
     assert_eq!(sample.pools.len(), 3, "every listed name keeps its row");
@@ -785,6 +799,8 @@ mod pools_from_incus {
                 "/1.0/storage-pools/default/resources".to_string(),
                 "/1.0/storage-pools/pool1/resources".to_string(),
                 POOLS.to_string(),
+                OSD_SECURITY.to_string(),
+                OSD_UPDATE.to_string(),
             ]
         );
     }
@@ -814,6 +830,8 @@ mod pools_from_incus {
                 INSTANCES.to_string(),
                 "/1.0/storage-pools/pool1/resources".to_string(),
                 POOLS.to_string(),
+                OSD_SECURITY.to_string(),
+                OSD_UPDATE.to_string(),
             ],
             "a pool the filter drops is not read"
         );
@@ -843,7 +861,12 @@ mod pools_from_incus {
         );
         assert_eq!(
             sorted_paths(&fake),
-            vec![INSTANCES.to_string(), POOLS.to_string()],
+            vec![
+                INSTANCES.to_string(),
+                POOLS.to_string(),
+                OSD_SECURITY.to_string(),
+                OSD_UPDATE.to_string(),
+            ],
             "no resources read for a name Incus does not list"
         );
     }
@@ -1402,5 +1425,275 @@ mod latency_probe {
             sampler.sample(at);
         }
         assert_eq!(sampler.readings().latency, None);
+    }
+}
+
+mod osd_readings {
+    use std::sync::{Arc, Mutex};
+
+    use arca_incus::{IncusError, IncusRead};
+    use arca_metrics::OsdReading;
+
+    use super::*;
+
+    const SECURITY: &str = "/os/1.0/system/security";
+    const UPDATE: &str = "/os/1.0/system/update";
+
+    /// A fake secret. It is obviously fake, and no reading, debug text or error may carry it.
+    const FAKE_KEY: &str = "FAKE-RECOVERY-KEY-NOT-REAL-0002";
+
+    /// The check time of the fixtures: 10:00:00 UTC on 2026-11-01, in epoch milliseconds.
+    const CHECKED: u64 = 1_793_527_200_000;
+    const DAY: u64 = 86_400_000;
+
+    /// The two documents the fake serves, or `None` for both answering 404 as a plain Incus does. Each read is recorded by path.
+    #[derive(Clone, Default)]
+    struct Docs {
+        served: Arc<Mutex<Option<(Value, Value)>>>,
+        reads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Docs {
+        fn serve(&self, security: Value, update: Value) {
+            *self.served.lock().expect("the documents are not poisoned") = Some((security, update));
+        }
+
+        fn down(&self) {
+            *self.served.lock().expect("the documents are not poisoned") = None;
+        }
+
+        /// The times the security document was read at, given the sample times.
+        fn security_reads(&self) -> usize {
+            self.reads
+                .lock()
+                .expect("the reads are not poisoned")
+                .iter()
+                .filter(|path| path.as_str() == SECURITY)
+                .count()
+        }
+    }
+
+    impl IncusRead for Docs {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            self.reads
+                .lock()
+                .expect("the reads are not poisoned")
+                .push(path.to_string());
+            let served = self.served.lock().expect("the documents are not poisoned");
+            match (served.as_ref(), path) {
+                (Some((security, _)), SECURITY) => Ok(security.clone()),
+                (Some((_, update)), UPDATE) => Ok(update.clone()),
+                _ => Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                }),
+            }
+        }
+    }
+
+    /// The security document with Secure Boot on, a TPM that reports ok, and the fake keys in the places incus-osd keeps them.
+    fn security() -> Value {
+        json!({
+            "config": { "encryption_recovery_keys": [FAKE_KEY] },
+            "state": {
+                "secure_boot_enabled": true,
+                "tpm_status": "ok",
+                "drive_recovery_keys": { "drive1": FAKE_KEY },
+                "pool_recovery_keys": { "pool1": FAKE_KEY },
+                "tpm_public_key": "FAKE-PUBLIC-KEY-NOT-REAL",
+            },
+        })
+    }
+
+    /// The update document with a status and a check time.
+    fn update(status: &str, last_check: &str) -> Value {
+        json!({
+            "config": { "auto_reboot": false },
+            "state": { "status": status, "last_check": last_check, "needs_reboot": false },
+        })
+    }
+
+    /// A sampler over roots that do not exist and no pools, so only the incus-osd documents have readings.
+    fn sampler_over(docs: &Docs) -> Sampler<Docs> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-osd-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-osd-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            docs.clone(),
+        )
+    }
+
+    /// The reading the sampler holds at its latest sample.
+    fn reading(sampler: &Sampler<Docs>) -> Option<OsdReading> {
+        sampler.readings().osd.clone()
+    }
+
+    #[test]
+    fn a_plain_incus_that_answers_404_gives_no_osd_reading() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        sampler.sample(CHECKED);
+        assert_eq!(reading(&sampler), None, "404 is unknown, never a reading");
+    }
+
+    #[test]
+    fn the_documents_are_read_at_zero_and_300_seconds_and_not_between() {
+        let docs = Docs::default();
+        docs.serve(
+            security(),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        let mut sampler = sampler_over(&docs);
+        let mut read_at = Vec::new();
+        let mut seen = 0;
+        for at in (0..=600_000).step_by(5_000) {
+            sampler.sample(at);
+            let now = docs.security_reads();
+            if now != seen {
+                read_at.push(at);
+                seen = now;
+            }
+        }
+        assert_eq!(
+            read_at,
+            vec![0, 300_000, 600_000],
+            "reads at 0 s, 300 s and 600 s only"
+        );
+        assert_eq!(
+            docs.reads
+                .lock()
+                .expect("the reads are not poisoned")
+                .iter()
+                .filter(|p| p.as_str() == UPDATE)
+                .count(),
+            3,
+            "the update document is read at the same times"
+        );
+    }
+
+    #[test]
+    fn a_failed_status_gives_update_failed_and_a_check_15_days_old_does_too() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        docs.serve(
+            security(),
+            update(
+                "Failed to refresh system extensions",
+                "2026-11-01T10:00:00Z",
+            ),
+        );
+        sampler.sample(CHECKED);
+        let failed = reading(&sampler).expect("both documents read");
+        assert!(failed.update_failed, "a failed status");
+        assert_eq!(
+            failed.last_success_ms, None,
+            "a failed status has no success time"
+        );
+
+        docs.serve(
+            security(),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        sampler.sample(CHECKED + 15 * DAY);
+        let stale = reading(&sampler).expect("both documents read");
+        assert!(
+            stale.update_failed,
+            "a check 15 days old with no failed status"
+        );
+        assert_eq!(stale.last_check_ms, Some(CHECKED));
+    }
+
+    #[test]
+    fn a_check_one_day_old_with_no_failed_status_is_not_a_failure() {
+        let docs = Docs::default();
+        docs.serve(
+            security(),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        let mut sampler = sampler_over(&docs);
+        sampler.sample(CHECKED + DAY);
+        let fresh = reading(&sampler).expect("both documents read");
+        assert!(!fresh.update_failed);
+        assert!(fresh.secure_boot);
+        assert!(fresh.tpm_ok);
+        assert_eq!(fresh.last_success_ms, Some(CHECKED));
+    }
+
+    #[test]
+    fn a_read_that_fails_clears_the_reading_until_the_next_read_and_between_reads_it_holds() {
+        let docs = Docs::default();
+        docs.serve(
+            security(),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        let mut sampler = sampler_over(&docs);
+        sampler.sample(0);
+        assert!(reading(&sampler).is_some());
+        sampler.sample(60_000);
+        assert!(
+            reading(&sampler).is_some(),
+            "between reads the reading holds"
+        );
+        docs.down();
+        sampler.sample(300_000);
+        assert_eq!(reading(&sampler), None, "the read at 300 s failed");
+        docs.serve(
+            security(),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        sampler.sample(330_000);
+        assert_eq!(reading(&sampler), None, "no read until 600 s");
+        sampler.sample(600_000);
+        assert!(
+            reading(&sampler).is_some(),
+            "the next read at 600 s succeeds"
+        );
+    }
+
+    #[test]
+    fn a_missing_check_time_is_no_staleness_and_no_success_but_the_status_still_reads() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        docs.serve(
+            security(),
+            json!({ "state": { "status": "OS update check completed" } }),
+        );
+        sampler.sample(CHECKED + 30 * DAY);
+        let reading =
+            reading(&sampler).expect("both documents answer with the fields the status needs");
+        assert!(!reading.update_failed, "no check time means no staleness");
+        assert_eq!(reading.last_check_ms, None);
+        assert_eq!(reading.last_success_ms, None);
+    }
+
+    #[test]
+    fn a_document_missing_its_security_half_is_no_reading_at_all() {
+        let docs = Docs::default();
+        let mut sampler = sampler_over(&docs);
+        docs.serve(
+            json!({ "state": {} }),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        sampler.sample(CHECKED);
+        assert_eq!(reading(&sampler), None);
+    }
+
+    #[test]
+    fn no_fake_secret_reaches_the_readings_or_their_debug_form() {
+        let docs = Docs::default();
+        docs.serve(
+            security(),
+            update("Failed to check for OS updates", "2026-11-01T10:00:00Z"),
+        );
+        let mut sampler = sampler_over(&docs);
+        sampler.sample(CHECKED);
+        let debug = format!("{:?}", sampler.readings());
+        assert!(!debug.contains(FAKE_KEY), "{debug}");
+        assert!(!debug.contains("FAKE-PUBLIC-KEY"), "{debug}");
+        assert!(reading(&sampler).is_some());
     }
 }

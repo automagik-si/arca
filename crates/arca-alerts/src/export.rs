@@ -12,7 +12,9 @@ use arca_metrics::{HostSample, Readings, Sampler};
 use arca_store::{AlertEvent, Point, SeriesKind};
 
 use crate::AlertSnapshot;
-use crate::eval::{HEALTH_MAX_AGE_MS, Inputs, PROBE_MAX_AGE_MS, Timed, WATCH_MAX_AGE_MS};
+use crate::eval::{
+    HEALTH_MAX_AGE_MS, Inputs, OSD_MAX_AGE_MS, PROBE_MAX_AGE_MS, Timed, WATCH_MAX_AGE_MS,
+};
 
 pub const CPU_USED: &str = "arca_node_cpu_used_ratio";
 pub const CPU_CORES: &str = "arca_node_cpu_cores";
@@ -37,6 +39,10 @@ pub const INSTANCE_STARTS: &str = "arca_instance_starts_total";
 pub const INSTANCE_CPU: &str = "arca_instance_cpu_seconds_total";
 pub const INSTANCE_MEMORY: &str = "arca_instance_memory_used_bytes";
 pub const LATENCY: &str = "arca_latency_seconds";
+pub const SECURE_BOOT: &str = "arca_secureboot_enabled";
+pub const TPM_PRESENT: &str = "arca_tpm_present";
+pub const UPDATE_LAST_SUCCESS: &str = "arca_update_last_success_timestamp_seconds";
+pub const UPDATE_FAILED: &str = "arca_update_failed";
 pub const ALERT_FIRING: &str = "arca_alert_firing";
 pub const STORE_WRITE_FAILURES: &str = "arca_store_write_failures_total";
 pub const SAMPLE_TIMESTAMP: &str = "arca_sample_timestamp_seconds";
@@ -54,7 +60,7 @@ struct Family {
 }
 
 /// The families `/metrics` renders, in the export contract's order. A new family goes in its place in this order.
-const FAMILIES: [Family; 26] = [
+const FAMILIES: [Family; 30] = [
     Family {
         name: CPU_USED,
         kind: "gauge",
@@ -192,6 +198,30 @@ const FAMILIES: [Family; 26] = [
         kind: "gauge",
         help: "The TCP connect time to a latency target, in seconds.",
         labels: &["target"],
+    },
+    Family {
+        name: SECURE_BOOT,
+        kind: "gauge",
+        help: "1 when Secure Boot is enabled, 0 when it is not.",
+        labels: &[],
+    },
+    Family {
+        name: TPM_PRESENT,
+        kind: "gauge",
+        help: "1 when the TPM reports its status as ok, 0 when it does not.",
+        labels: &[],
+    },
+    Family {
+        name: UPDATE_LAST_SUCCESS,
+        kind: "gauge",
+        help: "When incus-osd last checked for updates without a reported failure, in epoch seconds.",
+        labels: &[],
+    },
+    Family {
+        name: UPDATE_FAILED,
+        kind: "gauge",
+        help: "1 when incus-osd reports an update failure, or its last check is 14 days old, 0 when not.",
+        labels: &[],
     },
     Family {
         name: ALERT_FIRING,
@@ -390,6 +420,42 @@ pub fn points_of(sample: &HostSample, readings: &Readings, inputs: &Inputs) -> V
             push(&mut out, LATENCY, SeriesKind::Gauge, &labels, *seconds);
         }
     }
+    // The incus-osd reading is written only while it is no older than its maximum age at the tick. A failed read is no reading.
+    if let Some(osd) = readings
+        .osd
+        .as_ref()
+        .filter(|osd| inputs.at.saturating_sub(osd.at) <= OSD_MAX_AGE_MS)
+    {
+        let flag = |value: bool| Some(if value { 1.0 } else { 0.0 });
+        push(
+            &mut out,
+            SECURE_BOOT,
+            SeriesKind::Gauge,
+            &[],
+            flag(osd.secure_boot),
+        );
+        push(
+            &mut out,
+            TPM_PRESENT,
+            SeriesKind::Gauge,
+            &[],
+            flag(osd.tpm_ok),
+        );
+        push(
+            &mut out,
+            UPDATE_LAST_SUCCESS,
+            SeriesKind::Gauge,
+            &[],
+            osd.last_success_ms.map(|ms| ms as f64 / 1_000.0),
+        );
+        push(
+            &mut out,
+            UPDATE_FAILED,
+            SeriesKind::Gauge,
+            &[],
+            flag(osd.update_failed),
+        );
+    }
     if let Some(components) = fresh(&inputs.components, HEALTH_MAX_AGE_MS, inputs.at) {
         for component in &components.value {
             let ok = if component.ok { 1.0 } else { 0.0 };
@@ -564,4 +630,147 @@ fn escape(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use arca_incus::{IncusError, IncusRead};
+    use arca_metrics::{Sampler, SamplerConfig};
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::AlertSnapshot;
+    use crate::eval::UpdateUse;
+    use crate::inputs::from_sampler;
+
+    /// A fake secret. It is obviously fake, and no `/metrics` line may carry it.
+    const FAKE_KEY: &str = "FAKE-RECOVERY-KEY-NOT-REAL-0003";
+    const AT: u64 = 1_793_527_200_000;
+
+    /// An Incus that answers the two incus-osd documents, or 404 for each when `served` is `None`.
+    struct Osd {
+        served: Option<(Value, Value)>,
+    }
+
+    impl IncusRead for Osd {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            match (&self.served, path) {
+                (Some((security, _)), "/os/1.0/system/security") => Ok(security.clone()),
+                (Some((_, update)), "/os/1.0/system/update") => Ok(update.clone()),
+                _ => Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                }),
+            }
+        }
+    }
+
+    /// A sampler that has read the documents once at `AT`, over roots that do not exist.
+    fn sampled(served: Option<(Value, Value)>) -> Sampler<Osd> {
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-export-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-export-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+            },
+            Osd { served },
+        );
+        sampler.sample(AT);
+        sampler
+    }
+
+    /// The documents with Secure Boot on, a TPM that reports ok, a check that reports no failure, and fake recovery keys.
+    fn documents() -> (Value, Value) {
+        (
+            json!({ "state": {
+                "secure_boot_enabled": true,
+                "tpm_status": "ok",
+                "drive_recovery_keys": { "drive1": FAKE_KEY },
+                "pool_recovery_keys": { "pool1": FAKE_KEY },
+            } }),
+            json!({ "state": { "status": "OS update check completed", "last_check": "2026-11-01T10:00:00Z" } }),
+        )
+    }
+
+    #[test]
+    fn the_osd_families_render_from_the_documents_and_no_secret_text_reaches_metrics() {
+        let sampler = sampled(Some(documents()));
+        let inputs = from_sampler(&sampler);
+        assert_eq!(
+            inputs.update,
+            Some(Timed {
+                at: AT,
+                value: UpdateUse { failed: false },
+            })
+        );
+        let snapshot = AlertSnapshot {
+            at: AT,
+            sample_at: Some(AT),
+            points: points(&sampler, &inputs),
+            ..AlertSnapshot::default()
+        };
+        let text = render_metrics("node1", &snapshot);
+        assert!(
+            text.contains("arca_secureboot_enabled{node=\"node1\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("arca_tpm_present{node=\"node1\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("arca_update_failed{node=\"node1\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "arca_update_last_success_timestamp_seconds{node=\"node1\"} 1793527200\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains(FAKE_KEY), "{text}");
+    }
+
+    #[test]
+    fn an_unreadable_osd_writes_no_osd_series() {
+        let sampler = sampled(None);
+        let inputs = from_sampler(&sampler);
+        assert_eq!(inputs.update, None, "a failed read is unknown");
+        let text = render_metrics(
+            "node1",
+            &AlertSnapshot {
+                points: points(&sampler, &inputs),
+                ..AlertSnapshot::default()
+            },
+        );
+        assert!(!text.contains("arca_secureboot_enabled"), "{text}");
+        assert!(!text.contains("arca_update_failed"), "{text}");
+    }
+
+    #[test]
+    fn an_osd_reading_older_than_its_max_age_is_left_out() {
+        let sampler = sampled(Some(documents()));
+        let sample = sampler.latest().expect("one sample was taken");
+        let fresh = Inputs {
+            at: AT + OSD_MAX_AGE_MS,
+            ..Inputs::default()
+        };
+        let stale = Inputs {
+            at: AT + OSD_MAX_AGE_MS + 1,
+            ..Inputs::default()
+        };
+        let has_osd = |points: &[Point]| points.iter().any(|point| point.name == UPDATE_FAILED);
+        assert!(
+            has_osd(&points_of(sample, sampler.readings(), &fresh)),
+            "at the boundary it is still read"
+        );
+        assert!(
+            !has_osd(&points_of(sample, sampler.readings(), &stale)),
+            "one millisecond past it is not"
+        );
+    }
 }

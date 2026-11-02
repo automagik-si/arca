@@ -81,6 +81,18 @@ arca_instance_memory_used_bytes{node="000000000000000000000000000000000000000000
 # TYPE arca_latency_seconds gauge
 arca_latency_seconds{node="0000000000000000000000000000000000000000000000000000000000000000",target="gateway"} 0.002
 arca_latency_seconds{node="0000000000000000000000000000000000000000000000000000000000000000",target="relay"} 0.045
+# HELP arca_secureboot_enabled 1 when Secure Boot is enabled, 0 when it is not.
+# TYPE arca_secureboot_enabled gauge
+arca_secureboot_enabled{node="0000000000000000000000000000000000000000000000000000000000000000"} 1
+# HELP arca_tpm_present 1 when the TPM reports its status as ok, 0 when it does not.
+# TYPE arca_tpm_present gauge
+arca_tpm_present{node="0000000000000000000000000000000000000000000000000000000000000000"} 1
+# HELP arca_update_last_success_timestamp_seconds When incus-osd last checked for updates without a reported failure, in epoch seconds.
+# TYPE arca_update_last_success_timestamp_seconds gauge
+arca_update_last_success_timestamp_seconds{node="0000000000000000000000000000000000000000000000000000000000000000"} 1793361725
+# HELP arca_update_failed 1 when incus-osd reports an update failure, or its last check is 14 days old, 0 when not.
+# TYPE arca_update_failed gauge
+arca_update_failed{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
 # HELP arca_alert_firing 1 for each firing alert.
 # TYPE arca_alert_firing gauge
 arca_alert_firing{node="0000000000000000000000000000000000000000000000000000000000000000",rule="cpu-hot",severity="warning"} 1

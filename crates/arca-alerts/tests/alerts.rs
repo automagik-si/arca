@@ -1613,6 +1613,15 @@ mod get_only {
             requests.iter().all(|request| request.method == "GET"),
             "{requests:?}"
         );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path == "/os/1.0/system/security")
+                && requests
+                    .iter()
+                    .any(|request| request.path == "/os/1.0/system/update"),
+            "the incus-osd documents are read, by GET"
+        );
         // The health check's one non-GET goes to arca's own socket, once per tick, and nowhere else.
         assert_eq!(arca.requests(), vec!["POST /mcp HTTP/1.1".to_string(); 30]);
         assert!(fake.writes().is_empty(), "no write reached Incus");
