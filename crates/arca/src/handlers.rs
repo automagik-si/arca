@@ -879,6 +879,8 @@ mod tests {
     use super::*;
 
     const PROJECTS_PATH: &str = "/1.0/projects?recursion=1";
+    /// The instance list the sampler reads each tick, with each row's state.
+    const SAMPLED_INSTANCES: &str = "/1.0/instances?all-projects=true&recursion=2";
 
     /// An Incus that answers the project index and the instance listing from two scripts, one answer per read, the last
     /// answer repeating.
@@ -908,7 +910,8 @@ mod tests {
                         .collect(),
                 ));
             }
-            if path == INSTANCES_ALL_PROJECTS {
+            // The watch reads the recursion-one listing, and the sampler reads the recursion-two listing in the same tick.
+            if path == INSTANCES_ALL_PROJECTS || path == SAMPLED_INSTANCES {
                 return Ok(Value::Array(next_answer(&self.instances)));
             }
             Err(IncusError::Decode(format!("no script answer for {path}")))
