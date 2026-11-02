@@ -3,7 +3,6 @@
 //! temporary directory. Nothing here reaches a real Incus socket, a tailnet address or a system service: every Incus socket
 //! is a fake behind a recording shim, and a refused config never gets as far as a socket.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -980,11 +979,12 @@ fn free_loopback_port() -> std::net::SocketAddr {
 /// Whether process `pid` holds a listening IPv4 or IPv6 TCP socket on `port`, read from procfs (Linux). A socket is in the
 /// process's descriptor table with its inode, and the kernel lists it as LISTEN in `/proc/net/tcp*`, only once its own `bind`
 /// and `listen` have succeeded. So this holds for the server under test and never for another process's listener.
+#[cfg(target_os = "linux")]
 fn child_listens_on(pid: u32, port: u16) -> bool {
     let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
         return false;
     };
-    let sockets: BTreeSet<String> = fds
+    let sockets: std::collections::BTreeSet<String> = fds
         .filter_map(|fd| fs::read_link(fd.ok()?.path()).ok())
         .filter_map(|link| {
             let text = link.to_str()?;
@@ -1019,6 +1019,7 @@ fn child_listens_on(pid: u32, port: u16) -> bool {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     let scratch = Scratch::new("serve-proxy");
     let rig = rig(&scratch);

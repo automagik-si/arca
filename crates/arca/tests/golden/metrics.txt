@@ -87,7 +87,7 @@ arca_secureboot_enabled{node="00000000000000000000000000000000000000000000000000
 # HELP arca_tpm_present 1 when the TPM reports its status as ok, 0 when it does not.
 # TYPE arca_tpm_present gauge
 arca_tpm_present{node="0000000000000000000000000000000000000000000000000000000000000000"} 1
-# HELP arca_update_last_success_timestamp_seconds When incus-osd last completed an update check, in epoch seconds.
+# HELP arca_update_last_success_timestamp_seconds The start time of the last completed incus-osd update check, in epoch seconds.
 # TYPE arca_update_last_success_timestamp_seconds gauge
 arca_update_last_success_timestamp_seconds{node="0000000000000000000000000000000000000000000000000000000000000000"} 1793361725
 # HELP arca_update_failed 1 when incus-osd reports an update failure, or no update check has completed in 14 days, 0 when not.

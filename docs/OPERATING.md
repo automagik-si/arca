@@ -177,7 +177,9 @@ its request is read.
 - `watch_report` reads every project and instance through Incus GET, but a call never starts a sweep. The `arca-watcher`
   thread sweeps once when `serve` starts and then every 30 seconds, so the GETs do not depend on how often the report is
   asked for. A call answers from the newest successful sweep, and every answer carries `ageMs`, the milliseconds since that
-  sweep started. A failed sweep leaves the previous report in place. Before the first sweep has finished, a call waits up to
+  sweep started. A sweep that runs longer than about 44 seconds makes `watch` stale: the stamp is the sweep's start, the
+  next sweep starts only after the last one ends, so the newest stamp can be more than 90 seconds old before the next sweep
+  finishes. A failed sweep leaves the previous report in place. Before the first sweep has finished, a call waits up to
   35 seconds for it. If no sweep has ever succeeded, the call answers the last sweep error, or `no watch sweep has finished
   yet`. Live desired-state entries do not exist yet, so the report has no entries to compare, and every kernel-marked
   object is reported as drift.
@@ -663,7 +665,8 @@ or a file that is not JSON stops `serve` with exit 2. The error names a key and 
 
 Set `"enabled": false` for a sensor the node lacks, such as a CPU without a temperature sensor, or a node with no SMART
 drive. A disabled rule is never evaluated or exported, and `alerts_list` lists it under `disabled`. If a rule that has a
-firing alert is disabled, that alert resolves at the next start with reason `rule-disabled`.
+firing alert is disabled, that alert resolves at the next start with reason `rule-disabled`. On a node without incus-osd,
+also disable `update-failed` and `smart-warning`; see "incus-osd readings".
 
 ### The rules
 
@@ -717,13 +720,24 @@ result, 2 hours.
 
 Every 300 seconds, `serve` reads two incus-osd documents with GETs: the security state and the update status. Every 600
 seconds it reads the storage document for SMART. A node without incus-osd gives no reading for these, so their rules are
-unknown there.
+unknown there, and the HEALTH line shows `· N unknown` for them. On such a node, disable both rules in `alerts.json` and
+restart `serve`, which reads that file only at start:
+
+```json
+{
+  "rules": [
+    { "id": "update-failed", "enabled": false },
+    { "id": "smart-warning", "enabled": false }
+  ]
+}
+```
 
 - **Secure Boot.** `arca_secureboot_enabled` is 1 when Secure Boot is on.
 - **TPM.** `arca_tpm_present` is 1 only when incus-osd reports the TPM status `ok`, a physical TPM whose measured boot state
   matches. It is 0 for these other statuses:
   - `pcr mismatch`: PCR 7, the Secure Boot measurement, differs from the value incus-osd computes from its event log.
-    incus-osd then reports that a PCR update is pending before the encrypted volumes can unlock with the TPM.
+    The mismatch does not by itself stop TPM unlock. incus-osd reports the encrypted volumes as `unlocked (TPM; PCR update
+    pending)` and assumes TPM unlock still works at the next reboot.
   - `swtpm`: no physical TPM was found, so incus-osd runs on a software TPM. incus-osd reports this as a degraded security
     state.
   - Any other status is also 0.
@@ -732,8 +746,9 @@ unknown there.
   as a check in progress, a skipped check outside the maintenance window, or an error text, keeps the previous result.
   `update-failed` is 1 after a failed check and until a later completed one, and it is 1 when no check has completed for 14
   days. A node that incus-osd has never given a check time for, and that has no completed check, has no reading, so the rule
-  does not fire. `arca_update_last_success_timestamp_seconds` is the time of the last completed check, and it is absent
-  until one completes. `arca_update_failed` is absent while the rule has no reading.
+  does not fire. `arca_update_last_success_timestamp_seconds` is the start time of the last completed check, because
+  incus-osd records a check's time when the check starts. It is absent until one completes. `arca_update_failed` is absent
+  while the rule has no reading.
 - **Recovery keys.** The security document holds recovery keys. Each read takes only the Secure Boot and TPM fields, and it
   drops the body when the read returns. The keys are therefore held in memory, as a JSON value, for the length of each read.
   They are never stored, logged, put in an error or exported.
@@ -794,11 +809,12 @@ incus-osd records for the drive changes. To map a label to a physical drive:
 
 The four health components feed `service-down`. Each one is checked on every tick:
 
-- `incus`: `GET /1.0` on the Incus socket returns 200 within 2 seconds.
+- `incus`: `GET /1.0` on the Incus socket returns 200 within 2 seconds. The 2 seconds cover the request and its reply;
+  the connect to the Unix socket has no timeout of its own.
 - `arca`: a `POST /mcp` with no token to the node's own unix socket returns 401 within 2 seconds. This is the one request
   `arca-alerts` makes that is not a GET. It carries no token and changes nothing.
 - `watch`: the newest successful watch sweep is no older than 90 seconds. Sweeps are timed by the clock, so if the clock is set
-  back, sweeps pause until it has passed the last sweep's start by 30 seconds.
+  back, sweeps pause until it has passed the last sweep's start by 30 seconds. The age counts from the sweep's start.
 - `shim`: with `shimSocket` set, `GET /1.0` through the recording shim answers 200 within 2 seconds.
 
 ### Restarts
@@ -850,7 +866,7 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_latency_seconds` | gauge | `target` (`gateway`, `internet`, `relay`) | the TCP connect time to a probe target |
 | `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |
 | `arca_tpm_present` | gauge | | 1 only when incus-osd reports the TPM status `ok`; see "incus-osd readings" |
-| `arca_update_last_success_timestamp_seconds` | gauge | | when incus-osd last completed an update check, in epoch seconds |
+| `arca_update_last_success_timestamp_seconds` | gauge | | the start time of the last completed incus-osd update check, in epoch seconds |
 | `arca_update_failed` | gauge | | 1 for a failed update or no completed check in 14 days, 0 otherwise |
 | `arca_smart_passed` | gauge | `device` | 1 when the drive's SMART check passed, 0 when it failed; see "SMART drive labels" |
 | `arca_alert_firing` | gauge | `rule`, `severity`, and the alert's own labels | 1 for each firing alert |
@@ -895,7 +911,8 @@ next commit that works (see "Store failure").
 
 - The file is in WAL mode with `synchronous=FULL`. A commit is on disk when it returns, so a tick that committed survives a
   crash or a power loss. `NORMAL` is not used, because it could lose the last commits.
-- Each 5-second tick is one transaction: the tick's points, about 125 series on a typical node, and its alert events.
+- Each 5-second tick is one transaction: the tick's points and its alert events. The measured one-host example under
+  "Sizing" has 125 series.
 - The WAL is checkpointed automatically every 1000 pages, and after a checkpoint its file is cut back to at most 64 MiB. When
   an hour closes, the rollup checkpoints the WAL fully and returns free pages, which can stall one tick by up to 5 seconds.
 - Each connection reads back its journal mode and `synchronous` value. If they are not `wal` and 2, the store refuses to open,
@@ -942,11 +959,14 @@ client's `after` cursor therefore never sees `seq` go backwards.
 When a commit fails, for example on a full disk:
 
 - The tick still publishes, with `storeError: {at, message}` in `alerts_list`, and that tick's points are dropped.
-- Its alert events wait in memory, at most 1,000. Past that the oldest are dropped, and the message counts them.
+- Its alert events wait in memory, at most 1,000. Past that the oldest are dropped. The `storeError` message then counts
+  every alert event dropped since the server started, and that count does not reset until a restart.
 - The next commit that works writes the waiting events with their original times. Until then they appear in `alerts_list`
   without a `seq`, and they are not in `/alerts`.
 - `store-write-failed` fires at once, and `arca_store_write_failures_total` counts the failure. A commit that takes over one
   second also counts as a failure, although its events are kept.
+- A rollup that fails, which runs at the first tick of a minute, takes the same path: that tick's `storeError` is set and
+  `store-write-failed` fires.
 
 ## Tests
 

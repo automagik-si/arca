@@ -216,7 +216,7 @@ const FAMILIES: [Family; 31] = [
     Family {
         name: UPDATE_LAST_SUCCESS,
         kind: "gauge",
-        help: "When incus-osd last completed an update check, in epoch seconds.",
+        help: "The start time of the last completed incus-osd update check, in epoch seconds.",
         labels: &[],
     },
     Family {
