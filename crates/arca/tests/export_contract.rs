@@ -31,7 +31,7 @@ use arca_mcp::{
     CallError, Caller, GetHandler, GetReply, Server, TokenStore, ToolHandler, mint, serve_unix,
 };
 use arca_metrics::{Cpu, HostSample, Load, Memory, NicCounters, Pool, ProjectCount, Psi, Readings};
-use arca_store::{AlertEvent, EventState, ResolveReason, Store};
+use arca_store::{AlertEvent, DB_FILE, EventState, ResolveReason, Store};
 use common::{NOW, Scratch, caller};
 use serde_json::{Value, json};
 
@@ -727,6 +727,41 @@ fn alerts_list_reads_the_resolves_of_the_last_day_newest_first() {
     assert!(list["storeBytes"].as_u64().is_some_and(|bytes| bytes > 0));
     let schema = (verb("alerts_list").expect("the verb exists").result)();
     assert_eq!(conforms(&schema, &list), Ok(()));
+}
+
+#[test]
+fn alerts_list_keeps_the_firing_alerts_when_the_history_read_fails() {
+    let scratch = Scratch::new("history-read");
+    let state = state_dir(&scratch);
+    let snapshot = run(&state);
+    let firing_count = snapshot.firing.len();
+    assert!(firing_count > 0, "the scenario has firing alerts");
+    let alerts = AlertsPublished::default();
+    alerts.publish(snapshot);
+    let handler = AlertsHandler {
+        alerts,
+        published: Published::default(),
+        store: reader(&state),
+        node: NODE.to_string(),
+    };
+    // Dropping the table under the open reader makes its history read fail.
+    rusqlite::Connection::open(state.join(DB_FILE))
+        .expect("the database opens")
+        .execute("DROP TABLE alert_events", [])
+        .expect("the table drops");
+    let list = handler
+        .call(json!({}), &caller(Scope::Viewer))
+        .expect("alerts_list still answers");
+    assert_eq!(list["firing"].as_array().map(Vec::len), Some(firing_count));
+    assert_eq!(list["resolvedRecent"], json!([]));
+    assert!(
+        list["storeError"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not be read")),
+        "the read failure is reported: {}",
+        list["storeError"]
+    );
+    assert!(list["healthLine"].is_string());
 }
 
 #[test]

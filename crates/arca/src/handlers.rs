@@ -380,17 +380,29 @@ impl ToolHandler for AlertsHandler {
             })
             .collect();
         let store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = store
-            .resolved_since(now.saturating_sub(RESOLVED_WINDOW_MS), RESOLVED_LIMIT)
-            .map_err(|error| {
-                CallError::Internal(format!("the resolved alerts could not be read: {error}"))
-            })?;
+        let read = store.resolved_since(now.saturating_sub(RESOLVED_WINDOW_MS), RESOLVED_LIMIT);
         let store_bytes = store.bytes();
         drop(store);
-        let resolved: Vec<Value> = resolved
-            .iter()
-            .map(|event| event.to_json(&self.node))
-            .collect();
+        // A failed history read must not hide the firing alerts, so it empties `resolvedRecent` and reports itself.
+        let (resolved, read_failure): (Vec<Value>, Option<String>) = match read {
+            Ok(events) => (
+                events
+                    .iter()
+                    .map(|event| event.to_json(&self.node))
+                    .collect(),
+                None,
+            ),
+            Err(error) => {
+                let message = format!("the resolved alerts could not be read: {error}");
+                eprintln!("arca: {message}");
+                (Vec::new(), Some(message))
+            }
+        };
+        let store_error = match (&snapshot.store_error, read_failure) {
+            (Some(error), _) => Some(json!({ "at": error.at, "message": error.message })),
+            (None, Some(message)) => Some(json!({ "at": now, "message": message })),
+            (None, None) => None,
+        };
         Ok(json!({
             "firing": firing,
             "unknown": unknown,
@@ -399,9 +411,7 @@ impl ToolHandler for AlertsHandler {
             "sampleAgeMs": sample_age,
             "watchAgeMs": snapshot.watch_at.map(|taken| now.saturating_sub(taken)),
             "commitMs": snapshot.commit_ms,
-            "storeError": snapshot.store_error.as_ref().map(|error| {
-                json!({ "at": error.at, "message": error.message })
-            }),
+            "storeError": store_error,
             "storeReset": snapshot.store_reset,
             "storeBytes": store_bytes,
             "healthLine": health::alerts_line(&snapshot, now),

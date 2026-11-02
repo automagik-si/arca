@@ -48,6 +48,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "p256",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.1",
