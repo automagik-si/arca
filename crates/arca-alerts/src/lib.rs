@@ -10,6 +10,7 @@
 pub mod checks;
 pub mod eval;
 pub mod export;
+pub mod health;
 pub mod inputs;
 pub mod rules;
 
@@ -125,6 +126,8 @@ pub struct AlertSnapshot {
     pub at: u64,
     /// When the host sample the tick read was taken.
     pub sample_at: Option<u64>,
+    /// When the newest watch sweep the tick read was taken, or `None` when no sweep has succeeded.
+    pub watch_at: Option<u64>,
     pub points: Vec<Point>,
     pub firing: Vec<FiringAlert>,
     pub unknown: Vec<UnknownAlert>,
@@ -203,6 +206,7 @@ impl<S: TickStore> Engine<S> {
         AlertSnapshot {
             at: now_ms,
             sample_at: None,
+            watch_at: None,
             points,
             firing: self.firing(),
             unknown: self.eval.unknown(),

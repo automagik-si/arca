@@ -36,7 +36,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler, Published,
+    AlertsExport, AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler, Published,
     SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
     plan_handlers, spawn_watcher,
 };
@@ -149,6 +149,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .with_watch(Arc::clone(&watch));
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
+    let reader = Arc::new(Mutex::new(reader));
     let mut server = Server::new(verbs(), tokens)
         .handle(
             "arca_status",
@@ -171,8 +172,15 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(AlertsHandler {
                 alerts: alerts.clone(),
                 published,
-                store: Arc::new(Mutex::new(reader)),
+                store: Arc::clone(&reader),
                 node: node.clone(),
+            }),
+        )
+        .get_route(
+            "/alerts",
+            Arc::new(AlertsExport {
+                node: node.clone(),
+                store: reader,
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
