@@ -222,7 +222,7 @@ const FAMILIES: [Family; 31] = [
     Family {
         name: UPDATE_FAILED,
         kind: "gauge",
-        help: "1 when incus-osd reports an update failure, or no update check has completed in 14 days, 0 when not.",
+        help: "1 when incus-osd reports an update failure, no update check has completed in 14 days, or a node up 24 hours has no completed check on record; 0 when not.",
         labels: &[],
     },
     Family {

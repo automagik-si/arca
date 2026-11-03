@@ -748,9 +748,9 @@ restart `serve`, which reads that file only at start:
   days. A node with no usable check time and no known completed check also fires once its uptime reaches 24 hours.
   Uptime comes from `/proc/uptime`, so restarting arca does not restart this grace period. Missing or unparseable uptime
   leaves this condition unknown. A completed status with an unusable time does not count as never checked.
-  `arca_update_last_success_timestamp_seconds` is the start time of the last completed check, because
-  incus-osd records a check's time when the check starts. It is absent until one completes. `arca_update_failed` is absent
-  while the rule has no reading.
+  `arca_update_last_success_timestamp_seconds` is the start time of the last completed check, because incus-osd records
+  a check's time when the check starts. It is absent until one completes. `arca_update_failed` is absent while the rule
+  has no reading.
 - **Recovery keys.** The security document holds recovery keys. Each read takes only the Secure Boot and TPM fields, and it
   drops the body when the read returns. The keys are therefore held in memory, as a JSON value, for the length of each read.
   They are never stored, logged, put in an error or exported.
