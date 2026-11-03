@@ -383,3 +383,44 @@ async fn first_stream_and_first_pair_line_have_an_accept_deadline() {
     .await
     .expect("accept deadline must close both idle connections");
 }
+
+#[tokio::test]
+async fn pairing_sanitizes_device_names_before_storing() {
+    timeout(Duration::from_secs(10), async {
+        let (a, b) = (Temp::new(), Temp::new());
+        let host = node(&a, "first", false).await;
+        let guest = node(&b, "second", false).await;
+        let controls: String = (0..=31).map(char::from).collect();
+        for (device, expected) in [
+            (
+                format!("{controls}{}\u{001f}", "λ".repeat(61)),
+                "λ".repeat(60),
+            ),
+            (controls, "device".to_string()),
+            (String::new(), "device".to_string()),
+        ] {
+            let text = invite(&a, &host);
+            let code = text.split("&c=").nth(1).unwrap().split('&').next().unwrap();
+            let connection = guest
+                .endpoint()
+                .connect(addr(&host), PAIR_ALPN)
+                .await
+                .unwrap();
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            let mut bytes =
+                serde_json::to_vec(&serde_json::json!({"code": code, "device": device})).unwrap();
+            bytes.push(b'\n');
+            send.write_all(&bytes).await.unwrap();
+            send.finish().unwrap();
+            let reply: serde_json::Value =
+                serde_json::from_slice(&recv.read_to_end(4096).await.unwrap()).unwrap();
+            assert_eq!(reply["ok"], true);
+            assert_eq!(a.state().peers().unwrap()[0].name, expected);
+            connection.close(0u32.into(), b"done");
+        }
+        host.shutdown().await;
+        guest.shutdown().await;
+    })
+    .await
+    .expect("name sanitation test deadline");
+}

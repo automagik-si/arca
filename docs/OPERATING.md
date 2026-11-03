@@ -11,6 +11,11 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
+| `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
+| `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
+| `arca link join <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
+| `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
+| `arca link remove <name> --config <file>` | removes every peer with that name | `{ "removed": <count> }` as JSON |
 | `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -64,6 +69,7 @@ refused without the value being echoed back.
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
+| `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 
 The config is refused, with exit 2, when:
@@ -103,6 +109,40 @@ any other bind error, such as a port in use, stops it at once.
 
 The connection is plain HTTP on the bridge, and a host that can take the peer's address can reach the listener; the bearer
 token is still required. Serving on a proxy address is a separate step, approved by the owner like the tailnet listener.
+
+## The link
+
+`arca link serve --config <file>` runs one iroh endpoint with a persistent key. The optional `link` config section has
+camelCase keys and refuses unknown keys:
+
+- `name`: the node's name, from 1 to 60 characters, without U+0000..U+001F control characters. When absent, the name is the
+  first 10 characters of its endpoint id. Incoming device names have those controls stripped, are capped at 60 characters,
+  and fall back to `device` when empty.
+- `forward`: an ALPN-to-unix-socket-path map, empty by default. Each admitted stream is forwarded unchanged in both
+  directions to its socket. For example, `arca/mcp/1` may be an entry; it has no special handling.
+- `pairMinutes`: the default code lifetime in minutes, overridden by `link pair --minutes`. The default is 10, and the
+  selected value is clamped to 1 through 60.
+
+The endpoint accepts `arca/pair/1` for pairing, plus the ALPNs in `forward`. Every forwarded connection requires a live entry
+in `peers.json` before its local socket is opened. `arca/pair/1` and `arca/peers/1` cannot be forward entries;
+`arca/peers/1` is not accepted. Removing a peer closes its live connections on the next sweep, within 2 seconds.
+
+All link state lives directly in the top-level `stateDir`:
+
+| File | Contents |
+|------|----------|
+| `secret.key` | The endpoint's 32 raw secret bytes, generated once. |
+| `peers.json` | An array of `{ "id", "name", "paired", "seen" }`; timestamps are epoch milliseconds. Admission reads this file on every connection. |
+| `pairing.json` | The pending single-use code, expiry, node name and wrong-attempt counters. Deleted after successful pairing. |
+| `status.json` | The running server's `{ "pid", "id", "ticket", "name" }`. Removed on clean stop; stale or absent status prevents `pair`. |
+
+These files are written atomically with mode 0600. `pair` requires a running `link serve`. It creates a code and a link of
+the form `arca://pair?v=1&n=<percent-encoded name>&c=<code>&t=<endpoint ticket>`. A code works once, until its expiry. A peer
+is refused after three wrong tries, and 1,000 wrong tries overall exhaust the code. `join` consumes that link and stores
+the host peer locally; when a local server is running, it reuses that server's endpoint.
+
+`pair`, `join`, `peers` and `remove` print JSON on stdout. `pair` draws its terminal QR on stderr, so redirecting stdout
+captures only JSON. The link and QR contain the pairing code; keep them private until the code is used or expires.
 
 ## Tokens
 

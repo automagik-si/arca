@@ -26,6 +26,15 @@ pub struct Config {
 
 impl Config {
     pub fn check(&self) -> Result<()> {
+        if let Some(name) = &self.name
+            && (name.is_empty()
+                || name.chars().count() > 60
+                || name.chars().any(|c| c <= '\u{001f}'))
+        {
+            return Err(Error::Config(
+                "link.name must contain 1 to 60 characters and no U+0000..U+001F controls",
+            ));
+        }
         if self.forward.keys().any(|alpn| {
             alpn.is_empty() || alpn.len() > 255 || alpn == "arca/pair/1" || alpn == "arca/peers/1"
         }) {

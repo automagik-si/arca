@@ -154,7 +154,18 @@ impl State {
             return Ok(Response::refused("wrong code"));
         }
         self.delete("pairing.json")?;
-        self.add_locked(id, request.device)?;
+        let device: String = request
+            .device
+            .chars()
+            .filter(|c| *c > '\u{001f}')
+            .take(60)
+            .collect();
+        let device = if device.is_empty() {
+            "device".to_string()
+        } else {
+            device
+        };
+        self.add_locked(id, device)?;
         Ok(Response {
             ok: true,
             name: Some(pending.name),
