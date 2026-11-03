@@ -16,6 +16,9 @@ pub const UPDATE_PATH: &str = "/os/1.0/system/update";
 /// With no successful check for this long, in milliseconds, the update is failed (14 days).
 pub const STALE_CHECK_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 
+/// A node up this long with no completed update check is failed, in milliseconds.
+pub const NEVER_CHECKED_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// What incus-osd reported at one read. A read that fails, or a body without the fields this module needs, is no reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OsdReading {
@@ -26,8 +29,8 @@ pub struct OsdReading {
     /// Whether incus-osd reports the TPM as `ok`. `pcr mismatch` and `swtpm` are not ok.
     pub tpm_ok: bool,
     /// `Some(true)` when the latest classified check failed or no successful check is known within 14 days, `Some(false)` when
-    /// the latest classified check succeeded within 14 days, and `None` (unknown) when neither can be told: no check has been
-    /// classified since the sampler started and no check time says the last success is 14 days old.
+    /// the latest classified check succeeded within 14 days. Also `Some(true)` when no completed check is known, no usable
+    /// check time exists and node uptime is at least 24 hours. `None` (unknown) when none of these can be established.
     pub update_failed: Option<bool>,
     /// When incus-osd last checked for updates, in epoch milliseconds. `None` when the document has no usable check time: the
     /// zero time incus-osd reports before its first check, a missing field, or text that is not an RFC 3339 time.
@@ -76,14 +79,19 @@ fn classify(status: &str) -> StatusKind {
 /// Reads the security and update documents at `at`, carrying the update result in `memory`. `None` when either GET fails, as a
 /// plain Incus answers 404, so an unreachable or unlike host is unknown and never a reading of `false`. A failed read leaves
 /// `memory` as it was.
-pub fn read<R: IncusRead>(incus: &R, at: u64, memory: &mut UpdateMemory) -> Option<OsdReading> {
+pub fn read<R: IncusRead>(
+    incus: &R,
+    at: u64,
+    memory: &mut UpdateMemory,
+    uptime_ms: Option<u64>,
+) -> Option<OsdReading> {
     // Both GETs are sent even when the first fails, so one tick never hides which document an Incus lacks.
     let security = incus.get(SECURITY_PATH);
     let update = incus.get(UPDATE_PATH);
     let (Ok(security), Ok(update)) = (security, update) else {
         return None;
     };
-    from_documents(&security, &update, at, memory)
+    from_documents(&security, &update, at, memory, uptime_ms)
 }
 
 /// The reading the two bodies give at `at`, given what `memory` carries from earlier reads. Each field is taken by its JSON path,
@@ -93,6 +101,7 @@ pub fn from_documents(
     update: &Value,
     at: u64,
     memory: &mut UpdateMemory,
+    uptime_ms: Option<u64>,
 ) -> Option<OsdReading> {
     let secure_boot = security.pointer("/state/secure_boot_enabled")?.as_bool()?;
     let tpm_ok = security.pointer("/state/tpm_status")?.as_str()? == "ok";
@@ -121,6 +130,13 @@ pub fn from_documents(
         (Some(false), Some(false)) => Some(false),
         _ => None,
     };
+    // This check measures how long the node has run. Sampler start time resets on every arca restart and would postpone
+    // the alert by another 24 hours, so use node uptime from procfs. Unknown uptime cannot establish a failure.
+    let never_checked = last_check_ms.is_none()
+        && memory.last_success_ms.is_none()
+        && memory.failed != Some(false)
+        && uptime_ms.is_some_and(|uptime| uptime >= NEVER_CHECKED_MS);
+    let update_failed = update_failed.or(never_checked.then_some(true));
     Some(OsdReading {
         at,
         secure_boot,
@@ -279,6 +295,7 @@ mod tests {
             update,
             at,
             &mut UpdateMemory::default(),
+            None,
         )
         .expect("both documents have their fields")
     }
@@ -393,6 +410,102 @@ mod tests {
         assert_eq!(reading.last_check_ms, Some(AT));
     }
 
+    fn never_checked_documents() -> Vec<Value> {
+        vec![
+            json!({ "state": { "status": "" } }),
+            update("Checking for OS updates", "0001-01-01T00:00:00Z"),
+            update("Skipping update check", "not a time"),
+        ]
+    }
+
+    #[test]
+    fn never_checked_at_23_hours_or_unknown_uptime_is_unknown() {
+        for doc in never_checked_documents() {
+            for uptime in [None, Some(23 * 60 * 60 * 1000), Some(NEVER_CHECKED_MS - 1)] {
+                let reading = from_documents(
+                    &security(true, "ok"),
+                    &doc,
+                    AT,
+                    &mut UpdateMemory::default(),
+                    uptime,
+                )
+                .expect("the reading");
+                assert_eq!(reading.update_failed, None);
+            }
+        }
+    }
+
+    #[test]
+    fn never_checked_at_24_hours_and_above_is_failed() {
+        for doc in never_checked_documents() {
+            for uptime in [NEVER_CHECKED_MS, NEVER_CHECKED_MS + 1, 2 * NEVER_CHECKED_MS] {
+                let reading = from_documents(
+                    &security(true, "ok"),
+                    &doc,
+                    AT,
+                    &mut UpdateMemory::default(),
+                    Some(uptime),
+                )
+                .expect("the reading");
+                assert_eq!(reading.update_failed, Some(true));
+                assert_eq!(reading.last_success_ms, None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_completed_check_clears_never_checked_and_the_next_read_stays_ok() {
+        let mut memory = UpdateMemory::default();
+        let sec = security(true, "ok");
+        let initial = from_documents(
+            &sec,
+            &update("", ""),
+            AT,
+            &mut memory,
+            Some(NEVER_CHECKED_MS),
+        )
+        .expect("the reading");
+        assert_eq!(initial.update_failed, Some(true));
+        let done = from_documents(
+            &sec,
+            &update("OS update check completed", "2026-11-01T10:00:00Z"),
+            AT,
+            &mut memory,
+            Some(NEVER_CHECKED_MS),
+        )
+        .expect("the reading");
+        assert_eq!(done.update_failed, Some(false));
+        assert_eq!(done.last_success_ms, Some(AT));
+        let next = from_documents(
+            &sec,
+            &update("Checking for OS updates", ""),
+            AT + 300_000,
+            &mut memory,
+            Some(NEVER_CHECKED_MS + 300_000),
+        )
+        .expect("the reading");
+        assert_eq!(next.update_failed, Some(false));
+        assert_eq!(next.last_success_ms, Some(AT));
+    }
+
+    #[test]
+    fn a_completed_status_without_a_usable_time_is_not_never_checked() {
+        let mut memory = UpdateMemory::default();
+        let sec = security(true, "ok");
+        for status in ["OS update check completed", "Checking for OS updates"] {
+            let reading = from_documents(
+                &sec,
+                &update(status, "0001-01-01T00:00:00Z"),
+                AT,
+                &mut memory,
+                Some(NEVER_CHECKED_MS),
+            )
+            .expect("the reading");
+            assert_eq!(reading.update_failed, None);
+            assert_eq!(reading.last_success_ms, None);
+        }
+    }
+
     #[test]
     fn a_check_15_days_old_is_a_failure_and_one_day_old_is_not() {
         let checked = "2026-11-01T10:00:00Z";
@@ -432,6 +545,7 @@ mod tests {
             &update("OS update check completed", "2026-11-01T10:00:00Z"),
             AT,
             &mut memory,
+            None,
         )
         .expect("the reading");
         let later = from_documents(
@@ -439,6 +553,7 @@ mod tests {
             &update("OS update check completed", "garbage"),
             AT + 15 * DAY,
             &mut memory,
+            None,
         )
         .expect("the reading");
         assert_eq!(later.update_failed, Some(true));
@@ -454,6 +569,7 @@ mod tests {
                 &checked,
                 AT,
                 &mut UpdateMemory::default(),
+                None,
             )
             .expect("the reading");
             assert_eq!(reading.tpm_ok, ok, "{status}");
@@ -466,10 +582,13 @@ mod tests {
         let mut memory = UpdateMemory::default();
         let no_tpm = json!({ "state": { "secure_boot_enabled": true } });
         let failed = update("Failed to check for OS updates", "2026-11-01T10:00:00Z");
-        assert_eq!(from_documents(&no_tpm, &failed, AT, &mut memory), None);
+        assert_eq!(
+            from_documents(&no_tpm, &failed, AT, &mut memory, None),
+            None
+        );
         let no_status = json!({ "state": { "last_check": "2026-11-01T10:00:00Z" } });
         assert_eq!(
-            from_documents(&security(true, "ok"), &no_status, AT, &mut memory),
+            from_documents(&security(true, "ok"), &no_status, AT, &mut memory, None),
             None
         );
         assert_eq!(memory, UpdateMemory::default());
@@ -483,6 +602,7 @@ mod tests {
             &update("Failed to check for OS updates", "2026-11-01T10:00:00Z"),
             AT,
             &mut memory,
+            None,
         )
         .expect("the reading");
         for shown in [format!("{reading:?}"), format!("{memory:?}")] {

@@ -1547,6 +1547,68 @@ mod osd_readings {
     }
 
     #[test]
+    fn never_checked_uses_proc_root_uptime_on_osd_cadence_even_after_sampler_restart() {
+        let scratch = Scratch::new("never-checked-uptime");
+        let docs = Docs::default();
+        docs.serve(security(), json!({ "state": { "status": "" } }));
+        let cfg = SamplerConfig {
+            proc_root: scratch.path().join("proc"),
+            sys_root: scratch.path().join("sys"),
+            pools: Vec::new(),
+            interval_ms: 5_000,
+            history_minutes: 60,
+        };
+        let mut sampler = Sampler::new(cfg.clone(), docs.clone());
+        sampler.sample(CHECKED);
+        assert_eq!(
+            reading(&sampler).unwrap().update_failed,
+            None,
+            "missing uptime"
+        );
+        write(scratch.path(), "proc/uptime", "82800.00 0.00\n");
+        sampler.sample(CHECKED + 300_000);
+        assert_eq!(reading(&sampler).unwrap().update_failed, None, "23 hours");
+        write(scratch.path(), "proc/uptime", "86400.00 0.00\n");
+        sampler.sample(CHECKED + 305_000);
+        assert_eq!(
+            reading(&sampler).unwrap().update_failed,
+            None,
+            "between reads"
+        );
+        sampler.sample(CHECKED + 600_000);
+        assert_eq!(
+            reading(&sampler).unwrap().update_failed,
+            Some(true),
+            "24 hours"
+        );
+
+        let mut restarted = Sampler::new(cfg, docs.clone());
+        restarted.sample(CHECKED + 600_000);
+        assert_eq!(
+            reading(&restarted).unwrap().update_failed,
+            Some(true),
+            "node uptime survives sampler restart"
+        );
+
+        write(scratch.path(), "proc/uptime", "not uptime\n");
+        restarted.sample(CHECKED + 900_000);
+        assert_eq!(
+            reading(&restarted).unwrap().update_failed,
+            None,
+            "invalid uptime is unknown"
+        );
+        write(scratch.path(), "proc/uptime", "90000.00 0.00\n");
+        docs.serve(
+            security(),
+            update("OS update check completed", "2026-11-01T10:00:00Z"),
+        );
+        restarted.sample(CHECKED + 1_200_000);
+        assert_eq!(reading(&restarted).unwrap().update_failed, Some(false));
+        restarted.sample(CHECKED + 1_500_000);
+        assert_eq!(reading(&restarted).unwrap().update_failed, Some(false));
+    }
+
+    #[test]
     fn the_documents_are_read_at_zero_and_300_seconds_and_not_between() {
         let docs = Docs::default();
         docs.serve(

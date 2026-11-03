@@ -681,7 +681,7 @@ value stays at or below `threshold - clearMargin` for `clearForS` seconds. Every
 | `cpu-hot` | the CPU temperature, in °C | 85 | 5 | warning |
 | `service-down` | each health component: `incus`, `arca`, `watch`, and `shim` when configured | 0 | 0 | critical |
 | `drift` | every drift entry of the newest watch sweep, of every kind | 0 | 0 | warning |
-| `update-failed` | the incus-osd update status: a failed check, or no completed check for 14 days | 0 | 0 | warning |
+| `update-failed` | the incus-osd update status: a failed check, no completed check for 14 days, or a node up 24 hours with no completed check and no usable check time | 0 | 0 | warning |
 | `crash-loop` | the starts of one instance in the last 600 seconds | 2 | 2 | critical |
 | `smart-warning` | a drive's SMART health check, failed when it reports false | 0 | 0 | critical |
 
@@ -745,8 +745,10 @@ restart `serve`, which reads that file only at start:
   with ` update check completed`, or contains ` has been updated to version `, is a completed check. Any other status, such
   as a check in progress, a skipped check outside the maintenance window, or an error text, keeps the previous result.
   `update-failed` is 1 after a failed check and until a later completed one, and it is 1 when no check has completed for 14
-  days. A node that incus-osd has never given a check time for, and that has no completed check, has no reading, so the rule
-  does not fire. `arca_update_last_success_timestamp_seconds` is the start time of the last completed check, because
+  days. A node with no usable check time and no known completed check also fires once its uptime reaches 24 hours.
+  Uptime comes from `/proc/uptime`, so restarting arca does not restart this grace period. Missing or unparseable uptime
+  leaves this condition unknown. A completed status with an unusable time does not count as never checked.
+  `arca_update_last_success_timestamp_seconds` is the start time of the last completed check, because
   incus-osd records a check's time when the check starts. It is absent until one completes. `arca_update_failed` is absent
   while the rule has no reading.
 - **Recovery keys.** The security document holds recovery keys. Each read takes only the Secure Boot and TPM fields, and it
@@ -867,7 +869,7 @@ a scraper sets that label itself. The names, types and labels below are fixed.
 | `arca_secureboot_enabled` | gauge | | 1 when Secure Boot is enabled |
 | `arca_tpm_present` | gauge | | 1 only when incus-osd reports the TPM status `ok`; see "incus-osd readings" |
 | `arca_update_last_success_timestamp_seconds` | gauge | | the start time of the last completed incus-osd update check, in epoch seconds |
-| `arca_update_failed` | gauge | | 1 for a failed update or no completed check in 14 days, 0 otherwise |
+| `arca_update_failed` | gauge | | 1 for a failed update, no completed check in 14 days, or a node up 24 hours with no completed check and no usable check time; 0 for a known recent success; absent when unknown |
 | `arca_smart_passed` | gauge | `device` | 1 when the drive's SMART check passed, 0 when it failed; see "SMART drive labels" |
 | `arca_alert_firing` | gauge | `rule`, `severity`, and the alert's own labels | 1 for each firing alert |
 | `arca_store_write_failures_total` | counter | | the failed writes since the server started |
