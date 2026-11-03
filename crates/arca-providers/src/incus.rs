@@ -55,6 +55,7 @@ pub const DROIDD_PROJECTS_FIXED: [&str; 2] = ["bench", "default"];
 const SCRATCH_PREFIX: &str = "arcak-scratch-";
 /// The prefix of a config value that names a secret file rather than being the value itself.
 pub const SECRET_PREFIX: &str = "arca-secret:";
+const FOREIGN_SECRET_MARKER: &str = "<redacted: another entry's secret>";
 /// The largest secret file the provider reads, in bytes.
 const SECRET_MAX_BYTES: u64 = 64 * 1024;
 /// How deep the provider looks for secret files under its directory.
@@ -499,7 +500,7 @@ impl IncusProvider {
         }
         let mut resolved = Map::new();
         for (key, value) in &text {
-            resolved.insert(key.clone(), Value::String(self.resolve_text(value)?));
+            resolved.insert(key.clone(), Value::String(self.resolve_text(entry, value)?));
         }
         let mut sent = fields.clone();
         sent.insert("config".to_string(), Value::Object(resolved));
@@ -569,8 +570,8 @@ impl IncusProvider {
             });
         };
         self.check_change(entry, object, changes, &reading.config)?;
-        self.resolve_changes(changes)?;
-        let pre_image = self.pre_image_of(changes, &reading.config)?;
+        self.resolve_changes(entry, changes)?;
+        let pre_image = self.pre_image_of(entry, changes, &reading.config)?;
         Ok(Planned {
             acl_patch: None,
             class,
@@ -585,12 +586,14 @@ impl IncusProvider {
     /// A key the patch sets to a secret reference, and whose value is no current secret, is journalled as `None`: a redacted
     /// marker whose inverse removes the key. A key the object does not hold is `None`. A value that starts with the reference
     /// prefix and matches no current secret is refused, since an inverse that restored it would read it as a reference.
+    /// Another entry's secret matches no usable current secret and follows the same rules as any other unmatched value.
     fn pre_image_of(
         &self,
+        entry: &EntryId,
         changes: &BTreeMap<String, Option<String>>,
         current: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
-        let secrets = self.secrets_by_value();
+        let secrets = self.secrets_by_value(entry);
         let mut pre_image = BTreeMap::new();
         for (key, new) in changes {
             let value = match current.get(key) {
@@ -613,9 +616,9 @@ impl IncusProvider {
     }
 
     /// Resolves one config value: a secret reference becomes the file's content, and any other text passes through.
-    fn resolve_text(&self, text: &str) -> Result<String, EffectRefusal> {
+    fn resolve_text(&self, entry: &EntryId, text: &str) -> Result<String, EffectRefusal> {
         if text.starts_with(SECRET_PREFIX) {
-            self.read_secret(text)
+            self.read_secret(entry, text)
         } else {
             Ok(text.to_string())
         }
@@ -624,13 +627,14 @@ impl IncusProvider {
     /// Resolves the secret references in a change. A removed key stays removed.
     fn resolve_changes(
         &self,
+        entry: &EntryId,
         changes: &BTreeMap<String, Option<String>>,
     ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
         let mut resolved = BTreeMap::new();
         for (key, value) in changes {
             let value = value
                 .as_deref()
-                .map(|text| self.resolve_text(text))
+                .map(|text| self.resolve_text(entry, text))
                 .transpose()?;
             resolved.insert(key.clone(), value);
         }
@@ -652,7 +656,23 @@ impl IncusProvider {
     /// and so must each directory on the way: a real directory, owned by this process, with no group or other bits. The file must
     /// be a regular file, mode 0600, owned by this process, and small. A reference that fails any rule is refused with a fixed
     /// reason, and the value is never read into an error.
-    fn read_secret(&self, reference: &str) -> Result<String, EffectRefusal> {
+    fn read_secret(&self, entry: &EntryId, reference: &str) -> Result<String, EffectRefusal> {
+        let name = reference
+            .strip_prefix(SECRET_PREFIX)
+            .filter(|name| valid_secret_name(name))
+            .ok_or_else(|| {
+                EffectRefusal::Provider("a secret reference names no valid secret".to_string())
+            })?;
+        if !may_use_secret(entry, name) {
+            return Err(EffectRefusal::Provider(
+                "a secret reference names another entry's secret".to_string(),
+            ));
+        }
+        self.read_secret_file(reference)
+    }
+
+    /// Reads a usable secret file without an entry check, including during the directory walk.
+    fn read_secret_file(&self, reference: &str) -> Result<String, EffectRefusal> {
         let name = reference
             .strip_prefix(SECRET_PREFIX)
             .filter(|name| valid_secret_name(name))
@@ -707,13 +727,23 @@ impl IncusProvider {
         Err(unavailable())
     }
 
-    /// Every usable secret under the directory, as (reference, content). Used to name a value a journal must not hold by its
-    /// reference. A file that is not usable is skipped, since it cannot be a reference a value came from.
-    fn secrets_by_value(&self) -> Vec<(String, String)> {
+    /// Shared and own usable secrets, as (reference, content). Unusable files are skipped.
+    fn secrets_by_value(&self, entry: &EntryId) -> Vec<(String, String)> {
         let mut found = Vec::new();
         if self.secrets_root_private() {
             self.collect_secrets(&self.secrets_dir, "", 0, &mut found);
         }
+        found.retain(|(reference, _)| may_use_secret(entry, &reference[SECRET_PREFIX.len()..]));
+        found
+    }
+
+    /// Usable secrets owned by another entry, as (reference, content).
+    fn foreign_secrets_by_value(&self, entry: &EntryId) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        if self.secrets_root_private() {
+            self.collect_secrets(&self.secrets_dir, "", 0, &mut found);
+        }
+        found.retain(|(reference, _)| !may_use_secret(entry, &reference[SECRET_PREFIX.len()..]));
         found
     }
 
@@ -750,7 +780,7 @@ impl IncusProvider {
             } else if meta.is_file() && valid_secret_name(&name) {
                 let reference = format!("{SECRET_PREFIX}{name}");
                 if let Some(content) = self
-                    .read_secret(&reference)
+                    .read_secret_file(&reference)
                     .ok()
                     .filter(|content| !content.is_empty())
                 {
@@ -763,12 +793,13 @@ impl IncusProvider {
     /// Whether the config holds every pre-image value, with a reference resolved to the file it names.
     fn shows_pre_image(
         &self,
+        entry: &EntryId,
         config: &BTreeMap<String, String>,
         pre_image: &BTreeMap<String, Option<String>>,
     ) -> bool {
         pre_image.iter().all(|(key, value)| {
             let expected = match value {
-                Some(text) => match self.resolve_text(text) {
+                Some(text) => match self.resolve_text(entry, text) {
                     Ok(content) => Some(content),
                     Err(_) => return false,
                 },
@@ -809,7 +840,7 @@ impl IncusProvider {
                 if shows(&reading.config, changes) {
                     return Ok(());
                 }
-                if self.shows_pre_image(&reading.config, pre_image) {
+                if self.shows_pre_image(entry, &reading.config, pre_image) {
                     return Err(EffectRefusal::Provider(
                         "the patch did not land".to_string(),
                     ));
@@ -956,6 +987,8 @@ impl Provider for IncusProvider {
                 if kind == IncusKind::Instance && !projects.iter().any(|p| p == project) {
                     return Err(EffectRefusal::ProjectNotAllowed);
                 }
+                let usable = self.secrets_by_value(entry);
+                let foreign = self.foreign_secrets_by_value(entry);
                 let mut value = self.reader.get(path).map_err(incus_refusal)?;
                 if kind == IncusKind::Acl {
                     let config = value
@@ -970,7 +1003,7 @@ impl Provider for IncusProvider {
                     }
                 }
                 // Redact equal secret contents throughout the answer, including expanded_config.
-                redact_secret_values(&mut value, &self.secrets_by_value());
+                redact_secret_values(&mut value, &usable, &foreign);
                 Ok(value)
             }
         }
@@ -1114,12 +1147,12 @@ impl Provider for IncusProvider {
                     ));
                 };
                 // The pre-image is derived again from the object as it is now, and must be the plan's.
-                if self.pre_image_of(config, owned.config())? != pre_image {
+                if self.pre_image_of(entry, config, owned.config())? != pre_image {
                     return Err(EffectRefusal::Provider(
                         "the plan's pre-image is not the one the object holds".to_string(),
                     ));
                 }
-                let sent = self.resolve_changes(config)?;
+                let sent = self.resolve_changes(entry, config)?;
                 match writer.patch(&owned, &sent) {
                     Ok(_) => {}
                     Err(error) => {
@@ -1229,7 +1262,7 @@ impl Provider for IncusProvider {
             Err(error) => return Err(incus_refusal(error)),
         };
         let holds_pre_image =
-            pre_image.is_some_and(|pre| self.shows_pre_image(&reading.config, pre));
+            pre_image.is_some_and(|pre| self.shows_pre_image(entry, &reading.config, pre));
         Ok(ReadBack::Present {
             object: ObjectRef {
                 uuid: reading.uuid.clone(),
@@ -1568,6 +1601,16 @@ fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
     (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
 }
 
+/// The entry a secret name belongs to: its first segment, when that parses as an entry id and another segment follows.
+fn secret_owner(name: &str) -> Option<&str> {
+    let (owner, _) = name.split_once('/')?;
+    EntryId::parse(owner).map(|_| owner)
+}
+
+fn may_use_secret(entry: &EntryId, name: &str) -> bool {
+    secret_owner(name).is_none_or(|owner| owner == entry.0)
+}
+
 /// A secret name: `^[a-z0-9][a-z0-9/-]{0,127}$`. It is checked by hand, so no pattern library is needed.
 fn valid_secret_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -1685,21 +1728,27 @@ fn check_acl_patch(object: &ObjectRef, rules: &[Value]) -> Result<(), EffectRefu
     Ok(())
 }
 
-fn redact_secret_values(value: &mut Value, secrets: &[(String, String)]) {
+fn redact_secret_values(
+    value: &mut Value,
+    usable: &[(String, String)],
+    foreign: &[(String, String)],
+) {
     match value {
         Value::String(text) => {
-            if let Some(reference) = secret_reference(text, secrets) {
+            if let Some(reference) = secret_reference(text, usable) {
                 *text = reference;
+            } else if secret_reference(text, foreign).is_some() {
+                *text = FOREIGN_SECRET_MARKER.to_string();
             }
         }
         Value::Object(map) => {
             for value in map.values_mut() {
-                redact_secret_values(value, secrets);
+                redact_secret_values(value, usable, foreign);
             }
         }
         Value::Array(items) => {
             for value in items {
-                redact_secret_values(value, secrets);
+                redact_secret_values(value, usable, foreign);
             }
         }
         _ => {}

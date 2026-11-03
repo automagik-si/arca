@@ -37,6 +37,8 @@ const FIXTURE: &str = concat!(
     "/../arca-incus/tests/fixtures/state.json"
 );
 const SECRET_VALUE: &str = "SECRET-VALUE-7731";
+const OTHER_ENTRY_VALUE: &str = "OTHER-ENTRY-VALUE-8842";
+const TOY_VALUE: &str = "TOY-VALUE-9953";
 const READ_UUID: &str = "00000000-0000-4000-8000-0000000000e1";
 const OTHER_UUID: &str = "00000000-0000-4000-8000-0000000000e2";
 
@@ -249,6 +251,14 @@ fn write_secret(dir: &Path, name: &str, value: &str) {
     let path = dir.join(name);
     fs::write(&path, value).expect("write the secret");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+}
+
+/// Writes an entry's secret under a private owner directory.
+fn write_scoped_secret(dir: &Path, owner: &str, name: &str, value: &str) {
+    let scoped = dir.join(owner);
+    fs::create_dir_all(&scoped).expect("create the owner directory");
+    fs::set_permissions(&scoped, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+    write_secret(&scoped, name, value);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------
@@ -951,6 +961,79 @@ fn a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journal
         !format!("{:?}", fake.writes()).contains(SECRET_VALUE),
         "the fake records no value"
     );
+}
+
+#[test]
+fn a_create_or_patch_naming_another_entrys_secret_is_refused_and_own_and_shared_resolve() {
+    let scratch = Scratch::new("secret-scope-writes");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "database", SECRET_VALUE);
+    write_scoped_secret(&secrets, "other", "database", OTHER_ENTRY_VALUE);
+    write_scoped_secret(&secrets, "toy", "database", TOY_VALUE);
+    let mut state = state();
+    let mut other = state
+        .instances
+        .iter()
+        .find(|i| i["name"] == "k1")
+        .unwrap()
+        .clone();
+    other["name"] = json!("other-instance");
+    other["config"][MARK] = json!("other");
+    other["config"]["volatile.uuid"] = json!(OTHER_UUID);
+    state.instances.push(other);
+    let fake = FakeIncus::start(&scratch.0, state).unwrap();
+    let mut provider = provider(&fake, &secrets);
+    let toy = entry("toy");
+    let refused = Err(EffectRefusal::Provider(
+        "a secret reference names another entry's secret".to_string(),
+    ));
+    let foreign_create = create(
+        IncusKind::Instance,
+        "svc",
+        None,
+        "foreign-secret",
+        json!({"config": {"user.key": "arca-secret:other/database"}}),
+    );
+    let before = fake.requests();
+    assert_eq!(provider.plan(&toy, &foreign_create), refused);
+    assert_eq!(
+        fake.requests().len(),
+        before.len(),
+        "a refused create sends no request"
+    );
+    let foreign_patch = patch(
+        object(IncusKind::Instance, "svc", None, "k1"),
+        &[("user.key", Some("arca-secret:other/database"))],
+    );
+    assert_eq!(provider.plan(&toy, &foreign_patch), refused);
+    assert!(only_gets(&fake), "a refused patch sends no write");
+    for (name, reference, expected) in [
+        ("own-secret", "arca-secret:toy/database", TOY_VALUE),
+        ("shared-secret", "arca-secret:database", SECRET_VALUE),
+    ] {
+        let op = create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            name,
+            json!({"config": {"user.key": reference}}),
+        );
+        let planned = provider
+            .plan(&toy, &op)
+            .expect("an own or shared reference plans");
+        provider
+            .effect(&toy, &op, &planned)
+            .expect("the create applies");
+        assert_eq!(
+            read(&fake, &format!("/1.0/instances/{name}?project=svc"))["config"]["user.key"],
+            expected
+        );
+    }
+    assert_eq!(
+        fake.writes().iter().filter(|w| w.method == "POST").count(),
+        2
+    );
+    assert!(!format!("{:?}", fake.writes()).contains(OTHER_ENTRY_VALUE));
 }
 
 #[test]
@@ -3578,6 +3661,61 @@ fn scoped_observe_allows_instance_state_and_own_acl_and_redacts_secret_values() 
         assert!(get(path).is_err(), "{path}");
     }
     assert!(fake.requests()[before..].iter().all(|r| r.method == "GET"));
+}
+
+#[test]
+fn scoped_observe_marks_another_entrys_secret_and_keeps_own_and_shared_references() {
+    let scratch = Scratch::new("scoped-observe-secrets");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "database", SECRET_VALUE);
+    write_scoped_secret(&secrets, "other", "database", OTHER_ENTRY_VALUE);
+    write_scoped_secret(&secrets, "toy", "database", TOY_VALUE);
+    let mut state = state();
+    let own = state
+        .instances
+        .iter_mut()
+        .find(|i| i["name"] == "k1")
+        .unwrap();
+    own["config"]["environment.DATABASE_URL"] = json!(SECRET_VALUE);
+    own["config"]["user.key"] = json!(TOY_VALUE);
+    let mut other = own.clone();
+    other["name"] = json!("other-instance");
+    other["config"][MARK] = json!("other");
+    other["config"]["volatile.uuid"] = json!(OTHER_UUID);
+    other["config"]["user.key"] = json!(OTHER_ENTRY_VALUE);
+    state.instances.push(other);
+    let fake = FakeIncus::start(&scratch.0, state).unwrap();
+    let provider = provider(&fake, &secrets);
+    let get = |owner: &str, name: &str| {
+        provider
+            .observe(
+                &entry(owner),
+                &["svc".into()],
+                &Observe::IncusGet {
+                    path: format!("/1.0/instances/{name}?project=svc"),
+                },
+            )
+            .unwrap()
+    };
+    let own = get("toy", "k1");
+    assert_eq!(
+        own["config"]["environment.DATABASE_URL"],
+        "arca-secret:database"
+    );
+    assert_eq!(own["config"]["user.key"], "arca-secret:toy/database");
+    assert!(!own.to_string().contains(SECRET_VALUE));
+    assert!(!own.to_string().contains(TOY_VALUE));
+    let foreign = get("toy", "other-instance");
+    assert_eq!(
+        foreign["config"]["user.key"],
+        "<redacted: another entry's secret>"
+    );
+    assert!(!foreign.to_string().contains(OTHER_ENTRY_VALUE));
+    assert!(!foreign.to_string().contains("arca-secret:other/database"));
+    let other = get("other", "other-instance");
+    assert_eq!(other["config"]["user.key"], "arca-secret:other/database");
+    assert!(!other.to_string().contains(OTHER_ENTRY_VALUE));
+    assert!(only_gets(&fake));
 }
 
 // Populate only the temporary fake with objects the kernel itself must refuse to create.
