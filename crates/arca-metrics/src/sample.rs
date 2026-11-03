@@ -271,7 +271,8 @@ impl<R: IncusRead> Sampler<R> {
         };
         let osd = if self.osd_due(now_ms) {
             self.osd_read_at = Some(now_ms);
-            osd::read(&self.incus, now_ms, &mut self.osd_memory)
+            let uptime_ms = procfs::read_uptime_ms(&self.cfg.proc_root);
+            osd::read(&self.incus, now_ms, &mut self.osd_memory, uptime_ms)
         } else {
             self.readings.osd.clone()
         };

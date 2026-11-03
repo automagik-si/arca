@@ -38,6 +38,35 @@ pub fn read_cpu(proc_root: &Path) -> CpuReading {
     parse_stat(&read_text(&proc_root.join("stat")).unwrap_or_default())
 }
 
+/// Node uptime in epoch-independent milliseconds, from the first field of `uptime`. Missing or invalid data is unknown.
+pub fn read_uptime_ms(proc_root: &Path) -> Option<u64> {
+    let text = read_text(&proc_root.join("uptime"))?;
+    parse_uptime_ms(text.split_whitespace().next()?)
+}
+
+fn parse_uptime_ms(seconds: &str) -> Option<u64> {
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, "0"));
+    if whole.is_empty()
+        || fraction.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let millis = fraction
+        .bytes()
+        .chain(std::iter::repeat(b'0'))
+        .take(3)
+        .fold(0u64, |value, digit| value * 10 + u64::from(digit - b'0'));
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(1000)?
+        .checked_add(millis)
+}
+
 pub fn read_load(proc_root: &Path) -> Load {
     let text = read_text(&proc_root.join("loadavg")).unwrap_or_default();
     let mut values = text.split_whitespace().map(parse_finite);
@@ -224,4 +253,43 @@ fn sorted_names(dir: &Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uptime_seconds_and_decimals_give_milliseconds() {
+        for (text, expected) in [
+            ("0", 0),
+            ("0.01", 10),
+            ("1.2", 1200),
+            ("123.4567", 123456),
+            ("86399.999", 86_399_999),
+            ("86400.00", 86_400_000),
+        ] {
+            assert_eq!(parse_uptime_ms(text), Some(expected), "{text}");
+        }
+    }
+
+    #[test]
+    fn invalid_or_overflowing_uptime_is_unknown() {
+        for text in [
+            "",
+            ".1",
+            "1.",
+            "-1.0",
+            "NaN",
+            "inf",
+            "1e5",
+            "1.2.3",
+            "garbage",
+            "18446744073709551616",
+            "18446744073709552",
+            "18446744073709551.616",
+        ] {
+            assert_eq!(parse_uptime_ms(text), None, "{text}");
+        }
+    }
 }
