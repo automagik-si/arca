@@ -90,7 +90,7 @@ arca_tpm_present{node="000000000000000000000000000000000000000000000000000000000
 # HELP arca_update_last_success_timestamp_seconds The start time of the last completed incus-osd update check, in epoch seconds.
 # TYPE arca_update_last_success_timestamp_seconds gauge
 arca_update_last_success_timestamp_seconds{node="0000000000000000000000000000000000000000000000000000000000000000"} 1793361725
-# HELP arca_update_failed 1 when incus-osd reports an update failure, no update check has completed in 14 days, or a node up 24 hours has no completed check on record; 0 when not.
+# HELP arca_update_failed 1 when incus-osd reports an update failure, no update check has completed in 14 days, or a node up 24 hours has no usable check time and no completed check on record; 0 when not.
 # TYPE arca_update_failed gauge
 arca_update_failed{node="0000000000000000000000000000000000000000000000000000000000000000"} 0
 # HELP arca_smart_passed 1 when the drive's SMART health check passed, 0 when it failed. A drive with no usable SMART result has no series.

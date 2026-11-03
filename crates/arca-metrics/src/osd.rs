@@ -492,18 +492,41 @@ mod tests {
     fn a_completed_status_without_a_usable_time_is_not_never_checked() {
         let mut memory = UpdateMemory::default();
         let sec = security(true, "ok");
-        for status in ["OS update check completed", "Checking for OS updates"] {
-            let reading = from_documents(
-                &sec,
-                &update(status, "0001-01-01T00:00:00Z"),
-                AT,
-                &mut memory,
-                Some(NEVER_CHECKED_MS),
-            )
-            .expect("the reading");
-            assert_eq!(reading.update_failed, None);
-            assert_eq!(reading.last_success_ms, None);
-        }
+        let reading = from_documents(
+            &sec,
+            &update("OS update check completed", "0001-01-01T00:00:00Z"),
+            AT,
+            &mut memory,
+            Some(NEVER_CHECKED_MS),
+        )
+        .expect("the reading");
+        assert_eq!(reading.update_failed, None);
+        assert_eq!(reading.last_success_ms, None);
+    }
+
+    #[test]
+    fn an_in_progress_status_carries_a_completed_result_without_a_usable_time() {
+        let mut memory = UpdateMemory::default();
+        let sec = security(true, "ok");
+        from_documents(
+            &sec,
+            &update("OS update check completed", "0001-01-01T00:00:00Z"),
+            AT,
+            &mut memory,
+            Some(NEVER_CHECKED_MS),
+        )
+        .expect("the reading");
+        // The in-progress read carries the earlier completed result.
+        let reading = from_documents(
+            &sec,
+            &update("Checking for OS updates", "0001-01-01T00:00:00Z"),
+            AT,
+            &mut memory,
+            Some(NEVER_CHECKED_MS),
+        )
+        .expect("the reading");
+        assert_eq!(reading.update_failed, None);
+        assert_eq!(reading.last_success_ms, None);
     }
 
     #[test]
