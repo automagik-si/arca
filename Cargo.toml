@@ -18,6 +18,7 @@ arca-api = { path = "crates/arca-api" }
 arca-approval = { path = "crates/arca-approval" }
 arca-incus = { path = "crates/arca-incus" }
 arca-kernel = { path = "crates/arca-kernel" }
+arca-link = { path = "crates/arca-link" }
 arca-mcp = { path = "crates/arca-mcp" }
 arca-metrics = { path = "crates/arca-metrics" }
 arca-netproject = { path = "crates/arca-netproject" }
@@ -32,12 +33,18 @@ axum = "=0.8.9"
 base64 = "=0.23.1"
 ed25519-dalek = "=2.2.0"
 getrandom = "=0.4.3"
+# Link transport and ticket releases verified 2026-11-03; terminal QR encoder (MIT).
+iroh = "=1.4.1"
+iroh-tickets = "=1.0.0"
+qrcodegen = "=1.8.0"
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
 # SQLite is compiled from its bundled source, so the static musl build needs no system library.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.154", features = ["float_roundtrip"] }
 sha2 = "=0.11.1"
+# Constant-time comparison of pairing code digests.
+subtle = "=2.6.1"
 ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "ed25519"] }
 tokio = "=1.54.1"
 wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "cranelift", "component-model", "wat", "std"] }

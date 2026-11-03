@@ -1,0 +1,22 @@
+[package]
+name = "arca-link"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Arca node link: one endpoint, one-time pairing and byte streams to local sockets"
+
+[dependencies]
+base64.workspace = true
+getrandom.workspace = true
+iroh.workspace = true
+iroh-tickets.workspace = true
+qrcodegen.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time", "macros"] }
+
+[lints]
+workspace = true
