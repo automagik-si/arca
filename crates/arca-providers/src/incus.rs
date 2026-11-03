@@ -1,6 +1,6 @@
 //! The kernel's Incus write provider. It is the only code path in the kernel that writes to Incus. It sends only the writer's
 //! checked requests: a POST for a create, a config change under an `If-Match` (a PATCH, or for a project a PUT of its whole
-//! config), and the tombstone-then-DELETE sequence for a retirement. Each effect is planned read-only first. `plan` refuses
+//! config), one ACL rule array under `If-Match`, and the tombstone-then-DELETE sequence for a retirement. Each effect is planned read-only first. `plan` refuses
 //! before anything is journalled, and `effect` checks the family, the features, the ownership and the plan again before it
 //! applies anything. `docs/OWNERSHIP.md` states the rules.
 //!
@@ -32,7 +32,7 @@ use arca_incus::{
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
-use arca_kernel::journal::{EffectClass, Inverse};
+use arca_kernel::journal::{AclPatch, EffectClass, Inverse};
 use arca_kernel::ownership::{
     IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify, kernel_may_write,
 };
@@ -561,6 +561,7 @@ impl IncusProvider {
         let class = class_of(object.kind);
         let Some(changes) = changes else {
             return Ok(Planned {
+                acl_patch: None,
                 class,
                 op_digest: digest,
                 pre_image: None,
@@ -571,6 +572,7 @@ impl IncusProvider {
         self.resolve_changes(changes)?;
         let pre_image = self.pre_image_of(changes, &reading.config)?;
         Ok(Planned {
+            acl_patch: None,
             class,
             op_digest: digest,
             pre_image: Some(pre_image),
@@ -921,11 +923,11 @@ impl IncusProvider {
 }
 
 impl Provider for IncusProvider {
-    /// Answers the host's own addresses. Any other read is refused: a plugin reads Incus through the watch provider, not here.
+    /// Answers host addresses, scoped instance reads, and this entry's own ACL reads.
     fn observe(
         &self,
-        _entry: &EntryId,
-        _projects: &[String],
+        entry: &EntryId,
+        projects: &[String],
         query: &Observe,
     ) -> Result<Value, EffectRefusal> {
         match query {
@@ -935,7 +937,42 @@ impl Provider for IncusProvider {
                     addresses.iter().map(|ip| json!(ip.to_string())).collect(),
                 ))
             }
-            Observe::IncusGet { .. } => Err(EffectRefusal::NotDeclared),
+            Observe::IncusGet { path } => {
+                let (route, query) = path.split_once('?').ok_or(EffectRefusal::NotDeclared)?;
+                let project = query
+                    .strip_prefix("project=")
+                    .filter(|p| plain_name(p))
+                    .ok_or(EffectRefusal::NotDeclared)?;
+                let parts: Vec<_> = route.split('/').collect();
+                let kind = match parts.as_slice() {
+                    ["", "1.0", "instances", name] if plain_name(name) => IncusKind::Instance,
+                    ["", "1.0", "instances", name, "state"] if plain_name(name) => {
+                        IncusKind::Instance
+                    }
+                    ["", "1.0", "network-acls", name] if plain_name(name) => IncusKind::Acl,
+                    _ => return Err(EffectRefusal::NotDeclared),
+                };
+                self.check_family(kind, project)?;
+                if kind == IncusKind::Instance && !projects.iter().any(|p| p == project) {
+                    return Err(EffectRefusal::ProjectNotAllowed);
+                }
+                let mut value = self.reader.get(path).map_err(incus_refusal)?;
+                if kind == IncusKind::Acl {
+                    let config = value
+                        .get("config")
+                        .cloned()
+                        .ok_or(EffectRefusal::NotDeclared)?;
+                    let config: BTreeMap<String, String> =
+                        serde_json::from_value(config).map_err(|_| EffectRefusal::NotDeclared)?;
+                    let class = classify(&config, &self.retained.snapshot()?);
+                    if !kernel_may_write(&class, entry) {
+                        return Err(EffectRefusal::NotOwned(class));
+                    }
+                }
+                // Redact equal secret contents throughout the answer, including expanded_config.
+                redact_secret_values(&mut value, &self.secrets_by_value());
+                Ok(value)
+            }
         }
     }
 
@@ -954,6 +991,7 @@ impl Provider for IncusProvider {
                 self.prepared_create(entry, *kind, project, parent.as_deref(), name, body)?;
                 self.check_features(entry, *kind, project)?;
                 Ok(Planned {
+                    acl_patch: None,
                     class: class_of(*kind),
                     op_digest: digest,
                     pre_image: None,
@@ -962,6 +1000,35 @@ impl Provider for IncusProvider {
             }
             EffectOp::IncusPatchConfig { object, config } => {
                 self.plan_for_object(entry, object, Some(config), digest)
+            }
+            EffectOp::IncusPatchAclField {
+                object,
+                field,
+                rules,
+            } => {
+                check_acl_patch(object, rules)?;
+                self.check_family(object.kind, &object.project)?;
+                let writer = self.writer(entry)?;
+                let owned = self.owned_for_write(entry, &writer, object)?;
+                if owned.tombstone().is_some() {
+                    return Err(EffectRefusal::NotDeclared);
+                }
+                let previous = owned
+                    .acl_rules(*field)
+                    .filter(|rules| rules.iter().all(Value::is_object))
+                    .ok_or(EffectRefusal::NotDeclared)?
+                    .clone();
+                Ok(Planned {
+                    class: EffectClass::A,
+                    op_digest: digest,
+                    pre_image: None,
+                    acl_patch: Some(AclPatch {
+                        field: *field,
+                        previous,
+                        rules: rules.clone(),
+                    }),
+                    etag: Some(owned.etag().into()),
+                })
             }
             EffectOp::IncusDelete { object, .. } => {
                 self.plan_for_object(entry, object, None, digest)
@@ -996,7 +1063,7 @@ impl Provider for IncusProvider {
                         "the plan names another class for this kind".to_string(),
                     ));
                 }
-                if planned.pre_image.is_some() {
+                if planned.pre_image.is_some() || planned.acl_patch.is_some() {
                     return Err(EffectRefusal::Provider(
                         "a create's plan carries no pre-image".to_string(),
                     ));
@@ -1025,6 +1092,9 @@ impl Provider for IncusProvider {
                 }
             }
             EffectOp::IncusPatchConfig { object, config } => {
+                if planned.acl_patch.is_some() {
+                    return Err(EffectRefusal::NotDeclared);
+                }
                 if planned.class != class_of(object.kind) {
                     return Err(EffectRefusal::Provider(
                         "the plan names another class for this kind".to_string(),
@@ -1066,6 +1136,73 @@ impl Provider for IncusProvider {
                     },
                 ))
             }
+            EffectOp::IncusPatchAclField {
+                object,
+                field,
+                rules,
+            } => {
+                check_acl_patch(object, rules)?;
+                self.check_family(object.kind, &object.project)?;
+                let patch = planned
+                    .acl_patch
+                    .as_ref()
+                    .ok_or(EffectRefusal::NotDeclared)?;
+                if planned.class != EffectClass::A
+                    || planned.pre_image.is_some()
+                    || patch.field != *field
+                    || patch.rules != *rules
+                {
+                    return Err(EffectRefusal::NotDeclared);
+                }
+                let writer = self.writer(entry)?;
+                let owned = self.owned_for_write(entry, &writer, object)?;
+                if planned.etag.as_deref() != Some(owned.etag()) {
+                    return Err(EffectRefusal::Stale);
+                }
+                if owned.acl_rules(*field) != Some(&patch.previous)
+                    || !patch.previous.iter().all(Value::is_object)
+                {
+                    return Err(EffectRefusal::NotDeclared);
+                }
+                match writer.patch_acl_field(&owned, *field, rules) {
+                    Ok(_) => {}
+                    Err(IncusError::Status { code: 412, .. }) => return Err(EffectRefusal::Stale),
+                    Err(IncusError::Refused(reason)) => {
+                        return Err(EffectRefusal::Provider(reason));
+                    }
+                    Err(IncusError::Status { .. }) => {
+                        match self
+                            .read_back_acl(entry, object, patch)
+                            .map_err(|_| EffectRefusal::Unresolved)?
+                        {
+                            ReadBack::Present {
+                                owned: true,
+                                holds_pre_image: false,
+                                ..
+                            } => {}
+                            ReadBack::Present {
+                                owned: true,
+                                holds_pre_image: true,
+                                ..
+                            } => {
+                                return Err(EffectRefusal::Provider(
+                                    "the ACL array patch did not land".into(),
+                                ));
+                            }
+                            _ => return Err(EffectRefusal::Unresolved),
+                        }
+                    }
+                    Err(_) => return Err(EffectRefusal::Unresolved),
+                }
+                Ok((
+                    object.clone(),
+                    Inverse::IncusRestoreAclField {
+                        object: object.clone(),
+                        field: *field,
+                        rules: patch.previous.clone(),
+                    },
+                ))
+            }
             // A delete runs only through `retire`, after an approved plan. The kernel's own path refuses it.
             EffectOp::IncusDelete { .. } => Err(EffectRefusal::NotDeclared),
         }
@@ -1100,6 +1237,37 @@ impl Provider for IncusProvider {
             },
             owned: kernel_may_write(&reading.class, entry),
             holds_pre_image,
+        })
+    }
+
+    fn read_back_acl(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+    ) -> Result<ReadBack, EffectRefusal> {
+        check_acl_patch(target, &patch.rules)?;
+        self.check_family(target.kind, &target.project)?;
+        self.settle_operations(target)?;
+        let writer = self.writer(entry)?;
+        let owned = match self.owned_for_write(entry, &writer, target) {
+            Ok(owned) => owned,
+            Err(EffectRefusal::Provider(_)) => match writer.read_class(target) {
+                Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
+                _ => return Err(EffectRefusal::Unresolved),
+            },
+            Err(error) => return Err(error),
+        };
+        let current = owned
+            .acl_rules(patch.field)
+            .ok_or(EffectRefusal::Unresolved)?;
+        if current != &patch.previous && current != &patch.rules {
+            return Err(EffectRefusal::Unresolved);
+        }
+        Ok(ReadBack::Present {
+            object: target.clone(),
+            owned: true,
+            holds_pre_image: current == &patch.previous,
         })
     }
 
@@ -1309,11 +1477,15 @@ fn check_patch_keys(
     Ok(())
 }
 
-/// A config key that is plain: lowercase ASCII letters, digits, and `_ . -`.
+/// A config key is `[a-z0-9_.-]`, plus uppercase ASCII after a leading `environment.`.
 fn plain_config_key(key: &str) -> bool {
+    let environment = key.starts_with("environment.");
     !key.is_empty()
         && key.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'.' | b'-')
+                || (environment && b.is_ascii_uppercase())
         })
 }
 
@@ -1498,4 +1670,38 @@ fn process_uid() -> Result<u32, EffectRefusal> {
     let _ = fs::remove_dir_all(&dir);
     made.map(|meta| meta.uid())
         .map_err(|_| EffectRefusal::Provider("the uid probe failed".to_string()))
+}
+
+/// Validate the closed top-level patch vocabulary before any read.
+fn check_acl_patch(object: &ObjectRef, rules: &[Value]) -> Result<(), EffectRefusal> {
+    if object.kind != IncusKind::Acl
+        || object.project != NETWORK_HOME
+        || object.parent.is_some()
+        || object.uuid.is_some()
+        || !rules.iter().all(Value::is_object)
+    {
+        return Err(EffectRefusal::NotDeclared);
+    }
+    Ok(())
+}
+
+fn redact_secret_values(value: &mut Value, secrets: &[(String, String)]) {
+    match value {
+        Value::String(text) => {
+            if let Some(reference) = secret_reference(text, secrets) {
+                *text = reference;
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                redact_secret_values(value, secrets);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                redact_secret_values(value, secrets);
+            }
+        }
+        _ => {}
+    }
 }

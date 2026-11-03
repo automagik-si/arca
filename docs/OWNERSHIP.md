@@ -135,7 +135,7 @@ Source: `UnixIncusWriter::{wait_for, wait_on}` and `IncusError::Status` in `crat
 `an_answer_with_an_empty_or_absent_operation_is_done_without_a_wait` and `a_failed_operation_is_a_status_error_and_the_object_stays`.
 
 **Rule 15.** The writer sends only POST, PATCH, PUT and DELETE. A POST creates, a PATCH sets or removes config keys of any kind
-but a project, and a DELETE removes. A PUT is sent for one thing only: a project's config change or tombstone, as the project's
+but a project, or replaces one ACL ingress or egress array (Rule 47), and a DELETE removes. A PUT is sent for one thing only: a project's config change or tombstone, as the project's
 whole config with the change applied, under the ETag of the read the change was checked against (Rule 43). No other object is
 written wholesale, and no PATCH is sent to a project.
 Source: the methods passed to `mutate` in `crates/arca-incus/src/write.rs` (`POST` in `create`, `PATCH` and `PUT` in
@@ -713,6 +713,52 @@ refusals, `each_thing_the_instance_already_uses_is_planned_as_exactly_its_allowa
 `a_stopped_adoption_started_by_hand_is_released_only_once_it_is_stopped_again`; and in `crates/arca/src/adoptions.rs`,
 `a_running_plan_keeps_its_digest_and_a_recorded_plan_stays_valid`.
 
+## ACL arrays and scoped observations
+
+**Rule 46.** Config keys accept uppercase ASCII letters only after a leading lowercase `environment.` prefix.
+`environment.DATABASE_URL` is accepted; `Environment.X`, `foo.BAR`, non-ASCII letters and path separators are refused.
+Every other key keeps the lowercase ASCII, digit and `_ . -` rule. Both the provider and the writer enforce it.
+Source: orchestrator ruling / Group 22a; `plain_config_key` in `crates/arca-providers/src/incus.rs` and `plain_key` in
+`crates/arca-incus/src/write.rs`; tests `environment_uppercase_suffix_is_accepted_and_other_uppercase_keys_are_refused`
+in `crates/arca-providers/tests/incus_provider.rs` and `writer_accepts_uppercase_only_after_lowercase_environment_prefix`
+in `crates/arca-incus/tests/write.rs`.
+
+**Rule 47.** `IncusPatchAclField { object, field, rules }` replaces exactly one top-level ACL array, `ingress` or `egress`,
+with an array of rule objects. It is class A, addresses only an ACL in `default`, and requires the object's own config to
+classify as the requesting entry's own. Planning reads the ownership, previous array and ETag together without writing;
+the effect rechecks them and PATCHes only the named array under `If-Match`. A stale ETag is 412 and changes nothing.
+No other kind or field is admitted, and a retiring, foreign, droidd, contested or retained ACL is refused.
+Source: orchestrator ruling / Group 22a; `EffectOp::IncusPatchAclField`, `IncusProvider::{plan, effect}` and
+`UnixIncusWriter::patch_acl_field`; tests `acl_array_patch_journals_typed_pre_image_and_inverse_restores_both_fields`,
+`acl_array_patch_refuses_foreign_droidd_non_acl_and_non_object_rules` and `acl_array_patch_answered_412_is_stale` in
+`crates/arca-providers/tests/incus_provider.rs`, `acl_array_patch_under_a_stale_etag_is_412_and_changes_nothing` in
+`crates/arca-incus/tests/write.rs` and `ctx_accepts_only_acl_arrays_with_the_planned_inverse_and_class_a` in
+`crates/arca-kernel/tests/plugin.rs`.
+
+**Rule 48.** An ACL array patch follows Rule 23's four steps. Its intent durably records `acl_patch` with `field`, `previous`
+and `rules`; its inverse is `IncusRestoreAclField { object, field, rules }`, whose rules are the previous array. Its read-back
+must still classify as the entry's own and show the sent array; undo restores the previous array through the same journalled
+op. After a restart, an owned ACL showing the previous array settles as not landed, and one showing the sent array settles
+with the restore inverse. A different array, another owner or an unreadable object keeps the intent unresolved. Existing
+records omit `acl_patch` and keep deserializing. Writer diagnostics omit config and rule values.
+Source: orchestrator ruling / Group 22a; `AclPatch`, `Inverse::IncusRestoreAclField`, `JournalSink::intend_acl`,
+`Provider::read_back_acl`, `IncusProvider::read_back_acl` and `Reconciler::{settle_acl_patch, restore}`; tests
+`acl_array_intents_replay_before_and_after_patch_and_removal_restores_the_array` in
+`crates/arca-reconcile/tests/restart.rs`, `acl_array_inverse_is_closed_and_old_records_keep_their_serialized_shape`
+in `crates/arca-kernel/tests/journal.rs`, `acl_array_patch_journals_typed_pre_image_and_inverse_restores_both_fields`
+and `acl_array_patch_read_back_requires_the_sent_array_and_the_entrys_ownership` in
+`crates/arca-providers/tests/incus_provider.rs` and `writer_accepts_uppercase_only_after_lowercase_environment_prefix`
+in `crates/arca-incus/tests/write.rs`.
+
+**Rule 49.** `Observe::IncusGet` admits only an instance object or its `state` path in a kernel-family project named by the
+requesting manifest, or an ACL in `default` whose own config classifies as the requesting entry's own. The path must name
+one plain object and exactly one literal `project` query; unknown endpoints, encodings, extra query parameters and projects
+outside the family are refused. Observations send GETs only. Returned values equal to current secret contents are replaced
+with their `arca-secret:` references, including instance config and expanded config, so no such secret value is returned raw.
+Source: orchestrator ruling / Group 22a; `IncusProvider::observe`, `secrets_by_value`, `read_secret` and
+`redact_secret_values`; test `scoped_observe_allows_instance_state_and_own_acl_and_redacts_secret_values` in
+`crates/arca-providers/tests/incus_provider.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -778,3 +824,6 @@ must run before any live write.
   `timeout` passes is answered with the operation still running, and an operation Incus no longer holds is 404 (Rule 44). Read from
   the Incus source (`operationsGet` and `operationWaitGet` in `cmd/incusd/operations.go`, `render` in
   `internal/server/operations/operations.go`, and `instancesPost`); a live probe must confirm it.
+
+- An ACL PATCH replaces only the top-level ingress or egress array it names and preserves the other fields (Rules 47, 48).
+  This is modeled by the fake's top-level merge; a live probe must confirm it before a live use of the new op.

@@ -68,6 +68,7 @@ impl Provider for Answer {
 
     fn plan(&self, _entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
         Ok(Planned {
+            acl_patch: None,
             class: self.class,
             op_digest: op_digest(op),
             pre_image: None,

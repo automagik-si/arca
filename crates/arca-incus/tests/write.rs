@@ -2376,3 +2376,65 @@ fn no_public_writer_method_sends_a_patch_to_a_project() {
         BTreeSet::from(["DELETE".to_string(), "POST".to_string(), "PUT".to_string()])
     );
 }
+
+#[test]
+fn writer_accepts_uppercase_only_after_lowercase_environment_prefix() {
+    let (_dir, fake) = start("environment-prefix");
+    let writer = writer(&fake, "toy");
+    let target = target(IncusKind::Instance, "svc", "env1", None);
+    let owned = writer.create(&target, &marked()).unwrap();
+    let before = fake.writes().len();
+    for key in [
+        "Environment.X",
+        "foo.BAR",
+        "environment.É",
+        "environment.BAD/KEY",
+    ] {
+        assert!(matches!(
+            writer.patch(&owned, &changes(&[(key, Some("value"))])),
+            Err(IncusError::Refused(_))
+        ));
+    }
+    assert_eq!(fake.writes().len(), before);
+    let patched = writer
+        .patch(
+            &owned,
+            &changes(&[("environment.DATABASE_URL", Some("private-value"))]),
+        )
+        .unwrap();
+    assert_eq!(
+        patched.config()["environment.DATABASE_URL"],
+        "private-value"
+    );
+    assert!(!format!("{patched:?}").contains("private-value"));
+    assert!(!format!("{:?}", writer.read_class(&target).unwrap()).contains("private-value"));
+}
+
+#[test]
+fn acl_array_patch_under_a_stale_etag_is_412_and_changes_nothing() {
+    use arca_kernel::journal::AclField;
+    let (_dir, fake) = start("acl-stale");
+    let writer = writer(&fake, "toy");
+    let target = target(IncusKind::Acl, "default", "acl-stale", None);
+    let first = writer
+        .create(
+            &target,
+            &json!({"config":{MARK:"toy"}, "ingress":[], "egress":[]}),
+        )
+        .unwrap();
+    let rules = vec![json!({"action":"allow"})];
+    let second = writer
+        .patch_acl_field(&first, AclField::Ingress, &rules)
+        .unwrap();
+    let error = writer
+        .patch_acl_field(&first, AclField::Ingress, &[json!({"action":"reject"})])
+        .unwrap_err();
+    assert_eq!(status_of(&error), Some(412));
+    assert_eq!(writer.get_etag(&target).unwrap().0["ingress"], json!(rules));
+    assert_eq!(second.acl_rules(AclField::Ingress), Some(&rules));
+    assert!(
+        writer
+            .patch_acl_field(&second, AclField::Egress, &[json!("bad")])
+            .is_err()
+    );
+}

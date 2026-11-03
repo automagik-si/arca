@@ -65,6 +65,7 @@ fn patch(project: &str, name: &str, pairs: &[(&str, Option<&str>)]) -> EffectOp 
 
 /// A provider that records its calls in the shared log, and answers as configured.
 struct Host {
+    acl_patch: Option<arca_kernel::journal::AclPatch>,
     log: Log,
     plans: Cell<usize>,
     effects: usize,
@@ -82,6 +83,7 @@ struct Host {
 impl Host {
     fn new(log: &Log) -> Host {
         Host {
+            acl_patch: None,
             log: log.clone(),
             plans: Cell::new(0),
             effects: 0,
@@ -116,6 +118,7 @@ impl Provider for Host {
             return Err(refusal.clone());
         }
         Ok(Planned {
+            acl_patch: self.acl_patch.clone(),
             class: self.plan_class,
             op_digest: self.plan_digest.clone().unwrap_or_else(|| op_digest(op)),
             pre_image: self.pre_image.clone(),
@@ -152,6 +155,7 @@ impl Provider for Host {
                 uuid: Some("u-1".to_string()),
             },
             (None, EffectOp::IncusPatchConfig { object, .. })
+            | (None, EffectOp::IncusPatchAclField { object, .. })
             | (None, EffectOp::IncusDelete { object, .. }) => object.clone(),
         };
         let inverse = self.answer_inverse.clone().unwrap_or(match op {
@@ -161,6 +165,11 @@ impl Provider for Host {
             EffectOp::IncusPatchConfig { .. } => Inverse::IncusRestoreConfig {
                 object: object.clone(),
                 config: planned.pre_image.clone().unwrap_or_default(),
+            },
+            EffectOp::IncusPatchAclField { object, field, .. } => Inverse::IncusRestoreAclField {
+                object: object.clone(),
+                field: *field,
+                rules: planned.acl_patch.as_ref().unwrap().previous.clone(),
             },
             EffectOp::IncusDelete { .. } => Inverse::Emission,
         });
@@ -1008,4 +1017,74 @@ fn a_create_plan_that_carries_a_pre_image_is_refused_with_no_intent() {
     assert!(matches!(refusal, Err(EffectRefusal::Provider(_))));
     assert_eq!(*log.borrow(), vec!["plan"]);
     assert_eq!(host.effects, 0);
+}
+
+#[test]
+fn ctx_accepts_only_acl_arrays_with_the_planned_inverse_and_class_a() {
+    use arca_kernel::journal::{AclField, AclPatch};
+    let object = ObjectRef {
+        kind: IncusKind::Acl,
+        project: "default".into(),
+        parent: None,
+        name: "own".into(),
+        uuid: None,
+    };
+    let op = EffectOp::IncusPatchAclField {
+        object: object.clone(),
+        field: AclField::Ingress,
+        rules: vec![json!({"action":"allow"})],
+    };
+    let patch = AclPatch {
+        field: AclField::Ingress,
+        previous: vec![],
+        rules: vec![json!({"action":"allow"})],
+    };
+    let declared = manifest(
+        vec![
+            (IncusKind::Acl, EffectClass::A),
+            (IncusKind::Instance, EffectClass::B),
+        ],
+        &["default", "p"],
+        false,
+    );
+    for bad in ["none", "inverse", "class", "previous", "sent", "kind"] {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut host = Host::new(&log);
+        host.acl_patch = Some(patch.clone());
+        let mut op = op.clone();
+        match bad {
+            "inverse" => host.answer_inverse = Some(Inverse::Emission),
+            "class" => host.plan_class = EffectClass::B,
+            "previous" => host.acl_patch.as_mut().unwrap().previous = vec![json!("bad")],
+            "sent" => host.acl_patch.as_mut().unwrap().rules = vec![],
+            "kind" => {
+                op = EffectOp::IncusPatchAclField {
+                    object: ObjectRef {
+                        kind: IncusKind::Instance,
+                        project: "p".into(),
+                        ..object.clone()
+                    },
+                    field: AclField::Ingress,
+                    rules: vec![],
+                }
+            }
+            _ => {}
+        }
+        let mut journal = Journal::open(MemJournal::new()).unwrap();
+        let result = Ctx::new(entry(), &declared, &mut host, &mut journal, 1).effect(op);
+        if bad == "none" {
+            assert_eq!(result, Ok(object.clone()));
+            assert_eq!(
+                journal.live(&entry())[0].inverse,
+                Some(Inverse::IncusRestoreAclField {
+                    object: object.clone(),
+                    field: AclField::Ingress,
+                    rules: vec![]
+                })
+            );
+        } else {
+            assert!(result.is_err(), "{bad}");
+            assert_eq!(host.effects, usize::from(bad == "inverse"));
+        }
+    }
 }

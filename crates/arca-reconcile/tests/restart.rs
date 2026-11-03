@@ -2194,3 +2194,128 @@ fn a_failed_operations_read_holds_every_intent_and_the_open_refuses_with_no_writ
     .expect("the open settles once the operations read");
     assert_eq!(r.resolution().reverted, vec![1, 2]);
 }
+
+#[test]
+fn acl_array_intents_replay_before_and_after_patch_and_removal_restores_the_array() {
+    use arca_kernel::journal::{AclField, IntentFields};
+    for phase in ["before", "landed", "recorded", "changed", "foreign"] {
+        let scratch = Scratch::new(&format!("acl-array-{phase}"));
+        let fake = start_fake(&scratch);
+        let retained = RetainedSet::empty();
+        let key = node_key();
+        let previous = vec![json!({"action":"reject"})];
+        let sent = vec![json!({"action":"allow", "protocol":"tcp", "destination_port":"5432"})];
+        let path = "/1.0/network-acls/array-replay?project=default";
+        assert_eq!(
+            raw(
+                &fake,
+                "POST",
+                "/1.0/network-acls?project=default",
+                Some(&json!({
+                    "name":"array-replay", "config":{MARK:PE}, "ingress":previous, "egress":[]
+                }))
+            )
+            .0,
+            201
+        );
+        let target = acl("array-replay");
+        let op = EffectOp::IncusPatchAclField {
+            object: target.clone(),
+            field: AclField::Ingress,
+            rules: sent.clone(),
+        };
+        {
+            let mut provider = provider(&scratch, &fake, &retained);
+            let plan = provider.plan(&pe_id(), &op).unwrap();
+            let mut journal =
+                Journal::open(FileJournal::open(&scratch.path("journal.jsonl")).unwrap()).unwrap();
+            let id = journal
+                .intend_acl_by(
+                    Some(&PluginId(PATCHER.into())),
+                    IntentFields {
+                        entry: &pe_id(),
+                        class: EffectClass::A,
+                        op_digest: op_digest(&op),
+                        target: target.clone(),
+                        pre_image: None,
+                        now_ms: NOW,
+                    },
+                    plan.acl_patch.clone().unwrap(),
+                )
+                .unwrap();
+            if phase != "before" {
+                let (object, inverse) = provider.effect(&pe_id(), &op, &plan).unwrap();
+                if phase == "recorded" {
+                    journal.applied(id, object, inverse).unwrap();
+                }
+            }
+        }
+        if phase == "changed" {
+            assert_eq!(
+                raw(
+                    &fake,
+                    "PATCH",
+                    path,
+                    Some(&json!({"ingress":[{"action":"drop"}]}))
+                )
+                .0,
+                200
+            );
+        }
+        if phase == "foreign" {
+            assert_eq!(
+                raw(
+                    &fake,
+                    "PATCH",
+                    path,
+                    Some(&json!({"config":{MARK:"other"}}))
+                )
+                .0,
+                200
+            );
+        }
+        let writes = fake.writes().len();
+        let reopened = restarted(
+            &scratch,
+            &key,
+            plain(&scratch, &fake, &retained),
+            plugins(),
+            &retained,
+            None,
+        );
+        assert_eq!(fake.writes().len(), writes, "restart only reads");
+        if phase == "changed" || phase == "foreign" {
+            assert!(
+                matches!(reopened, Err(KernelError::Unresolved { .. })),
+                "{phase}"
+            );
+            continue;
+        }
+        let mut reconciler = reopened.unwrap();
+        assert!(reconciler.journal().unresolved().is_empty());
+        if phase == "before" {
+            assert!(reconciler.journal().live_entries().is_empty());
+        } else {
+            let record = reconciler.journal().live(&pe_id()).pop().unwrap();
+            assert_eq!(
+                record.inverse,
+                Some(Inverse::IncusRestoreAclField {
+                    object: target.clone(),
+                    field: AclField::Ingress,
+                    rules: previous.clone()
+                })
+            );
+            let removal = signed(&key, 1, None, vec![]);
+            let outcomes = reconciler.reconcile(&removal, NOW);
+            assert!(
+                outcomes
+                    .iter()
+                    .any(|outcome| matches!(outcome, Outcome::Reverted { .. })),
+                "{outcomes:?}"
+            );
+            assert!(reconciler.journal().live_entries().is_empty());
+        }
+        assert_eq!(get(&fake, path).unwrap()["ingress"], json!(previous));
+        assert_eq!(get(&fake, path).unwrap()["config"][MARK], PE);
+    }
+}

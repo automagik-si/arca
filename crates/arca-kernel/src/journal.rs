@@ -31,6 +31,32 @@ pub enum EffectClass {
     C,
 }
 
+/// The only top-level fields a plugin may replace on an ACL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AclField {
+    Ingress,
+    Egress,
+}
+
+impl AclField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ingress => "ingress",
+            Self::Egress => "egress",
+        }
+    }
+}
+
+/// The durable pre-image and intended value of an ACL array patch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AclPatch {
+    pub field: AclField,
+    pub previous: Vec<serde_json::Value>,
+    pub rules: Vec<serde_json::Value>,
+}
+
 /// The data that undoes an applied effect. The vocabulary is closed: deserialization refuses any `op` this enum does not
 /// name and any field a variant does not name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +68,12 @@ pub enum Inverse {
     IncusRestoreConfig {
         object: ObjectRef,
         config: BTreeMap<String, Option<String>>,
+    },
+    /// Restores the complete array replaced by an ACL field patch.
+    IncusRestoreAclField {
+        object: ObjectRef,
+        field: AclField,
+        rules: Vec<serde_json::Value>,
     },
     /// Removes an ACL rule, identified by its digest.
     AclRuleRemove {
@@ -69,6 +101,12 @@ enum InverseWire {
         object: ObjectRef,
         config: BTreeMap<String, Option<String>>,
     },
+    IncusRestoreAclField {
+        #[serde(deserialize_with = "closed::object")]
+        object: ObjectRef,
+        field: AclField,
+        rules: Vec<serde_json::Value>,
+    },
     AclRuleRemove {
         project: String,
         acl: String,
@@ -81,19 +119,39 @@ enum InverseWire {
     Emission {},
 }
 
-impl From<InverseWire> for Inverse {
-    fn from(wire: InverseWire) -> Self {
-        match wire {
+impl TryFrom<InverseWire> for Inverse {
+    type Error = &'static str;
+    fn try_from(wire: InverseWire) -> Result<Self, Self::Error> {
+        Ok(match wire {
             InverseWire::IncusDelete { object } => Inverse::IncusDelete { object },
             InverseWire::IncusRestoreConfig { object, config } => {
                 Inverse::IncusRestoreConfig { object, config }
+            }
+            InverseWire::IncusRestoreAclField {
+                object,
+                field,
+                rules,
+            } => {
+                if object.kind != crate::ownership::IncusKind::Acl
+                    || object.project != "default"
+                    || object.parent.is_some()
+                    || object.uuid.is_some()
+                    || !rules.iter().all(serde_json::Value::is_object)
+                {
+                    return Err("invalid ACL array inverse");
+                }
+                Inverse::IncusRestoreAclField {
+                    object,
+                    field,
+                    rules,
+                }
             }
             InverseWire::AclRuleRemove { project, acl, rule } => {
                 Inverse::AclRuleRemove { project, acl, rule }
             }
             InverseWire::FileRemove { path, digest } => Inverse::FileRemove { path, digest },
             InverseWire::Emission {} => Inverse::Emission,
-        }
+        })
     }
 }
 
@@ -116,7 +174,7 @@ pub enum EffectState {
 }
 
 /// One journal record. A record names its effect by `id`; each state change writes a full copy of the record, so the newest
-/// record for an id is the effect's state. The intent fields (`target`, `pre_image`, `intent`) are copied unchanged to every
+/// record for an id is the effect's state. The intent fields (`target`, `pre_image`, `acl_patch`, `intent`) are copied unchanged to every
 /// later record of the effect. An `Intent` has no object and no inverse; every later state of an applied effect carries both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +189,9 @@ pub struct EffectRecord {
     /// For a patch, the values its keys held when the plan was made, with `None` for a key that was absent. `None` for a
     /// create, so recovery can tell the two apart from the intent alone.
     pub pre_image: Option<BTreeMap<String, Option<String>>>,
+    /// ACL patches carry typed arrays; omitted so old records retain their shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acl_patch: Option<AclPatch>,
     /// Set on the intent of a retirement and on every record of it. It is omitted when absent, so a record without it keeps the
     /// bytes it always had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +228,17 @@ pub trait JournalSink {
         pre_image: Option<BTreeMap<String, Option<String>>>,
         now_ms: u64,
     ) -> Result<u64, KernelError>;
+    /// Records an ACL array intent before its write. Sinks without support refuse before any effect.
+    fn intend_acl(
+        &mut self,
+        fields: IntentFields<'_>,
+        patch: AclPatch,
+    ) -> Result<u64, KernelError> {
+        let _ = (fields, patch);
+        Err(KernelError::Journal(
+            "the journal sink cannot record an ACL array patch".into(),
+        ))
+    }
     /// Records that the effect applied, with the object it touched and the inverse that undoes it.
     fn applied(&mut self, id: u64, object: ObjectRef, inverse: Inverse) -> Result<(), KernelError>;
     /// Records that the effect was refused. The reason is returned to the caller and is not journalled: a record carries no
@@ -448,6 +520,7 @@ impl<S: JournalStore> Journal<S> {
             op_digest: prev.op_digest.clone(),
             target: prev.target.clone(),
             pre_image: prev.pre_image.clone(),
+            acl_patch: prev.acl_patch.clone(),
             intent: prev.intent,
             plugin: prev.plugin.clone(),
             object,
@@ -458,6 +531,7 @@ impl<S: JournalStore> Journal<S> {
         if let Some(why) = refusal_to_follow(&prev, &next) {
             return Err(corrupt(id, why));
         }
+        check_outcome(&next)?;
         self.write(next)
     }
 
@@ -472,6 +546,7 @@ impl<S: JournalStore> Journal<S> {
 /// The parts of an intent that a create, a patch and a retirement do not share: a patch's pre-image, and the marker a retirement
 /// carries.
 struct IntentShape {
+    acl_patch: Option<AclPatch>,
     pre_image: Option<BTreeMap<String, Option<String>>>,
     intent: Option<IntentKind>,
     plugin: Option<PluginId>,
@@ -489,11 +564,49 @@ impl<S: JournalStore> Journal<S> {
         now_ms: u64,
     ) -> Result<u64, KernelError> {
         let shape = IntentShape {
+            acl_patch: None,
             pre_image: None,
             intent: Some(IntentKind::Delete),
             plugin: None,
         };
         self.intend_as(entry, class, op_digest, target, shape, now_ms)
+    }
+
+    /// Records a typed ACL patch intent, optionally attributed to a plugin.
+    pub fn intend_acl_by(
+        &mut self,
+        plugin: Option<&PluginId>,
+        fields: IntentFields<'_>,
+        patch: AclPatch,
+    ) -> Result<u64, KernelError> {
+        if fields.class != EffectClass::A
+            || fields.target.kind != crate::ownership::IncusKind::Acl
+            || fields.target.project != "default"
+            || fields.target.parent.is_some()
+            || fields.target.uuid.is_some()
+            || fields.pre_image.is_some()
+            || !patch
+                .previous
+                .iter()
+                .chain(&patch.rules)
+                .all(serde_json::Value::is_object)
+        {
+            return Err(KernelError::Journal("invalid ACL array intent".into()));
+        }
+        let shape = IntentShape {
+            acl_patch: Some(patch),
+            pre_image: None,
+            intent: None,
+            plugin: plugin.cloned(),
+        };
+        self.intend_as(
+            fields.entry,
+            fields.class,
+            fields.op_digest,
+            fields.target,
+            shape,
+            fields.now_ms,
+        )
     }
 
     fn intend_as(
@@ -522,6 +635,7 @@ impl<S: JournalStore> Journal<S> {
             op_digest,
             target,
             pre_image: shape.pre_image,
+            acl_patch: shape.acl_patch,
             intent: shape.intent,
             plugin: shape.plugin,
             object: None,
@@ -543,6 +657,7 @@ impl<S: JournalStore> Journal<S> {
         fields: IntentFields<'_>,
     ) -> Result<u64, KernelError> {
         let shape = IntentShape {
+            acl_patch: None,
             pre_image: fields.pre_image,
             intent: None,
             plugin: Some(plugin.clone()),
@@ -559,6 +674,14 @@ impl<S: JournalStore> Journal<S> {
 }
 
 impl<S: JournalStore> JournalSink for Journal<S> {
+    fn intend_acl(
+        &mut self,
+        fields: IntentFields<'_>,
+        patch: AclPatch,
+    ) -> Result<u64, KernelError> {
+        self.intend_acl_by(None, fields, patch)
+    }
+
     fn intend(
         &mut self,
         entry: &EntryId,
@@ -569,6 +692,7 @@ impl<S: JournalStore> JournalSink for Journal<S> {
         now_ms: u64,
     ) -> Result<u64, KernelError> {
         let shape = IntentShape {
+            acl_patch: None,
             pre_image,
             intent: None,
             plugin: None,
@@ -681,6 +805,7 @@ fn refusal_to_follow(prev: &EffectRecord, next: &EffectRecord) -> Option<&'stati
         || prev.at_ms != next.at_ms
         || prev.target != next.target
         || prev.pre_image != next.pre_image
+        || prev.acl_patch != next.acl_patch
         || prev.intent != next.intent
     {
         return Some("changes what its intent says");
@@ -737,7 +862,9 @@ fn inverse_names_other_object(record: &EffectRecord) -> Option<&'static str> {
         return None;
     };
     let named = match inverse {
-        Inverse::IncusDelete { object } | Inverse::IncusRestoreConfig { object, .. } => object,
+        Inverse::IncusDelete { object }
+        | Inverse::IncusRestoreConfig { object, .. }
+        | Inverse::IncusRestoreAclField { object, .. } => object,
         Inverse::AclRuleRemove { .. } | Inverse::FileRemove { .. } | Inverse::Emission => {
             return None;
         }
@@ -752,6 +879,41 @@ fn inverse_names_other_object(record: &EffectRecord) -> Option<&'static str> {
 /// Only an intent, a failure, and a revert of an intent that never applied carry no outcome. Every other state carries the
 /// object and its inverse together.
 fn check_outcome(record: &EffectRecord) -> Result<(), KernelError> {
+    if matches!(record.inverse, Some(Inverse::IncusRestoreAclField { .. }))
+        && record.acl_patch.is_none()
+    {
+        return Err(corrupt(
+            record.id,
+            "has an ACL array inverse without its intent",
+        ));
+    }
+    if let Some(patch) = &record.acl_patch {
+        let valid = record.class == EffectClass::A
+            && record.target.kind == crate::ownership::IncusKind::Acl
+            && record.target.project == "default"
+            && record.target.parent.is_none()
+            && record.target.uuid.is_none()
+            && record.pre_image.is_none()
+            && record.intent.is_none()
+            && patch
+                .previous
+                .iter()
+                .chain(&patch.rules)
+                .all(serde_json::Value::is_object);
+        if !valid {
+            return Err(corrupt(record.id, "carries an invalid ACL array intent"));
+        }
+        if let Some(inverse) = &record.inverse {
+            let expected = Inverse::IncusRestoreAclField {
+                object: record.target.clone(),
+                field: patch.field,
+                rules: patch.previous.clone(),
+            };
+            if inverse != &expected {
+                return Err(corrupt(record.id, "carries another ACL array inverse"));
+            }
+        }
+    }
     let bare = record.object.is_none() && record.inverse.is_none();
     let whole = record.object.is_some() && record.inverse.is_some();
     let fits = match record.state {

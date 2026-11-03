@@ -36,6 +36,7 @@ impl Provider for Unsure {
 
     fn plan(&self, _entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
         Ok(Planned {
+            acl_patch: None,
             class: EffectClass::A,
             op_digest: op_digest(op),
             pre_image: None,

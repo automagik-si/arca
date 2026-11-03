@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::KernelError;
 use crate::canon::{Digest, canonical_json};
 use crate::desired::{EntryId, PluginId};
-use crate::journal::{EffectClass, Inverse, JournalSink};
+use crate::journal::{AclField, AclPatch, EffectClass, IntentFields, Inverse, JournalSink};
 use crate::ownership::{IncusKind, ObjectRef, OwnerClass};
 
 /// A key a plugin provides to other plugins, with the version it provides it at.
@@ -66,6 +66,12 @@ pub enum EffectOp {
         object: ObjectRef,
         config: BTreeMap<String, Option<String>>,
     },
+    /// Replaces exactly one ACL rule array. The field is serialized as `ingress` or `egress`.
+    IncusPatchAclField {
+        object: ObjectRef,
+        field: AclField,
+        rules: Vec<Value>,
+    },
     /// Deletes an object, under the approved delete plan named by `plan`. Only the reconciler runs one; [`Ctx::effect`]
     /// refuses it.
     IncusDelete { object: ObjectRef, plan: Digest },
@@ -81,9 +87,9 @@ impl EffectOp {
                 name,
                 ..
             } => (*kind, project, name),
-            EffectOp::IncusPatchConfig { object, .. } | EffectOp::IncusDelete { object, .. } => {
-                (object.kind, &object.project, &object.name)
-            }
+            EffectOp::IncusPatchConfig { object, .. }
+            | EffectOp::IncusPatchAclField { object, .. }
+            | EffectOp::IncusDelete { object, .. } => (object.kind, &object.project, &object.name),
         }
     }
 }
@@ -100,6 +106,8 @@ pub fn op_digest(op: &EffectOp) -> Digest {
 /// patch would change as they stand now, and the ETag of the object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
+    /// Previous and sent arrays for an ACL field patch; absent for existing operations.
+    pub acl_patch: Option<AclPatch>,
     pub class: EffectClass,
     pub op_digest: Digest,
     pub pre_image: Option<BTreeMap<String, Option<String>>>,
@@ -201,6 +209,16 @@ pub trait Provider {
         pre_image: Option<&BTreeMap<String, Option<String>>>,
     ) -> Result<ReadBack, EffectRefusal> {
         let _ = (entry, target, pre_image);
+        Err(EffectRefusal::NotDeclared)
+    }
+    /// Reads back an ACL array patch after a restart. Unknown or differing values keep the intent open.
+    fn read_back_acl(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+    ) -> Result<ReadBack, EffectRefusal> {
+        let _ = (entry, target, patch);
         Err(EffectRefusal::NotDeclared)
     }
     /// Deletes an object the entry owns, with `plan` as the digest its tombstone carries. Only the reconciler calls this:
@@ -325,6 +343,15 @@ impl<'a> Ctx<'a> {
                 "a project's name is its project".to_string(),
             ));
         }
+        if let EffectOp::IncusPatchAclField { object, rules, .. } = &op
+            && (object.kind != IncusKind::Acl
+                || object.project != "default"
+                || object.parent.is_some()
+                || object.uuid.is_some()
+                || !rules.iter().all(Value::is_object))
+        {
+            return Err(EffectRefusal::NotDeclared);
+        }
         let digest = op_digest(&op);
         let planned = self.provider.plan(&self.entry, &op)?;
         if planned.op_digest != digest {
@@ -355,13 +382,24 @@ impl<'a> Ctx<'a> {
                 name: name.clone(),
                 uuid: None,
             },
-            EffectOp::IncusPatchConfig { object, .. } | EffectOp::IncusDelete { object, .. } => {
-                object.clone()
-            }
+            EffectOp::IncusPatchConfig { object, .. }
+            | EffectOp::IncusPatchAclField { object, .. }
+            | EffectOp::IncusDelete { object, .. } => object.clone(),
         };
-        let id = self
-            .journal
-            .intend(
+        let id = if let Some(patch) = &planned.acl_patch {
+            self.journal.intend_acl(
+                IntentFields {
+                    entry: &self.entry,
+                    class: planned.class,
+                    op_digest: digest,
+                    target: target.clone(),
+                    pre_image: None,
+                    now_ms: self.now_ms,
+                },
+                patch.clone(),
+            )
+        } else {
+            self.journal.intend(
                 &self.entry,
                 planned.class,
                 digest,
@@ -369,7 +407,8 @@ impl<'a> Ctx<'a> {
                 planned.pre_image.clone(),
                 self.now_ms,
             )
-            .map_err(journal_refusal)?;
+        }
+        .map_err(journal_refusal)?;
         match self.provider.effect(&self.entry, &op, &planned) {
             Ok((object, inverse)) => {
                 if !same_place(&object, &target) {
@@ -446,6 +485,11 @@ fn required_inverse(op: &EffectOp, object: &ObjectRef, planned: &Planned) -> Opt
             object: named.clone(),
             config: planned.pre_image.clone()?,
         }),
+        EffectOp::IncusPatchAclField { object, field, .. } => Some(Inverse::IncusRestoreAclField {
+            object: object.clone(),
+            field: *field,
+            rules: planned.acl_patch.as_ref()?.previous.clone(),
+        }),
         EffectOp::IncusDelete { .. } => None,
     }
 }
@@ -453,6 +497,18 @@ fn required_inverse(op: &EffectOp, object: &ObjectRef, planned: &Planned) -> Opt
 /// Whether a plan's pre-image has the shape its op needs: none for a create, and for a patch exactly one entry for each key
 /// the patch sets or removes, so the restore it implies covers the patch and nothing else.
 fn plan_has_op_shape(op: &EffectOp, planned: &Planned) -> bool {
+    if let EffectOp::IncusPatchAclField { field, rules, .. } = op {
+        return planned.class == EffectClass::A
+            && planned.pre_image.is_none()
+            && planned.acl_patch.as_ref().is_some_and(|patch| {
+                patch.field == *field
+                    && patch.rules == *rules
+                    && patch.previous.iter().all(Value::is_object)
+            });
+    }
+    if planned.acl_patch.is_some() {
+        return false;
+    }
     match (op, &planned.pre_image) {
         (EffectOp::IncusCreate { .. }, None) => true,
         (EffectOp::IncusPatchConfig { config, .. }, Some(pre)) => pre.keys().eq(config.keys()),

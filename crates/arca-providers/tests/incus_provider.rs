@@ -190,6 +190,7 @@ fn changes(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
 /// The planned answer a provider's `plan` gives for `op`, for a test that calls `effect` without a plan of its own.
 fn forged(op: &EffectOp, class: EffectClass, etag: Option<String>) -> Planned {
     Planned {
+        acl_patch: None,
         class,
         op_digest: op_digest(op),
         pre_image: None,
@@ -3354,4 +3355,316 @@ fn a_read_back_with_no_deadline_left_is_unresolved_at_once_while_an_operation_ru
         Err(EffectRefusal::Unresolved)
     );
     assert_eq!(paths_since(&fake, 0), vec![OPERATIONS_PATH.to_string()]);
+}
+
+#[test]
+fn environment_uppercase_suffix_is_accepted_and_other_uppercase_keys_are_refused() {
+    let (scratch, fake) = start("environment-case");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let target = object(IncusKind::Instance, "svc", None, "k1");
+    for key in [
+        "Environment.X",
+        "foo.BAR",
+        "environment.É",
+        "environment.BAD/KEY",
+    ] {
+        assert!(
+            provider
+                .plan(
+                    &entry("toy"),
+                    &patch(target.clone(), &[(key, Some("value"))])
+                )
+                .is_err()
+        );
+    }
+    assert!(fake.requests().is_empty());
+    let op = patch(target, &[("environment.DATABASE_URL", Some("value"))]);
+    let plan = provider.plan(&entry("toy"), &op).unwrap();
+    provider.effect(&entry("toy"), &op, &plan).unwrap();
+    assert_eq!(
+        read(&fake, "/1.0/instances/k1?project=svc")["config"]["environment.DATABASE_URL"],
+        "value"
+    );
+}
+
+fn make_acl(provider: &mut IncusProvider, name: &str) -> ObjectRef {
+    let op = create(
+        IncusKind::Acl,
+        "default",
+        None,
+        name,
+        json!({"name": name, "config": {}, "ingress": [{"action": "reject"}], "egress": []}),
+    );
+    let planned = provider.plan(&entry("toy"), &op).unwrap();
+    provider.effect(&entry("toy"), &op, &planned).unwrap().0
+}
+
+#[test]
+fn acl_array_patch_journals_typed_pre_image_and_inverse_restores_both_fields() {
+    use arca_kernel::journal::AclField;
+    let (scratch, fake) = start("acl-array");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let target = make_acl(&mut provider, "own-acl");
+    let mut manifest = manifest();
+    manifest.projects.push("default".into());
+    let mut journal = Journal::open(MemJournal::new()).unwrap();
+    for field in [AclField::Ingress, AclField::Egress] {
+        let before = read(&fake, "/1.0/network-acls/own-acl?project=default");
+        let rules = vec![json!({"action": "allow", "protocol": "tcp", "destination_port": "5432"})];
+        let op = EffectOp::IncusPatchAclField {
+            object: target.clone(),
+            field,
+            rules: rules.clone(),
+        };
+        let wire = serde_json::to_value(&op).unwrap();
+        assert_eq!(wire["op"], "IncusPatchAclField");
+        assert_eq!(wire["field"], field.as_str());
+        Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1)
+            .effect(op)
+            .unwrap();
+        let record = journal.live(&entry("toy")).pop().unwrap();
+        let patch = record.acl_patch.unwrap();
+        assert_eq!(json!(patch.previous), before[field.as_str()]);
+        assert_eq!(patch.rules, rules);
+        assert_eq!(
+            read(&fake, "/1.0/network-acls/own-acl?project=default")[field.as_str()],
+            json!(rules)
+        );
+        let inverse = record.inverse.unwrap();
+        let serialized = serde_json::to_value(&inverse).unwrap();
+        assert_eq!(serialized["op"], "IncusRestoreAclField");
+        assert_eq!(
+            serde_json::from_value::<Inverse>(serialized).unwrap(),
+            inverse
+        );
+        let Inverse::IncusRestoreAclField {
+            object,
+            field,
+            rules,
+        } = inverse
+        else {
+            panic!("ACL restore required")
+        };
+        Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 2)
+            .effect(EffectOp::IncusPatchAclField {
+                object,
+                field,
+                rules,
+            })
+            .unwrap();
+        assert_eq!(
+            read(&fake, "/1.0/network-acls/own-acl?project=default"),
+            before
+        );
+    }
+    let patches: Vec<_> = fake
+        .writes()
+        .into_iter()
+        .filter(|w| w.method == "PATCH")
+        .collect();
+    assert_eq!(patches.len(), 4);
+    assert!(patches.iter().all(|patch| patch.config_keys.is_empty()));
+}
+
+#[test]
+fn acl_array_patch_refuses_foreign_droidd_non_acl_and_non_object_rules() {
+    use arca_kernel::journal::AclField;
+    let scratch = Scratch::new("acl-refusals");
+    let state = state();
+    let acls = vec![
+        json!({"name":"foreign", "project":"default", "config":{}, "ingress":[], "egress":[]}),
+        json!({"name":"droid-acl", "project":"default", "config":{"user.droid.lease":"1"}, "ingress":[], "egress":[]}),
+        json!({"name":"other", "project":"default", "config":{MARK:"other"}, "ingress":[], "egress":[]}),
+    ];
+    let fake = FakeIncus::start(&scratch.0, state).unwrap();
+    for acl in acls {
+        post_acl(&fake, acl);
+    }
+    let before = writes(&fake).len();
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    for name in ["foreign", "droid-acl", "other"] {
+        let op = EffectOp::IncusPatchAclField {
+            object: object(IncusKind::Acl, "default", None, name),
+            field: AclField::Ingress,
+            rules: vec![],
+        };
+        assert!(matches!(
+            provider.plan(&entry("toy"), &op),
+            Err(EffectRefusal::NotOwned(_))
+        ));
+        let mut forged = forged(&op, EffectClass::A, None);
+        forged.acl_patch = Some(arca_kernel::journal::AclPatch {
+            field: AclField::Ingress,
+            previous: vec![],
+            rules: vec![],
+        });
+        assert!(matches!(
+            provider.effect(&entry("toy"), &op, &forged),
+            Err(EffectRefusal::NotOwned(_))
+        ));
+    }
+    for (kind, project, rules) in [
+        (IncusKind::Instance, "svc", vec![]),
+        (IncusKind::Acl, "svc", vec![]),
+        (IncusKind::Acl, "default", vec![json!("bad")]),
+    ] {
+        let op = EffectOp::IncusPatchAclField {
+            object: object(kind, project, None, "k1"),
+            field: AclField::Ingress,
+            rules,
+        };
+        assert!(provider.plan(&entry("toy"), &op).is_err());
+    }
+    assert!(serde_json::from_value::<AclField>(json!("config")).is_err());
+    assert_eq!(writes(&fake).len(), before);
+}
+
+#[test]
+fn scoped_observe_allows_instance_state_and_own_acl_and_redacts_secret_values() {
+    let scratch = Scratch::new("scoped-observe");
+    let secrets = secrets_dir(&scratch);
+    write_secret(&secrets, "database", SECRET_VALUE);
+    let mut state = state();
+    state
+        .instances
+        .iter_mut()
+        .find(|i| i["name"] == "k1")
+        .unwrap()["config"]["environment.DATABASE_URL"] = json!(SECRET_VALUE);
+    let acls = vec![
+        json!({"name":"own", "project":"default", "config":{MARK:"toy"}, "ingress":[], "egress":[]}),
+        json!({"name":"foreign", "project":"default", "config":{MARK:"other"}, "ingress":[], "egress":[]}),
+        json!({"name":"droid-acl", "project":"default", "config":{"user.droid.lease":"1"}, "ingress":[], "egress":[]}),
+    ];
+    let fake = FakeIncus::start(&scratch.0, state).unwrap();
+    for acl in acls {
+        post_acl(&fake, acl);
+    }
+    let before = fake.requests().len();
+    let provider = provider(&fake, &secrets);
+    let get = |path: &str| {
+        provider.observe(
+            &entry("toy"),
+            &["svc".into()],
+            &Observe::IncusGet { path: path.into() },
+        )
+    };
+    assert!(get("/1.0/instances/k1/state?project=svc").is_ok());
+    assert_eq!(
+        get("/1.0/network-acls/own?project=default").unwrap()["config"][MARK],
+        "toy"
+    );
+    let answer = get("/1.0/instances/k1?project=svc").unwrap();
+    assert_eq!(
+        answer["config"]["environment.DATABASE_URL"],
+        "arca-secret:database"
+    );
+    assert!(!answer.to_string().contains(SECRET_VALUE));
+    for path in [
+        "/1.0/instances/phone1?project=droid",
+        "/1.0/instances/k1?project=foreign",
+        "/1.0/instances/guest1?project=default",
+        "/1.0/instances/k1?project=bench",
+        "/1.0/network-acls/foreign?project=default",
+        "/1.0/network-acls/droid-acl?project=default",
+        "/1.0/certificates?project=svc",
+        "/1.0/instances/k1?project=svc&project=droid",
+        "/1.0/instances/k1?project=%73vc",
+        "/1.0/instances/%6b1?project=svc",
+        "/1.0/instances/k1/state/extra?project=svc",
+        "/1.0/instances/k1?project=svc#x",
+        "/1.0/instances/k1",
+        "/1.0/instances/k1?project=kfam",
+    ] {
+        assert!(get(path).is_err(), "{path}");
+    }
+    assert!(fake.requests()[before..].iter().all(|r| r.method == "GET"));
+}
+
+// Populate only the temporary fake with objects the kernel itself must refuse to create.
+fn post_acl(fake: &FakeIncus, body: Value) {
+    let mut stream = UnixStream::connect(fake.socket()).unwrap();
+    let body = body.to_string();
+    write!(stream, "POST /1.0/network-acls?project=default HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+}
+
+#[test]
+fn acl_array_patch_answered_412_is_stale() {
+    use arca_kernel::journal::AclField;
+    let script = Script::start("acl-array-412", |method, target| {
+        if method == "GET" && target.starts_with("/1.0/network-acls/") {
+            return object_reply(
+                &json!({"name":"own", "config":{MARK:"toy"}, "ingress":[], "egress":[]}),
+                "\"e1\"",
+            );
+        }
+        if method == "PATCH" {
+            return http(412, None, &error_env(412));
+        }
+        not_found()
+    });
+    let secrets = Scratch::new("acl-array-412-secrets");
+    let mut provider = script.provider(&secrets.0);
+    let op = EffectOp::IncusPatchAclField {
+        object: object(IncusKind::Acl, "default", None, "own"),
+        field: AclField::Ingress,
+        rules: vec![json!({"action":"allow"})],
+    };
+    let plan = provider.plan(&entry("toy"), &op).unwrap();
+    assert_eq!(
+        provider.effect(&entry("toy"), &op, &plan),
+        Err(EffectRefusal::Stale)
+    );
+    assert_eq!(script.count("PATCH"), 1);
+}
+
+#[test]
+fn acl_array_patch_read_back_requires_the_sent_array_and_the_entrys_ownership() {
+    use arca_kernel::journal::AclField;
+    for after in ["missing", "foreign", "droidd"] {
+        let mut patched = false;
+        let script = Script::start("acl-array-unconfirmed", move |method, target| {
+            if method == "PATCH" {
+                patched = true;
+                return http(
+                    200,
+                    None,
+                    &json!({"type":"sync", "status":"Success", "status_code":200, "metadata":{}}),
+                );
+            }
+            if method == "GET" && target.starts_with("/1.0/network-acls/") {
+                let mut body =
+                    json!({"name":"own", "config":{MARK:"toy"}, "ingress":[], "egress":[]});
+                if patched {
+                    body["ingress"] = json!([{"action":"allow"}]);
+                    match after {
+                        "missing" => body["ingress"] = json!([]),
+                        "foreign" => body["config"] = json!({}),
+                        "droidd" => body["config"] = json!({"user.droid.lease":"1"}),
+                        _ => unreachable!(),
+                    }
+                }
+                return object_reply(&body, "\"e1\"");
+            }
+            not_found()
+        });
+        let secrets = Scratch::new("acl-array-unconfirmed-secrets");
+        let mut provider = script.provider(&secrets.0);
+        let mut manifest = manifest();
+        manifest.projects.push("default".into());
+        let mut journal = Journal::open(MemJournal::new()).unwrap();
+        let op = EffectOp::IncusPatchAclField {
+            object: object(IncusKind::Acl, "default", None, "own"),
+            field: AclField::Ingress,
+            rules: vec![json!({"action":"allow"})],
+        };
+        assert_eq!(
+            Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1).effect(op),
+            Err(EffectRefusal::Unresolved)
+        );
+        assert_eq!(journal.unresolved().len(), 1, "{after}");
+        assert_eq!(script.count("PATCH"), 1);
+    }
 }

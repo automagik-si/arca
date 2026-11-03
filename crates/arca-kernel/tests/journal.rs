@@ -116,6 +116,7 @@ fn record(
     inverse: Option<Inverse>,
 ) -> EffectRecord {
     EffectRecord {
+        acl_patch: None,
         id,
         entry: entry("watch"),
         class: EffectClass::A,
@@ -1412,4 +1413,24 @@ fn an_intent_named_for_its_plugin_keeps_the_plugin_on_every_record_of_the_effect
         !second_line.contains("\"plugin\""),
         "an unnamed record keeps its bytes: {second_line}"
     );
+}
+
+#[test]
+fn acl_array_inverse_is_closed_and_old_records_keep_their_serialized_shape() {
+    let object = json!({"kind":"acl", "project":"default", "name":"own", "uuid":null});
+    let wire = json!({"op":"IncusRestoreAclField", "object":object, "field":"ingress", "rules":[{"action":"allow"}]});
+    let inverse: Inverse = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(inverse).unwrap(), wire);
+    for bad in [
+        json!({"op":"IncusRestoreAclField", "object":object, "field":"config", "rules":[]}),
+        json!({"op":"IncusRestoreAclField", "object":object, "field":"egress", "rules":["bad"]}),
+        json!({"op":"IncusRestoreAclField", "object":object, "field":"egress", "rules":[], "extra":1}),
+        json!({"op":"IncusRestoreAclField", "object":{"kind":"instance", "project":"svc", "name":"x", "uuid":null}, "field":"egress", "rules":[]}),
+    ] {
+        assert!(serde_json::from_value::<Inverse>(bad).is_err());
+    }
+    let old = record(1, EffectState::Intent, None, None);
+    let value = serde_json::to_value(&old).unwrap();
+    assert!(value.get("acl_patch").is_none());
+    assert_eq!(serde_json::from_value::<EffectRecord>(value).unwrap(), old);
 }
