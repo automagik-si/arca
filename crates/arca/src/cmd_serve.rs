@@ -38,9 +38,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    AlertsExport, AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler, Published,
-    SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers, spawn_watcher,
+    AlertsExport, AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler,
+    OntologyQuery, Published, SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler,
+    WatchHandler, new_sampler, now_ms, plan_handlers, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -170,6 +170,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .handle("watch_report", watch)
         .handle("token_list", Arc::new(TokenListHandler { ids }))
+        .handle("ontology_query", Arc::new(OntologyQuery))
         .handle(
             "alerts_list",
             Arc::new(AlertsHandler {

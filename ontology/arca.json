@@ -1,0 +1,204 @@
+{
+  "id": "arca",
+  "name": "Arca",
+  "what": "The infrastructure layer: the service, Omni and owner-approval tools for Arca.",
+  "status": "live",
+  "owns": [
+    {
+      "kind": "tool",
+      "id": "service_create",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_list",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_status",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_logs",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_secret_set",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_connect",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_disconnect",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_remove",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_publish",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "service_unpublish",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "omni_instance_create",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "omni_pair",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "omni_status",
+      "status": "live"
+    },
+    {
+      "kind": "tool",
+      "id": "owner_approval_request",
+      "status": "live",
+      "split": {
+        "by": "kind",
+        "value": "arca"
+      }
+    },
+    {
+      "kind": "tool",
+      "id": "owner_approval_status",
+      "status": "live",
+      "split": {
+        "by": "kind",
+        "value": "arca"
+      }
+    },
+    {
+      "kind": "tool",
+      "id": "owner_approval_list",
+      "status": "live",
+      "split": {
+        "by": "kind",
+        "value": "arca"
+      }
+    },
+    {
+      "kind": "tool",
+      "id": "node_metrics",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "watch_report",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "arca_status",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "token_list",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "alerts_list",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "approval_submit",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "plan_decline",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "plan_list",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "ontology_query",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "owner_approval_deliver",
+      "status": "planned",
+      "split": {
+        "by": "kind",
+        "value": "arca"
+      }
+    },
+    {
+      "kind": "incus-mark",
+      "id": "user.arca.",
+      "status": "live"
+    },
+    {
+      "kind": "incus-mark",
+      "id": "user.arcakernel.",
+      "status": "planned"
+    },
+    {
+      "kind": "passkey-name",
+      "id": "arca-approve",
+      "status": "planned"
+    }
+  ],
+  "calls": [],
+  "neverOwns": [
+    {
+      "kind": "data",
+      "id": "renter-gate"
+    },
+    {
+      "kind": "tool",
+      "prefix": "phone_"
+    },
+    {
+      "kind": "tool",
+      "prefix": "wa_"
+    },
+    {
+      "kind": "tool",
+      "prefix": "desktop_"
+    },
+    {
+      "kind": "tool",
+      "prefix": "browser_"
+    },
+    {
+      "kind": "tool",
+      "prefix": "droid_"
+    },
+    {
+      "kind": "incus-mark",
+      "prefix": "user.droid."
+    },
+    {
+      "kind": "incus-mark",
+      "prefix": "user.tactu."
+    }
+  ]
+}

@@ -28,7 +28,7 @@ fn names() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_table_holds_the_four_initial_verbs_the_three_plan_verbs_then_alerts_list_in_order() {
+fn the_table_holds_the_verbs_in_order() {
     assert_eq!(
         names(),
         [
@@ -40,6 +40,7 @@ fn the_table_holds_the_four_initial_verbs_the_three_plan_verbs_then_alerts_list_
             "plan_decline",
             "approval_submit",
             "alerts_list",
+            "ontology_query",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -56,6 +57,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_decline", Scope::Doctor, true, false),
         ("approval_submit", Scope::Doctor, true, true),
         ("alerts_list", Scope::Viewer, false, false),
+        ("ontology_query", Scope::Viewer, false, false),
     ];
     for (name, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -63,6 +65,57 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         assert_eq!(v.min_scope, scope, "{name} minimum scope");
         assert_eq!(v.writes, writes, "{name} writes");
         assert_eq!(v.destructive, destructive, "{name} destructive");
+    }
+}
+
+#[test]
+fn ontology_query_schemas_equal_its_table_row() {
+    let v = verb("ontology_query").expect("present");
+    assert_eq!(
+        (v.params)(),
+        closed_with(json!({"id": {"type": "string", "maxLength": 128}}), &["id"])
+    );
+    let nullable_enum =
+        |values: &[&str]| json!({"anyOf": [{"type": "string", "enum": values}, {"type": "null"}]});
+    let edge = open(
+        json!({
+            "id": {"type": "string"},
+            "to": {"type": "string", "enum": ["arca", "droidd", "dsh", "omni", "arca-id", "automagik", "weunfold", "herdr"]},
+            "contract": {"type": "string", "enum": ["mcp", "api", "file", "token", "socket"]},
+            "status": {"type": "string", "enum": ["live", "planned", "deferred"]}
+        }),
+        &["id", "to", "contract", "status"],
+    );
+    assert_eq!(
+        (v.result)(),
+        open(
+            json!({
+                "id": {"type": "string", "maxLength": 128},
+                "kind": nullable_enum(&["tool", "incus-project", "incus-mark", "data", "unit", "token-file", "passkey-name"]),
+                "owner": nullable_enum(&["arca"]),
+                "status": nullable_enum(&["live", "planned", "deferred"]),
+                "edges": {"type": "array", "items": edge},
+                "neverOwns": {"type": "boolean"}
+            }),
+            &["id", "kind", "owner", "status", "edges", "neverOwns"]
+        )
+    );
+}
+
+#[test]
+fn ontology_query_nullable_enums_accept_null_and_reject_unknown_values() {
+    let schema = (verb("ontology_query").expect("present").result)();
+    let unknown = json!({"id": "unknown", "kind": null, "owner": null, "status": null, "edges": [], "neverOwns": false});
+    assert_eq!(conforms(&schema, &unknown), Ok(()));
+    for key in ["kind", "owner", "status"] {
+        let mut invalid = unknown.clone();
+        invalid[key] = json!("invalid");
+        assert!(conforms(&schema, &invalid).is_err(), "{key}");
+    }
+    for key in ["id", "kind", "owner", "status", "edges", "neverOwns"] {
+        let mut missing = unknown.clone();
+        missing.as_object_mut().expect("object").remove(key);
+        assert!(conforms(&schema, &missing).is_err(), "{key} required");
     }
 }
 
