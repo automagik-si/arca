@@ -2569,3 +2569,83 @@ fn acl_array_patch_under_a_stale_etag_is_412_and_changes_nothing() {
             .is_err()
     );
 }
+
+#[test]
+fn acl_patches_preserve_other_rules_description_and_config() {
+    use arca_kernel::journal::AclField;
+    let (_dir, fake) = start("acl-preserve");
+    let writer = writer(&fake, "toy");
+    let target = target(IncusKind::Acl, "default", "acl-preserve", None);
+    let mut owned = writer
+        .create(
+            &target,
+            &json!({
+                "config": {MARK:"toy", "user.keep":"unchanged"},
+                "description":"keep this description",
+                "ingress":[{"action":"reject", "state":"enabled"}],
+                "egress":[{"action":"allow", "state":"enabled"}]
+            }),
+        )
+        .unwrap();
+    let rules = vec![
+        json!({"action":"allow", "source":"192.0.2.70/32", "protocol":"tcp", "destination_port":"5432", "state":"enabled"}),
+    ];
+    for field in [AclField::Ingress, AclField::Egress] {
+        let other = match field {
+            AclField::Ingress => AclField::Egress,
+            AclField::Egress => AclField::Ingress,
+        };
+        let previous_other = owned.acl_rules(other).unwrap().clone();
+        owned = writer.patch_acl_field(&owned, field, &rules).unwrap();
+        let read = writer.get_etag(&target).unwrap().0;
+        assert_eq!(read[field.as_str()], json!(rules));
+        assert_eq!(read[other.as_str()], json!(previous_other));
+        assert_eq!(read["description"], "keep this description");
+        assert_eq!(read["config"]["user.keep"], "unchanged");
+    }
+    let before = writer.get_etag(&target).unwrap().0;
+    owned = writer
+        .patch(&owned, &changes(&[("user.new", Some("new"))]))
+        .unwrap();
+    assert_eq!(owned.config()["user.new"], "new");
+    let marked = writer.tombstone(&owned, &plan()).unwrap();
+    let after = writer.get_etag(&target).unwrap().0;
+    for field in ["description", "ingress", "egress"] {
+        assert_eq!(after[field], before[field]);
+    }
+    assert_eq!(marked.config()["user.keep"], "unchanged");
+    assert_eq!(marked.tombstone(), Some(plan().to_hex().as_str()));
+}
+
+#[test]
+fn acl_patch_sends_source_supported_body_and_accepts_canonical_read_back() {
+    use arca_kernel::journal::AclField;
+    let rules = vec![
+        json!({"action":"allow", "source":"192.0.2.70/32", "protocol":"tcp", "destination_port":"5432", "state":"enabled"}),
+    ];
+    let expected = json!({"config":{}, "description":"", "egress":[], "ingress":rules});
+    let sent = Arc::new(Mutex::new(None));
+    let captured = sent.clone();
+    let read_rules = rules.clone();
+    let mut patched = false;
+    let server = Canned::start_with_body("acl-wire", move |method, _, body| {
+        if method == "PATCH" {
+            *captured.lock().unwrap() = Some(serde_json::from_slice::<Value>(body).unwrap());
+            patched = true;
+            return sync_reply(200, Value::Null);
+        }
+        // Both upstream tags omit empty optional fields, retain /32 and rule
+        // order, and keep explicitly supplied state/protocol on read-back.
+        object_reply(
+            &json!({"name":"acl-wire", "config":{MARK:"toy"}, "description":"", "egress":[], "ingress":if patched { read_rules.clone() } else { vec![] }}),
+        )
+    });
+    let writer = server.writer();
+    let target = target(IncusKind::Acl, "default", "acl-wire", None);
+    let owned = writer.read_owned(&target).unwrap();
+    writer
+        .patch_acl_field(&owned, AclField::Ingress, &rules)
+        .unwrap();
+    assert_eq!(*sent.lock().unwrap(), Some(expected));
+    assert_eq!(server.count("PATCH"), 1);
+}
