@@ -97,11 +97,13 @@ the image server `https://images.linuxcontainers.org` named with the protocol `s
 secret or certificate. Incus then pulls the image into the store the instance's project reads, which for a kernel project is its
 own (Rules 30, 42), so a probe makes its instance with no copy by hand. Any other server, any other protocol, and either one without
 the other are refused. The name must be free: the object's GET must answer 404 before the POST is sent. Every refusal happens
-before any write.
+before any write. An instance create starts the instance by default; a body that sets `start: false` creates it stopped.
 Source: `UnixIncusWriter::create`, `write::check_source` and `write::{IMAGE_SERVER, IMAGE_PROTOCOL}` in
 `crates/arca-incus/src/write.rs`; tests `a_create_is_refused_unless_its_config_classes_as_the_entrys_own`,
-`a_create_takes_only_an_image_source_and_sends_nothing_else`, `a_create_may_name_the_one_image_server_and_no_other` and
-`a_create_whose_name_is_taken_is_refused_and_nothing_is_written`.
+`a_create_takes_only_an_image_source_and_sends_nothing_else`, `a_create_may_name_the_one_image_server_and_no_other`,
+`a_create_whose_name_is_taken_is_refused_and_nothing_is_written`,
+`instance_create_starts_by_default_and_respects_explicit_false` and
+`a_delete_stops_a_running_instance_before_the_deleting_request` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 12.** A write that Incus accepted is confirmed by a read-back. After a create, a config change or a tombstone, the writer
 reads the object again. The read must class as the writer's entry's own, and it must show the write: the change, or the tombstone
@@ -135,13 +137,14 @@ Source: `UnixIncusWriter::{wait_for, wait_on}` and `IncusError::Status` in `crat
 `an_answer_with_an_empty_or_absent_operation_is_done_without_a_wait` and `a_failed_operation_is_a_status_error_and_the_object_stays`.
 
 **Rule 15.** The writer sends only POST, PATCH, PUT and DELETE. A POST creates, a PATCH sets or removes config keys of any kind
-but a project, or replaces one ACL ingress or egress array (Rule 47), and a DELETE removes. A PUT is sent for one thing only: a project's config change or tombstone, as the project's
-whole config with the change applied, under the ETag of the read the change was checked against (Rule 43). No other object is
-written wholesale, and no PATCH is sent to a project.
+but a project, or replaces one ACL ingress or egress array (Rule 47), and a DELETE removes. A PUT sends a project's config change
+or tombstone as its whole config with the change applied, under the ETag of the read the change was checked against (Rule 43).
+A PUT also force-stops a running instance through its state endpoint before DELETE (Rule 18). No other object is written
+wholesale, and no PATCH is sent to a project.
 Source: the methods passed to `mutate` in `crates/arca-incus/src/write.rs` (`POST` in `create`, `PATCH` and `PUT` in
-`send_config`, which `patch` and `tombstone` call, `DELETE` in `delete` and `clear_images`); `UnixIncus` in
+`send_config`, which `patch` and `tombstone` call, `PUT` in `delete`, `DELETE` in `delete` and `clear_images`); `UnixIncus` in
 `crates/arca-incus/src/read.rs` sends only GET; the round-trip test `each_kind_round_trips_through_create_patch_tombstone_and_delete`,
-which asserts that a PUT reaches only a project and a PATCH never does.
+which allows a PUT only for a project or an instance's stop and asserts that a PATCH never reaches a project.
 
 **Rule 16.** A removed config key is sent as the empty string in a PATCH. The fake reads an empty value as unset. A project's PUT
 leaves a removed key out of the whole config it sends.
@@ -164,14 +167,19 @@ Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arc
 **Rule 18.** A destructive removal runs in five steps: read the object with its ETag and classify it; set
 `user.arcakernel.retiring` to the plan's digest under `If-Match`, with a PATCH, or for a project a PUT of its whole config
 (Rule 43); read it back and require the entry's mark, the tombstone and, for an instance, the same uuid; read it again
-immediately before the delete and require the same; then DELETE. A DELETE sends no `If-Match`, so a change that lands between
+immediately before the delete and require the same; then DELETE. Before the DELETE, a running instance is stopped with
+`force: true`, and the stop's operation is waited on, because Incus refuses to delete a running instance. A failed stop prevents
+the DELETE and leaves the instance for a later reconciliation to retry. A stopped instance receives no stop request, and no
+other kind is stopped. A DELETE sends no `If-Match`, so a change that lands between
 the last read and the DELETE is not caught by Incus. That gap is the residual risk of this step. It is covered by the one-writer
 rule (only the entry's own writer changes its objects) and by the tombstone, which another writer would have to clear on purpose.
 The tombstone digest is the plan digest of an approved class-B plan (Rule 37). A class-A revert of a create has no
 approval, so its tombstone is the create's own op digest, which the journal already records.
 Source: `UnixIncusWriter::{tombstone, delete}` in `crates/arca-incus/src/write.rs`; tests
-`a_delete_is_refused_when_the_tombstone_was_removed_after_it_was_set` and
-`a_tombstone_with_a_stale_etag_is_412_and_sets_nothing`.
+`a_delete_is_refused_when_the_tombstone_was_removed_after_it_was_set`,
+`a_tombstone_with_a_stale_etag_is_412_and_sets_nothing`,
+`a_delete_stops_a_running_instance_before_the_deleting_request` and
+`a_delete_of_a_stopped_instance_sends_no_stop_request` in `crates/arca-incus/tests/write.rs`.
 
 **Rule 19.** A false precondition is refused before any write, and nothing more is sent for that object. A read-back after a
 write that shows the wrong uuid, no tombstone, another owner, or not the change is `AppliedUnconfirmed` (Rule 12). The caller

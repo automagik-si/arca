@@ -1424,7 +1424,7 @@ fn retire_tombstones_then_deletes_an_owned_instance_in_order() {
     let made = writer
         .create(
             &object(IncusKind::Instance, "svc", None, "r1"),
-            &json!({"start": false, "config": {MARK: "toy"}}),
+            &json!({"config": {MARK: "toy"}}),
         )
         .expect("create");
     let uuid = made.uuid().map(str::to_string);
@@ -1449,6 +1449,7 @@ fn retire_tombstones_then_deletes_an_owned_instance_in_order() {
         vec![
             "POST".to_string(),
             "PATCH".to_string(),
+            "PUT".to_string(),
             "DELETE".to_string()
         ]
     );

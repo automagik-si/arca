@@ -281,6 +281,8 @@ plan until an owner approves it. A plan lapses fifteen minutes after it was made
 approval for it is refused as `Expired`. A restart, or a new proposal while the removal still waits, makes a fresh plan with a new
 creation time and fifteen new minutes.
 
+Kernel instances start on create unless the body sets `start: false`; removal force-stops a running instance and waits for that operation before DELETE.
+
 The desired-state document expires thirty days after it is issued. A document past its expiry holds the applied state, and the
 reconciler makes no plan from it. So a restart after the thirty days drops every waiting plan, and `plan_list` lists none.
 

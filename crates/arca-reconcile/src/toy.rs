@@ -51,13 +51,12 @@ impl Plugin for Toy {
             name: format!("toy-acl-{}", cfg.tag),
             body: json!({ "name": format!("toy-acl-{}", cfg.tag), "config": {} }),
         })?;
-        // The removal suite deletes this fixture without a separate stop step.
         ctx.effect(EffectOp::IncusCreate {
             kind: IncusKind::Instance,
             project: TOY_PROJECT.to_string(),
             parent: None,
             name: format!("toy-box-{}", cfg.tag),
-            body: json!({ "name": format!("toy-box-{}", cfg.tag), "start": false, "config": {} }),
+            body: json!({ "name": format!("toy-box-{}", cfg.tag), "config": {} }),
         })?;
         Ok(())
     }
