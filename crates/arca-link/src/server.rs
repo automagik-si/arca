@@ -99,9 +99,6 @@ impl Link {
             refresh.clone(),
             cleanup,
         ));
-        if matches!(mesh::sync(&endpoint, &state).await, Ok(true)) {
-            refresh.notify_one();
-        }
         Ok(Self {
             endpoint,
             state,
@@ -194,7 +191,7 @@ async fn run(
         Duration::from_secs(30),
     );
     let mut syncing = JoinSet::new();
-    let mut needs_sync = false;
+    let mut needs_sync = true;
     let mut last_removed = state.snapshot().ok().map(|s| s.removed);
     loop {
         if needs_sync && syncing.is_empty() {
@@ -245,7 +242,9 @@ async fn run(
 }
 
 fn sweep(state: &State, connections: &Connections) {
-    let peers = state.peers().unwrap_or_default();
+    let Ok(peers) = state.peers() else {
+        return;
+    };
     for connection in connections.lock().expect("connections lock").values() {
         if !peers
             .iter()
@@ -482,4 +481,54 @@ pub async fn remove_running(state: &State, name: &str) -> Result<usize> {
             .ok_or(Error::Runtime("removal failed"))
     };
     runtime(timeout(Duration::from_secs(15), operation).await)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sweep_skips_read_errors_and_revokes_after_a_successful_read() {
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("arca-sweep-{}", client.id()));
+        let state = State::new(&dir).unwrap();
+        let link = Link::start(state.clone(), Config::default(), Network::local())
+            .await
+            .unwrap();
+        let connection = client
+            .connect(
+                EndpointAddr::new(link.endpoint().id())
+                    .with_ip_addr(link.endpoint().bound_sockets()[0]),
+                PAIR_ALPN,
+            )
+            .await
+            .unwrap();
+        let connections: Connections = Arc::default();
+        connections
+            .lock()
+            .unwrap()
+            .insert(connection.stable_id(), connection.clone());
+        std::fs::write(dir.join("peers.json"), b"{").unwrap();
+        sweep(&state, &connections);
+        assert!(
+            connection.close_reason().is_none(),
+            "a state read error must preserve connections"
+        );
+        state.write("peers.json", &Vec::<Peer>::new()).unwrap();
+        sweep(&state, &connections);
+        assert!(
+            connection.close_reason().is_some(),
+            "a readable empty peer list must revoke connections"
+        );
+        link.shutdown().await;
+        client.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

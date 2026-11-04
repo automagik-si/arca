@@ -127,6 +127,37 @@ async fn link_cli_pairs_joins_lists_and_removes_without_relays() {
 fn link_serve_sigterm_exits_cleanly_and_removes_runtime_files_without_relays() {
     let temp = Temp::new();
     let config = temp.config();
+    // Reserve a silent direct peer: startup sync cannot complete before the signal.
+    let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let id = State::new(temp.0.join("silent"))
+        .unwrap()
+        .secret()
+        .unwrap()
+        .public();
+    let state = temp.0.join("state");
+    State::new(&state).unwrap();
+    let mut peer = arca_link::Peer {
+        id: id.to_string(),
+        name: "silent".to_string(),
+        paired: 1,
+        seen: 1,
+        ticket: None,
+    };
+    peer.ticket = Some(
+        EndpointTicket::new(
+            peer.addr()
+                .unwrap()
+                .with_ip_addr(silent.local_addr().unwrap()),
+        )
+        .to_string(),
+    );
+    fs::write(
+        state.join("peers.json"),
+        serde_json::to_vec(&vec![peer]).unwrap(),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(state.join("peers.json"), fs::Permissions::from_mode(0o600)).unwrap();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
         .args(["link", "serve", "--config", &config])
         .stdout(std::process::Stdio::null())
@@ -134,7 +165,6 @@ fn link_serve_sigterm_exits_cleanly_and_removes_runtime_files_without_relays() {
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let state = temp.0.join("state");
     while !state.join("status.json").exists() {
         if let Some(exit) = child.try_wait().unwrap() {
             panic!("serve exited before publishing status: {exit}");
@@ -154,6 +184,8 @@ fn link_serve_sigterm_exits_cleanly_and_removes_runtime_files_without_relays() {
             .unwrap()
             .success()
     );
+    // Allow QUIC's best-effort close drain, while staying below the mesh dial timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
     loop {
         if let Some(exit) = child.try_wait().unwrap() {
             assert!(exit.success(), "{exit}");

@@ -98,6 +98,7 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
             };
             return Ok(Some(json!({"id": peer.id, "name": peer.name})));
         }
+        // Register both handlers before start can publish status.json.
         let mut terminate = signal(SignalKind::terminate())
             .map_err(|_| Failure::Runtime("cannot register link stop signal".to_string()))?;
         let mut interrupt = signal(SignalKind::interrupt())

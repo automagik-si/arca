@@ -491,8 +491,7 @@ async fn offline_member_startup_catches_joins_and_removals_without_resurrection(
         paired(&a, &first, &second).await;
         paired(&a, &first, &third).await;
         let fourth = node(&d, "fourth", false).await;
-        assert_members(&d, &[&first, &second, &third]);
-        // Explicit exchanges finish dissemination deterministically.
+        // Explicit exchanges finish asynchronous startup catch-up deterministically.
         fourth.sync_peers().await.unwrap();
         second.sync_peers().await.unwrap();
         third.sync_peers().await.unwrap();
@@ -536,6 +535,7 @@ async fn offline_member_startup_catches_joins_and_removals_without_resurrection(
         assert_members(&d, &[&first, &third]);
         fourth.shutdown().await;
         let fourth = node(&d, "fourth", false).await;
+        fourth.sync_peers().await.unwrap();
         assert_members(&d, &[&first, &third]);
         first.shutdown().await;
         second.shutdown().await;
@@ -577,6 +577,7 @@ async fn mesh_introductions_cross_a_member_that_is_not_the_pairing_host() {
             second.endpoint().id().to_string()
         );
         let third = node(&c, "third", false).await;
+        third.sync_peers().await.unwrap();
         let peers = c.state().peers().unwrap();
         assert_eq!(peers.len(), 3);
         for name in ["first", "second", "fourth"] {
@@ -835,4 +836,50 @@ async fn online_mesh_removal_reaches_all_members_and_closes_forwarded_stream() {
     })
     .await
     .expect("online removal deadline");
+}
+
+#[tokio::test]
+async fn startup_returns_while_initial_mesh_sync_waits_for_a_silent_peer() {
+    let temp = Temp::new();
+    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+        .relay_mode(iroh::RelayMode::Disabled)
+        .clear_ip_transports()
+        .bind_addr(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            0,
+        )))
+        .unwrap()
+        .bind()
+        .await
+        .unwrap();
+    let peer = arca_link::Peer {
+        id: silent.id().to_string(),
+        name: "silent".to_string(),
+        paired: 1,
+        seen: 1,
+        ticket: Some(
+            EndpointTicket::new(
+                EndpointAddr::new(silent.id()).with_ip_addr(silent.bound_sockets()[0]),
+            )
+            .to_string(),
+        ),
+    };
+    fs::write(
+        temp.0.join("peers.json"),
+        serde_json::to_vec(&vec![peer]).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(temp.0.join("peers.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let link = timeout(Duration::from_secs(2), node(&temp, "first", false))
+        .await
+        .expect("startup must return without waiting for its peer");
+    // Observe the automatic first sync, leaving the handshake unanswered.
+    let _incoming = timeout(Duration::from_secs(2), silent.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(6), link.shutdown())
+        .await
+        .expect("shutdown cancels the pending startup sync");
+    silent.close().await;
 }
