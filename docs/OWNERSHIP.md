@@ -769,6 +769,11 @@ Source: orchestrator ruling / Group 22a; `IncusProvider::{observe, secrets_by_va
 `scoped_observe_allows_instance_state_and_own_acl_and_redacts_secret_values` and
 `scoped_observe_marks_another_entrys_secret_and_keeps_own_and_shared_references` in
 `crates/arca-providers/tests/incus_provider.rs`.
+Group 22 additionally admits an own project object inside the kernel family, with matching project name/query, and an own
+network object in `default`. Both require the manifest's project and the requesting entry's own mark; this lets a partial
+netproject apply retry without adopting a foreign object. No other route is admitted. Source: `IncusProvider::observe`;
+tests: `own_project_and_network_observe_are_scoped`, `own_project_and_network_observe_refuses_foreign_and_other_routes`.
+
 
 ## Out of scope
 

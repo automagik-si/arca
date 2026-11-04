@@ -103,6 +103,8 @@ dependencies = [
  "arca-link",
  "arca-mcp",
  "arca-metrics",
+ "arca-netproject",
+ "arca-postgres",
  "arca-providers",
  "arca-reconcile",
  "arca-store",
@@ -207,6 +209,34 @@ version = "0.1.0"
 dependencies = [
  "arca-api",
  "arca-incus",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "arca-netproject"
+version = "0.1.0"
+dependencies = [
+ "arca-incus",
+ "arca-kernel",
+ "arca-providers",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "arca-postgres"
+version = "0.1.0"
+dependencies = [
+ "arca",
+ "arca-api",
+ "arca-approval",
+ "arca-incus",
+ "arca-kernel",
+ "arca-mcp",
+ "arca-netproject",
+ "arca-providers",
+ "arca-reconcile",
  "serde",
  "serde_json",
 ]

@@ -92,6 +92,8 @@ pub struct KernelConfig {
     pub droidd_projects: Vec<String>,
     #[serde(default)]
     pub reserved_cidrs: Vec<String>,
+    #[serde(default)]
+    pub service_cidr: Option<String>,
     /// The containers `arca adopt` may take from the default project, each with its adoption project. A config that lists any
     /// is for `arca adopt` alone: `serve` refuses it.
     #[serde(default)]
@@ -106,7 +108,10 @@ pub struct KernelConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// The file cannot be read. `why` is a fixed reason.
-    Io { path: String, why: String },
+    Io {
+        path: String,
+        why: String,
+    },
     /// The file does not parse, or a key is unknown or missing. The text is serde's naming of the key, with values removed.
     Parse(String),
     /// The tailnet address fails the tailnet rules.
@@ -123,6 +128,7 @@ pub enum ConfigError {
     DroiddProjectsEmpty,
     /// The link config contains an invalid name or route.
     Link(String),
+    ServiceCidr,
     /// The adoption allowlist or its attach networks break a rule. The text names the rule, never a value.
     Adopt(&'static str),
 }
@@ -147,6 +153,10 @@ impl fmt::Display for ConfigError {
                 "kernel.droiddProjects must list droidd's projects when kernel.projects is not empty"
             ),
             Self::Link(why) => f.write_str(why),
+            Self::ServiceCidr => write!(
+                f,
+                "kernel.serviceCidr must be an IPv4 /24 outside kernel.reservedCidrs"
+            ),
             Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
             Self::ApprovalHost => write!(
                 f,
@@ -194,6 +204,10 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     }
     if !kernel.projects.is_empty() && kernel.droidd_projects.is_empty() {
         return Err(ConfigError::DroiddProjectsEmpty);
+    }
+    if let Some(cidr) = &kernel.service_cidr {
+        arca_netproject::check_cidr(cidr, &kernel.reserved_cidrs)
+            .map_err(|_| ConfigError::ServiceCidr)?;
     }
     check_adopt(kernel)?;
     if kernel.scratch {

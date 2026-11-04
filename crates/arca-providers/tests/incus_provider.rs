@@ -3806,3 +3806,86 @@ fn acl_array_patch_read_back_requires_the_sent_array_and_the_entrys_ownership() 
         assert_eq!(script.count("PATCH"), 1);
     }
 }
+
+#[test]
+fn own_project_and_network_observe_are_scoped() {
+    let (dir, fake) = start("own-network-observe");
+    let mut p = provider(&fake, &dir.0);
+    let e = entry("toy");
+    let op = create(
+        IncusKind::Project,
+        "kfam",
+        None,
+        "kfam",
+        json!({"config":{}}),
+    );
+    let plan = p.plan(&e, &op).unwrap();
+    p.effect(&e, &op, &plan).unwrap();
+    for path in [
+        "/1.0/projects/kfam?project=kfam",
+        "/1.0/networks/kbr?project=default",
+    ] {
+        assert!(
+            p.observe(
+                &e,
+                &["kfam".into(), "default".into()],
+                &Observe::IncusGet { path: path.into() }
+            )
+            .is_ok()
+        );
+    }
+    let requests = fake.requests();
+    let before = requests.len();
+    assert!(
+        p.observe(
+            &e,
+            &[],
+            &Observe::IncusGet {
+                path: "/1.0/networks/kbr?project=default".into()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(fake.requests().len(), before);
+}
+#[test]
+fn own_project_and_network_observe_refuses_foreign_and_other_routes() {
+    let (dir, fake) = start("foreign-network-observe");
+    let p = provider(&fake, &dir.0);
+    let before = fake.writes().len();
+    for path in [
+        "/1.0/projects/svc?project=svc",
+        "/1.0/projects/default?project=default",
+        "/1.0/projects/bench?project=bench",
+        "/1.0/projects/droid?project=droid",
+        "/1.0/projects/foreign?project=foreign",
+        "/1.0/projects/svc?project=kfam",
+        "/1.0/networks/plainbr?project=default",
+        "/1.0/networks/droidbr?project=default",
+        "/1.0/networks/kbr?project=svc",
+        "/1.0/networks/kbr?project=default&recursion=1",
+        "/1.0/networks/kbr/state?project=default",
+        "/1.0/networks?project=default",
+    ] {
+        assert!(
+            p.observe(
+                &entry("toy"),
+                &["svc".into(), "default".into()],
+                &Observe::IncusGet { path: path.into() }
+            )
+            .is_err(),
+            "{path}"
+        );
+    }
+    assert!(
+        p.observe(
+            &entry("other"),
+            &["default".into()],
+            &Observe::IncusGet {
+                path: "/1.0/networks/kbr?project=default".into()
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(fake.writes().len(), before);
+}
