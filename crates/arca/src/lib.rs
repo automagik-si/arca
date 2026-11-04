@@ -11,6 +11,7 @@ pub mod adoptions;
 pub mod cmd_adopt;
 pub mod cmd_call;
 pub mod cmd_link;
+pub mod cmd_probe;
 pub mod cmd_serve;
 pub mod cmd_store;
 pub mod cmd_token;
@@ -39,6 +40,8 @@ const USAGE: &str = "usage: arca <command>
   link join <link> --config <file>
   link peers --config <file>
   link remove <name> --config <file>
+  probe consumer add --name <n> --image <fingerprint> --config <file>
+  probe consumer remove --name <n> --config <file>
   serve --config <file>
   call <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
@@ -189,6 +192,7 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),
         "call" => cmd_call::call(rest),
         "link" => cmd_link::link(rest),
+        "probe" => cmd_probe::probe(rest),
         "adopt" => cmd_adopt::adopt(rest),
         "store" => match rest.split_first() {
             Some((action, rest)) if action == "check" => {

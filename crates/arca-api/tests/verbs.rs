@@ -28,7 +28,7 @@ fn names() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_table_holds_the_four_initial_verbs_the_three_plan_verbs_then_alerts_list_in_order() {
+fn the_table_holds_the_initial_plan_alerts_and_postgres_verbs_in_order() {
     assert_eq!(
         names(),
         [
@@ -40,6 +40,11 @@ fn the_table_holds_the_four_initial_verbs_the_three_plan_verbs_then_alerts_list_
             "plan_decline",
             "approval_submit",
             "alerts_list",
+            "postgres_create",
+            "postgres_list",
+            "postgres_link",
+            "postgres_unlink",
+            "postgres_delete",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -56,6 +61,11 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_decline", Scope::Doctor, true, false),
         ("approval_submit", Scope::Doctor, true, true),
         ("alerts_list", Scope::Viewer, false, false),
+        ("postgres_create", Scope::Doctor, true, false),
+        ("postgres_list", Scope::Viewer, false, false),
+        ("postgres_link", Scope::Doctor, true, false),
+        ("postgres_unlink", Scope::Doctor, true, false),
+        ("postgres_delete", Scope::Doctor, true, true),
     ];
     for (name, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -678,5 +688,13 @@ fn mentions_key(v: &Value, key: &str) -> bool {
         Value::Object(map) => map.contains_key(key) || map.values().any(|x| mentions_key(x, key)),
         Value::Array(items) => items.iter().any(|x| mentions_key(x, key)),
         _ => false,
+    }
+}
+
+#[test]
+fn viewer_cannot_call_postgres_write_verbs() {
+    for verb in verbs().iter().filter(|v| v.name.starts_with("postgres_")) {
+        assert_eq!(may_call(Scope::Viewer, verb), !verb.writes);
+        assert!(may_call(Scope::Doctor, verb));
     }
 }

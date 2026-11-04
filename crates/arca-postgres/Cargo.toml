@@ -1,0 +1,27 @@
+[package]
+name = "arca-postgres"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.arca]
+kind = "plugin"
+
+[dependencies]
+arca-kernel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+arca-netproject.workspace = true
+
+[dev-dependencies]
+arca-incus.workspace = true
+arca-providers.workspace = true
+arca.workspace = true
+arca-api.workspace = true
+arca-approval.workspace = true
+arca-mcp.workspace = true
+arca-reconcile.workspace = true
+
+[lints]
+workspace = true

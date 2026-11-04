@@ -976,6 +976,10 @@ impl Provider for IncusProvider {
                     .ok_or(EffectRefusal::NotDeclared)?;
                 let parts: Vec<_> = route.split('/').collect();
                 let kind = match parts.as_slice() {
+                    ["", "1.0", "projects", name] if plain_name(name) && *name == project => {
+                        IncusKind::Project
+                    }
+                    ["", "1.0", "networks", name] if plain_name(name) => IncusKind::Network,
                     ["", "1.0", "instances", name] if plain_name(name) => IncusKind::Instance,
                     ["", "1.0", "instances", name, "state"] if plain_name(name) => {
                         IncusKind::Instance
@@ -984,13 +988,16 @@ impl Provider for IncusProvider {
                     _ => return Err(EffectRefusal::NotDeclared),
                 };
                 self.check_family(kind, project)?;
-                if kind == IncusKind::Instance && !projects.iter().any(|p| p == project) {
+                if kind != IncusKind::Acl && !projects.iter().any(|p| p == project) {
                     return Err(EffectRefusal::ProjectNotAllowed);
                 }
                 let usable = self.secrets_by_value(entry);
                 let foreign = self.foreign_secrets_by_value(entry);
                 let mut value = self.reader.get(path).map_err(incus_refusal)?;
-                if kind == IncusKind::Acl {
+                if matches!(
+                    kind,
+                    IncusKind::Acl | IncusKind::Project | IncusKind::Network
+                ) {
                     let config = value
                         .get("config")
                         .cloned()

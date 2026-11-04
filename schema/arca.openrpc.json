@@ -1333,6 +1333,325 @@
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "postgres_create",
+      "params": [
+        {
+          "name": "image",
+          "required": true,
+          "schema": {
+            "maxLength": 512,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "maxLength": 31,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "entry": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "pending",
+                "running"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "entry",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Create a service database.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "postgres_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "databases": {
+              "items": {
+                "properties": {
+                  "address": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "entry": {
+                    "type": "string"
+                  },
+                  "links": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "port": {
+                    "type": "integer"
+                  },
+                  "status": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "entry",
+                  "status",
+                  "address",
+                  "port",
+                  "links"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "databases"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "List a service database.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "postgres_link",
+      "params": [
+        {
+          "name": "consumer",
+          "required": true,
+          "schema": {
+            "maxLength": 63,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "maxLength": 31,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "consumer": {
+              "type": "string"
+            },
+            "env": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "consumer",
+            "env"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Link a service database.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "postgres_unlink",
+      "params": [
+        {
+          "name": "consumer",
+          "required": true,
+          "schema": {
+            "maxLength": 63,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "maxLength": 31,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "consumer": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "removed": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "consumer",
+            "removed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Unlink a service database.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "postgres_delete",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "maxLength": 31,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "plan": {
+              "properties": {
+                "createdAt": {
+                  "type": "integer"
+                },
+                "entry": {
+                  "type": "string"
+                },
+                "expiresAt": {
+                  "type": "integer"
+                },
+                "objects": {
+                  "items": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "project",
+                          "instance",
+                          "network",
+                          "acl",
+                          "profile",
+                          "volume",
+                          "zone",
+                          "forward",
+                          "bucket"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "project": {
+                        "type": "string"
+                      },
+                      "uuid": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "project",
+                      "name",
+                      "uuid"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "paramsDigest": {
+                  "maxLength": 64,
+                  "minLength": 64,
+                  "type": "string"
+                },
+                "plan": {
+                  "maxLength": 64,
+                  "minLength": 64,
+                  "type": "string"
+                },
+                "statement": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "plan",
+                "entry",
+                "createdAt",
+                "expiresAt",
+                "objects",
+                "paramsDigest",
+                "statement"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "plan"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Delete a service database.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     }
   ],
   "openrpc": "1.3.2"

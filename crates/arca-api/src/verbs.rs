@@ -61,7 +61,7 @@ pub struct Verb {
     pub result: fn() -> Value,
 }
 
-static VERBS: [Verb; 8] = [
+static VERBS: [Verb; 13] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -141,6 +141,56 @@ static VERBS: [Verb; 8] = [
         destructive: false,
         params: alerts_list_params,
         result: alerts_list_result,
+    },
+    Verb {
+        name: "postgres_create",
+        summary: "Create a service database.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        params: postgres_create_params,
+        result: postgres_create_result,
+    },
+    Verb {
+        name: "postgres_list",
+        summary: "List a service database.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        params: postgres_list_params,
+        result: postgres_list_result,
+    },
+    Verb {
+        name: "postgres_link",
+        summary: "Link a service database.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        params: postgres_link_params,
+        result: postgres_link_result,
+    },
+    Verb {
+        name: "postgres_unlink",
+        summary: "Unlink a service database.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        params: postgres_unlink_params,
+        result: postgres_unlink_result,
+    },
+    Verb {
+        name: "postgres_delete",
+        summary: "Delete a service database.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        params: postgres_delete_params,
+        result: postgres_delete_result,
     },
 ];
 
@@ -561,4 +611,64 @@ fn alert_event(extra: Vec<Field>) -> Value {
 /// An alert's own labels: an open object of names to strings, which the subset checks only as an object.
 fn labels() -> Value {
     result(vec![])
+}
+
+fn postgres_create_params() -> Value {
+    params(vec![
+        ("name", true, string_max(31)),
+        ("image", true, string_max(512)),
+    ])
+}
+fn postgres_create_result() -> Value {
+    result(vec![
+        ("name", true, string()),
+        ("entry", true, string()),
+        ("status", true, one_of(&["pending", "running"])),
+    ])
+}
+fn postgres_list_params() -> Value {
+    params(vec![])
+}
+fn postgres_list_result() -> Value {
+    result(vec![(
+        "databases",
+        true,
+        array(result(vec![
+            ("name", true, string()),
+            ("entry", true, string()),
+            ("status", true, string()),
+            ("address", true, nullable(string())),
+            ("port", true, int()),
+            ("links", true, array(string())),
+        ])),
+    )])
+}
+fn postgres_link_params() -> Value {
+    params(vec![
+        ("name", true, string_max(31)),
+        ("consumer", true, string_max(63)),
+    ])
+}
+fn postgres_link_result() -> Value {
+    result(vec![
+        ("name", true, string()),
+        ("consumer", true, string()),
+        ("env", true, array(string())),
+    ])
+}
+fn postgres_unlink_params() -> Value {
+    postgres_link_params()
+}
+fn postgres_unlink_result() -> Value {
+    result(vec![
+        ("name", true, string()),
+        ("consumer", true, string()),
+        ("removed", true, array(string())),
+    ])
+}
+fn postgres_delete_params() -> Value {
+    params(vec![("name", true, string_max(31))])
+}
+fn postgres_delete_result() -> Value {
+    result(vec![("plan", true, plan())])
 }
