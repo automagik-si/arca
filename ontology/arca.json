@@ -143,6 +143,31 @@
     },
     {
       "kind": "tool",
+      "id": "postgres_create",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "postgres_delete",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "postgres_link",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "postgres_list",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
+      "id": "postgres_unlink",
+      "status": "planned"
+    },
+    {
+      "kind": "tool",
       "id": "owner_approval_deliver",
       "status": "planned",
       "split": {
