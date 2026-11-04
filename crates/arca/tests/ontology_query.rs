@@ -128,6 +128,25 @@ impl Node {
 }
 
 #[test]
+fn viewer_reads_the_live_omni_edge() {
+    let node = Node::start();
+    let edges = json!([{
+        "id": "omni-api", "to": "omni", "contract": "api", "status": "live"
+    }]);
+    let result = node.query("omni_instance_create");
+    assert_eq!(result["owner"], "arca");
+    assert_eq!(result["kind"], "tool");
+    assert_eq!(result["status"], "live");
+    assert_eq!(result["edges"], edges);
+    for id in ["omni_pair", "omni_status"] {
+        assert_eq!(node.query(id)["edges"], edges, "{id}");
+    }
+    let unrelated = node.query("service_logs");
+    assert_eq!(unrelated["edges"], json!([]));
+    assert_eq!(unrelated["neverOwns"], false);
+}
+
+#[test]
 fn viewer_reads_planned_node_metrics() {
     assert_eq!(
         Node::start().query("node_metrics"),
@@ -144,6 +163,7 @@ fn viewer_reads_live_service_create() {
     assert_eq!(result["kind"], "tool");
     assert_eq!(result["status"], "live");
     assert_eq!(result["neverOwns"], false);
+    assert_eq!(result["edges"], json!([]));
 }
 
 #[test]

@@ -166,7 +166,20 @@
       "status": "planned"
     }
   ],
-  "calls": [],
+  "calls": [
+    {
+      "id": "omni-api",
+      "to": "omni",
+      "contract": "api",
+      "endpoint": "arca-api",
+      "carries": [
+        "omni_instance_create",
+        "omni_pair",
+        "omni_status"
+      ],
+      "status": "live"
+    }
+  ],
   "neverOwns": [
     {
       "kind": "data",

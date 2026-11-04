@@ -49,19 +49,19 @@ fn the_table_holds_the_verbs_in_order() {
 #[test]
 fn each_verb_has_its_table_row_for_class_scope_and_writes() {
     let rows = [
-        ("arca_status", Scope::Viewer, false, false),
-        ("node_metrics", Scope::Viewer, false, false),
-        ("watch_report", Scope::Viewer, false, false),
-        ("token_list", Scope::Operator, false, false),
-        ("plan_list", Scope::Viewer, false, false),
-        ("plan_decline", Scope::Doctor, true, false),
-        ("approval_submit", Scope::Doctor, true, true),
-        ("alerts_list", Scope::Viewer, false, false),
-        ("ontology_query", Scope::Viewer, false, false),
+        ("arca_status", VerbClass::L, Scope::Viewer, false, false),
+        ("node_metrics", VerbClass::L, Scope::Viewer, false, false),
+        ("watch_report", VerbClass::L, Scope::Viewer, false, false),
+        ("token_list", VerbClass::L, Scope::Operator, false, false),
+        ("plan_list", VerbClass::L, Scope::Viewer, false, false),
+        ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
+        ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
+        ("alerts_list", VerbClass::L, Scope::Viewer, false, false),
+        ("ontology_query", VerbClass::L, Scope::Viewer, false, false),
     ];
-    for (name, scope, writes, destructive) in rows {
+    for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
-        assert_eq!(v.class, VerbClass::L, "{name} is class L");
+        assert_eq!(v.class, class, "{name} class");
         assert_eq!(v.min_scope, scope, "{name} minimum scope");
         assert_eq!(v.writes, writes, "{name} writes");
         assert_eq!(v.destructive, destructive, "{name} destructive");
