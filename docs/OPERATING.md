@@ -10,14 +10,13 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
-| `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
 | `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
 | `arca link remove [--] <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
-| `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
+| `arca call [--peer <name>] <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the local node, or through a paired peer with `--peer` | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
@@ -67,7 +66,6 @@ refused without the value being echoed back.
 | `kernel.projects` | no | The project family the kernel may write in. With projects named, the writer serves only those projects. With none, the provider reads only, and a removal cannot reach Incus. |
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
-| `kernel.serviceCidr` | no | Service bridge `<ipv4-network>/24`, outside every `kernel.reservedCidrs` range. Required for Postgres creation and probe consumer add; no default. |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
@@ -120,16 +118,17 @@ camelCase keys and refuses unknown keys:
 - `name`: the node's name, from 1 to 60 characters, without U+0000..U+001F control characters. When absent, the name is the
   first 10 characters of its endpoint id. Incoming device names have those controls stripped, are capped at 60 characters,
   and fall back to `device` when empty.
-- `forward`: an ALPN-to-unix-socket-path map, empty by default. Each admitted stream is forwarded unchanged in both
-  directions to its socket. For example, `arca/mcp/1` may be an entry; it has no special handling.
+- `forward`: an ALPN-to-unix-socket-path map. Each admitted stream is forwarded unchanged in both directions to its socket.
+  `arca link serve` adds `arca/mcp/1` pointing to `listen.unix` unless the map already has an explicit entry for that ALPN.
 - `pairMinutes`: the default code lifetime in minutes, overridden by `link pair --minutes`. The default is 10, and the
   selected value is clamped to 1 through 60.
 - `localOnly`: when true, binds only loopback and disables discovery and relays. The default is false (N0 discovery and
   public relays). It also disables mesh reachability: the node neither reaches peers on other hosts for membership or
   forwarding, nor is reached by them. This also permits testing `link serve` without external network access.
 
-The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, plus the ALPNs in `forward`. Both membership
-and forwarded connections require a live entry in `peers.json`. `arca/pair/1` and `arca/peers/1` cannot be forward entries.
+The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, `arca/mcp/1` for peer calls, plus the ALPNs
+in `forward`. Both membership and forwarded connections require a live entry in `peers.json`; a forwarded connection checks
+that entry before its local socket is opened. `arca/pair/1` and `arca/peers/1` cannot be forward entries.
 Each forwarded connection runs at most 16 streams concurrently; further streams wait until a running stream finishes.
 Handshakes have a 10-second deadline, with at most 16 pending and 4 pending per address. The 4-per-address cap applies
 only to pending handshakes; open forwardings are capped only in total, at 64 open forwarded connections.
@@ -159,6 +158,7 @@ All link state lives directly in the top-level `stateDir`:
 | `removed.json` | A tombstone map `{ "<endpoint id>": <epoch milliseconds> }`, propagated in membership snapshots. |
 | `pairing.json` | The pending single-use code, expiry, node name and wrong-attempt counters. Deleted after successful pairing. |
 | `status.json` | The running server's `{ "pid", "id", "ticket", "name" }`. Removed on clean stop; stale or absent status prevents `pair`. |
+| `.link-control.sock` | The mode 0600 local socket for joining and dialing through the running endpoint. Removed on clean stop. |
 
 The link creates a missing `stateDir` with mode 0700 and refuses an existing directory with any group or other permission
 bit, reporting `link state directory must have mode 0700` as a config failure (exit 2).
@@ -268,6 +268,12 @@ A socket that another server answers on is left alone.
 with no group or other permission bit, and holds the secret and one newline. Its text is never printed. The arguments are a JSON
 object: `--args <json>` for the ones that carry no approval, or `--args-file <file>`, which must be private in the same way.
 
+`--peer <name>` selects a paired peer by name and may appear before or after the verb. It requires a running local
+`arca link serve` and reuses that endpoint through its control socket in `stateDir`. Each POST opens a fresh control
+connection and bidirectional stream using `arca/mcp/1`. The HTTP request and bearer header reach the peer unchanged;
+the peer's MCP server checks the token as usual. Missing or ambiguous peer names fail with exit 1. A saved peer ticket,
+when present, must match its endpoint id; without a ticket, the link uses N0 discovery by endpoint id.
+
 `--args` may not carry an `approval` key, and it is refused with exit 2 before anything is sent. An approval is passed only in
 `--args-file`, so it never appears in the process list or in the shell history.
 
@@ -306,8 +312,6 @@ A removal of a desired entry whose objects are class B (deleted by an Incus dele
 plan until an owner approves it. A plan lapses fifteen minutes after it was made. `plan_list` leaves a lapsed plan out, and an
 approval for it is refused as `Expired`. A restart, or a new proposal while the removal still waits, makes a fresh plan with a new
 creation time and fifteen new minutes.
-
-Kernel instances start on create unless the body sets `start: false`; removal force-stops a running instance and waits for that operation before DELETE.
 
 The desired-state document expires thirty days after it is issued. A document past its expiry holds the applied state, and the
 reconciler makes no plan from it. So a restart after the thirty days drops every waiting plan, and `plan_list` lists none.
@@ -1046,7 +1050,3 @@ The tests use the fake Incus and the recording shim from the Incus crate. They n
 address or a system service. The approval tests sign with software keys from fixed seeds, listed in a signers file the test
 writes itself, so no owner key or host file is read. They run under the default temporary directory, because a longer socket path breaks the unix
 socket's length limit. Run them with `cargo test -p arca`.
-
-Service database and consumer creates read `devices.root.pool` from the default project's default profile. A missing pool
-refuses creation. The internal desired config carries that pool; each instance creates its root disk there. Database images
-must already be present in the service project's image store at the requested fingerprint.
