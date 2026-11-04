@@ -1659,6 +1659,142 @@
       "x-arca-class": "L",
       "x-arca-scope": "doctor",
       "x-arca-writes": true
+    },
+    {
+      "name": "ontology_query",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "edges": {
+              "items": {
+                "properties": {
+                  "contract": {
+                    "enum": [
+                      "mcp",
+                      "api",
+                      "file",
+                      "token",
+                      "socket"
+                    ],
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "enum": [
+                      "live",
+                      "planned",
+                      "deferred"
+                    ],
+                    "type": "string"
+                  },
+                  "to": {
+                    "enum": [
+                      "arca",
+                      "droidd",
+                      "dsh",
+                      "omni",
+                      "arca-id",
+                      "automagik",
+                      "weunfold",
+                      "herdr"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "to",
+                  "contract",
+                  "status"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "id": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "kind": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "tool",
+                    "incus-project",
+                    "incus-mark",
+                    "data",
+                    "unit",
+                    "token-file",
+                    "passkey-name"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "neverOwns": {
+              "type": "boolean"
+            },
+            "owner": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "arca"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "status": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "live",
+                    "planned",
+                    "deferred"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "kind",
+            "owner",
+            "status",
+            "edges",
+            "neverOwns"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The ownership, status and outgoing calls for an item in Arca's public ontology.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
     }
   ],
   "openrpc": "1.3.2"

@@ -61,7 +61,7 @@ pub struct Verb {
     pub result: fn() -> Value,
 }
 
-static VERBS: [Verb; 13] = [
+static VERBS: [Verb; 14] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -191,6 +191,16 @@ static VERBS: [Verb; 13] = [
         destructive: true,
         params: postgres_delete_params,
         result: postgres_delete_result,
+    },
+    Verb {
+        name: "ontology_query",
+        summary: "The ownership, status and outgoing calls for an item in Arca's public ontology.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        params: ontology_query_params,
+        result: ontology_query_result,
     },
 ];
 
@@ -673,5 +683,60 @@ fn postgres_delete_result() -> Value {
     result(vec![
         ("plan", true, nullable(plan())),
         ("removed", true, boolean()),
+    ])
+}
+
+fn ontology_query_params() -> Value {
+    params(vec![("id", true, string_max(128))])
+}
+
+fn nullable_enum(values: &[&str]) -> Value {
+    json!({ "anyOf": [one_of(values), { "type": "null" }] })
+}
+
+fn ontology_query_result() -> Value {
+    let statuses = &["live", "planned", "deferred"];
+    let edge = result(vec![
+        ("id", true, string()),
+        (
+            "to",
+            true,
+            one_of(&[
+                "arca",
+                "droidd",
+                "dsh",
+                "omni",
+                "arca-id",
+                "automagik",
+                "weunfold",
+                "herdr",
+            ]),
+        ),
+        (
+            "contract",
+            true,
+            one_of(&["mcp", "api", "file", "token", "socket"]),
+        ),
+        ("status", true, one_of(statuses)),
+    ]);
+    result(vec![
+        ("id", true, string_max(128)),
+        (
+            "kind",
+            true,
+            nullable_enum(&[
+                "tool",
+                "incus-project",
+                "incus-mark",
+                "data",
+                "unit",
+                "token-file",
+                "passkey-name",
+            ]),
+        ),
+        ("owner", true, nullable_enum(&["arca"])),
+        ("status", true, nullable_enum(statuses)),
+        ("edges", true, array(edge)),
+        ("neverOwns", true, boolean()),
     ])
 }

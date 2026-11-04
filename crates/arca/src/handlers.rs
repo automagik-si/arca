@@ -26,10 +26,103 @@ use arca_providers::ReadOnlyIncusProvider;
 use arca_reconcile::PLAN_TTL_MS;
 use arca_store::Store;
 use arca_watch::{WatchConfig, watch_once};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::NodeConfig;
 use crate::kernel::Kernel;
+
+/// Answers from the public ontology embedded in the binary, without reading node state.
+pub struct OntologyQuery;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OntologySection {
+    owns: Vec<OntologyOwned>,
+    calls: Vec<OntologyCall>,
+    never_owns: Vec<OntologyNeverOwn>,
+}
+
+#[derive(Deserialize)]
+struct OntologyOwned {
+    id: String,
+    kind: String,
+    status: String,
+    #[serde(rename = "split")]
+    _split: Option<OntologySplit>,
+}
+
+#[derive(Deserialize)]
+struct OntologySplit {
+    #[serde(rename = "by")]
+    _by: String,
+    #[serde(rename = "value")]
+    _value: String,
+}
+
+#[derive(Deserialize)]
+struct OntologyCall {
+    id: String,
+    to: String,
+    contract: String,
+    status: String,
+    carries: Vec<String>,
+    #[serde(rename = "requires")]
+    _requires: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OntologyNeverOwn {
+    Exact { kind: String, id: String },
+    Prefix { kind: String, prefix: String },
+}
+
+impl OntologySection {
+    fn query(&self, id: &str) -> Value {
+        let owned = self.owns.iter().find(|entry| entry.id == id);
+        let never = self.never_owns.iter().find_map(|entry| match entry {
+            OntologyNeverOwn::Exact { kind, id: exact } if exact == id => Some(kind),
+            OntologyNeverOwn::Prefix { kind, prefix } if id.starts_with(prefix) => Some(kind),
+            _ => None,
+        });
+        let edges: Vec<Value> = self
+            .calls
+            .iter()
+            .filter(|edge| edge.carries.iter().any(|carried| carried == id))
+            .map(|edge| {
+                json!({
+                    "id": edge.id, "to": edge.to, "contract": edge.contract, "status": edge.status,
+                })
+            })
+            .collect();
+        json!({
+            "id": id,
+            "kind": owned.map(|entry| &entry.kind).or(never),
+            "owner": owned.map(|_| "arca"),
+            "status": owned.map(|entry| &entry.status),
+            "edges": edges,
+            "neverOwns": never.is_some(),
+        })
+    }
+}
+
+impl ToolHandler for OntologyQuery {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let id = args
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| id.chars().count() <= 128)
+            .ok_or_else(|| {
+                CallError::Invalid("id: expected a string of at most 128 characters".to_string())
+            })?;
+        let section: OntologySection =
+            serde_json::from_str(include_str!("../../../ontology/arca.json")).map_err(|_| {
+                CallError::Internal("the embedded ontology could not be parsed".to_string())
+            })?;
+        Ok(section.query(id))
+    }
+}
 
 /// How long an approval statement a plan listing carries is valid from its issue. Droidd's own window for an owner's
 /// approval, and the most the verifier accepts.
@@ -877,6 +970,59 @@ mod tests {
     use arca_providers::INSTANCES_ALL_PROJECTS;
 
     use super::*;
+
+    #[test]
+    fn ontology_direct_calls_validate_id_by_character_count() {
+        let caller = Caller {
+            token_id: "viewer".to_string(),
+            scope: Scope::Viewer,
+        };
+        for args in [
+            json!({}),
+            json!({"id": null}),
+            json!({"id": 1}),
+            json!({"id": "é".repeat(129)}),
+        ] {
+            assert!(matches!(
+                OntologyQuery.call(args, &caller),
+                Err(CallError::Invalid(_))
+            ));
+        }
+        assert!(
+            OntologyQuery
+                .call(json!({"id": "é".repeat(128)}), &caller)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn ontology_edges_follow_carries_for_owned_never_owned_and_unknown_ids() {
+        let section: OntologySection = serde_json::from_value(json!({
+            "owns": [{"id": "owned", "kind": "tool", "status": "live", "split": {"by": "kind", "value": "arca"}}],
+            "neverOwns": [{"id": "owned", "kind": "data"}, {"prefix": "foreign-", "kind": "data"}],
+            "calls": [
+                {"id": "outgoing", "to": "droidd", "contract": "mcp", "status": "planned",
+                 "endpoint": "arca-mcp", "carries": ["owned", "foreign-data", "unknown"], "requires": ["permission"]},
+                {"id": "unrelated", "to": "omni", "contract": "api", "status": "live", "carries": [], "requires": ["unknown"]}
+            ]
+        })).expect("section");
+        for id in ["owned", "foreign-data", "unknown"] {
+            assert_eq!(
+                section.query(id)["edges"],
+                json!([{
+                    "id": "outgoing", "to": "droidd", "contract": "mcp", "status": "planned"
+                }])
+            );
+        }
+        let owned = section.query("owned");
+        assert_eq!(owned["owner"], "arca");
+        assert_eq!(owned["kind"], "tool");
+        assert_eq!(owned["status"], "live");
+        assert_eq!(owned["neverOwns"], true);
+        assert_eq!(section.query("foreign-data")["kind"], "data");
+        assert_eq!(section.query("unknown")["kind"], Value::Null);
+        assert_eq!(section.query("foreign")["neverOwns"], false);
+    }
 
     const PROJECTS_PATH: &str = "/1.0/projects?recursion=1";
     /// The instance list the sampler reads each tick, with each row's state.
