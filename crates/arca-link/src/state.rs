@@ -2,14 +2,43 @@
 
 use crate::{Error, Result, now_ms, runtime};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::SecretKey;
+use iroh::{EndpointAddr, SecretKey};
+use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
 };
+
+const REMOVED_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+const REMOVED_LIMIT: usize = 64;
+const REMOVED_SKEW_MS: u64 = 5 * 60 * 1_000;
+
+fn prune_removed(removed: &mut BTreeMap<String, u64>, now: u64) -> bool {
+    let mut changed = false;
+    let latest = now.saturating_add(REMOVED_SKEW_MS);
+    removed.retain(|_, at| {
+        if *at > latest {
+            *at = latest;
+            changed = true;
+        }
+        let keep = now.saturating_sub(*at) <= REMOVED_TTL_MS;
+        changed |= !keep;
+        keep
+    });
+    if removed.len() > REMOVED_LIMIT {
+        let mut oldest: Vec<_> = removed.iter().map(|(id, at)| (*at, id.clone())).collect();
+        oldest.sort_unstable();
+        for (_, id) in oldest.into_iter().take(removed.len() - REMOVED_LIMIT) {
+            removed.remove(&id);
+        }
+        changed = true;
+    }
+    changed
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Peer {
@@ -17,6 +46,38 @@ pub struct Peer {
     pub name: String,
     pub paired: u64,
     pub seen: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+}
+
+impl Peer {
+    pub fn addr(&self) -> Result<EndpointAddr> {
+        let id = runtime(self.id.parse())?;
+        match &self.ticket {
+            Some(ticket) => {
+                let ticket: EndpointTicket = runtime(ticket.parse())?;
+                if ticket.endpoint_addr().id != id {
+                    return Err(Error::Runtime("peer ticket identity mismatch"));
+                }
+                Ok(ticket.endpoint_addr().clone())
+            }
+            None => Ok(EndpointAddr::new(id)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Removed {
+    pub id: String,
+    pub at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Snapshot {
+    pub peers: Vec<Peer>,
+    pub removed: Vec<Removed>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,7 +105,15 @@ pub struct State {
 impl State {
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self> {
         let state = Self { dir: dir.into() };
-        runtime(fs::create_dir_all(&state.dir))?;
+        runtime(
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&state.dir),
+        )?;
+        if runtime(fs::metadata(&state.dir))?.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Config("link state directory must have mode 0700"));
+        }
         Ok(state)
     }
 
@@ -127,23 +196,39 @@ impl State {
         Ok(self.read("peers.json")?.unwrap_or_default())
     }
 
-    pub(crate) fn add(&self, id: String, name: String) -> Result<Peer> {
+    pub(crate) fn add(&self, id: String, name: String, ticket: Option<String>) -> Result<Peer> {
         let _lock = self.lock()?;
-        self.add_locked(id, name)
+        self.add_locked(id, name, ticket)
     }
 
-    pub(crate) fn add_locked(&self, id: String, name: String) -> Result<Peer> {
+    pub(crate) fn add_locked(
+        &self,
+        id: String,
+        name: String,
+        ticket: Option<String>,
+    ) -> Result<Peer> {
         let mut peers = self.peers()?;
         let now = now_ms();
-        let paired = peers.iter().find(|p| p.id == id).map_or(now, |p| p.paired);
+        let mut removed = self.removed()?;
+        let paired = now
+            .max(removed.remove(&id).unwrap_or(0).saturating_add(1))
+            .max(
+                peers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map_or(0, |p| p.paired.saturating_add(1)),
+            );
+        prune_removed(&mut removed, now);
         peers.retain(|p| p.id != id);
         let peer = Peer {
             id,
             name,
             paired,
             seen: now,
+            ticket,
         };
         peers.push(peer.clone());
+        self.write("removed.json", &removed)?;
         self.write("peers.json", &peers)?;
         Ok(peer)
     }
@@ -163,9 +248,90 @@ impl State {
         let _lock = self.lock()?;
         let mut peers = self.peers()?;
         let before = peers.len();
+        let mut removed = self.removed()?;
+        let now = now_ms();
+        for peer in peers.iter().filter(|p| p.name == name) {
+            let at = now
+                .max(peer.paired)
+                .min(now.saturating_add(REMOVED_SKEW_MS));
+            removed
+                .entry(peer.id.clone())
+                .and_modify(|old| *old = (*old).max(at))
+                .or_insert(at);
+        }
+        prune_removed(&mut removed, now);
         peers.retain(|p| p.name != name);
+        self.write("removed.json", &removed)?;
         self.write("peers.json", &peers)?;
         Ok(before - peers.len())
+    }
+
+    fn removed(&self) -> Result<BTreeMap<String, u64>> {
+        Ok(self.read("removed.json")?.unwrap_or_default())
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<Snapshot> {
+        let _lock = self.lock()?;
+        let mut removed = self.removed()?;
+        if prune_removed(&mut removed, now_ms()) {
+            self.write("removed.json", &removed)?;
+        }
+        Ok(Snapshot {
+            peers: self.peers()?,
+            removed: removed
+                .into_iter()
+                .map(|(id, at)| Removed { id, at })
+                .collect(),
+        })
+    }
+
+    /// Any admitted member may introduce peers. Validate before mutating any state.
+    pub(crate) fn merge(&self, snapshot: Snapshot, own_id: &str) -> Result<bool> {
+        for peer in &snapshot.peers {
+            peer.addr()?;
+        }
+        for removed in &snapshot.removed {
+            runtime(removed.id.parse::<iroh::EndpointId>())?;
+        }
+        let _lock = self.lock()?;
+        let mut peers = self.peers()?;
+        let mut removed = self.removed()?;
+        let before = (peers.clone(), removed.clone());
+        let now = now_ms();
+        for tombstone in snapshot.removed {
+            let at = tombstone.at.min(now.saturating_add(REMOVED_SKEW_MS));
+            removed
+                .entry(tombstone.id)
+                .and_modify(|old| *old = (*old).max(at))
+                .or_insert(at);
+        }
+        prune_removed(&mut removed, now);
+        for peer in snapshot.peers {
+            if peer.id == own_id {
+                continue;
+            }
+            if let Some(existing) = peers.iter_mut().find(|p| p.id == peer.id) {
+                if peer.paired > existing.paired {
+                    *existing = peer;
+                }
+            } else {
+                peers.push(peer);
+            }
+        }
+        peers.retain(|peer| match removed.get(&peer.id) {
+            Some(at) if *at >= peer.paired => false,
+            Some(_) => {
+                removed.remove(&peer.id);
+                true
+            }
+            None => true,
+        });
+        let changed = before != (peers.clone(), removed.clone());
+        if changed {
+            self.write("removed.json", &removed)?;
+            self.write("peers.json", &peers)?;
+        }
+        Ok(changed)
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -184,5 +350,269 @@ impl State {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(Error::Runtime("cannot remove link state")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Fixture(State);
+
+    impl Fixture {
+        fn new() -> Self {
+            let mut bytes = [0; 32];
+            getrandom::fill(&mut bytes).unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("arca-merge-{}", URL_SAFE_NO_PAD.encode(bytes)));
+            Self(State::new(dir).unwrap())
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0.dir).unwrap();
+        }
+    }
+
+    fn peer(index: u64, paired: u64) -> Peer {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&index.to_le_bytes());
+        Peer {
+            id: SecretKey::from_bytes(&bytes).public().to_string(),
+            name: format!("peer-{index}"),
+            paired,
+            seen: paired,
+            ticket: None,
+        }
+    }
+
+    #[test]
+    fn merge_timestamps_tombstones_and_legacy_records() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let now = now_ms();
+        let id = peer(0, now).id;
+        let legacy = serde_json::json!({"id": id, "name": "first", "paired": now, "seen": now + 1});
+        let peer: Peer = serde_json::from_value(legacy).unwrap();
+        assert!(peer.ticket.is_none());
+        assert!(serde_json::to_value(&peer).unwrap().get("ticket").is_none());
+        assert_eq!(peer.addr().unwrap(), EndpointAddr::new(id.parse().unwrap()));
+        let snapshot = |peers, at| Snapshot {
+            peers,
+            removed: vec![Removed { id: id.clone(), at }],
+        };
+        state
+            .merge(snapshot(vec![peer.clone()], now - 1), "self")
+            .unwrap();
+        assert_eq!(state.peers().unwrap(), vec![peer.clone()]);
+        assert!(state.removed().unwrap().is_empty());
+        let mut older = peer.clone();
+        older.name = "older".to_string();
+        older.paired = now - 1;
+        state
+            .merge(
+                Snapshot {
+                    peers: vec![older],
+                    removed: vec![],
+                },
+                "self",
+            )
+            .unwrap();
+        assert_eq!(state.peers().unwrap(), vec![peer.clone()]);
+        state.merge(snapshot(vec![], now), "self").unwrap();
+        assert!(state.peers().unwrap().is_empty());
+        state
+            .merge(snapshot(vec![peer.clone()], now - 1), "self")
+            .unwrap();
+        assert!(state.peers().unwrap().is_empty());
+        let mut newer = peer;
+        newer.paired = now + 1;
+        state
+            .merge(snapshot(vec![newer.clone()], now), "self")
+            .unwrap();
+        assert_eq!(state.peers().unwrap(), vec![newer]);
+        assert!(state.removed().unwrap().is_empty());
+        state.remove("first").unwrap();
+        assert!(!state.removed().unwrap().is_empty());
+        let added = state.add(id.clone(), "first".to_string(), None).unwrap();
+        assert!(state.removed().unwrap().is_empty());
+        assert!(added.paired > now + 1);
+    }
+
+    #[test]
+    fn many_removals_keep_newest_and_snapshot_below_line_limit() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let now = now_ms();
+        let peers: Vec<_> = (0..320)
+            .map(|index| peer(index, now + REMOVED_SKEW_MS / 2 + index))
+            .collect();
+        state.write("peers.json", &peers).unwrap();
+        for peer in &peers {
+            assert_eq!(state.remove(&peer.name).unwrap(), 1);
+            assert!(state.removed().unwrap().len() <= REMOVED_LIMIT);
+        }
+        let expected: BTreeMap<_, _> = peers
+            .iter()
+            .rev()
+            .take(REMOVED_LIMIT)
+            .map(|peer| (peer.id.clone(), peer.paired))
+            .collect();
+        assert_eq!(state.removed().unwrap(), expected);
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.removed.len(), REMOVED_LIMIT);
+        assert!(snapshot.peers.is_empty());
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() < crate::mesh::LINE_LIMIT / 4);
+    }
+
+    #[test]
+    fn pruning_expires_clamps_and_breaks_ties_deterministically() {
+        let now = REMOVED_TTL_MS + 100;
+        let mut removed: BTreeMap<_, _> =
+            (0..100).map(|index| (peer(index, now).id, now)).collect();
+        let mut expected = removed.clone();
+        while expected.len() > REMOVED_LIMIT {
+            expected.pop_first();
+        }
+        assert!(prune_removed(&mut removed, now));
+        assert_eq!(removed, expected);
+        assert!(!prune_removed(&mut removed, now));
+
+        let (expired, boundary, future) = (peer(100, 0).id, peer(101, 0).id, peer(102, 0).id);
+        let mut removed = BTreeMap::from([
+            (expired.clone(), now - REMOVED_TTL_MS - 1),
+            (boundary.clone(), now - REMOVED_TTL_MS),
+            (future.clone(), u64::MAX),
+        ]);
+        assert!(prune_removed(&mut removed, now));
+        assert!(!removed.contains_key(&expired));
+        assert_eq!(removed[&boundary], now - REMOVED_TTL_MS);
+        assert_eq!(removed[&future], now + REMOVED_SKEW_MS);
+        assert!(!prune_removed(&mut removed, now));
+        let mut removed = BTreeMap::from([(future, u64::MAX)]);
+        assert!(!prune_removed(&mut removed, u64::MAX - 1));
+    }
+
+    #[test]
+    fn snapshot_prunes_and_persists_legacy_tombstones() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let now = now_ms();
+        let mut removed: BTreeMap<_, _> =
+            (0..320).map(|index| (peer(index, now).id, now)).collect();
+        let expired = peer(320, 0).id;
+        let future = peer(321, 0).id;
+        removed.insert(expired.clone(), now - REMOVED_TTL_MS - 1);
+        removed.insert(future.clone(), u64::MAX);
+        state.write("removed.json", &removed).unwrap();
+        let snapshot = state.snapshot().unwrap();
+        let persisted = state.removed().unwrap();
+        assert_eq!(persisted.len(), REMOVED_LIMIT);
+        assert!(!persisted.contains_key(&expired));
+        assert!(persisted[&future] <= now_ms() + REMOVED_SKEW_MS);
+        assert_eq!(
+            snapshot.removed,
+            persisted
+                .into_iter()
+                .map(|(id, at)| Removed { id, at })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn merge_clamps_future_tombstones_before_eviction() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let now = now_ms();
+        let older = peer(0, now);
+        let newer = peer(1, now + 2 * REMOVED_SKEW_MS);
+        let removed = [&older, &newer]
+            .into_iter()
+            .map(|peer| Removed {
+                id: peer.id.clone(),
+                at: u64::MAX,
+            })
+            .collect();
+        assert!(
+            state
+                .merge(
+                    Snapshot {
+                        peers: vec![older.clone(), newer.clone()],
+                        removed
+                    },
+                    "self"
+                )
+                .unwrap()
+        );
+        assert_eq!(state.peers().unwrap(), vec![newer]);
+        let removed = state.removed().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[&older.id] >= now + REMOVED_SKEW_MS);
+        assert!(removed[&older.id] <= now_ms() + REMOVED_SKEW_MS);
+    }
+
+    #[test]
+    fn merge_prunes_union_and_expired_tombstones() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let now = now_ms();
+        let previous: BTreeMap<_, _> = (0..64).map(|index| (peer(index, now).id, now)).collect();
+        state.write("removed.json", &previous).unwrap();
+        let newest: BTreeMap<_, _> = (64..128)
+            .map(|index| (peer(index, now).id, now + 1))
+            .collect();
+        let mut removed: Vec<_> = newest
+            .iter()
+            .map(|(id, at)| Removed {
+                id: id.clone(),
+                at: *at,
+            })
+            .collect();
+        removed.push(Removed {
+            id: peer(128, 0).id,
+            at: now - REMOVED_TTL_MS - 1,
+        });
+        assert!(
+            state
+                .merge(
+                    Snapshot {
+                        peers: vec![],
+                        removed
+                    },
+                    "self"
+                )
+                .unwrap()
+        );
+        assert_eq!(state.removed().unwrap(), newest);
+    }
+
+    #[test]
+    fn remove_clamps_future_pairing_timestamp() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let peer = peer(0, u64::MAX);
+        state.write("peers.json", &vec![peer.clone()]).unwrap();
+        assert_eq!(state.remove(&peer.name).unwrap(), 1);
+        assert!(state.removed().unwrap()[&peer.id] <= now_ms() + REMOVED_SKEW_MS);
+    }
+
+    #[test]
+    fn pairing_clears_own_tombstone_and_prunes_others() {
+        let fixture = Fixture::new();
+        let state = &fixture.0;
+        let now = now_ms();
+        let own = peer(0, now);
+        let expired = peer(100, 0).id;
+        let mut removed: BTreeMap<_, _> =
+            (0..100).map(|index| (peer(index, now).id, now)).collect();
+        removed.insert(expired.clone(), now - REMOVED_TTL_MS - 1);
+        state.write("removed.json", &removed).unwrap();
+        let added = state.add(own.id.clone(), own.name, None).unwrap();
+        assert!(added.paired > now);
+        let removed = state.removed().unwrap();
+        assert_eq!(removed.len(), REMOVED_LIMIT);
+        assert!(!removed.contains_key(&own.id));
+        assert!(!removed.contains_key(&expired));
     }
 }

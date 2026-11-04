@@ -26,7 +26,7 @@ impl Temp {
                 "listen": {"unix": self.0.join("arca.sock")},
                 "tokens": {"hashDir": self.0.join("tokens")},
                 "kernel": {"droiddProjects": []},
-                "link": {"name": "fixture", "forward": {}, "pairMinutes": 1}
+                "link": {"name": "fixture", "forward": {}, "pairMinutes": 1, "localOnly": true}
             }))
             .unwrap(),
         )
@@ -92,10 +92,13 @@ async fn link_cli_pairs_joins_lists_and_removes_without_relays() {
             command(&["link", "peers", "--config", &guest_config])[0]["id"],
             joined["id"]
         );
-        assert_eq!(
-            command(&["link", "remove", "first λ &", "--config", &guest_config]),
-            json!({"removed": 1})
-        );
+        let config = guest_config.clone();
+        let removed = tokio::task::spawn_blocking(move || {
+            command(&["link", "remove", "first λ &", "--config", &config])
+        })
+        .await
+        .unwrap();
+        assert_eq!(removed, json!({"removed": 1}));
         assert_eq!(
             command(&["link", "peers", "--config", &guest_config]),
             json!([])
@@ -118,4 +121,165 @@ async fn link_cli_pairs_joins_lists_and_removes_without_relays() {
     })
     .await
     .expect("CLI link test deadline");
+}
+
+#[test]
+fn link_remove_accepts_end_of_options_before_name() {
+    let temp = Temp::new();
+    let config = temp.config();
+    let remove = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+            .args(["link", "remove", "--", "--probe", "--config", &config])
+            .output()
+            .unwrap()
+    };
+    let output = remove();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"removed": 0})
+    );
+    assert!(temp.0.join("state/removed.json").is_file());
+
+    let state = State::new(temp.0.join("state")).unwrap();
+    let peer = arca_link::Peer {
+        id: state.secret().unwrap().public().to_string(),
+        name: "--probe".to_string(),
+        paired: arca_link::now_ms(),
+        seen: arca_link::now_ms(),
+        ticket: None,
+    };
+    fs::write(
+        temp.0.join("state/peers.json"),
+        serde_json::to_vec(&vec![peer.clone()]).unwrap(),
+    )
+    .unwrap();
+    let unmarked = std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+        .args(["link", "remove", "--probe", "--config", &config])
+        .output()
+        .unwrap();
+    assert_eq!(unmarked.status.code(), Some(2));
+    assert!(
+        String::from_utf8(unmarked.stderr)
+            .unwrap()
+            .starts_with("arca: usage: arca")
+    );
+    assert_eq!(state.peers().unwrap(), vec![peer]);
+    let output = remove();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"removed": 1})
+    );
+    assert!(state.peers().unwrap().is_empty());
+}
+
+#[test]
+fn link_join_accepts_end_of_options_before_link() {
+    let error = arca::run(
+        &["link", "join", "--", "--invalid-link", "--config", "unused"].map(String::from),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), 2);
+    assert_eq!(error.message(), "invalid pairing link");
+}
+
+#[test]
+fn link_serve_sigterm_exits_cleanly_and_removes_runtime_files_without_relays() {
+    let temp = Temp::new();
+    let config = temp.config();
+    // Reserve a silent direct peer: startup sync cannot complete before the signal.
+    let silent = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let id = State::new(temp.0.join("silent"))
+        .unwrap()
+        .secret()
+        .unwrap()
+        .public();
+    let state = temp.0.join("state");
+    State::new(&state).unwrap();
+    let mut peer = arca_link::Peer {
+        id: id.to_string(),
+        name: "silent".to_string(),
+        paired: 1,
+        seen: 1,
+        ticket: None,
+    };
+    peer.ticket = Some(
+        EndpointTicket::new(
+            peer.addr()
+                .unwrap()
+                .with_ip_addr(silent.local_addr().unwrap()),
+        )
+        .to_string(),
+    );
+    fs::write(
+        state.join("peers.json"),
+        serde_json::to_vec(&vec![peer]).unwrap(),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(state.join("peers.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+        .args(["link", "serve", "--config", &config])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !state.join("status.json").exists() {
+        if let Some(exit) = child.try_wait().unwrap() {
+            panic!("serve exited before publishing status: {exit}");
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("serve did not publish status");
+        }
+        std::thread::yield_now();
+    }
+    assert!(state.join(".link-control.sock").exists());
+    assert!(
+        std::process::Command::new("/bin/kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // Allow QUIC's best-effort close drain, while staying below the mesh dial timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(exit) = child.try_wait().unwrap() {
+            assert!(exit.success(), "{exit}");
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("serve did not stop after SIGTERM");
+        }
+        std::thread::yield_now();
+    }
+    assert!(!state.join("status.json").exists());
+    assert!(!state.join(".link-control.sock").exists());
+}
+
+#[test]
+fn link_rejects_public_state_directory_with_exit_two() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = Temp::new();
+    let config = temp.config();
+    let dir = temp.0.join("state");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+        .args(["link", "peers", "--config", &config])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("link state directory must have mode 0700")
+    );
+    assert!(!dir.join("secret.key").exists());
 }

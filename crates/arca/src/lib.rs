@@ -37,9 +37,9 @@ const USAGE: &str = "usage: arca <command>
   metrics --json [--sample-for <seconds, 0 to 60>] --config <file>
   link serve --config <file>
   link pair --config <file> [--minutes <n>]
-  link join <link> --config <file>
+  link join [--] <link> --config <file>
   link peers --config <file>
-  link remove <name> --config <file>
+  link remove [--] <name> --config <file>
   probe consumer add --name <n> --image <fingerprint> --config <file>
   probe consumer remove --name <n> --config <file>
   serve --config <file>

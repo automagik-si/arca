@@ -1,6 +1,8 @@
 use crate::{
-    Config, Error, PAIR_ALPN, PairLink, Peer, Result, State, Status,
+    Config, Error, FORWARDED_STREAM_LIMIT, PAIR_ALPN, PEERS_ALPN, PairLink, Peer, Result, State,
+    Status,
     guard::{Guard, Slot},
+    mesh,
     pairing::{self, Request, Response, read_line, write_line},
     runtime,
 };
@@ -60,7 +62,7 @@ impl Link {
         };
         state.delete("status.json")?;
         let key = state.secret()?;
-        let mut alpns = vec![PAIR_ALPN.to_vec()];
+        let mut alpns = vec![PAIR_ALPN.to_vec(), PEERS_ALPN.to_vec()];
         alpns.extend(config.forward.keys().map(|a| a.as_bytes().to_vec()));
         let builder = match network {
             Network::N0 => Endpoint::builder(presets::N0),
@@ -114,7 +116,15 @@ impl Link {
         self.endpoint.addr()
     }
     pub async fn join(&self, link: &PairLink) -> Result<Peer> {
-        pairing::join(&self.endpoint, &self.state, &self.name, link).await
+        let peer = pairing::join(&self.endpoint, &self.state, &self.name, link).await?;
+        self.refresh.notify_one();
+        Ok(peer)
+    }
+    /// Exchange full membership snapshots; unreachable members never fail a sync.
+    pub async fn sync_peers(&self) -> Result<()> {
+        mesh::sync(&self.endpoint, &self.state).await?;
+        self.refresh.notify_one();
+        Ok(())
     }
     /// Wake the removal sweep immediately, including in-process removals.
     pub fn refresh_peers(&self) {
@@ -176,12 +186,34 @@ async fn run(
     let connections: Connections = Arc::default();
     let mut tasks = JoinSet::new();
     let mut poll = tokio::time::interval(Duration::from_secs(2));
+    let mut periodic = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    let mut syncing = JoinSet::new();
+    let mut needs_sync = true;
+    let mut last_removed = state.snapshot().ok().map(|s| s.removed);
     loop {
+        if needs_sync && syncing.is_empty() {
+            needs_sync = false;
+            let (endpoint, state, refresh) = (endpoint.clone(), state.clone(), refresh.clone());
+            let connections = connections.clone();
+            syncing.spawn(async move {
+                if matches!(mesh::sync(&endpoint, &state).await, Ok(true)) {
+                    refresh.notify_one();
+                }
+                sweep(&state, &connections);
+            });
+        }
         tokio::select! {
             _ = stop.changed() => break,
-            _ = refresh.notified() => sweep(&state, &connections),
+            _ = refresh.notified() => { sweep(&state, &connections); needs_sync = true; },
+            _ = periodic.tick() => needs_sync = true,
+            _ = syncing.join_next(), if !syncing.is_empty() => {},
             _ = poll.tick() => {
                 sweep(&state, &connections);
+                let removed = state.snapshot().ok().map(|s| s.removed);
+                if removed != last_removed { last_removed = removed; needs_sync = true; }
                 if publish(&state, &endpoint, &name).is_err() { break; }
             },
             incoming = endpoint.accept() => {
@@ -190,24 +222,29 @@ async fn run(
                 if !incoming.remote_addr_validated() { let _ = incoming.retry(); continue; }
                 let Some(slot) = guard.take(incoming.remote_addr()) else { incoming.refuse(); continue; };
                 let deadline = Instant::now() + Duration::from_secs(10);
-                tasks.spawn(handle(incoming, slot, state.clone(), config.clone(), connections.clone(), deadline));
+                tasks.spawn(handle(incoming, slot, state.clone(), endpoint.id().to_string(), config.clone(), connections.clone(), refresh.clone(), deadline));
             },
             client = listener.accept() => {
                 if let Ok((client, _)) = client {
                     let (endpoint, state, name) = (endpoint.clone(), state.clone(), name.clone());
-                    tasks.spawn(async move { let _ = control(client, endpoint, state, name).await; });
+                    let (connections, refresh) = (connections.clone(), refresh.clone());
+                    tasks.spawn(async move { let _ = control(client, endpoint, state, name, connections, refresh).await; });
                 }
             },
             _ = tasks.join_next(), if !tasks.is_empty() => {},
         }
     }
+    syncing.abort_all();
+    while syncing.join_next().await.is_some() {}
     endpoint.close().await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
 }
 
 fn sweep(state: &State, connections: &Connections) {
-    let peers = state.peers().unwrap_or_default();
+    let Ok(peers) = state.peers() else {
+        return;
+    };
     for connection in connections.lock().expect("connections lock").values() {
         if !peers
             .iter()
@@ -218,14 +255,18 @@ fn sweep(state: &State, connections: &Connections) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     incoming: Incoming,
     mut slot: Slot,
     state: State,
+    own_id: String,
     config: Config,
     connections: Connections,
+    refresh: Arc<Notify>,
     deadline: Instant,
 ) {
+    let remote_addr = incoming.remote_addr();
     let Ok(accepting) = incoming.accept() else {
         return;
     };
@@ -240,7 +281,6 @@ async fn handle(
                 connection.close(1u32.into(), b"not paired");
                 return Err(Error::Runtime("not paired"));
             }
-            slot.trust();
             let id = connection.stable_id();
             connections
                 .lock()
@@ -249,10 +289,23 @@ async fn handle(
             registered = Some(id);
         }
         let (mut send, mut recv) = runtime(connection.accept_bi().await)?;
+        if !is_pair {
+            slot.trust();
+        }
         if is_pair {
             let line = read_line(&mut recv).await?;
             let response = match serde_json::from_slice::<Request>(&line) {
-                Ok(request) => state.redeem(connection.remote_id(), request)?,
+                Ok(request) => state.redeem(
+                    connection.remote_id(),
+                    request,
+                    Some(
+                        EndpointTicket::new(EndpointAddr::from_parts(
+                            connection.remote_id(),
+                            [remote_addr.into()],
+                        ))
+                        .to_string(),
+                    ),
+                )?,
                 Err(_) => Response::refused("invalid request"),
             };
             if response.ok {
@@ -266,6 +319,15 @@ async fn handle(
             }
             write_line(&mut send, &response).await?;
             runtime(send.finish())?;
+            if response.ok {
+                refresh.notify_one();
+            }
+            Ok((connection, None))
+        } else if connection.alpn() == PEERS_ALPN {
+            if mesh::receive(&state, &own_id, &mut send, &mut recv).await? {
+                sweep(&state, &connections);
+                refresh.notify_one();
+            }
             Ok((connection, None))
         } else {
             let alpn = std::str::from_utf8(connection.alpn())
@@ -292,7 +354,7 @@ async fn handle(
             loop {
                 tokio::select! {
                     _ = connection.closed() => break,
-                    stream = connection.accept_bi() => match stream {
+                    stream = connection.accept_bi(), if streams.len() < FORWARDED_STREAM_LIMIT => match stream {
                         Ok((send, recv)) => { streams.spawn(forward(path.clone(), send, recv)); },
                         Err(_) => break,
                     },
@@ -336,19 +398,36 @@ async fn control(
     endpoint: Endpoint,
     state: State,
     name: String,
+    connections: Connections,
+    refresh: Arc<Notify>,
 ) -> Result<()> {
     let operation = async {
         let text = read_line(&mut socket).await?;
-        let result = match std::str::from_utf8(&text)
-            .ok()
-            .and_then(|s| PairLink::parse(s).ok())
-        {
-            Some(link) => pairing::join(&endpoint, &state, &name, &link).await,
-            None => Err(Error::InvalidLink),
+        let remove = serde_json::from_slice::<RemoveRequest>(&text).ok();
+        let reply = if let Some(request) = remove {
+            match state.remove(&request.remove) {
+                Ok(count) => {
+                    sweep(&state, &connections);
+                    refresh.notify_one();
+                    serde_json::json!({"removed": count})
+                }
+                Err(_) => serde_json::json!({"error": "removal failed"}),
+            }
+        } else {
+            let result = match std::str::from_utf8(&text)
+                .ok()
+                .and_then(|s| PairLink::parse(s).ok())
+            {
+                Some(link) => pairing::join(&endpoint, &state, &name, &link).await,
+                None => Err(Error::InvalidLink),
+            };
+            result
+                .map(|p| {
+                    refresh.notify_one();
+                    serde_json::json!({"id": p.id, "name": p.name})
+                })
+                .unwrap_or_else(|_| serde_json::json!({"error": "pairing failed"}))
         };
-        let reply = result
-            .map(|p| serde_json::json!({"id": p.id, "name": p.name}))
-            .unwrap_or_else(|_| serde_json::json!({"error": "pairing failed"}));
         write_line(&mut socket, &reply).await
     };
     runtime(timeout(Duration::from_secs(12), operation).await)?
@@ -374,4 +453,82 @@ pub async fn join_running(state: &State, text: &str) -> Result<Peer> {
             .ok_or(Error::Runtime("paired peer is absent"))
     };
     runtime(timeout(Duration::from_secs(15), operation).await)?
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoveRequest {
+    remove: String,
+}
+
+/// Remove through the running server so admission and existing streams change immediately.
+pub async fn remove_running(state: &State, name: &str) -> Result<usize> {
+    state.status()?;
+    let operation = async {
+        let mut socket = runtime(UnixStream::connect(state.dir.join(".link-control.sock")).await)?;
+        write_line(
+            &mut socket,
+            &RemoveRequest {
+                remove: name.to_string(),
+            },
+        )
+        .await?;
+        let value: serde_json::Value =
+            runtime(serde_json::from_slice(&read_line(&mut socket).await?))?;
+        value["removed"]
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or(Error::Runtime("removal failed"))
+    };
+    runtime(timeout(Duration::from_secs(15), operation).await)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sweep_skips_read_errors_and_revokes_after_a_successful_read() {
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap()
+            .bind()
+            .await
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("arca-sweep-{}", client.id()));
+        let state = State::new(&dir).unwrap();
+        let link = Link::start(state.clone(), Config::default(), Network::local())
+            .await
+            .unwrap();
+        let connection = client
+            .connect(
+                EndpointAddr::new(link.endpoint().id())
+                    .with_ip_addr(link.endpoint().bound_sockets()[0]),
+                PAIR_ALPN,
+            )
+            .await
+            .unwrap();
+        let connections: Connections = Arc::default();
+        connections
+            .lock()
+            .unwrap()
+            .insert(connection.stable_id(), connection.clone());
+        std::fs::write(dir.join("peers.json"), b"{").unwrap();
+        sweep(&state, &connections);
+        assert!(
+            connection.close_reason().is_none(),
+            "a state read error must preserve connections"
+        );
+        state.write("peers.json", &Vec::<Peer>::new()).unwrap();
+        sweep(&state, &connections);
+        assert!(
+            connection.close_reason().is_some(),
+            "a readable empty peer list must revoke connections"
+        );
+        link.shutdown().await;
+        client.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

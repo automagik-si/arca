@@ -21,7 +21,14 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         return Err(usage_failure());
     }
     let positional = if command == "join" || command == "remove" {
-        let Some((value, rest)) = args.split_first().filter(|(v, _)| !v.starts_with("--")) else {
+        let end_of_options = args.first().is_some_and(|arg| arg == "--");
+        if end_of_options {
+            args = &args[1..];
+        }
+        let Some((value, rest)) = args
+            .split_first()
+            .filter(|(v, _)| end_of_options || !v.starts_with("--"))
+        else {
             return Err(usage_failure());
         };
         args = rest;
@@ -46,11 +53,6 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
     let state = State::new(config.state_dir).map_err(failure)?;
     match command.as_str() {
         "peers" => return Ok(Some(json!(state.peers().map_err(failure)?))),
-        "remove" => {
-            return Ok(Some(
-                json!({"removed": state.remove(positional.unwrap_or_default()).map_err(failure)?}),
-            ));
-        }
         "pair" => {
             let minutes = flags
                 .value("minutes")
@@ -72,13 +74,29 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         .build()
         .map_err(|_| Failure::Runtime("cannot start link runtime".to_string()))?;
     runtime.block_on(async {
+        if command == "remove" {
+            let name = positional.unwrap_or_default();
+            let count = if state.status().is_ok() {
+                arca_link::remove_running(&state, name)
+                    .await
+                    .map_err(failure)?
+            } else {
+                state.remove(name).map_err(failure)?
+            };
+            return Ok(Some(json!({"removed": count})));
+        }
+        let network = if link_config.local_only {
+            Network::local()
+        } else {
+            Network::N0
+        };
         if let Some(parsed) = parsed_link {
             let peer = if state.status().is_ok() {
                 arca_link::join_running(&state, positional.unwrap_or_default())
                     .await
                     .map_err(failure)?
             } else {
-                let node = Link::start(state, link_config, Network::N0)
+                let node = Link::start(state, link_config, network)
                     .await
                     .map_err(failure)?;
                 let result = node.join(&parsed).await;
@@ -87,11 +105,12 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
             };
             return Ok(Some(json!({"id": peer.id, "name": peer.name})));
         }
+        // Register both handlers before start can publish status.json.
         let mut terminate = signal(SignalKind::terminate())
             .map_err(|_| Failure::Runtime("cannot register link stop signal".to_string()))?;
         let mut interrupt = signal(SignalKind::interrupt())
             .map_err(|_| Failure::Runtime("cannot register link stop signal".to_string()))?;
-        let mut node = Link::start(state, link_config, Network::N0)
+        let mut node = Link::start(state, link_config, network)
             .await
             .map_err(failure)?;
         tokio::select! {
