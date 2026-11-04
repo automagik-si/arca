@@ -2,7 +2,7 @@
 
 use crate::{Error, Result, now_ms, runtime};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::{EndpointAddr, EndpointId, SecretKey};
+use iroh::{EndpointAddr, SecretKey};
 use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
@@ -198,35 +198,13 @@ impl State {
 
     /// Read optional address hints without changing the public peer record or its writer.
     pub(crate) fn peer_addr(&self, name: &str) -> Result<EndpointAddr> {
-        #[derive(Deserialize)]
-        struct Address {
-            id: String,
-            name: String,
-            ticket: Option<String>,
-        }
-        let peers: Vec<Address> = self.read("peers.json")?.unwrap_or_default();
-        let mut matches = peers.into_iter().filter(|p| p.name == name);
+        let peers = self.peers()?;
+        let mut matches = peers.iter().filter(|peer| peer.name == name);
         let peer = matches.next().ok_or(Error::Runtime("unknown peer name"))?;
         if matches.next().is_some() {
             return Err(Error::Runtime("ambiguous peer name"));
         }
-        let id: EndpointId = peer
-            .id
-            .parse()
-            .map_err(|_| Error::Runtime("invalid peer endpoint id"))?;
-        match peer.ticket {
-            Some(ticket) => {
-                let ticket: EndpointTicket = ticket
-                    .parse()
-                    .map_err(|_| Error::Runtime("invalid peer ticket"))?;
-                let addr = ticket.endpoint_addr();
-                if addr.id != id {
-                    return Err(Error::Runtime("peer ticket endpoint id does not match"));
-                }
-                Ok(addr.clone())
-            }
-            None => Ok(EndpointAddr::new(id)),
-        }
+        peer.addr()
     }
 
     pub(crate) fn add(&self, id: String, name: String, ticket: Option<String>) -> Result<Peer> {
@@ -676,7 +654,7 @@ mod tests {
         state
             .write(
                 "peers.json",
-                &json!([{"id": id.to_string(), "name": "peer", "ticket": ticket}]),
+                &json!([{"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0, "ticket": ticket}]),
             )
             .unwrap();
         assert_eq!(state.peer_addr("peer").unwrap(), addr);
@@ -698,26 +676,31 @@ mod tests {
         let mut key = [0; 32];
         getrandom::fill(&mut key).unwrap();
         let other = SecretKey::from_bytes(&key).public();
-        let record = json!({"id": id.to_string(), "name": "peer"});
+        let record = json!({"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0});
         state.write("peers.json", &json!([record, record])).unwrap();
         assert_eq!(
             state.peer_addr("peer").unwrap_err().to_string(),
             "ambiguous peer name"
         );
-        for (ticket, expected) in [
-            ("invalid".to_string(), "invalid peer ticket"),
-            (
-                EndpointTicket::new(EndpointAddr::new(other)).to_string(),
-                "peer ticket endpoint id does not match",
-            ),
-        ] {
-            state
-                .write(
-                    "peers.json",
-                    &json!([{"id": id.to_string(), "name": "peer", "ticket": ticket}]),
-                )
-                .unwrap();
-            assert_eq!(state.peer_addr("peer").unwrap_err().to_string(), expected);
-        }
+        // A ticket that does not parse fails like any other link operation.
+        state
+            .write(
+                "peers.json",
+                &json!([{"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0, "ticket": "invalid"}]),
+            )
+            .unwrap();
+        assert!(state.peer_addr("peer").is_err());
+        // A ticket for another endpoint is refused by identity, as Peer::addr refuses it.
+        state
+            .write(
+                "peers.json",
+                &json!([{"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0,
+                         "ticket": EndpointTicket::new(EndpointAddr::new(other)).to_string()}]),
+            )
+            .unwrap();
+        assert_eq!(
+            state.peer_addr("peer").unwrap_err().to_string(),
+            "peer ticket identity mismatch"
+        );
     }
 }
