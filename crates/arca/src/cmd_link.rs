@@ -49,7 +49,13 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
     };
     let flags = parse_flags(args, allowed, &[])?;
     let config = config::load(Path::new(flags.required("config")?))?;
-    let link_config = config.link.unwrap_or_default();
+    let mut link_config = config.link.clone().unwrap_or_default();
+    if command == "serve" {
+        link_config
+            .forward
+            .entry("arca/mcp/1".to_string())
+            .or_insert(config.listen.unix);
+    }
     let state = State::new(config.state_dir).map_err(failure)?;
     match command.as_str() {
         "peers" => return Ok(Some(json!(state.peers().map_err(failure)?))),

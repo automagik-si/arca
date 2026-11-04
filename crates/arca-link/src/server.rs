@@ -372,12 +372,20 @@ async fn handle(
 
 async fn forward(
     path: std::path::PathBuf,
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+) {
+    let Ok(socket) = UnixStream::connect(path).await else {
+        return;
+    };
+    proxy(socket, send, recv).await;
+}
+
+async fn proxy(
+    mut socket: UnixStream,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) {
-    let Ok(mut socket) = UnixStream::connect(path).await else {
-        return;
-    };
     let (mut read, mut write) = socket.split();
     let upstream = async {
         let result = tokio::io::copy(&mut recv, &mut write).await;
@@ -401,8 +409,36 @@ async fn control(
     connections: Connections,
     refresh: Arc<Notify>,
 ) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Dial {
+        dial: String,
+    }
     let operation = async {
         let text = read_line(&mut socket).await?;
+        if let Ok(request) = serde_json::from_slice::<Dial>(&text) {
+            let result: Result<_> = async {
+                let addr = state.peer_addr(&request.dial)?;
+                let connection = runtime(endpoint.connect(addr, b"arca/mcp/1").await)?;
+                let (send, recv) = runtime(connection.open_bi().await)?;
+                Ok((connection, send, recv))
+            }
+            .await;
+            return match result {
+                Ok(stream) => {
+                    write_line(&mut socket, &serde_json::json!({"ok": true})).await?;
+                    Ok(Some(stream))
+                }
+                Err(error) => {
+                    write_line(
+                        &mut socket,
+                        &serde_json::json!({"error": error.to_string()}),
+                    )
+                    .await?;
+                    Ok(None)
+                }
+            };
+        }
         let remove = serde_json::from_slice::<RemoveRequest>(&text).ok();
         let reply = if let Some(request) = remove {
             match state.remove(&request.remove) {
@@ -428,9 +464,16 @@ async fn control(
                 })
                 .unwrap_or_else(|_| serde_json::json!({"error": "pairing failed"}))
         };
-        write_line(&mut socket, &reply).await
+        write_line(&mut socket, &reply).await?;
+        Ok(None)
     };
-    runtime(timeout(Duration::from_secs(12), operation).await)?
+    if let Some((connection, send, recv)) =
+        runtime(timeout(Duration::from_secs(12), operation).await)??
+    {
+        proxy(socket, send, recv).await;
+        connection.close(0u32.into(), b"done");
+    }
+    Ok(())
 }
 
 /// Join through the existing node endpoint when `serve` holds the node lock.

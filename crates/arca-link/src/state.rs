@@ -196,6 +196,17 @@ impl State {
         Ok(self.read("peers.json")?.unwrap_or_default())
     }
 
+    /// Read optional address hints without changing the public peer record or its writer.
+    pub(crate) fn peer_addr(&self, name: &str) -> Result<EndpointAddr> {
+        let peers = self.peers()?;
+        let mut matches = peers.iter().filter(|peer| peer.name == name);
+        let peer = matches.next().ok_or(Error::Runtime("unknown peer name"))?;
+        if matches.next().is_some() {
+            return Err(Error::Runtime("ambiguous peer name"));
+        }
+        peer.addr()
+    }
+
     pub(crate) fn add(&self, id: String, name: String, ticket: Option<String>) -> Result<Peer> {
         let _lock = self.lock()?;
         self.add_locked(id, name, ticket)
@@ -356,6 +367,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     struct Fixture(State);
 
@@ -614,5 +626,81 @@ mod tests {
         assert_eq!(removed.len(), REMOVED_LIMIT);
         assert!(!removed.contains_key(&own.id));
         assert!(!removed.contains_key(&expired));
+    }
+
+    struct Temp(PathBuf);
+
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn peer_addresses_accept_legacy_records_and_verified_tickets() {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let temp = Temp(
+            std::env::temp_dir().join(format!("arca-peer-{}", URL_SAFE_NO_PAD.encode(random))),
+        );
+        let state = State::new(&temp.0).unwrap();
+        let id = state.secret().unwrap().public();
+        state.add(id.to_string(), "peer".into(), None).unwrap();
+        let addr = state.peer_addr("peer").unwrap();
+        assert_eq!(addr, EndpointAddr::new(id));
+
+        let addr = addr.with_ip_addr((std::net::Ipv4Addr::LOCALHOST, 12345).into());
+        let ticket = EndpointTicket::new(addr.clone()).to_string();
+        state
+            .write(
+                "peers.json",
+                &json!([{"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0, "ticket": ticket}]),
+            )
+            .unwrap();
+        assert_eq!(state.peer_addr("peer").unwrap(), addr);
+        assert_eq!(
+            state.peer_addr("missing").unwrap_err().to_string(),
+            "unknown peer name"
+        );
+    }
+
+    #[test]
+    fn peer_addresses_refuse_ambiguous_names_invalid_tickets_and_id_mismatches() {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let temp = Temp(
+            std::env::temp_dir().join(format!("arca-peer-{}", URL_SAFE_NO_PAD.encode(random))),
+        );
+        let state = State::new(&temp.0).unwrap();
+        let id = state.secret().unwrap().public();
+        let mut key = [0; 32];
+        getrandom::fill(&mut key).unwrap();
+        let other = SecretKey::from_bytes(&key).public();
+        let record = json!({"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0});
+        state.write("peers.json", &json!([record, record])).unwrap();
+        assert_eq!(
+            state.peer_addr("peer").unwrap_err().to_string(),
+            "ambiguous peer name"
+        );
+        // A ticket that does not parse fails like any other link operation.
+        state
+            .write(
+                "peers.json",
+                &json!([{"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0, "ticket": "invalid"}]),
+            )
+            .unwrap();
+        assert!(state.peer_addr("peer").is_err());
+        // A ticket for another endpoint is refused by identity, as Peer::addr refuses it.
+        state
+            .write(
+                "peers.json",
+                &json!([{"id": id.to_string(), "name": "peer", "paired": 0, "seen": 0,
+                         "ticket": EndpointTicket::new(EndpointAddr::new(other)).to_string()}]),
+            )
+            .unwrap();
+        assert_eq!(
+            state.peer_addr("peer").unwrap_err().to_string(),
+            "peer ticket identity mismatch"
+        );
     }
 }

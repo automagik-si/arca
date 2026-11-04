@@ -17,7 +17,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
 | `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
 | `arca link remove [--] <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
-| `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
+| `arca call [--peer <name>] <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the local node, or through a paired peer with `--peer` | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
@@ -120,16 +120,17 @@ camelCase keys and refuses unknown keys:
 - `name`: the node's name, from 1 to 60 characters, without U+0000..U+001F control characters. When absent, the name is the
   first 10 characters of its endpoint id. Incoming device names have those controls stripped, are capped at 60 characters,
   and fall back to `device` when empty.
-- `forward`: an ALPN-to-unix-socket-path map, empty by default. Each admitted stream is forwarded unchanged in both
-  directions to its socket. For example, `arca/mcp/1` may be an entry; it has no special handling.
+- `forward`: an ALPN-to-unix-socket-path map. Each admitted stream is forwarded unchanged in both directions to its socket.
+  `arca link serve` adds `arca/mcp/1` pointing to `listen.unix` unless the map already has an explicit entry for that ALPN.
 - `pairMinutes`: the default code lifetime in minutes, overridden by `link pair --minutes`. The default is 10, and the
   selected value is clamped to 1 through 60.
 - `localOnly`: when true, binds only loopback and disables discovery and relays. The default is false (N0 discovery and
   public relays). It also disables mesh reachability: the node neither reaches peers on other hosts for membership or
   forwarding, nor is reached by them. This also permits testing `link serve` without external network access.
 
-The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, plus the ALPNs in `forward`. Both membership
-and forwarded connections require a live entry in `peers.json`. `arca/pair/1` and `arca/peers/1` cannot be forward entries.
+The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, `arca/mcp/1` for peer calls, plus the ALPNs
+in `forward`. Both membership and forwarded connections require a live entry in `peers.json`; a forwarded connection checks
+that entry before its local socket is opened. `arca/pair/1` and `arca/peers/1` cannot be forward entries.
 Each forwarded connection runs at most 16 streams concurrently; further streams wait until a running stream finishes.
 Handshakes have a 10-second deadline, with at most 16 pending and 4 pending per address. The 4-per-address cap applies
 only to pending handshakes; open forwardings are capped only in total, at 64 open forwarded connections.
@@ -159,6 +160,7 @@ All link state lives directly in the top-level `stateDir`:
 | `removed.json` | A tombstone map `{ "<endpoint id>": <epoch milliseconds> }`, propagated in membership snapshots. |
 | `pairing.json` | The pending single-use code, expiry, node name and wrong-attempt counters. Deleted after successful pairing. |
 | `status.json` | The running server's `{ "pid", "id", "ticket", "name" }`. Removed on clean stop; stale or absent status prevents `pair`. |
+| `.link-control.sock` | The mode 0600 local socket for joining and dialing through the running endpoint. Removed on clean stop. |
 
 The link creates a missing `stateDir` with mode 0700 and refuses an existing directory with any group or other permission
 bit, reporting `link state directory must have mode 0700` as a config failure (exit 2).
@@ -267,6 +269,12 @@ A socket that another server answers on is left alone.
 `arca call <verb>` makes one call and prints its result. The token is read from `--token-file`, which must be a regular file
 with no group or other permission bit, and holds the secret and one newline. Its text is never printed. The arguments are a JSON
 object: `--args <json>` for the ones that carry no approval, or `--args-file <file>`, which must be private in the same way.
+
+`--peer <name>` selects a paired peer by name and may appear before or after the verb. It requires a running local
+`arca link serve` and reuses that endpoint through its control socket in `stateDir`. Each POST opens a fresh control
+connection and bidirectional stream using `arca/mcp/1`. The HTTP request and bearer header reach the peer unchanged;
+the peer's MCP server checks the token as usual. Missing or ambiguous peer names fail with exit 1. A saved peer ticket,
+when present, must match its endpoint id; without a ticket, the link uses N0 discovery by endpoint id.
 
 `--args` may not carry an `approval` key, and it is refused with exit 2 before anything is sent. An approval is passed only in
 `--args-file`, so it never appears in the process list or in the shell history.

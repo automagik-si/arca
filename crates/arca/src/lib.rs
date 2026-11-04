@@ -35,7 +35,7 @@ use crate::config::ConfigError;
 const USAGE: &str = "usage: arca <command>
   watch --once --json --config <file>
   metrics --json [--sample-for <seconds, 0 to 60>] --config <file>
-  link serve --config <file>
+  link serve --config <file> (forwards arca/mcp/1 to listen.unix by default)
   link pair --config <file> [--minutes <n>]
   link join [--] <link> --config <file>
   link peers --config <file>
@@ -43,7 +43,7 @@ const USAGE: &str = "usage: arca <command>
   probe consumer add --name <n> --image <fingerprint> --config <file>
   probe consumer remove --name <n> --config <file>
   serve --config <file>
-  call <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
+  call [--peer <name>] <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
   store check --config <file>
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
