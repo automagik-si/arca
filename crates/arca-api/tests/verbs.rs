@@ -28,7 +28,7 @@ fn names() -> Vec<&'static str> {
 }
 
 #[test]
-fn the_table_holds_the_verbs_in_order() {
+fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order() {
     assert_eq!(
         names(),
         [
@@ -40,6 +40,11 @@ fn the_table_holds_the_verbs_in_order() {
             "plan_decline",
             "approval_submit",
             "alerts_list",
+            "postgres_create",
+            "postgres_list",
+            "postgres_link",
+            "postgres_unlink",
+            "postgres_delete",
             "ontology_query",
         ]
     );
@@ -57,6 +62,11 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
         ("alerts_list", VerbClass::L, Scope::Viewer, false, false),
+        ("postgres_create", VerbClass::L, Scope::Doctor, true, false),
+        ("postgres_list", VerbClass::L, Scope::Viewer, false, false),
+        ("postgres_link", VerbClass::L, Scope::Doctor, true, false),
+        ("postgres_unlink", VerbClass::L, Scope::Doctor, true, false),
+        ("postgres_delete", VerbClass::L, Scope::Doctor, true, true),
         ("ontology_query", VerbClass::L, Scope::Viewer, false, false),
     ];
     for (name, class, scope, writes, destructive) in rows {
@@ -732,4 +742,25 @@ fn mentions_key(v: &Value, key: &str) -> bool {
         Value::Array(items) => items.iter().any(|x| mentions_key(x, key)),
         _ => false,
     }
+}
+
+#[test]
+fn viewer_cannot_call_postgres_write_verbs() {
+    for verb in verbs().iter().filter(|v| v.name.starts_with("postgres_")) {
+        assert_eq!(may_call(Scope::Viewer, verb), !verb.writes);
+        assert!(may_call(Scope::Doctor, verb));
+    }
+}
+
+#[test]
+fn postgres_delete_accepts_a_waiting_plan_or_a_settled_removal() {
+    let schema = (verb("postgres_delete").unwrap().result)();
+    assert_eq!(schema["required"], json!(["plan", "removed"]));
+    assert_eq!(
+        schema["properties"]["plan"]["type"],
+        json!(["object", "null"])
+    );
+    assert!(conforms(&schema, &json!({"plan":null,"removed":true})).is_ok());
+    assert!(conforms(&schema, &json!({"plan":null})).is_err());
+    assert!(conforms(&schema, &json!({"plan":null,"removed":"true"})).is_err());
 }

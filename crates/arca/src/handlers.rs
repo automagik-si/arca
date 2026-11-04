@@ -1443,3 +1443,446 @@ mod iso_tests {
         }
     }
 }
+
+/// Build one entry without secret values in its config.
+pub fn service_entry(id: &str, plugin: &str, config: Value) -> arca_kernel::desired::Entry {
+    arca_kernel::desired::Entry {
+        id: EntryId(id.into()),
+        plugin: arca_kernel::desired::PluginId(plugin.into()),
+        version: "0.1.0".into(),
+        digest: Digest::of(
+            arca_kernel::canon::canonical_json(&config)
+                .expect("config JSON")
+                .as_bytes(),
+        ),
+        signer: "node".into(),
+        config,
+        disabled: false,
+    }
+}
+
+/// Read the host's default profile once; the service project's own profile has no root disk.
+pub fn service_pool(cfg: &NodeConfig) -> Result<String, CallError> {
+    let profile = UnixIncus::new(cfg.incus.socket.clone())
+        .get("/1.0/profiles/default?project=default")
+        .map_err(|_| pg_invalid("default profile root pool is unavailable"))?;
+    profile["devices"]["root"]["pool"]
+        .as_str()
+        .filter(|p| arca_postgres::pool_ok(p))
+        .map(str::to_string)
+        .ok_or_else(|| pg_invalid("default profile must name a valid devices.root.pool"))
+}
+
+/// The shared network is the first change when absent, in the caller's one document.
+pub fn ensure_netproject(
+    entries: &[arca_kernel::desired::Entry],
+    cfg: &NodeConfig,
+) -> Result<Vec<crate::desired_store::EntryChange>, CallError> {
+    let cidr = cfg
+        .kernel
+        .service_cidr
+        .as_deref()
+        .ok_or_else(|| CallError::Invalid("kernel.serviceCidr is required".into()))?;
+    arca_netproject::check_cidr(cidr, &cfg.kernel.reserved_cidrs)
+        .map_err(|e| CallError::Invalid(e.into()))?;
+    if !cfg
+        .kernel
+        .projects
+        .iter()
+        .any(|p| p == arca_netproject::PROJECT)
+    {
+        return Err(CallError::Invalid(
+            "kernel.projects must include the service project".into(),
+        ));
+    }
+    if cfg
+        .kernel
+        .droidd_projects
+        .iter()
+        .any(|p| p == arca_netproject::PROJECT)
+        || cfg.kernel.scratch
+    {
+        return Err(CallError::Invalid(
+            "the service project is excluded by kernel configuration".into(),
+        ));
+    }
+    if entries.iter().any(|e| e.id.0 == "net-arcak-svc") {
+        return Ok(vec![]);
+    }
+    Ok(vec![crate::desired_store::EntryChange::Put(service_entry(
+        "net-arcak-svc",
+        "arca.netproject",
+        json!({"project":arca_netproject::PROJECT,"bridge":arca_netproject::BRIDGE,"cidr":cidr,"virtualMachines":0}),
+    ))])
+}
+
+pub fn postgres_handlers(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    // Serialize secret/document transactions without blocking other kernel users during I/O.
+    let writes = Arc::new(Mutex::new(()));
+    [
+        "postgres_create",
+        "postgres_list",
+        "postgres_link",
+        "postgres_unlink",
+        "postgres_delete",
+    ]
+    .into_iter()
+    .map(|verb| {
+        (
+            verb,
+            Arc::new(PostgresHandler {
+                verb,
+                kernel: kernel.clone(),
+                clock: clock.clone(),
+                cfg: cfg.clone(),
+                writes: writes.clone(),
+            }) as Arc<dyn ToolHandler>,
+        )
+    })
+    .collect()
+}
+struct PostgresHandler {
+    verb: &'static str,
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+    writes: Arc<Mutex<()>>,
+}
+fn pg_invalid(message: &str) -> CallError {
+    CallError::Invalid(message.into())
+}
+fn pg_name(args: &Value, key: &str, prefix: &str, max: usize) -> Result<String, CallError> {
+    args[key]
+        .as_str()
+        .filter(|n| arca_netproject::name_ok(n, prefix, max))
+        .map(str::to_string)
+        .ok_or_else(|| pg_invalid("invalid database or consumer name"))
+}
+fn pg_entry(
+    entries: &[arca_kernel::desired::Entry],
+    id: &str,
+    plugin: &str,
+) -> Result<arca_kernel::desired::Entry, CallError> {
+    entries
+        .iter()
+        .find(|e| e.id.0 == id && e.plugin.0 == plugin && !e.disabled)
+        .cloned()
+        .ok_or_else(|| pg_invalid("database or consumer entry is absent"))
+}
+
+/// Secret directories must be real, private and owned by this process.
+fn secret_dir(cfg: &NodeConfig, owner: &str) -> Result<PathBuf, CallError> {
+    use std::{
+        fs,
+        os::unix::fs::{DirBuilderExt, MetadataExt},
+    };
+    let uid = arca_approval::effective_uid().map_err(|_| internal())?;
+    let mut path = cfg.state_dir.clone();
+    for part in ["secrets", owner] {
+        path.push(part);
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(internal()),
+        }
+        let meta = fs::symlink_metadata(&path).map_err(|_| internal())?;
+        if !meta.is_dir()
+            || meta.file_type().is_symlink()
+            || meta.uid() != uid
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(internal());
+        }
+    }
+    Ok(path)
+}
+fn read_pg_secret(path: &std::path::Path) -> Result<String, CallError> {
+    use std::{fs, io::Read, os::unix::fs::MetadataExt};
+    let meta = fs::symlink_metadata(path).map_err(|_| internal())?;
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.mode() & 0o777 != 0o600
+        || meta.uid() != arca_approval::effective_uid().map_err(|_| internal())?
+        || meta.len() > 65536
+    {
+        return Err(internal());
+    }
+    let file = fs::File::open(path).map_err(|_| internal())?;
+    let opened = file.metadata().map_err(|_| internal())?;
+    if (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
+        return Err(internal());
+    }
+    let mut value = String::new();
+    file.take(65537)
+        .read_to_string(&mut value)
+        .map_err(|_| internal())?;
+    if value.len() > 65536 {
+        return Err(internal());
+    }
+    Ok(value)
+}
+fn write_pg_secret(path: &std::path::Path, value: &str) -> Result<(), CallError> {
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+    };
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| internal())?;
+    let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let temp = path.with_file_name(format!(".secret-{nonce}.tmp"));
+    let dir = path.parent().ok_or_else(internal)?;
+    let result = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(value.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temp, path)?;
+            File::open(dir)?.sync_all()
+        })
+        .map_err(|_| internal());
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+fn remove_pg_secret(path: &std::path::Path) -> Result<(), CallError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(internal()),
+    }
+}
+fn previous_pg_secret(path: &std::path::Path) -> Result<Option<String>, CallError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => read_pg_secret(path).map(Some),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(internal()),
+    }
+}
+impl ToolHandler for PostgresHandler {
+    fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+        if self.verb != "postgres_list" && caller.scope < Scope::Doctor {
+            return Err(CallError::Forbidden {
+                verb: self.verb.into(),
+            });
+        }
+        let now = (self.clock)();
+        let _write = if self.verb == "postgres_list" {
+            None
+        } else {
+            Some(self.writes.lock().map_err(|_| internal())?)
+        };
+        let entries = {
+            let kernel = lock(&self.kernel)?;
+            kernel
+                .entries()
+                .iter()
+                .filter(|e| self.verb != "postgres_list" || e.plugin.0 == "arca.postgres")
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        if self.verb == "postgres_list" {
+            let read = UnixIncus::new(self.cfg.incus.socket.clone());
+            let mut rows = Vec::new();
+            for entry in &entries {
+                let cfg: arca_postgres::PostgresConfig =
+                    serde_json::from_value(entry.config.clone()).map_err(|_| internal())?;
+                let state = match read.get(&format!(
+                    "/1.0/instances/{}/state?project={}",
+                    cfg.name, cfg.project
+                )) {
+                    Ok(s) => s,
+                    Err(arca_incus::IncusError::Status { code: 404, .. }) => Value::Null,
+                    Err(_) => return Err(internal()),
+                };
+                let address = arca_postgres::ipv4(&state).map(|ip| ip.to_string());
+                let status = if address.is_none() {
+                    "pending".into()
+                } else {
+                    state["status"].as_str().unwrap_or("pending").to_lowercase()
+                };
+                rows.push(json!({"name":cfg.name,"entry":entry.id.0,"status":status,"address":address,"port":5432,"links":cfg.allow}));
+            }
+            return Ok(json!({"databases":rows}));
+        }
+        let name = pg_name(&args, "name", "postgres", 31)?;
+        let id = format!("postgres-{name}");
+        use crate::desired_store::EntryChange::{Put, Remove};
+        if self.verb == "postgres_create" {
+            let mut changes = ensure_netproject(&entries, &self.cfg)?;
+            if entries.iter().any(|e| e.id.0 == id) {
+                return Err(pg_invalid("database entry already exists"));
+            }
+            let image = args["image"]
+                .as_str()
+                .filter(|i| i.len() <= 512)
+                .ok_or_else(|| pg_invalid("image is required"))?;
+            arca_postgres::fingerprint(image)
+                .map_err(|_| pg_invalid("a digest-pinned image is required"))?;
+            let pool = service_pool(&self.cfg)?;
+            let path = secret_dir(&self.cfg, &id)?.join("password");
+            let mut bytes = [0u8; 32];
+            getrandom::fill(&mut bytes).map_err(|_| internal())?;
+            let password: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            write_pg_secret(&path, &password)?;
+            changes.push(Put(service_entry(&id,"arca.postgres",json!({"name":name,"image":image,"pool":pool,"project":arca_netproject::PROJECT,"bridge":arca_netproject::BRIDGE,"allow":[]}))));
+            let proposed = lock(&self.kernel).and_then(|mut kernel| {
+                if kernel.entries().iter().any(|e| e.id.0 == id) {
+                    return Err(pg_invalid("database entry already exists"));
+                }
+                kernel.propose(changes, now).map_err(|_| internal())
+            });
+            if let Err(error) = proposed {
+                remove_pg_secret(&path)?;
+                return Err(error);
+            }
+            return Ok(json!({"name":name,"entry":id,"status":"pending"}));
+        }
+        let mut database = pg_entry(&entries, &id, "arca.postgres")?;
+        if self.verb == "postgres_delete" {
+            let mut changes = vec![Remove(database.id)];
+            let mut urls = Vec::new();
+            for mut entry in entries
+                .iter()
+                .filter(|e| e.plugin.0 == "arca.consumer")
+                .cloned()
+            {
+                let mut cfg: arca_postgres::consumer::ConsumerConfig =
+                    serde_json::from_value(entry.config.clone()).map_err(|_| internal())?;
+                if !cfg.links.iter().any(|link| link.database == name) {
+                    continue;
+                }
+                cfg.links.retain(|link| link.database != name);
+                urls.push(
+                    self.cfg
+                        .state_dir
+                        .join("secrets")
+                        .join(&entry.id.0)
+                        .join(format!("{name}-url")),
+                );
+                let updated = service_entry(
+                    &entry.id.0,
+                    "arca.consumer",
+                    serde_json::to_value(cfg).map_err(|_| internal())?,
+                );
+                entry.config = updated.config;
+                entry.digest = updated.digest;
+                changes.push(Put(entry));
+            }
+            let (plan, host) = {
+                let mut kernel = lock(&self.kernel)?;
+                kernel.propose(changes, now).map_err(|_| internal())?;
+                (
+                    kernel.pending_plans().into_iter().find(|p| p.entry.0 == id),
+                    kernel.host().to_string(),
+                )
+            };
+            for path in urls {
+                remove_pg_secret(&path)?;
+            }
+            let dir = self.cfg.state_dir.join("secrets").join(&id);
+            remove_pg_secret(&dir.join("password"))?;
+            match std::fs::remove_dir(&dir) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(_) => return Err(internal()),
+            }
+            return Ok(
+                json!({"removed":plan.is_none(), "plan":plan.as_ref().map(|p| plan_json(&host,p,now)).transpose()?}),
+            );
+        }
+        let consumer = pg_name(&args, "consumer", "consumer", 63)?;
+        let mut target = pg_entry(&entries, &format!("consumer-{consumer}"), "arca.consumer")?;
+        let mut cc: arca_postgres::consumer::ConsumerConfig =
+            serde_json::from_value(target.config.clone()).map_err(|_| internal())?;
+        let mut db: arca_postgres::PostgresConfig =
+            serde_json::from_value(database.config.clone()).map_err(|_| internal())?;
+        let mut env: Vec<String> = cc
+            .links
+            .iter()
+            .filter(|l| l.database == name)
+            .map(|l| l.env.clone())
+            .collect();
+        let linking = self.verb == "postgres_link";
+        let url_path = self
+            .cfg
+            .state_dir
+            .join("secrets")
+            .join(&target.id.0)
+            .join(format!("{name}-url"));
+        let mut previous_url = None;
+        if linking {
+            if env.is_empty() {
+                let key = if cc.links.is_empty() {
+                    "DATABASE_URL".into()
+                } else {
+                    format!("DATABASE_URL_{}", name.to_uppercase().replace('-', "_"))
+                };
+                if cc.links.iter().any(|l| l.env == key) {
+                    return Err(pg_invalid("link environment name is already in use"));
+                }
+                cc.links.push(arca_postgres::consumer::ConsumerLink {
+                    database: name.clone(),
+                    env: key.clone(),
+                });
+                env.push(key);
+            }
+            let password = read_pg_secret(&secret_dir(&self.cfg, &id)?.join("password"))?;
+            let url = format!("postgresql://postgres:{password}@{name}:5432/postgres");
+            secret_dir(&self.cfg, &target.id.0)?;
+            previous_url = previous_pg_secret(&url_path)?;
+            write_pg_secret(&url_path, &url)?;
+            if !db.allow.contains(&consumer) {
+                db.allow.push(consumer.clone());
+            }
+        } else {
+            cc.links.retain(|l| l.database != name);
+            db.allow.retain(|c| c != &consumer);
+        }
+        target = service_entry(
+            &target.id.0,
+            "arca.consumer",
+            serde_json::to_value(cc).map_err(|_| internal())?,
+        );
+        database = service_entry(
+            &id,
+            "arca.postgres",
+            serde_json::to_value(db).map_err(|_| internal())?,
+        );
+        let proposed = lock(&self.kernel).and_then(|mut kernel| {
+            kernel
+                .propose(vec![Put(target), Put(database)], now)
+                .map_err(|_| internal())
+        });
+        if let Err(error) = proposed {
+            if linking {
+                match previous_url {
+                    Some(value) => write_pg_secret(&url_path, &value)?,
+                    None => remove_pg_secret(&url_path)?,
+                }
+            }
+            return Err(error);
+        }
+        if !linking {
+            remove_pg_secret(&url_path)?;
+        }
+        Ok(if linking {
+            json!({"name":name,"consumer":consumer,"env":env})
+        } else {
+            json!({"name":name,"consumer":consumer,"removed":env})
+        })
+    }
+}

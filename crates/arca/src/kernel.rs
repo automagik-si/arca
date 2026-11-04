@@ -73,6 +73,13 @@ impl Kernel {
         })
     }
 
+    /// The entries in the current desired-state document, in application order.
+    pub fn entries(&self) -> &[arca_kernel::desired::Entry] {
+        self.store
+            .current()
+            .map_or(&[], |s| s.document.entries.as_slice())
+    }
+
     /// The host name every approval statement of this kernel names.
     pub fn host(&self) -> &str {
         &self.host

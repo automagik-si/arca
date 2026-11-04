@@ -400,6 +400,7 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "watch_report",
             "plan_list",
             "alerts_list",
+            "postgres_list",
             "ontology_query"
         ]
     );

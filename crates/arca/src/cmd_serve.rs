@@ -106,10 +106,20 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     eprintln!("arca: {signing_keys} owner signing key(s), {passkeys} passkey(s) kept");
     let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
     let verifier = ApprovalVerifier::new(host.clone(), trusted, nonces);
+    let mut plugins = PluginSet::new();
+    plugins
+        .add::<arca_netproject::NetProject>()
+        .map_err(kernel_failure)?;
+    plugins
+        .add::<arca_postgres::Postgres>()
+        .map_err(kernel_failure)?;
+    plugins
+        .add::<arca_postgres::consumer::Consumer>()
+        .map_err(kernel_failure)?;
     let kernel = Kernel::open(
         &cfg.state_dir,
         key,
-        PluginSet::new(),
+        plugins,
         verifier,
         host,
         write_provider(&cfg),
@@ -188,7 +198,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
-    for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock) {
+    for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock.clone())
+        .into_iter()
+        .chain(crate::handlers::postgres_handlers(
+            kernel.clone(),
+            clock,
+            Arc::new(cfg.clone()),
+        ))
+    {
         server = server.handle(verb, handler);
     }
     let router = server.router();
