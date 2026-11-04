@@ -9,8 +9,9 @@
 //! the entry's own, its source is an image (a local one, or one on the one pinned image server), and its name is free. A retiring
 //! project's DELETE is preceded by the DELETE of each image in its own store, which is the project's by containment.
 //!
-//! Writes are POST, PATCH, PUT and DELETE. A PATCH carries only the config keys it changes, or one ACL ingress or egress
-//! array, and it is sent to every kind but a project. A project's config change and its tombstone are a PUT of the project's whole config, with the change applied, and of
+//! Writes are POST, PATCH, PUT and DELETE. A PATCH carries the config keys it changes. For an ACL it also sends the description
+//! and both arrays from the read, replacing only the requested field: Incus merges only config on PATCH. A project's config
+//! change and its tombstone are a PUT of the project's whole config, with the change applied, and of
 //! the description, both as the read showed them: Incus 7.3's project PATCH replaces the whole config with the keys it names
 //! (`projectPatch` in `cmd/incusd/api_project.go` copies the old keys into the raw request map, not into the request it applies),
 //! so a PATCH of one key would drop the kernel's mark, `restricted` and every feature. A PUT also force-stops a running instance
@@ -388,7 +389,8 @@ impl UnixIncusWriter {
                 "an ACL patch requires a non-retiring ACL and an array of rule objects",
             ));
         }
-        let body = json!({field.as_str(): rules});
+        let mut body = acl_patch(owned, json!({}))?;
+        body[field.as_str()] = json!(rules);
         self.mutate(
             "PATCH",
             &urls(&owned.target)?.object,
@@ -396,7 +398,12 @@ impl UnixIncusWriter {
             Some(&body),
         )?;
         self.confirm(&owned.target, |fresh| {
-            if fresh.acl_rules(field).map(Vec::as_slice) == Some(rules) {
+            if fresh.acl_rules(field).map(Vec::as_slice) == Some(rules)
+                && fresh.acl_rules(other_acl_field(field))
+                    == owned.acl_rules(other_acl_field(field))
+                && fresh.description == owned.description
+                && fresh.config == owned.config
+            {
                 Ok(())
             } else {
                 Err("the read-back does not show the ACL array".into())
@@ -441,8 +448,9 @@ impl UnixIncusWriter {
         })
     }
 
-    /// Sends a config change under the ETag of `owned`, which the classifier checked. Every kind but a project takes a PATCH of
-    /// the changed keys alone. A project takes a PUT of `after`, its whole config with the change applied, and of the description
+    /// Sends a config change under the ETag of `owned`, which the classifier checked. An ACL's PATCH also preserves its
+    /// description and both rule arrays, which Incus replaces even when omitted. A project takes a PUT of `after`, its whole
+    /// config with the change applied, and of the description
     /// the read showed: Incus 7.3's project PATCH would replace the whole config with the keys it named. Incus checks a PUT's
     /// `If-Match` against the project's description and config, so a project changed since the read is 412 and changes nothing,
     /// as a stale PATCH is. Returns the whole config a PUT sent, which the read-back must hold.
@@ -454,12 +462,11 @@ impl UnixIncusWriter {
     ) -> Result<Option<BTreeMap<String, String>>, IncusError> {
         let urls = urls(&owned.target)?;
         if owned.target.kind != IncusKind::Project {
-            self.mutate(
-                "PATCH",
-                &urls.object,
-                Some(&owned.etag),
-                Some(&config_patch(changes)),
-            )?;
+            let mut body = config_patch(changes);
+            if owned.target.kind == IncusKind::Acl {
+                body = acl_patch(owned, body["config"].clone())?;
+            }
+            self.mutate("PATCH", &urls.object, Some(&owned.etag), Some(&body))?;
             return Ok(None);
         }
         let body = json!({ "description": owned.description, "config": after });
@@ -871,6 +878,28 @@ struct Unread {
 struct Urls {
     collection: String,
     object: String,
+}
+
+fn other_acl_field(field: AclField) -> AclField {
+    match field {
+        AclField::Ingress => AclField::Egress,
+        AclField::Egress => AclField::Ingress,
+    }
+}
+
+// Incus v7.5.1/v7.6.0 networkACLPut merges only config on PATCH. It
+// replaces description and both arrays, and needs a non-null config map
+// to merge existing keys. Preserve the fields from the If-Match read.
+fn acl_patch(owned: &Owned, config: Value) -> Result<Value, IncusError> {
+    let (Some(ingress), Some(egress)) = (&owned.ingress, &owned.egress) else {
+        return Err(refused("an ACL patch requires both rule arrays"));
+    };
+    Ok(json!({
+        "description": owned.description,
+        "ingress": ingress,
+        "egress": egress,
+        "config": config,
+    }))
 }
 
 fn urls(target: &Target) -> Result<Urls, IncusError> {

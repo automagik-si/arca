@@ -2270,7 +2270,7 @@ fn acl_array_intents_replay_before_and_after_patch_and_removal_restores_the_arra
                     &fake,
                     "PATCH",
                     path,
-                    Some(&json!({"ingress":[{"action":"drop"}]}))
+                    Some(&json!({"config":{}, "description":"", "egress":[], "ingress":[{"action":"drop"}]}))
                 )
                 .0,
                 200
@@ -2282,7 +2282,7 @@ fn acl_array_intents_replay_before_and_after_patch_and_removal_restores_the_arra
                     &fake,
                     "PATCH",
                     path,
-                    Some(&json!({"config":{MARK:"other"}}))
+                    Some(&json!({"config":{MARK:"other"}, "description":"", "egress":[], "ingress":sent}))
                 )
                 .0,
                 200

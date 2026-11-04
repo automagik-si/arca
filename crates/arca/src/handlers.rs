@@ -23,7 +23,7 @@ use arca_kernel::plugin::EffectRefusal;
 use arca_mcp::{CallError, Caller, GetHandler, GetReply, ToolHandler};
 use arca_metrics::{DEFAULT_MINUTES, HostSample, Sampler, SamplerConfig, mean};
 use arca_providers::ReadOnlyIncusProvider;
-use arca_reconcile::PLAN_TTL_MS;
+use arca_reconcile::{Outcome, PLAN_TTL_MS};
 use arca_store::Store;
 use arca_watch::{WatchConfig, watch_once};
 use serde::Deserialize;
@@ -1555,6 +1555,18 @@ struct PostgresHandler {
 fn pg_invalid(message: &str) -> CallError {
     CallError::Invalid(message.into())
 }
+fn pg_reconciled(outcomes: &[Outcome], entries: &[&str]) -> Result<(), CallError> {
+    if outcomes.iter().any(|outcome| {
+        matches!(outcome, Outcome::Failed { entry, .. } if entries.contains(&entry.0.as_str()))
+    }) {
+        // Never expose plugin/provider diagnostics or roll back secrets for an
+        // accepted desired document: reconciliation can be retried against it.
+        return Err(CallError::Internal(
+            "the database operation did not reconcile; desired state was saved".into(),
+        ));
+    }
+    Ok(())
+}
 fn pg_name(args: &Value, key: &str, prefix: &str, max: usize) -> Result<String, CallError> {
     args[key]
         .as_str()
@@ -1741,10 +1753,14 @@ impl ToolHandler for PostgresHandler {
                 }
                 kernel.propose(changes, now).map_err(|_| internal())
             });
-            if let Err(error) = proposed {
-                remove_pg_secret(&path)?;
-                return Err(error);
-            }
+            let outcomes = match proposed {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    remove_pg_secret(&path)?;
+                    return Err(error);
+                }
+            };
+            pg_reconciled(&outcomes, &[&id])?;
             return Ok(json!({"name":name,"entry":id,"status":"pending"}));
         }
         let mut database = pg_entry(&entries, &id, "arca.postgres")?;
@@ -1862,23 +1878,28 @@ impl ToolHandler for PostgresHandler {
             "arca.postgres",
             serde_json::to_value(db).map_err(|_| internal())?,
         );
+        let consumer_id = target.id.0.clone();
         let proposed = lock(&self.kernel).and_then(|mut kernel| {
             kernel
                 .propose(vec![Put(target), Put(database)], now)
                 .map_err(|_| internal())
         });
-        if let Err(error) = proposed {
-            if linking {
-                match previous_url {
-                    Some(value) => write_pg_secret(&url_path, &value)?,
-                    None => remove_pg_secret(&url_path)?,
+        let outcomes = match proposed {
+            Ok(outcomes) => outcomes,
+            Err(error) => {
+                if linking {
+                    match previous_url {
+                        Some(value) => write_pg_secret(&url_path, &value)?,
+                        None => remove_pg_secret(&url_path)?,
+                    }
                 }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         if !linking {
             remove_pg_secret(&url_path)?;
         }
+        pg_reconciled(&outcomes, &[&id, &consumer_id])?;
         Ok(if linking {
             json!({"name":name,"consumer":consumer,"env":env})
         } else {

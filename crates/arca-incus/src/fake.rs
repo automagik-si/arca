@@ -200,6 +200,7 @@ struct Shared {
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
+    reject_patch: Mutex<Vec<String>>,
     host_interfaces: Mutex<Vec<HostInterface>>,
     operations_unreadable: AtomicBool,
     /// The operations whose wait answers 404 while the listing still shows them running.
@@ -374,6 +375,7 @@ impl Shared {
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
+            reject_patch: Mutex::new(Vec::new()),
             host_interfaces: Mutex::new(Vec::new()),
             operations_unreadable: AtomicBool::new(false),
             waits_ended: Mutex::new(Vec::new()),
@@ -451,6 +453,11 @@ impl FakeIncus {
     /// object is not created. A switch for the live probe's rejection case.
     pub fn set_reject_config_on_post(&self, kind_path_prefix: &str) {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
+    }
+
+    /// Makes PATCH requests matching this path prefix fail with 400 before changing any object.
+    pub fn set_reject_patch(&self, path_prefix: &str) {
+        lock(&self.shared.reject_patch).push(path_prefix.to_string());
     }
 
     /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
@@ -1369,6 +1376,15 @@ fn create(
         );
     }
     let kind = address.kind;
+    if kind == "acl" {
+        for (field, empty) in [
+            ("description", json!("")),
+            ("ingress", json!([])),
+            ("egress", json!([])),
+        ] {
+            body.entry(field).or_insert(empty);
+        }
+    }
     let name_key = if kind == "forward" {
         "listen_address"
     } else {
@@ -1606,13 +1622,24 @@ fn put(
 }
 
 /// Changes an object from a PATCH. A stale `If-Match` is 412 and changes nothing. An empty string in `config` removes its key.
-/// A project's PATCH replaces its whole config (see [`write_project`]).
+/// A project's PATCH replaces its whole config (see [`write_project`]). An ACL's PATCH merges only config;
+/// description and both rule arrays are replaced, including empty defaults for omitted fields (Incus v7.5.1/v7.6.0).
 fn patch(
     shared: &Shared,
     store: &mut Store,
     request: &Request,
     address: &Address,
 ) -> (u16, String, Value) {
+    if lock(&shared.reject_patch)
+        .iter()
+        .any(|prefix| request.path().starts_with(prefix))
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "patch rejected by test"),
+        );
+    }
     let (index, changes) = match written(store, request, address) {
         Ok(found) => found,
         Err(answer) => return answer,
@@ -1621,6 +1648,28 @@ fn patch(
         return write_project(shared, store, index, &changes, false);
     }
     let mut changes = changes;
+    if store.objects[index].kind == "acl" {
+        // networkACLPut writes existing config keys into req.Config. With no
+        // config map and any existing key, upstream fails before applying it.
+        if !changes.get("config").is_some_and(Value::is_object)
+            && store.objects[index].body["config"]
+                .as_object()
+                .is_some_and(|config| !config.is_empty())
+        {
+            return (
+                500,
+                String::new(),
+                error_envelope(500, "ACL PATCH requires a config map"),
+            );
+        }
+        for (field, empty) in [
+            ("description", json!("")),
+            ("ingress", json!([])),
+            ("egress", json!([])),
+        ] {
+            changes.entry(field).or_insert(empty);
+        }
+    }
     let devices = (store.objects[index].kind == "instance")
         .then(|| changes.remove("devices"))
         .flatten();

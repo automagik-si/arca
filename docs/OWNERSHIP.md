@@ -743,7 +743,10 @@ in `crates/arca-incus/tests/write.rs`.
 **Rule 47.** `IncusPatchAclField { object, field, rules }` replaces exactly one top-level ACL array, `ingress` or `egress`,
 with an array of rule objects. It is class A, addresses only an ACL in `default`, and requires the object's own config to
 classify as the requesting entry's own. Planning reads the ownership, previous array and ETag together without writing;
-the effect rechecks them and PATCHes only the named array under `If-Match`. A stale ETag is 412 and changes nothing.
+the effect rechecks them and PATCHes under `If-Match`, sending both arrays and the description from that read, with only
+the named array changed, and `config: {}`. Incus merges config but replaces the other writable fields even when omitted;
+the config map must be present for the merge. Config patches and tombstones also preserve both arrays and the description.
+A stale ETag is 412 and changes nothing.
 No other kind or field is admitted, and a retiring, foreign, droidd, contested or retained ACL is refused.
 Source: orchestrator ruling / Group 22a; `EffectOp::IncusPatchAclField`, `IncusProvider::{plan, effect}` and
 `UnixIncusWriter::patch_acl_field`; tests `acl_array_patch_journals_typed_pre_image_and_inverse_restores_both_fields`,
@@ -851,7 +854,9 @@ must run before any live write.
   the Incus source (`operationsGet` and `operationWaitGet` in `cmd/incusd/operations.go`, `render` in
   `internal/server/operations/operations.go`, and `instancesPost`); a live probe must confirm it.
 
-- An ACL PATCH replaces only the top-level ingress or egress array it names and preserves the other fields (Rules 47, 48).
-  This is modeled by the fake's top-level merge. The If-Match safety of an ACL PATCH also depends on Incus changing the ACL's
-  ETag when either its ingress or egress array changes; the fake bumps it. A live probe must confirm both behaviors before a
-  live use of the new op.
+- Incus ACL PATCH merges only config and replaces both rule arrays and the description (Rule 47). See
+  [`networkACLPut`, v7.5.1](https://github.com/lxc/incus/blob/v7.5.1/cmd/incusd/network_acls.go#L604-L631) and
+  [v7.6.0](https://github.com/lxc/incus/blob/v7.6.0/cmd/incusd/network_acls.go#L610-L637).
+  An omitted config map cannot receive existing keys. Both versions' `common.Etag` includes name, description, both arrays
+  and config (`internal/server/network/acl/driver_common.go:202-205`). The fake models replacement of the non-config fields;
+  a live probe remains pending approval.

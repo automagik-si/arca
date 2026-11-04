@@ -154,11 +154,13 @@ impl Rig {
         )
     }
     fn create(&self, name: &str) -> Value {
+        self.try_create(name).unwrap()
+    }
+    fn try_create(&self, name: &str) -> Result<Value, CallError> {
         self.call(
             "postgres_create",
             json!({"name":name,"image":format!("example/db@sha256:{}","b".repeat(64))}),
         )
-        .unwrap()
     }
     fn get(&self, path: &str) -> Value {
         UnixIncus::new(self.fake.socket().into()).get(path).unwrap()
@@ -167,6 +169,117 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn assert_reconcile_error(result: Result<Value, CallError>) {
+    assert!(matches!(result, Err(CallError::Internal(message))
+        if message == "the database operation did not reconcile; desired state was saved"));
+}
+
+#[test]
+fn create_reports_failed_acl_effect_and_keeps_password_for_retry() {
+    let r = Rig::new(scratch(), true);
+    r.fake.set_reject_config_on_post("/1.0/network-acls");
+    assert_reconcile_error(r.try_create("db1"));
+    assert!(r.dir.join("secrets/postgres-db1/password").exists());
+    assert!(
+        r.kernel
+            .lock()
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|e| e.id.0 == "postgres-db1")
+    );
+    assert!(
+        UnixIncus::new(r.fake.socket().into())
+            .get("/1.0/instances/db1?project=arcak-svc")
+            .is_err()
+    );
+    assert!(r.call("postgres_list", json!({})).is_ok());
+    assert_eq!(
+        r.call("postgres_delete", json!({"name":"db1"})).unwrap(),
+        json!({"removed":true,"plan":null})
+    );
+    assert!(!r.dir.join("secrets/postgres-db1/password").exists());
+}
+
+#[test]
+fn link_and_unlink_report_failed_database_acl_patch() {
+    for verb in ["postgres_link", "postgres_unlink"] {
+        let r = Rig::new(scratch(), true);
+        r.create("db1");
+        if verb == "postgres_unlink" {
+            r.call(
+                "postgres_link",
+                json!({"name":"db1","consumer":"consumer-a"}),
+            )
+            .unwrap();
+        }
+        let before = r.get("/1.0/network-acls/postgres-db1?project=default")["ingress"].clone();
+        r.fake.set_reject_patch("/1.0/network-acls/postgres-db1");
+        assert_reconcile_error(r.call(verb, json!({"name":"db1","consumer":"consumer-a"})));
+        assert_eq!(
+            r.get("/1.0/network-acls/postgres-db1?project=default")["ingress"],
+            before
+        );
+        let records: Vec<Value> = fs::read_to_string(r.dir.join("journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|record| record["acl_patch"].is_object() && record["state"] == "Failed")
+        );
+        let kernel = r.kernel.lock().unwrap();
+        let db = kernel
+            .entries()
+            .iter()
+            .find(|e| e.id.0 == "postgres-db1")
+            .unwrap();
+        assert_eq!(
+            db.config["allow"],
+            if verb == "postgres_link" {
+                json!(["consumer-a"])
+            } else {
+                json!([])
+            }
+        );
+        assert_eq!(
+            r.dir.join("secrets/consumer-consumer-a/db1-url").exists(),
+            verb == "postgres_link"
+        );
+    }
+}
+
+#[test]
+fn link_and_unlink_report_failed_consumer_effect() {
+    for verb in ["postgres_link", "postgres_unlink"] {
+        let r = Rig::new(scratch(), true);
+        r.create("db1");
+        if verb == "postgres_unlink" {
+            r.call(
+                "postgres_link",
+                json!({"name":"db1","consumer":"consumer-a"}),
+            )
+            .unwrap();
+        }
+        r.fake.set_reject_patch("/1.0/instances/consumer-a");
+        assert_reconcile_error(r.call(verb, json!({"name":"db1","consumer":"consumer-a"})));
+        // The database succeeds; a failed consumer alone must reach the caller.
+        assert_eq!(
+            r.get("/1.0/network-acls/postgres-db1?project=default")["ingress"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            verb == "postgres_unlink"
+        );
+        assert_eq!(
+            r.dir.join("secrets/consumer-consumer-a/db1-url").exists(),
+            verb == "postgres_link"
+        );
     }
 }
 
@@ -626,11 +739,10 @@ fn missing_consumer_address_never_broadens_the_acl() {
         state["network"]["eth0"]["hwaddr"].as_str().unwrap(),
         "0.0.0.0",
     );
-    r.call(
+    assert_reconcile_error(r.call(
         "postgres_link",
         json!({"name":"db1","consumer":"consumer-a"}),
-    )
-    .unwrap();
+    ));
     assert_eq!(
         r.get("/1.0/network-acls/postgres-db1?project=default")["ingress"],
         json!([])
@@ -805,7 +917,7 @@ fn create_proposal_failure_cleans_password_and_retry_replaces_a_stale_file() {
 fn partial_create_delete_settles_and_removes_password_url_and_consumer_link() {
     let r = Rig::new(scratch(), true);
     r.fake.set_reject_config_on_post("/1.0/instances");
-    r.create("db1");
+    assert_reconcile_error(r.try_create("db1"));
     assert!(
         UnixIncus::new(r.fake.socket().into())
             .get("/1.0/instances/db1?project=arcak-svc")
@@ -815,7 +927,7 @@ fn partial_create_delete_settles_and_removes_password_url_and_consumer_link() {
         "postgres_link",
         json!({"name":"db1","consumer":"consumer-a"}),
     )
-    .unwrap();
+    .unwrap_err();
     assert!(r.dir.join("secrets/consumer-consumer-a/db1-url").exists());
     let deleted = r.call("postgres_delete", json!({"name":"db1"})).unwrap();
     assert_eq!(deleted, json!({"removed":true,"plan":null}));
@@ -897,12 +1009,11 @@ fn live_delete_cleans_all_consumer_links_and_secrets_in_one_document() {
 fn recreate_with_new_password_replaces_a_stale_consumer_url() {
     let r = Rig::new(scratch(), true);
     r.fake.set_reject_config_on_post("/1.0/instances");
-    r.create("db1");
-    r.call(
+    assert_reconcile_error(r.try_create("db1"));
+    assert_reconcile_error(r.call(
         "postgres_link",
         json!({"name":"db1","consumer":"consumer-a"}),
-    )
-    .unwrap();
+    ));
     let path = r.dir.join("secrets/consumer-consumer-a/db1-url");
     let old_url = fs::read_to_string(&path).unwrap();
     let old_password = fs::read_to_string(r.dir.join("secrets/postgres-db1/password")).unwrap();
@@ -910,16 +1021,15 @@ fn recreate_with_new_password_replaces_a_stale_consumer_url() {
         r.call("postgres_delete", json!({"name":"db1"})).unwrap()["removed"],
         true
     );
-    r.create("db1");
+    assert_reconcile_error(r.try_create("db1"));
     let password = fs::read_to_string(r.dir.join("secrets/postgres-db1/password")).unwrap();
     assert!(old_password != password);
     fs::write(&path, old_url).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    r.call(
+    assert_reconcile_error(r.call(
         "postgres_link",
         json!({"name":"db1","consumer":"consumer-a"}),
-    )
-    .unwrap();
+    ));
     assert!(
         fs::read_to_string(&path).unwrap()
             == format!("postgresql://postgres:{password}@db1:5432/postgres")
