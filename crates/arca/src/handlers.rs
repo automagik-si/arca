@@ -1896,10 +1896,10 @@ impl ToolHandler for PostgresHandler {
                 return Err(error);
             }
         };
+        pg_reconciled(&outcomes, &[&id, &consumer_id])?;
         if !linking {
             remove_pg_secret(&url_path)?;
         }
-        pg_reconciled(&outcomes, &[&id, &consumer_id])?;
         Ok(if linking {
             json!({"name":name,"consumer":consumer,"env":env})
         } else {

@@ -855,8 +855,8 @@ must run before any live write.
   `internal/server/operations/operations.go`, and `instancesPost`); a live probe must confirm it.
 
 - Incus ACL PATCH merges only config and replaces both rule arrays and the description (Rule 47). See
-  [`networkACLPut`, v7.5.1](https://github.com/lxc/incus/blob/v7.5.1/cmd/incusd/network_acls.go#L604-L631) and
-  [v7.6.0](https://github.com/lxc/incus/blob/v7.6.0/cmd/incusd/network_acls.go#L610-L637).
+  [`networkACLPut` and `netACL.Update`, v7.5.1](https://github.com/lxc/incus/blob/v7.5.1/cmd/incusd/network_acls.go#L585-L631) and
+  [v7.6.0](https://github.com/lxc/incus/blob/v7.6.0/cmd/incusd/network_acls.go#L591-L637).
   An omitted config map cannot receive existing keys. Both versions' `common.Etag` includes name, description, both arrays
   and config (`internal/server/network/acl/driver_common.go:202-205`). The fake models replacement of the non-config fields;
   a live probe remains pending approval.

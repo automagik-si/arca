@@ -247,10 +247,8 @@ fn link_and_unlink_report_failed_database_acl_patch() {
                 json!([])
             }
         );
-        assert_eq!(
-            r.dir.join("secrets/consumer-consumer-a/db1-url").exists(),
-            verb == "postgres_link"
-        );
+        // A failed effect leaves the URL file in place for the retry, on both verbs.
+        assert!(r.dir.join("secrets/consumer-consumer-a/db1-url").exists());
     }
 }
 
@@ -276,10 +274,8 @@ fn link_and_unlink_report_failed_consumer_effect() {
                 .is_empty(),
             verb == "postgres_unlink"
         );
-        assert_eq!(
-            r.dir.join("secrets/consumer-consumer-a/db1-url").exists(),
-            verb == "postgres_link"
-        );
+        // A failed effect leaves the URL file in place for the retry, on both verbs.
+        assert!(r.dir.join("secrets/consumer-consumer-a/db1-url").exists());
     }
 }
 
