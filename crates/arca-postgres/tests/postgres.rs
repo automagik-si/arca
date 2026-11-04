@@ -219,7 +219,7 @@ fn link_and_unlink_write_only_the_consumers_instance_and_databases_acl() {
         r.get("/1.0/network-acls/postgres-db1?project=default")["ingress"],
         json!([])
     );
-    assert!(r.dir.join("secrets/consumer-consumer-a/db1-url").is_file());
+    assert!(!r.dir.join("secrets/consumer-consumer-a/db1-url").exists());
 }
 #[test]
 fn digest_tag_refusal_never_echoes_the_image() {
@@ -392,6 +392,7 @@ fn second_link_uses_database_suffix_list_reads_only_state_and_delete_returns_pla
     .unwrap();
     assert!(r.get("/1.0/instances/consumer-a?project=arcak-svc")["config"]["environment.DATABASE_URL_DB2"].is_string());
     let deleted = r.call("postgres_delete", json!({"name":"db1"})).unwrap();
+    assert_eq!(deleted["removed"], false);
     assert_eq!(deleted["plan"]["entry"], "postgres-db1");
     assert!(deleted["plan"]["statement"].is_string());
     assert!(
@@ -403,7 +404,7 @@ fn second_link_uses_database_suffix_list_reads_only_state_and_delete_returns_pla
             .any(|e| e.id.0 == "net-arcak-svc")
     );
     assert!(r.call("postgres_delete", json!({"name":"db1"})).is_err());
-    assert!(r.dir.join("secrets/postgres-db1/password").exists());
+    assert!(!r.dir.join("secrets/postgres-db1/password").exists());
 }
 
 // Run the entire secret-bearing flow under a captured test subprocess, including all handler results and errors.
@@ -413,6 +414,7 @@ fn password_flow_child() {
     let dir = PathBuf::from(std::env::var_os("ARCA_PASSWORD_SCAN_DIR").unwrap());
     let r = Rig::new(dir.clone(), true);
     let mut transcript = String::new();
+    let mut password = None;
     for (verb, args) in [
         (
             "postgres_create",
@@ -433,34 +435,59 @@ fn password_flow_child() {
         ("postgres_delete", json!({"name":"db1"})),
     ] {
         let result = r.call(verb, args);
+        if verb == "postgres_create" && result.is_ok() {
+            password = Some(fs::read_to_string(dir.join("secrets/postgres-db1/password")).unwrap());
+            for path in ["secrets", "secrets/postgres-db1"] {
+                assert_eq!(
+                    fs::metadata(dir.join(path)).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            assert_eq!(
+                fs::metadata(dir.join("secrets/postgres-db1/password"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        if verb == "postgres_link" && result.is_ok() {
+            assert_eq!(
+                fs::metadata(dir.join("secrets/consumer-consumer-a"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(dir.join("secrets/consumer-consumer-a/db1-url"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         match &result {
             Ok(v) => transcript.push_str(&v.to_string()),
             Err(e) => transcript.push_str(&format!("{e:?}")),
         }
         transcript.push_str(&format!("{result:?}"));
     }
-    let password = fs::read_to_string(dir.join("secrets/postgres-db1/password")).unwrap();
+    let password = password.unwrap();
     assert_eq!(password.len(), 64);
     assert!(password.bytes().all(|b| b.is_ascii_hexdigit()));
-    for p in [
-        "secrets",
-        "secrets/postgres-db1",
-        "secrets/consumer-consumer-a",
-    ] {
-        assert_eq!(
-            fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-    }
-    for p in [
-        "secrets/postgres-db1/password",
-        "secrets/consumer-consumer-a/db1-url",
-    ] {
-        assert_eq!(
-            fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
+    // Private test evidence survives the cleanup so the parent can scan captured output.
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut evidence = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dir.join("scan-password"))
+        .unwrap();
+    evidence.write_all(password.as_bytes()).unwrap();
     transcript.push_str(&fs::read_to_string(dir.join("journal.jsonl")).unwrap());
     transcript.push_str(&fs::read_to_string(dir.join("desired.json")).unwrap());
     transcript.push_str(&format!("{:?} {:?}", r.fake.requests(), r.fake.writes()));
@@ -477,7 +504,7 @@ fn password_free_results_errors_journal_desired_and_captured_stderr() {
         .env("ARCA_PASSWORD_SCAN_DIR", &dir)
         .output()
         .unwrap();
-    let password = fs::read(dir.join("secrets/postgres-db1/password")).unwrap();
+    let password = fs::read(dir.join("scan-password")).unwrap();
     for bytes in [
         &output.stdout,
         &output.stderr,
@@ -635,4 +662,287 @@ fn root_disks_use_default_profile_pool_and_missing_pool_refuses_create() {
     for bad in ["", "../pool", "pool/name", "pool name"] {
         assert!(!arca_postgres::pool_ok(bad));
     }
+}
+
+#[test]
+fn create_proposal_failure_cleans_password_and_retry_replaces_a_stale_file() {
+    let r = Rig::new(scratch(), false);
+    let fault = r.dir.join("desired.json.tmp");
+    fs::create_dir(&fault).unwrap();
+    let result = r.call(
+        "postgres_create",
+        json!({"name":"db1","image":format!("example/db@sha256:{}","b".repeat(64))}),
+    );
+    assert!(matches!(result, Err(CallError::Internal(_))));
+    let path = r.dir.join("secrets/postgres-db1/password");
+    assert!(
+        path.parent().unwrap().is_dir(),
+        "secret creation preceded the refused proposal"
+    );
+    assert!(!path.exists());
+    assert!(
+        !r.kernel
+            .lock()
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|e| e.id.0 == "postgres-db1")
+    );
+    fs::remove_dir(fault).unwrap();
+    fs::write(&path, "stale-password").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(r.create("db1")["status"], "pending");
+    assert!(fs::read_to_string(&path).unwrap() != "stale-password");
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(r.get("/1.0/instances/db1?project=arcak-svc")["name"], "db1");
+}
+
+#[test]
+fn partial_create_delete_settles_and_removes_password_url_and_consumer_link() {
+    let r = Rig::new(scratch(), true);
+    r.fake.set_reject_config_on_post("/1.0/instances");
+    r.create("db1");
+    assert!(
+        UnixIncus::new(r.fake.socket().into())
+            .get("/1.0/instances/db1?project=arcak-svc")
+            .is_err()
+    );
+    r.call(
+        "postgres_link",
+        json!({"name":"db1","consumer":"consumer-a"}),
+    )
+    .unwrap();
+    assert!(r.dir.join("secrets/consumer-consumer-a/db1-url").exists());
+    let deleted = r.call("postgres_delete", json!({"name":"db1"})).unwrap();
+    assert_eq!(deleted, json!({"removed":true,"plan":null}));
+    assert!(!r.dir.join("secrets/postgres-db1").exists());
+    assert!(!r.dir.join("secrets/consumer-consumer-a/db1-url").exists());
+    let entries = r.kernel.lock().unwrap().entries().to_vec();
+    assert_eq!(
+        entries
+            .iter()
+            .find(|e| e.id.0 == "consumer-consumer-a")
+            .unwrap()
+            .config["links"],
+        json!([])
+    );
+    assert!(!entries.iter().any(|e| e.id.0 == "postgres-db1"));
+    assert!(r.kernel.lock().unwrap().pending_plans().is_empty());
+    assert!(
+        UnixIncus::new(r.fake.socket().into())
+            .get("/1.0/network-acls/postgres-db1?project=default")
+            .is_err()
+    );
+}
+
+#[test]
+fn live_delete_cleans_all_consumer_links_and_secrets_in_one_document() {
+    let r = Rig::new(scratch(), true);
+    r.create("db1");
+    let other = arca::handlers::service_entry(
+        "consumer-consumer-b",
+        "arca.consumer",
+        json!({"name":"consumer-b","image":"a".repeat(64),"pool":"pool1","project":PROJECT,"bridge":BRIDGE,"links":[]}),
+    );
+    r.kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Put(other)], NOW)
+        .unwrap();
+    for consumer in ["consumer-a", "consumer-b"] {
+        r.call("postgres_link", json!({"name":"db1","consumer":consumer}))
+            .unwrap();
+    }
+    let before: Value =
+        serde_json::from_slice(&fs::read(r.dir.join("desired.json")).unwrap()).unwrap();
+    let deleted = r.call("postgres_delete", json!({"name":"db1"})).unwrap();
+    assert_eq!(deleted["removed"], false);
+    assert_eq!(deleted["plan"]["entry"], "postgres-db1");
+    assert!(deleted["plan"]["statement"].is_string());
+    let after: Value =
+        serde_json::from_slice(&fs::read(r.dir.join("desired.json")).unwrap()).unwrap();
+    assert_eq!(
+        after["current"]["document"]["seq"].as_u64().unwrap(),
+        before["current"]["document"]["seq"].as_u64().unwrap() + 1
+    );
+    assert!(!r.dir.join("secrets/postgres-db1").exists());
+    let kernel = r.kernel.lock().unwrap();
+    for consumer in ["consumer-a", "consumer-b"] {
+        let id = format!("consumer-{consumer}");
+        assert_eq!(
+            kernel
+                .entries()
+                .iter()
+                .find(|e| e.id.0 == id)
+                .unwrap()
+                .config["links"],
+            json!([])
+        );
+        assert!(!r.dir.join("secrets").join(id).join("db1-url").exists());
+        assert!(
+            r.get(&format!("/1.0/instances/{consumer}?project=arcak-svc"))["config"]
+                .get("environment.DATABASE_URL")
+                .is_none()
+        );
+    }
+    drop(kernel);
+    assert_eq!(r.get("/1.0/instances/db1?project=arcak-svc")["name"], "db1");
+}
+
+#[test]
+fn recreate_with_new_password_replaces_a_stale_consumer_url() {
+    let r = Rig::new(scratch(), true);
+    r.fake.set_reject_config_on_post("/1.0/instances");
+    r.create("db1");
+    r.call(
+        "postgres_link",
+        json!({"name":"db1","consumer":"consumer-a"}),
+    )
+    .unwrap();
+    let path = r.dir.join("secrets/consumer-consumer-a/db1-url");
+    let old_url = fs::read_to_string(&path).unwrap();
+    let old_password = fs::read_to_string(r.dir.join("secrets/postgres-db1/password")).unwrap();
+    assert_eq!(
+        r.call("postgres_delete", json!({"name":"db1"})).unwrap()["removed"],
+        true
+    );
+    r.create("db1");
+    let password = fs::read_to_string(r.dir.join("secrets/postgres-db1/password")).unwrap();
+    assert!(old_password != password);
+    fs::write(&path, old_url).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    r.call(
+        "postgres_link",
+        json!({"name":"db1","consumer":"consumer-a"}),
+    )
+    .unwrap();
+    assert!(
+        fs::read_to_string(&path).unwrap()
+            == format!("postgresql://postgres:{password}@db1:5432/postgres")
+    );
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn link_proposal_failure_restores_previous_url_or_removes_new_url() {
+    let r = Rig::new(scratch(), true);
+    r.create("db1");
+    r.call(
+        "postgres_link",
+        json!({"name":"db1","consumer":"consumer-a"}),
+    )
+    .unwrap();
+    let path = r.dir.join("secrets/consumer-consumer-a/db1-url");
+    fs::write(&path, "previous-url").unwrap();
+    let fault = r.dir.join("desired.json.tmp");
+    fs::create_dir(&fault).unwrap();
+    assert!(
+        r.call(
+            "postgres_link",
+            json!({"name":"db1","consumer":"consumer-a"})
+        )
+        .is_err()
+    );
+    assert!(fs::read_to_string(&path).unwrap() == "previous-url");
+    fs::remove_dir(&fault).unwrap();
+    r.call(
+        "postgres_link",
+        json!({"name":"db1","consumer":"consumer-a"}),
+    )
+    .unwrap();
+    r.call(
+        "postgres_unlink",
+        json!({"name":"db1","consumer":"consumer-a"}),
+    )
+    .unwrap();
+    assert!(!path.exists());
+    fs::create_dir(&fault).unwrap();
+    assert!(
+        r.call(
+            "postgres_link",
+            json!({"name":"db1","consumer":"consumer-a"})
+        )
+        .is_err()
+    );
+    assert!(!path.exists());
+    fs::remove_dir(fault).unwrap();
+}
+
+#[test]
+fn postgres_list_releases_kernel_lock_while_instance_state_get_is_stalled() {
+    use std::{
+        io::Read,
+        net::Shutdown,
+        os::unix::net::UnixListener,
+        thread,
+        time::{Duration, Instant},
+    };
+    let r = Rig::new(scratch(), false);
+    r.create("db1");
+    let path = r.dir.join("stalled.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut cfg = r.cfg.clone();
+    cfg.incus.socket = path;
+    let handler = postgres_handlers(r.kernel.clone(), Arc::new(|| NOW), Arc::new(cfg))
+        .into_iter()
+        .find(|(name, _)| *name == "postgres_list")
+        .unwrap()
+        .1;
+    let call = thread::spawn(move || {
+        handler.call(
+            json!({}),
+            &Caller {
+                token_id: "viewer".into(),
+                scope: Scope::Viewer,
+            },
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) => panic!("state GET did not connect: {error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut request = [0u8; 1024];
+    assert!(stream.read(&mut request).unwrap() > 0);
+    let stalled = !call.is_finished();
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let available = loop {
+        if r.kernel.try_lock().is_ok() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    stream.shutdown(Shutdown::Both).unwrap();
+    drop(stream);
+    drop(listener);
+    let result = call.join().unwrap();
+    assert!(
+        stalled,
+        "GET must still be waiting for the unanswered response"
+    );
+    assert!(
+        available,
+        "an unanswered state GET must not hold the kernel mutex"
+    );
+    assert!(matches!(result, Err(CallError::Internal(_))));
 }

@@ -670,5 +670,8 @@ fn postgres_delete_params() -> Value {
     params(vec![("name", true, string_max(31))])
 }
 fn postgres_delete_result() -> Value {
-    result(vec![("plan", true, plan())])
+    result(vec![
+        ("plan", true, nullable(plan())),
+        ("removed", true, boolean()),
+    ])
 }

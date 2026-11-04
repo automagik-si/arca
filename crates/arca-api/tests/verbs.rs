@@ -698,3 +698,16 @@ fn viewer_cannot_call_postgres_write_verbs() {
         assert!(may_call(Scope::Doctor, verb));
     }
 }
+
+#[test]
+fn postgres_delete_accepts_a_waiting_plan_or_a_settled_removal() {
+    let schema = (verb("postgres_delete").unwrap().result)();
+    assert_eq!(schema["required"], json!(["plan", "removed"]));
+    assert_eq!(
+        schema["properties"]["plan"]["type"],
+        json!(["object", "null"])
+    );
+    assert!(conforms(&schema, &json!({"plan":null,"removed":true})).is_ok());
+    assert!(conforms(&schema, &json!({"plan":null})).is_err());
+    assert!(conforms(&schema, &json!({"plan":null,"removed":"true"})).is_err());
+}

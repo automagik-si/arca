@@ -1638,11 +1638,18 @@
                 "paramsDigest",
                 "statement"
               ],
-              "type": "object"
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "removed": {
+              "type": "boolean"
             }
           },
           "required": [
-            "plan"
+            "plan",
+            "removed"
           ],
           "type": "object"
         }
