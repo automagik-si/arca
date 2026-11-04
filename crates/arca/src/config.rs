@@ -38,6 +38,9 @@ pub struct NodeConfig {
     /// The host name every owner approval statement names. When it is not set, the system's host name is used.
     #[serde(default)]
     pub approval_host: Option<String>,
+    /// The node link endpoint and opaque ALPN routes.
+    #[serde(default)]
+    pub link: Option<arca_link::Config>,
 }
 
 /// Where Incus listens, and which storage pools the sampler reports. The pools come from Incus's own pool list. `pools` is an
@@ -118,6 +121,8 @@ pub enum ConfigError {
     ApprovalHost,
     /// Kernel projects are named, and no droidd project is listed to exclude.
     DroiddProjectsEmpty,
+    /// The link config contains an invalid name or route.
+    Link(String),
     /// The adoption allowlist or its attach networks break a rule. The text names the rule, never a value.
     Adopt(&'static str),
 }
@@ -141,6 +146,7 @@ impl fmt::Display for ConfigError {
                 f,
                 "kernel.droiddProjects must list droidd's projects when kernel.projects is not empty"
             ),
+            Self::Link(why) => f.write_str(why),
             Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
             Self::ApprovalHost => write!(
                 f,
@@ -166,6 +172,9 @@ pub fn load(path: &Path) -> Result<NodeConfig, ConfigError> {
 
 /// The rules a parsed config must meet.
 pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
+    if let Some(link) = &config.link {
+        link.check().map_err(|e| ConfigError::Link(e.to_string()))?;
+    }
     if let Some(addr) = config.listen.tailnet {
         tailnet_addr_ok(&addr).map_err(ConfigError::TailnetAddr)?;
     }
@@ -297,6 +306,30 @@ mod tests {
             value["approvalHost"] = serde_json::json!(host);
         }
         serde_json::from_value(value).expect("the fixture config parses")
+    }
+
+    #[test]
+    fn invalid_link_names_are_refused_before_commands_run() {
+        let mut config = config_with(None);
+        for name in [
+            String::new(),
+            "x\n".to_string(),
+            "\u{0000}\u{001f}".to_string(),
+            "x".repeat(61),
+        ] {
+            config.link = Some(arca_link::Config {
+                name: Some(name),
+                ..Default::default()
+            });
+            let error = check(&config).unwrap_err();
+            assert!(matches!(error, ConfigError::Link(_)));
+            assert!(error.to_string().starts_with("link.name must contain"));
+        }
+        config.link = Some(arca_link::Config {
+            name: Some("λ".repeat(60)),
+            ..Default::default()
+        });
+        assert_eq!(check(&config), Ok(()));
     }
 
     #[test]
