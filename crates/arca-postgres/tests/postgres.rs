@@ -22,13 +22,25 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicU64, Ordering},
     },
 };
 const NOW: u64 = 1_793_361_600_000;
 static SEQ: AtomicU64 = AtomicU64::new(0);
+/// A store is open in some test while this is read-locked. The password-scan test takes the write
+/// side while it spawns and waits for its child, so no sibling store is open in that window and
+/// the child cannot race a sibling test's desired.lock.
+static STORES: RwLock<()> = RwLock::new(());
+fn store_guard() -> RwLockReadGuard<'static, ()> {
+    STORES.read().unwrap_or_else(PoisonError::into_inner)
+}
+fn spawn_guard() -> RwLockWriteGuard<'static, ()> {
+    STORES.write().unwrap_or_else(PoisonError::into_inner)
+}
 struct Rig {
+    /// Held for the Rig's lifetime: the store is open while the guard lives.
+    _store: RwLockReadGuard<'static, ()>,
     dir: PathBuf,
     fake: FakeIncus,
     kernel: Arc<Mutex<Kernel>>,
@@ -47,6 +59,7 @@ fn scratch() -> PathBuf {
 }
 impl Rig {
     fn new(dir: PathBuf, running: bool) -> Self {
+        let store = store_guard();
         let consumer = json!({"name":"consumer-a","project":PROJECT,"status":"Running","config":{"user.arcakernel.entry":"consumer-consumer-a","environment.UNRELATED":"keep"},"devices":{"eth0":{"type":"nic","name":"eth0","network":BRIDGE,"ipv4.address":"192.0.2.10"}}});
         let fake = FakeIncus::start(
             &dir,
@@ -123,6 +136,7 @@ impl Rig {
             .into_iter()
             .collect();
         Self {
+            _store: store,
             dir,
             fake,
             kernel,
@@ -498,6 +512,7 @@ fn password_flow_child() {
 }
 #[test]
 fn password_free_results_errors_journal_desired_and_captured_stderr() {
+    let _spawn = spawn_guard();
     let dir = scratch();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "password_flow_child", "--nocapture"])
@@ -542,6 +557,7 @@ fn missing_consumer_address_never_broadens_the_acl() {
 }
 #[test]
 fn probe_add_and_remove_use_default_profile_pool_and_refuse_missing_configuration() {
+    let _store = store_guard();
     let dir = scratch();
     let path = dir.join("config.json");
     let mut cfg = json!({"stateDir":dir,"incus":{"socket":dir.join("absent.sock")},"listen":{"unix":dir.join("arca.sock")},"tokens":{"hashDir":dir.join("tokens")},"kernel":{"projects":[PROJECT],"droiddProjects":["other"]}});
