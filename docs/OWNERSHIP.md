@@ -136,14 +136,16 @@ Source: `UnixIncusWriter::{wait_for, wait_on}` and `IncusError::Status` in `crat
 `the_operation_wait_follows_running_and_accepts_only_status_200_success`, `a_sync_answer_is_done_at_once_and_an_async_one_is_waited_on`,
 `an_answer_with_an_empty_or_absent_operation_is_done_without_a_wait` and `a_failed_operation_is_a_status_error_and_the_object_stays`.
 
-**Rule 15.** The writer sends only POST, PATCH, PUT and DELETE. A POST creates, a PATCH sets or removes config keys of any kind
+**Rule 15.** The writer changes objects only with POST, PATCH, PUT and DELETE; every other request it sends is a GET, for a
+read-back or the instance state read before a stop. A POST creates, a PATCH sets or removes config keys of any kind
 but a project, or replaces one ACL ingress or egress array (Rule 47), and a DELETE removes. A PUT sends a project's config change
 or tombstone as its whole config with the change applied, under the ETag of the read the change was checked against (Rule 43).
 A PUT also force-stops a running instance through its state endpoint before DELETE (Rule 18). No other object is written
 wholesale, and no PATCH is sent to a project.
 Source: the methods passed to `mutate` in `crates/arca-incus/src/write.rs` (`POST` in `create`, `PATCH` and `PUT` in
-`send_config`, which `patch` and `tombstone` call, `PUT` in `delete`, `DELETE` in `delete` and `clear_images`); `UnixIncus` in
-`crates/arca-incus/src/read.rs` sends only GET; the round-trip test `each_kind_round_trips_through_create_patch_tombstone_and_delete`,
+`send_config`, which `patch` and `tombstone` call, `PUT` in `delete`, `DELETE` in `delete` and `clear_images`, and `GET` in
+`delete`'s state read), the `send("GET", ...)` read-backs in `write.rs`, and `UnixIncus` in
+`crates/arca-incus/src/read.rs`, which sends only GET; the round-trip test `each_kind_round_trips_through_create_patch_tombstone_and_delete`,
 which allows a PUT only for a project or an instance's stop and asserts that a PATCH never reaches a project.
 
 **Rule 16.** A removed config key is sent as the empty string in a PATCH. The fake reads an empty value as unset. A project's PUT
