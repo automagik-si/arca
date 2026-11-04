@@ -9,8 +9,8 @@
 //! the entry's own, its source is an image (a local one, or one on the one pinned image server), and its name is free. A retiring
 //! project's DELETE is preceded by the DELETE of each image in its own store, which is the project's by containment.
 //!
-//! Writes are POST, PATCH, PUT and DELETE. A PATCH carries only the config keys it changes, and it is sent to every kind but a
-//! project. A project's config change and its tombstone are a PUT of the project's whole config, with the change applied, and of
+//! Writes are POST, PATCH, PUT and DELETE. A PATCH carries only the config keys it changes, or one ACL ingress or egress
+//! array, and it is sent to every kind but a project. A project's config change and its tombstone are a PUT of the project's whole config, with the change applied, and of
 //! the description, both as the read showed them: Incus 7.3's project PATCH replaces the whole config with the keys it names
 //! (`projectPatch` in `cmd/incusd/api_project.go` copies the old keys into the raw request map, not into the request it applies),
 //! so a PATCH of one key would drop the kernel's mark, `restricted` and every feature. Nothing else is sent as a PUT, and nothing
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
+use arca_kernel::journal::AclField;
 use arca_kernel::ownership::{
     IncusKind, KERNEL_RETIRING_KEY, ObjectRef, OwnerClass, classify, kernel_may_write,
 };
@@ -74,8 +75,10 @@ pub fn network_home(kind: IncusKind) -> bool {
 /// An object the writer read and classed as its entry's own. Its fields are private, and only [`UnixIncusWriter`] makes one,
 /// so holding one is proof that the classifier allowed the entry to change the object at that read. Its `etag` is the one
 /// the read returned, and a PATCH sends it as `If-Match`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Owned {
+    ingress: Option<Vec<Value>>,
+    egress: Option<Vec<Value>>,
     entry: EntryId,
     target: Target,
     etag: String,
@@ -86,7 +89,25 @@ pub struct Owned {
     description: String,
 }
 
+// Config and rule values can contain secrets and must never appear in diagnostics.
+impl std::fmt::Debug for Owned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Owned")
+            .field("entry", &self.entry)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Owned {
+    /// The rule array from the same ETag-bearing read as the ownership config.
+    pub fn acl_rules(&self, field: AclField) -> Option<&Vec<Value>> {
+        match field {
+            AclField::Ingress => self.ingress.as_ref(),
+            AclField::Egress => self.egress.as_ref(),
+        }
+    }
+
     /// The entry that owns the object.
     pub fn entry(&self) -> &EntryId {
         &self.entry
@@ -119,7 +140,7 @@ impl Owned {
 }
 
 /// What a read of an object shows of its owner. See [`UnixIncusWriter::read_class`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Reading {
     /// The class the object's own config gives.
     pub class: OwnerClass,
@@ -129,6 +150,15 @@ pub struct Reading {
     pub uuid: Option<String>,
     /// The object's own config, as read. It may hold values, so it is never printed or journalled.
     pub config: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for Reading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reading")
+            .field("class", &self.class)
+            .field("uuid", &self.uuid)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The projects the kernel may write in: the names its configuration lists, and nothing else.
@@ -237,7 +267,7 @@ impl UnixIncusWriter {
         let (metadata, etag) = self.fetch(target)?;
         let config = own_config(&metadata)?;
         let description = own_description(&metadata)?;
-        self.classed(target, etag, config, description)
+        self.classed(target, etag, config, description, metadata)
             .map_err(|unread| refused(&unread.reason))
     }
 
@@ -334,6 +364,39 @@ impl UnixIncusWriter {
                 Err("the read-back lost a key the whole config sent".to_string())
             } else {
                 Ok(())
+            }
+        })
+    }
+
+    /// Replaces one ACL ingress or egress array under the ownership read's ETag.
+    pub fn patch_acl_field(
+        &self,
+        owned: &Owned,
+        field: AclField,
+        rules: &[Value],
+    ) -> Result<Owned, IncusError> {
+        self.check(owned)?;
+        if owned.target.kind != IncusKind::Acl
+            || owned.tombstone.is_some()
+            || !rules.iter().all(Value::is_object)
+            || owned.acl_rules(field).is_none()
+        {
+            return Err(refused(
+                "an ACL patch requires a non-retiring ACL and an array of rule objects",
+            ));
+        }
+        let body = json!({field.as_str(): rules});
+        self.mutate(
+            "PATCH",
+            &urls(&owned.target)?.object,
+            Some(&owned.etag),
+            Some(&body),
+        )?;
+        self.confirm(&owned.target, |fresh| {
+            if fresh.acl_rules(field).map(Vec::as_slice) == Some(rules) {
+                Ok(())
+            } else {
+                Err("the read-back does not show the ACL array".into())
             }
         })
     }
@@ -503,6 +566,7 @@ impl UnixIncusWriter {
         etag: String,
         config: BTreeMap<String, String>,
         description: String,
+        metadata: Value,
     ) -> Result<Owned, Unread> {
         let class = classify(&config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
@@ -519,6 +583,12 @@ impl UnixIncusWriter {
             });
         }
         Ok(Owned {
+            ingress: (target.kind == IncusKind::Acl)
+                .then(|| metadata.get("ingress").and_then(Value::as_array).cloned())
+                .flatten(),
+            egress: (target.kind == IncusKind::Acl)
+                .then(|| metadata.get("egress").and_then(Value::as_array).cloned())
+                .flatten(),
             entry: self.entry.clone(),
             target: target.clone(),
             etag,
@@ -554,7 +624,7 @@ impl UnixIncusWriter {
             .map_err(|error| landed(None, None, format!("the read-back failed: {error}")))?;
         let uuid = uuid_of(target.kind, &config);
         let owned = self
-            .classed(target, etag, config, description)
+            .classed(target, etag, config, description, metadata)
             .map_err(|unread| landed(uuid.clone(), unread.owner, unread.reason))?;
         expect(&owned).map_err(|reason| {
             landed(
@@ -883,12 +953,16 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     }
 }
 
-/// A key the writer sends: plain ASCII `[a-z0-9_.-]`, and not empty. Incus's decoder matches a key to a field whatever its case,
+/// A key the writer sends: `[a-z0-9_.-]`, plus uppercase ASCII after a leading `environment.`. Incus's decoder matches a key to a field whatever its case,
 /// and folds some Unicode letters onto ASCII ones, so a key outside this set can reach a field the checks did not read.
 fn plain_key(key: &str) -> bool {
+    let environment = key.starts_with("environment.");
     !key.is_empty()
         && key.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'.' | b'-')
+                || (environment && b.is_ascii_uppercase())
         })
 }
 

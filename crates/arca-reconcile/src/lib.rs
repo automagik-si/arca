@@ -143,6 +143,24 @@ struct Gate<'a, S: JournalStore> {
 }
 
 impl<S: JournalStore> JournalSink for Gate<'_, S> {
+    fn intend_acl(
+        &mut self,
+        fields: IntentFields<'_>,
+        patch: arca_kernel::journal::AclPatch,
+    ) -> Result<u64, KernelError> {
+        if let Some(error) = self.journal.poisoned() {
+            return Err(error.clone());
+        }
+        let unresolved = self.journal.unresolved();
+        if !unresolved.is_empty() {
+            return Err(KernelError::Unresolved {
+                ids: unresolved.iter().map(|r| r.id).collect(),
+            });
+        }
+        self.journal
+            .intend_acl_by(Some(&self.plugin), fields, patch)
+    }
+
     fn intend(
         &mut self,
         entry: &EntryId,
@@ -648,26 +666,34 @@ impl<S: JournalStore> Reconciler<S> {
                     Err(error) => Err(error.to_string()),
                 }
             }
-            Some(Inverse::IncusRestoreConfig { object, config }) => {
-                self.restore(record, object, config, now_ms)
-            }
+            Some(Inverse::IncusRestoreConfig { object, config }) => self.restore(
+                record,
+                EffectOp::IncusPatchConfig {
+                    object: object.clone(),
+                    config: config.clone(),
+                },
+                now_ms,
+            ),
+            Some(Inverse::IncusRestoreAclField {
+                object,
+                field,
+                rules,
+            }) => self.restore(
+                record,
+                EffectOp::IncusPatchAclField {
+                    object: object.clone(),
+                    field: *field,
+                    rules: rules.clone(),
+                },
+                now_ms,
+            ),
             _ => Err("removal does not run this undo".to_string()),
         }
     }
 
     /// Restores a patched object's keys through the plugin's own manifest, then settles the restore and the record it undoes.
-    fn restore(
-        &mut self,
-        record: &EffectRecord,
-        object: &ObjectRef,
-        config: &BTreeMap<String, Option<String>>,
-        now_ms: u64,
-    ) -> Result<(), String> {
+    fn restore(&mut self, record: &EffectRecord, op: EffectOp, now_ms: u64) -> Result<(), String> {
         let manifest = self.manifest_of(&record.entry)?;
-        let op = EffectOp::IncusPatchConfig {
-            object: object.clone(),
-            config: config.clone(),
-        };
         let digest = op_digest(&op);
         {
             let mut gate = Gate {

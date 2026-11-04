@@ -1,6 +1,6 @@
 //! The kernel's Incus write provider. It is the only code path in the kernel that writes to Incus. It sends only the writer's
 //! checked requests: a POST for a create, a config change under an `If-Match` (a PATCH, or for a project a PUT of its whole
-//! config), and the tombstone-then-DELETE sequence for a retirement. Each effect is planned read-only first. `plan` refuses
+//! config), one ACL rule array under `If-Match`, and the tombstone-then-DELETE sequence for a retirement. Each effect is planned read-only first. `plan` refuses
 //! before anything is journalled, and `effect` checks the family, the features, the ownership and the plan again before it
 //! applies anything. `docs/OWNERSHIP.md` states the rules.
 //!
@@ -32,7 +32,7 @@ use arca_incus::{
 };
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
-use arca_kernel::journal::{EffectClass, Inverse};
+use arca_kernel::journal::{AclPatch, EffectClass, Inverse};
 use arca_kernel::ownership::{
     IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify, kernel_may_write,
 };
@@ -55,6 +55,7 @@ pub const DROIDD_PROJECTS_FIXED: [&str; 2] = ["bench", "default"];
 const SCRATCH_PREFIX: &str = "arcak-scratch-";
 /// The prefix of a config value that names a secret file rather than being the value itself.
 pub const SECRET_PREFIX: &str = "arca-secret:";
+const FOREIGN_SECRET_MARKER: &str = "<redacted: another entry's secret>";
 /// The largest secret file the provider reads, in bytes.
 const SECRET_MAX_BYTES: u64 = 64 * 1024;
 /// How deep the provider looks for secret files under its directory.
@@ -499,7 +500,7 @@ impl IncusProvider {
         }
         let mut resolved = Map::new();
         for (key, value) in &text {
-            resolved.insert(key.clone(), Value::String(self.resolve_text(value)?));
+            resolved.insert(key.clone(), Value::String(self.resolve_text(entry, value)?));
         }
         let mut sent = fields.clone();
         sent.insert("config".to_string(), Value::Object(resolved));
@@ -561,6 +562,7 @@ impl IncusProvider {
         let class = class_of(object.kind);
         let Some(changes) = changes else {
             return Ok(Planned {
+                acl_patch: None,
                 class,
                 op_digest: digest,
                 pre_image: None,
@@ -568,9 +570,10 @@ impl IncusProvider {
             });
         };
         self.check_change(entry, object, changes, &reading.config)?;
-        self.resolve_changes(changes)?;
-        let pre_image = self.pre_image_of(changes, &reading.config)?;
+        self.resolve_changes(entry, changes)?;
+        let pre_image = self.pre_image_of(entry, changes, &reading.config)?;
         Ok(Planned {
+            acl_patch: None,
             class,
             op_digest: digest,
             pre_image: Some(pre_image),
@@ -583,12 +586,14 @@ impl IncusProvider {
     /// A key the patch sets to a secret reference, and whose value is no current secret, is journalled as `None`: a redacted
     /// marker whose inverse removes the key. A key the object does not hold is `None`. A value that starts with the reference
     /// prefix and matches no current secret is refused, since an inverse that restored it would read it as a reference.
+    /// Another entry's secret matches no usable current secret and follows the same rules as any other unmatched value.
     fn pre_image_of(
         &self,
+        entry: &EntryId,
         changes: &BTreeMap<String, Option<String>>,
         current: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
-        let secrets = self.secrets_by_value();
+        let secrets = self.secrets_by_value(entry);
         let mut pre_image = BTreeMap::new();
         for (key, new) in changes {
             let value = match current.get(key) {
@@ -611,9 +616,9 @@ impl IncusProvider {
     }
 
     /// Resolves one config value: a secret reference becomes the file's content, and any other text passes through.
-    fn resolve_text(&self, text: &str) -> Result<String, EffectRefusal> {
+    fn resolve_text(&self, entry: &EntryId, text: &str) -> Result<String, EffectRefusal> {
         if text.starts_with(SECRET_PREFIX) {
-            self.read_secret(text)
+            self.read_secret(entry, text)
         } else {
             Ok(text.to_string())
         }
@@ -622,13 +627,14 @@ impl IncusProvider {
     /// Resolves the secret references in a change. A removed key stays removed.
     fn resolve_changes(
         &self,
+        entry: &EntryId,
         changes: &BTreeMap<String, Option<String>>,
     ) -> Result<BTreeMap<String, Option<String>>, EffectRefusal> {
         let mut resolved = BTreeMap::new();
         for (key, value) in changes {
             let value = value
                 .as_deref()
-                .map(|text| self.resolve_text(text))
+                .map(|text| self.resolve_text(entry, text))
                 .transpose()?;
             resolved.insert(key.clone(), value);
         }
@@ -650,7 +656,23 @@ impl IncusProvider {
     /// and so must each directory on the way: a real directory, owned by this process, with no group or other bits. The file must
     /// be a regular file, mode 0600, owned by this process, and small. A reference that fails any rule is refused with a fixed
     /// reason, and the value is never read into an error.
-    fn read_secret(&self, reference: &str) -> Result<String, EffectRefusal> {
+    fn read_secret(&self, entry: &EntryId, reference: &str) -> Result<String, EffectRefusal> {
+        let name = reference
+            .strip_prefix(SECRET_PREFIX)
+            .filter(|name| valid_secret_name(name))
+            .ok_or_else(|| {
+                EffectRefusal::Provider("a secret reference names no valid secret".to_string())
+            })?;
+        if !may_use_secret(entry, name) {
+            return Err(EffectRefusal::Provider(
+                "a secret reference names another entry's secret".to_string(),
+            ));
+        }
+        self.read_secret_file(reference)
+    }
+
+    /// Reads a usable secret file without an entry check, including during the directory walk.
+    fn read_secret_file(&self, reference: &str) -> Result<String, EffectRefusal> {
         let name = reference
             .strip_prefix(SECRET_PREFIX)
             .filter(|name| valid_secret_name(name))
@@ -705,13 +727,23 @@ impl IncusProvider {
         Err(unavailable())
     }
 
-    /// Every usable secret under the directory, as (reference, content). Used to name a value a journal must not hold by its
-    /// reference. A file that is not usable is skipped, since it cannot be a reference a value came from.
-    fn secrets_by_value(&self) -> Vec<(String, String)> {
+    /// Shared and own usable secrets, as (reference, content). Unusable files are skipped.
+    fn secrets_by_value(&self, entry: &EntryId) -> Vec<(String, String)> {
         let mut found = Vec::new();
         if self.secrets_root_private() {
             self.collect_secrets(&self.secrets_dir, "", 0, &mut found);
         }
+        found.retain(|(reference, _)| may_use_secret(entry, &reference[SECRET_PREFIX.len()..]));
+        found
+    }
+
+    /// Usable secrets owned by another entry, as (reference, content).
+    fn foreign_secrets_by_value(&self, entry: &EntryId) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        if self.secrets_root_private() {
+            self.collect_secrets(&self.secrets_dir, "", 0, &mut found);
+        }
+        found.retain(|(reference, _)| !may_use_secret(entry, &reference[SECRET_PREFIX.len()..]));
         found
     }
 
@@ -748,7 +780,7 @@ impl IncusProvider {
             } else if meta.is_file() && valid_secret_name(&name) {
                 let reference = format!("{SECRET_PREFIX}{name}");
                 if let Some(content) = self
-                    .read_secret(&reference)
+                    .read_secret_file(&reference)
                     .ok()
                     .filter(|content| !content.is_empty())
                 {
@@ -761,12 +793,13 @@ impl IncusProvider {
     /// Whether the config holds every pre-image value, with a reference resolved to the file it names.
     fn shows_pre_image(
         &self,
+        entry: &EntryId,
         config: &BTreeMap<String, String>,
         pre_image: &BTreeMap<String, Option<String>>,
     ) -> bool {
         pre_image.iter().all(|(key, value)| {
             let expected = match value {
-                Some(text) => match self.resolve_text(text) {
+                Some(text) => match self.resolve_text(entry, text) {
                     Ok(content) => Some(content),
                     Err(_) => return false,
                 },
@@ -807,7 +840,7 @@ impl IncusProvider {
                 if shows(&reading.config, changes) {
                     return Ok(());
                 }
-                if self.shows_pre_image(&reading.config, pre_image) {
+                if self.shows_pre_image(entry, &reading.config, pre_image) {
                     return Err(EffectRefusal::Provider(
                         "the patch did not land".to_string(),
                     ));
@@ -921,11 +954,11 @@ impl IncusProvider {
 }
 
 impl Provider for IncusProvider {
-    /// Answers the host's own addresses. Any other read is refused: a plugin reads Incus through the watch provider, not here.
+    /// Answers host addresses, scoped instance reads, and this entry's own ACL reads.
     fn observe(
         &self,
-        _entry: &EntryId,
-        _projects: &[String],
+        entry: &EntryId,
+        projects: &[String],
         query: &Observe,
     ) -> Result<Value, EffectRefusal> {
         match query {
@@ -935,7 +968,44 @@ impl Provider for IncusProvider {
                     addresses.iter().map(|ip| json!(ip.to_string())).collect(),
                 ))
             }
-            Observe::IncusGet { .. } => Err(EffectRefusal::NotDeclared),
+            Observe::IncusGet { path } => {
+                let (route, query) = path.split_once('?').ok_or(EffectRefusal::NotDeclared)?;
+                let project = query
+                    .strip_prefix("project=")
+                    .filter(|p| plain_name(p))
+                    .ok_or(EffectRefusal::NotDeclared)?;
+                let parts: Vec<_> = route.split('/').collect();
+                let kind = match parts.as_slice() {
+                    ["", "1.0", "instances", name] if plain_name(name) => IncusKind::Instance,
+                    ["", "1.0", "instances", name, "state"] if plain_name(name) => {
+                        IncusKind::Instance
+                    }
+                    ["", "1.0", "network-acls", name] if plain_name(name) => IncusKind::Acl,
+                    _ => return Err(EffectRefusal::NotDeclared),
+                };
+                self.check_family(kind, project)?;
+                if kind == IncusKind::Instance && !projects.iter().any(|p| p == project) {
+                    return Err(EffectRefusal::ProjectNotAllowed);
+                }
+                let usable = self.secrets_by_value(entry);
+                let foreign = self.foreign_secrets_by_value(entry);
+                let mut value = self.reader.get(path).map_err(incus_refusal)?;
+                if kind == IncusKind::Acl {
+                    let config = value
+                        .get("config")
+                        .cloned()
+                        .ok_or(EffectRefusal::NotDeclared)?;
+                    let config: BTreeMap<String, String> =
+                        serde_json::from_value(config).map_err(|_| EffectRefusal::NotDeclared)?;
+                    let class = classify(&config, &self.retained.snapshot()?);
+                    if !kernel_may_write(&class, entry) {
+                        return Err(EffectRefusal::NotOwned(class));
+                    }
+                }
+                // Redact equal secret contents throughout the answer, including expanded_config.
+                redact_secret_values(&mut value, &usable, &foreign);
+                Ok(value)
+            }
         }
     }
 
@@ -954,6 +1024,7 @@ impl Provider for IncusProvider {
                 self.prepared_create(entry, *kind, project, parent.as_deref(), name, body)?;
                 self.check_features(entry, *kind, project)?;
                 Ok(Planned {
+                    acl_patch: None,
                     class: class_of(*kind),
                     op_digest: digest,
                     pre_image: None,
@@ -962,6 +1033,35 @@ impl Provider for IncusProvider {
             }
             EffectOp::IncusPatchConfig { object, config } => {
                 self.plan_for_object(entry, object, Some(config), digest)
+            }
+            EffectOp::IncusPatchAclField {
+                object,
+                field,
+                rules,
+            } => {
+                check_acl_patch(object, rules)?;
+                self.check_family(object.kind, &object.project)?;
+                let writer = self.writer(entry)?;
+                let owned = self.owned_for_write(entry, &writer, object)?;
+                if owned.tombstone().is_some() {
+                    return Err(EffectRefusal::NotDeclared);
+                }
+                let previous = owned
+                    .acl_rules(*field)
+                    .filter(|rules| rules.iter().all(Value::is_object))
+                    .ok_or(EffectRefusal::NotDeclared)?
+                    .clone();
+                Ok(Planned {
+                    class: EffectClass::A,
+                    op_digest: digest,
+                    pre_image: None,
+                    acl_patch: Some(AclPatch {
+                        field: *field,
+                        previous,
+                        rules: rules.clone(),
+                    }),
+                    etag: Some(owned.etag().into()),
+                })
             }
             EffectOp::IncusDelete { object, .. } => {
                 self.plan_for_object(entry, object, None, digest)
@@ -996,7 +1096,7 @@ impl Provider for IncusProvider {
                         "the plan names another class for this kind".to_string(),
                     ));
                 }
-                if planned.pre_image.is_some() {
+                if planned.pre_image.is_some() || planned.acl_patch.is_some() {
                     return Err(EffectRefusal::Provider(
                         "a create's plan carries no pre-image".to_string(),
                     ));
@@ -1025,6 +1125,9 @@ impl Provider for IncusProvider {
                 }
             }
             EffectOp::IncusPatchConfig { object, config } => {
+                if planned.acl_patch.is_some() {
+                    return Err(EffectRefusal::NotDeclared);
+                }
                 if planned.class != class_of(object.kind) {
                     return Err(EffectRefusal::Provider(
                         "the plan names another class for this kind".to_string(),
@@ -1044,12 +1147,12 @@ impl Provider for IncusProvider {
                     ));
                 };
                 // The pre-image is derived again from the object as it is now, and must be the plan's.
-                if self.pre_image_of(config, owned.config())? != pre_image {
+                if self.pre_image_of(entry, config, owned.config())? != pre_image {
                     return Err(EffectRefusal::Provider(
                         "the plan's pre-image is not the one the object holds".to_string(),
                     ));
                 }
-                let sent = self.resolve_changes(config)?;
+                let sent = self.resolve_changes(entry, config)?;
                 match writer.patch(&owned, &sent) {
                     Ok(_) => {}
                     Err(error) => {
@@ -1063,6 +1166,73 @@ impl Provider for IncusProvider {
                     Inverse::IncusRestoreConfig {
                         object: object.clone(),
                         config: pre_image,
+                    },
+                ))
+            }
+            EffectOp::IncusPatchAclField {
+                object,
+                field,
+                rules,
+            } => {
+                check_acl_patch(object, rules)?;
+                self.check_family(object.kind, &object.project)?;
+                let patch = planned
+                    .acl_patch
+                    .as_ref()
+                    .ok_or(EffectRefusal::NotDeclared)?;
+                if planned.class != EffectClass::A
+                    || planned.pre_image.is_some()
+                    || patch.field != *field
+                    || patch.rules != *rules
+                {
+                    return Err(EffectRefusal::NotDeclared);
+                }
+                let writer = self.writer(entry)?;
+                let owned = self.owned_for_write(entry, &writer, object)?;
+                if planned.etag.as_deref() != Some(owned.etag()) {
+                    return Err(EffectRefusal::Stale);
+                }
+                if owned.acl_rules(*field) != Some(&patch.previous)
+                    || !patch.previous.iter().all(Value::is_object)
+                {
+                    return Err(EffectRefusal::NotDeclared);
+                }
+                match writer.patch_acl_field(&owned, *field, rules) {
+                    Ok(_) => {}
+                    Err(IncusError::Status { code: 412, .. }) => return Err(EffectRefusal::Stale),
+                    Err(IncusError::Refused(reason)) => {
+                        return Err(EffectRefusal::Provider(reason));
+                    }
+                    Err(IncusError::Status { .. }) => {
+                        match self
+                            .read_back_acl(entry, object, patch)
+                            .map_err(|_| EffectRefusal::Unresolved)?
+                        {
+                            ReadBack::Present {
+                                owned: true,
+                                holds_pre_image: false,
+                                ..
+                            } => {}
+                            ReadBack::Present {
+                                owned: true,
+                                holds_pre_image: true,
+                                ..
+                            } => {
+                                return Err(EffectRefusal::Provider(
+                                    "the ACL array patch did not land".into(),
+                                ));
+                            }
+                            _ => return Err(EffectRefusal::Unresolved),
+                        }
+                    }
+                    Err(_) => return Err(EffectRefusal::Unresolved),
+                }
+                Ok((
+                    object.clone(),
+                    Inverse::IncusRestoreAclField {
+                        object: object.clone(),
+                        field: *field,
+                        rules: patch.previous.clone(),
                     },
                 ))
             }
@@ -1092,7 +1262,7 @@ impl Provider for IncusProvider {
             Err(error) => return Err(incus_refusal(error)),
         };
         let holds_pre_image =
-            pre_image.is_some_and(|pre| self.shows_pre_image(&reading.config, pre));
+            pre_image.is_some_and(|pre| self.shows_pre_image(entry, &reading.config, pre));
         Ok(ReadBack::Present {
             object: ObjectRef {
                 uuid: reading.uuid.clone(),
@@ -1100,6 +1270,37 @@ impl Provider for IncusProvider {
             },
             owned: kernel_may_write(&reading.class, entry),
             holds_pre_image,
+        })
+    }
+
+    fn read_back_acl(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+    ) -> Result<ReadBack, EffectRefusal> {
+        check_acl_patch(target, &patch.rules)?;
+        self.check_family(target.kind, &target.project)?;
+        self.settle_operations(target)?;
+        let writer = self.writer(entry)?;
+        let owned = match self.owned_for_write(entry, &writer, target) {
+            Ok(owned) => owned,
+            Err(EffectRefusal::Provider(_)) => match writer.read_class(target) {
+                Err(IncusError::Status { code: 404, .. }) => return Ok(ReadBack::Absent),
+                _ => return Err(EffectRefusal::Unresolved),
+            },
+            Err(error) => return Err(error),
+        };
+        let current = owned
+            .acl_rules(patch.field)
+            .ok_or(EffectRefusal::Unresolved)?;
+        if current != &patch.previous && current != &patch.rules {
+            return Err(EffectRefusal::Unresolved);
+        }
+        Ok(ReadBack::Present {
+            object: target.clone(),
+            owned: true,
+            holds_pre_image: current == &patch.previous,
         })
     }
 
@@ -1309,11 +1510,15 @@ fn check_patch_keys(
     Ok(())
 }
 
-/// A config key that is plain: lowercase ASCII letters, digits, and `_ . -`.
+/// A config key is `[a-z0-9_.-]`, plus uppercase ASCII after a leading `environment.`.
 fn plain_config_key(key: &str) -> bool {
+    let environment = key.starts_with("environment.");
     !key.is_empty()
         && key.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'.' | b'-')
+                || (environment && b.is_ascii_uppercase())
         })
 }
 
@@ -1394,6 +1599,16 @@ fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
         u32::MAX << (32 - length)
     };
     (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
+}
+
+/// The entry a secret name belongs to: its first segment, when that parses as an entry id and another segment follows.
+fn secret_owner(name: &str) -> Option<&str> {
+    let (owner, _) = name.split_once('/')?;
+    EntryId::parse(owner).map(|_| owner)
+}
+
+fn may_use_secret(entry: &EntryId, name: &str) -> bool {
+    secret_owner(name).is_none_or(|owner| owner == entry.0)
 }
 
 /// A secret name: `^[a-z0-9][a-z0-9/-]{0,127}$`. It is checked by hand, so no pattern library is needed.
@@ -1498,4 +1713,44 @@ fn process_uid() -> Result<u32, EffectRefusal> {
     let _ = fs::remove_dir_all(&dir);
     made.map(|meta| meta.uid())
         .map_err(|_| EffectRefusal::Provider("the uid probe failed".to_string()))
+}
+
+/// Validate the closed top-level patch vocabulary before any read.
+fn check_acl_patch(object: &ObjectRef, rules: &[Value]) -> Result<(), EffectRefusal> {
+    if object.kind != IncusKind::Acl
+        || object.project != NETWORK_HOME
+        || object.parent.is_some()
+        || object.uuid.is_some()
+        || !rules.iter().all(Value::is_object)
+    {
+        return Err(EffectRefusal::NotDeclared);
+    }
+    Ok(())
+}
+
+fn redact_secret_values(
+    value: &mut Value,
+    usable: &[(String, String)],
+    foreign: &[(String, String)],
+) {
+    match value {
+        Value::String(text) => {
+            if let Some(reference) = secret_reference(text, usable) {
+                *text = reference;
+            } else if secret_reference(text, foreign).is_some() {
+                *text = FOREIGN_SECRET_MARKER.to_string();
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                redact_secret_values(value, usable, foreign);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                redact_secret_values(value, usable, foreign);
+            }
+        }
+        _ => {}
+    }
 }

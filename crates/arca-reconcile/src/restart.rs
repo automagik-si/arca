@@ -109,6 +109,9 @@ impl<S: JournalStore> Reconciler<S> {
         if record.intent == Some(IntentKind::Delete) {
             return self.settle_delete(record, out);
         }
+        if let Some(patch) = &record.acl_patch {
+            return self.settle_acl_patch(record, patch, out);
+        }
         match record.pre_image.clone() {
             Some(pre_image) => self.settle_patch(record, &pre_image, out),
             None => self.settle_create(record, out),
@@ -197,6 +200,49 @@ impl<S: JournalStore> Reconciler<S> {
                     out.drift.push(object);
                 }
             }
+        }
+        self.check_journal()?;
+        Ok(Step::Settled)
+    }
+
+    fn settle_acl_patch(
+        &mut self,
+        record: &EffectRecord,
+        patch: &arca_kernel::journal::AclPatch,
+        out: &mut Resolution,
+    ) -> Result<Step, KernelError> {
+        let Ok(back) = self
+            .provider
+            .read_back_acl(&record.entry, &record.target, patch)
+        else {
+            return Ok(Step::Open);
+        };
+        out.held.push(record.entry.clone());
+        match back {
+            ReadBack::Present {
+                object,
+                owned: true,
+                holds_pre_image: false,
+            } => {
+                self.journal.applied(
+                    record.id,
+                    object.clone(),
+                    Inverse::IncusRestoreAclField {
+                        object,
+                        field: patch.field,
+                        rules: patch.previous.clone(),
+                    },
+                )?;
+                out.adopted.push(record.target.clone());
+            }
+            ReadBack::Present {
+                owned: true,
+                holds_pre_image: true,
+                ..
+            } => {
+                self.journal.failed(record.id, NOT_LANDED)?;
+            }
+            _ => return Ok(Step::Open),
         }
         self.check_journal()?;
         Ok(Step::Settled)

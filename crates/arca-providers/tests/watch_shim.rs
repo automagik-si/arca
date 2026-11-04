@@ -275,6 +275,7 @@ fn the_read_only_provider_refuses_every_plan_and_every_effect() {
         Err(EffectRefusal::WatchOnly)
     );
     let planned = Planned {
+        acl_patch: None,
         class: EffectClass::A,
         op_digest: arca_kernel::plugin::op_digest(&op),
         pre_image: None,

@@ -135,7 +135,7 @@ Source: `UnixIncusWriter::{wait_for, wait_on}` and `IncusError::Status` in `crat
 `an_answer_with_an_empty_or_absent_operation_is_done_without_a_wait` and `a_failed_operation_is_a_status_error_and_the_object_stays`.
 
 **Rule 15.** The writer sends only POST, PATCH, PUT and DELETE. A POST creates, a PATCH sets or removes config keys of any kind
-but a project, and a DELETE removes. A PUT is sent for one thing only: a project's config change or tombstone, as the project's
+but a project, or replaces one ACL ingress or egress array (Rule 47), and a DELETE removes. A PUT is sent for one thing only: a project's config change or tombstone, as the project's
 whole config with the change applied, under the ETag of the read the change was checked against (Rule 43). No other object is
 written wholesale, and no PATCH is sent to a project.
 Source: the methods passed to `mutate` in `crates/arca-incus/src/write.rs` (`POST` in `create`, `PATCH` and `PUT` in
@@ -300,7 +300,10 @@ Source: `check_bridge_create`, `check_bridge_config` and `BRIDGE_KEYS` in `crate
 `a_bridge_patch_into_a_reserved_range_is_refused_at_plan_and_sends_no_patch`.
 
 **Rule 32.** A config value that starts with `arca-secret:` names a secret file, and the value is never sent as the reference.
-The name must match `^[a-z0-9][a-z0-9/-]{0,127}$`. The secrets directory must be a real directory, not a symlink, owned by the
+The name must match `^[a-z0-9][a-z0-9/-]{0,127}$`. A name with more than one path segment belongs to the entry named by its
+first segment when that segment parses as an `EntryId` (`^[a-z][a-z0-9-]{0,62}$`); every other name is shared. Only that entry
+may use an owned secret; every entry may use a shared secret. A reference naming another entry's secret is refused at plan,
+before any filesystem access for the reference. The secrets directory must be a real directory, not a symlink, owned by the
 provider's own user, with no group or other permission bits. Each directory a name passes through must meet the same rule. The
 file must be a regular file, not a symlink, mode `0600`, owned by the provider's own user, and at most 64 KiB. A reference that
 fails a rule is refused at plan. While the secrets directory fails the rule, nothing is read from it and no secret is known. The
@@ -309,7 +312,8 @@ content.
 
 The journal's pre-image is chosen key by key. For each changed key that the object holds a value for:
 
-- A value equal to a current secret's content is journalled as that secret's reference, for a plain key and a secret key alike.
+- A value equal to a current shared or own secret's content is journalled as that secret's reference, for a plain key and a
+  secret key alike.
 - A key the patch sets to a secret reference, whose value is no current secret, is journalled as `None`, a redacted marker. Its
   inverse removes the key. Undoing a rotated secret therefore removes the key; it does not restore the old value. This is the
   cost of the rule. A failed patch of such a key settles as `Unresolved`, since the marker cannot show the old value.
@@ -319,7 +323,10 @@ The journal's pre-image is chosen key by key. For each changed key that the obje
 
 Residual, LOW: if a secret has been rotated away, and a plain patch or a removal lands on a key that still holds the old content,
 that content is journalled raw, because no current secret matches it. The journal never holds it as a reference in that case.
-Source: `IncusProvider::{read_secret, secrets_root_private, secrets_by_value, pre_image_of}`, `secret_reference` and `is_reference`
+A value equal only to another entry's secret likewise matches no usable current secret and is journalled raw on a plain patch
+or removal.
+Source: `IncusProvider::{read_secret, read_secret_file, secrets_root_private, secrets_by_value, pre_image_of}`, `secret_owner`,
+`may_use_secret`, `secret_reference` and `is_reference`
 in `crates/arca-providers/src/incus.rs`; tests `a_secret_reference_is_sent_as_the_file_content_and_the_value_is_never_journalled`,
 `a_patch_that_clears_a_key_holding_a_secret_journals_the_reference_as_its_pre_image`,
 `a_patch_that_rotates_a_secret_journals_no_value_and_its_inverse_removes_the_key`,
@@ -713,6 +720,56 @@ refusals, `each_thing_the_instance_already_uses_is_planned_as_exactly_its_allowa
 `a_stopped_adoption_started_by_hand_is_released_only_once_it_is_stopped_again`; and in `crates/arca/src/adoptions.rs`,
 `a_running_plan_keeps_its_digest_and_a_recorded_plan_stays_valid`.
 
+## ACL arrays and scoped observations
+
+**Rule 46.** Config keys accept uppercase ASCII letters only after a leading lowercase `environment.` prefix.
+`environment.DATABASE_URL` is accepted; `Environment.X`, `foo.BAR`, non-ASCII letters and path separators are refused.
+Every other key keeps the lowercase ASCII, digit and `_ . -` rule. Both the provider and the writer enforce it.
+Source: orchestrator ruling / Group 22a; `plain_config_key` in `crates/arca-providers/src/incus.rs` and `plain_key` in
+`crates/arca-incus/src/write.rs`; tests `environment_uppercase_suffix_is_accepted_and_other_uppercase_keys_are_refused`
+in `crates/arca-providers/tests/incus_provider.rs` and `writer_accepts_uppercase_only_after_lowercase_environment_prefix`
+in `crates/arca-incus/tests/write.rs`.
+
+**Rule 47.** `IncusPatchAclField { object, field, rules }` replaces exactly one top-level ACL array, `ingress` or `egress`,
+with an array of rule objects. It is class A, addresses only an ACL in `default`, and requires the object's own config to
+classify as the requesting entry's own. Planning reads the ownership, previous array and ETag together without writing;
+the effect rechecks them and PATCHes only the named array under `If-Match`. A stale ETag is 412 and changes nothing.
+No other kind or field is admitted, and a retiring, foreign, droidd, contested or retained ACL is refused.
+Source: orchestrator ruling / Group 22a; `EffectOp::IncusPatchAclField`, `IncusProvider::{plan, effect}` and
+`UnixIncusWriter::patch_acl_field`; tests `acl_array_patch_journals_typed_pre_image_and_inverse_restores_both_fields`,
+`acl_array_patch_refuses_foreign_droidd_non_acl_and_non_object_rules` and `acl_array_patch_answered_412_is_stale` in
+`crates/arca-providers/tests/incus_provider.rs`, `acl_array_patch_under_a_stale_etag_is_412_and_changes_nothing` in
+`crates/arca-incus/tests/write.rs` and `ctx_accepts_only_acl_arrays_with_the_planned_inverse_and_class_a` in
+`crates/arca-kernel/tests/plugin.rs`.
+
+**Rule 48.** An ACL array patch follows Rule 23's four steps. Its intent durably records `acl_patch` with `field`, `previous`
+and `rules`; its inverse is `IncusRestoreAclField { object, field, rules }`, whose rules are the previous array. Its read-back
+must still classify as the entry's own and show the sent array; undo restores the previous array through the same journalled
+op. After a restart, an owned ACL showing the previous array settles as not landed, and one showing the sent array settles
+with the restore inverse. A different array, another owner or an unreadable object keeps the intent unresolved. Existing
+records omit `acl_patch` and keep deserializing. Writer diagnostics omit config and rule values.
+Source: orchestrator ruling / Group 22a; `AclPatch`, `Inverse::IncusRestoreAclField`, `JournalSink::intend_acl`,
+`Provider::read_back_acl`, `IncusProvider::read_back_acl` and `Reconciler::{settle_acl_patch, restore}`; tests
+`acl_array_intents_replay_before_and_after_patch_and_removal_restores_the_array` in
+`crates/arca-reconcile/tests/restart.rs`, `acl_array_inverse_is_closed_and_old_records_keep_their_serialized_shape`
+in `crates/arca-kernel/tests/journal.rs`, `acl_array_patch_journals_typed_pre_image_and_inverse_restores_both_fields`
+and `acl_array_patch_read_back_requires_the_sent_array_and_the_entrys_ownership` in
+`crates/arca-providers/tests/incus_provider.rs` and `writer_accepts_uppercase_only_after_lowercase_environment_prefix`
+in `crates/arca-incus/tests/write.rs`.
+
+**Rule 49.** `Observe::IncusGet` admits only an instance object or its `state` path in a kernel-family project named by the
+requesting manifest, or an ACL in `default` whose own config classifies as the requesting entry's own. The path must name
+one plain object and exactly one literal `project` query; unknown endpoints, encodings, extra query parameters and projects
+outside the family are refused. Observations send GETs only. Returned values equal to current shared or own secret contents
+become their `arca-secret:` references, including instance config and expanded config. Otherwise, a value equal to another
+entry's secret becomes `<redacted: another entry's secret>`. Shared and own matches take precedence. Both secret lists are
+read before the GET, and redaction is applied after it.
+Source: orchestrator ruling / Group 22a; `IncusProvider::{observe, secrets_by_value, foreign_secrets_by_value, read_secret_file}`,
+`may_use_secret`, `FOREIGN_SECRET_MARKER` and `redact_secret_values`; tests
+`scoped_observe_allows_instance_state_and_own_acl_and_redacts_secret_values` and
+`scoped_observe_marks_another_entrys_secret_and_keeps_own_and_shared_references` in
+`crates/arca-providers/tests/incus_provider.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -778,3 +835,8 @@ must run before any live write.
   `timeout` passes is answered with the operation still running, and an operation Incus no longer holds is 404 (Rule 44). Read from
   the Incus source (`operationsGet` and `operationWaitGet` in `cmd/incusd/operations.go`, `render` in
   `internal/server/operations/operations.go`, and `instancesPost`); a live probe must confirm it.
+
+- An ACL PATCH replaces only the top-level ingress or egress array it names and preserves the other fields (Rules 47, 48).
+  This is modeled by the fake's top-level merge. The If-Match safety of an ACL PATCH also depends on Incus changing the ACL's
+  ETag when either its ingress or egress array changes; the fake bumps it. A live probe must confirm both behaviors before a
+  live use of the new op.
