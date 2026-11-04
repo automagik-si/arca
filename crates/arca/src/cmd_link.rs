@@ -21,7 +21,14 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         return Err(usage_failure());
     }
     let positional = if command == "join" || command == "remove" {
-        let Some((value, rest)) = args.split_first().filter(|(v, _)| !v.starts_with("--")) else {
+        let end_of_options = args.first().is_some_and(|arg| arg == "--");
+        if end_of_options {
+            args = &args[1..];
+        }
+        let Some((value, rest)) = args
+            .split_first()
+            .filter(|(v, _)| end_of_options || !v.starts_with("--"))
+        else {
             return Err(usage_failure());
         };
         args = rest;

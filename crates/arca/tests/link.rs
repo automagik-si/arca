@@ -124,6 +124,67 @@ async fn link_cli_pairs_joins_lists_and_removes_without_relays() {
 }
 
 #[test]
+fn link_remove_accepts_end_of_options_before_name() {
+    let temp = Temp::new();
+    let config = temp.config();
+    let remove = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+            .args(["link", "remove", "--", "--probe", "--config", &config])
+            .output()
+            .unwrap()
+    };
+    let output = remove();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"removed": 0})
+    );
+    assert!(temp.0.join("state/removed.json").is_file());
+
+    let state = State::new(temp.0.join("state")).unwrap();
+    let peer = arca_link::Peer {
+        id: state.secret().unwrap().public().to_string(),
+        name: "--probe".to_string(),
+        paired: arca_link::now_ms(),
+        seen: arca_link::now_ms(),
+        ticket: None,
+    };
+    fs::write(
+        temp.0.join("state/peers.json"),
+        serde_json::to_vec(&vec![peer.clone()]).unwrap(),
+    )
+    .unwrap();
+    let unmarked = std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+        .args(["link", "remove", "--probe", "--config", &config])
+        .output()
+        .unwrap();
+    assert_eq!(unmarked.status.code(), Some(2));
+    assert!(
+        String::from_utf8(unmarked.stderr)
+            .unwrap()
+            .starts_with("arca: usage: arca")
+    );
+    assert_eq!(state.peers().unwrap(), vec![peer]);
+    let output = remove();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"removed": 1})
+    );
+    assert!(state.peers().unwrap().is_empty());
+}
+
+#[test]
+fn link_join_accepts_end_of_options_before_link() {
+    let error = arca::run(
+        &["link", "join", "--", "--invalid-link", "--config", "unused"].map(String::from),
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), 2);
+    assert_eq!(error.message(), "invalid pairing link");
+}
+
+#[test]
 fn link_serve_sigterm_exits_cleanly_and_removes_runtime_files_without_relays() {
     let temp = Temp::new();
     let config = temp.config();

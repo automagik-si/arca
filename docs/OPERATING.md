@@ -14,9 +14,9 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
-| `arca link join <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
+| `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
 | `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
-| `arca link remove <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
+| `arca link remove [--] <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -125,11 +125,14 @@ camelCase keys and refuses unknown keys:
 - `pairMinutes`: the default code lifetime in minutes, overridden by `link pair --minutes`. The default is 10, and the
   selected value is clamped to 1 through 60.
 - `localOnly`: when true, binds only loopback and disables discovery and relays. The default is false (N0 discovery and
-  public relays). This also permits testing `link serve` without external network access.
+  public relays). It also disables mesh reachability: the node neither reaches peers on other hosts for membership or
+  forwarding, nor is reached by them. This also permits testing `link serve` without external network access.
 
 The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, plus the ALPNs in `forward`. Both membership
 and forwarded connections require a live entry in `peers.json`. `arca/pair/1` and `arca/peers/1` cannot be forward entries.
 Each forwarded connection runs at most 16 streams concurrently; further streams wait until a running stream finishes.
+Handshakes have a 10-second deadline, with at most 16 pending and 4 pending per address. The 4-per-address cap applies
+only to pending handshakes; open forwardings are capped only in total, at 64 open forwarded connections.
 `link remove` uses the running server's control socket, closes that peer's live connections, and triggers mesh sync
 immediately. Without a running server it writes the removal to disk; the next start propagates it. External disk removals
 are detected within 2 seconds while serving.
@@ -138,11 +141,14 @@ are detected within 2 seconds while serving.
 The receiver merges the request and replies with its merged snapshot, so both ends learn membership changes. Each JSON
 line is bounded at 64 KiB including its newline; pairing retains its 4 KiB bound. Sync runs after successful pairing,
 after removal, at startup, and every 30 seconds. Offline members do not make these operations fail; they catch up on a
-later exchange. Any admitted member can introduce peers received from another member.
+later exchange. Any admitted member can introduce or remove peers received from another member; membership changes
+rely on that mesh trust.
 
 A removal tombstone wins when its `at` timestamp is at least the peer's `paired` timestamp. A newer pairing survives and
-clears the tombstone; older snapshots cannot resurrect a removed device. Existing peer records change only when an
-incoming `paired` timestamp is newer. Tombstones are retained for offline members.
+clears the tombstone; older snapshots cannot resurrect a removed device while its tombstone is retained. Existing peer
+records change only when an incoming `paired` timestamp is newer. Tombstones are retained for offline members for up to
+30 days, keeping at most the 64 newest (ties broken by endpoint id). Their timestamps are capped at 5 minutes ahead of
+the local clock. An older snapshot can reintroduce a removed device whose tombstone has expired or been displaced by the cap.
 
 All link state lives directly in the top-level `stateDir`:
 
@@ -156,6 +162,8 @@ All link state lives directly in the top-level `stateDir`:
 
 The link creates a missing `stateDir` with mode 0700 and refuses an existing directory with any group or other permission
 bit, reporting `link state directory must have mode 0700` as a config failure (exit 2).
+For an older state directory, run `chmod 0700 <stateDir>` before starting; the link does not change existing directory
+permissions automatically because the top-level directory may be shared with other services.
 These files are written atomically with mode 0600. `pair` requires a running `link serve`. It creates a code and a link of
 the form `arca://pair?v=1&n=<percent-encoded name>&c=<code>&t=<endpoint ticket>`. A code works once, until its expiry. A peer
 is refused after three wrong tries, and 1,000 wrong tries overall exhaust the code. `join` consumes that link and stores
