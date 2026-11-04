@@ -1439,6 +1439,24 @@ fn toy_instance_uuid(fake: &FakeIncus) -> String {
         .to_string()
 }
 
+/// Model an external deletion, bypassing the kernel path being tested. Incus
+/// still requires this external actor to stop the instance before its DELETE.
+fn delete_instance_externally(fake: &FakeIncus, name: &str) {
+    let (status, _) = raw(
+        fake,
+        "PUT",
+        &format!("/1.0/instances/{name}/state?project={PROJECT}"),
+        Some(&json!({"action":"stop", "force":true})),
+    );
+    assert_eq!(status, 202, "the external stop succeeds");
+    let (status, _) = raw(fake, "DELETE", &instance_path(name), None);
+    assert_eq!(status, 202, "the external delete succeeds");
+    assert!(
+        get(fake, &instance_path(name)).is_none(),
+        "the instance is gone"
+    );
+}
+
 #[test]
 fn a_kill_between_a_class_a_delete_settled_and_its_create_settled_does_not_wedge_the_removal() {
     let scratch = Scratch::new("atk-a");
@@ -1549,8 +1567,7 @@ fn a_kill_between_a_class_b_delete_settled_and_its_create_settled_asks_nothing_a
         EffectClass::B,
         instance_object("toy-box-t1", Some(&uuid)),
     );
-    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
-    assert!(status < 300, "the instance is gone: {status}");
+    delete_instance_externally(&fake, "toy-box-t1");
 
     let mut r = restarted(
         &scratch,
@@ -1626,8 +1643,7 @@ fn an_async_class_b_delete_that_completes_after_its_read_back_kept_the_object_se
         "the read-back saw the instance"
     );
     // The async delete completes after the read-back.
-    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
-    assert!(status < 300, "the instance is gone: {status}");
+    delete_instance_externally(&fake, "toy-box-t1");
 
     // The retry removes the entry. The instance is gone, so the owner is not asked about it.
     let second = signed(&key, 2, Some(first.document.digest()), vec![]);
@@ -1675,8 +1691,7 @@ fn an_instance_deleted_after_the_owner_was_asked_is_settled_by_the_approved_run(
         "the instance waits for the owner: {removal:?}"
     );
     // The delete completes before the owner approves, so the approved run finds the instance gone.
-    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
-    assert!(status < 300, "the instance is gone: {status}");
+    delete_instance_externally(&fake, "toy-box-t1");
 
     let run = approve_and_run(&mut r, &scratch, &plans[0], "atk-run");
     assert!(
@@ -1826,8 +1841,7 @@ fn a_plan_whose_instance_is_gone_before_the_next_removal_is_withdrawn_and_nothin
     let removal = r.reconcile(&second, NOW);
     assert_eq!(asked(&removal).len(), 1, "the instance waits: {removal:?}");
     // The instance's delete completes while the owner has not answered.
-    let (status, _) = raw(&fake, "DELETE", &instance_path("toy-box-t1"), None);
-    assert!(status < 300, "the instance is gone: {status}");
+    delete_instance_externally(&fake, "toy-box-t1");
 
     let again = r.reconcile(&third, NOW);
     assert!(asked(&again).is_empty(), "nothing is asked: {again:?}");

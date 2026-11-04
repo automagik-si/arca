@@ -171,6 +171,82 @@ impl Drop for Rig {
 }
 
 #[test]
+fn postgres_skips_equal_acl_arrays_and_kernel_instances_are_running() {
+    let r = Rig::new(scratch(), false);
+    r.create("db1");
+    for name in ["consumer-a", "db1"] {
+        let state = r.get(&format!("/1.0/instances/{name}/state?project={PROJECT}"));
+        assert_eq!(state["status"], "Running", "{name}");
+        assert!(arca_postgres::ipv4(&state).is_some(), "{name}");
+    }
+    let records: Vec<Value> = fs::read_to_string(r.dir.join("journal.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.get("acl_patch").is_none())
+    );
+
+    // The same empty array on an existing ACL also needs no patch. Then repeat
+    // with nonempty ingress after linking a consumer.
+    for linked in [false, true] {
+        if linked {
+            r.call(
+                "postgres_link",
+                json!({"name":"db1","consumer":"consumer-a"}),
+            )
+            .unwrap();
+        }
+        let cfg: PostgresConfig = serde_json::from_value(
+            r.kernel
+                .lock()
+                .unwrap()
+                .entries()
+                .iter()
+                .find(|e| e.id.0 == "postgres-db1")
+                .unwrap()
+                .config
+                .clone(),
+        )
+        .unwrap();
+        let mut provider = IncusProvider::new(
+            r.fake.socket().into(),
+            Family {
+                projects: vec![PROJECT.into()],
+                scratch: false,
+                droidd_projects: vec![],
+                reserved_cidrs: vec![],
+            },
+            r.dir.join("secrets"),
+            RetainedSet::empty(),
+        )
+        .unwrap();
+        let mut journal = Journal::open(MemJournal::new()).unwrap();
+        let n = r.fake.writes().len();
+        Postgres::apply(
+            &mut Ctx::new(
+                EntryId("postgres-db1".into()),
+                &Postgres::manifest(),
+                &mut provider,
+                &mut journal,
+                NOW,
+            ),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(r.fake.writes().len(), n);
+        assert!(journal.live(&EntryId("postgres-db1".into())).is_empty());
+        assert!(journal.unresolved().is_empty());
+    }
+    let list = r.call("postgres_list", json!({})).unwrap();
+    assert_eq!(list["databases"][0]["status"], "running");
+    assert!(list["databases"][0]["address"].is_string());
+}
+
+#[test]
 fn link_and_unlink_write_only_the_consumers_instance_and_databases_acl() {
     let r = Rig::new(scratch(), true);
     r.create("db1");
@@ -390,8 +466,8 @@ fn second_link_uses_database_suffix_list_reads_only_state_and_delete_returns_pla
     );
     let n = r.fake.requests().len();
     let list = r.call("postgres_list", json!({})).unwrap();
-    assert_eq!(list["databases"][0]["address"], Value::Null);
-    assert_eq!(list["databases"][0]["status"], "pending");
+    assert!(list["databases"][0]["address"].is_string());
+    assert_eq!(list["databases"][0]["status"], "running");
     assert_eq!(list["databases"][0]["port"], 5432);
     assert_eq!(list["databases"][0]["links"], json!(["consumer-a"]));
     assert!(
@@ -541,6 +617,15 @@ fn password_free_results_errors_journal_desired_and_captured_stderr() {
 fn missing_consumer_address_never_broadens_the_acl() {
     let r = Rig::new(scratch(), false);
     r.create("db1");
+    // Creates now start, so explicitly model a consumer without a usable lease.
+    let state = r.get(&format!(
+        "/1.0/instances/consumer-a/state?project={PROJECT}"
+    ));
+    r.fake.set_lease(
+        BRIDGE,
+        state["network"]["eth0"]["hwaddr"].as_str().unwrap(),
+        "0.0.0.0",
+    );
     r.call(
         "postgres_link",
         json!({"name":"db1","consumer":"consumer-a"}),

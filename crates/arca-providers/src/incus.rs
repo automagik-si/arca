@@ -1210,7 +1210,9 @@ impl Provider for IncusProvider {
                     Err(IncusError::Refused(reason)) => {
                         return Err(EffectRefusal::Provider(reason));
                     }
-                    Err(IncusError::Status { .. }) => {
+                    Err(_) => {
+                        // Even an empty answer or an unconfirmed write can be
+                        // settled once no operation can still change this ACL.
                         match self
                             .read_back_acl(entry, object, patch)
                             .map_err(|_| EffectRefusal::Unresolved)?
@@ -1232,7 +1234,6 @@ impl Provider for IncusProvider {
                             _ => return Err(EffectRefusal::Unresolved),
                         }
                     }
-                    Err(_) => return Err(EffectRefusal::Unresolved),
                 }
                 Ok((
                     object.clone(),
@@ -1307,7 +1308,9 @@ impl Provider for IncusProvider {
         Ok(ReadBack::Present {
             object: target.clone(),
             owned: true,
-            holds_pre_image: current == &patch.previous,
+            // A no-op satisfies the wanted state even though it also holds the
+            // pre-image. Live effects and restart settlement must agree on this.
+            holds_pre_image: current == &patch.previous && current != &patch.rules,
         })
     }
 

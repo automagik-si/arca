@@ -192,6 +192,13 @@ struct Canned {
 
 impl Canned {
     fn start(tag: &str, mut answer: impl FnMut(&str, &str) -> Vec<u8> + Send + 'static) -> Canned {
+        Self::start_with_body(tag, move |method, target, _| answer(method, target))
+    }
+
+    fn start_with_body(
+        tag: &str,
+        mut answer: impl FnMut(&str, &str, &[u8]) -> Vec<u8> + Send + 'static,
+    ) -> Canned {
         let dir = Scratch::new(tag);
         let socket = dir.0.join("canned.sock");
         let listener = UnixListener::bind(&socket).expect("bind the canned socket");
@@ -264,7 +271,7 @@ impl Drop for Canned {
 /// Reads one request, records its method and target, and writes the reply `answer` gives.
 fn serve_once(
     mut stream: UnixStream,
-    answer: &mut impl FnMut(&str, &str) -> Vec<u8>,
+    answer: &mut impl FnMut(&str, &str, &[u8]) -> Vec<u8>,
     seen: &Mutex<Vec<(String, String)>>,
 ) {
     let _ = stream.set_nonblocking(false);
@@ -293,7 +300,7 @@ fn serve_once(
     seen.lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push((method.clone(), target.clone()));
-    let reply = answer(&method, &target);
+    let reply = answer(&method, &target, &body);
     let _ = stream.write_all(&reply);
 }
 
@@ -408,6 +415,43 @@ fn create_with_waits(waits: Vec<Value>) -> (Result<Owned, IncusError>, usize) {
 }
 
 #[test]
+fn instance_create_starts_by_default_and_respects_explicit_false() {
+    let (_dir, fake) = start("create-start");
+    let writer = writer(&fake, "toy");
+    for (name, start, status) in [
+        ("default-start", None, "Running"),
+        ("explicit-start", Some(true), "Running"),
+        ("explicit-stop", Some(false), "Stopped"),
+    ] {
+        let mut body = marked();
+        if let Some(start) = start {
+            body["start"] = json!(start);
+        }
+        writer
+            .create(&target(IncusKind::Instance, "svc", name, None), &body)
+            .unwrap();
+        let state = UnixIncus::new(fake.socket().into())
+            .get(&format!("/1.0/instances/{name}/state?project=svc"))
+            .unwrap();
+        assert_eq!(state["status"], status, "{name}");
+    }
+    let acl = writer
+        .create(
+            &target(IncusKind::Acl, "default", "no-start", None),
+            &marked(),
+        )
+        .unwrap();
+    assert!(
+        writer
+            .get_etag(acl.target())
+            .unwrap()
+            .0
+            .get("start")
+            .is_none()
+    );
+}
+
+#[test]
 fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     let (_dir, fake) = start("roundtrip");
     let writer = writer(&fake, "toy");
@@ -468,16 +512,16 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
         assert_eq!(status_of(&gone), Some(404), "{kind:?}");
     }
 
-    // Five writes per case, and the one create of the forward's network.
+    // Five writes per case, the forward's network create and the instance's stop.
     let writes = fake.writes();
-    assert_eq!(writes.len(), cases.len() * 5 + 1, "{writes:?}");
+    assert_eq!(writes.len(), cases.len() * 5 + 2, "{writes:?}");
     // A project's config is written with a PUT of its whole config, and every other kind's with a PATCH. No PATCH reaches a
     // project, since Incus 7.3 would replace the project's config with the keys it names.
     for write in &writes {
         let project = write.path.starts_with("/1.0/projects/");
         let allowed = match write.method.as_str() {
             "POST" | "DELETE" => true,
-            "PUT" => project,
+            "PUT" => project || write.path == "/1.0/instances/ki1/state?project=svc",
             "PATCH" => !project,
             _ => false,
         };
@@ -1731,6 +1775,91 @@ fn a_tombstone_with_a_stale_etag_is_412_and_sets_nothing() {
 }
 
 #[test]
+fn a_delete_stops_a_running_instance_before_the_deleting_request() {
+    let (_dir, fake) = start("delete-running");
+    let state_path = "/1.0/instances/running/state?project=svc";
+    // Capture only this synthetic stop body, keeping the fake's general log free
+    // of values. Every request is forwarded to the real fake state machine.
+    let stop_body = Arc::new(Mutex::new(None));
+    let captured = Arc::clone(&stop_body);
+    let socket = fake.socket().to_path_buf();
+    let proxy = Canned::start_with_body("delete-stop-body", move |method, path, body| {
+        if method == "PUT" && path == state_path {
+            *captured.lock().unwrap() = Some(serde_json::from_slice::<Value>(body).unwrap());
+        }
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: incus\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).unwrap();
+        reply
+    });
+    let writer = proxy.writer();
+    let target = target(IncusKind::Instance, "svc", "running", None);
+    let owned = writer.create(&target, &marked()).unwrap();
+    assert_eq!(
+        UnixIncus::new(fake.socket().into())
+            .get(state_path)
+            .unwrap()["status"],
+        "Running"
+    );
+    // A graceful stop fails, so success also proves the force flag takes effect.
+    fake.hang_stop("running", false);
+    let retiring = writer.tombstone(&owned, &plan()).unwrap();
+    let from = fake.requests().len();
+    writer.delete(&retiring).unwrap();
+    assert_eq!(
+        *stop_body.lock().unwrap(),
+        Some(json!({"action":"stop", "force":true}))
+    );
+    let requests = fake.requests();
+    let removal = &requests[from..];
+    let steps: Vec<_> = removal
+        .iter()
+        .filter(|r| r.path == state_path || r.method == "DELETE")
+        .map(|r| (r.method.as_str(), r.path.as_str()))
+        .collect();
+    assert_eq!(
+        steps,
+        vec![
+            ("GET", state_path),
+            ("PUT", state_path),
+            ("DELETE", "/1.0/instances/running?project=svc")
+        ]
+    );
+    let stop = removal.iter().position(|r| r.method == "PUT").unwrap();
+    let delete = removal.iter().position(|r| r.method == "DELETE").unwrap();
+    assert!(
+        removal[stop + 1..delete]
+            .iter()
+            .any(|r| r.method == "GET" && r.path.contains("/wait?")),
+        "the stop operation is waited on before DELETE"
+    );
+    assert_eq!(status_of(&writer.get_etag(&target).unwrap_err()), Some(404));
+}
+
+#[test]
+fn a_delete_of_a_stopped_instance_sends_no_stop_request() {
+    let (_dir, fake) = start("delete-stopped");
+    let writer = writer(&fake, "toy");
+    let target = target(IncusKind::Instance, "svc", "stopped", None);
+    let mut body = marked();
+    body["start"] = json!(false);
+    let owned = writer.create(&target, &body).unwrap();
+    let retiring = writer.tombstone(&owned, &plan()).unwrap();
+    let from = fake.requests().len();
+    writer.delete(&retiring).unwrap();
+    let requests = fake.requests();
+    assert!(
+        requests[from..]
+            .iter()
+            .any(|r| r.method == "GET" && r.path == "/1.0/instances/stopped/state?project=svc")
+    );
+    assert!(!requests[from..].iter().any(|r| r.method == "PUT"));
+    assert_eq!(status_of(&writer.get_etag(&target).unwrap_err()), Some(404));
+}
+
+#[test]
 fn a_failed_operation_is_a_status_error_and_the_object_stays() {
     let (_dir, fake) = start("operation");
     let writer = writer(&fake, "toy");
@@ -1739,18 +1868,20 @@ fn a_failed_operation_is_a_status_error_and_the_object_stays() {
     let running = target(IncusKind::Instance, "svc", "run1", None);
     let owned = writer.create(&running, &body).expect("create");
     let retiring = writer.tombstone(&owned, &plan()).expect("tombstone");
+    fake.hang_stop("run1", true);
 
     let failed = writer
         .delete(&retiring)
-        .expect_err("a running instance does not delete");
+        .expect_err("a failed forced stop prevents deletion");
     assert_eq!(
         failed,
         IncusError::Status {
             code: 400,
-            message: "The instance is running".to_string()
+            message: "Failed shutting down instance".to_string()
         }
     );
     assert!(writer.get_etag(&running).is_ok(), "the instance stays");
+    assert!(!fake.requests().iter().any(|r| r.method == "DELETE"));
 }
 
 #[test]

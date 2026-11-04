@@ -13,8 +13,8 @@
 //! array, and it is sent to every kind but a project. A project's config change and its tombstone are a PUT of the project's whole config, with the change applied, and of
 //! the description, both as the read showed them: Incus 7.3's project PATCH replaces the whole config with the keys it names
 //! (`projectPatch` in `cmd/incusd/api_project.go` copies the old keys into the raw request map, not into the request it applies),
-//! so a PATCH of one key would drop the kernel's mark, `restricted` and every feature. Nothing else is sent as a PUT, and nothing
-//! sends a PATCH to a project.
+//! so a PATCH of one key would drop the kernel's mark, `restricted` and every feature. A PUT also force-stops a running instance
+//! before its DELETE. Nothing sends a PATCH to a project.
 //!
 //! A write whose answer is sync, or names no operation, is done. One that names an operation is waited on until it succeeds,
 //! fails, or passes the writer's deadline. A write that Incus accepted and whose read-back does not confirm it is
@@ -275,7 +275,7 @@ impl UnixIncusWriter {
     /// when it has one, must be an image. Every key in the body, at any depth, must be plain ASCII, and the body's config may
     /// not set a `volatile.*` key. The body's config must class as this entry's own, so the object belongs to the entry from
     /// the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object is read
-    /// back, which must class as this entry's own.
+    /// back, which must class as this entry's own. An instance starts by default unless its body explicitly sets `start: false`.
     pub fn create(&self, target: &Target, body: &Value) -> Result<Owned, IncusError> {
         self.allow_target(target)?;
         if target.uuid.is_some() {
@@ -310,6 +310,9 @@ impl UnixIncusWriter {
         }
         let mut sent = fields.clone();
         sent.insert("name".to_string(), json!(target.name));
+        if target.kind == IncusKind::Instance {
+            sent.entry("start").or_insert(json!(true));
+        }
         if target.kind == IncusKind::Forward {
             sent.insert("listen_address".to_string(), json!(target.name));
         }
@@ -465,7 +468,8 @@ impl UnixIncusWriter {
     }
 
     /// Deletes an object that carries its tombstone. The object is first read again, and it must show the same tombstone, and the same uuid where Incus gives one. A
-    /// project then has the images in its own store deleted (see [`Self::clear_images`]). The DELETE carries no `If-Match`, because Incus checks ETags only on PUT and PATCH.
+    /// running instance is forcibly stopped and its stop operation waited on; a project has the images in its own store deleted
+    /// (see [`Self::clear_images`]). The DELETE carries no `If-Match`, because Incus checks ETags only on PUT and PATCH.
     pub fn delete(&self, owned: &Owned) -> Result<(), IncusError> {
         self.check(owned)?;
         let Some(plan) = owned.tombstone.as_deref() else {
@@ -478,10 +482,30 @@ impl UnixIncusWriter {
         if fresh.uuid != owned.uuid || fresh.tombstone.as_deref() != Some(plan) {
             return Err(refused("the object changed after its tombstone"));
         }
+        let urls = urls(&owned.target)?;
+        if owned.target.kind == IncusKind::Instance {
+            let (object, query) = urls
+                .object
+                .split_once('?')
+                .ok_or_else(|| decode("an instance URL has no project"))?;
+            let state = format!("{object}/state?{query}");
+            let framed = self.send("GET", &state, None, None)?;
+            let envelope = checked_envelope(&framed.into_raw())?;
+            let status = envelope["metadata"]["status"]
+                .as_str()
+                .ok_or_else(|| decode("the instance state has no status"))?;
+            if status == "Running" {
+                self.mutate(
+                    "PUT",
+                    &state,
+                    None,
+                    Some(&json!({"action": "stop", "force": true})),
+                )?;
+            }
+        }
         if owned.target.kind == IncusKind::Project {
             self.clear_images(&fresh)?;
         }
-        let urls = urls(&owned.target)?;
         self.mutate("DELETE", &urls.object, None, None)
     }
 

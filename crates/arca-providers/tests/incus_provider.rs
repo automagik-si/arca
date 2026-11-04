@@ -1449,6 +1449,7 @@ fn retire_tombstones_then_deletes_an_owned_instance_in_order() {
         vec![
             "POST".to_string(),
             "PATCH".to_string(),
+            "PUT".to_string(),
             "DELETE".to_string()
         ]
     );
@@ -3480,6 +3481,128 @@ fn make_acl(provider: &mut IncusProvider, name: &str) -> ObjectRef {
     );
     let planned = provider.plan(&entry("toy"), &op).unwrap();
     provider.effect(&entry("toy"), &op, &planned).unwrap().0
+}
+
+/// Model a server that leaves the ACL unchanged. Run the patch and the following
+/// instance create through Ctx, so an unsettled patch stops the same effect chain
+/// as Postgres::apply. These are modeled replies, not a captured live response.
+fn acl_unchanged_response(reply: Vec<u8>, rules: Vec<Value>, succeeds: bool) {
+    use arca_kernel::journal::AclField;
+    let mut created = false;
+    let script = Script::start("acl-unchanged", move |method, target| {
+        match (method, target) {
+            ("PATCH", "/1.0/network-acls/database?project=default") => reply.clone(),
+            ("GET", "/1.0/network-acls/database?project=default") => object_reply(
+                &json!({"name":"database", "config":{MARK:"toy"}, "ingress":[], "egress":[]}),
+                "\"acl\"",
+            ),
+            ("GET", OPERATIONS_PATH) => http(200, None, &sync_env(json!({}))),
+            ("POST", "/1.0/instances?project=svc") => {
+                created = true;
+                ok_reply()
+            }
+            ("GET", "/1.0/instances/database?project=svc") if created => object_reply(
+                &json!({"name":"database", "config":{MARK:"toy", "volatile.uuid":READ_UUID}}),
+                "\"instance\"",
+            ),
+            _ => not_found(),
+        }
+    });
+    let secrets = Scratch::new("acl-unchanged-secrets");
+    let mut provider = script.provider(&secrets.0);
+    let manifest = manifest_with_default();
+    let path = secrets.0.join("journal.jsonl");
+    let mut journal = Journal::open(FileJournal::open(&path).unwrap()).unwrap();
+    let op = EffectOp::IncusPatchAclField {
+        object: object(IncusKind::Acl, "default", None, "database"),
+        field: AclField::Ingress,
+        rules,
+    };
+    let result = (|| {
+        let mut ctx = Ctx::new(entry("toy"), &manifest, &mut provider, &mut journal, 1);
+        ctx.effect(op.clone())?;
+        ctx.effect(create(
+            IncusKind::Instance,
+            "svc",
+            None,
+            "database",
+            json!({"config":{}}),
+        ))
+    })();
+    let unresolved = journal.unresolved();
+    drop(journal);
+    let (records, _) = FileJournal::open(&path).unwrap().load().unwrap();
+    let last_patch = records
+        .iter()
+        .rev()
+        .find(|r| r.acl_patch.is_some())
+        .unwrap();
+    eprintln!(
+        "ACL effect: {result:?}; patch state: {:?}; open intents: {}",
+        last_patch.state,
+        unresolved.len()
+    );
+    assert!(unresolved.is_empty(), "a settled ACL must leave no Intent");
+    if succeeds {
+        assert!(
+            result.is_ok(),
+            "an already satisfied ACL succeeds: {result:?}"
+        );
+        assert_eq!(last_patch.state, EffectState::Applied);
+        assert_eq!(script.count("POST"), 1, "the instance create ran");
+        // Restart uses this same observation: wanted wins when previous == wanted.
+        let planned = provider.plan(&entry("toy"), &op).unwrap();
+        assert!(matches!(
+            provider
+                .read_back_acl(
+                    &entry("toy"),
+                    &last_patch.target,
+                    planned.acl_patch.as_ref().unwrap()
+                )
+                .unwrap(),
+            ReadBack::Present {
+                owned: true,
+                holds_pre_image: false,
+                ..
+            }
+        ));
+    } else {
+        assert!(matches!(result, Err(EffectRefusal::Provider(_))));
+        assert_eq!(last_patch.state, EffectState::Failed);
+        assert_eq!(script.count("POST"), 0, "a failed patch stops the create");
+    }
+}
+
+#[test]
+fn acl_noop_304_is_applied_and_allows_the_next_create() {
+    acl_unchanged_response(
+        b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        vec![],
+        true,
+    );
+}
+
+#[test]
+fn acl_noop_empty_response_is_applied_and_allows_the_next_create() {
+    acl_unchanged_response(
+        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        vec![],
+        true,
+    );
+}
+
+#[test]
+fn acl_noop_without_operation_is_applied_and_allows_the_next_create() {
+    acl_unchanged_response(http(200, None, &sync_env(Value::Null)), vec![], true);
+}
+
+#[test]
+fn acl_patch_that_does_not_land_is_failed_not_left_at_intent() {
+    acl_unchanged_response(
+        http(200, None, &sync_env(Value::Null)),
+        vec![json!({"action":"reject"})],
+        false,
+    );
 }
 
 #[test]

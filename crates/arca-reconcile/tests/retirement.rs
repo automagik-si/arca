@@ -218,14 +218,8 @@ fn a_refused_delete_closes_its_intent_reports_drift_and_leaves_the_reconciler_un
     let mut r = reconciler(&scratch, &fake, &key, &retained);
     let first = signed(&key, 1, None, vec![toy_entry("t1")]);
     r.reconcile(&first, NOW);
-    // A running instance cannot be deleted: Incus fails the delete's operation, and the instance stays.
-    let (status, _) = raw(
-        &fake,
-        "PATCH",
-        &instance_path("toy-box-t1"),
-        Some(&json!({ "status": "Running" })),
-    );
-    assert_eq!(status, 200, "the instance is running");
+    // A failed forced stop prevents DELETE and leaves the instance for a retry.
+    fake.hang_stop("toy-box-t1", true);
     let second = signed(&key, 2, Some(first.document.digest()), vec![]);
     let outcomes = r.reconcile(&second, NOW);
     let Some(Outcome::AwaitingApproval { plan }) = outcomes.last().cloned() else {

@@ -48,8 +48,9 @@
 //! from those profiles and its own keys, as Incus expands them. A project reads its own profiles when its config sets
 //! `features.profiles` to `"true"`, and the default project's otherwise; its `default` profile is empty until a test adds one
 //! ([`FakeIncus::add_profile`]). `/1.0/instances/<i>/state` serves the status and each NIC's MAC and IPv4, and a PUT there starts
-//! or stops the instance as an operation. A graceful stop can be made to outlast its timeout ([`FakeIncus::hang_stop`]), and
-//! then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`, else its `volatile.<dev>.hwaddr`, else one the start
+//! or stops the instance as an operation. An instance create with `start: true` starts it too. A graceful stop can be made to
+//! outlast its timeout ([`FakeIncus::hang_stop`]), and then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`,
+//! else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
 //! else a fresh one the start leases ([`FakeIncus::set_lease`]; `/1.0/networks/<n>/leases`). A lease a start pins, or one
 //! [`FakeIncus::set_static_lease`] gives, is listed as static, as Incus lists the lease a NIC's `ipv4.address` names; any other
@@ -1450,8 +1451,12 @@ fn create(
     }
     match kind {
         "instance" => {
-            body.entry("status")
-                .or_insert_with(|| Value::String("Stopped".to_string()));
+            let status = if body.get("start") == Some(&json!(true)) {
+                "Running"
+            } else {
+                "Stopped"
+            };
+            body.entry("status").or_insert_with(|| json!(status));
         }
         "volume" => {
             body.insert("pool".to_string(), Value::String(parent.clone()));
@@ -1491,7 +1496,11 @@ fn create(
     store.objects.push(stored);
     if kind == "instance" {
         let at = store.objects.len() - 1;
-        store.expand(at, false);
+        if store.objects[at].body.get("start") == Some(&json!(true)) {
+            store.start(at, shared.counter.fetch_add(1, Ordering::SeqCst));
+        } else {
+            store.expand(at, false);
+        }
     }
     answered(shared, store, kind, "POST", Ok(()))
 }
