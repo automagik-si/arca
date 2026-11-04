@@ -16,7 +16,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
 | `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
-| `arca link remove <name> --config <file>` | removes every peer with that name | `{ "removed": <count> }` as JSON |
+| `arca link remove <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the node that `serve` runs | the verb's result, as JSON |
 | `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
@@ -124,20 +124,38 @@ camelCase keys and refuses unknown keys:
   directions to its socket. For example, `arca/mcp/1` may be an entry; it has no special handling.
 - `pairMinutes`: the default code lifetime in minutes, overridden by `link pair --minutes`. The default is 10, and the
   selected value is clamped to 1 through 60.
+- `localOnly`: when true, binds only loopback and disables discovery and relays. The default is false (N0 discovery and
+  public relays). This also permits testing `link serve` without external network access.
 
-The endpoint accepts `arca/pair/1` for pairing, plus the ALPNs in `forward`. Every forwarded connection requires a live entry
-in `peers.json` before its local socket is opened. `arca/pair/1` and `arca/peers/1` cannot be forward entries;
-`arca/peers/1` is not accepted. Removing a peer closes its live connections on the next sweep, within 2 seconds.
+The endpoint accepts `arca/pair/1` for pairing, `arca/peers/1` for membership, plus the ALPNs in `forward`. Both membership
+and forwarded connections require a live entry in `peers.json`. `arca/pair/1` and `arca/peers/1` cannot be forward entries.
+Each forwarded connection runs at most 16 streams concurrently; further streams wait until a running stream finishes.
+`link remove` uses the running server's control socket, closes that peer's live connections, and triggers mesh sync
+immediately. Without a running server it writes the removal to disk; the next start propagates it. External disk removals
+are detected within 2 seconds while serving.
+
+`arca/peers/1` exchanges one full JSON snapshot on one bidirectional stream: `{"peers":[...],"removed":[{"id","at"}]}`.
+The receiver merges the request and replies with its merged snapshot, so both ends learn membership changes. Each JSON
+line is bounded at 64 KiB including its newline; pairing retains its 4 KiB bound. Sync runs after successful pairing,
+after removal, at startup, and every 30 seconds. Offline members do not make these operations fail; they catch up on a
+later exchange. Any admitted member can introduce peers received from another member.
+
+A removal tombstone wins when its `at` timestamp is at least the peer's `paired` timestamp. A newer pairing survives and
+clears the tombstone; older snapshots cannot resurrect a removed device. Existing peer records change only when an
+incoming `paired` timestamp is newer. Tombstones are retained for offline members.
 
 All link state lives directly in the top-level `stateDir`:
 
 | File | Contents |
 |------|----------|
 | `secret.key` | The endpoint's 32 raw secret bytes, generated once. |
-| `peers.json` | An array of `{ "id", "name", "paired", "seen" }`; timestamps are epoch milliseconds. Admission reads this file on every connection. |
+| `peers.json` | An array of `{ "id", "name", "paired", "seen", "ticket"? }`; timestamps are epoch milliseconds. The optional endpoint ticket supplies transport addresses; older records without one use N0 lookup. Admission reads this file on every connection. |
+| `removed.json` | A tombstone map `{ "<endpoint id>": <epoch milliseconds> }`, propagated in membership snapshots. |
 | `pairing.json` | The pending single-use code, expiry, node name and wrong-attempt counters. Deleted after successful pairing. |
 | `status.json` | The running server's `{ "pid", "id", "ticket", "name" }`. Removed on clean stop; stale or absent status prevents `pair`. |
 
+The link creates a missing `stateDir` with mode 0700 and refuses an existing directory with any group or other permission
+bit, reporting `link state directory must have mode 0700` as a config failure (exit 2).
 These files are written atomically with mode 0600. `pair` requires a running `link serve`. It creates a code and a link of
 the form `arca://pair?v=1&n=<percent-encoded name>&c=<code>&t=<endpoint ticket>`. A code works once, until its expiry. A peer
 is refused after three wrong tries, and 1,000 wrong tries overall exhaust the code. `join` consumes that link and stores

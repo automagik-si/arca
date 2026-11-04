@@ -14,6 +14,7 @@ impl Temp {
         let path =
             std::env::temp_dir().join(format!("arca-link-{}", URL_SAFE_NO_PAD.encode(bytes)));
         fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         Self(path)
     }
     fn state(&self) -> State {
@@ -75,7 +76,7 @@ async fn echo(listener: UnixListener) {
 }
 
 #[tokio::test]
-async fn pair_forward_remove_and_keep_membership_local() {
+async fn pair_forward_remove_and_mesh_membership() {
     timeout(Duration::from_secs(20), async {
         let (a, b, c) = (Temp::new(), Temp::new(), Temp::new());
         let listener = UnixListener::bind(a.0.join("echo.sock")).unwrap();
@@ -125,27 +126,23 @@ async fn pair_forward_remove_and_keep_membership_local() {
                 .iter()
                 .any(|p| p.id == third.endpoint().id().to_string())
         );
+        guest.sync_peers().await.unwrap();
+        host.sync_peers().await.unwrap();
+        third.sync_peers().await.unwrap();
         assert!(
-            !a.state()
+            a.state()
                 .peers()
                 .unwrap()
                 .iter()
                 .any(|p| p.id == third.endpoint().id().to_string())
         );
         assert!(
-            !c.state()
+            c.state()
                 .peers()
                 .unwrap()
                 .iter()
                 .any(|p| p.id == host.endpoint().id().to_string())
         );
-        let refused = third
-            .endpoint()
-            .connect(addr(&host), FORWARD)
-            .await
-            .unwrap();
-        let closed = refused.closed().await;
-        assert!(closed.to_string().contains("not paired"), "{closed}");
 
         assert_eq!(a.state().remove("second & unicode λ").unwrap(), 1);
         host.refresh_peers();
@@ -423,4 +420,419 @@ async fn pairing_sanitizes_device_names_before_storing() {
     })
     .await
     .expect("name sanitation test deadline");
+}
+
+fn assert_members(temp: &Temp, nodes: &[&Link]) {
+    let peers = temp.state().peers().unwrap();
+    assert_eq!(peers.len(), nodes.len(), "{peers:?}");
+    for node in nodes {
+        let peer = peers
+            .iter()
+            .find(|p| p.id == node.endpoint().id().to_string())
+            .unwrap();
+        assert!(peer.ticket.is_some());
+        assert_eq!(peer.addr().unwrap().id, node.endpoint().id());
+    }
+}
+
+#[tokio::test]
+async fn three_members_mesh_tickets_allow_guest_to_guest_forwarding() {
+    timeout(Duration::from_secs(30), async {
+        let (a, b, c) = (Temp::new(), Temp::new(), Temp::new());
+        let listener = UnixListener::bind(c.0.join("echo.sock")).unwrap();
+        let echo_task = tokio::spawn(echo(listener));
+        let first = node(&a, "first", false).await;
+        let second = node(&b, "second", false).await;
+        let third = node(&c, "third", true).await;
+        paired(&a, &first, &second).await;
+        paired(&a, &first, &third).await;
+        first.sync_peers().await.unwrap();
+        second.sync_peers().await.unwrap();
+        third.sync_peers().await.unwrap();
+        assert_members(&a, &[&second, &third]);
+        assert_members(&b, &[&first, &third]);
+        assert_members(&c, &[&first, &second]);
+        let peer = b
+            .state()
+            .peers()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == third.endpoint().id().to_string())
+            .unwrap();
+        let connection = second
+            .endpoint()
+            .connect(peer.addr().unwrap(), FORWARD)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"mesh bytes").await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(100).await.unwrap(), b"mesh bytes");
+        first.shutdown().await;
+        second.shutdown().await;
+        third.shutdown().await;
+        echo_task.abort();
+    })
+    .await
+    .expect("three member deadline");
+}
+
+#[tokio::test]
+async fn offline_member_startup_catches_joins_and_removals_without_resurrection() {
+    timeout(Duration::from_secs(60), async {
+        let (a, b, c, d) = (Temp::new(), Temp::new(), Temp::new(), Temp::new());
+        let echo_task = tokio::spawn(echo(UnixListener::bind(a.0.join("echo.sock")).unwrap()));
+        let first = node(&a, "first", true).await;
+        let fourth = node(&d, "fourth", false).await;
+        paired(&a, &first, &fourth).await;
+        fourth.shutdown().await;
+        let second = node(&b, "second", false).await;
+        let third = node(&c, "third", false).await;
+        paired(&a, &first, &second).await;
+        paired(&a, &first, &third).await;
+        let fourth = node(&d, "fourth", false).await;
+        assert_members(&d, &[&first, &second, &third]);
+        // Explicit exchanges finish dissemination deterministically.
+        fourth.sync_peers().await.unwrap();
+        second.sync_peers().await.unwrap();
+        third.sync_peers().await.unwrap();
+        assert_members(&d, &[&first, &second, &third]);
+        assert_members(&b, &[&first, &third, &fourth]);
+        assert_members(&c, &[&first, &second, &fourth]);
+        let connection = second
+            .endpoint()
+            .connect(addr(&first), FORWARD)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"live").await.unwrap();
+        let mut bytes = [0; 4];
+        recv.read_exact(&mut bytes).await.unwrap();
+        fourth.shutdown().await;
+        assert_eq!(
+            arca_link::remove_running(&a.state(), "second")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(connection.closed().await.to_string().contains("not paired"));
+        assert!(recv.read_exact(&mut bytes).await.is_err());
+        first.sync_peers().await.unwrap();
+        third.sync_peers().await.unwrap();
+        assert!(
+            !c.state()
+                .peers()
+                .unwrap()
+                .iter()
+                .any(|p| p.name == "second")
+        );
+        let fourth = node(&d, "fourth", false).await;
+        fourth.sync_peers().await.unwrap();
+        assert_members(&d, &[&first, &third]);
+        assert!(fs::read(d.0.join("removed.json")).unwrap().len() > 2);
+        // A removed member cannot use an old snapshot to reintroduce itself.
+        second.sync_peers().await.unwrap();
+        fourth.sync_peers().await.unwrap();
+        assert_members(&d, &[&first, &third]);
+        fourth.shutdown().await;
+        let fourth = node(&d, "fourth", false).await;
+        assert_members(&d, &[&first, &third]);
+        first.shutdown().await;
+        second.shutdown().await;
+        third.shutdown().await;
+        fourth.shutdown().await;
+        echo_task.abort();
+    })
+    .await
+    .expect("offline member deadline");
+}
+
+#[tokio::test]
+async fn mesh_introductions_cross_a_member_that_is_not_the_pairing_host() {
+    timeout(Duration::from_secs(80), async {
+        let (a, b, c, d) = (Temp::new(), Temp::new(), Temp::new(), Temp::new());
+        let second = node(&b, "second", false).await;
+        let third = node(&c, "third", false).await;
+        paired(&b, &second, &third).await;
+        third.shutdown().await;
+        let first = node(&a, "first", false).await;
+        let fourth = node(&d, "fourth", false).await;
+        paired(&a, &first, &fourth).await;
+        paired(&a, &first, &second).await;
+        second.sync_peers().await.unwrap();
+        assert!(
+            b.state()
+                .peers()
+                .unwrap()
+                .iter()
+                .any(|p| p.id == fourth.endpoint().id().to_string() && p.ticket.is_some())
+        );
+        first.shutdown().await;
+        fourth.shutdown().await;
+        // C still only knows B. A and D are offline throughout C's catch-up,
+        // so their records must travel A -> B -> C, never directly from A.
+        assert_eq!(c.state().peers().unwrap().len(), 1);
+        assert_eq!(
+            c.state().peers().unwrap()[0].id,
+            second.endpoint().id().to_string()
+        );
+        let third = node(&c, "third", false).await;
+        let peers = c.state().peers().unwrap();
+        assert_eq!(peers.len(), 3);
+        for name in ["first", "second", "fourth"] {
+            assert!(peers.iter().any(|p| p.name == name && p.ticket.is_some()));
+        }
+        second.shutdown().await;
+        third.shutdown().await;
+    })
+    .await
+    .expect("transitive mesh deadline");
+}
+
+#[tokio::test]
+async fn mesh_lines_are_bounded_and_malformed_requests_do_not_mutate_state() {
+    timeout(Duration::from_secs(20), async {
+        let (a, b) = (Temp::new(), Temp::new());
+        let host = node(&a, "first", false).await;
+        let guest = node(&b, "second", false).await;
+        paired(&a, &host, &guest).await;
+        for line in [vec![b'x'; 64 * 1024], b"{bad}\n".to_vec(), b"{}\n".to_vec(), b"{\"peers\":[{\"id\":\"bad\",\"name\":\"x\",\"paired\":0,\"seen\":0}],\"removed\":[]}\n".to_vec()] {
+            let connection = guest.endpoint().connect(addr(&host), arca_link::PEERS_ALPN).await.unwrap();
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            send.write_all(&line).await.unwrap();
+            send.finish().unwrap();
+            assert!(recv.read_to_end(64 * 1024).await.is_err());
+            assert_members(&a, &[&guest]);
+        }
+        let mut boundary = b"{\"peers\":[],\"removed\":[]}".to_vec();
+        boundary.resize(64 * 1024 - 1, b' ');
+        boundary.push(b'\n');
+        let connection = guest.endpoint().connect(addr(&host), arca_link::PEERS_ALPN).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&boundary).await.unwrap();
+        send.finish().unwrap();
+        assert!(!recv.read_to_end(64 * 1024).await.unwrap().is_empty());
+        connection.close(0u32.into(), b"done");
+        // A legal snapshot larger than the pairing bound still works.
+        let peer = a.state().peers().unwrap().remove(0);
+        let snapshot = serde_json::json!({"peers": vec![peer; 20], "removed": []});
+        let mut line = serde_json::to_vec(&snapshot).unwrap();
+        assert!(line.len() > 4096 && line.len() < 64 * 1024);
+        line.push(b'\n');
+        let connection = guest.endpoint().connect(addr(&host), arca_link::PEERS_ALPN).await.unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(&line).await.unwrap();
+        send.finish().unwrap();
+        assert!(!recv.read_to_end(64 * 1024).await.unwrap().is_empty());
+        host.shutdown().await;
+        guest.shutdown().await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn forwarded_stream_cap_backpressures_and_every_stream_round_trips() {
+    timeout(Duration::from_secs(20), async {
+        let (a, b) = (Temp::new(), Temp::new());
+        let listener = UnixListener::bind(a.0.join("echo.sock")).unwrap();
+        let host = node(&a, "first", true).await;
+        let guest = node(&b, "second", false).await;
+        paired(&a, &host, &guest).await;
+        let (accepted, mut accepts) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let echo_task = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    socket = listener.accept() => {
+                        let (mut socket, _) = socket.unwrap();
+                        accepted.send(()).unwrap();
+                        let mut released = released.clone();
+                        tasks.spawn(async move {
+                            if !*released.borrow_and_update() { released.changed().await.unwrap(); }
+                            let (mut read, mut write) = socket.split();
+                            tokio::io::copy(&mut read, &mut write).await.unwrap();
+                        });
+                    }
+                    _ = tasks.join_next(), if !tasks.is_empty() => {}
+                }
+            }
+        });
+        let connection = guest
+            .endpoint()
+            .connect(addr(&host), FORWARD)
+            .await
+            .unwrap();
+        let mut streams = tokio::task::JoinSet::new();
+        for index in 0..40u8 {
+            let connection = connection.clone();
+            streams.spawn(async move {
+                let (mut send, mut recv) = connection.open_bi().await.unwrap();
+                send.write_all(&[index]).await.unwrap();
+                send.finish().unwrap();
+                assert_eq!(recv.read_to_end(10).await.unwrap(), [index]);
+            });
+        }
+        for _ in 0..arca_link::FORWARDED_STREAM_LIMIT {
+            accepts.recv().await.unwrap();
+        }
+        assert!(
+            timeout(Duration::from_millis(100), accepts.recv())
+                .await
+                .is_err(),
+            "a seventeenth socket must wait"
+        );
+        release.send(true).unwrap();
+        while let Some(result) = streams.join_next().await {
+            result.unwrap();
+        }
+        // The same connection keeps working after draining the concurrent batch.
+        for index in 0..20u8 {
+            let (mut send, mut recv) = connection.open_bi().await.unwrap();
+            send.write_all(&[index]).await.unwrap();
+            send.finish().unwrap();
+            assert_eq!(recv.read_to_end(10).await.unwrap(), [index]);
+        }
+        host.shutdown().await;
+        guest.shutdown().await;
+        echo_task.abort();
+    })
+    .await
+    .expect("stream cap deadline");
+}
+
+#[tokio::test]
+async fn pending_connection_guard_refuses_fifth_and_stream_releases_a_slot() {
+    timeout(Duration::from_secs(8), async {
+        let (a, b) = (Temp::new(), Temp::new());
+        let echo_task = tokio::spawn(echo(UnixListener::bind(a.0.join("echo.sock")).unwrap()));
+        let host = node(&a, "first", true).await;
+        let guest = node(&b, "second", false).await;
+        paired(&a, &host, &guest).await;
+        let mut pending = Vec::new();
+        for _ in 0..4 {
+            pending.push(
+                guest
+                    .endpoint()
+                    .connect(addr(&host), FORWARD)
+                    .await
+                    .unwrap(),
+            );
+        }
+        match guest.endpoint().connect(addr(&host), FORWARD).await {
+            Err(_) => {}
+            Ok(connection) => {
+                connection.closed().await;
+            }
+        }
+        let (mut send, mut recv) = pending[0].open_bi().await.unwrap();
+        send.write_all(b"trust").await.unwrap();
+        let mut bytes = [0; 5];
+        recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"trust");
+        let admitted = guest
+            .endpoint()
+            .connect(addr(&host), FORWARD)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = admitted.open_bi().await.unwrap();
+        send.write_all(b"next").await.unwrap();
+        send.finish().unwrap();
+        assert_eq!(recv.read_to_end(10).await.unwrap(), b"next");
+        host.shutdown().await;
+        guest.shutdown().await;
+        echo_task.abort();
+    })
+    .await
+    .expect("pending guard test must finish before the handshake deadline");
+}
+
+#[tokio::test]
+async fn all_link_state_files_have_private_modes() {
+    let (a, b) = (Temp::new(), Temp::new());
+    let host = node(&a, "first", false).await;
+    let guest = node(&b, "second", false).await;
+    paired(&a, &host, &guest).await;
+    a.state().pair(10).unwrap();
+    a.state().remove("second").unwrap();
+    for name in [
+        "secret.key",
+        "peers.json",
+        "status.json",
+        "pairing.json",
+        "removed.json",
+    ] {
+        assert_eq!(
+            fs::metadata(a.0.join(name)).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{name}"
+        );
+    }
+    host.shutdown().await;
+    guest.shutdown().await;
+}
+
+#[test]
+fn state_directory_is_created_private_and_refuses_group_or_other_permissions() {
+    let temp = Temp::new();
+    let dir = temp.0.join("new");
+    State::new(&dir).unwrap();
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for mode in [0o701, 0o702, 0o704, 0o710, 0o720, 0o740] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        let error = State::new(&dir).err().unwrap();
+        assert!(matches!(error, arca_link::Error::Config(_)));
+        assert_eq!(
+            error.to_string(),
+            "link state directory must have mode 0700"
+        );
+    }
+}
+
+#[tokio::test]
+async fn online_mesh_removal_reaches_all_members_and_closes_forwarded_stream() {
+    timeout(Duration::from_secs(30), async {
+        let (a, b, c, d) = (Temp::new(), Temp::new(), Temp::new(), Temp::new());
+        let echo_task = tokio::spawn(echo(UnixListener::bind(a.0.join("echo.sock")).unwrap()));
+        let first = node(&a, "first", true).await;
+        let second = node(&b, "second", false).await;
+        let third = node(&c, "third", false).await;
+        let fourth = node(&d, "fourth", false).await;
+        paired(&a, &first, &second).await;
+        paired(&a, &first, &third).await;
+        paired(&a, &first, &fourth).await;
+        first.sync_peers().await.unwrap();
+        let connection = second
+            .endpoint()
+            .connect(addr(&first), FORWARD)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+        send.write_all(b"live").await.unwrap();
+        let mut bytes = [0; 4];
+        recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(
+            arca_link::remove_running(&a.state(), "second")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(connection.closed().await.to_string().contains("not paired"));
+        assert!(recv.read_exact(&mut bytes).await.is_err());
+        first.sync_peers().await.unwrap();
+        third.sync_peers().await.unwrap();
+        fourth.sync_peers().await.unwrap();
+        assert_members(&a, &[&third, &fourth]);
+        assert_members(&c, &[&first, &fourth]);
+        assert_members(&d, &[&first, &third]);
+        first.shutdown().await;
+        second.shutdown().await;
+        third.shutdown().await;
+        fourth.shutdown().await;
+        echo_task.abort();
+    })
+    .await
+    .expect("online removal deadline");
 }

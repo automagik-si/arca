@@ -133,7 +133,12 @@ impl State {
         })
     }
 
-    pub(crate) fn redeem(&self, id: EndpointId, request: Request) -> Result<Response> {
+    pub(crate) fn redeem(
+        &self,
+        id: EndpointId,
+        request: Request,
+        ticket: Option<String>,
+    ) -> Result<Response> {
         let _lock = self.lock()?;
         let Some(mut pending): Option<Pending> = self.read("pairing.json")? else {
             return Ok(Response::refused("no pending code"));
@@ -165,7 +170,7 @@ impl State {
         } else {
             device
         };
-        self.add_locked(id, device)?;
+        self.add_locked(id, device, ticket)?;
         Ok(Response {
             ok: true,
             name: Some(pending.name),
@@ -199,25 +204,40 @@ impl Response {
 }
 
 pub(crate) async fn read_line<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<u8>> {
+    read_line_bounded(recv, 4096).await
+}
+
+pub(crate) async fn read_line_bounded<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    limit: usize,
+) -> Result<Vec<u8>> {
     let mut line = Vec::new();
-    for _ in 0..4096 {
+    for _ in 0..limit {
         let byte = runtime(recv.read_u8().await)?;
         if byte == b'\n' {
             return Ok(line);
         }
         line.push(byte);
     }
-    Err(Error::Runtime("link JSON line exceeds 4096 bytes"))
+    Err(Error::Runtime("link JSON line exceeds limit"))
 }
 
 pub(crate) async fn write_line<W: AsyncWrite + Unpin, T: Serialize>(
     send: &mut W,
     value: &T,
 ) -> Result<()> {
+    write_line_bounded(send, value, 4096).await
+}
+
+pub(crate) async fn write_line_bounded<W: AsyncWrite + Unpin, T: Serialize>(
+    send: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<()> {
     let mut bytes = runtime(serde_json::to_vec(value))?;
     bytes.push(b'\n');
-    if bytes.len() > 4096 {
-        return Err(Error::Runtime("link JSON line exceeds 4096 bytes"));
+    if bytes.len() > limit {
+        return Err(Error::Runtime("link JSON line exceeds limit"));
     }
     runtime(send.write_all(&bytes).await)
 }
@@ -252,7 +272,11 @@ pub(crate) async fn join(
             let host_name = response
                 .name
                 .ok_or(Error::Runtime("invalid pairing reply"))?;
-            state.add(connection.remote_id().to_string(), host_name)
+            state.add(
+                connection.remote_id().to_string(),
+                host_name,
+                Some(link.ticket.to_string()),
+            )
         }
         .await;
         connection.close(0u32.into(), b"done");

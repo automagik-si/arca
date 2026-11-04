@@ -1,16 +1,20 @@
 //! One node endpoint, one-time pairing and opaque streams to local unix sockets.
 
 mod guard;
+mod mesh;
 mod pairing;
 mod server;
 mod state;
 
 pub use pairing::{PairLink, PairOutput, qr};
-pub use server::{Link, Network, join_running};
+pub use server::{Link, Network, join_running, remove_running};
 pub use state::{Peer, State, Status};
 
 use serde::Deserialize;
 use std::{collections::BTreeMap, fmt, path::PathBuf};
+
+pub const PEERS_ALPN: &[u8] = b"arca/peers/1";
+pub const FORWARDED_STREAM_LIMIT: usize = 16;
 
 pub const PAIR_ALPN: &[u8] = b"arca/pair/1";
 
@@ -22,6 +26,9 @@ pub struct Config {
     #[serde(default)]
     pub forward: BTreeMap<String, PathBuf>,
     pub pair_minutes: Option<u64>,
+    /// Bind only loopback, with discovery and relays disabled.
+    #[serde(default)]
+    pub local_only: bool,
 }
 
 impl Config {

@@ -2,12 +2,14 @@
 
 use crate::{Error, Result, now_ms, runtime};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use iroh::SecretKey;
+use iroh::{EndpointAddr, SecretKey};
+use iroh_tickets::endpoint::EndpointTicket;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::PathBuf,
 };
 
@@ -17,6 +19,38 @@ pub struct Peer {
     pub name: String,
     pub paired: u64,
     pub seen: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+}
+
+impl Peer {
+    pub fn addr(&self) -> Result<EndpointAddr> {
+        let id = runtime(self.id.parse())?;
+        match &self.ticket {
+            Some(ticket) => {
+                let ticket: EndpointTicket = runtime(ticket.parse())?;
+                if ticket.endpoint_addr().id != id {
+                    return Err(Error::Runtime("peer ticket identity mismatch"));
+                }
+                Ok(ticket.endpoint_addr().clone())
+            }
+            None => Ok(EndpointAddr::new(id)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Removed {
+    pub id: String,
+    pub at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Snapshot {
+    pub peers: Vec<Peer>,
+    pub removed: Vec<Removed>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,7 +78,15 @@ pub struct State {
 impl State {
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self> {
         let state = Self { dir: dir.into() };
-        runtime(fs::create_dir_all(&state.dir))?;
+        runtime(
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&state.dir),
+        )?;
+        if runtime(fs::metadata(&state.dir))?.permissions().mode() & 0o077 != 0 {
+            return Err(Error::Config("link state directory must have mode 0700"));
+        }
         Ok(state)
     }
 
@@ -127,23 +169,38 @@ impl State {
         Ok(self.read("peers.json")?.unwrap_or_default())
     }
 
-    pub(crate) fn add(&self, id: String, name: String) -> Result<Peer> {
+    pub(crate) fn add(&self, id: String, name: String, ticket: Option<String>) -> Result<Peer> {
         let _lock = self.lock()?;
-        self.add_locked(id, name)
+        self.add_locked(id, name, ticket)
     }
 
-    pub(crate) fn add_locked(&self, id: String, name: String) -> Result<Peer> {
+    pub(crate) fn add_locked(
+        &self,
+        id: String,
+        name: String,
+        ticket: Option<String>,
+    ) -> Result<Peer> {
         let mut peers = self.peers()?;
         let now = now_ms();
-        let paired = peers.iter().find(|p| p.id == id).map_or(now, |p| p.paired);
+        let mut removed = self.removed()?;
+        let paired = now
+            .max(removed.remove(&id).unwrap_or(0).saturating_add(1))
+            .max(
+                peers
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map_or(0, |p| p.paired.saturating_add(1)),
+            );
         peers.retain(|p| p.id != id);
         let peer = Peer {
             id,
             name,
             paired,
             seen: now,
+            ticket,
         };
         peers.push(peer.clone());
+        self.write("removed.json", &removed)?;
         self.write("peers.json", &peers)?;
         Ok(peer)
     }
@@ -163,9 +220,80 @@ impl State {
         let _lock = self.lock()?;
         let mut peers = self.peers()?;
         let before = peers.len();
+        let mut removed = self.removed()?;
+        for peer in peers.iter().filter(|p| p.name == name) {
+            let at = now_ms().max(peer.paired);
+            removed
+                .entry(peer.id.clone())
+                .and_modify(|old| *old = (*old).max(at))
+                .or_insert(at);
+        }
         peers.retain(|p| p.name != name);
+        self.write("removed.json", &removed)?;
         self.write("peers.json", &peers)?;
         Ok(before - peers.len())
+    }
+
+    fn removed(&self) -> Result<BTreeMap<String, u64>> {
+        Ok(self.read("removed.json")?.unwrap_or_default())
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<Snapshot> {
+        let _lock = self.lock()?;
+        Ok(Snapshot {
+            peers: self.peers()?,
+            removed: self
+                .removed()?
+                .into_iter()
+                .map(|(id, at)| Removed { id, at })
+                .collect(),
+        })
+    }
+
+    /// Any admitted member may introduce peers. Validate before mutating any state.
+    pub(crate) fn merge(&self, snapshot: Snapshot, own_id: &str) -> Result<bool> {
+        for peer in &snapshot.peers {
+            peer.addr()?;
+        }
+        for removed in &snapshot.removed {
+            runtime(removed.id.parse::<iroh::EndpointId>())?;
+        }
+        let _lock = self.lock()?;
+        let mut peers = self.peers()?;
+        let mut removed = self.removed()?;
+        let before = (peers.clone(), removed.clone());
+        for tombstone in snapshot.removed {
+            removed
+                .entry(tombstone.id)
+                .and_modify(|at| *at = (*at).max(tombstone.at))
+                .or_insert(tombstone.at);
+        }
+        for peer in snapshot.peers {
+            if peer.id == own_id {
+                continue;
+            }
+            if let Some(existing) = peers.iter_mut().find(|p| p.id == peer.id) {
+                if peer.paired > existing.paired {
+                    *existing = peer;
+                }
+            } else {
+                peers.push(peer);
+            }
+        }
+        peers.retain(|peer| match removed.get(&peer.id) {
+            Some(at) if *at >= peer.paired => false,
+            Some(_) => {
+                removed.remove(&peer.id);
+                true
+            }
+            None => true,
+        });
+        let changed = before != (peers.clone(), removed.clone());
+        if changed {
+            self.write("removed.json", &removed)?;
+            self.write("peers.json", &peers)?;
+        }
+        Ok(changed)
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -184,5 +312,66 @@ impl State {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(Error::Runtime("cannot remove link state")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_timestamps_tombstones_and_legacy_records() {
+        let mut bytes = [0; 32];
+        getrandom::fill(&mut bytes).unwrap();
+        let id = SecretKey::from_bytes(&bytes).public().to_string();
+        let dir =
+            std::env::temp_dir().join(format!("arca-merge-{}", URL_SAFE_NO_PAD.encode(bytes)));
+        let state = State::new(&dir).unwrap();
+        let legacy = serde_json::json!({"id": id, "name": "first", "paired": 10, "seen": 11});
+        let peer: Peer = serde_json::from_value(legacy).unwrap();
+        assert!(peer.ticket.is_none());
+        assert!(serde_json::to_value(&peer).unwrap().get("ticket").is_none());
+        assert_eq!(peer.addr().unwrap(), EndpointAddr::new(id.parse().unwrap()));
+        let snapshot = |peers, at| Snapshot {
+            peers,
+            removed: vec![Removed { id: id.clone(), at }],
+        };
+        state
+            .merge(snapshot(vec![peer.clone()], 9), "self")
+            .unwrap();
+        assert_eq!(state.peers().unwrap(), vec![peer.clone()]);
+        assert!(state.removed().unwrap().is_empty());
+        let mut older = peer.clone();
+        older.name = "older".to_string();
+        older.paired = 9;
+        state
+            .merge(
+                Snapshot {
+                    peers: vec![older],
+                    removed: vec![],
+                },
+                "self",
+            )
+            .unwrap();
+        assert_eq!(state.peers().unwrap(), vec![peer.clone()]);
+        state.merge(snapshot(vec![], 10), "self").unwrap();
+        assert!(state.peers().unwrap().is_empty());
+        state
+            .merge(snapshot(vec![peer.clone()], 9), "self")
+            .unwrap();
+        assert!(state.peers().unwrap().is_empty());
+        let mut newer = peer;
+        newer.paired = 11;
+        state
+            .merge(snapshot(vec![newer.clone()], 10), "self")
+            .unwrap();
+        assert_eq!(state.peers().unwrap(), vec![newer]);
+        assert!(state.removed().unwrap().is_empty());
+        state.remove("first").unwrap();
+        assert!(!state.removed().unwrap().is_empty());
+        let added = state.add(id.clone(), "first".to_string(), None).unwrap();
+        assert!(state.removed().unwrap().is_empty());
+        assert!(added.paired > 11);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
