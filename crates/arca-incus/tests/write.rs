@@ -408,6 +408,43 @@ fn create_with_waits(waits: Vec<Value>) -> (Result<Owned, IncusError>, usize) {
 }
 
 #[test]
+fn instance_create_starts_by_default_and_respects_explicit_false() {
+    let (_dir, fake) = start("create-start");
+    let writer = writer(&fake, "toy");
+    for (name, start, status) in [
+        ("default-start", None, "Running"),
+        ("explicit-start", Some(true), "Running"),
+        ("explicit-stop", Some(false), "Stopped"),
+    ] {
+        let mut body = marked();
+        if let Some(start) = start {
+            body["start"] = json!(start);
+        }
+        writer
+            .create(&target(IncusKind::Instance, "svc", name, None), &body)
+            .unwrap();
+        let state = UnixIncus::new(fake.socket().into())
+            .get(&format!("/1.0/instances/{name}/state?project=svc"))
+            .unwrap();
+        assert_eq!(state["status"], status, "{name}");
+    }
+    let acl = writer
+        .create(
+            &target(IncusKind::Acl, "default", "no-start", None),
+            &marked(),
+        )
+        .unwrap();
+    assert!(
+        writer
+            .get_etag(acl.target())
+            .unwrap()
+            .0
+            .get("start")
+            .is_none()
+    );
+}
+
+#[test]
 fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
     let (_dir, fake) = start("roundtrip");
     let writer = writer(&fake, "toy");
@@ -436,7 +473,12 @@ fn each_kind_round_trips_through_create_patch_tombstone_and_delete() {
             _ => "svc",
         };
         let target = target(kind, project, name, parent);
-        let created = writer.create(&target, &marked()).expect("create");
+        let mut body = marked();
+        if kind == IncusKind::Instance {
+            // This round trip deletes the instance without a stop operation.
+            body["start"] = json!(false);
+        }
+        let created = writer.create(&target, &body).expect("create");
         assert_eq!(created.entry(), &EntryId("toy".to_string()), "{kind:?}");
         assert_eq!(
             created.uuid().is_some(),

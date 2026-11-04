@@ -275,7 +275,7 @@ impl UnixIncusWriter {
     /// when it has one, must be an image. Every key in the body, at any depth, must be plain ASCII, and the body's config may
     /// not set a `volatile.*` key. The body's config must class as this entry's own, so the object belongs to the entry from
     /// the moment it exists. The name must be free: its GET must answer 404. The POST is then sent, and the object is read
-    /// back, which must class as this entry's own.
+    /// back, which must class as this entry's own. An instance starts by default unless its body explicitly sets `start: false`.
     pub fn create(&self, target: &Target, body: &Value) -> Result<Owned, IncusError> {
         self.allow_target(target)?;
         if target.uuid.is_some() {
@@ -310,6 +310,9 @@ impl UnixIncusWriter {
         }
         let mut sent = fields.clone();
         sent.insert("name".to_string(), json!(target.name));
+        if target.kind == IncusKind::Instance {
+            sent.entry("start").or_insert(json!(true));
+        }
         if target.kind == IncusKind::Forward {
             sent.insert("listen_address".to_string(), json!(target.name));
         }

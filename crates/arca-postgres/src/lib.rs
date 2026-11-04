@@ -117,7 +117,8 @@ impl Plugin for Postgres {
             rules.push(json!({"action":"allow","source":format!("{ip}/32"),"protocol":"tcp","destination_port":"5432","state":"enabled"}));
         }
         let acl = format!("postgres-{}", cfg.name);
-        if observed(ctx, format!("/1.0/network-acls/{acl}?project=default"))?.is_none() {
+        let current = observed(ctx, format!("/1.0/network-acls/{acl}?project=default"))?;
+        if current.is_none() {
             create(
                 ctx,
                 IncusKind::Acl,
@@ -126,11 +127,19 @@ impl Plugin for Postgres {
                 json!({"name":acl,"config":{},"ingress":[],"egress":[]}),
             )?;
         }
-        ctx.effect(EffectOp::IncusPatchAclField {
-            object: object(IncusKind::Acl, "default", &acl),
-            field: AclField::Ingress,
-            rules,
-        })?;
+        // A new ACL has empty ingress; an existing ACL uses the observed array.
+        // Avoid journalling an intent when the requested rules already hold.
+        let patch_needed = match current {
+            Some(acl) => acl["ingress"].as_array() != Some(&rules),
+            None => !rules.is_empty(),
+        };
+        if patch_needed {
+            ctx.effect(EffectOp::IncusPatchAclField {
+                object: object(IncusKind::Acl, "default", &acl),
+                field: AclField::Ingress,
+                rules,
+            })?;
+        }
         if observed(
             ctx,
             format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),

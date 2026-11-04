@@ -105,7 +105,7 @@ impl Plugin for Patcher {
             project: PROJECT.to_string(),
             parent: None,
             name: box_name.clone(),
-            body: json!({ "name": box_name, "config": {} }),
+            body: json!({ "name": box_name, "start": false, "config": {} }),
         })?;
         ctx.effect(EffectOp::IncusPatchConfig {
             object: acl_made,

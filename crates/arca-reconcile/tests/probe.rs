@@ -220,6 +220,15 @@ fn present(fake: &arca_incus::FakeIncus, object: &ObjectRef) -> bool {
     get(fake, &path_of(object)).is_some()
 }
 
+/// Kernel creates start by default; deletion fixtures must stop their instance.
+fn stop_probe(fake: &arca_incus::FakeIncus) {
+    let path = format!("/1.0/instances/probe-box/state?project={PROJECT}");
+    assert_eq!(get(fake, &path).unwrap()["status"], "Running");
+    let (status, _) = raw(fake, "PUT", &path, Some(&json!({"action":"stop"})));
+    assert_eq!(status, 202);
+    assert_eq!(get(fake, &path).unwrap()["status"], "Stopped");
+}
+
 /// The place an object names, without its uuid.
 fn place(object: &ObjectRef) -> (IncusKind, String, Option<String>, String) {
     (
@@ -352,6 +361,7 @@ fn kill_then_restart(case: Option<(usize, Phase)>) {
         "the instance's image was pulled into the probe project's own store"
     );
 
+    stop_probe(&fake);
     // Removal goes through the journalled retirement: class-A objects revert at once and class-B objects run under an approval.
     let key = SkKey::from_seed(7);
     let mut verifier: ApprovalVerifier<SshSigVerifier, FileNonces> =
@@ -737,6 +747,7 @@ fn the_journal_an_earlier_probe_left_is_removed_to_nothing_and_a_fresh_probe_the
         rows.iter().all(|row| row.outcome == ProbeOutcome::Created),
         "{rows:?}"
     );
+    stop_probe(&fake);
     let run = reconciler
         .probe_remove(
             &spec,
