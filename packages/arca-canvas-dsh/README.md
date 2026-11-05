@@ -56,7 +56,7 @@ Mint a viewer token using the existing Arca configuration:
 
 ```sh
 arca token mint --scope viewer --id canvas-viewer \
-  --out /path/to/arca-viewer.token --config /path/to/arca.toml
+  --out /path/to/arca-viewer.token --config /path/to/arca.json
 ```
 
 Arca writes the secret directly into a new `0400` file and stores its hash in the
