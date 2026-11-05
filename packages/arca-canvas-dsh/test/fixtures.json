@@ -1,6 +1,6 @@
 {
   "arca_status": {"version":"0.1.0","node":"example-node","mode":"watch-only","uptimeS":90,"incusReachable":true,"appliedSeq":null},
-  "watch_report": {"at":1234,"projects":[{"project":"default","instances":[{"name":"worker","kind":"virtual-machine","status":"Running","owner":"foreign","privileged":false,"identity":false,"configHash":"example"}]},{"project":"sandbox","instances":[{"name":"worker","kind":"container","status":"Stopped","owner":"foreign","privileged":false,"identity":false,"configHash":"example"}]}],"drift":[]},
+  "watch_report": {"at":1234,"projects":[{"project":"default","instances":[{"name":"worker","kind":"virtual-machine","status":"Running","owner":{"class":"foreign"},"privileged":false,"identity":false,"configHash":"example"}]},{"project":"sandbox","instances":[{"name":"worker","kind":"container","status":"Stopped","owner":{"class":"foreign"},"privileged":false,"identity":false,"configHash":"example"}]}],"drift":[]},
   "postgres_list": {"databases":[{"name":"example-db","entry":"example-db","status":"pending","address":null,"port":5432,"links":[]}]},
   "node_metrics": {"at":1234,"minutes":5,"latest":null,"mean":null},
   "alerts_list": {"firing":[],"unknown":[],"resolvedRecent":[],"healthLine":"ok"},

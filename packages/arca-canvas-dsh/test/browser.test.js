@@ -51,6 +51,9 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     await page.goto(`${origin}/arca-canvas`);
     await page.waitForFunction(() => document.querySelector('[data-kind="machine"]')?.textContent.includes('example-node'));
     assert.equal(await page.locator('.arca-card').count(), 5);
+    const instanceText = await page.locator('[data-kind="instance"]').allTextContents();
+    assert.equal(instanceText.length, 2);
+    assert.ok(instanceText.every((value) => value.includes('Owner foreign') && !value.includes('[object Object]')));
     assert.equal(await page.locator('.arca-plans').getAttribute('href'), 'https://example.com/approve');
     assert.match(await page.locator('.arca-steps-placeholder').textContent(), /hidden/);
     const measured = await page.evaluate(() => {

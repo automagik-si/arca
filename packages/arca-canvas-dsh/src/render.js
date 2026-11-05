@@ -23,7 +23,7 @@ function cardContent(node, snapshot) {
     }
     case 'instance': return {
       title: text(row.name, 'Instance'), kind: text(row.kind, 'Instance'), icon: '◇',
-      lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner)}`, row.privileged ? 'Privileged' : 'Unprivileged'],
+      lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner?.class ?? row.owner, 'Not available')}`, row.privileged ? 'Privileged' : 'Unprivileged'],
       state: text(row.status, 'Unknown'), meta: row.identity ? 'Identity' : 'Instance',
     };
     case 'database': return {

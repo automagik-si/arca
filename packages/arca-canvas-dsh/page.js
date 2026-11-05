@@ -83,7 +83,7 @@
           title: text(row.name, "Instance"),
           kind: text(row.kind, "Instance"),
           icon: "\u25C7",
-          lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner)}`, row.privileged ? "Privileged" : "Unprivileged"],
+          lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner?.class ?? row.owner, "Not available")}`, row.privileged ? "Privileged" : "Unprivileged"],
           state: text(row.status, "Unknown"),
           meta: row.identity ? "Identity" : "Instance"
         };
