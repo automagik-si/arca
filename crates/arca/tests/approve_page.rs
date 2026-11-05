@@ -745,7 +745,7 @@ fn failed_display_leaves_no_valid_code_and_later_issuance_works() {
 }
 
 #[test]
-fn per_caller_lock_preserves_the_live_code_and_other_callers_budget() {
+fn locked_caller_is_refused_but_another_caller_enrols_with_the_same_live_code() {
     let (rig, key) = Rig::new_empty("page-callers");
     assert_eq!(
         rig.proxy_post(Some("caller-a"), "/approve/setup-code", json!({}))
@@ -774,14 +774,27 @@ fn per_caller_lock_preserves_the_live_code_and_other_callers_budget() {
     let (status, body) = rig.proxy_post(Some("caller-b"), "/approve/setup-code", json!({}));
     assert_eq!(status, 429);
     assert!(String::from_utf8_lossy(&body).contains("A code is already on your screen"));
+    let (status, body) = rig.proxy_post(
+        Some("caller-a"),
+        "/approve/register",
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(
+        status, 429,
+        "the correct code cannot bypass the caller lock"
+    );
+    assert!(String::from_utf8_lossy(&body).contains("Setup is locked for 60 more minute(s)"));
+    assert!(!rig.state_path().exists());
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
     assert_eq!(
         rig.proxy_post(
-            Some("caller-a"),
+            Some("caller-b"),
             "/approve/register",
             register_body(&key, Some(&code))
         )
         .0,
-        200
+        200,
+        "the caller lock does not invalidate the live code for another caller"
     );
 }
 
@@ -819,9 +832,9 @@ fn another_caller_can_issue_after_a_callers_live_code_expires() {
 }
 
 #[test]
-fn fifty_wrong_tries_lock_global_issuance_but_the_live_code_still_enrols() {
+fn fifty_wrong_tries_lock_global_issuance_and_refuse_the_correct_code() {
     let (rig, key) = Rig::new_empty("page-global-lock");
-    // Issue on the direct router, attack on the proxy router, enrol on the direct router: one shared state.
+    // Issue on the direct router and attack on the proxy router: the global lock covers both.
     assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
     let code = rig.last_code();
     for caller in 0..10 {
@@ -857,15 +870,24 @@ fn fifty_wrong_tries_lock_global_issuance_but_the_live_code_still_enrols() {
         .0,
         429
     );
-    assert_eq!(
-        rig.post(
+    let body = serde_json::to_vec(&register_body(&key, Some(&code))).expect("body");
+    for proxy in [false, true] {
+        let (status, body) = rig.request_on(
+            proxy,
+            Some("fresh-caller"),
+            "POST",
             "/approve/register",
             Some(ORIGIN),
-            register_body(&key, Some(&code))
-        )
-        .0,
-        200
-    );
+            &body,
+        );
+        assert_eq!(
+            status, 429,
+            "the correct code cannot bypass the global lock"
+        );
+        assert!(String::from_utf8_lossy(&body).contains("Setup is locked for 60 more minute(s)"));
+    }
+    assert!(!rig.state_path().exists());
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
 }
 
 #[test]

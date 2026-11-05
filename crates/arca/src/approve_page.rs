@@ -464,16 +464,17 @@ async fn register(
     }
     setup.prune(now);
     let caller = state.caller(&headers);
+    // Refuse locked callers before inspecting the code so the wrong-try budgets bound guessing.
+    if let Some(minutes) = setup
+        .locked_minutes(now)
+        .or_else(|| setup.caller_locked_minutes(&caller, now))
+    {
+        return locked(minutes);
+    }
     let correct = setup
         .live_if_fresh(now)
         .is_some_and(|live| setup_code == live.code);
     if !correct {
-        if let Some(minutes) = setup
-            .locked_minutes(now)
-            .or_else(|| setup.caller_locked_minutes(&caller, now))
-        {
-            return locked(minutes);
-        }
         if setup.live.is_none() {
             return (
                 StatusCode::FORBIDDEN,

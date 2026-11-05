@@ -441,9 +441,11 @@ To use it:
 
 The one-time setup code has 8 digits and expires after 10 minutes. Only one code can be live at a time, with one request
 per 60 seconds and 10 codes per rolling hour. Five wrong tries per caller address per rolling hour lock only that caller;
-the live code stays valid and a correct code still enrols. A global backstop of 50 wrong tries per rolling hour locks new
-issuance and further wrong attempts for everyone, while a live correct code still enrols. The proxy listener uses the last
-non-empty `X-Forwarded-For` address (or a shared unknown caller when absent); unix and tailnet share one direct caller budget.
+a locked caller is refused even with the correct code. A global backstop of 50 wrong tries per rolling hour locks new
+issuance and all code submissions for everyone, including the correct code. A lock never invalidates the live code:
+another unlocked caller, or the same caller after its rolling-hour lock ends, can still use it if it has not expired.
+The proxy listener uses the last non-empty `X-Forwarded-For` address (or a shared unknown caller when absent); unix and
+tailnet share one direct caller budget.
 
 Once one passkey is trusted, no setup code is issued. Later passkeys are added from one already trusted, not with a code.
 `/etc/arca/owner-passkeys` remains readable as a developer option, never the owner path. The state passkeys file is owned by
