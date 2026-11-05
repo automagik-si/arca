@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arca_api::{Scope, Verb, VerbClass, conforms, verb, verbs};
-use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, serve_unix};
+use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_tools, serve_unix};
 use common::{
     Reply, Scratch, bearer, connect_unix, exchange, mint_into, post, rpc, wait_for_socket,
+    write_hash_file,
 };
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -101,6 +102,7 @@ struct Fixture {
     _scratch: Scratch,
     socket: PathBuf,
     viewer: String,
+    viewer_tools: String,
     doctor: String,
     operator: String,
     writes: Arc<Mutex<Vec<String>>>,
@@ -110,6 +112,9 @@ impl Fixture {
     fn start(tag: &str) -> Fixture {
         let scratch = Scratch::new(tag);
         let viewer = mint_into(scratch.path(), "v-viewer", Scope::Viewer);
+        let tools = vec!["arca_status".to_string(), "journal_list".to_string()];
+        let (viewer_tools, tools_text) = mint_with_tools(Scope::Viewer, Some(&tools));
+        write_hash_file(scratch.path(), "v-tools", &tools_text, 0o400);
         let doctor = mint_into(scratch.path(), "d-doctor", Scope::Doctor);
         let operator = mint_into(scratch.path(), "o-operator", Scope::Operator);
         let tokens = TokenStore::load(scratch.path()).expect("the store loads");
@@ -139,6 +144,7 @@ impl Fixture {
             _scratch: scratch,
             socket,
             viewer,
+            viewer_tools,
             doctor,
             operator,
             writes,
@@ -398,11 +404,34 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "arca_status",
             "node_metrics",
             "watch_report",
+            "journal_list",
             "plan_list",
             "alerts_list",
             "postgres_list",
             "ontology_query"
         ]
+    );
+}
+
+#[test]
+fn a_tools_allowlist_hides_and_refuses_every_verb_outside_it() {
+    let fx = Fixture::start("tools-allow");
+    let reply = fx.call(&fx.viewer_tools, "tools/list", json!({}));
+    assert_eq!(names_of(&reply), vec!["arca_status", "journal_list"]);
+    assert_eq!(
+        fx.tool_call(&fx.viewer_tools, "arca_status", json!({}))
+            .status,
+        200
+    );
+    assert_eq!(
+        fx.tool_call(&fx.viewer_tools, "node_metrics", json!({}))
+            .status,
+        403
+    );
+    assert_eq!(
+        fx.tool_call(&fx.viewer_tools, "token_list", json!({}))
+            .status,
+        403
     );
 }
 

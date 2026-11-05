@@ -11,14 +11,15 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
-| `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
+| `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
 | `arca link peers --config <file>` | the paired peers file | the peers array, as JSON |
 | `arca link remove [--] <name> --config <file>` | removes every peer with that name through the running link, or from disk when stopped | `{ "removed": <count> }` as JSON |
 | `arca call [--peer <name>] <verb> --config <file> --token-file <file>`, with `--args <json>` or `--args-file <file>` | one tool call against the local node, or through a paired peer with `--peer` | the verb's result, as JSON |
-| `arca token mint --scope <s> --id <id> --out <file>` with `--config <file>` or `--hash-dir <dir>` | nothing | the id and the scope |
+| `arca token mint --scope <s> --id <id> --out <file> [--tools <comma list>]` with `--config <file>` or `--hash-dir <dir>` | nothing | the id, scope and tool list |
+| `arca token revoke <id>` with `--config <file>` or `--hash-dir <dir>` | the token's hash file | the id and `revoked: true` |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
 
@@ -184,10 +185,12 @@ reads one hash file per token from `tokens.hashDir`:
 ```
 scope=viewer
 sha256=<64 lowercase hex digits>
+tools=service_list,service_logs,journal_list
 ```
 
 The file name is `<id>.hash`, and the id is 1 to 64 lowercase letters, digits or hyphens. The scopes are `viewer`, `doctor`
-and `operator`.
+and `operator`. The `tools=` line is optional; without it the token reaches every verb its scope admits, and with it the token
+reaches only those named tools. A tool above the scope is refused at mint, so the list only narrows.
 
 ### Modes and the umask
 
@@ -203,8 +206,9 @@ chmod 0700 /etc/arca/tokens
 Each hash file must be a regular file, not a symbolic link, mode exactly 0400, and owned by the server's user. A file of any
 other mode, owner or kind makes the whole load fail, and the message names the file, never its content.
 
-`arca token mint` writes both files at mode 0400, refuses to overwrite an existing id or output file, and removes its hash
-file if it cannot write the secret. It needs the token directory to exist and to have no group or other write bit. Create
+`arca token mint --tools <comma list>` writes the optional allowlist; an unknown name or one above the scope is refused with
+exit 2 before anything is written. `arca token mint` writes both files at mode 0400, refuses to overwrite an existing id or
+output file, and removes its hash file if it cannot write the secret. It needs the token directory to exist and to have no group or other write bit. Create
 the directory and mint into it before the mode is tightened to 0500, because a 0500 directory cannot take new files.
 
 ```sh
@@ -217,6 +221,13 @@ one is refused with exit 2 and nothing is written. Giving neither is refused wit
 
 **Run `arca token mint` as the user that runs `serve`.** A mint run as another user writes hash files owned by that user, and
 the server refuses every file it does not own, so the load fails until those files are minted again as the server's user.
+
+`arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
+config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
+`/proc`. The server writes that pid file only after its unix socket is serving and removes it only when it still holds its own
+pid. The answer carries `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With
+`--hash-dir` alone no state directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server
+keeps the token until it is restarted or signalled. The hash files stay mode 0400. The signal uses the host's `kill` command.
 
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
@@ -236,7 +247,7 @@ The secret file holds the secret and one newline. A client reads that file, stri
 ## The MCP server
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
-in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `plan_list`, `plan_decline` and
+in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`, `plan_decline` and
 `approval_submit`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
@@ -257,14 +268,21 @@ its request is read.
   object is reported as drift.
 - `alerts_list` answers the node's alerts: the firing ones, the unknown ones, the disabled rules, the resolves of the last
   24 hours and the store's health. It reads the newest published tick and never waits on Incus. See "Alerts".
-- `token_list` lists each token's id and scope as they were when the server started. It never lists a secret or a digest.
+- `token_list` lists each live token's id, scope and optional tool list. It never lists a secret or a digest.
 - `plan_list` lists each waiting delete plan with the statement its owner signs. See the next section.
 - `plan_decline` retains a waiting plan's objects. A decline is final and survives a restart.
 - `approval_submit` checks an owner's approval for a waiting plan and, when it holds, deletes the plan's objects once.
 
 `serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
+SIGHUP reloads the bearer token store only; it does not reread the node config or the owner passkeys.
 A socket that another server answers on is left alone.
+
+`journal_list` is a viewer read over the effect journal. It returns the newest record for each effect and pages by effect
+id with `after` and `limit` (default 100, maximum 500). Each record exposes only `id`, `entry`, `class`, `target`, `plugin`,
+`state`, `at_ms`, `intent` and `object`; it never exposes `pre_image`, `inverse` or `acl_patch`, which can hold rendered
+secrets. The read decodes the whole append-only file without the journal's open-time integrity checks, so a listing can show a
+sequence `serve` would refuse at open; its cost grows with history.
 
 ## Calling the server
 

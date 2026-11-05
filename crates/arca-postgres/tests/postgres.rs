@@ -150,6 +150,7 @@ impl Rig {
             &Caller {
                 token_id: "doctor".into(),
                 scope: Scope::Doctor,
+                tools: None,
             },
         )
     }
@@ -492,6 +493,7 @@ fn viewer_is_refused_by_every_postgres_write_handler() {
                 &Caller {
                     token_id: "viewer".into(),
                     scope: Scope::Viewer,
+                    tools: None,
                 },
             )
             .unwrap_err();
@@ -1108,6 +1110,7 @@ fn postgres_list_releases_kernel_lock_while_instance_state_get_is_stalled() {
             &Caller {
                 token_id: "viewer".into(),
                 scope: Scope::Viewer,
+                tools: None,
             },
         )
     });

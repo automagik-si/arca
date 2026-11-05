@@ -37,6 +37,7 @@ struct Node {
     socket: PathBuf,
     viewer: PathBuf,
     doctor: PathBuf,
+    operator: PathBuf,
     owner: SkKey,
 }
 
@@ -106,6 +107,7 @@ fn start_node_keys(tag: &str, signers: &str, passkeys: Option<&str>) -> Node {
     fs::set_permissions(&hash_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
     let viewer = mint(&scratch, &hash_dir, "viewer", "viewer-1");
     let doctor = mint(&scratch, &hash_dir, "doctor", "doctor-1");
+    let operator = mint(&scratch, &hash_dir, "operator", "operator-1");
 
     let socket = scratch.path("arca.sock");
     let config = scratch.path("node.json");
@@ -145,6 +147,7 @@ fn start_node_keys(tag: &str, signers: &str, passkeys: Option<&str>) -> Node {
         socket,
         viewer,
         doctor,
+        operator,
         owner,
     };
     wait_for(&mut node);
@@ -370,6 +373,37 @@ fn a_doctor_calling_token_list_is_refused_403_and_the_call_exits_4() {
     let node = start_node("doctor-operator");
     let out = call(&node, &node.doctor, "token_list", &["--args", "{}"]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn revoke_removes_the_token_and_a_live_serve_drops_it_without_a_restart() {
+    let node = start_node("revoke");
+    let before = call(&node, &node.viewer, "arca_status", &[]);
+    assert_eq!(code(&before), 0);
+    let out = arca()
+        .args(["token", "revoke", "viewer-1", "--config"])
+        .arg(&node.config)
+        .output()
+        .expect("run token revoke");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    thread::sleep(Duration::from_millis(300));
+    let after = call(&node, &node.viewer, "arca_status", &[]);
+    assert_eq!(code(&after), 4, "a revoked token is 401");
+    let list = call(&node, &node.operator, "token_list", &[]);
+    assert_eq!(code(&list), 0);
+    let tokens = stdout_json(&list)["tokens"].clone();
+    assert!(
+        !tokens
+            .as_array()
+            .expect("tokens")
+            .iter()
+            .any(|token| token["id"] == "viewer-1"),
+        "token_list no longer shows the revoked token"
+    );
 }
 
 #[test]

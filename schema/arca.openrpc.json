@@ -698,6 +698,12 @@
                       "operator"
                     ],
                     "type": "string"
+                  },
+                  "tools": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
                   }
                 },
                 "required": [
@@ -719,6 +725,167 @@
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "operator",
+      "x-arca-writes": false
+    },
+    {
+      "name": "journal_list",
+      "params": [
+        {
+          "name": "after",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "records": {
+              "items": {
+                "properties": {
+                  "at_ms": {
+                    "type": "integer"
+                  },
+                  "class": {
+                    "enum": [
+                      "A",
+                      "B",
+                      "C"
+                    ],
+                    "type": "string"
+                  },
+                  "entry": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "integer"
+                  },
+                  "intent": {
+                    "enum": [
+                      "Delete"
+                    ],
+                    "type": "string"
+                  },
+                  "object": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "project",
+                          "instance",
+                          "network",
+                          "acl",
+                          "profile",
+                          "volume",
+                          "zone",
+                          "forward",
+                          "bucket"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "project": {
+                        "type": "string"
+                      },
+                      "uuid": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "project",
+                      "name",
+                      "uuid"
+                    ],
+                    "type": "object"
+                  },
+                  "plugin": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "enum": [
+                      "Intent",
+                      "Applied",
+                      "Confirmed",
+                      "Reverted",
+                      "Failed"
+                    ],
+                    "type": "string"
+                  },
+                  "target": {
+                    "properties": {
+                      "kind": {
+                        "enum": [
+                          "project",
+                          "instance",
+                          "network",
+                          "acl",
+                          "profile",
+                          "volume",
+                          "zone",
+                          "forward",
+                          "bucket"
+                        ],
+                        "type": "string"
+                      },
+                      "name": {
+                        "type": "string"
+                      },
+                      "project": {
+                        "type": "string"
+                      },
+                      "uuid": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "project",
+                      "name",
+                      "uuid"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "id",
+                  "entry",
+                  "class",
+                  "target",
+                  "state",
+                  "at_ms"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "records"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The newest record for each effect in the journal, paged by effect id. It names only the intent and object fields, never a pre-image or inverse.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
     {

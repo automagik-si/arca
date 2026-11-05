@@ -18,9 +18,10 @@ use arca_incus::{IncusRead, UnixIncus};
 use arca_kernel::canon::{Digest, params_digest};
 use arca_kernel::desired::EntryId;
 use arca_kernel::journal::DeletePlan;
+use arca_kernel::journal::read_journal;
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
-use arca_mcp::{CallError, Caller, GetHandler, GetReply, ToolHandler};
+use arca_mcp::{CallError, Caller, GetHandler, GetReply, TokenStore, ToolHandler};
 use arca_metrics::{DEFAULT_MINUTES, HostSample, Sampler, SamplerConfig, mean};
 use arca_providers::ReadOnlyIncusProvider;
 use arca_reconcile::{Outcome, PLAN_TTL_MS};
@@ -30,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::NodeConfig;
-use crate::kernel::Kernel;
+use crate::kernel::{JOURNAL_FILE, Kernel};
 
 /// Answers from the public ontology embedded in the binary, without reading node state.
 pub struct OntologyQuery;
@@ -730,17 +731,75 @@ pub fn watch_reading(report: &Value) -> WatchReading {
     WatchReading { drift }
 }
 
-/// `token_list`: the id and scope of each token, as they were when the server started. No secret and no digest.
+/// `journal_list`: a viewer read over the effect journal. It exposes only the intent and object fields, never a
+/// `pre_image`, `inverse` or ACL patch, which can hold rendered secrets. Paging is by sequence with a limit.
+pub struct JournalListHandler {
+    pub state_dir: PathBuf,
+}
+
+impl ToolHandler for JournalListHandler {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let after = args.get("after").and_then(Value::as_u64).unwrap_or(0);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .min(500);
+        let (records, _) = read_journal(&self.state_dir.join(JOURNAL_FILE))
+            .map_err(|_| CallError::Internal("the journal could not be read".to_string()))?;
+        // The journal's own view is the newest record for each effect id. Each state change appends a full copy, so a
+        // listing that returned every line would repeat an effect and could skip a later state when paging by id.
+        let mut latest = BTreeMap::new();
+        for record in records {
+            latest.insert(record.id, record);
+        }
+        let records: Vec<Value> = latest
+            .into_values()
+            .filter(|record| record.id > after)
+            .take(limit as usize)
+            .map(|record| {
+                let mut value = json!({
+                    "id": record.id,
+                    "entry": record.entry.0,
+                    "class": record.class,
+                    "target": record.target,
+                    "state": record.state,
+                    "at_ms": record.at_ms,
+                });
+                if let Some(plugin) = record.plugin {
+                    value["plugin"] = json!(plugin.0);
+                }
+                if let Some(intent) = record.intent {
+                    value["intent"] = json!(intent);
+                }
+                if let Some(object) = record.object {
+                    value["object"] = json!(object);
+                }
+                value
+            })
+            .collect();
+        Ok(json!({ "records": records }))
+    }
+}
+
+/// `token_list`: the id, scope and optional tool list of each live token. No secret and no digest.
 pub struct TokenListHandler {
-    pub ids: Vec<(String, Scope)>,
+    pub tokens: TokenStore,
 }
 
 impl ToolHandler for TokenListHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let tokens: Vec<Value> = self
-            .ids
-            .iter()
-            .map(|(id, scope)| json!({ "id": id, "scope": scope.as_str() }))
+            .tokens
+            .ids()
+            .into_iter()
+            .map(|(id, scope, tools)| {
+                let mut token = json!({ "id": id, "scope": scope.as_str() });
+                if let Some(tools) = tools {
+                    token["tools"] = json!(tools);
+                }
+                token
+            })
             .collect();
         Ok(json!({ "tokens": tokens }))
     }
@@ -992,6 +1051,7 @@ mod tests {
         let caller = Caller {
             token_id: "viewer".to_string(),
             scope: Scope::Viewer,
+            tools: None,
         };
         for args in [
             json!({}),
@@ -1277,6 +1337,7 @@ mod watch_newest_tests {
         Caller {
             token_id: "viewer-1".to_string(),
             scope: Scope::Viewer,
+            tools: None,
         }
     }
 

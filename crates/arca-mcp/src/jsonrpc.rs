@@ -106,7 +106,7 @@ fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
     server
         .verbs
         .iter()
-        .filter(|v| may_call(caller.scope, v))
+        .filter(|v| may_call(caller.scope, v) && caller.allows_tool(v.name))
         .map(|v| {
             json!({
                 "name": v.name,
@@ -136,7 +136,7 @@ async fn call_tool(
     let Some(verb) = server.verbs.iter().find(|v| v.name == name) else {
         return Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None)));
     };
-    if !may_call(caller.scope, verb) {
+    if !may_call(caller.scope, verb) || !caller.allows_tool(verb.name) {
         return Err(CallError::Forbidden {
             verb: name.to_string(),
         });

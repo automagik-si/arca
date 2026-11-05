@@ -342,6 +342,7 @@ pub fn caller(scope: arca_api::Scope) -> Caller {
     Caller {
         token_id: "test-caller".to_string(),
         scope,
+        tools: None,
     }
 }
 
