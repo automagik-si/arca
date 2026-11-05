@@ -9,6 +9,7 @@
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
 //! host stays `approval_host(&cfg)`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -18,11 +19,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arca_approval::passkey::{STATE_PASSKEYS_FILE, format_passkey_line};
-use arca_approval::{PasskeyLine, load_state_passkeys};
+use arca_approval::{PasskeyLine, load_state_passkeys, parse_passkeys};
 use arca_mcp::CallError;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -43,6 +44,7 @@ const CODE_HOUR_MS: u64 = 60 * 60 * 1000;
 /// The most setup-code requests and the most wrong setup codes in the window.
 const MAX_CODE_REQUESTS: usize = 10;
 const MAX_WRONG_CODES: usize = 5;
+const MAX_GLOBAL_WRONG_CODES: usize = 50;
 /// The digits of a setup code.
 const CODE_DIGITS: u32 = 8;
 const CODE_MODULUS: u32 = 100_000_000;
@@ -84,6 +86,7 @@ impl SetupCodeDisplay for DesktopDisplay {
 
 /// The one page state: the configured origin and its rp id, the kernel plans are read from and approved in, the clock, the
 /// state-directory passkeys file, the setup-code budget and the display.
+#[derive(Clone)]
 struct PageState {
     origin: String,
     rp_id: String,
@@ -93,6 +96,8 @@ struct PageState {
     base_passkeys: Vec<PasskeyLine>,
     setup: Arc<Mutex<SetupState>>,
     display: Arc<dyn SetupCodeDisplay>,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+    trust_forwarded_for: bool,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -101,6 +106,7 @@ struct SetupState {
     live: Option<LiveCode>,
     requests: Vec<u64>,
     wrong: Vec<u64>,
+    callers: HashMap<String, Vec<u64>>,
     locked_until: Option<u64>,
     last_request: Option<u64>,
 }
@@ -116,6 +122,10 @@ impl SetupState {
             .retain(|at| now.saturating_sub(*at) < CODE_HOUR_MS);
         self.wrong
             .retain(|at| now.saturating_sub(*at) < CODE_HOUR_MS);
+        self.callers.retain(|_, attempts| {
+            attempts.retain(|at| now.saturating_sub(*at) < CODE_HOUR_MS);
+            !attempts.is_empty()
+        });
         if let Some(until) = self.locked_until
             && now >= until
         {
@@ -131,7 +141,30 @@ impl SetupState {
 
     fn lock(&mut self, now: u64) {
         self.locked_until = Some(now.saturating_add(CODE_HOUR_MS));
-        self.live = None;
+    }
+
+    fn caller_locked_minutes(&self, caller: &str, now: u64) -> Option<u64> {
+        self.callers
+            .get(caller)
+            .filter(|attempts| attempts.len() >= MAX_WRONG_CODES)
+            .and_then(|attempts| attempts.first())
+            .map(|first| {
+                first
+                    .saturating_add(CODE_HOUR_MS)
+                    .saturating_sub(now)
+                    .div_ceil(60_000)
+            })
+    }
+
+    fn wrong_code(&mut self, caller: String, now: u64) {
+        self.callers.entry(caller).or_default().push(now);
+        self.wrong.push(now);
+        if self.wrong.len() >= MAX_GLOBAL_WRONG_CODES {
+            self.locked_until = self
+                .wrong
+                .first()
+                .map(|first| first.saturating_add(CODE_HOUR_MS));
+        }
     }
 
     fn live_if_fresh(&mut self, now: u64) -> Option<&LiveCode> {
@@ -156,7 +189,7 @@ pub fn router(
     router_with(origin, kernel, clock, state_dir, Arc::new(DesktopDisplay))
 }
 
-/// Builds the page router with a display seam. Tests use a fake; `cmd_serve` uses [`router`].
+/// Builds a direct page router with a display seam. Use [`Page`] to share state across listener variants.
 ///
 /// # Panics
 ///
@@ -168,38 +201,97 @@ pub fn router_with(
     state_dir: PathBuf,
     display: Arc<dyn SetupCodeDisplay>,
 ) -> Router {
-    let rp_id = origin
-        .strip_prefix("https://")
-        .and_then(|authority| authority.split(':').next())
-        .filter(|host| !host.is_empty())
-        .expect("approvalOrigin is validated before the page router is built")
-        .to_string();
-    let base_passkeys = kernel
-        .lock()
-        .map(|kernel| kernel.owner_passkey_lines())
-        .unwrap_or_default();
-    let state = Arc::new(PageState {
-        origin,
-        rp_id,
-        kernel,
-        clock,
-        state_dir,
-        base_passkeys,
-        setup: Arc::new(Mutex::new(SetupState::default())),
-        display,
-    });
-    Router::new()
-        .route("/approve", get(page))
-        .route("/approve/plans", get(plans))
-        .route("/approve/approve", post(approve))
-        .route("/approve/setup-code", post(setup_code))
-        .route("/approve/register", post(register))
-        .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            origin_rule,
-        ))
-        .with_state(state)
+    Page::new(origin, kernel, clock, state_dir, display).router(false)
+}
+
+/// One approval-page binding, shared by the direct and trusted-proxy routers.
+pub struct Page {
+    state: PageState,
+}
+
+impl Page {
+    /// Binds the validated origin, kernel, clock, state directory and display once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `origin` is not the validated `https://` origin.
+    pub fn new(
+        origin: String,
+        kernel: Arc<Mutex<Kernel>>,
+        clock: Clock,
+        state_dir: PathBuf,
+        display: Arc<dyn SetupCodeDisplay>,
+    ) -> Self {
+        let rp_id = origin
+            .strip_prefix("https://")
+            .and_then(|authority| authority.split(':').next())
+            .filter(|host| !host.is_empty())
+            .expect("approvalOrigin is validated before the page router is built")
+            .to_string();
+        let base_passkeys = kernel
+            .lock()
+            .map(|kernel| kernel.owner_passkey_lines())
+            .unwrap_or_default();
+        Self {
+            state: PageState {
+                origin,
+                rp_id,
+                kernel,
+                clock,
+                state_dir,
+                base_passkeys,
+                setup: Arc::new(Mutex::new(SetupState::default())),
+                display,
+                log: Arc::new(|line| eprintln!("{line}")),
+                trust_forwarded_for: false,
+            },
+        }
+    }
+
+    /// Replaces the enrolment log sink; tests capture only the public log message.
+    pub fn with_log(mut self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.state.log = log;
+        self
+    }
+
+    /// Builds a router sharing this binding's setup state. Only the proxy listener trusts forwarded caller addresses.
+    pub fn router(&self, trust_forwarded_for: bool) -> Router {
+        let state = Arc::new(PageState {
+            trust_forwarded_for,
+            ..self.state.clone()
+        });
+        Router::new()
+            .route("/approve", get(page))
+            .route("/approve/plans", get(plans))
+            .route("/approve/approve", post(approve))
+            .route("/approve/setup-code", post(setup_code))
+            .route("/approve/register", post(register))
+            .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                origin_rule,
+            ))
+            .with_state(state)
+    }
+}
+
+impl PageState {
+    fn caller(&self, headers: &HeaderMap) -> String {
+        if !self.trust_forwarded_for {
+            return "direct".to_string();
+        }
+        headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .rfind(|token| !token.is_empty())
+            })
+            .unwrap_or("proxy-unknown")
+            .to_string()
+    }
 }
 
 /// The page's Origin rule, before any body is read: a POST needs the exact configured Origin; a GET needs none or the exact
@@ -268,21 +360,25 @@ async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
     }
 }
 
-async fn setup_code(State(state): State<Arc<PageState>>) -> Response {
-    if trusted_count(&state) > 0 {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "message": "A passkey is already trusted" })),
-        )
-            .into_response();
-    }
+async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
     let now = (state.clock)();
     let mut setup = match state.setup.lock() {
         Ok(setup) => setup,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let kernel = match state.kernel.lock() {
+        Ok(kernel) => kernel,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if kernel.owner_passkey_count() > 0 {
+        return already_trusted();
+    }
     setup.prune(now);
-    if let Some(minutes) = setup.locked_minutes(now) {
+    let caller = state.caller(&headers);
+    if let Some(minutes) = setup
+        .locked_minutes(now)
+        .or_else(|| setup.caller_locked_minutes(&caller, now))
+    {
         return locked(minutes);
     }
     if setup.requests.len() >= MAX_CODE_REQUESTS {
@@ -298,10 +394,6 @@ async fn setup_code(State(state): State<Arc<PageState>>) -> Response {
             Json(json!({ "message": "A code is already on your screen" })),
         )
             .into_response();
-    }
-    if setup.wrong.len() >= MAX_WRONG_CODES {
-        setup.lock(now);
-        return locked(setup.locked_minutes(now).unwrap_or(1));
     }
     if let Some(last) = setup.last_request
         && now.saturating_sub(last) < CODE_SPACING_MS
@@ -331,7 +423,11 @@ async fn setup_code(State(state): State<Arc<PageState>>) -> Response {
     Json(json!({ "issued": true })).into_response()
 }
 
-async fn register(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+async fn register(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let Ok(value) = serde_json::from_slice::<Value>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -354,34 +450,43 @@ async fn register(State(state): State<Arc<PageState>>, body: Bytes) -> Response 
     let Some(setup_code) = setup_code.as_str() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if trusted_count(&state) > 0 {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "message": "A passkey is already trusted" })),
-        )
-            .into_response();
-    }
     let now = (state.clock)();
     let mut setup = match state.setup.lock() {
         Ok(setup) => setup,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    setup.prune(now);
-    if let Some(minutes) = setup.locked_minutes(now) {
-        return locked(minutes);
-    }
-    let Some(live) = setup.live_if_fresh(now) else {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "message": "The setup code expired" })),
-        )
-            .into_response();
+    let mut kernel = match state.kernel.lock() {
+        Ok(kernel) => kernel,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if setup_code != live.code {
-        setup.wrong.push(now);
-        if setup.wrong.len() >= MAX_WRONG_CODES {
-            setup.lock(now);
-            return locked(setup.locked_minutes(now).unwrap_or(1));
+    if kernel.owner_passkey_count() > 0 {
+        return already_trusted();
+    }
+    setup.prune(now);
+    let caller = state.caller(&headers);
+    let correct = setup
+        .live_if_fresh(now)
+        .is_some_and(|live| setup_code == live.code);
+    if !correct {
+        if let Some(minutes) = setup
+            .locked_minutes(now)
+            .or_else(|| setup.caller_locked_minutes(&caller, now))
+        {
+            return locked(minutes);
+        }
+        if setup.live.is_none() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "The setup code expired" })),
+            )
+                .into_response();
+        }
+        setup.wrong_code(caller.clone(), now);
+        if let Some(minutes) = setup
+            .locked_minutes(now)
+            .or_else(|| setup.caller_locked_minutes(&caller, now))
+        {
+            return locked(minutes);
         }
         return (
             StatusCode::FORBIDDEN,
@@ -390,16 +495,20 @@ async fn register(State(state): State<Arc<PageState>>, body: Bytes) -> Response 
             .into_response();
     }
     let state_path = state.state_dir.join(STATE_PASSKEYS_FILE);
-    if write_state_line(&state.state_dir, &line).is_err() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "message": "The passkey could not be saved" })),
-        )
-            .into_response();
-    }
+    let previous = match write_state_line(&state.state_dir, &line) {
+        Ok(previous) => previous,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": "The passkey could not be saved" })),
+            )
+                .into_response();
+        }
+    };
     let state_lines = match load_state_passkeys(&state_path) {
         Ok(lines) => lines,
         Err(_) => {
+            let _ = restore_state(&state.state_dir, previous.as_deref());
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "message": "The passkey file could not be read" })),
@@ -415,14 +524,10 @@ async fn register(State(state): State<Arc<PageState>>, body: Bytes) -> Response 
             lines.push(line);
         }
     }
-    let (trusted, count) = match state.kernel.lock() {
-        Ok(mut kernel) => {
-            kernel.replace_owner_passkeys(lines);
-            (true, kernel.owner_passkey_count())
-        }
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+    kernel.replace_owner_passkeys(lines);
+    let count = kernel.owner_passkey_count();
     if count == 0 {
+        let _ = restore_state(&state.state_dir, previous.as_deref());
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": "The passkey could not be trusted" })),
@@ -430,16 +535,16 @@ async fn register(State(state): State<Arc<PageState>>, body: Bytes) -> Response 
             .into_response();
     }
     setup.live = None;
-    eprintln!("arca: passkey trusted, {count} passkey(s) kept");
-    Json(json!({ "trusted": trusted, "line": line })).into_response()
+    (state.log)(&format!("arca: passkey trusted, {count} passkey(s) kept"));
+    Json(json!({ "trusted": true, "line": line })).into_response()
 }
 
-fn trusted_count(state: &PageState) -> usize {
-    state
-        .kernel
-        .lock()
-        .map(|kernel| kernel.owner_passkey_count())
-        .unwrap_or(0)
+fn already_trusted() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "message": "A passkey is already trusted" })),
+    )
+        .into_response()
 }
 
 fn locked(minutes: u64) -> Response {
@@ -464,26 +569,57 @@ fn fresh_code() -> Result<String, ()> {
 }
 
 /// Writes `line` as a new line of the state passkeys file by atomic rename in `dir`. The file is mode 0600 and owned by this
-/// process; the state directory is already 0700.
-fn write_state_line(dir: &Path, line: &str) -> std::io::Result<()> {
+/// process; the state directory is already 0700. Existing credentials or fingerprints are left unchanged. The returned
+/// bytes allow rollback if reloading or trusting fails; `None` means the file did not exist.
+fn write_state_line(dir: &Path, line: &str) -> std::io::Result<Option<Vec<u8>>> {
     let path = dir.join(STATE_PASSKEYS_FILE);
-    let mut body = match fs::read(&path) {
-        Ok(body) => body,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+    let previous = match fs::read(&path) {
+        Ok(body) => Some(body),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid passkeys file");
+    let existing =
+        parse_passkeys(previous.as_deref().unwrap_or_default()).map_err(|_| invalid())?;
+    let incoming = parse_passkeys(line.as_bytes()).map_err(|_| invalid())?;
+    let incoming = incoming.first().ok_or_else(invalid)?;
+    if existing.iter().any(|seen| {
+        seen.credential_id == incoming.credential_id || seen.fingerprint == incoming.fingerprint
+    }) {
+        return Ok(previous);
+    }
+    let mut body = previous.clone().unwrap_or_default();
     if !body.is_empty() && !body.ends_with(b"\n") {
         body.push(b'\n');
     }
     body.extend_from_slice(line.as_bytes());
     body.push(b'\n');
+    write_state_bytes(dir, &body)?;
+    Ok(previous)
+}
+
+fn restore_state(dir: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(body) => write_state_bytes(dir, body),
+        None => fs::remove_file(dir.join(STATE_PASSKEYS_FILE)).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }),
+    }
+}
+
+fn write_state_bytes(dir: &Path, body: &[u8]) -> std::io::Result<()> {
+    let path = dir.join(STATE_PASSKEYS_FILE);
     let tmp = dir.join(format!(".{STATE_PASSKEYS_FILE}.{}.tmp", std::process::id()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    file.write_all(&body)?;
+    file.write_all(body)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&tmp, &path)?;
@@ -493,8 +629,64 @@ fn write_state_line(dir: &Path, line: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "../../arca-approval/tests/common/webauthn.rs"]
+mod test_passkey;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_line_append_is_idempotent_by_credential_or_fingerprint() {
+        let dir = std::env::temp_dir().join(format!(
+            "arca-page-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).expect("test directory");
+        let first = super::test_passkey::SoftPasskey::from_seed(1);
+        let second = super::test_passkey::SoftPasskey::from_seed(2);
+        let line = first.line(arca_approval::ARCA_NAMESPACE);
+        assert!(
+            write_state_line(&dir, &line)
+                .expect("first write")
+                .is_none()
+        );
+        let original = fs::read(dir.join(STATE_PASSKEYS_FILE)).expect("original bytes");
+        let same_credential = format_passkey_line(
+            super::test_passkey::RP,
+            super::test_passkey::ORIGIN,
+            &first.cred_text(),
+            &second.key_text(),
+        )
+        .expect("same credential");
+        let same_key = format_passkey_line(
+            super::test_passkey::RP,
+            super::test_passkey::ORIGIN,
+            &second.cred_text(),
+            &first.key_text(),
+        )
+        .expect("same fingerprint");
+        for duplicate in [&line, &same_credential, &same_key] {
+            assert!(
+                write_state_line(&dir, duplicate)
+                    .expect("idempotent write")
+                    .as_deref()
+                    == Some(original.as_slice())
+            );
+            let kept = fs::read(dir.join(STATE_PASSKEYS_FILE)).expect("kept bytes");
+            assert!(kept == original);
+            assert_eq!(parse_passkeys(&kept).expect("parseable file").len(), 1);
+        }
+        restore_state(&dir, None).expect("remove newly created file");
+        assert!(!dir.join(STATE_PASSKEYS_FILE).exists());
+        restore_state(&dir, Some(&original)).expect("restore existing file");
+        assert!(fs::read(dir.join(STATE_PASSKEYS_FILE)).expect("restored bytes") == original);
+        fs::remove_dir_all(dir).expect("remove test directory");
+    }
 
     fn now() -> u64 {
         1_793_361_600_000
@@ -524,6 +716,11 @@ mod tests {
             expires: now() + CODE_TTL_MS,
         });
         assert!(setup.live_if_fresh(now()).is_some());
+        setup.lock(now());
+        assert!(
+            setup.live_if_fresh(now()).is_some(),
+            "a lock preserves the live code"
+        );
         assert!(setup.live_if_fresh(now() + CODE_TTL_MS).is_none());
         assert!(setup.live.is_none());
     }

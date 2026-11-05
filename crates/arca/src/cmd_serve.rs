@@ -210,13 +210,21 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         server = server.handle(verb, handler);
     }
     let router = server.router();
-    let router = match cfg.approval_origin.clone() {
-        Some(origin) => router.merge(crate::approve_page::router(
+    let page = cfg.approval_origin.clone().map(|origin| {
+        crate::approve_page::Page::new(
             origin,
             Arc::clone(&kernel),
             clock.clone(),
             cfg.state_dir.clone(),
-        )),
+            Arc::new(crate::approve_page::DesktopDisplay),
+        )
+    });
+    let proxy_router = match &page {
+        Some(page) => router.clone().merge(page.router(true)),
+        None => router.clone(),
+    };
+    let router = match &page {
+        Some(page) => router.merge(page.router(false)),
         None => router,
     };
 
@@ -244,7 +252,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         };
         let proxy = async {
             match cfg.listen.proxy {
-                Some(proxy) => serve_proxy(router.clone(), proxy.addr, proxy.peer).await,
+                Some(proxy) => serve_proxy(proxy_router.clone(), proxy.addr, proxy.peer).await,
                 None => std::future::pending().await,
             }
         };

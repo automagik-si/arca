@@ -152,7 +152,7 @@ async function register() {
     if (!answer.ok) throw new Error(body.message || ("the registration answered " + answer.status));
     input.value = "";
     const line = document.getElementById("line");
-    if (body.trusted) {
+    if (setupCode) {
       line.hidden = true;
       line.textContent = "";
       status("Passkey trusted.");
