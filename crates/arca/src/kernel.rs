@@ -3,7 +3,9 @@
 
 use std::path::Path;
 
-use arca_approval::{ApprovalRefusal, ApprovalVerifier, ArcaAction, FileNonces, OwnerKeys};
+use arca_approval::{
+    ApprovalRefusal, ApprovalVerifier, ArcaAction, FileNonces, OwnerKeys, PasskeyLine,
+};
 use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::DesiredStateGate;
@@ -88,6 +90,21 @@ impl Kernel {
     /// The delete plans waiting for an owner's approval, in the order the reconciler holds them.
     pub fn pending_plans(&self) -> Vec<DeletePlan> {
         self.reconciler.pending_plans()
+    }
+
+    /// The passkey lines the owner verifier currently trusts, root-file and state-file lines together.
+    pub fn owner_passkey_lines(&self) -> Vec<PasskeyLine> {
+        self.verifier.verifier().passkey_lines().to_vec()
+    }
+
+    /// The number of passkeys the owner verifier currently trusts.
+    pub fn owner_passkey_count(&self) -> usize {
+        self.verifier.verifier().key_counts().1
+    }
+
+    /// Replaces the owner passkey lines without a restart, keeping the sign-count store and the SSH keys.
+    pub fn replace_owner_passkeys(&mut self, lines: Vec<PasskeyLine>) {
+        self.verifier.verifier_mut().replace_passkey_lines(lines);
     }
 
     /// Proposes `changes` as the next desired-state document and reconciles toward it. The document is persisted before it is

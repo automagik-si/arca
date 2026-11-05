@@ -10,6 +10,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 ExecStart=%h/.local/bin/arca serve --config %h/.config/arca/node.json
 Restart=on-failure
 RestartSec=10

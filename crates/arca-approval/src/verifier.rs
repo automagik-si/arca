@@ -88,6 +88,16 @@ impl<V: SignatureVerifier, N: NonceStore> ApprovalVerifier<V, N> {
         }
     }
 
+    /// The verifier, for reading the owner keys without taking the kernel's approval path.
+    pub fn verifier(&self) -> &V {
+        &self.verifier
+    }
+
+    /// The verifier, for replacing the owner passkey lines while keeping the kernel's sign-count store.
+    pub fn verifier_mut(&mut self) -> &mut V {
+        &mut self.verifier
+    }
+
     /// Checks `approval` for `action` on `target` with the call's `args` (the digest covers all of them but `approval`), at
     /// `now_ms`, and spends it. The order is droidd's: the call's own inputs, the approval's parse, the signature, the bound
     /// fields, the time window, and last the nonce. The nonce is read only after the signature has verified.

@@ -1,5 +1,5 @@
-//! The approval page: open GETs, exact-Origin POSTs, the same kernel approval path, and registration line round-trip. The
-//! software P-256 passkey is the shared test authenticator; no hardware key is used.
+//! The approval page: open GETs, exact-Origin POSTs, the same kernel approval path, setup-code enrolment, and registration.
+//! The software P-256 passkey is the shared test authenticator; no hardware key is used.
 
 mod common;
 #[path = "../../arca-approval/tests/common/webauthn.rs"]
@@ -7,16 +7,18 @@ mod webauthn;
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arca::approve_page;
+use arca::approve_page::{self, SetupCodeDisplay};
 use arca::desired_store::EntryChange;
 use arca::handlers::Clock;
 use arca::kernel::Kernel;
-use arca_approval::parse_passkeys;
+use arca_approval::{STATE_PASSKEYS_FILE, load_state_passkeys, parse_passkeys};
 use arca_kernel::desired::EntryId;
 use arca_mcp::{Server, TokenStore, serve_unix};
 use common::*;
@@ -24,21 +26,57 @@ use serde_json::{Value, json};
 use tokio::runtime::Runtime;
 use webauthn::{Assert, ORIGIN, SoftPasskey, passkey_approval};
 
-/// A node with a fake provider, one enrolled passkey, and the merged router served on a unix socket.
+/// The desktop display seam replaced in tests: it captures the code, or fails when asked.
+#[derive(Default)]
+struct FakeDisplay {
+    codes: Mutex<Vec<String>>,
+    fail: AtomicBool,
+}
+
+impl SetupCodeDisplay for FakeDisplay {
+    fn show(&self, code: &str) -> Result<(), String> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("No screen to show the code on".to_string());
+        }
+        self.codes
+            .lock()
+            .expect("display lock")
+            .push(code.to_string());
+        Ok(())
+    }
+}
+
+/// A node with a fake provider and the merged router served on a unix socket. The passkey may start enrolled (Group 1
+/// developer registration) or absent (the setup-code flow).
 struct Rig {
     _scratch: Scratch,
     fake: arca_incus::FakeIncus,
     kernel: Arc<Mutex<Kernel>>,
-    socket: std::path::PathBuf,
+    socket: PathBuf,
+    state_dir: PathBuf,
+    clock: Arc<AtomicU64>,
+    display: Arc<FakeDisplay>,
     _runtime: Runtime,
 }
 
 impl Rig {
     fn new(tag: &str, with_page: bool) -> (Rig, SoftPasskey) {
+        Self::build(tag, with_page, true)
+    }
+
+    fn new_empty(tag: &str) -> (Rig, SoftPasskey) {
+        Self::build(tag, true, false)
+    }
+
+    fn build(tag: &str, with_page: bool, enrolled: bool) -> (Rig, SoftPasskey) {
         let scratch = Scratch::new(tag);
         let fake = start_fake(&scratch);
         let key = SoftPasskey::from_seed(1);
-        let lines = format!("{}\n", key.line(NAMESPACE));
+        let lines = if enrolled {
+            format!("{}\n", key.line(NAMESPACE))
+        } else {
+            String::new()
+        };
         let verifier = verifier_with_passkeys(&scratch, &[], &lines, tag);
         let kernel = Arc::new(Mutex::new(
             kernel(&scratch, &fake, verifier, NOW).expect("the kernel opens"),
@@ -48,12 +86,20 @@ impl Rig {
         fs::set_permissions(&tokens_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
         let tokens = TokenStore::load(&tokens_dir).expect("an empty token store loads");
         let base = Server::new(arca_api::verbs(), tokens).router();
-        let clock: Clock = Arc::new(|| NOW);
+        let state_dir = scratch.path("state");
+        fs::create_dir(&state_dir).expect("the state directory");
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
+        let clock = Arc::new(AtomicU64::new(NOW));
+        let display = Arc::new(FakeDisplay::default());
+        let page_clock = Arc::clone(&clock);
+        let clock_fn: Clock = Arc::new(move || page_clock.load(Ordering::SeqCst));
         let router = if with_page {
-            base.merge(approve_page::router(
+            base.merge(approve_page::router_with(
                 ORIGIN.to_string(),
                 Arc::clone(&kernel),
-                clock,
+                clock_fn,
+                state_dir.clone(),
+                Arc::clone(&display) as Arc<dyn SetupCodeDisplay>,
             ))
         } else {
             base
@@ -74,9 +120,26 @@ impl Rig {
             fake,
             kernel,
             socket,
+            state_dir,
+            clock,
+            display,
             _runtime: runtime,
         };
         (rig, key)
+    }
+
+    fn last_code(&self) -> String {
+        self.display
+            .codes
+            .lock()
+            .expect("display lock")
+            .last()
+            .cloned()
+            .expect("a captured setup code")
+    }
+
+    fn advance(&self, millis: u64) {
+        self.clock.fetch_add(millis, Ordering::SeqCst);
     }
 
     fn waiting_plan(&self) -> (String, String) {
@@ -154,6 +217,14 @@ impl Rig {
             serde_json::to_vec(&body).expect("the body").as_slice(),
         )
     }
+
+    fn post_empty(&self, path: &str, origin: Option<&str>) -> (u16, Vec<u8>) {
+        self.request("POST", path, origin, &[])
+    }
+
+    fn state_path(&self) -> PathBuf {
+        self.state_dir.join(STATE_PASSKEYS_FILE)
+    }
 }
 
 fn approval(key: &SoftPasskey, statement: &str) -> String {
@@ -163,6 +234,18 @@ fn approval(key: &SoftPasskey, statement: &str) -> String {
 
 fn refusal(status: u16) -> bool {
     (400..=499).contains(&status)
+}
+
+fn register_body(key: &SoftPasskey, setup_code: Option<&str>) -> Value {
+    let mut body = json!({
+        "credentialId": key.cred_text(),
+        "publicKey": key.key_text(),
+        "publicKeyAlgorithm": -7,
+    });
+    if let Some(code) = setup_code {
+        body["setupCode"] = json!(code);
+    }
+    body
 }
 
 #[test]
@@ -269,12 +352,7 @@ fn a_valid_approval_runs_the_plan_once_and_every_bad_post_deletes_nothing() {
 #[test]
 fn registration_round_trips_through_parse_passkeys_and_refuses_bad_keys() {
     let (rig, key) = Rig::new("page-register", true);
-    let registration = json!({
-        "credentialId": key.cred_text(),
-        "publicKey": key.key_text(),
-        "publicKeyAlgorithm": -7,
-    });
-    let (status, body) = rig.post("/approve/register", Some(ORIGIN), registration);
+    let (status, body) = rig.post("/approve/register", Some(ORIGIN), register_body(&key, None));
     assert_eq!(status, 200);
     let body: Value = serde_json::from_slice(&body).expect("registration JSON");
     let line = body["line"].as_str().expect("the line");
@@ -301,10 +379,210 @@ fn registration_round_trips_through_parse_passkeys_and_refuses_bad_keys() {
         rig.post("/approve/register", Some(ORIGIN), bad_key).0
     ));
 
-    let no_origin = json!({
-        "credentialId": key.cred_text(),
-        "publicKey": key.key_text(),
-        "publicKeyAlgorithm": -7,
-    });
-    assert!(refusal(rig.post("/approve/register", None, no_origin).0));
+    assert!(refusal(
+        rig.post("/approve/register", None, register_body(&key, None))
+            .0
+    ));
+}
+
+#[test]
+fn setup_code_enrols_the_first_passkey_and_approval_works_without_restart() {
+    let (rig, key) = Rig::new_empty("page-enrol");
+    assert!(refusal(
+        rig.post_empty("/approve/setup-code", Some("https://elsewhere.example"))
+            .0
+    ));
+    let (status, answer) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
+    println!(
+        "setup status {status}: {}",
+        String::from_utf8_lossy(&answer)
+    );
+    assert_eq!(status, 200);
+    let code = rig.last_code();
+    assert_eq!(code.len(), 8);
+    assert!(
+        !String::from_utf8_lossy(&answer).contains(&code),
+        "the setup code is not in the HTTP answer"
+    );
+
+    let (status, answer) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let body: Value = serde_json::from_slice(&answer).expect("registration JSON");
+    assert_eq!(body["trusted"], json!(true));
+    assert!(
+        !String::from_utf8_lossy(&answer).contains(&code),
+        "the setup code is not in the registration answer"
+    );
+    let state = fs::metadata(rig.state_path()).expect("the state passkeys file");
+    assert_eq!(state.permissions().mode() & 0o777, 0o600);
+    let lines = load_state_passkeys(&rig.state_path()).expect("the state line loads");
+    assert_eq!(lines.len(), 1);
+    assert!(
+        !fs::read_to_string(rig.state_path())
+            .expect("the state file reads")
+            .contains(&code)
+    );
+
+    let (plan, statement) = rig.waiting_plan();
+    let (status, answer) = rig.post(
+        "/approve/approve",
+        Some(ORIGIN),
+        json!({ "plan": plan, "approval": approval(&key, &statement) }),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 1);
+}
+
+#[test]
+fn a_second_setup_code_is_refused_while_one_is_live_and_the_live_code_still_works() {
+    let (rig, key) = Rig::new_empty("page-live-code");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some(ORIGIN)).0,
+        429,
+        "a live code is never replaced"
+    );
+    let (status, _) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "the first code still works");
+}
+
+#[test]
+fn setup_code_spacing_survives_a_failed_display_and_the_hourly_budget_locks() {
+    let (rig, _) = Rig::new_empty("page-limits");
+    rig.display.fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some(ORIGIN)).0,
+        503,
+        "no screen means no code"
+    );
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some(ORIGIN)).0,
+        429,
+        "the next request is spaced"
+    );
+    rig.display.fail.store(false, Ordering::SeqCst);
+    rig.advance(61_000);
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    // The live code refuses replacement but every request counts toward ten; the eleventh locks.
+    for _ in 0..9 {
+        let status = rig.post_empty("/approve/setup-code", Some(ORIGIN)).0;
+        assert!(status == 429 || status == 200);
+    }
+    let (status, body) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
+    assert_eq!(status, 429);
+    assert!(String::from_utf8_lossy(&body).contains("locked"));
+}
+
+#[test]
+fn five_wrong_setup_codes_lock_for_an_hour_and_then_unlock() {
+    let (rig, key) = Rig::new_empty("page-wrong");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    let wrong = if code == "99999999" {
+        "11111111"
+    } else {
+        "99999999"
+    };
+    for _ in 0..5 {
+        let (status, _) = rig.post(
+            "/approve/register",
+            Some(ORIGIN),
+            register_body(&key, Some(wrong)),
+        );
+        assert!(refusal(status), "a wrong code is refused");
+    }
+    let (status, body) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 429);
+    assert!(String::from_utf8_lossy(&body).contains("locked"));
+    rig.advance(60 * 60 * 1000);
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some(ORIGIN)).0,
+        200,
+        "the lock is timed, not until restart"
+    );
+}
+
+#[test]
+fn an_expired_setup_code_is_refused_and_no_passkey_is_trusted() {
+    let (rig, key) = Rig::new_empty("page-expired");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    rig.advance(10 * 60 * 1000 + 1);
+    let (status, _) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 403);
+    assert!(!rig.state_path().exists());
+    assert_eq!(
+        rig.kernel
+            .lock()
+            .expect("kernel lock")
+            .owner_passkey_count(),
+        0
+    );
+}
+
+#[test]
+fn a_setup_code_is_refused_once_a_passkey_is_trusted() {
+    let (rig, key) = Rig::new_empty("page-trusted");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    assert_eq!(
+        rig.post(
+            "/approve/register",
+            Some(ORIGIN),
+            register_body(&key, Some(&code))
+        )
+        .0,
+        200
+    );
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 409);
+    assert_eq!(
+        rig.post(
+            "/approve/register",
+            Some(ORIGIN),
+            register_body(&key, Some(&code))
+        )
+        .0,
+        409
+    );
+}
+
+#[test]
+fn the_state_passkeys_loader_refuses_a_0644_file_and_a_link() {
+    let scratch = Scratch::new("page-state-rule");
+    let state = scratch.path("state");
+    fs::create_dir(&state).expect("state dir");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("state mode");
+    let key = SoftPasskey::from_seed(1);
+    let path = state.join(STATE_PASSKEYS_FILE);
+    fs::write(&path, format!("{}\n", key.line(NAMESPACE))).expect("state file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("0644");
+    assert!(
+        load_state_passkeys(&path).is_err(),
+        "a 0644 file is refused"
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("0600");
+    assert_eq!(
+        load_state_passkeys(&path).expect("a 0600 file loads").len(),
+        1
+    );
+    let link = state.join("link-passkeys");
+    symlink(&path, &link).expect("symlink");
+    assert!(load_state_passkeys(&link).is_err(), "a link is refused");
 }

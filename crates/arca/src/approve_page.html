@@ -13,6 +13,7 @@
   .digest, .expiry { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
   button { font: inherit; padding: .5rem 1rem; border-radius: .4rem; border: 1px solid currentColor; background: transparent; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
+  input { font: inherit; padding: .45rem .55rem; border-radius: .4rem; border: 1px solid currentColor; background: transparent; width: 10rem; }
   pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .75rem; border: 1px dashed currentColor; }
   .status { min-height: 1.5rem; }
 </style>
@@ -20,13 +21,16 @@
 <body>
 <h1>Arca approvals</h1>
 <p>Waiting plans on this node. Approving one asks this browser's passkey for one tap; the kernel checks the proof.</p>
+<p>Trusted passkeys: <strong id="trusted">…</strong></p>
 
 <h2>Waiting plans</h2>
 <div id="plans"><p>Loading…</p></div>
 <p id="status" class="status" role="status"></p>
 
 <h2>Register this browser</h2>
-<p>Register a passkey for this origin. The line below is added to the root-owned passkeys file, then <code>serve</code> is restarted.</p>
+<p>Get a setup code and type the 8 digits shown on this machine's own screen. One trusted passkey is enough; later passkeys are added from one already trusted.</p>
+<button id="get-code">Get a setup code</button>
+<p><label for="setup-code">Setup code</label> <input id="setup-code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{8}" placeholder="8 digits"></p>
 <button id="register">Register passkey</button>
 <pre id="line" hidden></pre>
 
@@ -47,12 +51,21 @@ function status(text) {
   document.getElementById("status").textContent = text;
 }
 
+function showTrusted(count) {
+  document.getElementById("trusted").textContent = String(count);
+  const getCode = document.getElementById("get-code");
+  const field = document.getElementById("setup-code");
+  getCode.hidden = count > 0;
+  field.hidden = count > 0;
+}
+
 async function loadPlans() {
   const target = document.getElementById("plans");
   try {
     const response = await fetch("/approve/plans", { headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error("the plan list answered " + response.status);
     const body = await response.json();
+    showTrusted(body.passkeysTrusted || 0);
     target.replaceChildren();
     if (!body.plans.length) {
       const empty = document.createElement("p");
@@ -78,6 +91,81 @@ async function loadPlans() {
   } catch (error) {
     target.replaceChildren();
     status(String(error));
+  }
+}
+
+async function getCode() {
+  const button = document.getElementById("get-code");
+  button.disabled = true;
+  status("Asking for a setup code…");
+  try {
+    const answer = await fetch("/approve/setup-code", { method: "POST" });
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok) throw new Error(body.message || ("the setup code answered " + answer.status));
+    status("Check this machine's screen for the 8-digit code, then type it below.");
+  } catch (error) {
+    status(String(error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function register() {
+  const button = document.getElementById("register");
+  button.disabled = true;
+  const input = document.getElementById("setup-code");
+  const setupCode = input.value.trim();
+  status("Waiting for the authenticator…");
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const user = crypto.getRandomValues(new Uint8Array(16));
+    const credential = await navigator.credentials.create({
+      publicKey: {
+        challenge,
+        rp: { id: location.hostname, name: "Arca approvals" },
+        user: { id: user, name: "owner", displayName: "Owner" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: {
+          userVerification: "required",
+          residentKey: "required",
+          requireResidentKey: true,
+        },
+        attestation: "none",
+        timeout: 60000,
+      },
+    });
+    if (!credential) throw new Error("no passkey was created");
+    const publicKey = credential.response.getPublicKey();
+    if (!publicKey) throw new Error("the authenticator returned no public key");
+    const payload = {
+      credentialId: b64url(new Uint8Array(credential.rawId)),
+      publicKey: b64(new Uint8Array(publicKey)),
+      publicKeyAlgorithm: credential.response.getPublicKeyAlgorithm(),
+    };
+    if (setupCode) payload.setupCode = setupCode;
+    const answer = await fetch("/approve/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok) throw new Error(body.message || ("the registration answered " + answer.status));
+    input.value = "";
+    const line = document.getElementById("line");
+    if (body.trusted) {
+      line.hidden = true;
+      line.textContent = "";
+      status("Passkey trusted.");
+    } else if (body.line) {
+      line.hidden = false;
+      line.textContent = body.line;
+      status("Passkey registered. This developer answer returns the line for a root-owned file.");
+    }
+    await loadPlans();
+  } catch (error) {
+    status(String(error));
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -124,53 +212,7 @@ async function approve(plan, button) {
   }
 }
 
-async function register() {
-  const button = document.getElementById("register");
-  button.disabled = true;
-  status("Waiting for the authenticator…");
-  try {
-    const challenge = crypto.getRandomValues(new Uint8Array(32));
-    const user = crypto.getRandomValues(new Uint8Array(16));
-    const credential = await navigator.credentials.create({
-      publicKey: {
-        challenge,
-        rp: { id: location.hostname, name: "Arca approvals" },
-        user: { id: user, name: "owner", displayName: "Owner" },
-        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-        authenticatorSelection: {
-          userVerification: "required",
-          residentKey: "required",
-          requireResidentKey: true,
-        },
-        attestation: "none",
-        timeout: 60000,
-      },
-    });
-    if (!credential) throw new Error("no passkey was created");
-    const publicKey = credential.response.getPublicKey();
-    if (!publicKey) throw new Error("the authenticator returned no public key");
-    const answer = await fetch("/approve/register", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        credentialId: b64url(new Uint8Array(credential.rawId)),
-        publicKey: b64(new Uint8Array(publicKey)),
-        publicKeyAlgorithm: credential.response.getPublicKeyAlgorithm(),
-      }),
-    });
-    const body = await answer.json().catch(() => ({}));
-    if (!answer.ok) throw new Error("the registration answered " + answer.status);
-    const line = document.getElementById("line");
-    line.hidden = false;
-    line.textContent = body.line;
-    status("Passkey registered. Add the line below to the root-owned passkeys file, then restart serve.");
-  } catch (error) {
-    status(String(error));
-  } finally {
-    button.disabled = false;
-  }
-}
-
+document.getElementById("get-code").addEventListener("click", getCode);
 document.getElementById("register").addEventListener("click", register);
 loadPlans();
 </script>

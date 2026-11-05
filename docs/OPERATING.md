@@ -417,25 +417,32 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
 
 - `GET /approve` returns the page.
 - `GET /approve/plans` returns the waiting plans with the same fields as `plan_list`.
+- `POST /approve/setup-code` issues a one-time 8-digit setup code to the machine's own screen while no passkey is trusted.
 - `POST /approve/approve` takes `{ "plan": "<digest>", "approval": "<string>" }` and runs the plan through the same kernel
   approval path as `approval_submit`.
-- `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }` and
-  returns the passkeys-file line.
+- `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }`,
+  plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
+  it returns `{ "line": "<line>" }` as the developer answer.
 
-The GETs need no token and admit no `Origin` or the configured one. Both POSTs admit only the exact configured `Origin` and
+The GETs need no token and admit no `Origin` or the configured one. The POSTs admit only the exact configured `Origin` and
 refuse any other before reading the body. `/mcp` and every other MCP route keep refusing every `Origin`.
 
 To use it:
 
 1. Set `approvalOrigin` to the page's HTTPS origin, for example `https://arca.example.com`, and restart `serve`.
 2. Publish the `/approve` routes through the reverse proxy to the same `listen.proxy` upstream as `/mcp`. The page is also
-   reachable on the tailnet listener; the proxy adds HTTPS and the host name the passkey is bound to.
-3. Open the page at that origin, register a passkey, and copy the line it prints.
-4. As root, add that line to `/etc/arca/owner-passkeys` with the file's trust rule (root-owned, not writable by the `serve`
-   account, not a link).
-5. Restart `serve`; its start log reports the passkey count, `arca: <n> owner signing key(s), <m> passkey(s) kept`.
-6. Open the page, choose a waiting plan, and approve it. The page shows each plan's target digest and expiry; the kernel's
-   answer reports the deleted objects or the refusal.
+   reachable on the tailnet listener, but WebAuthn needs the HTTPS proxy origin; plain HTTP is not a secure context.
+3. Open the page at that origin and press **Get a setup code**. The code appears in a desktop notification on the machine
+   running `serve`; it is never shown in the page, a log or an HTTP answer.
+4. Type the 8 digits and register the passkey. `serve` writes the trusted line to `<stateDir>/owner-passkeys`, reloads the
+   verifier and logs `arca: passkey trusted, 1 passkey(s) kept`; no restart and no terminal step are needed.
+5. Choose a waiting plan and approve it. The page shows each plan's target digest and expiry; the kernel's answer reports the
+   deleted objects or the refusal.
+
+Once one passkey is trusted, no setup code is issued. Later passkeys are added from one already trusted, not with a code.
+`/etc/arca/owner-passkeys` remains readable as a developer option, never the owner path. The state passkeys file is owned by
+the `serve` account with mode 0600 in its 0700 state directory; it has no root anchor, so anything running as that account is a
+trust root (see Decision 11 in the wish).
 
 **A scratch kernel can take its owner keys from files named in `ARCA_TEST_OWNER_SIGNERS` and `ARCA_TEST_OWNER_PASSKEYS`.**
 That is honoured only when:
