@@ -79,11 +79,12 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     if let Some(path) = flags.value("config") {
         let cfg = config::load(Path::new(path))?;
         let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
+        let config_path = Path::new(path);
         let from_file = fs::read_to_string(&pid_path)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
-            .filter(|pid| pid_is_arca_serve(*pid));
-        let pid = from_file.or_else(|| serve_pid_for_config(Path::new(path)));
+            .filter(|pid| pid_serves_config(*pid, config_path));
+        let pid = from_file.or_else(|| serve_pid_for_config(config_path));
         if let Some(pid) = pid {
             let status = Command::new("kill")
                 .arg("-HUP")
@@ -101,63 +102,72 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
 
 /// Finds a live `arca serve --config <config>` process for this config, for the window before its post-bind pid file lands.
 fn serve_pid_for_config(config: &Path) -> Option<u32> {
-    let wanted = fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
     for entry in fs::read_dir("/proc").ok()?.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+        let Some(name) = name.to_str() else {
+            continue;
+        };
         let Ok(pid) = name.parse::<u32>() else {
             continue;
         };
-        let Ok(bytes) = fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        let args: Vec<&[u8]> = bytes
-            .split(|byte| *byte == 0)
-            .filter(|arg| !arg.is_empty())
-            .collect();
-        let Some(program) = args.first() else {
-            continue;
-        };
-        let program = String::from_utf8_lossy(program);
-        if !program
-            .rsplit('/')
-            .next()
-            .is_some_and(|name| name == "arca")
-        {
-            continue;
-        }
-        if !args.iter().any(|arg| *arg == b"serve") {
-            continue;
-        }
-        for pair in args.windows(2) {
-            if pair[0] == b"--config" {
-                let named_text = String::from_utf8_lossy(pair[1]).into_owned();
-                let named = Path::new(&named_text);
-                let named = fs::canonicalize(named).unwrap_or_else(|_| named.to_path_buf());
-                if named == wanted {
-                    return Some(pid);
-                }
-            }
+        if pid_serves_config(pid, config) {
+            return Some(pid);
         }
     }
     None
 }
 
-/// Whether `/proc/<pid>/cmdline` names an `arca serve` process. A stale or recycled pid is not signalled.
-fn pid_is_arca_serve(pid: u32) -> bool {
+/// Reads `/proc/<pid>/cmdline` and `/proc/<pid>/cwd` and compares the named config with `config`.
+fn pid_serves_config(pid: u32, config: &Path) -> bool {
     let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    let mut args = bytes.split(|byte| *byte == 0).filter(|arg| !arg.is_empty());
-    let Some(program) = args.next() else {
+    let args: Vec<Vec<u8>> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect();
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    serve_args_match_config(&args, cwd.as_deref(), config)
+}
+
+/// Whether `args` name `arca serve --config <config>`, resolving a relative config against the process's cwd.
+fn serve_args_match_config(args: &[Vec<u8>], cwd: Option<&Path>, config: &Path) -> bool {
+    let Some(program) = args.first() else {
         return false;
     };
     let program = String::from_utf8_lossy(program);
-    let named_arca = program
+    if !program
         .rsplit('/')
         .next()
-        .is_some_and(|name| name == "arca");
-    named_arca && args.any(|arg| arg == b"serve")
+        .is_some_and(|name| name == "arca")
+    {
+        return false;
+    }
+    if !args.iter().any(|arg| arg.as_slice() == b"serve") {
+        return false;
+    }
+    let wanted = fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+    for pair in args.windows(2) {
+        if pair[0].as_slice() != b"--config" {
+            continue;
+        }
+        let named_text = String::from_utf8_lossy(&pair[1]).into_owned();
+        let named = Path::new(&named_text);
+        let named = if named.is_relative() {
+            match cwd {
+                Some(cwd) => cwd.join(named),
+                None => named.to_path_buf(),
+            }
+        } else {
+            named.to_path_buf()
+        };
+        let named = fs::canonicalize(&named).unwrap_or(named);
+        if named == wanted {
+            return true;
+        }
+    }
+    false
 }
 
 fn parse_tools(text: &str, scope: Scope) -> Result<Vec<String>, Failure> {
@@ -296,5 +306,30 @@ mod tests {
         assert!(parse_tools("token_list", Scope::Viewer).is_err());
         assert!(parse_tools("node_metrics,node_metrics", Scope::Viewer).is_err());
         assert!(parse_tools("", Scope::Viewer).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pid_match_tests {
+    use super::*;
+
+    fn args(items: &[&str]) -> Vec<Vec<u8>> {
+        items.iter().map(|item| item.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn a_relative_config_is_resolved_against_the_process_cwd() {
+        let dir = std::env::temp_dir().join(format!("arca-cfg-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("scratch");
+        let config = dir.join("node.json");
+        fs::write(&config, "{}").expect("config");
+        let process = args(&["/home/me/.local/bin/arca", "serve", "--config", "node.json"]);
+        assert!(serve_args_match_config(&process, Some(&dir), &config));
+        assert!(!serve_args_match_config(&process, None, &config));
+        let other = dir.join("other.json");
+        fs::write(&other, "{}").expect("other");
+        assert!(!serve_args_match_config(&process, Some(&dir), &other));
+        assert!(!pid_serves_config(std::process::id(), &config));
+        let _ = fs::remove_dir_all(dir);
     }
 }

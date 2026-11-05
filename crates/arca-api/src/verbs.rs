@@ -59,6 +59,14 @@ pub struct Verb {
     pub destructive: bool,
     pub params: fn() -> Value,
     pub result: fn() -> Value,
+    /// The result may carry text produced outside Arca; the MCP door marks it.
+    pub untrusted: bool,
+    /// When the result is not an object, the MCP door puts it under this key.
+    pub output_key: Option<&'static str>,
+    /// The one-line text summary of a result in the MCP door.
+    pub summary_text: fn(&Value) -> String,
+    /// What the MCP door cuts for its cap, and then marks `truncated`.
+    pub cut: fn(&Value) -> Option<Value>,
 }
 
 static VERBS: [Verb; 15] = [
@@ -69,6 +77,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_status,
+        cut: no_cut,
         params: arca_status_params,
         result: arca_status_result,
     },
@@ -79,6 +91,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_metrics,
+        cut: no_cut,
         params: node_metrics_params,
         result: node_metrics_result,
     },
@@ -89,6 +105,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_watch_report,
+        cut: no_cut,
         params: watch_report_params,
         result: watch_report_result,
     },
@@ -99,6 +119,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Operator,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tokens,
+        cut: no_cut,
         params: token_list_params,
         result: token_list_result,
     },
@@ -109,6 +133,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_journal,
+        cut: no_cut,
         params: journal_list_params,
         result: journal_list_result,
     },
@@ -119,6 +147,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_plans,
+        cut: no_cut,
         params: plan_list_params,
         result: plan_list_result,
     },
@@ -129,6 +161,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Doctor,
         writes: true,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_decline,
+        cut: no_cut,
         params: plan_decline_params,
         result: plan_decline_result,
     },
@@ -139,6 +175,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Doctor,
         writes: true,
         destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_approval,
+        cut: no_cut,
         params: approval_submit_params,
         result: approval_submit_result,
     },
@@ -149,6 +189,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_alerts,
+        cut: no_cut,
         params: alerts_list_params,
         result: alerts_list_result,
     },
@@ -159,6 +203,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Doctor,
         writes: true,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_pg_create,
+        cut: no_cut,
         params: postgres_create_params,
         result: postgres_create_result,
     },
@@ -169,6 +217,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_pg_list,
+        cut: no_cut,
         params: postgres_list_params,
         result: postgres_list_result,
     },
@@ -179,6 +231,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Doctor,
         writes: true,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_pg_link,
+        cut: no_cut,
         params: postgres_link_params,
         result: postgres_link_result,
     },
@@ -189,6 +245,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Doctor,
         writes: true,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_pg_unlink,
+        cut: no_cut,
         params: postgres_unlink_params,
         result: postgres_unlink_result,
     },
@@ -199,6 +259,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Doctor,
         writes: true,
         destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_pg_delete,
+        cut: no_cut,
         params: postgres_delete_params,
         result: postgres_delete_result,
     },
@@ -209,6 +273,10 @@ static VERBS: [Verb; 15] = [
         min_scope: Scope::Viewer,
         writes: false,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_ontology,
+        cut: no_cut,
         params: ontology_query_params,
         result: ontology_query_result,
     },
@@ -217,6 +285,149 @@ static VERBS: [Verb; 15] = [
 /// Every verb of the table, in table order.
 pub fn verbs() -> &'static [Verb] {
     &VERBS
+}
+
+/// The default one-line summary for a verb without a richer one.
+pub fn summary_done(_: &Value) -> String {
+    "done".to_string()
+}
+
+/// A short line for a successful `arca_status`.
+pub fn summary_status(v: &Value) -> String {
+    format!(
+        "arca {} ({} mode)",
+        v["version"].as_str().unwrap_or("?"),
+        v["mode"].as_str().unwrap_or("?")
+    )
+}
+
+/// A short line for a successful `node_metrics`.
+pub fn summary_metrics(v: &Value) -> String {
+    format!("host metrics for {} minute(s)", v["minutes"])
+}
+
+/// A short line for a successful `watch_report`.
+pub fn summary_watch_report(v: &Value) -> String {
+    let projects = v["projects"].as_array().map_or(0, Vec::len);
+    let instances: usize = v["projects"].as_array().map_or(0, |list| {
+        list.iter()
+            .map(|project| project["instances"].as_array().map_or(0, Vec::len))
+            .sum()
+    });
+    format!("{instances} instance(s) in {projects} project(s)")
+}
+
+/// A short line for a successful `token_list`.
+pub fn summary_tokens(v: &Value) -> String {
+    format!("{} token(s)", v["tokens"].as_array().map_or(0, Vec::len))
+}
+
+/// A short line for a successful `journal_list`.
+pub fn summary_journal(v: &Value) -> String {
+    format!(
+        "{} journal record(s)",
+        v["records"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `plan_list`.
+pub fn summary_plans(v: &Value) -> String {
+    format!(
+        "{} waiting plan(s)",
+        v["plans"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `plan_decline`.
+pub fn summary_decline(v: &Value) -> String {
+    format!(
+        "plan {} declined; {} object(s) retained",
+        v["plan"].as_str().unwrap_or("?"),
+        v["retained"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `approval_submit`.
+pub fn summary_approval(v: &Value) -> String {
+    format!(
+        "plan {} submitted; {} deleted, {} drifted, partial={}",
+        v["plan"].as_str().unwrap_or("?"),
+        v["deleted"].as_array().map_or(0, Vec::len),
+        v["drift"].as_array().map_or(0, Vec::len),
+        v["partial"]
+    )
+}
+
+/// A short line for a successful `alerts_list`.
+pub fn summary_alerts(v: &Value) -> String {
+    format!(
+        "{} firing, {} unknown, {} disabled",
+        v["firing"].as_array().map_or(0, Vec::len),
+        v["unknown"].as_array().map_or(0, Vec::len),
+        v["disabled"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `postgres_create`.
+pub fn summary_pg_create(v: &Value) -> String {
+    format!(
+        "database {} ({}) {}",
+        v["name"].as_str().unwrap_or("?"),
+        v["entry"].as_str().unwrap_or("?"),
+        v["status"].as_str().unwrap_or("?")
+    )
+}
+
+/// A short line for a successful `postgres_list`.
+pub fn summary_pg_list(v: &Value) -> String {
+    format!(
+        "{} database(s)",
+        v["databases"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `postgres_link`.
+pub fn summary_pg_link(v: &Value) -> String {
+    format!(
+        "database {} linked to {} ({} variable(s))",
+        v["name"].as_str().unwrap_or("?"),
+        v["consumer"].as_str().unwrap_or("?"),
+        v["env"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `postgres_unlink`.
+pub fn summary_pg_unlink(v: &Value) -> String {
+    format!(
+        "database {} unlinked from {} ({} variable(s) removed)",
+        v["name"].as_str().unwrap_or("?"),
+        v["consumer"].as_str().unwrap_or("?"),
+        v["removed"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `postgres_delete`.
+pub fn summary_pg_delete(v: &Value) -> String {
+    if v["removed"].as_bool().unwrap_or(false) {
+        "database removed".to_string()
+    } else {
+        "database delete planned".to_string()
+    }
+}
+
+/// A short line for a successful `ontology_query`.
+pub fn summary_ontology(v: &Value) -> String {
+    format!(
+        "{} is {} with {} edge(s)",
+        v["id"].as_str().unwrap_or("?"),
+        v["status"].as_str().unwrap_or("unknown"),
+        v["edges"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// The default cut: the result is already within its cap.
+pub fn no_cut(_: &Value) -> Option<Value> {
+    None
 }
 
 /// The verb with this name, if the table has one.
