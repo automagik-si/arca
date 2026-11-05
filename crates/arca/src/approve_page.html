@@ -358,7 +358,7 @@
           <span class="num">1</span>
           <div>
             <p class="step-title">Get a setup code</p>
-            <p class="step-text">Arca shows 8 digits on its own screen.</p>
+            <p class="step-text">Arca shows the 8 digits on the computer that runs Arca, so be at that computer for this step. The passkey itself is saved on the phone or computer you're using now.</p>
             <button id="get-code" class="btn btn-secondary" type="button">Get a setup code</button>
           </div>
         </li>
@@ -439,7 +439,7 @@ function plain(error) {
   if (error && error.name === "NotAllowedError") return "The passkey prompt was closed or ran out of time. Try again when you're ready.";
   if (error && error.name === "InvalidStateError") return "This device already has a passkey for Arca.";
   if (error && error.name === "SecurityError") return "Passkeys can't be used at this page's address. Open Arca from its usual address.";
-  if (message === "A code is already on your screen") return "A code is already on Arca's screen. Type that one below.";
+  if (message === "A code is already on your screen") return "A code is already showing on the computer that runs Arca. Type that one below.";
   const answered = message.match(/answered (\d+)$/);
   if (answered) return "Arca could not do that just now (error " + answered[1] + "). Try again in a moment.";
   if (/locked/.test(message)) return message + ". This happens after too many tries, and it unlocks by itself.";
@@ -481,9 +481,11 @@ function notice(kind, title, text) {
 }
 
 function expiryText(expiresAt) {
-  const minutes = Math.round((expiresAt - Date.now()) / 60000);
+  const ms = expiresAt - Date.now();
   const clock = new Date(expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  if (minutes <= 0) return "Expired";
+  if (ms <= 0) return "Expired";
+  if (ms < 60000) return "Expires in less than a minute · " + clock;
+  const minutes = Math.floor(ms / 60000);
   if (minutes < 60) return "Expires in " + minutes + " min · " + clock;
   return "Expires at " + clock;
 }
@@ -501,9 +503,9 @@ function planCard(plan) {
   meta.append(el("span", "badge", "Delete"), expiry);
 
   const count = objects.length;
-  const title = count === 1
-    ? "Delete " + objects[0].name
-    : "Delete " + (count || "these") + " item" + (count === 1 ? "" : "s");
+  let title = "Delete " + count + " items";
+  if (count === 0) title = "Delete (no items listed)";
+  if (count === 1) title = "Delete " + objects[0].name;
   const heading = el("h3", "", title);
 
   const list = el("ul", "objects");
@@ -603,7 +605,7 @@ async function getCode() {
     const answer = await fetch("/approve/setup-code", { method: "POST" });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) throw new Error(body.message || ("the setup code answered " + answer.status));
-    status("Look at Arca's own screen for the 8-digit code, then type it below.");
+    status("Look at the computer that runs Arca for the 8-digit code, then type it below.");
     document.getElementById("setup-code").focus();
   } catch (error) {
     fail(error);
