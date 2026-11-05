@@ -1,0 +1,10 @@
+- insert:
+    - id: arca-canvas
+      name: arca-canvas-dsh
+      failOnStartupError: false
+      config:
+        socketPath: /run/arca/arca.sock
+        viewerTokenPath: /path/to/arca-viewer.token
+        pollMs: 5000
+        droiddUrl: ''
+        droiddTokenPath: ''
