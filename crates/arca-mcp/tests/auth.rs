@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use arca_api::Scope;
-use arca_mcp::{Caller, TokenStore, TokenStoreError, mint};
+use arca_mcp::{Caller, TokenStore, TokenStoreError, mint, mint_with_tools};
 use common::{Scratch, mint_into, own_uid, write_hash_file, write_named};
 use sha2::{Digest, Sha256};
 
@@ -79,14 +79,16 @@ fn a_loaded_store_authenticates_each_secret_as_its_own_token() {
         store.lookup(&viewer),
         Some(Caller {
             token_id: "ops-viewer".into(),
-            scope: Scope::Viewer
+            scope: Scope::Viewer,
+            tools: None,
         })
     );
     assert_eq!(
         store.lookup(&admin),
         Some(Caller {
             token_id: "ops-admin".into(),
-            scope: Scope::Operator
+            scope: Scope::Operator,
+            tools: None,
         })
     );
 }
@@ -107,6 +109,50 @@ fn a_store_finds_its_token_among_many() {
 }
 
 #[test]
+fn a_tools_line_is_loaded_into_the_caller_and_a_two_line_file_admits_everything() {
+    let scratch = Scratch::new("tools-line");
+    let tools = vec!["journal_list".to_string(), "node_metrics".to_string()];
+    let (secret, text) = mint_with_tools(Scope::Viewer, Some(&tools));
+    write_hash_file(scratch.path(), "v-tools", &text, 0o400);
+    let two_line = mint(Scope::Viewer);
+    write_hash_file(scratch.path(), "v-all", &two_line.1, 0o400);
+    let store = TokenStore::load(scratch.path()).expect("loads");
+    let caller = store.lookup(&secret).expect("the allowlisted token");
+    assert_eq!(caller.tools, Some(tools.clone()));
+    assert!(caller.allows_tool("journal_list"));
+    assert!(!caller.allows_tool("watch_report"));
+    let all = store.lookup(&two_line.0).expect("the two-line token");
+    assert_eq!(all.tools, None);
+    assert!(all.allows_tool("watch_report"));
+    assert_eq!(
+        store.ids(),
+        vec![
+            ("v-all".to_string(), Scope::Viewer, None),
+            ("v-tools".to_string(), Scope::Viewer, Some(tools))
+        ]
+    );
+}
+
+#[test]
+fn reload_drops_a_removed_token_without_restarting_the_store() {
+    let scratch = Scratch::new("reload");
+    let first = mint_into(scratch.path(), "v-first", Scope::Viewer);
+    let store = TokenStore::load(scratch.path()).expect("loads");
+    let live = store.clone();
+    assert!(live.lookup(&first).is_some());
+    fs::remove_file(scratch.at("v-first.hash")).expect("remove");
+    assert_eq!(live.reload(scratch.path()).expect("reload"), 0);
+    assert!(live.lookup(&first).is_none());
+    assert!(live.ids().is_empty());
+    let second = mint_into(scratch.path(), "v-second", Scope::Doctor);
+    assert_eq!(live.reload(scratch.path()).expect("reload"), 1);
+    assert_eq!(
+        live.lookup(&second).map(|caller| caller.scope),
+        Some(Scope::Doctor)
+    );
+}
+
+#[test]
 fn ids_lists_each_token_with_its_scope_and_nothing_else() {
     let scratch = Scratch::new("ids");
     mint_into(scratch.path(), "b-doctor", Scope::Doctor);
@@ -115,8 +161,8 @@ fn ids_lists_each_token_with_its_scope_and_nothing_else() {
     assert_eq!(
         store.ids(),
         vec![
-            ("a-viewer".to_string(), Scope::Viewer),
-            ("b-doctor".to_string(), Scope::Doctor)
+            ("a-viewer".to_string(), Scope::Viewer, None),
+            ("b-doctor".to_string(), Scope::Doctor, None)
         ]
     );
 }

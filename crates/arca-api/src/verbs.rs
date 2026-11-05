@@ -61,7 +61,7 @@ pub struct Verb {
     pub result: fn() -> Value,
 }
 
-static VERBS: [Verb; 14] = [
+static VERBS: [Verb; 15] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -101,6 +101,16 @@ static VERBS: [Verb; 14] = [
         destructive: false,
         params: token_list_params,
         result: token_list_result,
+    },
+    Verb {
+        name: "journal_list",
+        summary: "The effect journal, paged by sequence. It names only the intent and object fields, never a pre-image or inverse.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        params: journal_list_params,
+        result: journal_list_result,
     },
     Verb {
         name: "plan_list",
@@ -482,6 +492,33 @@ fn token_list_result() -> Value {
         array(result(vec![
             ("id", true, string()),
             ("scope", true, one_of(&["viewer", "doctor", "operator"])),
+            ("tools", false, array(string())),
+        ])),
+    )])
+}
+
+fn journal_list_params() -> Value {
+    params(vec![("after", false, int()), ("limit", false, int())])
+}
+
+fn journal_list_result() -> Value {
+    result(vec![(
+        "records",
+        true,
+        array(result(vec![
+            ("id", true, int()),
+            ("entry", true, string()),
+            ("class", true, one_of(&["A", "B", "C"])),
+            ("target", true, object_ref()),
+            ("plugin", false, string()),
+            (
+                "state",
+                true,
+                one_of(&["Intent", "Applied", "Confirmed", "Reverted", "Failed"]),
+            ),
+            ("at_ms", true, int()),
+            ("intent", false, one_of(&["Delete"])),
+            ("object", false, object_ref()),
         ])),
     )])
 }

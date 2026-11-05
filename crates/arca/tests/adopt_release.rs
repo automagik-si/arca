@@ -1290,6 +1290,7 @@ fn viewer() -> Caller {
     Caller {
         token_id: "viewer-1".to_string(),
         scope: Scope::Viewer,
+        tools: None,
     }
 }
 

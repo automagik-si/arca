@@ -1,8 +1,8 @@
 //! Interim bearer tokens: stored digests, a strict file format and one check per request.
 //!
 //! A token is the secret `arca_` followed by 43 base64url characters (32 random bytes). The server holds only the SHA-256
-//! digest of the whole secret, in `<id>.hash`, whose text is `scope=<scope>` and `sha256=<64 lowercase hex>`, each on its
-//! own line. A secret carries 256 random bits, so a plain digest is enough: a copied hash file yields no usable secret.
+//! digest of the whole secret, in `<id>.hash`, whose text is `scope=<scope>`, `sha256=<64 lowercase hex>` and an optional
+//! `tools=<comma list>`, each on its own line. A secret carries 256 random bits, so a plain digest is enough: a copied hash file yields no usable secret.
 //! A secret is never stored, logged or echoed, and an error names a file, never its content. The token directory is a real
 //! directory, not a symlink, owned by this process and writable by its owner only.
 
@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use arca_api::Scope;
 use base64::Engine as _;
@@ -31,6 +32,17 @@ const MAX_ID_LEN: usize = 64;
 pub struct Caller {
     pub token_id: String,
     pub scope: Scope,
+    /// The token's optional tool allowlist. `None` admits every verb the scope does.
+    pub tools: Option<Vec<String>>,
+}
+
+impl Caller {
+    /// Whether this token's allowlist admits `tool`. A token without a list admits all of them.
+    pub fn allows_tool(&self, tool: &str) -> bool {
+        self.tools
+            .as_ref()
+            .is_none_or(|tools| tools.iter().any(|name| name == tool))
+    }
 }
 
 /// Why a token directory will not load. Each variant names one file, never the file's content. `UnsafeDir` names the
@@ -67,22 +79,28 @@ impl std::fmt::Display for TokenStoreError {
 
 impl std::error::Error for TokenStoreError {}
 
-/// One loaded token: its id, its scope and the digest of its secret.
+/// One loaded token: its id, its scope, its optional tool allowlist and the digest of its secret.
+#[derive(Clone)]
 struct Entry {
     id: String,
     scope: Scope,
+    tools: Option<Vec<String>>,
     digest: [u8; 32],
 }
 
-/// The loaded token digests, read once at start.
+/// The loaded token digests, read once at start and replaceable on SIGHUP. Cloning shares the live set.
+#[derive(Clone)]
 pub struct TokenStore {
-    entries: Vec<Entry>,
+    entries: Arc<RwLock<Vec<Entry>>>,
 }
 
 impl std::fmt::Debug for TokenStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenStore")
-            .field("tokens", &self.entries.len())
+            .field(
+                "tokens",
+                &self.entries.read().map(|e| e.len()).unwrap_or_default(),
+            )
             .finish()
     }
 }
@@ -128,7 +146,26 @@ impl TokenStore {
             entries.push(entry);
         }
         entries.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(TokenStore { entries })
+        Ok(TokenStore {
+            entries: Arc::new(RwLock::new(entries)),
+        })
+    }
+
+    /// Replaces the live token set from `dir` and returns its size. The previous set stays in place when the load fails.
+    pub fn reload(&self, dir: &Path) -> Result<usize, TokenStoreError> {
+        let loaded = TokenStore::load(dir)?;
+        let next = loaded
+            .entries
+            .read()
+            .map_err(|_| TokenStoreError::Io {
+                file: "the token store".into(),
+            })?
+            .clone();
+        let len = next.len();
+        *self.entries.write().map_err(|_| TokenStoreError::Io {
+            file: "the token store".into(),
+        })? = next;
+        Ok(len)
     }
 
     /// The caller a bearer authenticates as, or `None`. Every stored digest is compared, with no early exit.
@@ -137,8 +174,9 @@ impl TokenStore {
             return None;
         }
         let digest = sha256(bearer.as_bytes());
+        let entries = self.entries.read().ok()?;
         let mut found = None;
-        for entry in &self.entries {
+        for entry in entries.iter() {
             if digests_equal(&entry.digest, &digest) {
                 found = Some(entry);
             }
@@ -146,28 +184,42 @@ impl TokenStore {
         found.map(|e| Caller {
             token_id: e.id.clone(),
             scope: e.scope,
+            tools: e.tools.clone(),
         })
     }
 
-    /// Every token's id and scope, by id. Never a digest or a secret.
-    pub fn ids(&self) -> Vec<(String, Scope)> {
+    /// Every token's id, scope and optional tool list, by id. Never a digest or a secret.
+    pub fn ids(&self) -> Vec<(String, Scope, Option<Vec<String>>)> {
         self.entries
-            .iter()
-            .map(|e| (e.id.clone(), e.scope))
-            .collect()
+            .read()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| (e.id.clone(), e.scope, e.tools.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
 /// A new secret of `scope`, and the text of its hash file.
 pub fn mint(scope: Scope) -> (String, String) {
+    mint_with_tools(scope, None)
+}
+
+/// A new secret of `scope` and its hash-file text, with an optional tool allowlist as the third line.
+pub fn mint_with_tools(scope: Scope, tools: Option<&[String]>) -> (String, String) {
     let mut raw = [0u8; SECRET_BYTES];
     getrandom::fill(&mut raw).expect("the operating system's random source is available");
     let secret = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(raw));
-    let text = format!(
+    let mut text = format!(
         "scope={}\nsha256={}\n",
         scope.as_str(),
         to_hex(&sha256(secret.as_bytes()))
     );
+    if let Some(tools) = tools {
+        text.push_str(&format!("tools={}\n", tools.join(",")));
+    }
     (secret, text)
 }
 
@@ -259,20 +311,38 @@ fn load_one(path: &Path, name: &str, id: String, owner_uid: u32) -> Result<Entry
         return Err(malformed());
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
-    let (scope, digest) = parse_body(text).ok_or_else(malformed)?;
-    Ok(Entry { id, scope, digest })
+    let (scope, tools, digest) = parse_body(text).ok_or_else(malformed)?;
+    Ok(Entry {
+        id,
+        scope,
+        tools,
+        digest,
+    })
 }
 
-/// The two lines of a hash file. Exactly these, LF endings, a final newline, and nothing after the digest.
-fn parse_body(text: &str) -> Option<(Scope, [u8; 32])> {
+/// The two or three lines of a hash file. Exactly these, LF endings, a final newline, and nothing after the digest. A
+/// two-line file means every verb the scope admits; a third `tools=` line is the optional allowlist.
+fn parse_body(text: &str) -> Option<(Scope, Option<Vec<String>>, [u8; 32])> {
     let body = text.strip_suffix('\n')?;
     let mut lines = body.split('\n');
     let scope = parse_scope(lines.next()?.strip_prefix("scope=")?)?;
     let digest = decode_hex(lines.next()?.strip_prefix("sha256=")?)?;
+    let tools = match lines.next() {
+        None => None,
+        Some(line) => {
+            let list = line.strip_prefix("tools=")?;
+            Some(
+                list.split(',')
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )
+        }
+    };
     if lines.next().is_some() {
         return None;
     }
-    Some((scope, digest))
+    Some((scope, tools, digest))
 }
 
 fn parse_scope(text: &str) -> Option<Scope> {

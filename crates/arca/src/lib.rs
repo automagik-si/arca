@@ -45,7 +45,8 @@ const USAGE: &str = "usage: arca <command>
   probe consumer remove --name <n> --config <file>
   serve --config <file>
   call [--peer <name>] <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
-  token mint --scope <viewer|doctor|operator> --id <id> --out <file> (--config <file> | --hash-dir <dir>)
+  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)
+  token revoke <id> (--config <file> | --hash-dir <dir>)
   store check --config <file>
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
@@ -204,9 +205,13 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "token" => match rest.split_first() {
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
                 rest,
-                &["scope", "id", "hash-dir", "out", "config"],
+                &["scope", "id", "hash-dir", "out", "config", "tools"],
                 &[],
             )?),
+            Some((action, rest)) if action == "revoke" => {
+                let (id, rest) = rest.split_first().ok_or_else(usage_failure)?;
+                cmd_token::revoke_token(id, &parse_flags(rest, &["hash-dir", "config"], &[])?)
+            }
             _ => Err(usage_failure()),
         },
         "shim" => run_shim(&parse_flags(

@@ -255,6 +255,7 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "arca_status",
             "node_metrics",
             "watch_report",
+            "journal_list",
             "plan_list",
             "alerts_list",
             "postgres_list",

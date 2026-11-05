@@ -39,15 +39,17 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    AlertsExport, AlertsHandler, AlertsPublished, Clock, MetricsExport, MetricsHandler,
-    OntologyQuery, Published, SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler,
-    WatchHandler, new_sampler, now_ms, plan_handlers, spawn_watcher,
+    AlertsExport, AlertsHandler, AlertsPublished, Clock, JournalListHandler, MetricsExport,
+    MetricsHandler, OntologyQuery, Published, SAMPLE_INTERVAL, StatusHandler, Ticker,
+    TokenListHandler, WatchHandler, new_sampler, now_ms, plan_handlers, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
 
 /// The file that holds the node's ed25519 key, in the state directory.
 const NODE_KEY_FILE: &str = "node.key";
+/// The file a running server leaves its pid in, so `arca token revoke` can send it SIGHUP.
+pub(crate) const SERVE_PID_FILE: &str = "serve.pid";
 /// The file the approval nonces are spent in, in the state directory.
 const NONCE_FILE: &str = "approval-nonces.jsonl";
 /// The directory secret files are read from, in the state directory.
@@ -92,9 +94,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The alert rules are read before anything listens. A malformed alerts.json stops the start with exit 2.
     let alerts_file = rules::load(&cfg.state_dir).map_err(rules_failure)?;
 
-    // The token store is read before anything listens. Its ids are copied out first, because the server takes the store.
+    // The token store is read before anything listens. The server and the SIGHUP handler share it.
     let tokens = TokenStore::load(&cfg.tokens.hash_dir).map_err(token_failure)?;
-    let ids = tokens.ids();
     let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     let node = key.id().to_hex();
@@ -164,7 +165,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));
-    let mut server = Server::new(verbs(), tokens)
+    let mut server = Server::new(verbs(), tokens.clone())
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
@@ -180,7 +181,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .handle("watch_report", watch)
-        .handle("token_list", Arc::new(TokenListHandler { ids }))
+        .handle(
+            "journal_list",
+            Arc::new(JournalListHandler {
+                state_dir: cfg.state_dir.clone(),
+            }),
+        )
+        .handle(
+            "token_list",
+            Arc::new(TokenListHandler {
+                tokens: tokens.clone(),
+            }),
+        )
         .handle("ontology_query", Arc::new(OntologyQuery))
         .handle(
             "alerts_list",
@@ -232,10 +244,24 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .enable_all()
         .build()
         .map_err(|e| Failure::Runtime(e.to_string()))?;
+    let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
+    fs::write(&pid_path, format!("{}\n", std::process::id()))
+        .map_err(|e| Failure::Runtime(format!("cannot write the serve pid file: {e}")))?;
     let unix_path = cfg.listen.unix.clone();
     let outcome: io::Result<()> = runtime.block_on(async {
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut hangup = signal(SignalKind::hangup())?;
+        let reload_tokens = tokens.clone();
+        let reload_dir = cfg.tokens.hash_dir.clone();
+        tokio::spawn(async move {
+            while hangup.recv().await.is_some() {
+                match reload_tokens.reload(&reload_dir) {
+                    Ok(count) => eprintln!("arca: {count} token(s) reloaded"),
+                    Err(error) => eprintln!("arca: the token store was not reloaded: {error}"),
+                }
+            }
+        });
         let stop = async {
             tokio::select! {
                 _ = terminate.recv() => {}
@@ -263,6 +289,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             () = stop => Ok(()),
         }
     });
+    let _ = fs::remove_file(&pid_path);
     match outcome {
         Ok(()) => {
             remove_own_socket(&cfg.listen.unix);

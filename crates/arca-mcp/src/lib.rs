@@ -11,7 +11,7 @@ pub mod http;
 pub mod jsonrpc;
 pub mod tools;
 
-pub use auth::{Caller, TokenStore, TokenStoreError, mint};
+pub use auth::{Caller, TokenStore, TokenStoreError, mint, mint_with_tools};
 pub use http::{
     GetHandler, GetReply, Server, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy,
     serve_tailnet, serve_unix, tailnet_addr_ok,

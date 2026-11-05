@@ -356,6 +356,19 @@ impl JournalStore for FileJournal {
     }
 }
 
+/// Reads the journal at `path` without taking its lock, for a read-only listing while a server holds the file. A missing
+/// file is an empty journal. Damaged records refuse the read; a torn last line is dropped by the same decoder.
+pub fn read_journal(path: &Path) -> Result<(Vec<EffectRecord>, Option<String>), KernelError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), None));
+        }
+        Err(error) => return Err(io_error(&path.display().to_string(), &error)),
+    };
+    decode(&bytes).map(|decoded| (decoded.records, decoded.torn))
+}
+
 /// An in-memory journal, for tests and for callers that need no durability.
 #[derive(Debug, Default, Clone)]
 pub struct MemJournal {

@@ -36,6 +36,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "node_metrics",
             "watch_report",
             "token_list",
+            "journal_list",
             "plan_list",
             "plan_decline",
             "approval_submit",
@@ -416,7 +417,8 @@ fn token_list_schemas_equal_its_table_row() {
                         "type": "object",
                         "properties": {
                             "id": { "type": "string" },
-                            "scope": { "type": "string", "enum": ["viewer", "doctor", "operator"] }
+                            "scope": { "type": "string", "enum": ["viewer", "doctor", "operator"] },
+                            "tools": { "type": "array", "items": { "type": "string" } }
                         },
                         "required": ["id", "scope"]
                     }
