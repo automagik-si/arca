@@ -28,6 +28,7 @@ arca-providers.workspace = true
 arca-reconcile.workspace = true
 arca-store.workspace = true
 arca-watch.workspace = true
+axum.workspace = true
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true

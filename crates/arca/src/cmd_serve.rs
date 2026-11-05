@@ -202,13 +202,21 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .into_iter()
         .chain(crate::handlers::postgres_handlers(
             kernel.clone(),
-            clock,
+            clock.clone(),
             Arc::new(cfg.clone()),
         ))
     {
         server = server.handle(verb, handler);
     }
     let router = server.router();
+    let router = match cfg.approval_origin.clone() {
+        Some(origin) => router.merge(crate::approve_page::router(
+            origin,
+            Arc::clone(&kernel),
+            clock.clone(),
+        )),
+        None => router,
+    };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

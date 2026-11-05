@@ -259,7 +259,45 @@ pub fn parse_passkeys(bytes: &[u8]) -> Result<Vec<PasskeyLine>, ApprovalRefusal>
         .collect())
 }
 
-/// `text` decoded by `engine`, when `text` is exactly the encoding `engine` writes of its bytes and they are not empty.
+/// Formats one passkeys-file line for a registration: the same shape [`parse_passkeys`] accepts, with `rp` as the relying
+/// party, `origin` as its exact page origin, `credential_id` as unpadded base64url and `public_key` as canonical base64 of a
+/// 91-byte P-256 SPKI. It refuses anything the parser would refuse, before returning a line.
+pub fn format_passkey_line(
+    rp: &str,
+    origin: &str,
+    credential_id: &str,
+    public_key: &str,
+) -> Result<String, ApprovalRefusal> {
+    if !dns_name_ok(rp) {
+        return Err(malformed("the rp is not a lowercase DNS name"));
+    }
+    if !origin_ok(origin, rp) {
+        return Err(malformed(
+            "the origin is not https:// and its rp or a name under it, with at most a port that is not 443",
+        ));
+    }
+    decode_exact(credential_id, &URL_SAFE_NO_PAD)
+        .filter(|id| (CRED_MIN..=CRED_MAX).contains(&id.len()))
+        .ok_or_else(|| {
+            malformed("the credential id is not 16 to 1023 bytes of unpadded base64url")
+        })?;
+    let spki = decode_exact(public_key, &STANDARD)
+        .ok_or_else(|| malformed("the public key is not canonical base64"))?;
+    if spki.len() != P256_SPKI_LEN || spki[..P256_SPKI_HEADER.len()] != P256_SPKI_HEADER {
+        return Err(malformed(
+            "the public key is not a 91-byte P-256 public key (SPKI DER)",
+        ));
+    }
+    if p256_key(&spki).is_none() {
+        return Err(malformed(
+            "the public key is not a P-256 point on the curve",
+        ));
+    }
+    Ok(format!(
+        "owner namespaces=\"{ARCA_NAMESPACE}\" rp=\"{rp}\" origin=\"{origin}\" alg=\"ES256\" cred=\"{credential_id}\" key=\"{public_key}\""
+    ))
+}
+
 fn decode_exact(text: &str, engine: &impl Engine) -> Option<Vec<u8>> {
     let bytes = engine.decode(text).ok()?;
     (!bytes.is_empty() && engine.encode(&bytes) == text).then_some(bytes)
