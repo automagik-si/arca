@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arca approvals</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.5rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  .plan { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: .5rem; padding: 1rem; margin: .75rem 0; }
+  .digest, .expiry { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+  button { font: inherit; padding: .5rem 1rem; border-radius: .4rem; border: 1px solid currentColor; background: transparent; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .75rem; border: 1px dashed currentColor; }
+  .status { min-height: 1.5rem; }
+</style>
+</head>
+<body>
+<h1>Arca approvals</h1>
+<p>Waiting plans on this node. Approving one asks this browser's passkey for one tap; the kernel checks the proof.</p>
+
+<h2>Waiting plans</h2>
+<div id="plans"><p>Loading…</p></div>
+<p id="status" class="status" role="status"></p>
+
+<h2>Register this browser</h2>
+<p>Register a passkey for this origin. The line below is added to the root-owned passkeys file, then <code>serve</code> is restarted.</p>
+<button id="register">Register passkey</button>
+<pre id="line" hidden></pre>
+
+<script>
+const enc = new TextEncoder();
+
+function b64(bytes) {
+  let text = "";
+  for (const byte of bytes) text += String.fromCharCode(byte);
+  return btoa(text);
+}
+
+function b64url(bytes) {
+  return b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function status(text) {
+  document.getElementById("status").textContent = text;
+}
+
+async function loadPlans() {
+  const target = document.getElementById("plans");
+  try {
+    const response = await fetch("/approve/plans", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error("the plan list answered " + response.status);
+    const body = await response.json();
+    target.replaceChildren();
+    if (!body.plans.length) {
+      const empty = document.createElement("p");
+      empty.textContent = "No plan is waiting.";
+      target.append(empty);
+      return;
+    }
+    for (const plan of body.plans) {
+      const card = document.createElement("div");
+      card.className = "plan";
+      const heading = document.createElement("div");
+      heading.className = "digest";
+      heading.textContent = "target " + plan.plan;
+      const expiry = document.createElement("div");
+      expiry.className = "expiry";
+      expiry.textContent = "expires " + new Date(plan.expiresAt).toISOString();
+      const button = document.createElement("button");
+      button.textContent = "Approve";
+      button.addEventListener("click", () => approve(plan, button));
+      card.append(heading, expiry, button);
+      target.append(card);
+    }
+  } catch (error) {
+    target.replaceChildren();
+    status(String(error));
+  }
+}
+
+async function approve(plan, button) {
+  button.disabled = true;
+  status("Waiting for the passkey…");
+  try {
+    const challenge = await crypto.subtle.digest(
+      "SHA-256",
+      enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + plan.statement),
+    );
+    const credential = await navigator.credentials.get({
+      publicKey: {
+        challenge,
+        rpId: location.hostname,
+        userVerification: "required",
+        timeout: 60000,
+      },
+    });
+    if (!credential) throw new Error("no passkey was selected");
+    const response = credential.response;
+    const proof = {
+      alg: "ES256",
+      authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
+      clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
+      credentialId: b64url(new Uint8Array(credential.rawId)),
+      kind: "webauthn",
+      signature: b64url(new Uint8Array(response.signature)),
+      v: 1,
+    };
+    const approval = b64(enc.encode(plan.statement)) + "." + b64(enc.encode(JSON.stringify(proof)));
+    const answer = await fetch("/approve/approve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan: plan.plan, approval }),
+    });
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok) throw new Error(body.refusal || ("the approval answered " + answer.status));
+    status("Approved: " + (body.deleted || []).length + " object(s) deleted.");
+    await loadPlans();
+  } catch (error) {
+    status(String(error));
+    button.disabled = false;
+  }
+}
+
+async function register() {
+  const button = document.getElementById("register");
+  button.disabled = true;
+  status("Waiting for the authenticator…");
+  try {
+    const challenge = crypto.getRandomValues(new Uint8Array(32));
+    const user = crypto.getRandomValues(new Uint8Array(16));
+    const credential = await navigator.credentials.create({
+      publicKey: {
+        challenge,
+        rp: { id: location.hostname, name: "Arca approvals" },
+        user: { id: user, name: "owner", displayName: "Owner" },
+        pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        authenticatorSelection: {
+          userVerification: "required",
+          residentKey: "required",
+          requireResidentKey: true,
+        },
+        attestation: "none",
+        timeout: 60000,
+      },
+    });
+    if (!credential) throw new Error("no passkey was created");
+    const publicKey = credential.response.getPublicKey();
+    if (!publicKey) throw new Error("the authenticator returned no public key");
+    const answer = await fetch("/approve/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        credentialId: b64url(new Uint8Array(credential.rawId)),
+        publicKey: b64(new Uint8Array(publicKey)),
+        publicKeyAlgorithm: credential.response.getPublicKeyAlgorithm(),
+      }),
+    });
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok) throw new Error("the registration answered " + answer.status);
+    const line = document.getElementById("line");
+    line.hidden = false;
+    line.textContent = body.line;
+    status("Passkey registered. Add the line below to the root-owned passkeys file, then restart serve.");
+  } catch (error) {
+    status(String(error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
+document.getElementById("register").addEventListener("click", register);
+loadPlans();
+</script>
+</body>
+</html>

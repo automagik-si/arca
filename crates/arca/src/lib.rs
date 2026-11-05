@@ -8,6 +8,7 @@
 //! does not hold the adoption it is asked to resume, release or verify.
 
 pub mod adoptions;
+pub mod approve_page;
 pub mod cmd_adopt;
 pub mod cmd_call;
 pub mod cmd_link;

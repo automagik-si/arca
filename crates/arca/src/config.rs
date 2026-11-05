@@ -38,6 +38,10 @@ pub struct NodeConfig {
     /// The host name every owner approval statement names. When it is not set, the system's host name is used.
     #[serde(default)]
     pub approval_host: Option<String>,
+    /// The page origin the owner approval page is served at: `https://` plus a host name and at most a non-443 port.
+    /// It is the WebAuthn rp id and origin; it is not the host an approval statement names.
+    #[serde(default)]
+    pub approval_origin: Option<String>,
     /// The node link endpoint and opaque ALPN routes.
     #[serde(default)]
     pub link: Option<arca_link::Config>,
@@ -124,6 +128,8 @@ pub enum ConfigError {
     ScratchPrefix(String),
     /// The approval host is not a host name. The value is left out of the message.
     ApprovalHost,
+    /// The approval origin is not an https origin with a host name and at most a non-443 port. The value is left out.
+    ApprovalOrigin,
     /// Kernel projects are named, and no droidd project is listed to exclude.
     DroiddProjectsEmpty,
     /// The link config contains an invalid name or route.
@@ -161,6 +167,10 @@ impl fmt::Display for ConfigError {
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
+            ),
+            Self::ApprovalOrigin => write!(
+                f,
+                "approvalOrigin is refused: it must be https://, a lowercase host name, and at most a non-443 port, with no path"
             ),
         }
     }
@@ -222,7 +232,50 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::ApprovalHost);
     }
+    if let Some(origin) = &config.approval_origin
+        && !approval_origin_ok(origin)
+    {
+        return Err(ConfigError::ApprovalOrigin);
+    }
     Ok(())
+}
+
+/// Whether `origin` is `https://`, a lowercase DNS host name, and at most a port that is not 443, with no path. The host is
+/// the WebAuthn rp id, so the passkeys file's stricter DNS rule applies here too.
+fn approval_origin_ok(origin: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.contains(':') && authority.matches(':').count() > 1
+    {
+        return false;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let port_ok = port.is_none_or(|port| {
+        !port.starts_with('0')
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|p| p != 0 && p != 443)
+    });
+    port_ok && dns_name_ok(host)
+}
+
+/// Whether `name` is a lowercase DNS name: 1 to 253 bytes of dot-separated labels, each 1 to 63 lowercase letters, digits
+/// and dashes, with no dash at either end.
+fn dns_name_ok(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 /// The adoption rules: plain names, each adoption project starting `arcak-adopt-` and listed in `kernel.projects`, no
@@ -411,5 +464,39 @@ mod tests {
     fn an_approval_host_that_is_a_host_name_or_none_is_accepted() {
         assert_eq!(check(&config_with(Some("node1.example"))), Ok(()));
         assert_eq!(check(&config_with(None)), Ok(()));
+    }
+
+    #[test]
+    fn an_approval_origin_must_be_https_a_lowercase_host_and_an_optional_non_443_port() {
+        let mut config = config_with(None);
+        for bad in [
+            "http://box1.example.com",
+            "https://",
+            "https://box1.example.com/approve",
+            "https://box1.example.com:443",
+            "https://box1.example.com:",
+            "https://box1.example.com:0",
+            "https://box1.example.com:65536",
+            "https://Box1.example.com",
+            "https://-box1.example.com",
+            "https://box1.example.com:08443",
+        ] {
+            config.approval_origin = Some(bad.to_string());
+            assert_eq!(
+                check(&config),
+                Err(ConfigError::ApprovalOrigin),
+                "{bad:?} is not an approval origin"
+            );
+        }
+        for good in [
+            "https://box1.example.com",
+            "https://box1.example.com:8443",
+            "https://node1.example",
+        ] {
+            config.approval_origin = Some(good.to_string());
+            assert_eq!(check(&config), Ok(()), "{good:?} is an approval origin");
+        }
+        config.approval_origin = None;
+        assert_eq!(check(&config), Ok(()));
     }
 }

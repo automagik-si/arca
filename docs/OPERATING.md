@@ -73,11 +73,13 @@ refused without the value being echoed back.
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
+| `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 
 The config is refused, with exit 2, when:
 
 - a key is unknown, a required key is missing, or a value has the wrong form;
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
+- `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path;
 - `listen.tailnet` is not a tailnet address: it must be a fixed port, not a wildcard, inside `100.64.0.0/10` or
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
@@ -408,6 +410,32 @@ passkey's next assertion carries a higher count. A synced passkey's approval (co
 
 A plan that waits under no digest is `NoSuchPlan`. A valid approval for such a plan is still checked, so a spent approval reads as
 `Replayed`. The approval string is never stored or echoed, and an approval spends its nonce once, before its delete runs.
+
+### The approval page
+
+With `approvalOrigin` set, `serve` serves an approval page and mounts its routes outside the MCP bearer check:
+
+- `GET /approve` returns the page.
+- `GET /approve/plans` returns the waiting plans with the same fields as `plan_list`.
+- `POST /approve/approve` takes `{ "plan": "<digest>", "approval": "<string>" }` and runs the plan through the same kernel
+  approval path as `approval_submit`.
+- `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }` and
+  returns the passkeys-file line.
+
+The GETs need no token and admit no `Origin` or the configured one. Both POSTs admit only the exact configured `Origin` and
+refuse any other before reading the body. `/mcp` and every other MCP route keep refusing every `Origin`.
+
+To use it:
+
+1. Set `approvalOrigin` to the page's HTTPS origin, for example `https://arca.example.com`, and restart `serve`.
+2. Publish the `/approve` routes through the reverse proxy to the same `listen.proxy` upstream as `/mcp`. The page is also
+   reachable on the tailnet listener; the proxy adds HTTPS and the host name the passkey is bound to.
+3. Open the page at that origin, register a passkey, and copy the line it prints.
+4. As root, add that line to `/etc/arca/owner-passkeys` with the file's trust rule (root-owned, not writable by the `serve`
+   account, not a link).
+5. Restart `serve`; its start log reports the passkey count, `arca: <n> owner signing key(s), <m> passkey(s) kept`.
+6. Open the page, choose a waiting plan, and approve it. The page shows each plan's target digest and expiry; the kernel's
+   answer reports the deleted objects or the refusal.
 
 **A scratch kernel can take its owner keys from files named in `ARCA_TEST_OWNER_SIGNERS` and `ARCA_TEST_OWNER_PASSKEYS`.**
 That is honoured only when:

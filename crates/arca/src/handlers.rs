@@ -783,14 +783,20 @@ impl ToolHandler for PlanList {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let now = (self.clock)();
         let kernel = lock(&self.kernel)?;
-        let plans = kernel
-            .pending_plans()
-            .iter()
-            .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
-            .map(|plan| plan_json(kernel.host(), plan, now))
-            .collect::<Result<Vec<Value>, CallError>>()?;
-        Ok(json!({ "plans": plans }))
+        list_plans(&kernel, now)
     }
+}
+
+/// The waiting plan list, shared by `plan_list` and the open approval page. Each listing draws a new nonce, so every
+/// statement is built fresh.
+pub(crate) fn list_plans(kernel: &Kernel, now: u64) -> Result<Value, CallError> {
+    let plans = kernel
+        .pending_plans()
+        .iter()
+        .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
+        .map(|plan| plan_json(kernel.host(), plan, now))
+        .collect::<Result<Vec<Value>, CallError>>()?;
+    Ok(json!({ "plans": plans }))
 }
 
 /// `plan_decline`: declines one waiting plan. Its objects are retained, and the decline is final.
@@ -821,23 +827,33 @@ struct ApprovalSubmit {
 
 impl ToolHandler for ApprovalSubmit {
     fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
-        let digest = plan_argument(&args)?;
-        let approval = args
-            .get("approval")
-            .and_then(Value::as_str)
-            .ok_or_else(|| CallError::Invalid("approval is required".to_string()))?;
         let now = (self.clock)();
         let mut kernel = lock(&self.kernel)?;
-        match kernel.approve(&digest, approval, now) {
-            Ok(None) => Err(no_such_plan()),
-            Ok(Some(run)) => Ok(json!({
-                "plan": digest.to_hex(),
-                "deleted": objects_json(&run.deleted)?,
-                "drift": objects_json(&run.drift)?,
-                "partial": run.partial,
-            })),
-            Err(refusal) => Err(refusal_failure(refusal)),
-        }
+        approve_plan(&mut kernel, &args, now)
+    }
+}
+
+/// The approval path shared by `approval_submit` and the open approval page: check the proof for the named waiting plan and
+/// run its delete once. The approval string is read and never stored or echoed.
+pub(crate) fn approve_plan(
+    kernel: &mut Kernel,
+    args: &Value,
+    now: u64,
+) -> Result<Value, CallError> {
+    let digest = plan_argument(args)?;
+    let approval = args
+        .get("approval")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CallError::Invalid("approval is required".to_string()))?;
+    match kernel.approve(&digest, approval, now) {
+        Ok(None) => Err(no_such_plan()),
+        Ok(Some(run)) => Ok(json!({
+            "plan": digest.to_hex(),
+            "deleted": objects_json(&run.deleted)?,
+            "drift": objects_json(&run.drift)?,
+            "partial": run.partial,
+        })),
+        Err(refusal) => Err(refusal_failure(refusal)),
     }
 }
 
