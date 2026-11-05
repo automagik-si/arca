@@ -2,7 +2,7 @@
 //! names. One seam, one nonce store and one statement format serve both kinds of proof.
 
 use crate::ApprovalRefusal;
-use crate::passkey::PasskeyVerifier;
+use crate::passkey::{PasskeyLine, PasskeyVerifier};
 use crate::sshsig::SshSigVerifier;
 use crate::statement::PASSKEY_PROOF_OPEN;
 use crate::verifier::SignatureVerifier;
@@ -24,6 +24,16 @@ impl OwnerKeys {
     /// The number of SSH keys and the number of passkeys trusted, in that order.
     pub fn key_counts(&self) -> (usize, usize) {
         (self.ssh.key_count(), self.passkeys.key_count())
+    }
+
+    /// The passkey lines this owner trusts. An enrolling page appends to them and replaces them without a restart.
+    pub fn passkey_lines(&self) -> &[PasskeyLine] {
+        self.passkeys.lines()
+    }
+
+    /// Replaces the passkey lines while keeping their sign-count store. The SSH keys are untouched.
+    pub fn replace_passkey_lines(&mut self, lines: Vec<PasskeyLine>) {
+        self.passkeys.replace_lines(lines);
     }
 }
 

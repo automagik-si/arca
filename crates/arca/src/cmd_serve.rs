@@ -19,8 +19,9 @@ use arca_alerts::rules::{self, Probes, RulesError};
 use arca_api::verbs;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE,
-    PasskeyVerifier, SignerLine, SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys, load_signers,
-    passkeys_trust, signers_trust,
+    PasskeyLine, PasskeyVerifier, STATE_PASSKEYS_FILE, SignerLine, SshSigVerifier,
+    TEST_PASSKEYS_ENV, load_passkeys, load_signers, load_state_passkeys, passkeys_trust,
+    signers_trust,
 };
 use arca_incus::UnixIncus;
 use arca_kernel::KernelError;
@@ -209,12 +210,21 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         server = server.handle(verb, handler);
     }
     let router = server.router();
-    let router = match cfg.approval_origin.clone() {
-        Some(origin) => router.merge(crate::approve_page::router(
+    let page = cfg.approval_origin.clone().map(|origin| {
+        crate::approve_page::Page::new(
             origin,
             Arc::clone(&kernel),
             clock.clone(),
-        )),
+            cfg.state_dir.clone(),
+            Arc::new(crate::approve_page::DesktopDisplay),
+        )
+    });
+    let proxy_router = match &page {
+        Some(page) => router.clone().merge(page.router(true)),
+        None => router.clone(),
+    };
+    let router = match &page {
+        Some(page) => router.merge(page.router(false)),
         None => router,
     };
 
@@ -242,7 +252,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         };
         let proxy = async {
             match cfg.listen.proxy {
-                Some(proxy) => serve_proxy(router.clone(), proxy.addr, proxy.peer).await,
+                Some(proxy) => serve_proxy(proxy_router.clone(), proxy.addr, proxy.peer).await,
                 None => std::future::pending().await,
             }
         };
@@ -307,7 +317,23 @@ fn owner_keys(cfg: &NodeConfig) -> Result<OwnerKeys, Failure> {
         passkeys_trust(cfg.kernel.scratch, &cfg.kernel.projects, test).map_err(approval_failure)?;
     let counts =
         FileSignCounts::open(&cfg.state_dir.join(PASSKEY_COUNTS_FILE)).map_err(approval_failure)?;
-    let passkeys = match load_passkeys(&path, &trust) {
+    let loaded = (|| -> Result<Vec<PasskeyLine>, ApprovalRefusal> {
+        let mut lines = load_passkeys(&path, &trust)?;
+        let state_path = cfg.state_dir.join(STATE_PASSKEYS_FILE);
+        let state_lines = load_state_passkeys(&state_path)?;
+        for line in state_lines {
+            if lines.iter().any(|seen| {
+                seen.credential_id == line.credential_id || seen.fingerprint == line.fingerprint
+            }) {
+                return Err(ApprovalRefusal::Untrusted(
+                    "a credential id or public key is in both passkeys files".to_string(),
+                ));
+            }
+            lines.push(line);
+        }
+        Ok(lines)
+    })();
+    let passkeys = match loaded {
         Ok(lines) => PasskeyVerifier::new(lines, counts),
         Err(refusal) => {
             eprintln!("arca: every passkey approval is refused: {refusal}");

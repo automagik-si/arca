@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -35,13 +36,15 @@ use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
 use crate::nonces::open_records;
-use crate::signers::{TrustRoot, namespaces_ok, read_trusted, trust_for, untrusted};
+use crate::signers::{TrustRoot, effective_uid, namespaces_ok, read_trusted, trust_for, untrusted};
 use crate::statement::valid_hex;
 use crate::verifier::SignatureVerifier;
 use crate::{ARCA_NAMESPACE, ApprovalRefusal};
 
 /// The owner's passkeys file in production. Root-owned, under the trust rule of the signers file.
 pub const OWNER_PASSKEYS: &str = "/etc/arca/owner-passkeys";
+/// The passkeys file Arca owns in its state directory, under the state-dir ownership rule.
+pub const STATE_PASSKEYS_FILE: &str = "owner-passkeys";
 /// The scratch-only passkeys injection, honoured under the signers injection's rules.
 pub const TEST_PASSKEYS_ENV: &str = "ARCA_TEST_OWNER_PASSKEYS";
 /// What a passkey's challenge hashes before the namespace.
@@ -176,6 +179,42 @@ pub fn load_passkeys(path: &Path, trust: &TrustRoot) -> Result<Vec<PasskeyLine>,
         return Ok(Vec::new());
     }
     let bytes = read_trusted(path, trust, "passkeys")?;
+    parse_passkeys(&bytes)
+}
+
+/// Loads the passkeys file Arca keeps in its own state directory. The file has no root anchor: it must be a regular file
+/// owned by this process's uid with mode exactly 0600, not a link, and it lives in the 0700 state directory `serve` already
+/// checks. A file that is not there is no passkey. A bad file is refused, so the caller can make the passkey verifier refuse
+/// while the SSH path still verifies; the start itself is never refused.
+pub fn load_state_passkeys(path: &Path) -> Result<Vec<PasskeyLine>, ApprovalRefusal> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(untrusted(format!(
+                "the state passkeys file cannot be read ({})",
+                error.kind()
+            )));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(untrusted(
+            "the state passkeys file is a link or not a regular file".to_string(),
+        ));
+    }
+    let uid = effective_uid()?;
+    if meta.uid() != uid {
+        return Err(untrusted(
+            "the state passkeys file is not owned by the serve user".to_string(),
+        ));
+    }
+    if meta.mode() & 0o777 != 0o600 {
+        return Err(untrusted(
+            "the state passkeys file does not have mode 0600".to_string(),
+        ));
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|_| untrusted("the state passkeys file cannot be read".to_string()))?;
     parse_passkeys(&bytes)
 }
 
@@ -758,6 +797,27 @@ impl PasskeyVerifier {
         match &self.keys {
             Keys::Kept { lines, .. } => lines.len(),
             Keys::Refused(_) => 0,
+        }
+    }
+
+    /// The passkey lines this verifier trusts. A refusing verifier trusts none.
+    pub fn lines(&self) -> &[PasskeyLine] {
+        match &self.keys {
+            Keys::Kept { lines, .. } => lines,
+            Keys::Refused(_) => &[],
+        }
+    }
+
+    /// Replaces the trusted lines while keeping the sign-count store. An enrolment uses this, so a count already kept for a
+    /// line that stays trusted is not lost. A verifier that refused its file stays refusing; the caller cannot recover it
+    /// without a restart.
+    pub fn replace_lines(&mut self, lines: Vec<PasskeyLine>) {
+        if let Keys::Kept {
+            lines: kept,
+            counts: _,
+        } = &mut self.keys
+        {
+            *kept = lines;
         }
     }
 }
