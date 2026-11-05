@@ -2,40 +2,418 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <title>Arca approvals</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.5rem; }
-  h2 { font-size: 1.1rem; margin-top: 2rem; }
-  .plan { border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: .5rem; padding: 1rem; margin: .75rem 0; }
-  .digest, .expiry { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
-  button { font: inherit; padding: .5rem 1rem; border-radius: .4rem; border: 1px solid currentColor; background: transparent; cursor: pointer; }
-  button:disabled { opacity: .5; cursor: default; }
-  input { font: inherit; padding: .45rem .55rem; border-radius: .4rem; border: 1px solid currentColor; background: transparent; width: 10rem; }
-  pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .75rem; border: 1px dashed currentColor; }
-  .status { min-height: 1.5rem; }
+  /* Arca design tokens. Light first, dark under prefers-color-scheme. Shared with the Arca website later. */
+  :root {
+    color-scheme: light dark;
+
+    /* colour */
+    --arca-bg: #f4f4f7;
+    --arca-surface: #ffffff;
+    --arca-surface-2: #f8f8fb;
+    --arca-ink: #0c0d11;
+    --arca-muted: #5d6170;
+    --arca-faint: #6b7080;
+    --arca-hair: #c8cbd5;
+    --arca-line: rgba(12, 13, 17, .07);
+    --arca-line-2: rgba(12, 13, 17, .12);
+    --arca-fill: rgba(12, 13, 17, .05);
+    --arca-fill-2: rgba(12, 13, 17, .09);
+    --arca-accent: #5b54f9;
+    --arca-on-accent: #ffffff;
+    --arca-accent-soft: rgba(91, 84, 249, .1);
+    --arca-ok: #12a150;
+    --arca-ok-ink: #0e7a3c;
+    --arca-ok-soft: rgba(18, 161, 80, .1);
+    --arca-warn: #e08a00;
+    --arca-warn-ink: #9a5b00;
+    --arca-warn-soft: rgba(224, 138, 0, .1);
+    --arca-bad: #d4343a;
+    --arca-bad-soft: rgba(212, 52, 58, .08);
+    --arca-shade-a: rgba(16, 18, 27, .05);
+    --arca-shade-b: rgba(16, 18, 27, .13);
+    --arca-shade-c: rgba(16, 18, 27, .3);
+
+    /* spacing */
+    --arca-space-1: 4px;
+    --arca-space-2: 8px;
+    --arca-space-3: 12px;
+    --arca-space-4: 16px;
+    --arca-space-5: 20px;
+    --arca-space-6: 28px;
+    --arca-space-7: 48px;
+    --arca-gutter: var(--arca-space-4);
+    --arca-column: 34rem;
+
+    /* type */
+    --arca-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --arca-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --arca-text-xs: 11px;
+    --arca-text-sm: 13px;
+    --arca-text-md: 15px;
+    --arca-text-lg: 20px;
+    --arca-text-xl: 28px;
+    --arca-leading: 1.5;
+    --arca-leading-tight: 1.2;
+
+    /* radii */
+    --arca-r-sm: 8px;
+    --arca-r-md: 14px;
+    --arca-r-lg: 22px;
+    --arca-r-pill: 999px;
+
+    /* shadows */
+    --arca-shadow-1: 0 1px 2px var(--arca-shade-a), 0 10px 28px -14px var(--arca-shade-b);
+    --arca-shadow-2: 0 2px 6px var(--arca-shade-a), 0 30px 80px -20px var(--arca-shade-c);
+
+    /* motion */
+    --arca-fast: 150ms;
+    --arca-ease: cubic-bezier(.2, .8, .2, 1);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --arca-bg: #0b0b0f;
+      --arca-surface: #15161c;
+      --arca-surface-2: #1b1c23;
+      --arca-ink: #f1f2f6;
+      --arca-muted: #a4a9b7;
+      --arca-faint: #8a90a0;
+      --arca-hair: #3b3e4a;
+      --arca-line: rgba(255, 255, 255, .075);
+      --arca-line-2: rgba(255, 255, 255, .13);
+      --arca-fill: rgba(255, 255, 255, .07);
+      --arca-fill-2: rgba(255, 255, 255, .12);
+      --arca-accent: #8b85ff;
+      --arca-on-accent: #0c0d11;
+      --arca-accent-soft: rgba(139, 133, 255, .16);
+      --arca-ok: #22c55e;
+      --arca-ok-ink: #4ade80;
+      --arca-ok-soft: rgba(34, 197, 94, .14);
+      --arca-warn-ink: #f5b14c;
+      --arca-warn-soft: rgba(245, 177, 76, .12);
+      --arca-bad: #ff6b70;
+      --arca-bad-soft: rgba(255, 107, 112, .12);
+      --arca-shade-a: rgba(0, 0, 0, .4);
+      --arca-shade-b: rgba(0, 0, 0, .55);
+      --arca-shade-c: rgba(0, 0, 0, .75);
+    }
+  }
+
+  /* base */
+  *, *::before, *::after { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--arca-bg);
+    color: var(--arca-ink);
+    font: var(--arca-text-md)/var(--arca-leading) var(--arca-font);
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3, p, ol, ul { margin: 0; }
+  code, pre { font-family: var(--arca-mono); }
+  svg { flex: none; }
+  .icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+  .page {
+    max-width: var(--arca-column);
+    margin: 0 auto;
+    padding: calc(var(--arca-space-5) + env(safe-area-inset-top)) calc(var(--arca-gutter) + env(safe-area-inset-right))
+      calc(var(--arca-space-7) + env(safe-area-inset-bottom)) calc(var(--arca-gutter) + env(safe-area-inset-left));
+  }
+  @media (min-width: 720px) { .page { padding-top: var(--arca-space-7); } }
+
+  /* header */
+  .top { display: flex; align-items: center; justify-content: space-between; gap: var(--arca-space-3); }
+  .brand { display: inline-flex; align-items: center; gap: var(--arca-space-2); font-weight: 650; letter-spacing: -.01em; }
+  .brand-mark { width: 28px; height: 28px; }
+  .brand-mark rect { fill: var(--arca-accent); }
+  .brand-mark path { fill: none; stroke: var(--arca-on-accent); stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+  .trust {
+    display: inline-flex; align-items: center; gap: var(--arca-space-2);
+    padding: 6px var(--arca-space-3) 6px 10px;
+    border: 1px solid var(--arca-line-2); border-radius: var(--arca-r-pill);
+    background: var(--arca-surface);
+    color: var(--arca-muted); font-size: var(--arca-text-sm); white-space: nowrap;
+  }
+  .trust .icon { color: var(--arca-accent); }
+  .trust strong { color: var(--arca-ink); font-variant-numeric: tabular-nums; }
+
+  .intro { margin: var(--arca-space-6) 0 var(--arca-space-5); }
+  h1 { font-size: var(--arca-text-xl); line-height: var(--arca-leading-tight); letter-spacing: -.02em; font-weight: 700; }
+  .lede { margin-top: var(--arca-space-2); color: var(--arca-muted); }
+
+  /* status notice */
+  .status {
+    --tone: var(--arca-accent);
+    --tone-soft: var(--arca-accent-soft);
+    position: sticky; top: var(--arca-space-2); z-index: 2;
+    display: flex; align-items: flex-start; gap: 10px;
+    margin: 0 0 var(--arca-space-5);
+    padding: var(--arca-space-3) 14px;
+    border: 1px solid var(--arca-line); border-radius: var(--arca-r-md);
+    background: linear-gradient(var(--tone-soft), var(--tone-soft)), var(--arca-surface);
+    box-shadow: var(--arca-shadow-1);
+  }
+  .status:empty { display: none; }
+  .status::before {
+    content: ""; flex: none; width: 8px; height: 8px; margin-top: 7px;
+    border-radius: 50%; background: var(--tone);
+  }
+  .status[data-tone="ok"] { --tone: var(--arca-ok); --tone-soft: var(--arca-ok-soft); }
+  .status[data-tone="warn"] { --tone: var(--arca-warn); --tone-soft: var(--arca-warn-soft); }
+  .status[data-tone="bad"] { --tone: var(--arca-bad); --tone-soft: var(--arca-bad-soft); }
+  .status[data-tone="wait"]::before {
+    width: 12px; height: 12px; margin-top: 5px; background: none;
+    border: 2px solid var(--arca-accent-soft); border-top-color: var(--arca-accent);
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* sections and cards */
+  .sections { display: flex; flex-direction: column; gap: var(--arca-space-6); }
+  /* No passkey yet: nothing can be approved, so setting one up comes first. */
+  body[data-trusted="no"] .setup { order: -1; }
+  h2 {
+    margin-bottom: 10px;
+    color: var(--arca-muted); font-size: var(--arca-text-sm); font-weight: 600; letter-spacing: .02em;
+  }
+  .card {
+    background: var(--arca-surface);
+    border: 1px solid var(--arca-line);
+    border-radius: var(--arca-r-lg);
+    box-shadow: var(--arca-shadow-1);
+    padding: var(--arca-space-5);
+  }
+  .plans { display: grid; gap: var(--arca-space-3); }
+
+  /* a waiting plan */
+  .plan-meta { display: flex; align-items: center; justify-content: space-between; gap: var(--arca-space-2); }
+  .badge {
+    padding: 3px 9px; border-radius: var(--arca-r-pill);
+    background: var(--arca-bad-soft); color: var(--arca-bad);
+    font-size: var(--arca-text-xs); font-weight: 700; letter-spacing: .06em; text-transform: uppercase;
+  }
+  .expiry { display: inline-flex; align-items: center; gap: 6px; color: var(--arca-muted); font-size: var(--arca-text-sm); }
+  .expiry.soon { color: var(--arca-warn-ink); }
+  .plan h3 { margin: var(--arca-space-3) 0 var(--arca-space-2); font-size: var(--arca-text-lg); line-height: var(--arca-leading-tight); letter-spacing: -.01em; }
+  .objects { list-style: none; padding: 0; margin-bottom: var(--arca-space-4); }
+  .objects li {
+    display: flex; align-items: baseline; gap: var(--arca-space-3);
+    padding: var(--arca-space-2) 0; border-top: 1px solid var(--arca-line);
+  }
+  .objects li:last-child { border-bottom: 1px solid var(--arca-line); }
+  .obj-kind { flex: none; width: 6.5rem; color: var(--arca-muted); font-size: var(--arca-text-sm); }
+  .obj-name { min-width: 0; font-weight: 550; overflow-wrap: anywhere; }
+  .obj-where { color: var(--arca-faint); font-size: var(--arca-text-sm); font-weight: 400; }
+
+  .digest { margin-bottom: var(--arca-space-4); font-size: var(--arca-text-sm); }
+  .digest-row { display: flex; align-items: center; gap: var(--arca-space-2); }
+  .digest-label { color: var(--arca-muted); margin-right: auto; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    min-height: 32px; padding: 0 10px;
+    border: 1px solid var(--arca-line-2); border-radius: var(--arca-r-sm);
+    background: var(--arca-fill); color: var(--arca-ink);
+    font: 500 var(--arca-text-sm) var(--arca-mono); cursor: pointer;
+  }
+  .chip .icon { width: 14px; height: 14px; color: var(--arca-muted); transition: transform var(--arca-fast) var(--arca-ease); }
+  .chip[aria-expanded="true"] .icon { transform: rotate(180deg); }
+  .digest-full {
+    margin-top: var(--arca-space-2); padding: 10px var(--arca-space-3);
+    border-radius: var(--arca-r-sm); background: var(--arca-fill);
+    font: var(--arca-text-sm)/1.6 var(--arca-mono); overflow-wrap: anywhere; user-select: all;
+  }
+
+  /* buttons */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: var(--arca-space-2);
+    min-height: 44px; padding: 0 var(--arca-space-4);
+    border: 1px solid transparent; border-radius: var(--arca-r-md);
+    font: 600 var(--arca-text-md)/1 var(--arca-font);
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+    transition: transform var(--arca-fast) var(--arca-ease), filter var(--arca-fast) var(--arca-ease);
+  }
+  .btn:active:not(:disabled) { transform: scale(.98); }
+  .btn:disabled { opacity: .55; cursor: default; }
+  .btn:focus-visible, .chip:focus-visible, .code-input:focus-visible { outline: 2px solid var(--arca-accent); outline-offset: 2px; }
+  .btn-primary { background: var(--arca-accent); color: var(--arca-on-accent); box-shadow: 0 1px 2px var(--arca-shade-a); }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.07); }
+  .btn-secondary { background: var(--arca-fill); color: var(--arca-ink); border-color: var(--arca-line-2); }
+  .btn-secondary:hover:not(:disabled) { background: var(--arca-fill-2); }
+  .btn-small { min-height: 32px; padding: 0 10px; border-radius: var(--arca-r-sm); font-size: var(--arca-text-sm); }
+  .btn-big { width: 100%; min-height: 56px; font-size: var(--arca-text-lg); font-weight: 650; }
+  .btn-big .icon { width: 20px; height: 20px; }
+
+  /* empty, loading and problem cards */
+  .notice { display: flex; flex-direction: column; align-items: center; gap: var(--arca-space-2); padding: var(--arca-space-6) var(--arca-space-5); text-align: center; }
+  .notice-icon {
+    display: grid; place-items: center; width: 48px; height: 48px; margin-bottom: var(--arca-space-1);
+    border-radius: 50%; background: var(--arca-ok-soft); color: var(--arca-ok);
+  }
+  .notice-icon .icon { width: 22px; height: 22px; }
+  .notice.problem .notice-icon { background: var(--arca-bad-soft); color: var(--arca-bad); }
+  .notice-title { font-weight: 650; }
+  .notice-text { max-width: 24rem; color: var(--arca-muted); font-size: var(--arca-text-sm); }
+  .notice .btn { margin-top: var(--arca-space-2); }
+  .loading { color: var(--arca-muted); text-align: center; animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 50% { opacity: .55; } }
+
+  /* passkey setup */
+  .setup-lede { color: var(--arca-muted); margin-bottom: var(--arca-space-4); }
+  .steps { list-style: none; padding: 0; display: grid; gap: var(--arca-space-5); }
+  .step { display: grid; grid-template-columns: 28px 1fr; gap: var(--arca-space-3); }
+  .num {
+    display: grid; place-items: center; width: 28px; height: 28px;
+    border-radius: 50%; background: var(--arca-accent-soft); color: var(--arca-accent);
+    font-size: var(--arca-text-sm); font-weight: 700;
+  }
+  .step-title { display: block; font-weight: 600; line-height: 28px; }
+  .step-text { color: var(--arca-muted); font-size: var(--arca-text-sm); margin-bottom: 10px; }
+  .code-input {
+    display: block; width: 100%; height: 60px; margin-top: var(--arca-space-1);
+    padding: 0 var(--arca-space-3);
+    border: 1px solid var(--arca-hair); border-radius: var(--arca-r-md);
+    background: var(--arca-surface-2); color: var(--arca-ink);
+    font: 600 var(--arca-text-xl) var(--arca-mono); letter-spacing: .3em; text-align: center;
+    transition: border-color var(--arca-fast), box-shadow var(--arca-fast);
+  }
+  .code-input::placeholder { color: var(--arca-faint); font: var(--arca-text-md) var(--arca-font); letter-spacing: 0; }
+  .code-input:focus { border-color: var(--arca-accent); box-shadow: 0 0 0 4px var(--arca-accent-soft); outline: none; }
+  .done { display: none; align-items: flex-start; gap: var(--arca-space-3); }
+  .done .notice-icon { width: 36px; height: 36px; margin: 0; }
+  .done .notice-icon .icon { width: 18px; height: 18px; }
+  .if-trusted { display: none; }
+  body[data-trusted="yes"] .done { display: flex; }
+  body[data-trusted="yes"] .setup-lede,
+  body[data-trusted="yes"] .step[data-new],
+  body[data-trusted="yes"] .step .num,
+  body[data-trusted="yes"] .if-new { display: none; }
+  body[data-trusted="yes"] .if-trusted { display: block; }
+  body[data-trusted="yes"] .steps { margin-top: var(--arca-space-4); padding-top: var(--arca-space-4); border-top: 1px solid var(--arca-line); }
+  body[data-trusted="yes"] .step { grid-template-columns: 1fr; }
+  body[data-trusted="yes"] #register { width: auto; min-height: 40px; font-size: var(--arca-text-sm); background: var(--arca-fill); color: var(--arca-ink); border-color: var(--arca-line-2); box-shadow: none; }
+  .line {
+    margin-top: var(--arca-space-4); padding: var(--arca-space-3);
+    border-radius: var(--arca-r-sm); background: var(--arca-fill);
+    font-size: var(--arca-text-sm); white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+
+  .foot { margin-top: var(--arca-space-6); color: var(--arca-faint); font-size: var(--arca-text-sm); text-align: center; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
 </style>
 </head>
 <body>
-<h1>Arca approvals</h1>
-<p>Waiting plans on this node. Approving one asks this browser's passkey for one tap; the kernel checks the proof.</p>
-<p>Trusted passkeys: <strong id="trusted">…</strong></p>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3m-3 3 2 2m-4.5.5 2 2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 8v5m0 3.5v.01"/><circle cx="12" cy="12" r="9"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></symbol>
+</svg>
 
-<h2>Waiting plans</h2>
-<div id="plans"><p>Loading…</p></div>
-<p id="status" class="status" role="status"></p>
+<main class="page">
+  <header class="top">
+    <span class="brand">
+      <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true"><rect width="28" height="28" rx="8"/><path d="M8.5 20v-6.5a5.5 5.5 0 0 1 11 0V20M6.5 20.5h15"/></svg>
+      Arca
+    </span>
+    <span class="trust"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Trusted passkeys <strong id="trusted">…</strong></span>
+  </header>
 
-<h2>Register this browser</h2>
-<p>Get a setup code and type the 8 digits shown on this machine's own screen. One trusted passkey is enough; later passkeys are added from one already trusted.</p>
-<button id="get-code">Get a setup code</button>
-<p><label for="setup-code">Setup code</label> <input id="setup-code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{8}" placeholder="8 digits"></p>
-<button id="register">Register passkey</button>
-<pre id="line" hidden></pre>
+  <div class="intro">
+    <h1>Approvals</h1>
+    <p class="lede">Arca asks before it deletes anything. Approving takes one tap with your passkey.</p>
+  </div>
+
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <div class="sections">
+  <section aria-labelledby="plans-title">
+    <h2 id="plans-title">Waiting for you</h2>
+    <div id="plans" class="plans"><div class="card loading">Loading…</div></div>
+  </section>
+
+  <section class="setup" aria-labelledby="setup-title">
+    <h2 id="setup-title">Your passkey</h2>
+    <div class="card">
+      <div class="done">
+        <span class="notice-icon"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg></span>
+        <div>
+          <p class="notice-title">Your passkey is set up</p>
+          <p class="notice-text">More passkeys are added from one that is already trusted.</p>
+        </div>
+      </div>
+      <p class="setup-lede">Do this once, on the phone or computer you will approve with.</p>
+      <ol class="steps">
+        <li class="step" data-new>
+          <span class="num">1</span>
+          <div>
+            <p class="step-title">Get a setup code</p>
+            <p class="step-text">Arca shows 8 digits on its own screen.</p>
+            <button id="get-code" class="btn btn-secondary" type="button">Get a setup code</button>
+          </div>
+        </li>
+        <li class="step" data-new>
+          <span class="num">2</span>
+          <div>
+            <label class="step-title" for="setup-code">Type the code</label>
+            <input id="setup-code" class="code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{8}" placeholder="8 digits" enterkeyhint="done">
+          </div>
+        </li>
+        <li class="step">
+          <span class="num">3</span>
+          <div>
+            <p class="step-title if-new">Save your passkey</p>
+            <p class="step-text if-new">Your device asks for your fingerprint, face or PIN.</p>
+            <p class="step-text if-trusted">For developers: add a passkey without a code. Arca then shows a line to save by hand.</p>
+            <button id="register" class="btn btn-primary btn-big" type="button"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Add passkey</button>
+          </div>
+        </li>
+      </ol>
+      <pre id="line" class="line" hidden></pre>
+    </div>
+  </section>
+  </div>
+
+  <p class="foot">Arca checks every approval itself. Nothing is deleted without your passkey.</p>
+</main>
 
 <script>
 const enc = new TextEncoder();
+
+const KINDS = {
+  project: "Project",
+  instance: "Machine",
+  network: "Network",
+  acl: "Network rules",
+  profile: "Profile",
+  volume: "Storage",
+  zone: "DNS zone",
+  forward: "Port forward",
+  bucket: "Storage bucket",
+};
+
+const REFUSALS = {
+  Expired: "This approval ran out of time. Reload the page and try again.",
+  Replayed: "This approval was already used. Reload the page to see what is still waiting.",
+  NoSuchPlan: "This plan is no longer waiting. Reload the page to see what is left.",
+  Untrusted: "Arca does not trust this passkey. Use the passkey you set up for Arca.",
+  BadSignature: "Arca could not check the passkey's answer. Try again.",
+  NoUserPresence: "Your device did not confirm it was you. Try again.",
+  NoUserVerification: "Your device did not confirm it was you. Try again.",
+  WrongOrigin: "This page's address does not match Arca's settings.",
+  WrongRp: "This page's address does not match Arca's settings.",
+  WrongHost: "This approval was made for a different Arca.",
+};
 
 function b64(bytes) {
   let text = "";
@@ -47,12 +425,142 @@ function b64url(bytes) {
   return b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function status(text) {
-  document.getElementById("status").textContent = text;
+function status(text, tone) {
+  const target = document.getElementById("status");
+  target.textContent = text;
+  target.dataset.tone = tone || "";
+}
+
+// Plain words for a failure: the network, the passkey prompt, a refusal, or the server's own message.
+function plain(error) {
+  const message = String((error && error.message) || error);
+  if (error && error.refusal) return REFUSALS[error.refusal] || "Arca did not accept this approval (" + error.refusal + ").";
+  if (error && error.name === "TypeError") return "Can't reach Arca. Check your connection, then try again.";
+  if (error && error.name === "NotAllowedError") return "The passkey prompt was closed or ran out of time. Try again when you're ready.";
+  if (error && error.name === "InvalidStateError") return "This device already has a passkey for Arca.";
+  if (error && error.name === "SecurityError") return "Passkeys can't be used at this page's address. Open Arca from its usual address.";
+  if (message === "A code is already on your screen") return "A code is already on Arca's screen. Type that one below.";
+  const answered = message.match(/answered (\d+)$/);
+  if (answered) return "Arca could not do that just now (error " + answered[1] + "). Try again in a moment.";
+  if (/locked/.test(message)) return message + ". This happens after too many tries, and it unlocks by itself.";
+  const text = message.charAt(0).toUpperCase() + message.slice(1);
+  return /[.!?…]$/.test(text) ? text : text + ".";
+}
+
+function fail(error) {
+  const message = String((error && error.message) || error);
+  let tone = "bad";
+  if (/locked|^Wait /.test(message)) tone = "warn";
+  if (message === "A code is already on your screen") tone = "";
+  status(plain(error), tone);
+}
+
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+  use.setAttribute("href", "#i-" + name);
+  svg.append(use);
+  return svg;
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function notice(kind, title, text) {
+  const card = el("div", "card notice" + (kind === "problem" ? " problem" : ""));
+  const badge = el("span", "notice-icon");
+  badge.append(icon(kind === "problem" ? "alert" : "check"));
+  card.append(badge, el("p", "notice-title", title), el("p", "notice-text", text));
+  return card;
+}
+
+function expiryText(expiresAt) {
+  const minutes = Math.round((expiresAt - Date.now()) / 60000);
+  const clock = new Date(expiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (minutes <= 0) return "Expired";
+  if (minutes < 60) return "Expires in " + minutes + " min · " + clock;
+  return "Expires at " + clock;
+}
+
+function planCard(plan) {
+  const card = el("article", "card plan");
+  const objects = Array.isArray(plan.objects) ? plan.objects : [];
+
+  const meta = el("div", "plan-meta");
+  const expiry = el("time", "expiry");
+  expiry.dateTime = new Date(plan.expiresAt).toISOString();
+  expiry.title = new Date(plan.expiresAt).toLocaleString();
+  if (plan.expiresAt - Date.now() < 5 * 60000) expiry.classList.add("soon");
+  expiry.append(icon("clock"), expiryText(plan.expiresAt));
+  meta.append(el("span", "badge", "Delete"), expiry);
+
+  const count = objects.length;
+  const title = count === 1
+    ? "Delete " + objects[0].name
+    : "Delete " + (count || "these") + " item" + (count === 1 ? "" : "s");
+  const heading = el("h3", "", title);
+
+  const list = el("ul", "objects");
+  for (const object of objects) {
+    const row = el("li");
+    const name = el("span", "obj-name", object.name);
+    if (object.project && object.project !== object.name) name.append(" ", el("span", "obj-where", "in " + object.project));
+    row.append(el("span", "obj-kind", KINDS[object.kind] || object.kind), name);
+    list.append(row);
+  }
+
+  const digest = el("div", "digest");
+  const row = el("div", "digest-row");
+  const full = el("div", "digest-full", plan.plan);
+  full.hidden = true;
+  const chip = el("button", "chip");
+  chip.type = "button";
+  chip.setAttribute("aria-expanded", "false");
+  chip.title = "Show the full fingerprint";
+  chip.append(plan.plan.slice(0, 8) + "…" + plan.plan.slice(-4), icon("down"));
+  chip.addEventListener("click", () => {
+    full.hidden = !full.hidden;
+    chip.setAttribute("aria-expanded", String(!full.hidden));
+  });
+  const copy = el("button", "btn btn-secondary btn-small");
+  copy.type = "button";
+  copy.append(icon("copy"), "Copy");
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(plan.plan);
+      copy.lastChild.textContent = "Copied";
+    } catch {
+      full.hidden = false;
+      chip.setAttribute("aria-expanded", "true");
+      getSelection().selectAllChildren(full);
+      copy.lastChild.textContent = "Selected";
+    }
+    setTimeout(() => { copy.lastChild.textContent = "Copy"; }, 1600);
+  });
+  row.append(el("span", "digest-label", "Fingerprint"), chip, copy);
+  digest.append(row, full);
+
+  const button = el("button", "btn btn-primary btn-big approve");
+  button.type = "button";
+  button.setAttribute("aria-label", "Approve: " + title);
+  button.append(icon("key"), "Approve");
+  button.addEventListener("click", () => approve(plan, button));
+
+  card.append(meta, heading);
+  if (count) card.append(list);
+  card.append(digest, button);
+  return card;
 }
 
 function showTrusted(count) {
   document.getElementById("trusted").textContent = String(count);
+  document.body.dataset.trusted = count > 0 ? "yes" : "no";
   const getCode = document.getElementById("get-code");
   const field = document.getElementById("setup-code");
   getCode.hidden = count > 0;
@@ -68,43 +576,37 @@ async function loadPlans() {
     showTrusted(body.passkeysTrusted || 0);
     target.replaceChildren();
     if (!body.plans.length) {
-      const empty = document.createElement("p");
-      empty.textContent = "No plan is waiting.";
-      target.append(empty);
+      target.append(notice("empty", "Nothing to approve", "When Arca wants to delete something, it will wait here for your OK."));
       return;
     }
-    for (const plan of body.plans) {
-      const card = document.createElement("div");
-      card.className = "plan";
-      const heading = document.createElement("div");
-      heading.className = "digest";
-      heading.textContent = "target " + plan.plan;
-      const expiry = document.createElement("div");
-      expiry.className = "expiry";
-      expiry.textContent = "expires " + new Date(plan.expiresAt).toISOString();
-      const button = document.createElement("button");
-      button.textContent = "Approve";
-      button.addEventListener("click", () => approve(plan, button));
-      card.append(heading, expiry, button);
-      target.append(card);
-    }
+    for (const plan of body.plans) target.append(planCard(plan));
   } catch (error) {
-    target.replaceChildren();
-    status(String(error));
+    const card = notice("problem", "Couldn't load what's waiting", "Your plans are safe. Nothing changes until you approve it.");
+    const retry = el("button", "btn btn-secondary", "Try again");
+    retry.type = "button";
+    retry.addEventListener("click", () => {
+      status("");
+      target.replaceChildren(el("div", "card loading", "Loading…"));
+      loadPlans();
+    });
+    card.append(retry);
+    target.replaceChildren(card);
+    fail(error);
   }
 }
 
 async function getCode() {
   const button = document.getElementById("get-code");
   button.disabled = true;
-  status("Asking for a setup code…");
+  status("Asking for a setup code…", "wait");
   try {
     const answer = await fetch("/approve/setup-code", { method: "POST" });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) throw new Error(body.message || ("the setup code answered " + answer.status));
-    status("Check this machine's screen for the 8-digit code, then type it below.");
+    status("Look at Arca's own screen for the 8-digit code, then type it below.");
+    document.getElementById("setup-code").focus();
   } catch (error) {
-    status(String(error));
+    fail(error);
   } finally {
     button.disabled = false;
   }
@@ -115,7 +617,7 @@ async function register() {
   button.disabled = true;
   const input = document.getElementById("setup-code");
   const setupCode = input.value.trim();
-  status("Waiting for the authenticator…");
+  status("Follow your device's prompt to save the passkey…", "wait");
   try {
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const user = crypto.getRandomValues(new Uint8Array(16));
@@ -161,9 +663,10 @@ async function register() {
       line.textContent = body.line;
       status("Passkey registered. This developer answer returns the line for a root-owned file.");
     }
+    if (setupCode || body.line) document.getElementById("status").dataset.tone = "ok";
     await loadPlans();
   } catch (error) {
-    status(String(error));
+    fail(error);
   } finally {
     button.disabled = false;
   }
@@ -171,7 +674,7 @@ async function register() {
 
 async function approve(plan, button) {
   button.disabled = true;
-  status("Waiting for the passkey…");
+  status("Confirm with your passkey…", "wait");
   try {
     const challenge = await crypto.subtle.digest(
       "SHA-256",
@@ -203,11 +706,16 @@ async function approve(plan, button) {
       body: JSON.stringify({ plan: plan.plan, approval }),
     });
     const body = await answer.json().catch(() => ({}));
-    if (!answer.ok) throw new Error(body.refusal || ("the approval answered " + answer.status));
-    status("Approved: " + (body.deleted || []).length + " object(s) deleted.");
+    if (!answer.ok) {
+      const refused = new Error(body.refusal || ("the approval answered " + answer.status));
+      refused.refusal = body.refusal;
+      throw refused;
+    }
+    const deleted = (body.deleted || []).length;
+    status("Approved. " + deleted + " item" + (deleted === 1 ? "" : "s") + " deleted.", "ok");
     await loadPlans();
   } catch (error) {
-    status(String(error));
+    fail(error);
     button.disabled = false;
   }
 }
