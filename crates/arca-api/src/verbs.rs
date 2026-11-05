@@ -104,7 +104,7 @@ static VERBS: [Verb; 15] = [
     },
     Verb {
         name: "journal_list",
-        summary: "The effect journal, paged by sequence. It names only the intent and object fields, never a pre-image or inverse.",
+        summary: "The newest record for each effect in the journal, paged by effect id. It names only the intent and object fields, never a pre-image or inverse.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,

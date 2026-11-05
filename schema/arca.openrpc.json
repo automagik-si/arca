@@ -882,7 +882,7 @@
           "type": "object"
         }
       },
-      "summary": "The effect journal, paged by sequence. It names only the intent and object fields, never a pre-image or inverse.",
+      "summary": "The newest record for each effect in the journal, paged by effect id. It names only the intent and object fields, never a pre-image or inverse.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",

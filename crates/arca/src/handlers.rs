@@ -747,8 +747,14 @@ impl ToolHandler for JournalListHandler {
             .min(500);
         let (records, _) = read_journal(&self.state_dir.join(JOURNAL_FILE))
             .map_err(|_| CallError::Internal("the journal could not be read".to_string()))?;
-        let records: Vec<Value> = records
-            .into_iter()
+        // The journal's own view is the newest record for each effect id. Each state change appends a full copy, so a
+        // listing that returned every line would repeat an effect and could skip a later state when paging by id.
+        let mut latest = BTreeMap::new();
+        for record in records {
+            latest.insert(record.id, record);
+        }
+        let records: Vec<Value> = latest
+            .into_values()
             .filter(|record| record.id > after)
             .take(limit as usize)
             .map(|record| {

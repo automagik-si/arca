@@ -4,13 +4,14 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 use arca_alerts::Engine;
@@ -245,8 +246,6 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .build()
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
-    fs::write(&pid_path, format!("{}\n", std::process::id()))
-        .map_err(|e| Failure::Runtime(format!("cannot write the serve pid file: {e}")))?;
     let unix_path = cfg.listen.unix.clone();
     let outcome: io::Result<()> = runtime.block_on(async {
         let mut terminate = signal(SignalKind::terminate())?;
@@ -260,6 +259,27 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                     Ok(count) => eprintln!("arca: {count} token(s) reloaded"),
                     Err(error) => eprintln!("arca: the token store was not reloaded: {error}"),
                 }
+            }
+        });
+        let pid_write_path = pid_path.clone();
+        let pid_probe = unix_path.clone();
+        tokio::spawn(async move {
+            let until = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < until {
+                if tokio::net::UnixStream::connect(&pid_probe).await.is_ok() {
+                    if let Ok(mut file) = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&pid_write_path)
+                    {
+                        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
+                        let _ = file.sync_all();
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
         let stop = async {
@@ -289,13 +309,24 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             () = stop => Ok(()),
         }
     });
-    let _ = fs::remove_file(&pid_path);
+    remove_own_pid(&pid_path);
     match outcome {
         Ok(()) => {
             remove_own_socket(&cfg.listen.unix);
             Ok(None)
         }
         Err(e) => Err(Failure::Runtime(format!("the server stopped: {e}"))),
+    }
+}
+
+/// Removes `path` only when it still holds this process's pid, so a second server cannot delete the first one's file.
+fn remove_own_pid(path: &Path) {
+    let own = std::process::id().to_string();
+    if fs::read_to_string(path)
+        .ok()
+        .is_some_and(|text| text.trim() == own)
+    {
+        let _ = fs::remove_file(path);
     }
 }
 

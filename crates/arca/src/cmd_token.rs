@@ -75,26 +75,89 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     }
     fs::remove_file(&hash_path)
         .map_err(|e| Failure::Runtime(format!("cannot remove the hash file: {e}")))?;
+    let mut reload_signalled = false;
     if let Some(path) = flags.value("config") {
         let cfg = config::load(Path::new(path))?;
         let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
-        if let Ok(text) = fs::read_to_string(&pid_path) {
-            let pid = text.trim();
-            if pid.parse::<u32>().is_ok() {
-                let status = Command::new("kill")
-                    .arg("-HUP")
-                    .arg(pid)
-                    .status()
-                    .map_err(|e| Failure::Runtime(format!("cannot signal serve: {e}")))?;
-                if !status.success() {
-                    return Err(Failure::Runtime(
-                        "the token was removed, but serve could not be signalled".to_string(),
-                    ));
+        let from_file = fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .filter(|pid| pid_is_arca_serve(*pid));
+        let pid = from_file.or_else(|| serve_pid_for_config(Path::new(path)));
+        if let Some(pid) = pid {
+            let status = Command::new("kill")
+                .arg("-HUP")
+                .arg(pid.to_string())
+                .status();
+            reload_signalled = status.is_ok_and(|status| status.success());
+        }
+    }
+    Ok(Some(json!({
+        "id": id,
+        "revoked": true,
+        "reloadSignalled": reload_signalled
+    })))
+}
+
+/// Finds a live `arca serve --config <config>` process for this config, for the window before its post-bind pid file lands.
+fn serve_pid_for_config(config: &Path) -> Option<u32> {
+    let wanted = fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        let args: Vec<&[u8]> = bytes
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .collect();
+        let Some(program) = args.first() else {
+            continue;
+        };
+        let program = String::from_utf8_lossy(program);
+        if !program
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name == "arca")
+        {
+            continue;
+        }
+        if !args.iter().any(|arg| *arg == b"serve") {
+            continue;
+        }
+        for pair in args.windows(2) {
+            if pair[0] == b"--config" {
+                let named_text = String::from_utf8_lossy(pair[1]).into_owned();
+                let named = Path::new(&named_text);
+                let named = fs::canonicalize(named).unwrap_or_else(|_| named.to_path_buf());
+                if named == wanted {
+                    return Some(pid);
                 }
             }
         }
     }
-    Ok(Some(json!({ "id": id, "revoked": true })))
+    None
+}
+
+/// Whether `/proc/<pid>/cmdline` names an `arca serve` process. A stale or recycled pid is not signalled.
+fn pid_is_arca_serve(pid: u32) -> bool {
+    let Ok(bytes) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let mut args = bytes.split(|byte| *byte == 0).filter(|arg| !arg.is_empty());
+    let Some(program) = args.next() else {
+        return false;
+    };
+    let program = String::from_utf8_lossy(program);
+    let named_arca = program
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == "arca");
+    named_arca && args.any(|arg| arg == b"serve")
 }
 
 fn parse_tools(text: &str, scope: Scope) -> Result<Vec<String>, Failure> {

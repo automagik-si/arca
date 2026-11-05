@@ -11,7 +11,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
-| `arca serve --config <file>` | runs until SIGTERM or SIGINT | nothing |
+| `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
 | `arca link join [--] <link> --config <file>` | pairs with the endpoint in the link | `{ "id", "name" }` as JSON |
@@ -222,9 +222,12 @@ one is refused with exit 2 and nothing is written. Giving neither is refused wit
 **Run `arca token mint` as the user that runs `serve`.** A mint run as another user writes hash files owned by that user, and
 the server refuses every file it does not own, so the load fails until those files are minted again as the server's user.
 
-`arca token revoke <id>` removes the token's hash file and sends `SIGHUP` to the `serve` process named by
-`<stateDir>/serve.pid`, so the running server reloads its token store without a restart; `token_list` drops it and a call
-with it is 401. The hash files stay mode 0400.
+`arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
+config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
+`/proc`. The server writes that pid file only after its unix socket is serving and removes it only when it still holds its own
+pid. The answer carries `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With
+`--hash-dir` alone no state directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server
+keeps the token until it is restarted or signalled. The hash files stay mode 0400. The signal uses the host's `kill` command.
 
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
@@ -272,11 +275,14 @@ its request is read.
 
 `serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
+SIGHUP reloads the bearer token store only; it does not reread the node config or the owner passkeys.
 A socket that another server answers on is left alone.
 
-`journal_list` is a viewer read over the effect journal, paged by sequence with `after` and `limit` (default 100, maximum
-500). Each record exposes only `id`, `entry`, `class`, `target`, `plugin`, `state`, `at_ms`, `intent` and `object`; it never
-exposes `pre_image`, `inverse` or `acl_patch`, which can hold rendered secrets.
+`journal_list` is a viewer read over the effect journal. It returns the newest record for each effect and pages by effect
+id with `after` and `limit` (default 100, maximum 500). Each record exposes only `id`, `entry`, `class`, `target`, `plugin`,
+`state`, `at_ms`, `intent` and `object`; it never exposes `pre_image`, `inverse` or `acl_patch`, which can hold rendered
+secrets. The read decodes the whole append-only file without the journal's open-time integrity checks, so a listing can show a
+sequence `serve` would refuse at open; its cost grows with history.
 
 ## Calling the server
 

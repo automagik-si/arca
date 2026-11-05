@@ -83,6 +83,10 @@ fn journal_list_pages_by_id_and_never_returns_a_pre_image_or_inverse() {
         body.push_str(&serde_json::to_string(&record(id)).expect("record JSON"));
         body.push('\n');
     }
+    let mut confirmed = record(1);
+    confirmed.state = EffectState::Confirmed;
+    body.push_str(&serde_json::to_string(&confirmed).expect("confirmed JSON"));
+    body.push('\n');
     fs::write(&path, body).expect("journal");
     let handler = JournalListHandler {
         state_dir: dir.clone(),
@@ -100,6 +104,12 @@ fn journal_list_pages_by_id_and_never_returns_a_pre_image_or_inverse() {
     assert_eq!(answer["records"][0]["plugin"], json!("arca.postgres"));
     assert_eq!(answer["records"][0]["class"], json!("A"));
     assert_eq!(answer["records"][0]["state"], json!("Applied"));
+    let first = handler
+        .call(json!({ "after": 0, "limit": 1 }), &caller())
+        .expect("journal_list first");
+    assert_eq!(first["records"].as_array().expect("records").len(), 1);
+    assert_eq!(first["records"][0]["id"], json!(1));
+    assert_eq!(first["records"][0]["state"], json!("Confirmed"));
     let keys: Vec<&str> = answer["records"][0]
         .as_object()
         .expect("object")
