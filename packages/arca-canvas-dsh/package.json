@@ -1,0 +1,39 @@
+{
+  "name": "arca-canvas-dsh",
+  "version": "0.1.0",
+  "description": "Read-only Arca snapshots for a DSH canvas",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/weunfold/arca.git",
+    "directory": "packages/arca-canvas-dsh"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "src/arca-client.js", "src/snapshot.js", "client.js", "cordis.patch.yml", "README.md"],
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": ">=0.2.2-rc.1 <0.2.2-rc.2"
+  },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "inject": [] }
+  },
+  "scripts": {
+    "test": "node --test",
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.19.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "esbuild": "0.28.2",
+    "js-yaml": "4.3.2"
+  }
+}
