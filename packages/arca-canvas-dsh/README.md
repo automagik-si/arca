@@ -2,9 +2,11 @@
 
 A read-only host plugin for stock DSH and an embedding DSH host. It polls Arca
 through a Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
-`GET /arca-canvas` provides a minimal page linking to that snapshot. Canvas drawing
-and optional sidebar integration will be added separately. The browser module has
-no host imports, credentials or required services.
+`GET /arca-canvas` draws machine, instance, database and alert cards from the
+snapshot. It works without a sidebar. When the sidebar is installed, an Arca
+canvas tab embeds this same page, sharing its renderer, polling and styles.
+Steps shows a hidden-state placeholder until the journal adapter is available.
+The canvas is read only; waiting plans open the configured approval page.
 
 ## Install
 
@@ -19,7 +21,7 @@ dsh plugin --profile <profile> add -w "github:weunfold/arca#<commit>&path:/packa
 Replace `<profile>` and `<commit>` with the desired profile and full commit SHA.
 The quotes keep `&path:` in the same argument. DSH forwards the arguments to
 pnpm, whose git spec splits the commit and `path:` selectors at `&`. The built
-`client.js` is committed, so the git-path install needs no build hook.
+`client.js`, `page.js` and `page.css` are committed, so the git-path install needs no build hook.
 
 Use the same command with an embedding DSH host's profile. Fully quit that host
 before editing its profile, and restart it afterwards. The package contributes
@@ -35,6 +37,7 @@ config:
   socketPath: /run/arca/arca.sock
   viewerTokenPath: /path/to/arca-viewer.token
   pollMs: 5000
+  approvalUrl: ''
   droiddUrl: ''
   droiddTokenPath: ''
 ```
@@ -44,6 +47,7 @@ config:
 | `socketPath` | Required absolute path to Arca's `listen.unix` socket. DSH must run as the same user as Arca. |
 | `viewerTokenPath` | Required absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
 | `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Polls never overlap. |
+| `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
 | `droiddUrl` | Optional MCP URL, empty by default. Reserved for the device adapter; unused in this version. |
 | `droiddTokenPath` | Optional reader-token file path, empty by default. Reserved for the device adapter; unused in this version. |
 
@@ -71,7 +75,8 @@ readers.
 ## Snapshot
 
 The JSON object always has `at` (ISO timestamp), `error` (null or safe error text),
-`machine`, `instances`, `databases`, `metrics`, `alerts`, and `plans`.
+`approvalUrl` (empty or the configured approval URL), `machine`, `instances`,
+`databases`, `metrics`, `alerts`, and `plans`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
@@ -89,11 +94,29 @@ are scrubbed of any bearer echo. Snapshot strings are never inserted as HTML.
 
 ```sh
 npm ci
-npm test
-npm run build
-git diff --exit-code client.js
+npx playwright install chromium
+npx -y node@24.11.0 --test
+npx -y node@24.11.0 build.mjs
+git diff --exit-code -- client.js page.js page.css
 ```
 
-Tests use fixture data and temporary Unix sockets only. The host entry is plain
-JavaScript; `npm run build` regenerates only the browser module using exact-pinned
-esbuild. Keep `client.js` in the commit with any browser-source change.
+Tests use fixture data, temporary Unix sockets and an ephemeral loopback browser
+server. Playwright 1.64.0 is pinned to the Chromium used by the rendering checks.
+The tests assert light/dark colors, layout regions and literal rendering of
+untrusted strings in a real browser. They also rebuild every browser artifact
+into a temporary directory and compare SHA-256 hashes.
+
+`npm run build` regenerates the browser module and standalone page assets using
+exact-pinned esbuild. Commit all three artifacts with browser-source changes.
+Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test’s
+1440×900 light/dark screenshots and measured rectangles outside the repository.
+
+The client contract is pinned to the sidebar’s 0.24.1 API: package metadata uses
+`dsh.client.inject: ["dsh-better-sidebar"]` (package IDs), while the client exports
+`inject = ['betterSidebar']` (Cordis service names). DSH calls `apply(ctx)`;
+`ctx.betterSidebar.registerTab({ id, title, component })` returns the disposer
+owned by `ctx.effect`. The React component uses DSH’s module-loader `react`
+export, without bundling a second React. It returns a same-origin frame of
+`/arca-canvas`. Without the sidebar, Cordis leaves this client consumer waiting;
+the host still starts with only `inject = ['webServer']` and serves the page.
+The client also guards a missing service when invoked directly.

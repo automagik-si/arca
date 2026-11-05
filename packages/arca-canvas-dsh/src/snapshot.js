@@ -1,9 +1,10 @@
 import { snapshotError } from './arca-client.js';
 
-export function emptySnapshot() {
+export function emptySnapshot(config = {}) {
   return {
     at: new Date().toISOString(),
     error: null,
+    approvalUrl: config.approvalUrl ?? '',
     machine: null,
     instances: [],
     databases: [],
@@ -18,8 +19,8 @@ function rows(value) {
   return value;
 }
 
-export async function collectSnapshot(client) {
-  const snapshot = emptySnapshot();
+export async function collectSnapshot(client, config = {}) {
+  const snapshot = emptySnapshot(config);
   const reads = [
     ['machine', 'arca_status', (value) => value],
     ['instances', 'watch_report', (value) => rows(value.projects).flatMap((project) =>
@@ -41,12 +42,12 @@ export async function collectSnapshot(client) {
   return snapshot;
 }
 
-export function createSnapshotCache(client, pollMs) {
-  let cached = { ...emptySnapshot(), error: 'Waiting for the first Arca snapshot.' };
+export function createSnapshotCache(client, pollMs, config = {}) {
+  let cached = { ...emptySnapshot(config), error: 'Waiting for the first Arca snapshot.' };
   let timer;
   let stopped = false;
   const refresh = async () => {
-    cached = await collectSnapshot(client);
+    cached = await collectSnapshot(client, config);
     if (!stopped) {
       timer = setTimeout(refresh, pollMs);
       timer.unref();

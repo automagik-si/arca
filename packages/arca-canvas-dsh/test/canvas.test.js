@@ -101,9 +101,10 @@ test('all six fixtures become one snapshot with project-qualified instances', as
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans']);
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
   assert.equal(snapshot.error, null);
+  assert.equal(snapshot.approvalUrl, '');
   assert.deepEqual(snapshot.machine, fixtures.arca_status);
   assert.deepEqual(snapshot.instances, fixtures.watch_report.projects.flatMap(({ project, instances }) => instances.map((instance) => ({ ...instance, project }))));
   assert.deepEqual(snapshot.databases, fixtures.postgres_list.databases);
@@ -227,6 +228,7 @@ function exchange(socketPath, path, method = 'GET') {
 
 test('Cordis receives row config, serves cached GET routes without a sidebar, and disposes', async (t) => {
   const { dir, config } = await sandbox(t);
+  config.approvalUrl = 'https://example.com/approve';
   const calls = await fakeArca(t, config, (body) => toolResult(body,
     body.params.name === 'arca_status' ? { ...fixtures.arca_status, node: '<script>untrusted</script>' } : fixtures[body.params.name]));
   const routes = [];
@@ -252,11 +254,21 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(snapshot.status, 200);
+  assert.equal(JSON.parse(snapshot.body).approvalUrl, config.approvalUrl);
   assert.equal(JSON.parse(snapshot.body).machine.node, '<script>untrusted</script>');
   assert.equal(snapshot.headers['cache-control'], 'no-store');
   const page = await exchange(socketPath, '/arca-canvas');
   assert.equal(page.status, 200);
   assert.match(page.body, /Arca canvas/);
+  assert.match(page.body, /src="\/arca-canvas\/page.js"/);
+  assert.match(page.headers['content-security-policy'], /script-src 'self'/);
+  for (const [asset, type] of [['page.js', 'text/javascript'], ['page.css', 'text/css']]) {
+    const result = await exchange(socketPath, `/arca-canvas/${asset}`);
+    assert.equal(result.status, 200);
+    assert.match(result.headers['content-type'], new RegExp(type));
+    assert.equal(result.body, await readFile(new URL(`../${asset}`, import.meta.url), 'utf8'));
+    assert.equal((await exchange(socketPath, `/arca-canvas/${asset}`, 'POST')).status, 405);
+  }
   assert.equal(page.body.includes('<script>untrusted'), false);
   assert.equal(page.body.includes(sentinel), false);
   assert.equal((await exchange(socketPath, '/arca-canvas/snapshot', 'POST')).status, 405);
@@ -278,6 +290,10 @@ test('bundle patch has one configured row and schema rejects invalid settings', 
   assert.deepEqual(validate(row.config).value, row.config);
   assert.ok(validate({ ...row.config, pollMs: 0 }).issues);
   assert.ok(validate({ ...row.config, socketPath: 'relative.sock' }).issues);
+  for (const approvalUrl of ['/approve', 'javascript:alert(1)', 'https://', 'https://user:pass@example.com/approve']) {
+    assert.ok(validate({ ...row.config, approvalUrl }).issues);
+  }
+  assert.equal(validate({ ...row.config, approvalUrl: 'https://example.com/approve' }).value.approvalUrl, 'https://example.com/approve');
   const { pollMs, ...minimal } = row.config;
   assert.equal(validate(minimal).value.pollMs, 5000);
 });
@@ -287,9 +303,30 @@ test('built client registers a browser-only module without host imports', async 
   const source = await readFile(new URL('../client.js', import.meta.url), 'utf8');
   runInNewContext(source, { window: { __ModuleLoader__: { load(value) { registered = value; } } } });
   assert.equal(registered.id, 'arca-canvas-dsh');
-  const module = registered.factory(() => { throw new Error('Unexpected browser import'); });
+  const module = registered.factory((name) => {
+    assert.equal(name, 'react');
+    return { createElement: (tag, props) => ({ tag, props }) };
+  });
   assert.equal(module.name, 'arca-canvas');
-  assert.equal(module.inject.length, 0);
+  assert.deepEqual(Array.from(module.inject), ['betterSidebar']);
   module.apply({});
+  let registrations = 0;
+  let disposed = false;
+  const ctx = new Context();
+  const fiber = await ctx.plugin(module);
+  assert.equal(registrations, 0);
+  ctx.provide('betterSidebar', { registerTab(tab) {
+    registrations++;
+    assert.equal(tab.id, 'arca-canvas');
+    assert.equal(tab.title, 'Arca canvas');
+    const view = tab.component({ visible: true });
+    assert.equal(view.tag, 'iframe');
+    assert.equal(view.props.src, '/arca-canvas');
+    assert.equal(view.props.title, 'Arca canvas');
+    return () => { disposed = true; };
+  } });
+  await until(() => registrations === 1);
+  await fiber.dispose();
+  assert.equal(disposed, true);
   assert.equal(source.includes('viewerTokenPath'), false);
 });
