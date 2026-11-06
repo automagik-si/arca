@@ -201,11 +201,13 @@ struct Shared {
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
     reject_patch: Mutex<Vec<String>>,
+    reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
     host_interfaces: Mutex<Vec<HostInterface>>,
     operations_unreadable: AtomicBool,
     /// The operations whose wait answers 404 while the listing still shows them running.
     waits_ended: Mutex<Vec<String>>,
+    console: Mutex<BTreeMap<(String, String), String>>,
     counter: AtomicU64,
 }
 
@@ -292,6 +294,7 @@ enum Route {
     PoolResources(String),
     NetworkLeases(String),
     InstanceState(Address),
+    Console(Address),
     InstanceSnapshots(Address),
     InstanceBackups(Address),
     ListOperations,
@@ -313,6 +316,7 @@ impl Route {
             }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
+            Route::Console(_) => &["GET"],
             Route::InstanceSnapshots(_) => &["GET", "POST"],
             Route::InstanceBackups(_) => &["GET", "POST"],
             _ => &["GET"],
@@ -378,10 +382,12 @@ impl Shared {
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
             reject_patch: Mutex::new(Vec::new()),
+            reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
             host_interfaces: Mutex::new(Vec::new()),
             operations_unreadable: AtomicBool::new(false),
             waits_ended: Mutex::new(Vec::new()),
+            console: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
         }
     }
@@ -424,6 +430,12 @@ impl FakeIncus {
         lock(&self.shared.requests).clone()
     }
 
+    /// Sets the raw console log a project's instance serves from `/console`.
+    pub fn set_console_log(&self, project: &str, name: &str, text: &str) {
+        lock(&self.shared.console)
+            .insert((project.to_string(), name.to_string()), text.to_string());
+    }
+
     /// Every write received so far, in arrival order: each non-GET request, with the config keys it carried.
     pub fn writes(&self) -> Vec<WriteRecord> {
         lock(&self.shared.writes).clone()
@@ -464,6 +476,11 @@ impl FakeIncus {
     }
 
     /// Makes PATCH requests matching this path prefix fail with 400 before changing any object.
+    /// Makes a DELETE of an object whose name starts with `prefix` answer 400.
+    pub fn set_reject_delete(&self, prefix: &str) {
+        lock(&self.shared.reject_delete).push(prefix.to_string());
+    }
+
     pub fn set_reject_patch(&self, path_prefix: &str) {
         lock(&self.shared.reject_patch).push(path_prefix.to_string());
     }
@@ -778,6 +795,12 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         Ok(None) => return,
         Err(_) => Request::bad(),
     };
+    if let Some(console) = console_body(shared, &request) {
+        record(shared, &request, console.0);
+        let _ = respond(&mut stream, console.0, reason(console.0), "", &console.1);
+        drain(&mut stream);
+        return;
+    }
     let (status, extra, envelope) = handle(shared, &request);
     record(shared, &request, status);
     let _ = respond(
@@ -896,6 +919,23 @@ fn config_keys(body: &[u8]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// A console-log request's raw `(status, body)`, or `None` for every other route.
+fn console_body(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
+    let Some(Route::Console(address)) = parse(&request.target) else {
+        return None;
+    };
+    if request.method != "GET" {
+        return Some((405, Vec::new()));
+    }
+    let body = lock(&shared.console)
+        .get(&(address.project, address.name))
+        .cloned();
+    match body {
+        Some(text) => Some((200, text.into_bytes())),
+        None => Some((404, Vec::new())),
+    }
+}
+
 /// The status, the extra header lines and the envelope for one request.
 fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
     if request.method.is_empty() {
@@ -985,6 +1025,7 @@ fn parse(target: &str) -> Option<Route> {
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
         ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
+        ["instances", name, "console"] => Route::Console(address("instance", "", name)),
         ["instances", name, "snapshots"] => Route::InstanceSnapshots(address("snapshot", name, "")),
         ["instances", name, "snapshots", snapshot] => {
             Route::Object(address("snapshot", name, snapshot))
@@ -1876,6 +1917,16 @@ fn merge(
 
 /// Removes an object. A non-empty project is refused at once. A running instance's delete fails inside its operation.
 fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String, Value) {
+    if lock(&shared.reject_delete)
+        .iter()
+        .any(|prefix| address.name.starts_with(prefix))
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "the delete was refused"),
+        );
+    }
     let Some(index) = store.find(address) else {
         return (404, String::new(), error_envelope(404, "not found"));
     };

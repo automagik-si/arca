@@ -2355,6 +2355,101 @@
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "service_logs",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "lines",
+          "required": false,
+          "schema": {
+            "default": 50,
+            "description": "How many lines, 1-200 (default 50).",
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "lines": {
+              "items": {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              "maxItems": 200,
+              "type": "array"
+            }
+          },
+          "required": [
+            "lines"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The last lines of a service's log, cleaned and with every stored secret redacted.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "service_remove",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "removed": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "removed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Remove a service, its links, its ACL and its secrets, with the owner's signed approval.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     }
   ],
   "openrpc": "1.3.2"

@@ -138,6 +138,29 @@ impl Kernel {
         Ok(Some(objects))
     }
 
+    /// Checks an owner approval for a service action without a delete plan and spends it.
+    pub fn check_approval(
+        &mut self,
+        action: ArcaAction,
+        target: &str,
+        args: &serde_json::Value,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<(), ApprovalRefusal> {
+        self.verifier
+            .check(action, target, args, approval, now_ms)?;
+        Ok(())
+    }
+
+    /// Runs a delete plan whose owner approval was checked and spent by the caller.
+    pub fn run_plan_authorized(
+        &mut self,
+        plan: &Digest,
+        now_ms: u64,
+    ) -> Result<arca_reconcile::PlanRun, ApprovalRefusal> {
+        self.reconciler.run_plan_authorized(plan, now_ms)
+    }
+
     /// Checks `approval` for the plan with `plan` and, when the plan waits, runs its delete. A plan that waits nowhere is still
     /// checked, so a spent approval reads as replayed; a valid approval for a plan that no longer waits is spent and names no
     /// plan, and it returns `None`. Nothing is spent on any refusal.

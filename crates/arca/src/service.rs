@@ -17,6 +17,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 pub const COOKIE: &str = "user.arca.managed";
+pub const ACL_INFIX: &str = "svc";
 pub const TEMPLATE_KEY: &str = "user.arca.template";
 pub const ADDRESS_KEY: &str = "user.arca.address";
 pub const PORTS_KEY: &str = "user.arca.ports";
@@ -67,6 +68,12 @@ pub struct ServiceConfig {
     pub droidd_port: Option<u16>,
     #[serde(default)]
     pub start: bool,
+    /// An instance Arca adopted instead of creating; its project is the instance's own.
+    #[serde(default)]
+    pub adopted: bool,
+    /// A record whose create has not settled, shown as `creating` after a restart.
+    #[serde(default)]
+    pub creating: bool,
 }
 
 impl ServiceConfig {
@@ -88,7 +95,7 @@ pub fn manifest_for() -> Manifest {
 }
 
 pub fn acl_name(project: &str, name: &str) -> String {
-    format!("{project}-svc-{name}")
+    format!("{project}-{ACL_INFIX}-{name}")
 }
 
 pub fn service_name_ok(name: &str) -> bool {
@@ -270,6 +277,10 @@ impl Plugin for Service {
     }
 
     fn apply(ctx: &mut Ctx<'_>, cfg: &ServiceConfig) -> Result<(), PluginError> {
+        // An adopted instance is owned through its adopt entry. The service record never writes it.
+        if cfg.adopted {
+            return Ok(());
+        }
         if cfg.project != PROJECT || cfg.bridge != BRIDGE {
             return Err(PluginError::Config(
                 "the service project and bridge are required".into(),
@@ -884,6 +895,7 @@ pub fn live_ipv4(state: &Value) -> Option<Ipv4Addr> {
 /// A view row, for a record or for an instance Arca did not create.
 pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
     let (state, ipv4) = match live {
+        None if cfg.creating => ("creating", cfg.ipv4.clone()),
         Some(live) => (
             state(live["status"].as_str()),
             live_ipv4(live)
@@ -935,6 +947,26 @@ pub fn unknown_view(row: &Value) -> Option<Value> {
     }))
 }
 
+/// A marked instance without a readable record: listed as failed and left alone.
+pub fn failed_view(row: &Value) -> Option<Value> {
+    let name = row["name"].as_str()?;
+    if !service_name_ok(name) {
+        return None;
+    }
+    let ipv4 = row["devices"]["eth0"]["ipv4.address"]
+        .as_str()
+        .unwrap_or("");
+    Some(json!({
+        "name": name,
+        "template": row["config"][TEMPLATE_KEY].as_str().unwrap_or(""),
+        "state": "failed",
+        "ipv4": ipv4,
+        "ports": [],
+        "links": [],
+        "published": null
+    }))
+}
+
 /// The service rows of a project listing.
 pub fn project_instances(listing: &Value, project: &str) -> Vec<Value> {
     listing
@@ -944,4 +976,67 @@ pub fn project_instances(listing: &Value, project: &str) -> Vec<Value> {
         .filter(|row| row["project"].as_str() == Some(project))
         .cloned()
         .collect()
+}
+
+/// A log line cleaned the way the MCP door cleans untrusted text: ANSI/control bytes gone, whitespace runs one space, trimmed.
+pub fn clean_log(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_escape = false;
+    for ch in text.chars() {
+        if in_escape {
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+            continue;
+        }
+        if ch == '\u{1b}' {
+            in_escape = true;
+            continue;
+        }
+        if ch.is_control() && ch != '\t' {
+            continue;
+        }
+        out.push(ch);
+    }
+    let mut words = out.split_whitespace();
+    let mut clean = words.next().unwrap_or("").to_string();
+    for word in words {
+        clean.push(' ');
+        clean.push_str(word);
+    }
+    clean
+}
+
+fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
+    use std::sync::OnceLock;
+    static PATTERNS: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            (r#"(?i)\b((?:access_|refresh_|id_|auth_)?token|api[_-]?key|apikey|auth[_-]?key|client_secret|secret|passw(?:or)?d)=[^\s&"'<>]+"#, "$1=[secret]"),
+            (r#"(?i)(authorization["']?\s*[:=]\s*["']?)(?:(?:bearer|basic|token)\s+)?[^\s"',]+"#, "$1[secret]"),
+            (r#"(?i)\b(bearer)\s+[A-Za-z0-9._~+/-]{16,}=*"#, "$1 [secret]"),
+            (r"\btskey-[A-Za-z0-9-]+", "[secret]"),
+            (r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:@/?#]*):[^\s@/?#]+@", "$1:[secret]@"),
+            (r"\bomni_sk_[A-Za-z0-9*]+", "[secret]"),
+        ]
+        .into_iter()
+        .map(|(pattern, replacement)| {
+            (regex::Regex::new(pattern).expect("the credential pattern is valid"), replacement)
+        })
+        .collect()
+    })
+}
+
+/// Replaces every stored/rendered secret value (longest first) and then every credential pattern.
+pub fn redact_log(text: &str, secrets: &[String]) -> String {
+    let mut out = text.to_string();
+    let mut values: Vec<&String> = secrets.iter().filter(|value| value.len() >= 8).collect();
+    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    for value in values {
+        out = out.replace(value, "[secret]");
+    }
+    for (pattern, replacement) in credential_patterns() {
+        out = pattern.replace_all(&out, *replacement).into_owned();
+    }
+    out
 }

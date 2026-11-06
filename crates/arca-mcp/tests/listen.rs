@@ -261,7 +261,8 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "postgres_list",
             "ontology_query",
             "service_list",
-            "service_status"
+            "service_status",
+            "service_logs"
         ]
     );
 }

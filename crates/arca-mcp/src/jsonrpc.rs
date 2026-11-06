@@ -164,13 +164,17 @@ async fn call_tool(
     };
     match result {
         Ok(value) => {
+            let (truncated, value) = match (verb.cut)(&value) {
+                Some(cut) => (true, cut),
+                None => (false, value),
+            };
             if conforms(&(verb.result)(), &value).is_err() {
                 return Ok(Some(result_reply(
                     id,
                     tool_failure("internal", "the tool failed"),
                 )));
             }
-            Ok(Some(result_reply(id, tool_result(verb, value))))
+            Ok(Some(result_reply(id, tool_result(verb, value, truncated))))
         }
         Err(CallError::NotFound) => Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None))),
         Err(CallError::Invalid(why)) => Ok(Some(error_reply(id, INVALID_PARAMS, &why, None))),
@@ -288,12 +292,7 @@ fn open_schema(schema: &mut Value) {
 
 /// An MCP tool result in the door's envelope: summary text, structured content with the untrusted note and optional
 /// truncation, and the two `droidd/*` meta keys.
-fn tool_result(v: &Verb, mut value: Value) -> Value {
-    let (truncated, cut) = match (v.cut)(&value) {
-        Some(cut) => (true, cut),
-        None => (false, value.clone()),
-    };
-    value = cut;
+fn tool_result(v: &Verb, value: Value, truncated: bool) -> Value {
     let mut content = Vec::new();
     if v.untrusted {
         content.push(json!({ "type": "text", "text": UNTRUSTED_NOTE }));
@@ -387,7 +386,7 @@ mod tests {
 
     #[test]
     fn an_untrusted_and_cut_result_carries_the_note_meta_and_structured_fields() {
-        let result = tool_result(&probe(), json!(["a", "b"]));
+        let result = tool_result(&probe(), json!({ "cut": true }), true);
         assert_eq!(result["content"][0]["text"], UNTRUSTED_NOTE);
         assert_eq!(
             result["content"][1]["text"],
@@ -412,10 +411,10 @@ mod tests {
             json!(false),
             Value::Null,
         ] {
-            let result = tool_result(&verb, data.clone());
+            let result = tool_result(&verb, data.clone(), false);
             assert_eq!(result["structuredContent"]["items"], data);
         }
-        let result = tool_result(&verb, json!({ "name": "example" }));
+        let result = tool_result(&verb, json!({ "name": "example" }), false);
         assert_eq!(result["structuredContent"]["name"], "example");
         assert!(result["structuredContent"].get("items").is_none());
     }
@@ -434,7 +433,7 @@ mod tests {
                 json!(false),
                 Value::Null,
             ] {
-                let result = tool_result(&verb, data);
+                let result = tool_result(&verb, data, false);
                 assert_eq!(
                     result["structuredContent"],
                     if untrusted {

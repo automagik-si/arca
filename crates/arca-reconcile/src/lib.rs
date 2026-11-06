@@ -340,6 +340,28 @@ impl<S: JournalStore> Reconciler<S> {
         verifier: &mut ApprovalVerifier<impl SignatureVerifier, impl NonceStore>,
         now_ms: u64,
     ) -> Result<PlanRun, ApprovalRefusal> {
+        let delete_plan = self.delete_plan_for(plan, now_ms)?;
+        verifier.check(
+            ArcaAction::Delete,
+            &format!("plan-{}", plan.to_hex()),
+            &json!({ "plan": plan.to_hex() }),
+            approval,
+            now_ms,
+        )?;
+        self.execute_plan(plan, delete_plan, now_ms)
+    }
+
+    /// Runs a plan whose owner approval was already checked by the caller. The same TTL, blocked and live-object checks run.
+    pub fn run_plan_authorized(
+        &mut self,
+        plan: &Digest,
+        now_ms: u64,
+    ) -> Result<PlanRun, ApprovalRefusal> {
+        let delete_plan = self.delete_plan_for(plan, now_ms)?;
+        self.execute_plan(plan, delete_plan, now_ms)
+    }
+
+    fn delete_plan_for(&self, plan: &Digest, now_ms: u64) -> Result<DeletePlan, ApprovalRefusal> {
         let delete_plan = self
             .pending
             .iter()
@@ -352,7 +374,6 @@ impl<S: JournalStore> Reconciler<S> {
         if self.blocked() {
             return Err(ApprovalRefusal::Unresolved);
         }
-        // A live object the plan does not name is a new step, and it needs a new approval over a new plan.
         let live = self.live_deletes(&delete_plan.entry);
         if live
             .iter()
@@ -360,19 +381,21 @@ impl<S: JournalStore> Reconciler<S> {
         {
             return Err(ApprovalRefusal::WrongParams);
         }
-        verifier.check(
-            ArcaAction::Delete,
-            &format!("plan-{}", plan.to_hex()),
-            &json!({ "plan": plan.to_hex() }),
-            approval,
-            now_ms,
-        )?;
+        Ok(delete_plan)
+    }
+
+    fn execute_plan(
+        &mut self,
+        plan: &Digest,
+        delete_plan: DeletePlan,
+        now_ms: u64,
+    ) -> Result<PlanRun, ApprovalRefusal> {
+        let live = self.live_deletes(&delete_plan.entry);
         let mut run = PlanRun {
             deleted: Vec::new(),
             drift: Vec::new(),
             partial: false,
         };
-        // Most recent first, so a later object is gone before the one it was made on.
         for object in live.iter().rev() {
             if self.blocked() {
                 run.partial = true;
@@ -396,7 +419,6 @@ impl<S: JournalStore> Reconciler<S> {
                 }
             }
         }
-        // A partial run keeps its plan, so a retry needs a new approval. A full run retires the plan.
         if !run.partial {
             self.pending.retain(|pending| pending.plan.digest != *plan);
             if self.revertible_live(&delete_plan.entry) == 0 {
