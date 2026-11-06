@@ -105,8 +105,8 @@ html, body, #arca-root { height: 100%; margin: 0; }
 }
 .arca-title { font-size: 16px; }
 .arca-crumb { color: var(--arca-muted); border-left: 1px solid var(--arca-line-2); padding-left: 16px; }
-.arca-mode, .arca-plans { border-radius: 999px; padding: 4px 10px; font-size: 12px; white-space: nowrap; }
-.arca-mode { color: var(--arca-muted); background: var(--arca-fill); }
+.arca-mode, .arca-devices, .arca-plans { border-radius: 999px; padding: 4px 10px; font-size: 12px; white-space: nowrap; }
+.arca-mode, .arca-devices { color: var(--arca-muted); background: var(--arca-fill); }
 .arca-plans { margin-left: auto; color: var(--arca-warn-ink); background: var(--arca-warn-soft); border: 1px solid var(--arca-line-2); }
 a.arca-plans { text-decoration: none; }
 a.arca-plans:hover { text-decoration: underline; }

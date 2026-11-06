@@ -145,13 +145,15 @@ body,
   padding-left: 16px;
 }
 .arca-mode,
+.arca-devices,
 .arca-plans {
   border-radius: 999px;
   padding: 4px 10px;
   font-size: 12px;
   white-space: nowrap;
 }
-.arca-mode {
+.arca-mode,
+.arca-devices {
   color: var(--arca-muted);
   background: var(--arca-fill);
 }

@@ -101,7 +101,7 @@ test('all six fixtures become one snapshot with project-qualified instances', as
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans', 'devices', 'phones', 'desktops']);
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
   assert.equal(snapshot.error, null);
   assert.equal(snapshot.approvalUrl, '');
@@ -294,6 +294,12 @@ test('bundle patch has one configured row and schema rejects invalid settings', 
     assert.ok(validate({ ...row.config, approvalUrl }).issues);
   }
   assert.equal(validate({ ...row.config, approvalUrl: 'https://example.com/approve' }).value.approvalUrl, 'https://example.com/approve');
+  for (const devicesUrl of ['invalid', 'http://public.example/mcp', 'https://user:pass@example.com/mcp']) {
+    assert.equal(validate({ ...row.config, devicesUrl, devicesTokenPath: 'relative' }).value.devicesUrl, devicesUrl);
+  }
+  const { devicesUrl, devicesTokenPath, ...withoutDevices } = row.config;
+  assert.equal(validate(withoutDevices).value.devicesUrl, '');
+  assert.equal(validate(withoutDevices).value.devicesTokenPath, '');
   const { pollMs, ...minimal } = row.config;
   assert.equal(validate(minimal).value.pollMs, 5000);
 });
@@ -329,4 +335,49 @@ test('built client registers a browser-only module without host imports', async 
   await fiber.dispose();
   assert.equal(disposed, true);
   assert.equal(source.includes('viewerTokenPath'), false);
+});
+
+test('host snapshot route returns Arca cards within 100ms while device HTTP never answers', async (t) => {
+  const { config } = await sandbox(t);
+  await fakeArca(t, config);
+  let deviceRequests = 0, closed = 0;
+  const devices = createServer((req, res) => {
+    deviceRequests++;
+    req.resume();
+    res.on('close', () => { closed++; });
+  });
+  await new Promise((resolve) => devices.listen(0, '127.0.0.1', resolve));
+  t.after(() => { devices.closeAllConnections(); return new Promise((resolve) => devices.close(resolve)); });
+  const ctx = new Context();
+  let route;
+  ctx.provide('webServer', { register(value) { route = value; return () => {}; } });
+  const web = createServer((req, res) => route.handler(req, res));
+  await new Promise((resolve) => web.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => web.close(resolve)));
+  const start = performance.now();
+  const fiber = await ctx.plugin(plugin, { ...config,
+    devicesUrl: `http://127.0.0.1:${devices.address().port}/mcp`, devicesTokenPath: config.viewerTokenPath });
+  t.after(() => fiber.dispose());
+  const url = `http://127.0.0.1:${web.address().port}/arca-canvas/snapshot`;
+  let snapshot;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    snapshot = await (await fetch(url)).json();
+    if (snapshot.machine) break;
+  }
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 100, `host first snapshot took ${elapsed}ms`);
+  assert.deepEqual(snapshot.machine, fixtures.arca_status);
+  assert.equal(snapshot.instances.length, 2);
+  assert.equal(snapshot.error, null);
+  assert.equal(snapshot.devices, 'unavailable');
+  await until(() => deviceRequests === 1);
+  await new Promise((resolve) => setTimeout(resolve, 130));
+  const pollStart = performance.now();
+  const next = await (await fetch(url)).json();
+  assert.ok(performance.now() - pollStart < 50, 'host route must serve cached data promptly');
+  assert.notEqual(next.at, snapshot.at, 'Arca keeps polling during the pending device phase');
+  assert.equal(next.error, null);
+  await fiber.dispose();
+  await until(() => closed === deviceRequests);
+  t.diagnostic(`host first snapshot ${elapsed.toFixed(1)}ms (<100ms); pending device request aborted on disposal`);
 });

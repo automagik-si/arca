@@ -2,7 +2,7 @@
 
 A read-only host plugin for stock DSH and an embedding DSH host. It polls Arca
 through a Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
-`GET /arca-canvas` draws machine, instance, database and alert cards from the
+`GET /arca-canvas` draws machine, instance, database, alert, phone and desktop cards from the
 snapshot. It works without a sidebar. When the sidebar is installed, an Arca
 canvas tab embeds this same page, sharing its renderer, polling and styles.
 Steps shows a hidden-state placeholder until the journal adapter is available.
@@ -38,18 +38,18 @@ config:
   viewerTokenPath: /path/to/arca-viewer.token
   pollMs: 5000
   approvalUrl: ''
-  droiddUrl: ''
-  droiddTokenPath: ''
+  devicesUrl: ''
+  devicesTokenPath: ''
 ```
 
 | Key | Meaning |
 | --- | --- |
 | `socketPath` | Required absolute path to Arca's `listen.unix` socket. DSH must run as the same user as Arca. |
 | `viewerTokenPath` | Required absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
-| `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Polls never overlap. |
+| `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Arca polls never overlap; the device phase runs independently. |
 | `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
-| `droiddUrl` | Optional MCP URL, empty by default. Reserved for the device adapter; unused in this version. |
-| `droiddTokenPath` | Optional reader-token file path, empty by default. Reserved for the device adapter; unused in this version. |
+| `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
+| `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
 
 All example paths must be replaced with paths on the machine running DSH. Paths
 are literal; `~` and environment variables are not expanded. Config contains
@@ -76,7 +76,7 @@ readers.
 
 The JSON object always has `at` (ISO timestamp), `error` (null or safe error text),
 `approvalUrl` (empty or the configured approval URL), `machine`, `instances`,
-`databases`, `metrics`, `alerts`, and `plans`.
+`databases`, `metrics`, `alerts`, `plans`, `devices`, `phones`, and `desktops`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
@@ -89,6 +89,35 @@ Successful reads survive partial failures. Requests use MCP protocol
 `2025-11-25`, `initialize` then `tools/call`, over HTTP POST to `/mcp`. Error
 messages omit upstream bodies and filesystem details, and successful payloads
 are scrubbed of any bearer echo. Snapshot strings are never inserted as HTML.
+
+The optional device reader uses HTTP POST to the exact configured `devicesUrl`,
+with the same protocol and initialization sequence and its own per-request bearer.
+It calls only `droid_list`, `desktop_list`, `droidd_status` and `phone_status`.
+Structured list results use `droids` and `desktops` keys; older JSON text results
+are also accepted. Phone entries retain name, state, network type, battery level
+and screen size (`[width, height]`); desktop entries retain name, status and memory limit. Status is
+read only for ready phones; other states remain visible with unavailable details.
+Both device settings empty means `devices: 'off'`, with no device requests.
+Configured readers report `ok` after successful reads, or `unavailable` on invalid
+settings, missing/refused tokens, unreachable service or any failed required read.
+Device validation happens in the host reader and never prevents canvas startup.
+Refused settings make no device HTTP requests. A failed list or service-status
+read clears device entries; a failed `phone_status` keeps that phone's name with
+state `unknown` and null status fields, alongside all other phones and desktops.
+
+Device reads start alongside Arca reads and update cached device cards in the
+background under one five-second deadline. Arca snapshots and paints never wait
+for that phase. In-flight device requests are aborted on deadline or host stop;
+a later poll may retry. A muted `Phones unavailable` topbar chip appears only for
+`unavailable`, with no device error banner. The host logs one safe line per device
+state change, naming `devicesUrl` or `devicesTokenPath` for a rejected setting.
+Setting values, device credentials and upstream error details never enter logs,
+the snapshot or the browser bundle. Arca reads keep their existing error behavior.
+
+A ResizeObserver on the stage batches reflow into an animation frame when the
+window or embedding sidebar changes width. Reflow measures the stage content box;
+empty columns consume no space, and populated columns wrap to keep cards inside it.
+The observer disconnects when the canvas stops.
 
 ## Develop
 
