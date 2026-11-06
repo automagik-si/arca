@@ -187,7 +187,7 @@ test('muted text-only device chip appears only for unavailable with Arca cards a
     renderCanvas(target, { ...snapshot, devices });
     const chips = all(target).filter((node) => node.className === 'arca-devices');
     assert.equal(chips.length, devices === 'unavailable' ? 1 : 0);
-    if (chips.length) assert.equal(chips[0].textContent, 'Phones unavailable');
+    if (chips.length) assert.equal(chips[0].textContent, 'Devices unavailable');
     assert.equal(all(target).filter((node) => node.className === 'arca-card').length, 4);
     assert.match(all(target).find((node) => node.className === 'arca-status').textContent, /^Snapshot /);
   }

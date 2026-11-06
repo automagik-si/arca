@@ -108,7 +108,7 @@ state `unknown` and null status fields, alongside all other phones and desktops.
 Device reads start alongside Arca reads and update cached device cards in the
 background under one five-second deadline. Arca snapshots and paints never wait
 for that phase. In-flight device requests are aborted on deadline or host stop;
-a later poll may retry. A muted `Phones unavailable` topbar chip appears only for
+a later poll may retry. A muted `Devices unavailable` topbar chip appears only for
 `unavailable`, with no device error banner. The host logs one safe line per device
 state change, naming `devicesUrl` or `devicesTokenPath` for a rejected setting.
 Setting values, device credentials and upstream error details never enter logs,
