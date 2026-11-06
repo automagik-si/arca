@@ -69,7 +69,7 @@ pub struct Verb {
     pub cut: fn(&Value) -> Option<Value>,
 }
 
-static VERBS: [Verb; 18] = [
+static VERBS: [Verb; 20] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -304,7 +304,7 @@ static VERBS: [Verb; 18] = [
         untrusted: false,
         output_key: None,
         summary_text: summary_service_list,
-        cut: no_cut,
+        cut: cut_service_list,
         params: service_list_params,
         result: service_list_result,
     },
@@ -321,6 +321,34 @@ static VERBS: [Verb; 18] = [
         cut: no_cut,
         params: service_status_params,
         result: service_status_result,
+    },
+    Verb {
+        name: "service_logs",
+        summary: "The last lines of a service's log, cleaned and with every stored secret redacted.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_service_logs,
+        cut: cut_service_logs,
+        params: service_logs_params,
+        result: service_logs_result,
+    },
+    Verb {
+        name: "service_remove",
+        summary: "Remove a service, its links, its ACL and its secrets, with the owner's signed approval.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_remove,
+        cut: no_cut,
+        params: service_remove_params,
+        result: service_remove_result,
     },
 ];
 
@@ -1188,4 +1216,130 @@ fn service_status_params() -> Value {
 
 fn service_status_result() -> Value {
     service_view_schema()
+}
+
+/// A short line for a successful `service_logs`.
+pub fn summary_service_logs(v: &Value) -> String {
+    let count = v["lines"].as_array().map_or(0, Vec::len);
+    format!("{count} log line(s), untrusted (the service wrote them).")
+}
+
+/// The logs' cut: the oldest lines and the characters beyond each line's cap.
+pub fn cut_service_logs(v: &Value) -> Option<Value> {
+    let lines = v["lines"].as_array()?;
+    let mut out = Vec::new();
+    let start = lines.len().saturating_sub(200);
+    for line in &lines[start..] {
+        let text = line.as_str()?;
+        let mut cut: String = text.chars().take(2000).collect();
+        if cut.is_empty() && !text.is_empty() {
+            cut = "…".to_string();
+        }
+        out.push(Value::String(cut));
+    }
+    if start > 0 || out.iter().zip(&lines[start..]).any(|(a, b)| a != b) {
+        Some(json!({ "lines": out }))
+    } else {
+        None
+    }
+}
+
+/// Caps the service rows while leaving their natural result schema unchanged.
+pub fn cut_service_list(v: &Value) -> Option<Value> {
+    let rows = v["services"].as_array()?;
+    (rows.len() > 256).then(|| json!({ "services": &rows[..256] }))
+}
+
+/// Describes the service data omitted by the MCP cap, without adding natural result fields.
+pub fn service_cut_description(name: &str, original: &Value) -> Option<String> {
+    match name {
+        "service_logs" => {
+            let lines = original["lines"].as_array()?;
+            let dropped = lines.len().saturating_sub(200);
+            let shortened = lines[dropped..]
+                .iter()
+                .filter(|line| {
+                    line.as_str()
+                        .is_some_and(|text| text.chars().count() > 2000)
+                })
+                .count();
+            Some(format!(
+                "{dropped} line(s) dropped, {shortened} line(s) truncated of {} original line(s)",
+                lines.len()
+            ))
+        }
+        "service_list" => {
+            let rows = original["services"].as_array()?;
+            Some(format!(
+                "{} service row(s) omitted of {} original row(s)",
+                rows.len().saturating_sub(256),
+                rows.len()
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// A short line for a successful `service_remove`.
+pub fn summary_service_remove(_: &Value) -> String {
+    "Service removed.".to_string()
+}
+
+fn service_logs_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "lines": {
+                "default": 50,
+                "description": "How many lines, 1-200 (default 50).",
+                "maximum": 200,
+                "minimum": 1,
+                "type": "integer"
+            },
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
+        },
+        "required": ["name"],
+        "type": "object"
+    })
+}
+
+fn service_logs_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "lines": {
+                "items": { "maxLength": 2000, "type": "string" },
+                "maxItems": 200,
+                "type": "array"
+            }
+        },
+        "required": ["lines"],
+        "type": "object"
+    })
+}
+
+fn service_remove_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": {
+                "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
+        },
+        "required": ["name", "approval"],
+        "type": "object"
+    })
+}
+
+fn service_remove_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": { "removed": { "const": true, "type": "boolean" } },
+        "required": ["removed"],
+        "type": "object"
+    })
 }

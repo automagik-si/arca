@@ -8,7 +8,7 @@ use arca_approval::{
 };
 use arca_kernel::KernelError;
 use arca_kernel::canon::Digest;
-use arca_kernel::desired::DesiredStateGate;
+use arca_kernel::desired::{DesiredStateGate, EntryId};
 use arca_kernel::identity::NodeKey;
 use arca_kernel::journal::{DeletePlan, FileJournal, Journal};
 use arca_kernel::ownership::ObjectRef;
@@ -29,6 +29,19 @@ pub struct Kernel {
     retained: RetainedSet,
     verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
     host: String,
+}
+
+/// The reconciliation and approved plan run of one atomic service removal.
+pub struct ServiceRemoval {
+    pub outcomes: Vec<Outcome>,
+    pub run: Result<Option<PlanRun>, ApprovalRefusal>,
+}
+
+/// Whether removal stopped before approval was spent or during the proposal afterward.
+#[derive(Debug)]
+pub enum ServiceRemovalError {
+    Approval(ApprovalRefusal),
+    Proposal(KernelError),
 }
 
 impl Kernel {
@@ -136,6 +149,58 @@ impl Kernel {
         }
         self.save()?;
         Ok(Some(objects))
+    }
+
+    /// Checks an owner approval for a service action without a delete plan and spends it.
+    pub fn check_approval(
+        &mut self,
+        action: ArcaAction,
+        target: &str,
+        args: &serde_json::Value,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<(), ApprovalRefusal> {
+        self.verifier
+            .check(action, target, args, approval, now_ms)?;
+        Ok(())
+    }
+
+    /// Spends one service-action approval, removes its entry and runs its pending plan under the caller's one kernel lock.
+    /// A concurrent plan approval cannot observe the plan between the proposal and its execution.
+    pub fn remove_service(
+        &mut self,
+        entry: &EntryId,
+        name: &str,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<ServiceRemoval, ServiceRemovalError> {
+        self.check_approval(
+            ArcaAction::Delete,
+            name,
+            &json!({ "name": name }),
+            approval,
+            now_ms,
+        )
+        .map_err(ServiceRemovalError::Approval)?;
+        let outcomes = self
+            .propose(vec![EntryChange::Remove(entry.clone())], now_ms)
+            .map_err(ServiceRemovalError::Proposal)?;
+        let run = self
+            .pending_plans()
+            .into_iter()
+            .find(|plan| &plan.entry == entry)
+            .map(|plan| self.run_plan_authorized(&plan.digest, now_ms))
+            .transpose();
+        Ok(ServiceRemoval { outcomes, run })
+    }
+
+    /// Runs a delete plan whose owner approval was checked and spent by the caller.
+    pub fn run_plan_authorized(
+        &mut self,
+        plan: &Digest,
+        now_ms: u64,
+    ) -> Result<arca_reconcile::PlanRun, ApprovalRefusal> {
+        self.reconciler.run_plan_authorized(plan, now_ms)
     }
 
     /// Checks `approval` for the plan with `plan` and, when the plan waits, runs its delete. A plan that waits nowhere is still

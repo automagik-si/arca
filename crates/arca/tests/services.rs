@@ -1,4 +1,5 @@
 //! Service verbs against a fake Incus: create, list and status are hermetic; no live host is touched.
+mod common;
 
 use arca::{
     config::NodeConfig, handlers::service_handlers, kernel::Kernel, service, service::Service,
@@ -6,7 +7,14 @@ use arca::{
 use arca_api::Scope;
 use arca_approval::{ApprovalVerifier, FileNonces, OwnerKeys, PasskeyVerifier, SshSigVerifier};
 use arca_incus::{FakeIncus, FakeState, IncusRead, UnixIncus};
+use arca_kernel::canon::Digest;
+use arca_kernel::desired::EntryId;
 use arca_kernel::identity::NodeKey;
+use arca_kernel::journal::{AclPatch, Inverse};
+use arca_kernel::ownership::{IncusKind, ObjectRef};
+use arca_kernel::plugin::{
+    EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
+};
 use arca_mcp::{CallError, Caller, ToolHandler};
 use arca_netproject::PROJECT;
 use arca_providers::incus::{Family, IncusProvider};
@@ -26,6 +34,75 @@ use std::{
 const NOW: u64 = 1_793_361_600_000;
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+// Pauses the instance retirement at the provider boundary, after its plan exists.
+struct RemovalPause {
+    entered: std::sync::mpsc::Sender<Digest>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+struct PausedProvider {
+    inner: IncusProvider,
+    pause: Option<RemovalPause>,
+}
+
+impl Provider for PausedProvider {
+    fn observe(
+        &self,
+        entry: &EntryId,
+        projects: &[String],
+        query: &Observe,
+    ) -> Result<Value, EffectRefusal> {
+        self.inner.observe(entry, projects, query)
+    }
+    fn plan(&self, entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
+        self.inner.plan(entry, op)
+    }
+    fn effect(
+        &mut self,
+        entry: &EntryId,
+        op: &EffectOp,
+        planned: &Planned,
+    ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
+        self.inner.effect(entry, op, planned)
+    }
+    fn read_back(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&std::collections::BTreeMap<String, Option<String>>>,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back(entry, target, pre_image)
+    }
+    fn read_back_acl(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back_acl(entry, target, patch)
+    }
+    fn retire(
+        &mut self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        plan: &Digest,
+    ) -> Result<Retirement, EffectRefusal> {
+        if object.kind == IncusKind::Instance
+            && let Some(pause) = self.pause.take()
+        {
+            pause
+                .entered
+                .send(plan.clone())
+                .expect("report retirement plan");
+            pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release retirement");
+        }
+        self.inner.retire(entry, object, plan)
+    }
+}
 
 struct Rig {
     dir: PathBuf,
@@ -50,6 +127,25 @@ impl Rig {
     }
 
     fn with(state: FakeState, projects: Vec<String>, cidr: Option<&str>) -> Self {
+        Self::with_key(state, projects, cidr, None)
+    }
+
+    fn with_key(
+        state: FakeState,
+        projects: Vec<String>,
+        cidr: Option<&str>,
+        key: Option<&common::SkKey>,
+    ) -> Self {
+        Self::with_key_and_pause(state, projects, cidr, key, None)
+    }
+
+    fn with_key_and_pause(
+        state: FakeState,
+        projects: Vec<String>,
+        cidr: Option<&str>,
+        key: Option<&common::SkKey>,
+        pause: Option<RemovalPause>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-service-{}-{}",
             std::process::id(),
@@ -77,14 +173,20 @@ impl Rig {
             "kernel": kernel_config
         }))
         .expect("config");
-        let verifier = ApprovalVerifier::new(
-            "node1".into(),
-            OwnerKeys::new(
-                SshSigVerifier::new(vec![]),
-                PasskeyVerifier::refusing(arca_approval::ApprovalRefusal::NoVerifier),
+        let verifier = match key {
+            Some(key) => {
+                let scratch = common::Scratch::new("service-owner");
+                common::verifier_for(&scratch, &[key], "service")
+            }
+            None => ApprovalVerifier::new(
+                "node1".into(),
+                OwnerKeys::new(
+                    SshSigVerifier::new(vec![]),
+                    PasskeyVerifier::refusing(arca_approval::ApprovalRefusal::NoVerifier),
+                ),
+                FileNonces::open(&dir.join("nonces")).expect("nonces"),
             ),
-            FileNonces::open(&dir.join("nonces")).expect("nonces"),
-        );
+        };
         let mut plugins = PluginSet::new();
         plugins.add::<arca_netproject::NetProject>().expect("net");
         plugins.add::<Service>().expect("service");
@@ -98,8 +200,8 @@ impl Rig {
                 verifier,
                 "node1".into(),
                 move |retained| {
-                    Ok(Box::new(
-                        IncusProvider::new(
+                    Ok(Box::new(PausedProvider {
+                        inner: IncusProvider::new(
                             socket,
                             Family {
                                 projects: vec![PROJECT.into()],
@@ -111,7 +213,8 @@ impl Rig {
                             retained,
                         )
                         .expect("provider"),
-                    ))
+                        pause,
+                    }))
                 },
                 NOW,
             )
@@ -765,7 +868,7 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
         "an unmarked instance config is not a service record"
     );
     assert!(rig.fake.requests().iter().any(|request| request.path
-        == format!("/1.0/instances?project={PROJECT}&recursion=2")
+        == "/1.0/instances?all-projects=true&recursion=2"
         && request.status == 200));
     let empty = Rig::new();
     assert_eq!(
@@ -773,8 +876,8 @@ fn lists_the_service_project_with_each_instances_own_config_and_devices_none_whe
         json!({"services":[]})
     );
     assert!(empty.fake.requests().iter().any(|request| request.path
-        == format!("/1.0/instances?project={PROJECT}&recursion=2")
-        && request.status == 404));
+        == "/1.0/instances?all-projects=true&recursion=2"
+        && request.status == 200));
 }
 
 #[test]
@@ -1002,6 +1105,17 @@ fn a_failed_start_keeps_the_created_instance_record_and_secrets() {
             .unwrap()
             .starts_with("test_")
     );
+    let listed = rig.call("service_list", json!({})).unwrap();
+    assert_eq!(listed["services"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["services"][0]["name"], "nats");
+    assert_eq!(listed["services"][0]["state"], "stopped");
+    assert_eq!(
+        rig.call("service_status", json!({"name":"nats"})).unwrap()["state"],
+        "stopped"
+    );
+    assert!(
+        matches!(rig.call("service_create", json!({"name":"nats","template":"nats"})), Err(CallError::Refused { message, .. }) if message == "service nats exists")
+    );
 }
 
 #[test]
@@ -1060,5 +1174,918 @@ fn service_key_names_and_acl_home_match_the_public_contract() {
             .unwrap()
             .keys()
             .all(|key| !key.starts_with("user.arcakernel.service."))
+    );
+}
+
+fn adopted_instance(
+    name: &str,
+    project: &str,
+    template: &str,
+    ipv4: &str,
+    ports: &str,
+    uuid: &str,
+) -> Value {
+    json!({
+        "name": name,
+        "project": project,
+        "type": "container",
+        "status": "Running",
+        "config": {
+            "user.arcakernel.entry": format!("adopt-{name}"),
+            "user.arca.template": template,
+            "user.arca.address": ipv4,
+            "user.arca.ports": ports,
+            "user.arca.envkeys": "POSTGRES_PASSWORD",
+            "environment.POSTGRES_PASSWORD": "redacted-value",
+            "volatile.uuid": uuid
+        },
+        "devices": {"eth0":{"type":"nic","name":"eth0","ipv4.address":ipv4}}
+    })
+}
+
+#[test]
+fn the_server_watch_covers_services_and_reports_a_missing_service_object() {
+    use arca::handlers::watcher_step;
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![json!({"name":"default","config":{}})],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+    );
+    rig.template("nats", nats_template());
+    let cfg: NodeConfig = serde_json::from_value(json!({
+        "stateDir":rig.dir, "incus":{"socket":rig.fake.socket()},
+        "listen":{"unix":rig.dir.join("arca.sock")},
+        "tokens":{"hashDir":rig.dir.join("tokens")},
+        "kernel":{"projects":[PROJECT], "droiddProjects":["other"], "serviceCidr":"192.0.2.0/24"}
+    }))
+    .unwrap();
+    let watch = arca::cmd_serve::watch_kernel_handler(&cfg, Arc::clone(&rig.kernel));
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .unwrap();
+    // The handler predates the record, so the sweep must read the current kernel entries.
+    let mut last = None;
+    watcher_step(&watch, NOW, &mut last);
+    let report = watch.newest().unwrap().1;
+    let project = report["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["project"] == PROJECT)
+        .unwrap();
+    assert_eq!(project["instances"][0]["owner"]["class"], "kernel");
+    assert_eq!(project["instances"][0]["owner"]["entry"], "service-nats");
+    assert_eq!(report["drift"], json!([]));
+    assert!(
+        report["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["project"] == "default")
+    );
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/nats/state?project={PROJECT}"),
+        json!({"action":"stop"}),
+    );
+    rig.edit(
+        "DELETE",
+        &format!("/1.0/instances/nats?project={PROJECT}"),
+        json!({}),
+    );
+    watcher_step(&watch, NOW + 30_000, &mut last);
+    let report = watch.newest().unwrap().1;
+    assert_eq!(
+        report["drift"],
+        json!([{"kind":"entryWithoutObject","entry":"service-nats"}])
+    );
+}
+
+#[test]
+fn a_droidd_service_before_import_stays_external_and_has_no_service_record() {
+    let mut row = adopted_instance(
+        "db1",
+        "other",
+        "postgres-autopg",
+        "192.0.2.10",
+        "5432",
+        "uuid-db1",
+    );
+    row["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("user.arcakernel.entry");
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![row],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into(), "other".into()],
+        Some("192.0.2.0/24"),
+    );
+    assert_eq!(
+        rig.call("service_list", json!({})).unwrap()["services"],
+        json!([])
+    );
+    assert!(
+        rig.entries()
+            .iter()
+            .all(|entry| entry.id.0 != "service-db1")
+    );
+    let live = rig.get("/1.0/instances/db1?project=other").unwrap();
+    let own = serde_json::from_value(live["config"].clone()).unwrap();
+    assert_eq!(
+        arca_kernel::ownership::classify(&own, &Default::default()),
+        arca_kernel::ownership::OwnerClass::Droidd
+    );
+    let error = rig
+        .call("service_create", json!({"name":"db1","template":"nats"}))
+        .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { message, .. } if message == "an instance named db1 already exists that is not a service of Arca's; it is left alone" && !message.contains("other") && !message.contains(PROJECT))
+    );
+    assert!(
+        matches!(rig.call("service_status", json!({"name":"db1"})), Err(CallError::Refused { code, .. }) if code == "not_found")
+    );
+    // Invalid metadata outside the owned scope must not become a failed service either.
+    rig.edit(
+        "PATCH",
+        "/1.0/instances/db1?project=other",
+        json!({"config":{"user.arca.address":"invalid"}}),
+    );
+    assert_eq!(
+        rig.call("service_list", json!({})).unwrap()["services"],
+        json!([])
+    );
+    assert!(
+        rig.entries()
+            .iter()
+            .all(|entry| entry.id.0 != "service-db1")
+    );
+    assert!(
+        rig.fake
+            .writes()
+            .iter()
+            .all(|write| write.method == "PATCH")
+    );
+}
+
+#[test]
+fn adoption_reads_the_exact_user_arca_keys_and_leaves_them_as_they_are() {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![adopted_instance(
+                "svc1",
+                "arca",
+                "postgres-autopg",
+                "192.0.2.10",
+                "5432",
+                "uuid-svc1",
+            )],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string(), "arca".into()],
+        Some("192.0.2.0/24"),
+    );
+    let listed = rig.call("service_list", json!({})).expect("list");
+    let rows = listed["services"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "svc1");
+    assert_eq!(rows[0]["template"], "postgres-autopg");
+    assert_eq!(rows[0]["state"], "running");
+    assert_eq!(rows[0]["ipv4"], "192.0.2.10");
+    assert_eq!(rows[0]["ports"], json!([5432]));
+    assert_eq!(rows[0]["links"], json!([]));
+    assert!(
+        rig.entries()
+            .iter()
+            .any(|entry| { entry.id.0 == "service-svc1" && entry.config["adopted"] == true })
+    );
+    let live = rig
+        .get("/1.0/instances/svc1?project=arca")
+        .expect("instance");
+    assert_eq!(live["config"]["user.arca.template"], "postgres-autopg");
+    assert_eq!(live["config"]["user.arca.address"], "192.0.2.10");
+    assert_eq!(live["config"]["user.arca.ports"], "5432");
+    assert_eq!(
+        live["config"]["environment.POSTGRES_PASSWORD"],
+        "redacted-value"
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"svc1"})).unwrap()["state"],
+        "running"
+    );
+    assert!(matches!(
+        rig.call("service_create", json!({"name":"svc1","template":"nats"})),
+        Err(CallError::Refused { message, .. }) if message.contains("svc1")
+    ));
+    assert!(matches!(
+        rig.call("service_remove", json!({"name":"svc1","approval":"x"})),
+        Err(CallError::Refused { code, .. }) if code == "adopted"
+    ));
+    // Deleting the record never touches the instance.
+    let id = arca_kernel::desired::EntryId("service-svc1".into());
+    rig.kernel
+        .lock()
+        .unwrap()
+        .propose(vec![arca::desired_store::EntryChange::Remove(id)], NOW)
+        .expect("record removal");
+    assert!(rig.get("/1.0/instances/svc1?project=arca").is_some());
+}
+
+#[test]
+fn a_marked_instance_with_unreadable_keys_is_listed_failed_and_left_alone() {
+    let mut row = adopted_instance(
+        "broken",
+        "arca",
+        "postgres-autopg",
+        "192.0.2.10",
+        "5432",
+        "uuid-b",
+    );
+    row["config"]["user.arca.address"] = json!("192.0.2.99");
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![row],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string(), "arca".into()],
+        Some("192.0.2.0/24"),
+    );
+    let listed = rig.call("service_list", json!({})).expect("list");
+    let rows = listed["services"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["state"], "failed");
+    assert!(
+        rig.entries()
+            .iter()
+            .all(|entry| entry.id.0 != "service-broken")
+    );
+    assert_eq!(
+        rig.get("/1.0/instances/broken?project=arca").unwrap()["config"]["user.arca.address"],
+        "192.0.2.99"
+    );
+}
+
+#[test]
+fn service_list_and_status_and_logs_work_on_an_adopted_record() {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![adopted_instance(
+                "svc1",
+                "arca",
+                "postgres-autopg",
+                "192.0.2.10",
+                "5432",
+                "uuid-svc1",
+            )],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string(), "arca".into()],
+        Some("192.0.2.0/24"),
+    );
+    rig.fake
+        .set_console_log("arca", "svc1", "line one\nline two\n");
+    rig.call("service_list", json!({})).expect("adopt");
+    let logs = rig
+        .call("service_logs", json!({"name":"svc1","lines":2}))
+        .expect("logs");
+    assert_eq!(logs["lines"], json!(["line one", "line two"]));
+}
+
+#[test]
+fn service_logs_redacts_stored_secrets_rendered_environment_and_credentials() {
+    let rig = Rig::new();
+    rig.template(
+        "omni",
+        json!({
+            "name":"omni","kind":"oci","image":"ghcr.io/automagik-dev/omni-api",
+            "digest":DIGEST,"ports":[8882],
+            "env":{"OMNI_API_KEY":"{{secret:OMNI_API_KEY}}"},
+            "secrets":["OMNI_API_KEY"],"generate":{"OMNI_API_KEY":"omni_sk_"},
+            "publishable":false
+        }),
+    );
+    rig.call("service_create", json!({"name":"omni","template":"omni"}))
+        .expect("create");
+    let key = rig
+        .get(&format!("/1.0/instances/omni?project={PROJECT}"))
+        .expect("instance")["config"]["environment.OMNI_API_KEY"]
+        .as_str()
+        .expect("key")
+        .to_string();
+    let log = format!(
+        "{key}\nauthorization: Bearer abcdefghijklmnopqrstuvwxyz\ntskey-abc123\npostgresql://user:pw123456@db/app\napi_key=supersecret\nomni_sk_12***"
+    );
+    rig.fake.set_console_log(PROJECT, "omni", &log);
+    let lines = rig
+        .call("service_logs", json!({"name":"omni","lines":50}))
+        .expect("logs")["lines"]
+        .clone();
+    let text = lines.to_string();
+    assert!(!text.contains(&key));
+    assert!(!text.contains("abcdefghijklmnopqrstuvwxyz"));
+    assert!(!text.contains("tskey-abc123"));
+    assert!(!text.contains("pw123456"));
+    assert!(text.contains("[secret]"));
+}
+
+#[test]
+fn service_logs_is_untrusted_and_has_a_real_cut_that_names_the_truncation() {
+    use arca_api::verb;
+    let logs = verb("service_logs").expect("logs");
+    assert!(logs.untrusted);
+    let mut lines = (0..205).map(|i| format!("{i}")).collect::<Vec<_>>();
+    lines[0] = "x".repeat(2100);
+    let (cut, truncated) = arca_api::verbs::cut_service_logs(&json!({"lines": lines}))
+        .map(|cut| (cut, true))
+        .unwrap_or((json!({}), false));
+    assert!(truncated);
+    let out = cut["lines"].as_array().expect("lines");
+    assert_eq!(out.len(), 200);
+    assert!(out[0].as_str().unwrap().chars().count() <= 2000);
+}
+
+#[test]
+fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete() {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![hand_instance(
+                "hand",
+                PROJECT,
+                json!({"eth0":{"type":"nic","ipv4.address":"192.0.2.10"}}),
+            )],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+    );
+    assert!(matches!(
+        rig.call("service_logs", json!({"name":"hand"})),
+        Err(CallError::Refused { code, .. }) if code == "not_found"
+    ));
+    assert!(matches!(
+        rig.call("service_remove", json!({"name":"hand","approval":"x"})),
+        Err(CallError::Refused { code, .. }) if code == "not_found"
+    ));
+    assert!(
+        !rig.fake
+            .requests()
+            .iter()
+            .any(|r| r.path.contains("console"))
+    );
+    assert!(!rig.fake.requests().iter().any(|r| r.method == "DELETE"));
+}
+
+#[test]
+fn the_four_templates_and_nothing_else_load_and_are_pinned() {
+    use std::path::Path;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".json") && !name.starts_with("package"))
+        .map(|name| name.trim_end_matches(".json").to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["automagik", "nats", "omni-api", "postgres-autopg"]
+    );
+    for name in &names {
+        let template = service::load_template(&dir, name).expect("the template loads");
+        if template.kind == "oci" {
+            assert!(
+                template
+                    .digest
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("sha256:"))
+            );
+        }
+        assert!(!template.image.to_lowercase().contains("redis"));
+    }
+    let automagik = service::load_template(&dir, "automagik").unwrap();
+    assert_eq!(
+        automagik.commit.as_deref(),
+        Some("bc0e4cf5465cae4fbeb454fbb089249bfeb3e189")
+    );
+    assert!(
+        automagik
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("templates/automagik.build.sh")
+    );
+    assert!(dir.join("automagik.build.sh").is_file());
+    assert!(automagik.publishable);
+    assert_eq!(automagik.dash_port, Some(3080));
+    let nats = service::load_template(&dir, "nats").unwrap();
+    assert!(
+        nats.entrypoint
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--jetstream")
+    );
+    assert!(!nats.publishable);
+    let pg = service::load_template(&dir, "postgres-autopg").unwrap();
+    let entry = pg.entrypoint.as_ref().unwrap();
+    assert!(
+        entry
+            .iter()
+            .any(|v| v.get("file").and_then(Value::as_str) == Some("postgres-autopg.sh"))
+    );
+    let script = std::fs::read_to_string(dir.join("postgres-autopg.sh")).unwrap();
+    assert!(script.contains("postgres") && script.contains("exec"));
+}
+
+#[test]
+fn the_build_lockfile_pins_every_package_by_registry_integrity_and_runs_no_install_script() {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/automagik-dsh");
+    let pkg: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap()).unwrap();
+    let lock: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("package-lock.json")).unwrap())
+            .unwrap();
+    assert_eq!(pkg["dependencies"]["@deepseek-ai/dsh"], "0.2.1-rc.3");
+    assert_eq!(pkg["dependencies"]["pnpm"], "11.28.5");
+    for (path, package) in lock["packages"].as_object().unwrap() {
+        if path.is_empty() {
+            continue;
+        }
+        assert!(
+            package["resolved"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("https://registry.npmjs.org/"))
+        );
+        assert!(
+            package["integrity"]
+                .as_str()
+                .is_some_and(|i| i.starts_with("sha512-"))
+        );
+    }
+    assert!(lock["packages"].get("node_modules/pnpm").is_some());
+}
+
+fn owner_approval(key: &common::SkKey, name: &str) -> String {
+    use arca_kernel::canon::{canonical_json, params_digest};
+    let args = json!({"name": name});
+    let statement = canonical_json(&json!({
+        "host": "node1",
+        "action": "delete",
+        "target": name,
+        "paramsDigest": params_digest(&args).expect("digest"),
+        "issuedAt": "2026-10-30T12:00:00.000Z",
+        "expiresAt": "2026-10-30T12:05:00.000Z",
+        "nonce": "a".repeat(64)
+    }))
+    .expect("canonical");
+    common::approve_statement(key, &statement)
+}
+
+fn stopped_service_template() -> Value {
+    json!({
+        "name":"pg","kind":"oci","image":"docker.io/library/pg","digest":DIGEST,
+        "ports":[5432],
+        "env":{"POSTGRES_PASSWORD":"{{secret:POSTGRES_PASSWORD}}"},
+        "secrets":["POSTGRES_PASSWORD"],
+        "publishable":false
+    })
+}
+
+#[test]
+fn service_remove_is_refused_without_a_valid_approval_and_removes_with_one() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    let created = rig
+        .call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    assert_eq!(created["state"], "stopped");
+    assert!(matches!(
+        rig.call(
+            "service_remove",
+            json!({"name":"pg","approval":"not-an-approval"})
+        ),
+        Err(CallError::Refused { .. })
+    ));
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_some()
+    );
+    let secrets = rig.dir.join("secrets/service-pg");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("password"), "removed-on-success").unwrap();
+    let approval = owner_approval(&key, "pg");
+    let removed = rig
+        .call("service_remove", json!({"name":"pg","approval":approval}))
+        .expect("remove");
+    assert_eq!(removed, json!({"removed":true}));
+    assert!(!secrets.exists());
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-pg?project=default"
+        ))
+        .is_none()
+    );
+    assert!(rig.entries().iter().all(|entry| entry.id.0 != "service-pg"));
+}
+
+#[test]
+fn a_removal_that_fails_after_the_approval_was_spent_says_so() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let secrets = rig.dir.join("secrets/service-pg");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("password"), "kept-secret").unwrap();
+    let acl_path = format!("/1.0/network-acls/{PROJECT}-svc-pg?project=default");
+    rig.fake.set_reject_delete(&format!("{PROJECT}-svc-pg"));
+    let approval = owner_approval(&key, "pg");
+    let error = rig
+        .call("service_remove", json!({"name":"pg","approval":approval}))
+        .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { code, message } if code == "refused" && message == "remove service pg: partial removal (instance removed; ACL remains); the owner's approval is spent, so another try needs a new one")
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(rig.get(&acl_path).is_some());
+    assert_eq!(
+        fs::read_to_string(secrets.join("password")).unwrap(),
+        "kept-secret"
+    );
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.method == "DELETE"
+                && request.path == acl_path
+                && request.status == 400)
+    );
+    assert!(matches!(
+        rig.kernel.lock().unwrap().check_approval(
+            arca_approval::ArcaAction::Delete,
+            "pg",
+            &json!({"name":"pg"}),
+            &approval,
+            NOW
+        ),
+        Err(arca_approval::ApprovalRefusal::Replayed)
+    ));
+}
+
+#[test]
+fn an_instance_only_delete_rejection_is_a_partial_refusal_and_keeps_secrets() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let secrets = rig.dir.join("secrets/service-pg");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("password"), "kept-secret").unwrap();
+    rig.fake.set_reject_delete("pg");
+    let approval = owner_approval(&key, "pg");
+    let error = rig
+        .call("service_remove", json!({"name":"pg","approval":approval}))
+        .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { code, message } if code == "refused" && message == "remove service pg: partial removal (instance remains; ACL removed); the owner's approval is spent, so another try needs a new one")
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_some()
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-pg?project=default"
+        ))
+        .is_none()
+    );
+    assert_eq!(
+        fs::read_to_string(secrets.join("password")).unwrap(),
+        "kept-secret"
+    );
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.method == "DELETE"
+                && request.path == format!("/1.0/instances/pg?project={PROJECT}")
+                && request.status == 400)
+    );
+    assert!(matches!(
+        rig.kernel.lock().unwrap().check_approval(
+            arca_approval::ArcaAction::Delete,
+            "pg",
+            &json!({"name":"pg"}),
+            &approval,
+            NOW
+        ),
+        Err(arca_approval::ApprovalRefusal::Replayed)
+    ));
+}
+
+#[test]
+fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let key = common::SkKey::from_seed(9);
+    let (entered, at_retirement) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let rig = Rig::with_key_and_pause(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+        Some(RemovalPause {
+            entered,
+            release: released,
+        }),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let handler = Arc::clone(rig.handlers.get("service_remove").unwrap());
+    let approval = owner_approval(&key, "pg");
+    let remove = std::thread::spawn(move || {
+        handler.call(
+            json!({"name":"pg","approval":approval}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        )
+    });
+    let plan = at_retirement.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The pending plan exists, but the service call still owns the kernel lock.
+    assert!(matches!(
+        rig.kernel.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    let statement =
+        arca::handlers::plan_statement("node1", &plan.to_hex(), NOW, &"b".repeat(64)).unwrap();
+    let proof = common::approve_statement(&key, &statement);
+    let handler = arca::handlers::plan_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW))
+        .into_iter()
+        .find(|(name, _)| *name == "approval_submit")
+        .unwrap()
+        .1;
+    let (started, waiting) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    let approve = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = handler.call(
+            json!({"plan":plan.to_hex(),"approval":proof}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        );
+        finished.send(result).unwrap();
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    release.send(()).unwrap();
+    assert_eq!(remove.join().unwrap().unwrap(), json!({"removed":true}));
+    assert!(
+        matches!(done.recv_timeout(Duration::from_secs(5)).unwrap(), Err(CallError::Refused { code, .. }) if code == "NoSuchPlan")
+    );
+    approve.join().unwrap();
+    assert_eq!(
+        rig.fake
+            .writes()
+            .iter()
+            .filter(|write| write.method == "DELETE"
+                && write.path == format!("/1.0/instances/pg?project={PROJECT}"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        rig.fake
+            .writes()
+            .iter()
+            .filter(|write| write.method == "DELETE"
+                && write.path == format!("/1.0/network-acls/{PROJECT}-svc-pg?project=default"))
+            .count(),
+        1
+    );
+    assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
+}
+
+#[test]
+fn service_logs_reads_a_system_services_console_without_a_template_mark() {
+    let rig = Rig::new();
+    rig.template(
+        "dash",
+        json!({
+            "name":"dash","kind":"system","image":"local:dash-image",
+            "ports":[],"env":{},"publishable":false
+        }),
+    );
+    rig.call("service_create", json!({"name":"dash","template":"dash"}))
+        .expect("system service");
+    rig.edit(
+        "PATCH",
+        &format!("/1.0/instances/dash?project={PROJECT}"),
+        json!({"config":{"user.arca.template":null}}),
+    );
+    rig.fake.set_console_log(PROJECT, "dash", "system line\n");
+    let logs = rig
+        .call("service_logs", json!({"name":"dash"}))
+        .expect("logs");
+    assert_eq!(logs["lines"], json!(["system line"]));
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.method == "GET"
+                && request.path
+                    == format!("/1.0/instances/dash/console?project={PROJECT}&type=log"))
+    );
+}
+
+#[test]
+fn after_a_rollback_that_lost_the_secrets_service_logs_still_redacts_the_environment_values_rendered_from_them()
+ {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![adopted_instance(
+                "svc1",
+                "arca",
+                "postgres-autopg",
+                "192.0.2.10",
+                "5432",
+                "uuid-svc1",
+            )],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string(), "arca".into()],
+        Some("192.0.2.0/24"),
+    );
+    rig.fake
+        .set_console_log("arca", "svc1", "password redacted-value in the log");
+    let logs = rig
+        .call("service_logs", json!({"name":"svc1"}))
+        .expect("logs");
+    let text = logs["lines"].to_string();
+    assert!(!text.contains("redacted-value"));
+    assert!(text.contains("[secret]"));
+}
+
+#[test]
+fn template_images_are_pinned_by_digest_and_the_automagik_build_by_commit() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    for name in ["nats", "postgres-autopg", "omni-api"] {
+        let template = service::load_template(&dir, name).unwrap();
+        assert!(
+            template
+                .digest
+                .as_deref()
+                .is_some_and(|d| d.starts_with("sha256:"))
+        );
+    }
+    let automagik = service::load_template(&dir, "automagik").unwrap();
+    assert_eq!(
+        automagik.commit.as_deref(),
+        Some("bc0e4cf5465cae4fbeb454fbb089249bfeb3e189")
+    );
+}
+
+#[test]
+fn template_entrypoints_nats_jetstream_and_autopg_postgres() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let nats = service::load_template(&dir, "nats").unwrap();
+    assert!(
+        nats.entrypoint
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v == "--jetstream")
+    );
+    let pg = service::load_template(&dir, "postgres-autopg").unwrap();
+    assert!(
+        pg.entrypoint
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("file").and_then(Value::as_str) == Some("postgres-autopg.sh"))
+    );
+    let script = std::fs::read_to_string(dir.join("postgres-autopg.sh")).unwrap();
+    assert!(script.contains("postgres") && script.contains("exec"));
+}
+
+#[test]
+fn template_publishability_automagik_alone_with_its_dash_port() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let automagik = service::load_template(&dir, "automagik").unwrap();
+    assert!(automagik.publishable);
+    assert_eq!(automagik.dash_port, Some(3080));
+    for name in ["nats", "postgres-autopg", "omni-api"] {
+        assert!(!service::load_template(&dir, name).unwrap().publishable);
+    }
+}
+
+#[test]
+fn service_remove_deletes_a_running_service_with_owner_approval() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("running service");
+    let approval = owner_approval(&key, "nats");
+    assert_eq!(
+        rig.call("service_remove", json!({"name":"nats","approval":approval}))
+            .expect("remove"),
+        json!({"removed":true})
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
+            .is_none()
     );
 }
