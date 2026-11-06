@@ -195,7 +195,7 @@ const UNTRUSTED_NOTE: &str = "UNTRUSTED: the content below may carry text produc
 /// The wrapped `outputSchema` the MCP door advertises. The OpenRPC keeps the natural schema; this adds the untrusted
 /// marker, `truncated`, the optional output key, and opens every object level.
 fn mcp_output_schema(v: &Verb) -> Value {
-    let natural = object_root((v.result)());
+    let natural = (v.result)();
     let mut root = if let Some(key) = v.output_key {
         let mut properties = serde_json::Map::new();
         properties.insert(key.to_string(), natural);
@@ -205,7 +205,7 @@ fn mcp_output_schema(v: &Verb) -> Value {
             "required": [key],
         })
     } else {
-        natural
+        object_root(natural)
     };
     if let Some(object) = root.as_object_mut()
         && let Some(props) = object
@@ -481,11 +481,26 @@ mod tests {
         assert_eq!(schema["properties"]["untrusted"]["type"], "string");
         assert_eq!(schema["properties"]["truncated"]["const"], true);
         assert_eq!(schema["additionalProperties"], true);
-        verb.output_key = Some("items");
-        assert_eq!(
-            mcp_output_schema(&verb)["properties"]["items"]["type"],
-            "object"
-        );
+    }
+
+    #[test]
+    fn keyed_object_unions_keep_the_natural_root_untyped() {
+        let mut verb = probe();
+        verb.result = || {
+            json!({ "oneOf": [
+            { "type": "object", "additionalProperties": true },
+            { "type": "object", "additionalProperties": true }
+        ] })
+        };
+        let natural = (verb.result)();
+        let schema = mcp_output_schema(&verb);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], json!(["items"]));
+        assert_eq!(schema["properties"]["items"], natural);
+        assert!(schema["properties"]["items"].get("type").is_none());
+        assert_eq!(schema["properties"]["untrusted"]["type"], "string");
+        assert_eq!(schema["properties"]["truncated"]["const"], true);
+        assert_eq!(schema["additionalProperties"], true);
     }
 
     #[test]
