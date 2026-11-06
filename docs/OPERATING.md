@@ -224,10 +224,11 @@ the server refuses every file it does not own, so the load fails until those fil
 
 `arca token revoke <id>` removes the token's hash file. With `--config`, it sends `SIGHUP` to a live `arca serve` for that
 config: it checks `<stateDir>/serve.pid` only when its pid is a live `arca serve`, and otherwise finds the same process in
-`/proc`. The server writes that pid file only after its unix socket is serving and removes it only when it still holds its own
-pid. The answer carries `reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With
-`--hash-dir` alone no state directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server
-keeps the token until it is restarted or signalled. The hash files stay mode 0400. The signal uses the host's `kill` command.
+`/proc`. The server writes that pid file only after its own unix socket accepts connections and removes it only when it still
+holds its own pid. A second start that fails to bind leaves the running server's pid file unchanged. The answer carries
+`reloadSignalled`; `token_list` drops the token and a call with it is 401 without a restart. With `--hash-dir` alone no state
+directory or serve is known, so no signal is sent (`reloadSignalled: false`) and a running server keeps the token until it is
+restarted or signalled. The hash files stay mode 0400. The signal uses the host's `kill` command.
 
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
@@ -243,6 +244,10 @@ The secret file holds the secret and one newline. A client reads that file, stri
 | a call the caller may make | 200, with the verb's result or a JSON-RPC error |
 
 `tools/list` shows a caller only the verbs it may call.
+
+`tools/list` advertises each verb's MCP `outputSchema`: the natural result schema, wrapped under its `output.key` when the result is not an object, with `truncated` and (for an untrusted verb) `untrusted` added and every object level open. The OpenRPC document keeps the natural schemas.
+
+`tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
 
 ## The MCP server
 

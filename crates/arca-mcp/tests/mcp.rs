@@ -27,6 +27,10 @@ fn table() -> &'static [Verb] {
             min_scope: Scope::Doctor,
             writes: true,
             destructive: false,
+            untrusted: false,
+            output_key: None,
+            summary_text: arca_api::verbs::summary_done,
+            cut: arca_api::verbs::no_cut,
             params: write_probe_params,
             result: write_probe_result,
         });
@@ -384,10 +388,14 @@ fn a_viewer_calling_arca_status_gets_a_result_that_conforms() {
         Ok(()),
         "the result matches its schema"
     );
-    let text: Value =
-        serde_json::from_str(result["content"][0]["text"].as_str().expect("text content"))
-            .expect("the text content is the same JSON");
-    assert_eq!(&text, structured);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("arca ")),
+        "the summary line names the node"
+    );
+    assert_eq!(result["_meta"]["droidd/untrusted"], false);
+    assert_eq!(result["_meta"].get("droidd/truncated"), None);
 }
 
 // The tool list follows the scope.
@@ -471,10 +479,13 @@ fn a_listed_tool_carries_its_schemas_and_annotations() {
         status["inputSchema"],
         (verb("arca_status").expect("verb").params)()
     );
+    let output = &status["outputSchema"];
+    assert_eq!(output["properties"]["version"], json!({ "type": "string" }));
     assert_eq!(
-        status["outputSchema"],
-        (verb("arca_status").expect("verb").result)()
+        output["properties"]["truncated"],
+        json!({ "type": "boolean", "const": true, "description": "Present when something was cut to fit its cap." })
     );
+    assert!(output["properties"].get("untrusted").is_none());
     assert_eq!(status["annotations"]["readOnlyHint"], true);
     let probe = tools
         .as_array()
@@ -484,6 +495,18 @@ fn a_listed_tool_carries_its_schemas_and_annotations() {
         .expect("write_probe")
         .clone();
     assert_eq!(probe["annotations"]["readOnlyHint"], false);
+    for tool in tools.as_array().expect("tools") {
+        assert_eq!(
+            tool["outputSchema"]["properties"]["truncated"]["const"], true,
+            "{} advertises the truncation marker",
+            tool["name"]
+        );
+        assert_eq!(
+            tool["outputSchema"]["additionalProperties"], true,
+            "{} is advertised open",
+            tool["name"]
+        );
+    }
 }
 
 // Routing and argument checks.
@@ -527,11 +550,17 @@ fn arguments_are_checked_against_the_closed_params_schema() {
 }
 
 #[test]
-fn a_result_that_breaks_its_schema_is_a_500_with_no_body() {
+fn a_result_that_breaks_its_schema_is_an_is_error_tool_result() {
     let fx = Fixture::start("bad-result");
     let reply = fx.tool_call(&fx.operator, "watch_report", json!({}));
-    assert_eq!(reply.status, 500);
-    assert!(reply.body.is_empty(), "the internal shape is not shown");
+    assert_eq!(reply.status, 200);
+    let result = &reply.json()["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["_meta"]["droidd/error"], "internal");
+    assert!(
+        !reply.body.contains("oops"),
+        "the internal shape is not shown"
+    );
 }
 
 #[test]
@@ -553,10 +582,14 @@ fn a_handler_forbidden_answer_is_403() {
 }
 
 #[test]
-fn a_handler_internal_failure_is_a_500_whose_detail_stays_inside() {
+fn a_handler_internal_failure_is_an_is_error_tool_result() {
     let fx = Fixture::start("handler-boom");
     let reply = fx.tool_call(&fx.doctor, "write_probe", json!({ "name": "boom" }));
-    assert_eq!(reply.status, 500);
+    assert_eq!(reply.status, 200);
+    let result = &reply.json()["result"];
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["content"][0]["text"], "internal: the tool failed");
+    assert_eq!(result["_meta"]["droidd/error"], "internal");
     assert!(
         !reply.body.contains("must not leave"),
         "the detail is not echoed"
@@ -592,11 +625,11 @@ fn no_reply_carries_a_secret_or_any_part_of_one() {
 }
 
 #[test]
-fn a_panicking_handler_is_a_500_and_the_server_still_answers() {
+fn a_panicking_handler_is_an_is_error_tool_result_and_the_server_still_answers() {
     let fx = Fixture::start("panic");
     let reply = fx.tool_call(&fx.doctor, "write_probe", json!({ "name": "panic" }));
-    assert_eq!(reply.status, 500, "a handler fault is an internal error");
-    assert!(reply.body.is_empty());
+    assert_eq!(reply.status, 200, "a handler fault is a tool failure");
+    assert_eq!(reply.json()["result"]["isError"], true);
     let after = fx.call(&fx.viewer, "ping", json!({}));
     assert_eq!(after.status, 200, "the next request is still served");
 }
@@ -622,6 +655,10 @@ fn a_write_verb_open_to_viewers_is_a_wiring_error_at_start() {
         min_scope: Scope::Viewer,
         writes: true,
         destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: arca_api::verbs::summary_done,
+        cut: arca_api::verbs::no_cut,
         params: write_probe_params,
         result: write_probe_result,
     });

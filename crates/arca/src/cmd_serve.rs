@@ -51,6 +51,10 @@ use crate::{Failure, Flags};
 const NODE_KEY_FILE: &str = "node.key";
 /// The file a running server leaves its pid in, so `arca token revoke` can send it SIGHUP.
 pub(crate) const SERVE_PID_FILE: &str = "serve.pid";
+#[cfg(target_os = "linux")]
+const PID_NOFOLLOW: i32 = 0o400000;
+#[cfg(not(target_os = "linux"))]
+const PID_NOFOLLOW: i32 = 0;
 /// The file the approval nonces are spent in, in the state directory.
 const NONCE_FILE: &str = "approval-nonces.jsonl";
 /// The directory secret files are read from, in the state directory.
@@ -266,17 +270,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         tokio::spawn(async move {
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                if tokio::net::UnixStream::connect(&pid_probe).await.is_ok() {
-                    if let Ok(mut file) = fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&pid_write_path)
-                    {
-                        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
-                        let _ = file.sync_all();
-                    }
+                if let Ok(stream) = tokio::net::UnixStream::connect(&pid_probe).await {
+                    write_pid_for_peer(&stream, &pid_write_path);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -319,14 +314,89 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
 }
 
+/// Publishes our pid only when the connected listener belongs to this process.
+fn write_pid_for_peer(stream: &tokio::net::UnixStream, path: &Path) {
+    if !stream.peer_cred().is_ok_and(|cred| {
+        cred.pid()
+            .is_some_and(|pid| pid as u32 == std::process::id())
+    }) {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(PID_NOFOLLOW)
+        .open(path)
+        && file.metadata().is_ok_and(|meta| meta.is_file())
+    {
+        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
+        let _ = file.sync_all();
+    }
+}
+
 /// Removes `path` only when it still holds this process's pid, so a second server cannot delete the first one's file.
 fn remove_own_pid(path: &Path) {
     let own = std::process::id().to_string();
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
     if fs::read_to_string(path)
         .ok()
         .is_some_and(|text| text.trim() == own)
     {
         let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod pid_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "arca-pid-{}-{}-{tag}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("scratch");
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        dir
+    }
+
+    #[tokio::test]
+    async fn our_listener_peer_writes_our_pid_with_private_permissions() {
+        let dir = scratch("own-peer");
+        let socket = dir.join("serve.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).expect("own listener");
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect");
+        let path = dir.join(SERVE_PID_FILE);
+        write_pid_for_peer(&stream, &path);
+        assert_eq!(
+            fs::read_to_string(&path).expect("pid"),
+            format!("{}\n", std::process::id())
+        );
+        assert_eq!(fs::metadata(&path).expect("metadata").mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_second_server_pid_file_is_not_removed_by_this_process() {
+        let dir = scratch("remove");
+        let path = dir.join(SERVE_PID_FILE);
+        fs::write(&path, "999999\n").expect("other pid");
+        remove_own_pid(&path);
+        assert!(path.exists(), "the other server's pid file stays");
+        fs::write(&path, format!("{}\n", std::process::id())).expect("own pid");
+        remove_own_pid(&path);
+        assert!(!path.exists(), "this process removes its own pid file");
+        let _ = fs::remove_dir_all(dir);
     }
 }
 
