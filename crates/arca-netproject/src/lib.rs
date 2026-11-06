@@ -150,12 +150,30 @@ impl Plugin for NetProject {
         )?
         .is_none()
         {
+            let default = ctx
+                .observe(Observe::IncusGet {
+                    path: "/1.0/profiles/default?project=default".into(),
+                })
+                .map_err(|_| {
+                    PluginError::Failed("the default profile does not name a storage pool".into())
+                })?;
+            let pool = default["devices"]["root"]["pool"]
+                .as_str()
+                .filter(|pool| !pool.is_empty())
+                .ok_or_else(|| {
+                    PluginError::Failed("the default profile does not name a storage pool".into())
+                })?;
             create(
                 ctx,
                 IncusKind::Profile,
                 &cfg.project,
                 PROFILE,
-                json!({"name": PROFILE, "config": {}, "devices": {}}),
+                json!({"name": PROFILE,
+                    "description": format!("Arca service (project {}); managed by infra/provision-services.mjs", cfg.project),
+                    "config": {"limits.memory":"2GiB", "limits.cpu":"2", "limits.cpu.priority":"5",
+                        "limits.processes":"4096", "security.privileged":"false", "security.nesting":"false",
+                        "security.idmap.isolated":"true", "security.guestapi":"false"},
+                    "devices": {"root":{"type":"disk", "path":"/", "pool":pool, "size":"16GiB"}}}),
             )?;
         }
         Ok(())

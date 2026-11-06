@@ -2068,8 +2068,11 @@ fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
     Ok((cidr.to_string(), gateway.to_string()))
 }
 
-fn service_listing(read: &UnixIncus) -> Result<Vec<Value>, CallError> {
-    match read.get("/1.0/instances?all-projects=true&recursion=2") {
+fn service_listing(read: &UnixIncus, project: Option<&str>) -> Result<Vec<Value>, CallError> {
+    let path = project
+        .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
+        .unwrap_or_else(|| "/1.0/instances?all-projects=true&recursion=2".into());
+    match read.get(&path) {
         Ok(rows) => Ok(rows.as_array().cloned().unwrap_or_default()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
         Err(_) => Err(internal()),
@@ -2094,7 +2097,30 @@ fn service_leases(read: &UnixIncus) -> Result<Vec<String>, CallError> {
     }
 }
 
-fn service_used(rows: &[Value], leases: &[String]) -> BTreeSet<std::net::Ipv4Addr> {
+fn service_secret_names(dir: &std::path::Path) -> std::io::Result<BTreeSet<std::ffi::OsString>> {
+    match std::fs::read_dir(dir) {
+        Ok(files) => files
+            .map(|file| file.map(|file| file.file_name()))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_service_secrets(dir: &std::path::Path, seeded: &BTreeSet<std::ffi::OsString>) {
+    if let Ok(names) = service_secret_names(dir) {
+        for name in names.difference(seeded) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let _ = std::fs::remove_dir(dir); // Only succeeds when empty.
+    }
+}
+
+fn service_used(
+    rows: &[Value],
+    leases: &[String],
+    entries: &[arca_kernel::desired::Entry],
+) -> BTreeSet<std::net::Ipv4Addr> {
     let mut used = BTreeSet::new();
     for row in rows {
         if let Some(devices) = row["devices"].as_object() {
@@ -2121,6 +2147,11 @@ fn service_used(rows: &[Value], leases: &[String]) -> BTreeSet<std::net::Ipv4Add
     }
     for lease in leases {
         if let Ok(ip) = lease.parse() {
+            used.insert(ip);
+        }
+    }
+    for (_, config) in service_entries(entries) {
+        if let Ok(ip) = config.ipv4.parse() {
             used.insert(ip);
         }
     }
@@ -2229,7 +2260,10 @@ impl ToolHandler for ServiceHandler {
         };
         let (cidr, gateway) = service_project(&self.cfg)?;
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
-        let rows = service_listing(&read)?;
+        let rows = service_listing(
+            &read,
+            (self.verb != "service_create").then_some(arca_netproject::PROJECT),
+        )?;
         let project_rows: Vec<Value> = rows
             .iter()
             .filter(|row| row["project"].as_str() == Some(arca_netproject::PROJECT))
@@ -2307,7 +2341,7 @@ impl ToolHandler for ServiceHandler {
                 let candidates =
                     crate::service::candidates(&cidr).map_err(service_template_error)?;
                 let leases = service_leases(&read)?;
-                let used = service_used(&rows, &leases);
+                let used = service_used(&rows, &leases, &entries);
                 let ipv4 = candidates
                     .iter()
                     .find(|ip| !used.contains(ip))
@@ -2324,6 +2358,8 @@ impl ToolHandler for ServiceHandler {
                     service_refused("no service project: kernel.serviceCidr is required")
                 })?;
                 let secrets_dir = self.cfg.state_dir.join("secrets");
+                let service_secrets = secrets_dir.join(format!("service-{name}"));
+                let seeded = service_secret_names(&service_secrets).map_err(|_| internal())?;
                 let config = service_config(ServiceParts {
                     name: &name,
                     template: &template,
@@ -2333,7 +2369,8 @@ impl ToolHandler for ServiceHandler {
                     now,
                     secrets_dir: &secrets_dir,
                     templates_dir: &templates_dir,
-                })?;
+                })
+                .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
                 changes.push(crate::desired_store::EntryChange::Put(service_entry(
                     &id,
                     "arca.service",
@@ -2347,6 +2384,18 @@ impl ToolHandler for ServiceHandler {
                     |outcome| matches!(outcome, Outcome::Failed { entry, .. } if entry.0 == id),
                 );
                 if failed {
+                    match read.get(&format!(
+                        "/1.0/instances/{name}?project={}",
+                        arca_netproject::PROJECT
+                    )) {
+                        Ok(_) => {
+                            return Err(service_refused(format!(
+                                "start service {name} (created and stopped; service_remove removes it)"
+                            )));
+                        }
+                        Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
+                        Err(_) => return Err(internal()),
+                    }
                     let _ = {
                         let mut kernel = lock(&self.kernel)?;
                         kernel.propose(
@@ -2356,7 +2405,7 @@ impl ToolHandler for ServiceHandler {
                             now,
                         )
                     };
-                    let _ = std::fs::remove_dir_all(secrets_dir.join(format!("service-{name}")));
+                    cleanup_service_secrets(&service_secrets, &seeded);
                     return Err(service_refused(format!(
                         "create service {name} from template {template_name}"
                     )));

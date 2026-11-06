@@ -34,7 +34,7 @@ use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::journal::{AclPatch, EffectClass, Inverse};
 use arca_kernel::ownership::{
-    IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify, kernel_may_write,
+    IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, classify_object, kernel_may_write,
 };
 pub use arca_kernel::plugin::Retirement;
 use arca_kernel::plugin::{
@@ -532,7 +532,10 @@ impl IncusProvider {
     ) -> Result<(), EffectRefusal> {
         check_patch_keys(object.kind, changes)?;
         let after = apply_changes(current, changes);
-        if !kernel_may_write(&classify(&after, &self.retained.snapshot()?), entry) {
+        if !kernel_may_write(
+            &classify_object(object, &after, &self.retained.snapshot()?),
+            entry,
+        ) {
             return Err(EffectRefusal::Provider(
                 "the change would leave the object owned by another owner".to_string(),
             ));
@@ -988,6 +991,13 @@ impl Provider for IncusProvider {
                     ["", "1.0", "profiles", name] if plain_name(name) => IncusKind::Profile,
                     _ => return Err(EffectRefusal::NotDeclared),
                 };
+                // The shared service profile derives its pool from this read-only default profile.
+                if entry.0 == "net-arcak-svc" && path == "/1.0/profiles/default?project=default" {
+                    let value = self.reader.get(path).map_err(incus_refusal)?;
+                    return Ok(
+                        json!({"devices":{"root":{"pool":value["devices"]["root"]["pool"]}}}),
+                    );
+                }
                 self.check_family(kind, project)?;
                 if kind != IncusKind::Acl && !projects.iter().any(|p| p == project) {
                     return Err(EffectRefusal::ProjectNotAllowed);
@@ -1005,7 +1015,14 @@ impl Provider for IncusProvider {
                         .ok_or(EffectRefusal::NotDeclared)?;
                     let config: BTreeMap<String, String> =
                         serde_json::from_value(config).map_err(|_| EffectRefusal::NotDeclared)?;
-                    let class = classify(&config, &self.retained.snapshot()?);
+                    let object = ObjectRef {
+                        kind,
+                        project: project.into(),
+                        parent: None,
+                        name: parts[3].into(),
+                        uuid: None,
+                    };
+                    let class = classify_object(&object, &config, &self.retained.snapshot()?);
                     if !kernel_may_write(&class, entry) {
                         return Err(EffectRefusal::NotOwned(class));
                     }

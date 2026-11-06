@@ -6,7 +6,7 @@
 use arca_kernel::{
     journal::EffectClass,
     ownership::IncusKind,
-    plugin::{Ctx, EffectOp, Manifest, Plugin, PluginError},
+    plugin::{Ctx, EffectOp, Manifest, Observe, Plugin, PluginError},
 };
 use arca_netproject::{BRIDGE, PROFILE, PROJECT, create, manifest, name_ok, observed};
 use arca_providers::incus::SECRET_PREFIX;
@@ -16,13 +16,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-pub const COOKIE: &str = "user.arcakernel.service.managed";
-pub const TEMPLATE_KEY: &str = "user.arcakernel.service.template";
-pub const ADDRESS_KEY: &str = "user.arcakernel.service.address";
-pub const PORTS_KEY: &str = "user.arcakernel.service.ports";
-pub const PUBLISHED_KEY: &str = "user.arcakernel.service.published";
-pub const CREATED_KEY: &str = "user.arcakernel.service.created";
-pub const ENVKEYS_KEY: &str = "user.arcakernel.service.envkeys";
+pub const COOKIE: &str = "user.arca.managed";
+pub const TEMPLATE_KEY: &str = "user.arca.template";
+pub const ADDRESS_KEY: &str = "user.arca.address";
+pub const PORTS_KEY: &str = "user.arca.ports";
+pub const PUBLISHED_KEY: &str = "user.arca.published";
+pub const LINKS_KEY: &str = "user.arca.links";
+pub const ENVKEYS_KEY: &str = "user.arca.envkeys";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -103,31 +103,100 @@ pub fn template_name_ok(name: &str) -> bool {
 pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
     let mut rules = Vec::new();
     if let Some(port) = cfg.droidd_port {
-        rules.push(json!({
+        rules.push(rule(json!({
             "action": "allow",
             "source": format!("{}/32", cfg.gateway),
             "protocol": "tcp",
             "destination_port": port.to_string(),
-            "description": format!("service management from the bridge gateway to port {port}"),
+            "description": format!("droidd from the host bridge address to port {port}"),
             "state": "enabled"
-        }));
+        })));
     }
     let mut links: Vec<&ServiceLink> = cfg.links.iter().collect();
     links.sort_by(|a, b| a.to.cmp(&b.to).then(a.port.cmp(&b.port)));
     for link in links {
-        rules.push(json!({
+        rules.push(rule(json!({
             "action": "allow",
             "source": format!("{}/32", cfg.ipv4),
             "protocol": "tcp",
             "destination_port": link.port.to_string(),
             "description": format!("link from {} to port {}", cfg.ipv4, link.port),
             "state": "enabled"
-        }));
+        })));
     }
     rules
 }
 
-fn instance_body(cfg: &ServiceConfig) -> Value {
+/// Match Incus' complete ACL rule shape, including its empty optional fields.
+fn rule(fields: Value) -> Value {
+    let mut out = json!({"action":"", "source":"", "destination":"", "protocol":"",
+        "source_port":"", "destination_port":"", "icmp_type":"", "icmp_code":"",
+        "description":"", "state":"enabled"});
+    out.as_object_mut()
+        .unwrap()
+        .extend(fields.as_object().unwrap().clone());
+    out
+}
+
+/// Reject private ranges outside this service /24 before allowing internet traffic.
+pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
+    let own = u32::from(cfg.gateway.parse::<Ipv4Addr>().expect("validated gateway")) & 0xffffff00;
+    let mut rejected = Vec::new();
+    for (base, prefix) in [
+        (0x0a000000u32, 8u32),
+        (0xac100000, 12),
+        (0xc0a80000, 16),
+        (0x64400000, 10),
+        (0xa9fe0000, 16),
+        (0x7f000000, 8),
+    ] {
+        if own & (u32::MAX << (32 - prefix)) == base {
+            let mut blocks = Vec::new();
+            for length in prefix + 1..=24 {
+                let size = 1u32 << (32 - length);
+                blocks.push(((own & (u32::MAX << (32 - length))) ^ size, length));
+            }
+            blocks.sort_unstable();
+            rejected.extend(
+                blocks
+                    .into_iter()
+                    .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip))),
+            );
+        } else {
+            rejected.push(format!("{}/{prefix}", Ipv4Addr::from(base)));
+        }
+    }
+    let mut host4 = BTreeSet::from([cfg.gateway.parse::<Ipv4Addr>().expect("validated gateway")]);
+    host4.extend(
+        hosts
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|host| host.as_str()?.split('/').next()?.parse::<Ipv4Addr>().ok()),
+    );
+    let destinations = host4
+        .iter()
+        .map(|ip| format!("{ip}/32"))
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        rule(
+            json!({"action":"reject", "destination":rejected.join(","), "description":"RFC1918 outside the service subnet, CGNAT (tailnet), link-local, loopback"}),
+        ),
+        rule(
+            json!({"action":"reject", "destination":"::/0", "description":"all IPv6 (IPv4-only bridge), host addresses included"}),
+        ),
+        rule(
+            json!({"action":"reject", "destination":"224.0.0.0/4,255.255.255.255/32,0.0.0.0/8,240.0.0.0/4", "description":"multicast, broadcast, this-network, reserved (as desktops)"}),
+        ),
+        rule(
+            json!({"action":"reject", "destination":destinations, "description":"host addresses, the bridge gateway among them"}),
+        ),
+        rule(json!({"action":"allow", "description":"internet"})),
+    ]
+}
+
+fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     let mut config = Map::new();
     config.insert(TEMPLATE_KEY.to_string(), json!(cfg.template));
     config.insert(ADDRESS_KEY.to_string(), json!(cfg.ipv4));
@@ -146,7 +215,6 @@ fn instance_body(cfg: &ServiceConfig) -> Value {
     if let Some(entrypoint) = &cfg.entrypoint {
         config.insert("oci.entrypoint".to_string(), json!(entrypoint));
     }
-    config.insert(CREATED_KEY.to_string(), json!(cfg.created.to_string()));
     for (key, value) in &cfg.environment {
         config.insert(format!("environment.{key}"), json!(value));
     }
@@ -158,6 +226,9 @@ fn instance_body(cfg: &ServiceConfig) -> Value {
             .collect::<Vec<_>>()
             .join(",");
         config.insert(ENVKEYS_KEY.to_string(), json!(keys));
+    }
+    if !links.is_empty() {
+        config.insert(LINKS_KEY.to_string(), json!(links.join(",")));
     }
     let mut devices = Map::new();
     devices.insert(
@@ -218,6 +289,7 @@ impl Plugin for Service {
         let acl = cfg.acl();
         let current = observed(ctx, format!("/1.0/network-acls/{acl}?project=default"))?;
         let rules = ingress(cfg);
+        let outgoing = egress(cfg, &ctx.observe(Observe::HostAddresses)?);
         match current {
             None => {
                 create(
@@ -230,7 +302,7 @@ impl Plugin for Service {
                         "description": format!("Arca service {} NIC ACL", cfg.name),
                         "config": { COOKIE: "true" },
                         "ingress": rules,
-                        "egress": []
+                        "egress": outgoing
                     }),
                 )?;
             }
@@ -240,33 +312,66 @@ impl Plugin for Service {
                         "the existing ACL is not managed by a service".into(),
                     ));
                 }
-                if current["ingress"].as_array() != Some(&rules) {
-                    ctx.effect(EffectOp::IncusPatchAclField {
-                        object: arca_kernel::ownership::ObjectRef {
-                            kind: IncusKind::Acl,
-                            project: "default".into(),
-                            parent: None,
-                            name: acl,
-                            uuid: None,
-                        },
-                        field: arca_kernel::journal::AclField::Ingress,
-                        rules,
-                    })?;
+                for (field, key, desired) in [
+                    (arca_kernel::journal::AclField::Ingress, "ingress", rules),
+                    (arca_kernel::journal::AclField::Egress, "egress", outgoing),
+                ] {
+                    if current[key].as_array() != Some(&desired) {
+                        ctx.effect(EffectOp::IncusPatchAclField {
+                            object: arca_kernel::ownership::ObjectRef {
+                                kind: IncusKind::Acl,
+                                project: "default".into(),
+                                parent: None,
+                                name: acl.clone(),
+                                uuid: None,
+                            },
+                            field,
+                            rules: desired,
+                        })?;
+                    }
                 }
             }
         }
-        if observed(
+        let instance = observed(
             ctx,
             format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
-        )?
-        .is_none()
+        )?;
+        if let Some(instance) = &instance
+            && (instance["config"][TEMPLATE_KEY].as_str() != Some(cfg.template.as_str())
+                || instance["config"][ADDRESS_KEY].as_str() != Some(cfg.ipv4.as_str())
+                || instance["devices"]["eth0"]["ipv4.address"].as_str() != Some(cfg.ipv4.as_str())
+                || instance["devices"]["eth0"]["security.acls"].as_str() != Some(acl.as_str()))
         {
+            return Err(PluginError::Config(
+                "the existing instance is not the marked service with its NIC ACL".into(),
+            ));
+        }
+        if instance.is_none() {
             create(
                 ctx,
                 IncusKind::Instance,
                 &cfg.project,
                 &cfg.name,
-                instance_body(cfg),
+                instance_body(
+                    cfg,
+                    &cfg.links
+                        .iter()
+                        .map(|link| {
+                            let provider = ctx.observe(Observe::IncusGet {
+                                path: format!("/1.0/instances/{}?project={}", link.to, cfg.project),
+                            })?;
+                            let uuid = provider["config"]["volatile.uuid"]
+                                .as_str()
+                                .filter(|uuid| !uuid.is_empty())
+                                .ok_or_else(|| {
+                                    PluginError::Failed(
+                                        "linked provider has no instance UUID".into(),
+                                    )
+                                })?;
+                            Ok(format!("{}:{}:{uuid}", link.to, link.port))
+                        })
+                        .collect::<Result<Vec<_>, PluginError>>()?,
+                ),
             )?;
         }
         Ok(())
@@ -581,15 +686,49 @@ pub fn secret_file(secrets_dir: &Path, name: &str, key: &str) -> Option<PathBuf>
 }
 
 fn generated_secret(prefix: &str) -> Result<String, TemplateError> {
+    generated_secret_with(prefix, |bytes| getrandom::fill(bytes).map_err(|_| ()))
+}
+
+fn generated_secret_with(
+    prefix: &str,
+    mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+) -> Result<String, TemplateError> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|_| TemplateError::refused("no generated key"))?;
     let mut out = String::with_capacity(prefix.len() + 32);
     out.push_str(prefix);
-    for byte in bytes {
-        out.push(ALPHABET[byte as usize % ALPHABET.len()] as char);
+    while out.len() < prefix.len() + 32 {
+        let mut bytes = [0u8; 32];
+        fill(&mut bytes).map_err(|_| TemplateError::refused("no generated key"))?;
+        for byte in bytes {
+            if byte < 248 && out.len() < prefix.len() + 32 {
+                out.push(ALPHABET[byte as usize % ALPHABET.len()] as char);
+            }
+        }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_secrets_reject_biased_bytes_refill_and_stop_at_length() {
+        let mut calls = 0;
+        let secret = generated_secret_with("key_", |bytes| {
+            calls += 1;
+            bytes.fill(if calls == 1 { 248 } else { 247 });
+            bytes[0] = 255;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(secret, format!("key_{}", "9".repeat(32)));
+        assert!(generated_secret_with("", |_| Err(())).is_err());
+        let secret = generated_secret("").unwrap();
+        assert_eq!(secret.len(), 32);
+        assert!(secret.bytes().all(|b| b.is_ascii_alphanumeric()));
+    }
 }
 
 fn write_secret(path: &Path, value: &str) -> Result<(), TemplateError> {

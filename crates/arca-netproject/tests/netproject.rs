@@ -42,6 +42,24 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
         cidr: "192.0.2.0/24".into(),
         virtual_machines: 0,
     };
+    let error = NetProject::apply(
+        &mut Ctx::new(
+            EntryId("net-arcak-svc".into()),
+            &manifest,
+            &mut provider,
+            &mut journal,
+            0,
+        ),
+        &cfg,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, arca_kernel::plugin::PluginError::Failed(message) if message.contains("storage pool"))
+    );
+    fake.add_profile(
+        "default",
+        json!({"name":"default","config":{},"devices":{"root":{"pool":"pool1"}}}),
+    );
     for _ in 0..2 {
         NetProject::apply(
             &mut Ctx::new(
@@ -69,6 +87,25 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
         .get(&format!("/1.0/profiles/{PROFILE}?project={PROJECT}"))
         .unwrap();
     assert_eq!(profile["name"], PROFILE);
+    assert_eq!(
+        profile["description"],
+        format!("Arca service (project {PROJECT}); managed by infra/provision-services.mjs")
+    );
+    let mut config = profile["config"].as_object().unwrap().clone();
+    config.remove("user.arcakernel.entry");
+    assert_eq!(
+        config,
+        json!({"limits.memory":"2GiB","limits.cpu":"2","limits.cpu.priority":"5",
+        "limits.processes":"4096","security.privileged":"false","security.nesting":"false",
+        "security.idmap.isolated":"true","security.guestapi":"false"})
+        .as_object()
+        .unwrap()
+        .clone()
+    );
+    assert_eq!(
+        profile["devices"],
+        json!({"root":{"type":"disk","path":"/","pool":"pool1","size":"16GiB"}})
+    );
     assert_eq!(fake.writes().len(), 3);
     drop(fake);
     std::fs::remove_dir_all(dir).unwrap();

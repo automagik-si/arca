@@ -201,6 +201,7 @@ struct Shared {
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
     reject_patch: Mutex<Vec<String>>,
+    fail_create_start: AtomicBool,
     host_interfaces: Mutex<Vec<HostInterface>>,
     operations_unreadable: AtomicBool,
     /// The operations whose wait answers 404 while the listing still shows them running.
@@ -284,6 +285,7 @@ enum Route {
     ListImages(String),
     ListInstances,
     ListInstancesWithState,
+    ProjectInstancesWithState(String),
     ListPools,
     HostInterfaces,
     HostInterfaceState(String),
@@ -376,6 +378,7 @@ impl Shared {
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
             reject_patch: Mutex::new(Vec::new()),
+            fail_create_start: AtomicBool::new(false),
             host_interfaces: Mutex::new(Vec::new()),
             operations_unreadable: AtomicBool::new(false),
             waits_ended: Mutex::new(Vec::new()),
@@ -453,6 +456,11 @@ impl FakeIncus {
     /// object is not created. A switch for the live probe's rejection case.
     pub fn set_reject_config_on_post(&self, kind_path_prefix: &str) {
         lock(&self.shared.reject_config).push(kind_path_prefix.to_string());
+    }
+
+    /// Fail the start phase of create, leaving the new instance stopped.
+    pub fn fail_instance_start_on_create(&self) {
+        self.shared.fail_create_start.store(true, Ordering::SeqCst);
     }
 
     /// Makes PATCH requests matching this path prefix fail with 400 before changing any object.
@@ -971,6 +979,9 @@ fn parse(target: &str) -> Option<Route> {
         }),
         ["instances"] if query == "all-projects=true&recursion=1" => Route::ListInstances,
         ["instances"] if query == "all-projects=true&recursion=2" => Route::ListInstancesWithState,
+        ["instances"] if query_param(query, "recursion") == Some("2") => {
+            Route::ProjectInstancesWithState(project.into())
+        }
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
         ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
@@ -1053,6 +1064,28 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         },
         ("GET", Route::ListInstances) => sync(Value::Array(store.bodies("instance"))),
         ("GET", Route::ListInstancesWithState) => sync(Value::Array(store.instances_with_state())),
+        ("GET", Route::ProjectInstancesWithState(project)) => {
+            if project != "default"
+                && !store
+                    .objects
+                    .iter()
+                    .any(|object| object.kind == "project" && object.name == project)
+            {
+                (
+                    404,
+                    String::new(),
+                    error_envelope(404, "the project is not found"),
+                )
+            } else {
+                sync(Value::Array(
+                    store
+                        .instances_with_state()
+                        .into_iter()
+                        .filter(|row| row["project"] == project)
+                        .collect(),
+                ))
+            }
+        }
         ("GET", Route::HostInterfaces) => {
             let interfaces = lock(&shared.host_interfaces);
             sync(Value::Array(
@@ -1513,6 +1546,17 @@ fn create(
     if kind == "instance" {
         let at = store.objects.len() - 1;
         if store.objects[at].body.get("start") == Some(&json!(true)) {
+            if shared.fail_create_start.load(Ordering::SeqCst) {
+                store.objects[at].body["status"] = json!("Stopped");
+                store.expand(at, false);
+                return answered(
+                    shared,
+                    store,
+                    kind,
+                    "POST",
+                    Err((400, "Failed starting instance".into())),
+                );
+            }
             store.start(at, shared.counter.fetch_add(1, Ordering::SeqCst));
         } else {
             store.expand(at, false);

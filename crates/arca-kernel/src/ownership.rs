@@ -99,6 +99,52 @@ pub fn classify(
     }
 }
 
+/// Class an addressed kernel service's public metadata without changing adoption's classifier.
+/// Only exact service object names and exact metadata keys accompany the kernel entry mark.
+/// Every other owner key still contests the object, and retained entries remain retained.
+pub fn classify_object(
+    object: &ObjectRef,
+    own_config: &BTreeMap<String, String>,
+    retained: &BTreeMap<EntryId, (PluginId, Digest)>,
+) -> OwnerClass {
+    let service = own_config
+        .get(KERNEL_ENTRY_KEY)
+        .and_then(|entry| entry.strip_prefix("service-"));
+    let Some(name) = service
+        .filter(|name| !name.is_empty() && EntryId::parse(&format!("service-{name}")).is_some())
+    else {
+        return classify(own_config, retained);
+    };
+    let keys: &[&str] = match object.kind {
+        IncusKind::Instance
+            if object.project == "arcak-svc" && object.name == name && object.parent.is_none() =>
+        {
+            &[
+                "user.arca.template",
+                "user.arca.address",
+                "user.arca.ports",
+                "user.arca.links",
+                "user.arca.published",
+                "user.arca.envkeys",
+            ]
+        }
+        IncusKind::Acl
+            if object.project == "default"
+                && object.name == format!("arcak-svc-svc-{name}")
+                && object.parent.is_none() =>
+        {
+            &["user.arca.managed"]
+        }
+        _ => &[],
+    };
+    let ownership = own_config
+        .iter()
+        .filter(|(key, _)| !keys.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    classify(&ownership, retained)
+}
+
 fn is_droidd_key(key: &str) -> bool {
     DROIDD_MARK_PREFIXES.iter().any(|prefix| {
         let bare = prefix.trim_end_matches('.');
