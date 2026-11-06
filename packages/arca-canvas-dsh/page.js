@@ -1,0 +1,198 @@
+(() => {
+  // src/layout.js
+  var COLUMNS = {
+    machine: { w: 230, h: 210 },
+    instance: { w: 260, h: 210 },
+    database: { w: 210, h: 136 },
+    alert: { w: 240, h: 160 }
+  };
+  var CONTENT_WIDTH = 1440 - 396 - 2 * 16;
+  var COLUMN_GAP = 40;
+  function spread(items) {
+    const sum = items.reduce((height2, item) => height2 + item.h, 0);
+    const height = Math.max(480, sum + 30 * (items.length - 1));
+    const gap = items.length > 1 ? (height - sum) / (items.length - 1) : 0;
+    let y = 0;
+    return items.map((item) => {
+      const placed = { ...item, y: Math.round(y) };
+      y += item.h + gap;
+      return placed;
+    });
+  }
+  var list = (value) => Array.isArray(value) ? value : [];
+  function alertRows(alerts) {
+    return Array.isArray(alerts) ? alerts : [
+      ...list(alerts?.firing).map((row) => ({ ...row, state: "firing" })),
+      ...list(alerts?.unknown).map((row) => ({ ...row, state: "unknown" })),
+      ...list(alerts?.resolvedRecent).map((row) => ({ ...row, state: "resolved" }))
+    ];
+  }
+  function layoutCanvas(snapshot, contentWidth = CONTENT_WIDTH) {
+    const groups = {
+      machine: snapshot.machine ? [snapshot.machine] : [],
+      instance: list(snapshot.instances),
+      database: list(snapshot.databases),
+      alert: alertRows(snapshot.alerts)
+    };
+    const nodes = [];
+    let x = 0;
+    let y = 0;
+    let bottom = 0;
+    for (const [kind, rows] of Object.entries(groups)) {
+      const column = COLUMNS[kind];
+      const w = Math.min(column.w, contentWidth);
+      if (x > 0 && x + w > contentWidth) {
+        x = 0;
+        y = bottom + COLUMN_GAP;
+      }
+      const key = (row) => `${row.project ?? ""}/${row.name ?? row.node ?? row.rule ?? ""}`;
+      const sorted = [...rows].sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
+      for (const [index, item] of spread(sorted.map((data) => ({ data, h: column.h }))).entries()) {
+        const node = { kind, id: `${kind}:${key(item.data)}:${index}`, x, w, ...item, y: y + item.y };
+        nodes.push(node);
+        bottom = Math.max(bottom, node.y + node.h);
+      }
+      x += w + COLUMN_GAP;
+    }
+    return { width: contentWidth, height: Math.max(620, bottom + 76), nodes };
+  }
+
+  // src/approval.js
+  function approvalUrl(value) {
+    if (typeof value !== "string" || !/^https?:\/\//i.test(value)) return "";
+    try {
+      const url = new URL(value);
+      return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url.href : "";
+    } catch {
+      return "";
+    }
+  }
+
+  // src/render.js
+  function element(doc, tag, className, text2) {
+    const node = doc.createElement(tag);
+    node.className = className;
+    if (text2 !== void 0) node.textContent = String(text2);
+    return node;
+  }
+  var text = (value, fallback = "Not available") => value == null ? fallback : String(value);
+  var number = (value, suffix = "") => Number.isFinite(value) ? `${Math.round(value * 10) / 10}${suffix}` : "Not available";
+  function cardContent(node, snapshot) {
+    const row = node.data;
+    switch (node.kind) {
+      case "machine": {
+        const metrics = snapshot.metrics?.latest;
+        return {
+          title: text(row.node, "Machine"),
+          kind: "Machine",
+          icon: "\u25C8",
+          lines: [`CPU ${number(metrics?.cpu?.usedPct, "%")}`, `Load ${number(metrics?.load?.one)}`, `Uptime ${number(row.uptimeS, " s")}`],
+          state: row.incusReachable ? "Incus reachable" : "Incus unavailable",
+          meta: text(row.mode)
+        };
+      }
+      case "instance":
+        return {
+          title: text(row.name, "Instance"),
+          kind: text(row.kind, "Instance"),
+          icon: "\u25C7",
+          lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner?.class ?? row.owner, "Not available")}`, row.privileged ? "Privileged" : "Unprivileged"],
+          state: text(row.status, "Unknown"),
+          meta: row.identity ? "Identity" : "Instance"
+        };
+      case "database":
+        return {
+          title: text(row.name, "Database"),
+          kind: "PostgreSQL",
+          icon: "\u25A4",
+          lines: [row.address ? `${text(row.address)}:${text(row.port)}` : "Awaiting an address"],
+          state: text(row.status, "Unknown"),
+          meta: row.port ? `:${row.port}` : "Database"
+        };
+      case "alert":
+        return {
+          title: text(row.rule ?? row.name, "Alert"),
+          kind: "Alert",
+          icon: "!",
+          lines: [text(row.message ?? row.reason, "No further details")],
+          state: text(row.state, "Unknown"),
+          meta: text(row.target, "Machine")
+        };
+    }
+  }
+  function renderCanvas(root, snapshot) {
+    const doc = root.ownerDocument;
+    const shell = element(doc, "div", "arca-canvas");
+    const bar = element(doc, "header", "arca-topbar");
+    bar.dataset.region = "topbar";
+    bar.append(element(doc, "strong", "arca-title", "\u25C8  Arca"), element(doc, "span", "arca-crumb", "Canvas"));
+    bar.append(element(doc, "span", "arca-mode", text(snapshot.machine?.mode, "Read only")));
+    const plans = Array.isArray(snapshot.plans) ? snapshot.plans.length : 0;
+    const url = approvalUrl(snapshot.approvalUrl);
+    const badge = element(doc, url && plans ? "a" : "span", "arca-plans", `${plans} waiting plan${plans === 1 ? "" : "s"}`);
+    if (url && plans) badge.href = url;
+    bar.append(badge);
+    const main = element(doc, "div", "arca-main");
+    const stage = element(doc, "section", "arca-stage");
+    stage.setAttribute("aria-label", "Infrastructure canvas");
+    stage.dataset.region = "canvas";
+    const status = element(doc, "div", "arca-status", snapshot.error ?? `Snapshot ${text(snapshot.at, "pending")}`);
+    status.setAttribute("role", "status");
+    const world = element(doc, "div", "arca-world");
+    stage.append(status, world);
+    const panel = element(doc, "aside", "arca-panel");
+    const steps = element(doc, "div", "arca-steps-placeholder");
+    steps.dataset.region = "steps";
+    steps.append(element(doc, "h2", "", "Steps"), element(doc, "p", "", "Steps are hidden until the journal is available."));
+    panel.append(steps);
+    main.append(stage, panel);
+    shell.append(bar, main);
+    root.replaceChildren(shell);
+    const layout = layoutCanvas(snapshot, world.clientWidth || void 0);
+    world.style.width = `${layout.width}px`;
+    world.style.height = `${layout.height}px`;
+    for (const node of layout.nodes) {
+      const content = cardContent(node, snapshot);
+      const card = element(doc, "article", "arca-card");
+      card.dataset.kind = node.kind;
+      Object.assign(card.style, { left: `${node.x}px`, top: `${node.y}px`, width: `${node.w}px`, height: `${node.h}px` });
+      const header = element(doc, "header", "arca-card-header");
+      const title = element(doc, "div", "arca-card-title");
+      title.append(element(doc, "strong", "", content.title), element(doc, "span", "", content.kind));
+      header.append(element(doc, "span", "arca-icon", content.icon), title);
+      const live = element(doc, "div", "arca-live");
+      for (const line of content.lines) live.append(element(doc, "div", "", line));
+      const footer = element(doc, "footer", "arca-state");
+      footer.append(element(doc, "span", "", content.state), element(doc, "span", "arca-meta", content.meta));
+      card.append(header, live, footer);
+      world.append(card);
+    }
+    if (!layout.nodes.length) world.append(element(doc, "p", "arca-empty", "Waiting for Arca data."));
+  }
+  function mountCanvas(root, { fetchSnapshot = () => fetch("/arca-canvas/snapshot", { credentials: "same-origin" }), pollMs = 5e3 } = {}) {
+    let stopped = false;
+    let timer;
+    let current = { error: "Waiting for the first Arca snapshot." };
+    const refresh = async () => {
+      try {
+        const response = await fetchSnapshot();
+        if (!response.ok) throw new Error("Snapshot unavailable");
+        current = await response.json();
+      } catch {
+        current = { ...current, error: "Arca snapshot is unavailable. Retrying\u2026" };
+      }
+      if (stopped) return;
+      renderCanvas(root, current);
+      timer = setTimeout(refresh, pollMs);
+    };
+    renderCanvas(root, current);
+    void refresh();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }
+
+  // src/page.js
+  mountCanvas(document.getElementById("arca-root"));
+})();

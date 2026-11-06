@@ -21,14 +21,30 @@ var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: tru
 // src/client.js
 var client_exports = {};
 __export(client_exports, {
+  CanvasTab: () => CanvasTab,
   apply: () => apply,
   inject: () => inject,
   name: () => name
 });
 module.exports = __toCommonJS(client_exports);
+var import_react = require("react");
 var name = "arca-canvas";
-var inject = [];
-function apply() {
+var inject = ["betterSidebar"];
+function CanvasTab() {
+  return (0, import_react.createElement)("iframe", {
+    src: "/arca-canvas",
+    title: "Arca canvas",
+    style: { display: "block", width: "100%", height: "100%", border: 0 }
+  });
+}
+function apply(ctx) {
+  if (!ctx.betterSidebar) return;
+  ctx.effect(() => ctx.betterSidebar.registerTab({
+    id: "arca-canvas",
+    title: "Arca canvas",
+    single: true,
+    component: CanvasTab
+  }));
 }
 return module.exports;
 } });
