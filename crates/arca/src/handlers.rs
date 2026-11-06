@@ -209,22 +209,34 @@ pub fn watch_snapshot<R: IncusRead>(
     live: &BTreeSet<EntryId>,
     now: u64,
 ) -> Result<Value, CallError> {
+    watch_snapshot_scoped(incus, phones, live, now, true)
+}
+
+/// A standalone reader without desired service entries excludes the service project and cannot claim completeness.
+pub fn watch_snapshot_scoped<R: IncusRead>(
+    incus: R,
+    phones: &BTreeSet<String>,
+    live: &BTreeSet<EntryId>,
+    now: u64,
+    include_services: bool,
+) -> Result<Value, CallError> {
     let mut provider = ReadOnlyIncusProvider::new(incus);
     for _ in 0..WATCH_ATTEMPTS {
-        let scope = listed_projects(&provider)?;
+        let listed = listed_projects(&provider)?;
+        let mut scope = listed.clone();
+        let complete = include_services || !scope.remove(arca_netproject::PROJECT);
         let cfg = WatchConfig {
             identity_phones: phones.clone(),
             live_entries: live.clone(),
             projects: scope.clone(),
-            complete: true,
+            complete,
             ..WatchConfig::default()
         };
         let report = watch_once(&mut provider, &cfg, now)
             .map_err(|e| CallError::Internal(format!("the watch failed: {e}")))?;
-        if listed_projects(&provider)?
-            .iter()
-            .all(|name| scope.contains(name))
-        {
+        if listed_projects(&provider)?.iter().all(|name| {
+            scope.contains(name) || (!include_services && name == arca_netproject::PROJECT)
+        }) {
             return serde_json::to_value(&report)
                 .map_err(|_| CallError::Internal("the report does not serialize".to_string()));
         }
@@ -1217,6 +1229,33 @@ mod tests {
     }
 
     #[test]
+    fn the_standalone_watch_excludes_services_and_does_not_claim_missing_objects() {
+        let incus = Scripted {
+            index: Mutex::new(VecDeque::from(vec![vec![
+                "default",
+                arca_netproject::PROJECT,
+            ]])),
+            instances: Mutex::new(VecDeque::from(vec![vec![
+                instance("default", "guest"),
+                instance(arca_netproject::PROJECT, "nats"),
+            ]])),
+        };
+        let report = watch_snapshot_scoped(
+            incus,
+            &BTreeSet::new(),
+            &BTreeSet::from([EntryId("adopt-missing".into())]),
+            7,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rows_by_project(&report),
+            vec![("default".into(), vec!["guest".into()])]
+        );
+        assert_eq!(report["drift"], json!([]));
+    }
+
+    #[test]
     fn the_metrics_mean_of_a_minute_long_run_covers_its_first_sample() {
         // A 60-second `metrics` run takes samples at 0, 5, ..., 55 seconds and once more just past 60 seconds, 13 in all. The
         // first sees no instance and the rest see thirteen, so the mean over the whole run is (0 + 12 * 13) / 13 = 12. A
@@ -1993,21 +2032,27 @@ pub fn service_handlers(
     cfg: Arc<NodeConfig>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let writes = Arc::new(Mutex::new(()));
-    ["service_create", "service_list", "service_status"]
-        .into_iter()
-        .map(|verb| {
-            (
+    [
+        "service_create",
+        "service_list",
+        "service_status",
+        "service_logs",
+        "service_remove",
+    ]
+    .into_iter()
+    .map(|verb| {
+        (
+            verb,
+            Arc::new(ServiceHandler {
                 verb,
-                Arc::new(ServiceHandler {
-                    verb,
-                    kernel: kernel.clone(),
-                    clock: clock.clone(),
-                    cfg: cfg.clone(),
-                    writes: writes.clone(),
-                }) as Arc<dyn ToolHandler>,
-            )
-        })
-        .collect()
+                kernel: kernel.clone(),
+                clock: clock.clone(),
+                cfg: cfg.clone(),
+                writes: writes.clone(),
+            }) as Arc<dyn ToolHandler>,
+        )
+    })
+    .collect()
 }
 
 struct ServiceHandler {
@@ -2158,8 +2203,9 @@ fn service_used(
     used
 }
 
-fn service_live<'a>(rows: &'a [Value], name: &str) -> Option<&'a Value> {
-    rows.iter().find(|row| row["name"].as_str() == Some(name))
+fn service_live_in<'a>(rows: &'a [Value], project: &str, name: &str) -> Option<&'a Value> {
+    rows.iter()
+        .find(|row| row["name"].as_str() == Some(name) && row["project"].as_str() == Some(project))
 }
 
 fn service_entries(
@@ -2174,6 +2220,228 @@ fn service_entries(
                 .map(|config| (entry.clone(), config))
         })
         .collect()
+}
+
+fn split_list(text: Option<&str>) -> Vec<&str> {
+    text.unwrap_or("")
+        .split(',')
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn ipv4_in_cidr(ip: std::net::Ipv4Addr, cidr: &str) -> bool {
+    let Some((network, prefix)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(network), Ok(prefix)) = (network.parse::<std::net::Ipv4Addr>(), prefix.parse::<u32>())
+    else {
+        return false;
+    };
+    if prefix > 32 {
+        return false;
+    }
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    u32::from(ip) & mask == u32::from(network) & mask
+}
+
+fn node_ok(node: &str) -> bool {
+    !node.is_empty()
+        && node.len() <= 63
+        && node
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !node.starts_with('-')
+        && !node.ends_with('-')
+}
+
+/// One marked instance's record, from its `user.arca.*` keys and NIC, without reading or changing its environment.
+fn adopted_config(
+    row: &Value,
+    rows: &[Value],
+    cidr: &str,
+    gateway: &str,
+    now: u64,
+) -> Option<crate::service::ServiceConfig> {
+    let name = row["name"].as_str()?;
+    if !crate::service::service_name_ok(name) {
+        return None;
+    }
+    let project = row["project"].as_str()?;
+    let config = row["config"].as_object()?;
+    let template = config.get(crate::service::TEMPLATE_KEY)?.as_str()?;
+    if !crate::service::template_name_ok(template) {
+        return None;
+    }
+    let ipv4_text = config.get(crate::service::ADDRESS_KEY)?.as_str()?;
+    let ipv4 = ipv4_text.parse::<std::net::Ipv4Addr>().ok()?;
+    if !ipv4_in_cidr(ipv4, cidr)
+        || row["devices"]["eth0"]["ipv4.address"].as_str() != Some(ipv4_text)
+    {
+        return None;
+    }
+    let ports_text = config.get(crate::service::PORTS_KEY)?.as_str()?;
+    let mut ports = Vec::new();
+    for part in split_list(Some(ports_text)) {
+        let port = part.parse::<u16>().ok().filter(|port| *port >= 1)?;
+        if port.to_string() != part {
+            return None;
+        }
+        ports.push(port);
+    }
+    let published = match config
+        .get(crate::service::PUBLISHED_KEY)
+        .and_then(Value::as_str)
+    {
+        Some(node) if node_ok(node) => Some(crate::service::Published {
+            node: node.to_string(),
+            port: 8443,
+            reach: "tailnet".into(),
+        }),
+        Some(_) => return None,
+        None => None,
+    };
+    let mut links = Vec::new();
+    for entry in split_list(
+        config
+            .get(crate::service::LINKS_KEY)
+            .and_then(Value::as_str),
+    ) {
+        let mut parts = entry.splitn(3, ':');
+        let to = parts.next()?;
+        let port = parts.next()?.parse::<u16>().ok()?;
+        let uuid = parts.next()?;
+        if !crate::service::service_name_ok(to) || port == 0 {
+            return None;
+        }
+        let provider = rows.iter().find(|candidate| {
+            candidate["name"].as_str() == Some(to)
+                && candidate["config"]["volatile.uuid"].as_str() == Some(uuid)
+        })?;
+        if provider["name"].as_str() == Some(name) {
+            continue;
+        }
+        links.push(crate::service::ServiceLink {
+            to: to.to_string(),
+            port,
+            env: Vec::new(),
+        });
+    }
+    Some(crate::service::ServiceConfig {
+        name: name.to_string(),
+        template: template.to_string(),
+        instance: name.to_string(),
+        ipv4: ipv4_text.to_string(),
+        ports,
+        links,
+        published,
+        created: now,
+        source: json!({}),
+        pool: String::new(),
+        project: project.to_string(),
+        bridge: String::new(),
+        gateway: gateway.to_string(),
+        entrypoint: None,
+        environment: BTreeMap::new(),
+        droidd_port: None,
+        start: false,
+        adopted: true,
+        creating: false,
+    })
+}
+
+/// Whether an instance is in the service project or carries its kernel import mark.
+fn service_owned(row: &Value) -> bool {
+    row["project"].as_str() == Some(arca_netproject::PROJECT)
+        || row["name"].as_str().is_some_and(|name| {
+            row["config"][arca_kernel::ownership::KERNEL_ENTRY_KEY].as_str()
+                == Some(format!("adopt-{name}").as_str())
+        })
+}
+
+/// Adds a record for every kernel-owned marked instance without one. Nothing on the instance is read into a secret or re-rendered.
+fn adopt_services(
+    kernel: &Mutex<Kernel>,
+    entries: &[arca_kernel::desired::Entry],
+    rows: &[Value],
+    cidr: &str,
+    gateway: &str,
+    now: u64,
+) -> Result<(), CallError> {
+    let mut changes = Vec::new();
+    for row in rows {
+        if !service_owned(row) {
+            continue;
+        }
+        let Some(config) = adopted_config(row, rows, cidr, gateway, now) else {
+            continue;
+        };
+        let id = format!("service-{}", config.name);
+        if entries
+            .iter()
+            .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
+        {
+            continue;
+        }
+        changes.push(crate::desired_store::EntryChange::Put(service_entry(
+            &id,
+            "arca.service",
+            serde_json::to_value(&config).map_err(|_| internal())?,
+        )));
+    }
+    if !changes.is_empty() {
+        lock(kernel)?
+            .propose(changes, now)
+            .map_err(|_| internal())?;
+    }
+    Ok(())
+}
+
+fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
+    let mut values = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return values;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(files) = std::fs::read_dir(&path) {
+            for file in files.flatten() {
+                if let Ok(text) = std::fs::read_to_string(file.path())
+                    && text.len() >= 8
+                    && text.len() <= 4096
+                {
+                    values.push(text.trim_end_matches('\n').to_string());
+                }
+            }
+        }
+    }
+    values
+}
+
+/// Reports each service object's observed state after an approved removal could not finish.
+fn service_removal_refused(
+    read: &impl IncusRead,
+    config: &crate::service::ServiceConfig,
+) -> CallError {
+    let state = |path: String, object: &str| match read.get(&path) {
+        Ok(_) => format!("{object} remains"),
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => format!("{object} removed"),
+        Err(_) => format!("{object} state unknown"),
+    };
+    let instance = state(
+        format!(
+            "/1.0/instances/{}?project={}",
+            config.instance, config.project
+        ),
+        "instance",
+    );
+    let acl = state(
+        format!("/1.0/network-acls/{}?project=default", config.acl()),
+        "ACL",
+    );
+    service_refused(format!(
+        "remove service {}: partial removal ({instance}; {acl}); the owner's approval is spent, so another try needs a new one",
+        config.name
+    ))
 }
 
 fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConfig, CallError> {
@@ -2206,6 +2474,8 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         environment,
         droidd_port: parts.template.droidd_port,
         start,
+        adopted: false,
+        creating: false,
     })
 }
 
@@ -2233,6 +2503,8 @@ impl ToolHandler for ServiceHandler {
         let allowed: &[&str] = match self.verb {
             "service_create" => &["name", "template"],
             "service_status" => &["name"],
+            "service_logs" => &["name", "lines"],
+            "service_remove" => &["name", "approval"],
             _ => &[],
         };
         let object = args
@@ -2254,21 +2526,18 @@ impl ToolHandler for ServiceHandler {
             None
         };
         let now = (self.clock)();
-        let entries = {
+        let (cidr, gateway) = service_project(&self.cfg)?;
+        let read = UnixIncus::new(self.cfg.incus.socket.clone());
+        let rows = service_listing(&read, None)?;
+        let mut entries = {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
         };
-        let (cidr, gateway) = service_project(&self.cfg)?;
-        let read = UnixIncus::new(self.cfg.incus.socket.clone());
-        let rows = service_listing(
-            &read,
-            (self.verb != "service_create").then_some(arca_netproject::PROJECT),
-        )?;
-        let project_rows: Vec<Value> = rows
-            .iter()
-            .filter(|row| row["project"].as_str() == Some(arca_netproject::PROJECT))
-            .cloned()
-            .collect();
+        adopt_services(&self.kernel, &entries, &rows, &cidr, &gateway, now)?;
+        entries = {
+            let kernel = lock(&self.kernel)?;
+            kernel.entries().to_vec()
+        };
         match self.verb {
             "service_list" => {
                 let mut views = Vec::new();
@@ -2278,19 +2547,27 @@ impl ToolHandler for ServiceHandler {
                     .map(|(_, config)| config.name.clone())
                     .collect();
                 for (_, config) in &records {
-                    let live = service_live(&project_rows, &config.name);
+                    let live = service_live_in(&rows, &config.project, &config.name);
                     views.push(crate::service::view(config, live));
                 }
-                for row in &project_rows {
+                for row in &rows {
                     if let Some(name) = row["name"].as_str()
                         && !names.contains(name)
-                        && let Some(view) = crate::service::unknown_view(row)
+                        && service_owned(row)
                     {
-                        views.push(view);
+                        let view = if row["config"][crate::service::TEMPLATE_KEY].is_string() {
+                            crate::service::failed_view(row)
+                        } else if row["project"].as_str() == Some(arca_netproject::PROJECT) {
+                            crate::service::unknown_view(row)
+                        } else {
+                            None
+                        };
+                        if let Some(view) = view {
+                            views.push(view);
+                        }
                     }
                 }
                 views.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-                views.truncate(256);
                 Ok(json!({ "services": views }))
             }
             "service_status" => {
@@ -2301,17 +2578,121 @@ impl ToolHandler for ServiceHandler {
                 if let Some((_, config)) = record {
                     return Ok(crate::service::view(
                         &config,
-                        service_live(&project_rows, &config.name),
+                        service_live_in(&rows, &config.project, &config.name),
                     ));
                 }
-                if let Some(row) = service_live(&project_rows, &name)
-                    && let Some(view) = crate::service::unknown_view(row)
+                if let Some(row) = rows
+                    .iter()
+                    .find(|row| row["name"].as_str() == Some(name.as_str()) && service_owned(row))
                 {
-                    return Ok(view);
+                    if let Some(view) = crate::service::failed_view(row) {
+                        return Ok(view);
+                    }
+                    if let Some(view) = crate::service::unknown_view(row) {
+                        return Ok(view);
+                    }
                 }
                 Err(service_not_found(format!("service {name}: not found")))
             }
-            _ => {
+            "service_logs" => {
+                let name = service_name(&args)?;
+                let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
+                if !(1..=200).contains(&lines) {
+                    return Err(CallError::Invalid("lines: expected 1 to 200".into()));
+                }
+                let record = service_entries(&entries)
+                    .into_iter()
+                    .find(|(_, config)| config.name == name);
+                let Some((_, config)) = record else {
+                    return Err(service_not_found(format!("service {name}: not found")));
+                };
+                let row = service_live_in(&rows, &config.project, &name).ok_or_else(|| {
+                    service_refused(format!("service {name}: its instance is gone"))
+                })?;
+                let path = format!(
+                    "/1.0/instances/{name}/console?project={}&type=log",
+                    config.project
+                );
+                let text = read.get_text(&path).map_err(|error| match error {
+                    arca_incus::IncusError::Status { code: 404, .. } => {
+                        service_not_found(format!("service {name}: no log"))
+                    }
+                    _ => service_refused(format!("read service {name}'s log")),
+                })?;
+                let mut secrets = service_secret_values(&self.cfg.state_dir.join("secrets"));
+                let envkeys = row["config"][crate::service::ENVKEYS_KEY]
+                    .as_str()
+                    .unwrap_or("");
+                for key in split_list(Some(envkeys)) {
+                    if let Some(value) = row["config"][format!("environment.{key}")].as_str()
+                        && value.len() <= 4096
+                    {
+                        secrets.push(value.to_string());
+                    }
+                }
+                let mut lines_out = Vec::new();
+                for line in text.split(['\n', '\r']) {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let clean = crate::service::clean_log(line);
+                    if !clean.is_empty() {
+                        lines_out.push(json!(crate::service::redact_log(&clean, &secrets)));
+                    }
+                }
+                let start = lines_out.len().saturating_sub(lines as usize);
+                Ok(json!({ "lines": &lines_out[start..] }))
+            }
+            "service_remove" => {
+                let name = service_name(&args)?;
+                let approval = args["approval"]
+                    .as_str()
+                    .ok_or_else(|| CallError::Invalid("approval: expected a string".into()))?;
+                let record = service_entries(&entries)
+                    .into_iter()
+                    .find(|(_, config)| config.name == name);
+                let Some((entry, config)) = record else {
+                    return Err(service_not_found(format!("service {name}: not found")));
+                };
+                if config.adopted {
+                    return Err(CallError::Refused {
+                        code: "adopted".into(),
+                        message: format!(
+                            "service {name} was adopted; this build does not remove it"
+                        ),
+                    });
+                }
+                let id = entry.id.clone();
+                let removal = lock(&self.kernel)?
+                    .remove_service(&id, &name, approval, now)
+                    .map_err(|error| match error {
+                        crate::kernel::ServiceRemovalError::Approval(refusal) => {
+                            CallError::Refused {
+                                code: "owner_approval".into(),
+                                message: refusal.to_string(),
+                            }
+                        }
+                        crate::kernel::ServiceRemovalError::Proposal(_) => {
+                            service_removal_refused(&read, &config)
+                        }
+                    })?;
+                if removal.outcomes.iter().any(|outcome| {
+                    matches!(
+                        outcome,
+                        Outcome::Failed { .. } | Outcome::Refused(_) | Outcome::Held { .. }
+                    )
+                }) || removal
+                    .run
+                    .as_ref()
+                    .map_or(true, |run| run.as_ref().is_some_and(|run| run.partial))
+                {
+                    return Err(service_removal_refused(&read, &config));
+                }
+                let secrets = self.cfg.state_dir.join("secrets").join(&id.0);
+                let _ = std::fs::remove_dir_all(secrets);
+                Ok(json!({ "removed": true }))
+            }
+            "service_create" => {
                 let name = service_name(&args)?;
                 let template_name = args["template"]
                     .as_str()
@@ -2326,13 +2707,12 @@ impl ToolHandler for ServiceHandler {
                 {
                     return Err(service_refused(format!("service {name} exists")));
                 }
-                if project_rows
+                if rows
                     .iter()
                     .any(|row| row["name"].as_str() == Some(name.as_str()))
                 {
                     return Err(service_refused(format!(
-                        "project {} holds an instance named {name} that is not a service of Arca's; it is left alone",
-                        arca_netproject::PROJECT
+                        "an instance named {name} already exists that is not a service of Arca's; it is left alone"
                     )));
                 }
                 let templates_dir = self.cfg.state_dir.join("templates");
@@ -2427,6 +2807,7 @@ impl ToolHandler for ServiceHandler {
                 });
                 Ok(crate::service::view(&config, live.as_ref()))
             }
+            _ => Err(service_not_found("unknown service verb")),
         }
     }
 }

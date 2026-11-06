@@ -128,6 +128,25 @@ fn deadline_for(timeout: Duration) -> Option<Instant> {
     Instant::now().checked_add(timeout)
 }
 
+impl UnixIncus {
+    /// Reads a raw text endpoint, such as an instance's console log. A non-success status is an Incus status error.
+    pub fn get_text(&self, path: &str) -> Result<String, IncusError> {
+        check_path(path)?;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: text/plain\r\nConnection: close\r\n\r\n"
+        );
+        let framed = exchange(&self.socket, self.timeout, request.as_bytes())?;
+        if !(200..300).contains(&framed.status) {
+            return Err(IncusError::Status {
+                code: framed.status,
+                message: framed.reason,
+            });
+        }
+        String::from_utf8(framed.body)
+            .map_err(|_| IncusError::Decode("the text is not UTF-8".to_string()))
+    }
+}
+
 impl IncusRead for UnixIncus {
     fn get(&self, path: &str) -> Result<Value, IncusError> {
         check_path(path)?;

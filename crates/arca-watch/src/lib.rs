@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::journal::{Journal, MemJournal};
-use arca_kernel::ownership::{KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, OwnerClass, classify};
+use arca_kernel::ownership::{
+    IncusKind, KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY, ObjectRef, OwnerClass, classify_object,
+};
 use arca_kernel::plugin::{Ctx, KeySpec, Manifest, Observe, Plugin, PluginError, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -210,7 +212,14 @@ fn assemble(listing: &Value, cfg: &WatchConfig) -> Result<WatchReport, PluginErr
         .map(|project| (project.as_str(), Vec::new()))
         .collect();
     for fact in &facts {
-        let owner = classify(&fact.own, &cfg.retained);
+        let object = ObjectRef {
+            kind: IncusKind::Instance,
+            project: fact.project.clone(),
+            name: fact.name.clone(),
+            parent: None,
+            uuid: fact.own.get("volatile.uuid").cloned(),
+        };
+        let owner = classify_object(&object, &fact.own, &cfg.retained);
         match &owner {
             OwnerClass::Kernel { entry } => {
                 observed.insert(entry.clone());

@@ -164,13 +164,26 @@ async fn call_tool(
     };
     match result {
         Ok(value) => {
+            let (cut, value) = match (verb.cut)(&value) {
+                Some(capped) => (
+                    Some(
+                        arca_api::verbs::service_cut_description(verb.name, &value)
+                            .unwrap_or_else(|| "something was cut to fit its cap".to_string()),
+                    ),
+                    capped,
+                ),
+                None => (None, value),
+            };
             if conforms(&(verb.result)(), &value).is_err() {
                 return Ok(Some(result_reply(
                     id,
                     tool_failure("internal", "the tool failed"),
                 )));
             }
-            Ok(Some(result_reply(id, tool_result(verb, value))))
+            Ok(Some(result_reply(
+                id,
+                tool_result(verb, value, cut.as_deref()),
+            )))
         }
         Err(CallError::NotFound) => Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None))),
         Err(CallError::Invalid(why)) => Ok(Some(error_reply(id, INVALID_PARAMS, &why, None))),
@@ -288,19 +301,15 @@ fn open_schema(schema: &mut Value) {
 
 /// An MCP tool result in the door's envelope: summary text, structured content with the untrusted note and optional
 /// truncation, and the two `droidd/*` meta keys.
-fn tool_result(v: &Verb, mut value: Value) -> Value {
-    let (truncated, cut) = match (v.cut)(&value) {
-        Some(cut) => (true, cut),
-        None => (false, value.clone()),
-    };
-    value = cut;
+fn tool_result(v: &Verb, value: Value, cut: Option<&str>) -> Value {
+    let truncated = cut.is_some();
     let mut content = Vec::new();
     if v.untrusted {
         content.push(json!({ "type": "text", "text": UNTRUSTED_NOTE }));
     }
     let mut summary = (v.summary_text)(&value);
-    if truncated {
-        summary.push_str("\n(truncated: something was cut to fit its cap)");
+    if let Some(what) = cut {
+        summary.push_str(&format!("\n(truncated: {what})"));
     }
     content.push(json!({ "type": "text", "text": summary }));
     let mut structured = serde_json::Map::new();
@@ -387,7 +396,11 @@ mod tests {
 
     #[test]
     fn an_untrusted_and_cut_result_carries_the_note_meta_and_structured_fields() {
-        let result = tool_result(&probe(), json!(["a", "b"]));
+        let result = tool_result(
+            &probe(),
+            json!({ "cut": true }),
+            Some("something was cut to fit its cap"),
+        );
         assert_eq!(result["content"][0]["text"], UNTRUSTED_NOTE);
         assert_eq!(
             result["content"][1]["text"],
@@ -402,6 +415,45 @@ mod tests {
     }
 
     #[test]
+    fn service_caps_name_exactly_what_was_cut_in_the_summary() {
+        let logs = arca_api::verb("service_logs").unwrap();
+        let mut lines = vec![json!("old"); 2];
+        lines.extend(vec![json!("é".repeat(2001)); 200]);
+        let original = json!({"lines": lines});
+        let cut = arca_api::verbs::service_cut_description(logs.name, &original).unwrap();
+        let capped = (logs.cut)(&original).unwrap();
+        conforms(&(logs.result)(), &capped).unwrap();
+        let result = tool_result(logs, capped, Some(&cut));
+        assert_eq!(
+            result["content"][1]["text"],
+            "200 log line(s), untrusted (the service wrote them).\n(truncated: 2 line(s) dropped, 200 line(s) truncated of 202 original line(s))"
+        );
+        assert_eq!(result["structuredContent"]["truncated"], true);
+        assert!(result["structuredContent"].get("cut").is_none());
+        assert_eq!(
+            result["structuredContent"]["lines"][0]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            2000
+        );
+
+        let list = arca_api::verb("service_list").unwrap();
+        let row = json!({"name":"svc","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[],"links":[],"published":null});
+        let original = json!({"services": vec![row; 259]});
+        let cut = arca_api::verbs::service_cut_description(list.name, &original).unwrap();
+        let capped = (list.cut)(&original).unwrap();
+        conforms(&(list.result)(), &capped).unwrap();
+        let result = tool_result(list, capped, Some(&cut));
+        assert_eq!(
+            result["content"][0]["text"],
+            "256 service(s)\n(truncated: 3 service row(s) omitted of 259 original row(s))"
+        );
+        assert_eq!(result["structuredContent"]["truncated"], true);
+    }
+
+    #[test]
     fn a_key_wraps_non_objects_but_object_fields_are_spread() {
         let mut verb = probe();
         verb.cut = |_| None;
@@ -412,10 +464,10 @@ mod tests {
             json!(false),
             Value::Null,
         ] {
-            let result = tool_result(&verb, data.clone());
+            let result = tool_result(&verb, data.clone(), None);
             assert_eq!(result["structuredContent"]["items"], data);
         }
-        let result = tool_result(&verb, json!({ "name": "example" }));
+        let result = tool_result(&verb, json!({ "name": "example" }), None);
         assert_eq!(result["structuredContent"]["name"], "example");
         assert!(result["structuredContent"].get("items").is_none());
     }
@@ -434,7 +486,7 @@ mod tests {
                 json!(false),
                 Value::Null,
             ] {
-                let result = tool_result(&verb, data);
+                let result = tool_result(&verb, data, None);
                 assert_eq!(
                     result["structuredContent"],
                     if untrusted {

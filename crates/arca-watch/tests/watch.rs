@@ -674,3 +674,34 @@ fn a_row_that_names_no_project_fails_even_a_scoped_watch() {
         Err(PluginError::Failed(_))
     ));
 }
+
+#[test]
+fn a_kernel_marked_service_is_observed_and_a_missing_live_service_is_drift() {
+    let config = json!({"user.arcakernel.entry":"service-nats", "user.arca.template":"nats", "user.arca.address":"192.0.2.10", "user.arca.ports":"4222"});
+    let cfg = WatchConfig {
+        projects: ["arcak-svc".to_string(), "other".to_string()]
+            .into_iter()
+            .collect(),
+        live_entries: [entry("service-nats"), entry("service-missing")]
+            .into_iter()
+            .collect(),
+        complete: true,
+        ..WatchConfig::default()
+    };
+    let report = run(
+        json!([instance("arcak-svc", "nats", config.clone(), config)]),
+        &cfg,
+    );
+    assert_eq!(
+        find(&report, "arcak-svc", "nats").owner,
+        OwnerClass::Kernel {
+            entry: entry("service-nats")
+        }
+    );
+    assert_eq!(
+        report.drift,
+        vec![Drift::EntryWithoutObject {
+            entry: entry("service-missing")
+        }]
+    );
+}

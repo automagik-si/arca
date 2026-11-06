@@ -1,0 +1,12 @@
+{
+  "name": "nats",
+  "description": "NATS 2.10 (the public nats:2.10-alpine by digest) with JetStream on, storing under /data/jetstream. A link gives NATS_URL.",
+  "kind": "oci",
+  "image": "docker.io/library/nats",
+  "digest": "sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
+  "entrypoint": ["/usr/local/bin/nats-server", "--jetstream", "--store_dir", "/data/jetstream", "--port", "4222"],
+  "ports": [4222],
+  "env": {},
+  "provides": { "env": { "NATS_URL": "nats://{{host}}:{{port}}" } },
+  "publishable": false
+}

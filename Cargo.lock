@@ -115,6 +115,7 @@ dependencies = [
  "getrandom 0.4.3",
  "iroh-tickets",
  "p256",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
