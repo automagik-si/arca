@@ -2,5 +2,5 @@
   "droid_list": [{"name":"example-phone","state":"ready","lease":"example","owner":"example","address":null,"restarts":0,"createdAt":"2026-01-01T00:00:00Z"}],
   "desktop_list": [{"name":"example-desktop","status":"Running","createdAt":"2026-01-01T00:00:00Z","image":"example","memoryBytes":4294967296}],
   "droidd_status": {"status":"running","version":null,"tag":null,"sha":null,"instance":{"type":"personal"},"startedAt":1,"uptimeSeconds":90},
-  "phone_status": {"android":{"release":"14","sdk":34},"network":{"type":"wired","wifiRadio":false,"interfaces":[{"name":"eth0","up":true}]},"battery":{"level":100,"status":"full","plugged":"ac","simulated":true},"foreground":null,"size":{"width":720,"height":1280},"image":null,"look":null,"fastEyes":false,"hints":[]}
+  "phone_status": {"android":{"release":"14","sdk":34},"network":{"type":"wired","wifiRadio":false,"interfaces":[{"name":"eth0","up":true}]},"battery":{"level":100,"status":"full","plugged":"ac","simulated":true},"foreground":null,"size":[720,1280],"image":null,"look":null,"fastEyes":false,"hints":[]}
 }

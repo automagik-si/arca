@@ -122,7 +122,7 @@
           lines: [
             `Network ${text(row.network)}`,
             `Battery ${number(row.battery, "%")}`,
-            row.size ? `Screen ${text(row.size.width)} \xD7 ${text(row.size.height)}` : "Screen not available"
+            row.size ? `Screen ${text(row.size[0])} \xD7 ${text(row.size[1])}` : "Screen not available"
           ],
           state: text(row.state, "Unknown"),
           meta: "Read only"
@@ -158,6 +158,7 @@
     const url = approvalUrl(snapshot.approvalUrl);
     const badge = element(doc, url && plans ? "a" : "span", "arca-plans", `${plans} waiting plan${plans === 1 ? "" : "s"}`);
     if (url && plans) badge.href = url;
+    if (snapshot.devices === "unavailable") bar.append(element(doc, "span", "arca-devices", "Phones unavailable"));
     bar.append(badge);
     const main = element(doc, "div", "arca-main");
     const stage = element(doc, "section", "arca-stage");

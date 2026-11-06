@@ -19,7 +19,7 @@
     "index.js",
     "src/arca-client.js",
     "src/token.js",
-    "src/droidd-client.js",
+    "src/devices-client.js",
     "src/snapshot.js",
     "client.js",
     "cordis.patch.yml",

@@ -11,6 +11,7 @@ export function emptySnapshot(config = {}) {
     metrics: null,
     alerts: [],
     plans: [],
+    devices: 'off',
     phones: [],
     desktops: [],
   };
@@ -21,7 +22,7 @@ function rows(value) {
   return value;
 }
 
-export async function collectSnapshot(client, config = {}, droidd = null) {
+export async function collectSnapshot(client, config = {}) {
   const snapshot = emptySnapshot(config);
   const reads = [
     ['machine', 'arca_status', (value) => value],
@@ -40,40 +41,73 @@ export async function collectSnapshot(client, config = {}, droidd = null) {
       return `${tool}: ${snapshotError(error)}`;
     }
   }));
-  if (droidd) {
-    try {
-      const phones = rows(await droidd.call('droid_list'));
-      const desktops = rows(await droidd.call('desktop_list'));
-      await droidd.call('droidd_status');
-      // Only ready phones can answer a status read. Any failed read drops this
-      // optional source as a whole, without changing the Arca error field.
-      const entries = [];
-      for (const phone of phones) {
-        const status = phone.state === 'ready'
-          ? await droidd.call('phone_status', { droid: phone.name }) : null;
-        entries.push({ name: phone.name, state: phone.state,
-          network: status?.network?.type ?? null,
-          battery: status?.battery?.level ?? null,
-          size: status?.size ?? null });
-      }
-      const desktopEntries = desktops.map(({ name, status, memoryBytes }) => ({ name, status, memoryBytes }));
-      snapshot.phones = entries;
-      snapshot.desktops = desktopEntries;
-    } catch {
-      // Device data is optional. Never publish upstream errors or credentials.
-    }
-  }
   snapshot.error = errors.filter(Boolean).join(' ') || null;
   return snapshot;
 }
 
-export function createSnapshotCache(client, pollMs, config = {}, droidd = null) {
-  let cached = { ...emptySnapshot(config), error: 'Waiting for the first Arca snapshot.' };
+// The caller owns a single deadline for the entire device phase.
+export async function collectDevices(client, signal) {
+  if (!client) return { devices: 'off', phones: [], desktops: [] };
+  try {
+    const phones = rows(await client.call('droid_list', {}, signal));
+    const desktops = rows(await client.call('desktop_list', {}, signal));
+    await client.call('droidd_status', {}, signal);
+    let unavailable = false;
+    let setting;
+    const entries = [];
+    for (const phone of phones) {
+      let status = null;
+      let state = phone.state;
+      if (state === 'ready') {
+        try { status = await client.call('phone_status', { droid: phone.name }, signal); }
+        catch (error) { unavailable = true; state = 'unknown'; setting ??= error.setting; }
+      }
+      entries.push({ name: phone.name, state,
+        network: status?.network?.type ?? null,
+        battery: status?.battery?.level ?? null, size: status?.size ?? null });
+    }
+    const desktopEntries = desktops.map(({ name, status, memoryBytes }) => ({ name, status, memoryBytes }));
+    return { devices: unavailable ? 'unavailable' : 'ok', phones: entries, desktops: desktopEntries, setting };
+  } catch (error) {
+    return { devices: 'unavailable', phones: [], desktops: [], setting: error.setting };
+  }
+}
+
+export function createSnapshotCache(client, pollMs, config = {}, devices = null) {
+  let deviceState = { devices: devices ? 'unavailable' : 'off', phones: [], desktops: [] };
+  let cached = { ...emptySnapshot(config), ...deviceState, error: 'Waiting for the first Arca snapshot.' };
   let timer;
   let stopped = false;
+  let phase;
+  let lastState;
+  const log = config.log ?? ((message) => console.info(message));
+  const refreshDevices = () => {
+    if (!devices || phase) return;
+    const controller = new AbortController();
+    phase = controller;
+    const deadline = setTimeout(() => controller.abort(), config.devicesTimeoutMs ?? 5000);
+    deadline.unref();
+    void collectDevices(devices, controller.signal).then(({ setting, ...next }) => {
+      if (stopped) return;
+      deviceState = next;
+      cached = { ...cached, ...deviceState };
+      if (lastState !== next.devices) {
+        lastState = next.devices;
+        // Only known setting names may enter a host log; never upstream details.
+        const rejected = ['devicesUrl', 'devicesTokenPath'].includes(setting) ? ` (${setting})` : '';
+        log(`Arca canvas devices: ${next.devices}${rejected}`);
+      }
+    }).finally(() => {
+      clearTimeout(deadline);
+      controller.abort();
+      phase = null;
+    });
+  };
   const refresh = async () => {
-    cached = await collectSnapshot(client, config, droidd);
+    refreshDevices();
+    const snapshot = await collectSnapshot(client, config);
     if (!stopped) {
+      cached = { ...snapshot, ...deviceState };
       timer = setTimeout(refresh, pollMs);
       timer.unref();
     }
@@ -84,6 +118,7 @@ export function createSnapshotCache(client, pollMs, config = {}, droidd = null) 
     stop() {
       stopped = true;
       clearTimeout(timer);
+      phase?.abort();
     },
   };
 }

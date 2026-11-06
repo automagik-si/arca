@@ -180,3 +180,15 @@ test('resize batches in one frame, measures again, and disconnects on stop', () 
   callback([{ contentRect: { width: 400 } }]);
   assert.equal(frames, 2);
 });
+
+test('muted text-only device chip appears only for unavailable with Arca cards and no error banner', () => {
+  for (const devices of ['off', 'ok', 'unavailable', '<img src=x>']) {
+    const target = root();
+    renderCanvas(target, { ...snapshot, devices });
+    const chips = all(target).filter((node) => node.className === 'arca-devices');
+    assert.equal(chips.length, devices === 'unavailable' ? 1 : 0);
+    if (chips.length) assert.equal(chips[0].textContent, 'Phones unavailable');
+    assert.equal(all(target).filter((node) => node.className === 'arca-card').length, 4);
+    assert.match(all(target).find((node) => node.className === 'arca-status').textContent, /^Snapshot /);
+  }
+});

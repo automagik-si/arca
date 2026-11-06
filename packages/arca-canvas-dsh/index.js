@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import z from '@deepseek-ai/schemastery';
 import { approvalUrl } from './src/approval.js';
-import { createDroiddClient } from './src/droidd-client.js';
+import { createDevicesClient } from './src/devices-client.js';
 import { createArcaClient } from './src/arca-client.js';
 import { createSnapshotCache } from './src/snapshot.js';
 
@@ -16,8 +16,8 @@ export const Config = z.object({
     if (value && !approvalUrl(value)) throw new z.ValidationError('approvalUrl must be an absolute HTTP(S) URL without credentials', { path: ['approvalUrl'] });
     return value;
   }),
-  droiddUrl: z.string().default(''),
-  droiddTokenPath: z.string().default(''),
+  devicesUrl: z.string().default(''),
+  devicesTokenPath: z.string().default(''),
 });
 
 const page = `<!doctype html>
@@ -32,7 +32,7 @@ const assets = new Map([
 
 export function apply(ctx, config) {
   if (config.approvalUrl && !approvalUrl(config.approvalUrl)) throw new Error('approvalUrl must be an absolute HTTP(S) URL without credentials');
-  const cache = createSnapshotCache(createArcaClient(config), config.pollMs, { approvalUrl: approvalUrl(config.approvalUrl) }, createDroiddClient(config));
+  const cache = createSnapshotCache(createArcaClient(config), config.pollMs, { approvalUrl: approvalUrl(config.approvalUrl) }, createDevicesClient(config));
   ctx.effect(() => () => cache.stop());
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
