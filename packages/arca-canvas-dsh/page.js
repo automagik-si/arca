@@ -158,7 +158,7 @@
     const url = approvalUrl(snapshot.approvalUrl);
     const badge = element(doc, url && plans ? "a" : "span", "arca-plans", `${plans} waiting plan${plans === 1 ? "" : "s"}`);
     if (url && plans) badge.href = url;
-    if (snapshot.devices === "unavailable") bar.append(element(doc, "span", "arca-devices", "Phones unavailable"));
+    if (snapshot.devices === "unavailable") bar.append(element(doc, "span", "arca-devices", "Devices unavailable"));
     bar.append(badge);
     const main = element(doc, "div", "arca-main");
     const stage = element(doc, "section", "arca-stage");

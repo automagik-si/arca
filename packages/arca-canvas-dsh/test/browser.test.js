@@ -148,7 +148,7 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(`${origin}/arca-canvas`);
-    await page.waitForFunction(() => document.querySelector('.arca-devices')?.textContent === 'Phones unavailable');
+    await page.waitForFunction(() => document.querySelector('.arca-devices')?.textContent === 'Devices unavailable');
     assert.equal(await page.locator('.arca-card').count(), 5);
     assert.equal(await page.locator('[data-kind="phone"], [data-kind="desktop"]').count(), 0);
     assert.match(await page.locator('.arca-status').textContent(), /^Snapshot /);
