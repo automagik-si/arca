@@ -11,6 +11,7 @@ import * as plugin from '../index.js';
 const fixture = JSON.parse(await readFile(new URL('./fixtures.json', import.meta.url), 'utf8'));
 fixture.node_metrics.latest = { cpu: { usedPct: 24.5, cores: 8 }, load: { one: 1.2 } };
 fixture.alerts_list.firing = [{ rule: 'cpu-high', message: 'CPU exceeded its threshold', target: 'example-node' }];
+const devices = JSON.parse(await readFile(new URL('./droidd-fixtures.json', import.meta.url), 'utf8'));
 const reference = { topbar: [0, 0, 1440, 56], canvas: [0, 56, 1044, 844], steps: [1045, 124, 395, 616] };
 const evidence = process.env.ARCA_CANVAS_EVIDENCE_DIR;
 
@@ -32,10 +33,26 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   });
   await new Promise((resolve) => upstream.listen(socketPath, resolve));
   t.after(() => new Promise((resolve) => upstream.close(resolve)));
+  const droiddTokenPath = join(dir, 'reader');
+  await writeFile(droiddTokenPath, 'browser_reader_fixture_bearer', { mode: 0o400 });
+  const deviceServer = createServer(async (req, res) => {
+    let data = '';
+    for await (const chunk of req) data += chunk;
+    const body = JSON.parse(data);
+    const value = devices[body.params.name];
+    const result = body.method === 'initialize' ? { protocolVersion: '2025-11-25' }
+      : { content: [], structuredContent: body.params.name === 'droid_list' ? { droids: value }
+        : body.params.name === 'desktop_list' ? { desktops: value } : value };
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result }));
+  });
+  await new Promise((resolve) => deviceServer.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => deviceServer.close(resolve)));
+  const droiddUrl = `http://127.0.0.1:${deviceServer.address().port}/mcp`;
   let route;
   const ctx = new Context();
   ctx.provide('webServer', { register(value) { route = value; return () => {}; } });
-  const fiber = await ctx.plugin(plugin, { socketPath, viewerTokenPath, pollMs: 100, approvalUrl: 'https://example.com/approve' });
+  const fiber = await ctx.plugin(plugin, { socketPath, viewerTokenPath, droiddUrl, droiddTokenPath, pollMs: 100, approvalUrl: 'https://example.com/approve' });
   t.after(() => fiber.dispose());
   const web = createServer((req, res) => route.handler(req, res));
   await new Promise((resolve) => web.listen(0, '127.0.0.1', resolve));
@@ -48,9 +65,11 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, colorScheme: scheme });
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
+    let snapshotRequests = 0;
+    page.on('request', (request) => { if (request.url().endsWith('/snapshot')) snapshotRequests++; });
     await page.goto(`${origin}/arca-canvas`);
-    await page.waitForFunction(() => document.querySelector('[data-kind="machine"]')?.textContent.includes('example-node'));
-    assert.equal(await page.locator('.arca-card').count(), 5);
+    await page.waitForFunction(() => document.querySelector('[data-kind="machine"]')?.textContent.includes('example-node') && document.querySelector('[data-kind="desktop"]'));
+    assert.equal(await page.locator('.arca-card').count(), 7);
     const instanceText = await page.locator('[data-kind="instance"]').allTextContents();
     assert.equal(instanceText.length, 2);
     assert.ok(instanceText.every((value) => value.includes('Owner foreign') && !value.includes('[object Object]')));
@@ -89,6 +108,31 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     assert.deepEqual(errors, []);
     if (evidence) await page.screenshot({ path: join(evidence, `${scheme}-1440x900.png`) });
     results.push({ scheme, ...measured });
+    // Resize the embedding root (sidebar) and then the window, before a poll.
+    const requestsBeforeResize = snapshotRequests;
+    for (const width of [1200, 980, 1440]) {
+      await page.evaluate((width) => { document.getElementById('arca-root').style.width = `${width}px`; }, width);
+      await page.waitForFunction(() => {
+        const stage = document.querySelector('.arca-stage');
+        const style = getComputedStyle(stage);
+        const width = stage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        return document.querySelector('.arca-world').clientWidth === width;
+      });
+      const fit = await page.evaluate(() => {
+        const world = document.querySelector('.arca-world');
+        return [...world.children].every((card) => parseFloat(card.style.left) + card.offsetWidth <= world.clientWidth);
+      });
+      assert.equal(fit, true, `cards fit resized root ${width}`);
+    }
+    await page.evaluate(() => { document.getElementById('arca-root').style.width = ''; });
+    await page.setViewportSize({ width: 1100, height: 900 });
+    await page.waitForFunction(() => document.querySelector('.arca-world').clientWidth === 1100 - 396 - 32);
+    assert.equal(await page.evaluate(() => {
+      const world = document.querySelector('.arca-world');
+      return [...world.children].every((card) => parseFloat(card.style.left) + card.offsetWidth <= world.clientWidth);
+    }), true);
+    assert.equal(snapshotRequests, requestsBeforeResize, 'resize reflows without a new snapshot poll');
+    assert.deepEqual(errors, []);
     await page.close();
   }
   if (evidence) await writeFile(join(evidence, 'regions.json'), JSON.stringify(results, null, 2));
@@ -98,7 +142,7 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   await page.route('**/arca-canvas/snapshot', (route) => route.fulfill({ json: {
     at: malicious, error: malicious, approvalUrl: 'javascript:window.injected=1',
     machine: { node: malicious, mode: malicious }, instances: [{ name: malicious }],
-    databases: [{ name: malicious }], alerts: { firing: [{ rule: malicious, message: malicious }] }, plans: [{}],
+    databases: [{ name: malicious }], phones: [{ name: malicious, network: malicious }], desktops: [{ name: malicious, status: malicious }], alerts: { firing: [{ rule: malicious, message: malicious }] }, plans: [{}],
   } }));
   await page.goto(`${origin}/arca-canvas`);
   await page.waitForFunction(() => document.querySelector('.arca-card-title')?.textContent.includes('<img'));

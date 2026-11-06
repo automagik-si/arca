@@ -11,6 +11,8 @@ export function emptySnapshot(config = {}) {
     metrics: null,
     alerts: [],
     plans: [],
+    phones: [],
+    desktops: [],
   };
 }
 
@@ -19,7 +21,7 @@ function rows(value) {
   return value;
 }
 
-export async function collectSnapshot(client, config = {}) {
+export async function collectSnapshot(client, config = {}, droidd = null) {
   const snapshot = emptySnapshot(config);
   const reads = [
     ['machine', 'arca_status', (value) => value],
@@ -38,16 +40,39 @@ export async function collectSnapshot(client, config = {}) {
       return `${tool}: ${snapshotError(error)}`;
     }
   }));
+  if (droidd) {
+    try {
+      const phones = rows(await droidd.call('droid_list'));
+      const desktops = rows(await droidd.call('desktop_list'));
+      await droidd.call('droidd_status');
+      // Only ready phones can answer a status read. Any failed read drops this
+      // optional source as a whole, without changing the Arca error field.
+      const entries = [];
+      for (const phone of phones) {
+        const status = phone.state === 'ready'
+          ? await droidd.call('phone_status', { droid: phone.name }) : null;
+        entries.push({ name: phone.name, state: phone.state,
+          network: status?.network?.type ?? null,
+          battery: status?.battery?.level ?? null,
+          size: status?.size ?? null });
+      }
+      const desktopEntries = desktops.map(({ name, status, memoryBytes }) => ({ name, status, memoryBytes }));
+      snapshot.phones = entries;
+      snapshot.desktops = desktopEntries;
+    } catch {
+      // Device data is optional. Never publish upstream errors or credentials.
+    }
+  }
   snapshot.error = errors.filter(Boolean).join(' ') || null;
   return snapshot;
 }
 
-export function createSnapshotCache(client, pollMs, config = {}) {
+export function createSnapshotCache(client, pollMs, config = {}, droidd = null) {
   let cached = { ...emptySnapshot(config), error: 'Waiting for the first Arca snapshot.' };
   let timer;
   let stopped = false;
   const refresh = async () => {
-    cached = await collectSnapshot(client, config);
+    cached = await collectSnapshot(client, config, droidd);
     if (!stopped) {
       timer = setTimeout(refresh, pollMs);
       timer.unref();

@@ -3,6 +3,8 @@ export const COLUMNS = {
   instance: { w: 260, h: 210 },
   database: { w: 210, h: 136 },
   alert: { w: 240, h: 160 },
+  phone: { w: 230, h: 210 },
+  desktop: { w: 240, h: 210 },
 };
 
 // Default viewport minus the Steps panel and both stage paddings.
@@ -37,12 +39,15 @@ export function layoutCanvas(snapshot, contentWidth = CONTENT_WIDTH) {
     instance: list(snapshot.instances),
     database: list(snapshot.databases),
     alert: alertRows(snapshot.alerts),
+    phone: list(snapshot.phones),
+    desktop: list(snapshot.desktops),
   };
   const nodes = [];
   let x = 0;
   let y = 0;
   let bottom = 0;
   for (const [kind, rows] of Object.entries(groups)) {
+    if (!rows.length) continue;
     const column = COLUMNS[kind];
     const w = Math.min(column.w, contentWidth);
     // Keep column sizes and gaps; start a row below the tallest prior stack.

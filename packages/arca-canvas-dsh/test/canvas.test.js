@@ -101,7 +101,7 @@ test('all six fixtures become one snapshot with project-qualified instances', as
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans', 'phones', 'desktops']);
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
   assert.equal(snapshot.error, null);
   assert.equal(snapshot.approvalUrl, '');

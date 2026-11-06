@@ -1,6 +1,5 @@
-import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
 import { request } from 'node:http';
+import { readToken } from './token.js';
 
 export const PROTOCOL_VERSION = '2025-11-25';
 const MAX_BODY = 4 * 1024 * 1024;
@@ -27,28 +26,9 @@ export function snapshotError(error) {
     ? messages[error.code] : 'Arca request failed.';
 }
 
-async function readToken(path) {
-  let file;
-  try {
-    // Inspect the opened inode: refuse symlinks, devices, FIFOs and permission races.
-    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    const stat = await file.stat();
-    if (!stat.isFile() || (stat.mode & 0o7777) !== 0o400 || stat.size > 4096) {
-      throw new ArcaError('token');
-    }
-    const token = (await file.readFile('utf8')).trim();
-    if (!/^[A-Za-z0-9_-]+$/.test(token)) throw new ArcaError('token');
-    return token;
-  } catch {
-    throw new ArcaError('token');
-  } finally {
-    await file?.close().catch(() => {});
-  }
-}
-
 async function rpc(config, id, method, params) {
   // Authentication is refreshed for every HTTP call, including initialize.
-  const token = await readToken(config.viewerTokenPath);
+  const token = await readToken(config.viewerTokenPath).catch(() => { throw new ArcaError('token'); });
   const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
   return new Promise((resolve, reject) => {
     const fail = (code) => reject(new ArcaError(code));

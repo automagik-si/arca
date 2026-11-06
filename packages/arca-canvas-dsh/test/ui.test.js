@@ -52,7 +52,7 @@ test('fixture columns use grid and spread positions without changing inputs', ()
   assert.deepEqual(layoutCanvas({ ...snapshot, instances: [...snapshot.instances].reverse() }), layoutCanvas(snapshot));
 });
 
-test('alerts are the only additional cards; waiting plans remain a badge', () => {
+test('alert collections become cards; services stay absent and plans remain a badge', () => {
   const layout = layoutCanvas({ ...snapshot, alerts: { firing: [{ rule: 'cpu' }], unknown: [{ rule: 'load' }], resolvedRecent: [{ rule: 'memory' }] }, services: [{ name: 'unused' }] });
   assert.deepEqual(layout.nodes.filter(({ kind }) => kind === 'alert').map(({ x, y, data }) => [x, y, data.state]), [[0, 520, 'firing'], [0, 710, 'unknown'], [0, 900, 'resolved']]);
   assert.ok(layout.nodes.every(({ kind }) => ['machine', 'instance', 'database', 'alert'].includes(kind)));
@@ -60,12 +60,12 @@ test('alerts are the only additional cards; waiting plans remain a badge', () =>
 
 test('populated columns wrap within the 1012 px content width at 1440x900', () => {
   const rows = Array.from({ length: 5 }, (_, i) => ({ name: `${i}` }));
-  const populated = { ...snapshot, instances: rows, databases: rows, alerts: rows };
+  const populated = { ...snapshot, instances: rows, databases: rows, alerts: rows, phones: rows, desktops: rows };
   // The machine is a singleton; all list-backed columns have several cards.
   for (const width of [1440 - 396 - 2 * 16, 780, 500, 200, 1400]) {
     const layout = layoutCanvas(populated, width);
     assert.equal(layout.width, width);
-    assert.equal(layout.nodes.length, 16);
+    assert.equal(layout.nodes.length, 26);
     for (const node of layout.nodes) {
       assert.ok(node.x >= 0 && node.x + node.w <= width, `${node.kind} exceeds ${width}`);
       assert.ok(node.y + node.h <= layout.height);
@@ -144,4 +144,39 @@ test('every committed browser artifact has the SHA-256 of a fresh temporary buil
   for (const filename of ['client.js', 'page.js', 'page.css']) {
     assert.equal(sha256(await readFile(new URL(`../${filename}`, import.meta.url))), sha256(await readFile(join(temporary, filename))), filename);
   }
+});
+
+
+test('empty columns never advance the next phone or desktop column', () => {
+  const layout = layoutCanvas({ machine: { node: 'example' }, phones: [{ name: 'phone' }], desktops: [{ name: 'desktop' }] }, 2000);
+  assert.deepEqual(layout.nodes.map(({ kind, x }) => [kind, x]), [['machine', 0], ['phone', 270], ['desktop', 540]]);
+  assert.deepEqual(layoutCanvas({ desktops: [{ name: 'desktop' }] }, 2000).nodes.map(({ x }) => x), [0]);
+});
+
+test('resize batches in one frame, measures again, and disconnects on stop', () => {
+  const target = root();
+  let callback, observed, disconnected = 0, frames = 0, cancelled = 0, frame;
+  target.ownerDocument.defaultView = {
+    ResizeObserver: class {
+      constructor(cb) { callback = cb; }
+      observe(stage) { observed = stage; }
+      disconnect() { disconnected++; }
+    },
+    getComputedStyle: () => ({ paddingLeft: '16', paddingRight: '16' }),
+    requestAnimationFrame: (cb) => { frames++; frame = cb; return 1; },
+    cancelAnimationFrame: () => { cancelled++; },
+  };
+  const stop = mountCanvas(target, { fetchSnapshot: () => new Promise(() => {}) });
+  observed.clientWidth = 600;
+  callback([{ contentRect: { width: 600 } }]);
+  callback([{ contentRect: { width: 590 } }]);
+  assert.equal(frames, 1);
+  frame();
+  assert.equal(all(target).find(({ className }) => className === 'arca-world').style.width, '568px');
+  callback([{ contentRect: { width: 500 } }]);
+  stop();
+  assert.equal(disconnected, 2);
+  assert.equal(cancelled, 1);
+  callback([{ contentRect: { width: 400 } }]);
+  assert.equal(frames, 2);
 });

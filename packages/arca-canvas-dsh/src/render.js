@@ -31,6 +31,17 @@ function cardContent(node, snapshot) {
       lines: [row.address ? `${text(row.address)}:${text(row.port)}` : 'Awaiting an address'],
       state: text(row.status, 'Unknown'), meta: row.port ? `:${row.port}` : 'Database',
     };
+    case 'phone': return {
+      title: text(row.name, 'Phone'), kind: 'Phone', icon: '▯',
+      lines: [`Network ${text(row.network)}`, `Battery ${number(row.battery, '%')}`,
+        row.size ? `Screen ${text(row.size.width)} × ${text(row.size.height)}` : 'Screen not available'],
+      state: text(row.state, 'Unknown'), meta: 'Read only',
+    };
+    case 'desktop': return {
+      title: text(row.name, 'Desktop'), kind: 'Desktop', icon: '▣',
+      lines: [`Memory ${number(row.memoryBytes == null ? null : row.memoryBytes / 1024 ** 3, ' GiB')}`],
+      state: text(row.status, 'Unknown'), meta: 'Read only',
+    };
     case 'alert': return {
       title: text(row.rule ?? row.name, 'Alert'), kind: 'Alert', icon: '!',
       lines: [text(row.message ?? row.reason, 'No further details')],
@@ -67,32 +78,60 @@ export function renderCanvas(root, snapshot) {
   main.append(stage, panel);
   shell.append(bar, main);
   root.replaceChildren(shell);
-  // Before an explicit width, this block fills the stage's content box.
-  const layout = layoutCanvas(snapshot, world.clientWidth || undefined);
-  world.style.width = `${layout.width}px`;
-  world.style.height = `${layout.height}px`;
-  for (const node of layout.nodes) {
-    const content = cardContent(node, snapshot);
-    const card = element(doc, 'article', 'arca-card');
-    card.dataset.kind = node.kind;
-    Object.assign(card.style, { left: `${node.x}px`, top: `${node.y}px`, width: `${node.w}px`, height: `${node.h}px` });
-    const header = element(doc, 'header', 'arca-card-header');
-    const title = element(doc, 'div', 'arca-card-title');
-    title.append(element(doc, 'strong', '', content.title), element(doc, 'span', '', content.kind));
-    header.append(element(doc, 'span', 'arca-icon', content.icon), title);
-    const live = element(doc, 'div', 'arca-live');
-    for (const line of content.lines) live.append(element(doc, 'div', '', line));
-    const footer = element(doc, 'footer', 'arca-state');
-    footer.append(element(doc, 'span', '', content.state), element(doc, 'span', 'arca-meta', content.meta));
-    card.append(header, live, footer);
-    world.append(card);
-  }
-  if (!layout.nodes.length) world.append(element(doc, 'p', 'arca-empty', 'Waiting for Arca data.'));
+  const reflow = () => {
+    // Measure the stage afresh: the world's explicit width belongs to the last layout.
+    const style = doc.defaultView?.getComputedStyle(stage);
+    const width = style && stage.clientWidth ? Math.max(1, stage.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) : undefined;
+    const layout = layoutCanvas(snapshot, width);
+    world.replaceChildren();
+    world.style.width = `${layout.width}px`;
+    world.style.height = `${layout.height}px`;
+    for (const node of layout.nodes) {
+      const content = cardContent(node, snapshot);
+      const card = element(doc, 'article', 'arca-card');
+      card.dataset.kind = node.kind;
+      Object.assign(card.style, { left: `${node.x}px`, top: `${node.y}px`, width: `${node.w}px`, height: `${node.h}px` });
+      const header = element(doc, 'header', 'arca-card-header');
+      const title = element(doc, 'div', 'arca-card-title');
+      title.append(element(doc, 'strong', '', content.title), element(doc, 'span', '', content.kind));
+      header.append(element(doc, 'span', 'arca-icon', content.icon), title);
+      const live = element(doc, 'div', 'arca-live');
+      for (const line of content.lines) live.append(element(doc, 'div', '', line));
+      const footer = element(doc, 'footer', 'arca-state');
+      footer.append(element(doc, 'span', '', content.state), element(doc, 'span', 'arca-meta', content.meta));
+      card.append(header, live, footer);
+      world.append(card);
+    }
+    if (!layout.nodes.length) world.append(element(doc, 'p', 'arca-empty', 'Waiting for Arca data.'));
+  };
+  reflow();
+  return { stage, reflow };
 }
 
 export function mountCanvas(root, { fetchSnapshot = () => fetch('/arca-canvas/snapshot', { credentials: 'same-origin' }), pollMs = 5000 } = {}) {
   let stopped = false;
   let timer;
+  let frame;
+  let view;
+  let measuredWidth;
+  const win = root.ownerDocument.defaultView;
+  const observer = win?.ResizeObserver ? new win.ResizeObserver((entries) => {
+    const width = entries[0]?.contentRect.width;
+    if (stopped || width === measuredWidth) return;
+    measuredWidth = width;
+    if (frame !== undefined) return;
+    frame = win.requestAnimationFrame(() => {
+      frame = undefined;
+      if (!stopped) view.reflow();
+    });
+  }) : null;
+  const render = () => {
+    observer?.disconnect();
+    view = renderCanvas(root, current);
+    measuredWidth = undefined;
+    // The stage's width is controlled by its parent, never by reflow's world.
+    observer?.observe(view.stage);
+  };
   let current = { error: 'Waiting for the first Arca snapshot.' };
   const refresh = async () => {
     try {
@@ -103,10 +142,15 @@ export function mountCanvas(root, { fetchSnapshot = () => fetch('/arca-canvas/sn
       current = { ...current, error: 'Arca snapshot is unavailable. Retrying…' };
     }
     if (stopped) return;
-    renderCanvas(root, current);
+    render();
     timer = setTimeout(refresh, pollMs);
   };
-  renderCanvas(root, current);
+  render();
   void refresh();
-  return () => { stopped = true; clearTimeout(timer); };
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    observer?.disconnect();
+    if (frame !== undefined) win.cancelAnimationFrame(frame);
+  };
 }
