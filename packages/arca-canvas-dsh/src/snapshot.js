@@ -1,3 +1,4 @@
+import { hostname } from 'node:os';
 import { snapshotError } from './arca-client.js';
 
 export function emptySnapshot(config = {}) {
@@ -5,6 +6,7 @@ export function emptySnapshot(config = {}) {
     at: new Date().toISOString(),
     error: null,
     approvalUrl: config.approvalUrl ?? '',
+    nodeName: (config.nodeName ?? hostname()).trim() || 'Machine',
     machine: null,
     instances: [],
     databases: [],

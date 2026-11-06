@@ -10,20 +10,32 @@ function element(doc, tag, className, text) {
 const text = (value, fallback = 'Not available') => value == null ? fallback : String(value);
 const number = (value, suffix = '') => Number.isFinite(value) ? `${Math.round(value * 10) / 10}${suffix}` : 'Not available';
 
+function uptime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return 'Not available';
+  // Keep short spans in seconds, including the first partial two minutes.
+  const [unit, scale] = seconds < 120 ? ['s', 1] : seconds < 3600 ? ['m', 60]
+    : seconds < 86400 ? ['h', 3600] : ['d', 86400];
+  return `${Math.round(seconds / scale)} ${unit}`;
+}
+
+function ownerLabel(owner) {
+  return ['droidd', 'kernel', 'retained'].includes(owner?.class ?? owner) ? 'Managed by Arca' : 'External';
+}
+
 function cardContent(node, snapshot) {
   const row = node.data;
   switch (node.kind) {
     case 'machine': {
       const metrics = snapshot.metrics?.latest;
       return {
-        title: text(row.node, 'Machine'), kind: 'Machine', icon: '◈',
-        lines: [`CPU ${number(metrics?.cpu?.usedPct, '%')}`, `Load ${number(metrics?.load?.one)}`, `Uptime ${number(row.uptimeS, ' s')}`],
+        title: snapshot.nodeName?.trim() || 'Machine', kind: 'Machine', icon: '◈',
+        lines: [`CPU ${number(metrics?.cpu?.usedPct, '%')}`, `Load ${number(metrics?.load?.one)}`, `Arca up ${uptime(row.uptimeS)}`],
         state: row.incusReachable ? 'Incus reachable' : 'Incus unavailable', meta: text(row.mode),
       };
     }
     case 'instance': return {
       title: text(row.name, 'Instance'), kind: text(row.kind, 'Instance'), icon: '◇',
-      lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner?.class ?? row.owner, 'Not available')}`, row.privileged ? 'Privileged' : 'Unprivileged'],
+      lines: [`Project ${text(row.project)}`, ownerLabel(row.owner), row.privileged ? 'Privileged' : 'Unprivileged'],
       state: text(row.status, 'Unknown'), meta: row.identity ? 'Identity' : 'Instance',
     };
     case 'database': return {
@@ -59,10 +71,12 @@ export function renderCanvas(root, snapshot) {
   bar.append(element(doc, 'span', 'arca-mode', text(snapshot.machine?.mode, 'Read only')));
   const plans = Array.isArray(snapshot.plans) ? snapshot.plans.length : 0;
   const url = approvalUrl(snapshot.approvalUrl);
-  const badge = element(doc, url && plans ? 'a' : 'span', 'arca-plans', `${plans} waiting plan${plans === 1 ? '' : 's'}`);
-  if (url && plans) badge.href = url;
   if (snapshot.devices === 'unavailable') bar.append(element(doc, 'span', 'arca-devices', 'Devices unavailable'));
-  bar.append(badge);
+  if (plans) {
+    const badge = element(doc, url ? 'a' : 'span', 'arca-plans', `${plans} waiting plan${plans === 1 ? '' : 's'}`);
+    if (url) badge.href = url;
+    bar.append(badge);
+  }
   const main = element(doc, 'div', 'arca-main');
   const stage = element(doc, 'section', 'arca-stage');
   stage.setAttribute('aria-label', 'Infrastructure canvas');
@@ -70,7 +84,13 @@ export function renderCanvas(root, snapshot) {
   const status = element(doc, 'div', 'arca-status', snapshot.error ?? `Snapshot ${text(snapshot.at, 'pending')}`);
   status.setAttribute('role', 'status');
   const world = element(doc, 'div', 'arca-world');
-  stage.append(status, world);
+  const summary = element(doc, 'div', 'arca-summary');
+  const counts = [['machine', snapshot.machine ? 1 : 0], ['instance', snapshot.instances?.length ?? 0],
+    ['database', snapshot.databases?.length ?? 0], ['phone', snapshot.phones?.length ?? 0], ['desktop', snapshot.desktops?.length ?? 0]];
+  summary.append(element(doc, 'span', '', counts.map(([kind, count]) => `${count} ${kind}${count === 1 ? '' : 's'}`).join(' · ')));
+  const unknown = Array.isArray(snapshot.alerts?.unknown) ? snapshot.alerts.unknown.length : 0;
+  if (unknown) summary.append(element(doc, 'span', 'arca-no-data', `${unknown} check${unknown === 1 ? ' has' : 's have'} no data`));
+  stage.append(status, summary, world);
   const panel = element(doc, 'aside', 'arca-panel');
   const steps = element(doc, 'div', 'arca-steps-placeholder');
   steps.dataset.region = 'steps';
