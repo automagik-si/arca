@@ -30,7 +30,7 @@
   const button = document.getElementById("sign-in");
   const status = document.getElementById("status");
   const enc = new TextEncoder();
-  const NO_PASSKEY = "This device doesn't have your Arca passkey.";
+  const NO_PASSKEY = "No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows.";
   const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const fromB64url = (value) => Uint8Array.from(
     atob(value.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0),

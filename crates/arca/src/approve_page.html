@@ -390,7 +390,7 @@
 
 <script>
 const enc = new TextEncoder();
-const NO_PASSKEY = "This device doesn't have your Arca passkey.";
+const NO_PASSKEY = "No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows.";
 const trustedIds = JSON.parse(document.body.dataset.credentialIds || "[]");
 const allowCredentials = trustedIds.map((id) => ({ type: "public-key", id: fromB64url(id) }));
 function fromB64url(value) {
