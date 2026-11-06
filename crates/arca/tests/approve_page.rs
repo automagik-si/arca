@@ -19,14 +19,15 @@ use std::time::{Duration, Instant};
 use arca::approve_page::{self, SetupCodeDisplay};
 use arca::canvas::Canvas;
 use arca::desired_store::EntryChange;
-use arca::handlers::Clock;
+use arca::handlers::{Clock, plan_handlers};
 use arca::kernel::Kernel;
+use arca_api::Scope;
 use arca_approval::{
     PASSKEY_COUNTS_FILE, STATE_PASSKEYS_FILE, load_state_passkeys, parse_passkeys,
 };
 use arca_kernel::canon::canonical_json;
 use arca_kernel::desired::EntryId;
-use arca_mcp::{Server, TokenStore, serve_unix};
+use arca_mcp::{CallError, Caller, Server, TokenStore, serve_unix};
 use common::*;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -1651,16 +1652,62 @@ fn canvas_url_vectors_never_return_bytes_and_head_matches_get() {
 
 #[test]
 fn canvas_cookie_cannot_approve_or_reach_mcp() {
-    let (rig, _) = Rig::new("canvas-cookie-scope", true);
+    let (rig, key) = Rig::new("canvas-cookie-scope", true);
     let cookie = rig
         .canvas
         .issue_session("passkey:test", NOW)
         .expect("a session cookie");
     let pair = cookie.split(';').next().expect("cookie pair").to_string();
-    let (status, _, body) =
-        rig.post_with_cookie("/approve/approve", Some(ORIGIN), json!({}), &pair);
-    assert!(status >= 400, "a canvas cookie cannot approve");
+    let (plan, _) = rig.waiting_plan();
+    let (status, _, body) = rig.post_with_cookie(
+        "/approve/approve",
+        Some(ORIGIN),
+        json!({ "plan": plan }),
+        &pair,
+    );
+    assert_eq!(status, 400, "a canvas cookie cannot approve");
     assert!(!String::from_utf8_lossy(&body).contains("approved"));
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
+    let clock: Clock = Arc::new(|| NOW);
+    let handlers = plan_handlers(Arc::clone(&rig.kernel), clock);
+    let submit = handlers
+        .iter()
+        .find(|(name, _)| *name == "approval_submit")
+        .map(|(_, handler)| Arc::clone(handler))
+        .expect("the approval handler");
+    let caller = Caller {
+        token_id: "test".to_string(),
+        scope: Scope::Viewer,
+        tools: None,
+    };
+    let typed = submit
+        .call(json!({ "plan": plan }), &caller)
+        .expect_err("a missing approval is refused");
+    match typed {
+        CallError::Invalid(message) => assert_eq!(message, "approval is required"),
+        other => panic!("unexpected refusal: {other:?}"),
+    }
+    let signin = sign_in_statement(ORIGIN, &"cd".repeat(32), NOW);
+    let signed = approval(&key, &signin);
+    let (status, _, body) = rig.post_with_cookie(
+        "/approve/approve",
+        Some(ORIGIN),
+        json!({ "plan": plan, "approval": signed }),
+        &pair,
+    );
+    assert_eq!(
+        status, 403,
+        "the approval parser refuses a sign-in statement"
+    );
+    let refusal: Value = serde_json::from_slice(&body).expect("a typed refusal");
+    assert_eq!(refusal["refusal"], "Malformed");
+    assert!(
+        refusal["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("key Arca does not read")),
+        "{refusal}"
+    );
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     let (status, _, _) = rig.post_with_cookie("/mcp", None, json!({}), &pair);
     assert_eq!(status, 401, "a canvas cookie is not an MCP bearer");
 }
