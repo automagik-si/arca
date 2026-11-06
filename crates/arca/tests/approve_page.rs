@@ -1777,3 +1777,36 @@ fn canvas_failure_classes_name_statement_and_challenge_without_payloads() {
     assert!(!lines.contains(&key.cred_text()));
     assert!(!lines.contains(&key.key_text()));
 }
+
+#[test]
+fn pages_serve_trusted_credentials_and_check_trust_before_create() {
+    let (rig, key) = Rig::new("canvas-credentials", true);
+    let (status, body) = rig.get("/approve", None);
+    assert_eq!(status, 200);
+    let source = String::from_utf8(body).expect("page text");
+    assert!(source.contains("data-credential-ids=\""));
+    assert!(source.contains(&key.cred_text()));
+    assert!(!source.contains("__ARCA_CREDENTIAL_IDS__"));
+    let register = source
+        .split("async function register()")
+        .nth(1)
+        .expect("the register function");
+    let check = register
+        .find("passkeysTrusted")
+        .expect("the pre-create trust check");
+    let create = register
+        .find("navigator.credentials.create")
+        .expect("the create call");
+    assert!(check < create, "trust is checked before create");
+    assert!(source.contains("allowCredentials,"));
+    assert!(source.contains("This device doesn't have your Arca passkey."));
+
+    let (status, body) = rig.get("/approve/canvas", None);
+    assert_eq!(status, 200);
+    let signin = String::from_utf8(body).expect("sign-in text");
+    assert!(signin.contains("data-credential-ids=\""));
+    assert!(signin.contains(&key.cred_text()));
+    assert!(!signin.contains("__ARCA_CREDENTIAL_IDS__"));
+    assert!(signin.contains("allowCredentials"));
+    assert!(signin.contains("This device doesn't have your Arca passkey."));
+}

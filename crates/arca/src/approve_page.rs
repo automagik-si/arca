@@ -367,12 +367,15 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-async fn page() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("approve_page.html"),
-    )
-        .into_response()
+async fn page(State(state): State<Arc<PageState>>) -> Response {
+    let ids = trusted_credential_ids(&state);
+    let body = render_credentials(include_str!("approve_page.html"), &ids);
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
 }
 
 async fn not_found() -> StatusCode {
@@ -381,12 +384,11 @@ async fn not_found() -> StatusCode {
 
 async fn canvas_page(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
     let now = (state.clock)();
-    let body = if state.canvas.session(&headers, now).is_some() {
-        canvas::CANVAS_PAGE
-    } else {
-        canvas::SIGN_IN_PAGE
-    };
-    canvas_html(body)
+    if state.canvas.session(&headers, now).is_some() {
+        return canvas_html(canvas::CANVAS_PAGE);
+    }
+    let ids = trusted_credential_ids(&state);
+    canvas_html(render_credentials(canvas::SIGN_IN_PAGE, &ids))
 }
 
 async fn canvas_sign_in(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
@@ -512,8 +514,8 @@ async fn canvas_asset(
     }
 }
 
-fn canvas_html(body: &'static str) -> Response {
-    let mut response = body.into_response();
+fn canvas_html(body: impl Into<String>) -> Response {
+    let mut response = body.into().into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
@@ -536,6 +538,27 @@ fn canvas_failure(state: &PageState, status: StatusCode, class: &str) -> Respons
     // Only the class: never the statement, proof, challenge, credential id, key material or verifier's message.
     (state.log)(&format!("arca: canvas sign-in failed: {class}"));
     canvas_json(status, json!({ "message": "Sign-in failed" }))
+}
+
+fn trusted_credential_ids(state: &PageState) -> Vec<String> {
+    let Ok(kernel) = state.kernel.lock() else {
+        return Vec::new();
+    };
+    kernel
+        .owner_passkey_lines()
+        .iter()
+        .map(|line| URL_SAFE_NO_PAD.encode(&line.credential_id))
+        .collect()
+}
+
+fn render_credentials(html: &str, ids: &[String]) -> String {
+    let json = serde_json::to_string(ids).expect("credential ids serialize");
+    let escaped = json
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    html.replace("__ARCA_CREDENTIAL_IDS__", &escaped)
 }
 
 fn credential_known(kernel: &Kernel, proof: &Value) -> bool {
