@@ -542,6 +542,8 @@ mod tests {
             "http://127.0.0.1:3081/",
             "http://127.0.0.1:3081/canvas",
             "http://user@127.0.0.1:3081",
+            "http://2130706433:3081",
+            "http://0x7f000001:3081",
         ] {
             config.canvas_origin = bad.to_string();
             assert_eq!(

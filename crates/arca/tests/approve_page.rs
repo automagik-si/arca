@@ -416,6 +416,29 @@ impl Rig {
         self.request_full_on(false, None, "GET", path, None, &[], Some(cookie), &[])
     }
 
+    fn head_with_cookie(&self, path: &str, cookie: &str) -> (u16, String, Vec<u8>) {
+        self.request_full_on(false, None, "HEAD", path, None, &[], Some(cookie), &[])
+    }
+
+    fn post_with_cookie(
+        &self,
+        path: &str,
+        origin: Option<&str>,
+        body: Value,
+        cookie: &str,
+    ) -> (u16, String, Vec<u8>) {
+        self.request_full_on(
+            false,
+            None,
+            "POST",
+            path,
+            origin,
+            &serde_json::to_vec(&body).expect("the body"),
+            Some(cookie),
+            &[],
+        )
+    }
+
     fn post_full(&self, path: &str, origin: Option<&str>, body: Value) -> (u16, String, Vec<u8>) {
         self.request_full_on(
             false,
@@ -1552,4 +1575,92 @@ fn canvas_failure_logs_are_generic_and_do_not_lock_the_next_sign_in() {
         json!({ "statement": statement, "proof": key.proof_value(&good) }),
     );
     assert_eq!(status, 200, "a fresh challenge still signs in");
+}
+
+#[test]
+fn canvas_url_vectors_never_return_bytes_and_head_matches_get() {
+    let (rig, _) = Rig::new("canvas-vectors", true);
+    let cookie = rig
+        .canvas
+        .issue_session("passkey:test", NOW)
+        .expect("a session cookie");
+    let pair = cookie.split(';').next().expect("cookie pair").to_string();
+    for path in [
+        "/approve/canvas/",
+        "/approve/canvas%2F",
+        "/approve%2Fcanvas",
+        "/approve/canvas/%2E%2E/plans",
+        "/approve/canvas%2E%2E/plans",
+        "/approve/canvas/page%2Ecss",
+        "/approve/canvas/page.css%2F..",
+    ] {
+        let (status, _, body) = rig.get_with_cookie(path, &pair);
+        assert!(
+            status != 200 || body.is_empty(),
+            "{path} answered 200 with bytes"
+        );
+    }
+    assert_eq!(
+        rig.get_with_cookie("/approve/canvas/", &pair).0,
+        404,
+        "a trailing slash is not the exact page URL"
+    );
+
+    for signed in [false, true] {
+        for path in [
+            "/approve/canvas",
+            "/approve/canvas/page.css",
+            "/approve/canvas/page.js",
+            "/approve/canvas/snapshot",
+        ] {
+            let (get_status, get_head, get_body) = if signed {
+                rig.get_with_cookie(path, &pair)
+            } else {
+                rig.get_full(path, None)
+            };
+            let (head_status, head_head, head_body) = if signed {
+                rig.head_with_cookie(path, &pair)
+            } else {
+                rig.request_full_on(false, None, "HEAD", path, None, &[], None, &[])
+            };
+            assert_eq!(
+                head_status, get_status,
+                "{path} HEAD status (signed={signed})"
+            );
+            assert!(
+                head_body.is_empty(),
+                "{path} HEAD body must be empty (signed={signed})"
+            );
+            for name in [
+                "content-security-policy",
+                "x-content-type-options",
+                "referrer-policy",
+            ] {
+                assert_eq!(
+                    header_value(&head_head, name),
+                    header_value(&get_head, name),
+                    "{path} {name} (signed={signed})"
+                );
+            }
+            if !signed && path != "/approve/canvas" {
+                assert!(get_body.is_empty(), "{path} signed-out GET body");
+            }
+        }
+    }
+}
+
+#[test]
+fn canvas_cookie_cannot_approve_or_reach_mcp() {
+    let (rig, _) = Rig::new("canvas-cookie-scope", true);
+    let cookie = rig
+        .canvas
+        .issue_session("passkey:test", NOW)
+        .expect("a session cookie");
+    let pair = cookie.split(';').next().expect("cookie pair").to_string();
+    let (status, _, body) =
+        rig.post_with_cookie("/approve/approve", Some(ORIGIN), json!({}), &pair);
+    assert!(status >= 400, "a canvas cookie cannot approve");
+    assert!(!String::from_utf8_lossy(&body).contains("approved"));
+    let (status, _, _) = rig.post_with_cookie("/mcp", None, json!({}), &pair);
+    assert_eq!(status, 401, "a canvas cookie is not an MCP bearer");
 }
