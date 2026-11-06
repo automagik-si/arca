@@ -36,11 +36,12 @@ pub fn watch(flags: &Flags) -> Result<Option<Value>, Failure> {
     let phones: BTreeSet<String> = cfg.identity_phones.iter().cloned().collect();
     // The adopted instances are live entries, so each shows kernel-owned. A record that cannot be read fails the command.
     let adopted = AdoptionRecord::open(&cfg.state_dir)?.adopted();
-    let value = handlers::watch_snapshot(
+    let value = handlers::watch_snapshot_scoped(
         UnixIncus::new(cfg.incus.socket.clone()),
         &phones,
         &adopted,
         handlers::now_ms(),
+        false,
     )
     .map_err(call_failure)?;
     Ok(Some(value))

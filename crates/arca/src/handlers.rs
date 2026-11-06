@@ -209,13 +209,22 @@ pub fn watch_snapshot<R: IncusRead>(
     live: &BTreeSet<EntryId>,
     now: u64,
 ) -> Result<Value, CallError> {
+    watch_snapshot_scoped(incus, phones, live, now, true)
+}
+
+/// A standalone reader without desired service entries excludes the service project and cannot claim completeness.
+pub fn watch_snapshot_scoped<R: IncusRead>(
+    incus: R,
+    phones: &BTreeSet<String>,
+    live: &BTreeSet<EntryId>,
+    now: u64,
+    include_services: bool,
+) -> Result<Value, CallError> {
     let mut provider = ReadOnlyIncusProvider::new(incus);
     for _ in 0..WATCH_ATTEMPTS {
         let listed = listed_projects(&provider)?;
-        // The service project is reported by the service verbs, not by the watch: a service instance is owned by its
-        // service record, which the watch's live-entry set does not carry.
         let mut scope = listed.clone();
-        let complete = !scope.remove(arca_netproject::PROJECT);
+        let complete = include_services || !scope.remove(arca_netproject::PROJECT);
         let cfg = WatchConfig {
             identity_phones: phones.clone(),
             live_entries: live.clone(),
@@ -225,10 +234,9 @@ pub fn watch_snapshot<R: IncusRead>(
         };
         let report = watch_once(&mut provider, &cfg, now)
             .map_err(|e| CallError::Internal(format!("the watch failed: {e}")))?;
-        if listed_projects(&provider)?
-            .iter()
-            .all(|name| scope.contains(name) || name == arca_netproject::PROJECT)
-        {
+        if listed_projects(&provider)?.iter().all(|name| {
+            scope.contains(name) || (!include_services && name == arca_netproject::PROJECT)
+        }) {
             return serde_json::to_value(&report)
                 .map_err(|_| CallError::Internal("the report does not serialize".to_string()));
         }
@@ -1218,6 +1226,33 @@ mod tests {
                 ("b".to_string(), vec!["y1".to_string(), "y2".to_string()]),
             ]
         );
+    }
+
+    #[test]
+    fn the_standalone_watch_excludes_services_and_does_not_claim_missing_objects() {
+        let incus = Scripted {
+            index: Mutex::new(VecDeque::from(vec![vec![
+                "default",
+                arca_netproject::PROJECT,
+            ]])),
+            instances: Mutex::new(VecDeque::from(vec![vec![
+                instance("default", "guest"),
+                instance(arca_netproject::PROJECT, "nats"),
+            ]])),
+        };
+        let report = watch_snapshot_scoped(
+            incus,
+            &BTreeSet::new(),
+            &BTreeSet::from([EntryId("adopt-missing".into())]),
+            7,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rows_by_project(&report),
+            vec![("default".into(), vec!["guest".into()])]
+        );
+        assert_eq!(report["drift"], json!([]));
     }
 
     #[test]
@@ -2314,7 +2349,16 @@ fn adopted_config(
     })
 }
 
-/// Adds a record for every marked instance without one. Nothing on the instance is read into a secret or re-rendered.
+/// Whether an instance is in the service project or carries its kernel import mark.
+fn service_owned(row: &Value) -> bool {
+    row["project"].as_str() == Some(arca_netproject::PROJECT)
+        || row["name"].as_str().is_some_and(|name| {
+            row["config"][arca_kernel::ownership::KERNEL_ENTRY_KEY].as_str()
+                == Some(format!("adopt-{name}").as_str())
+        })
+}
+
+/// Adds a record for every kernel-owned marked instance without one. Nothing on the instance is read into a secret or re-rendered.
 fn adopt_services(
     kernel: &Mutex<Kernel>,
     entries: &[arca_kernel::desired::Entry],
@@ -2325,6 +2369,9 @@ fn adopt_services(
 ) -> Result<(), CallError> {
     let mut changes = Vec::new();
     for row in rows {
+        if !service_owned(row) {
+            continue;
+        }
         let Some(config) = adopted_config(row, rows, cidr, gateway, now) else {
             continue;
         };
@@ -2368,6 +2415,33 @@ fn service_secret_values(dir: &std::path::Path) -> Vec<String> {
         }
     }
     values
+}
+
+/// Reports each service object's observed state after an approved removal could not finish.
+fn service_removal_refused(
+    read: &impl IncusRead,
+    config: &crate::service::ServiceConfig,
+) -> CallError {
+    let state = |path: String, object: &str| match read.get(&path) {
+        Ok(_) => format!("{object} remains"),
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => format!("{object} removed"),
+        Err(_) => format!("{object} state unknown"),
+    };
+    let instance = state(
+        format!(
+            "/1.0/instances/{}?project={}",
+            config.instance, config.project
+        ),
+        "instance",
+    );
+    let acl = state(
+        format!("/1.0/network-acls/{}?project=default", config.acl()),
+        "ACL",
+    );
+    service_refused(format!(
+        "remove service {}: partial removal ({instance}; {acl}); the owner's approval is spent, so another try needs a new one",
+        config.name
+    ))
 }
 
 fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConfig, CallError> {
@@ -2479,6 +2553,7 @@ impl ToolHandler for ServiceHandler {
                 for row in &rows {
                     if let Some(name) = row["name"].as_str()
                         && !names.contains(name)
+                        && service_owned(row)
                     {
                         let view = if row["config"][crate::service::TEMPLATE_KEY].is_string() {
                             crate::service::failed_view(row)
@@ -2493,7 +2568,6 @@ impl ToolHandler for ServiceHandler {
                     }
                 }
                 views.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-                views.truncate(256);
                 Ok(json!({ "services": views }))
             }
             "service_status" => {
@@ -2509,7 +2583,7 @@ impl ToolHandler for ServiceHandler {
                 }
                 if let Some(row) = rows
                     .iter()
-                    .find(|row| row["name"].as_str() == Some(name.as_str()))
+                    .find(|row| row["name"].as_str() == Some(name.as_str()) && service_owned(row))
                 {
                     if let Some(view) = crate::service::failed_view(row) {
                         return Ok(view);
@@ -2535,11 +2609,6 @@ impl ToolHandler for ServiceHandler {
                 let row = service_live_in(&rows, &config.project, &name).ok_or_else(|| {
                     service_refused(format!("service {name}: its instance is gone"))
                 })?;
-                if !row["config"][crate::service::TEMPLATE_KEY].is_string() {
-                    return Err(service_refused(format!(
-                        "service {name}: its instance is not marked as a service"
-                    )));
-                }
                 let path = format!(
                     "/1.0/instances/{name}/console?project={}&type=log",
                     config.project
@@ -2593,51 +2662,32 @@ impl ToolHandler for ServiceHandler {
                         ),
                     });
                 }
-                let args_for_approval = json!({ "name": name });
-                {
-                    let mut kernel = lock(&self.kernel)?;
-                    kernel
-                        .check_approval(
-                            arca_approval::ArcaAction::Delete,
-                            &name,
-                            &args_for_approval,
-                            approval,
-                            now,
-                        )
-                        .map_err(|refusal| CallError::Refused {
-                            code: "owner_approval".into(),
-                            message: refusal.to_string(),
-                        })?;
-                }
                 let id = entry.id.clone();
-                let outcomes = lock(&self.kernel)?
-                    .propose(
-                        vec![crate::desired_store::EntryChange::Remove(id.clone())],
-                        now,
+                let removal = lock(&self.kernel)?
+                    .remove_service(&id, &name, approval, now)
+                    .map_err(|error| match error {
+                        crate::kernel::ServiceRemovalError::Approval(refusal) => {
+                            CallError::Refused {
+                                code: "owner_approval".into(),
+                                message: refusal.to_string(),
+                            }
+                        }
+                        crate::kernel::ServiceRemovalError::Proposal(_) => {
+                            service_removal_refused(&read, &config)
+                        }
+                    })?;
+                if removal.outcomes.iter().any(|outcome| {
+                    matches!(
+                        outcome,
+                        Outcome::Failed { .. } | Outcome::Refused(_) | Outcome::Held { .. }
                     )
-                    .map_err(|_| internal())?;
-                let plan = {
-                    let kernel = lock(&self.kernel)?;
-                    kernel
-                        .pending_plans()
-                        .into_iter()
-                        .find(|plan| plan.entry == id)
-                };
-                if let Some(plan) = plan {
-                    let run = lock(&self.kernel)?
-                        .run_plan_authorized(&plan.digest, now)
-                        .map_err(|_| {
-                            service_refused(format!(
-                                "remove service {name}: the delete did not finish; the owner's approval is spent, so another try needs a new one"
-                            ))
-                        })?;
-                    if run.partial {
-                        return Err(service_refused(format!(
-                            "remove service {name}: the delete did not finish; the owner's approval is spent, so another try needs a new one"
-                        )));
-                    }
+                }) || removal
+                    .run
+                    .as_ref()
+                    .map_or(true, |run| run.as_ref().is_some_and(|run| run.partial))
+                {
+                    return Err(service_removal_refused(&read, &config));
                 }
-                let _ = outcomes;
                 let secrets = self.cfg.state_dir.join("secrets").join(&id.0);
                 let _ = std::fs::remove_dir_all(secrets);
                 Ok(json!({ "removed": true }))
@@ -2657,13 +2707,12 @@ impl ToolHandler for ServiceHandler {
                 {
                     return Err(service_refused(format!("service {name} exists")));
                 }
-                if let Some(row) = rows
+                if rows
                     .iter()
-                    .find(|row| row["name"].as_str() == Some(name.as_str()))
+                    .any(|row| row["name"].as_str() == Some(name.as_str()))
                 {
                     return Err(service_refused(format!(
-                        "project {} holds an instance named {name} that is not a service of Arca's; it is left alone",
-                        row["project"].as_str().unwrap_or("?")
+                        "an instance named {name} already exists that is not a service of Arca's; it is left alone"
                     )));
                 }
                 let templates_dir = self.cfg.state_dir.join("templates");

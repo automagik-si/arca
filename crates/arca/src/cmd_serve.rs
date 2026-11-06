@@ -85,6 +85,26 @@ pub fn watch_handler(cfg: &NodeConfig) -> WatchHandler {
     })
 }
 
+/// The server watch also counts the shared kernel's service desired entries on every sweep.
+pub fn watch_kernel_handler(cfg: &NodeConfig, kernel: Arc<Mutex<Kernel>>) -> WatchHandler {
+    let base = watch_handler(cfg);
+    let adopted = Arc::clone(&base.adopted);
+    base.with_adopted(move || {
+        let mut live = adopted();
+        let kernel = kernel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live.extend(
+            kernel
+                .entries()
+                .iter()
+                .filter(|entry| entry.plugin.0 == "arca.service")
+                .map(|entry| entry.id.clone()),
+        );
+        live
+    })
+}
+
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let cfg = config::load(Path::new(flags.required("config")?))?;
     if !cfg.kernel.adopt.is_empty() {
@@ -155,7 +175,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The watch sweep runs on its own thread, so a slow sweep never delays the tick. The tick reads its newest answer, and
     // `watch_report` answers from the same handler, so neither starts a sweep.
     let clock: Clock = Arc::new(now_ms);
-    let watch = Arc::new(watch_handler(&cfg));
+    let watch = Arc::new(watch_kernel_handler(&cfg, Arc::clone(&kernel)));
     spawn_watcher(Arc::clone(&watch), Arc::clone(&clock))
         .map_err(|e| Failure::Runtime(e.to_string()))?;
 

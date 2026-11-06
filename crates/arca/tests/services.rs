@@ -7,7 +7,14 @@ use arca::{
 use arca_api::Scope;
 use arca_approval::{ApprovalVerifier, FileNonces, OwnerKeys, PasskeyVerifier, SshSigVerifier};
 use arca_incus::{FakeIncus, FakeState, IncusRead, UnixIncus};
+use arca_kernel::canon::Digest;
+use arca_kernel::desired::EntryId;
 use arca_kernel::identity::NodeKey;
+use arca_kernel::journal::{AclPatch, Inverse};
+use arca_kernel::ownership::{IncusKind, ObjectRef};
+use arca_kernel::plugin::{
+    EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
+};
 use arca_mcp::{CallError, Caller, ToolHandler};
 use arca_netproject::PROJECT;
 use arca_providers::incus::{Family, IncusProvider};
@@ -27,6 +34,75 @@ use std::{
 const NOW: u64 = 1_793_361_600_000;
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+// Pauses the instance retirement at the provider boundary, after its plan exists.
+struct RemovalPause {
+    entered: std::sync::mpsc::Sender<Digest>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+struct PausedProvider {
+    inner: IncusProvider,
+    pause: Option<RemovalPause>,
+}
+
+impl Provider for PausedProvider {
+    fn observe(
+        &self,
+        entry: &EntryId,
+        projects: &[String],
+        query: &Observe,
+    ) -> Result<Value, EffectRefusal> {
+        self.inner.observe(entry, projects, query)
+    }
+    fn plan(&self, entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
+        self.inner.plan(entry, op)
+    }
+    fn effect(
+        &mut self,
+        entry: &EntryId,
+        op: &EffectOp,
+        planned: &Planned,
+    ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
+        self.inner.effect(entry, op, planned)
+    }
+    fn read_back(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&std::collections::BTreeMap<String, Option<String>>>,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back(entry, target, pre_image)
+    }
+    fn read_back_acl(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back_acl(entry, target, patch)
+    }
+    fn retire(
+        &mut self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        plan: &Digest,
+    ) -> Result<Retirement, EffectRefusal> {
+        if object.kind == IncusKind::Instance
+            && let Some(pause) = self.pause.take()
+        {
+            pause
+                .entered
+                .send(plan.clone())
+                .expect("report retirement plan");
+            pause
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("release retirement");
+        }
+        self.inner.retire(entry, object, plan)
+    }
+}
 
 struct Rig {
     dir: PathBuf,
@@ -59,6 +135,16 @@ impl Rig {
         projects: Vec<String>,
         cidr: Option<&str>,
         key: Option<&common::SkKey>,
+    ) -> Self {
+        Self::with_key_and_pause(state, projects, cidr, key, None)
+    }
+
+    fn with_key_and_pause(
+        state: FakeState,
+        projects: Vec<String>,
+        cidr: Option<&str>,
+        key: Option<&common::SkKey>,
+        pause: Option<RemovalPause>,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-service-{}-{}",
@@ -114,8 +200,8 @@ impl Rig {
                 verifier,
                 "node1".into(),
                 move |retained| {
-                    Ok(Box::new(
-                        IncusProvider::new(
+                    Ok(Box::new(PausedProvider {
+                        inner: IncusProvider::new(
                             socket,
                             Family {
                                 projects: vec![PROJECT.into()],
@@ -127,7 +213,8 @@ impl Rig {
                             retained,
                         )
                         .expect("provider"),
-                    ))
+                        pause,
+                    }))
                 },
                 NOW,
             )
@@ -1018,6 +1105,17 @@ fn a_failed_start_keeps_the_created_instance_record_and_secrets() {
             .unwrap()
             .starts_with("test_")
     );
+    let listed = rig.call("service_list", json!({})).unwrap();
+    assert_eq!(listed["services"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["services"][0]["name"], "nats");
+    assert_eq!(listed["services"][0]["state"], "stopped");
+    assert_eq!(
+        rig.call("service_status", json!({"name":"nats"})).unwrap()["state"],
+        "stopped"
+    );
+    assert!(
+        matches!(rig.call("service_create", json!({"name":"nats","template":"nats"})), Err(CallError::Refused { message, .. }) if message == "service nats exists")
+    );
 }
 
 #[test]
@@ -1093,6 +1191,7 @@ fn adopted_instance(
         "type": "container",
         "status": "Running",
         "config": {
+            "user.arcakernel.entry": format!("adopt-{name}"),
             "user.arca.template": template,
             "user.arca.address": ipv4,
             "user.arca.ports": ports,
@@ -1102,6 +1201,141 @@ fn adopted_instance(
         },
         "devices": {"eth0":{"type":"nic","name":"eth0","ipv4.address":ipv4}}
     })
+}
+
+#[test]
+fn the_server_watch_covers_services_and_reports_a_missing_service_object() {
+    use arca::handlers::watcher_step;
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![json!({"name":"default","config":{}})],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+    );
+    rig.template("nats", nats_template());
+    let cfg: NodeConfig = serde_json::from_value(json!({
+        "stateDir":rig.dir, "incus":{"socket":rig.fake.socket()},
+        "listen":{"unix":rig.dir.join("arca.sock")},
+        "tokens":{"hashDir":rig.dir.join("tokens")},
+        "kernel":{"projects":[PROJECT], "droiddProjects":["other"], "serviceCidr":"192.0.2.0/24"}
+    }))
+    .unwrap();
+    let watch = arca::cmd_serve::watch_kernel_handler(&cfg, Arc::clone(&rig.kernel));
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .unwrap();
+    // The handler predates the record, so the sweep must read the current kernel entries.
+    let mut last = None;
+    watcher_step(&watch, NOW, &mut last);
+    let report = watch.newest().unwrap().1;
+    let project = report["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["project"] == PROJECT)
+        .unwrap();
+    assert_eq!(project["instances"][0]["owner"]["class"], "kernel");
+    assert_eq!(project["instances"][0]["owner"]["entry"], "service-nats");
+    assert_eq!(report["drift"], json!([]));
+    assert!(
+        report["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["project"] == "default")
+    );
+    rig.edit(
+        "PUT",
+        &format!("/1.0/instances/nats/state?project={PROJECT}"),
+        json!({"action":"stop"}),
+    );
+    rig.edit(
+        "DELETE",
+        &format!("/1.0/instances/nats?project={PROJECT}"),
+        json!({}),
+    );
+    watcher_step(&watch, NOW + 30_000, &mut last);
+    let report = watch.newest().unwrap().1;
+    assert_eq!(
+        report["drift"],
+        json!([{"kind":"entryWithoutObject","entry":"service-nats"}])
+    );
+}
+
+#[test]
+fn a_droidd_service_before_import_stays_external_and_has_no_service_record() {
+    let mut row = adopted_instance(
+        "db1",
+        "other",
+        "postgres-autopg",
+        "192.0.2.10",
+        "5432",
+        "uuid-db1",
+    );
+    row["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("user.arcakernel.entry");
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![row],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into(), "other".into()],
+        Some("192.0.2.0/24"),
+    );
+    assert_eq!(
+        rig.call("service_list", json!({})).unwrap()["services"],
+        json!([])
+    );
+    assert!(
+        rig.entries()
+            .iter()
+            .all(|entry| entry.id.0 != "service-db1")
+    );
+    let live = rig.get("/1.0/instances/db1?project=other").unwrap();
+    let own = serde_json::from_value(live["config"].clone()).unwrap();
+    assert_eq!(
+        arca_kernel::ownership::classify(&own, &Default::default()),
+        arca_kernel::ownership::OwnerClass::Droidd
+    );
+    let error = rig
+        .call("service_create", json!({"name":"db1","template":"nats"}))
+        .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { message, .. } if message == "an instance named db1 already exists that is not a service of Arca's; it is left alone" && !message.contains("other") && !message.contains(PROJECT))
+    );
+    assert!(
+        matches!(rig.call("service_status", json!({"name":"db1"})), Err(CallError::Refused { code, .. }) if code == "not_found")
+    );
+    // Invalid metadata outside the owned scope must not become a failed service either.
+    rig.edit(
+        "PATCH",
+        "/1.0/instances/db1?project=other",
+        json!({"config":{"user.arca.address":"invalid"}}),
+    );
+    assert_eq!(
+        rig.call("service_list", json!({})).unwrap()["services"],
+        json!([])
+    );
+    assert!(
+        rig.entries()
+            .iter()
+            .all(|entry| entry.id.0 != "service-db1")
+    );
+    assert!(
+        rig.fake
+            .writes()
+            .iter()
+            .all(|write| write.method == "PATCH")
+    );
 }
 
 #[test]
@@ -1355,6 +1589,14 @@ fn the_four_templates_and_nothing_else_load_and_are_pinned() {
         automagik.commit.as_deref(),
         Some("bc0e4cf5465cae4fbeb454fbb089249bfeb3e189")
     );
+    assert!(
+        automagik
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("templates/automagik.build.sh")
+    );
+    assert!(dir.join("automagik.build.sh").is_file());
     assert!(automagik.publishable);
     assert_eq!(automagik.dash_port, Some(3080));
     let nats = service::load_template(&dir, "nats").unwrap();
@@ -1463,11 +1705,15 @@ fn service_remove_is_refused_without_a_valid_approval_and_removes_with_one() {
         rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
             .is_some()
     );
+    let secrets = rig.dir.join("secrets/service-pg");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("password"), "removed-on-success").unwrap();
     let approval = owner_approval(&key, "pg");
     let removed = rig
         .call("service_remove", json!({"name":"pg","approval":approval}))
         .expect("remove");
     assert_eq!(removed, json!({"removed":true}));
+    assert!(!secrets.exists());
     assert!(
         rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
             .is_none()
@@ -1492,30 +1738,214 @@ fn a_removal_that_fails_after_the_approval_was_spent_says_so() {
             networks: vec![],
             pools: vec![],
         },
-        vec![PROJECT.to_string()],
+        vec![PROJECT.into()],
         Some("192.0.2.0/24"),
         Some(&key),
     );
-    rig.template("nats", nats_template());
-    rig.call("service_create", json!({"name":"nats","template":"nats"}))
-        .expect("running service");
-    rig.fake.set_reject_delete("nats");
-    let approval = owner_approval(&key, "nats");
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let secrets = rig.dir.join("secrets/service-pg");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("password"), "kept-secret").unwrap();
+    let acl_path = format!("/1.0/network-acls/{PROJECT}-svc-pg?project=default");
+    rig.fake.set_reject_delete(&format!("{PROJECT}-svc-pg"));
+    let approval = owner_approval(&key, "pg");
     let error = rig
-        .call("service_remove", json!({"name":"nats","approval":approval}))
-        .expect_err("a running instance refuses delete");
-    assert!(matches!(
-        error,
-        CallError::Refused { message, .. } if message.contains("approval is spent")
-    ));
+        .call("service_remove", json!({"name":"pg","approval":approval}))
+        .unwrap_err();
     assert!(
-        rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
-            .is_some()
+        matches!(error, CallError::Refused { code, message } if code == "refused" && message == "remove service pg: partial removal (instance removed; ACL remains); the owner's approval is spent, so another try needs a new one")
     );
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(rig.get(&acl_path).is_some());
+    assert_eq!(
+        fs::read_to_string(secrets.join("password")).unwrap(),
+        "kept-secret"
+    );
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.method == "DELETE"
+                && request.path == acl_path
+                && request.status == 400)
+    );
+    assert!(matches!(
+        rig.kernel.lock().unwrap().check_approval(
+            arca_approval::ArcaAction::Delete,
+            "pg",
+            &json!({"name":"pg"}),
+            &approval,
+            NOW
+        ),
+        Err(arca_approval::ApprovalRefusal::Replayed)
+    ));
 }
 
 #[test]
-fn service_logs_reads_an_oci_services_console_log_a_system_services_journal() {
+fn an_instance_only_delete_rejection_is_a_partial_refusal_and_keeps_secrets() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let secrets = rig.dir.join("secrets/service-pg");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::write(secrets.join("password"), "kept-secret").unwrap();
+    rig.fake.set_reject_delete("pg");
+    let approval = owner_approval(&key, "pg");
+    let error = rig
+        .call("service_remove", json!({"name":"pg","approval":approval}))
+        .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { code, message } if code == "refused" && message == "remove service pg: partial removal (instance remains; ACL removed); the owner's approval is spent, so another try needs a new one")
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_some()
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-pg?project=default"
+        ))
+        .is_none()
+    );
+    assert_eq!(
+        fs::read_to_string(secrets.join("password")).unwrap(),
+        "kept-secret"
+    );
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.method == "DELETE"
+                && request.path == format!("/1.0/instances/pg?project={PROJECT}")
+                && request.status == 400)
+    );
+    assert!(matches!(
+        rig.kernel.lock().unwrap().check_approval(
+            arca_approval::ArcaAction::Delete,
+            "pg",
+            &json!({"name":"pg"}),
+            &approval,
+            NOW
+        ),
+        Err(arca_approval::ApprovalRefusal::Replayed)
+    ));
+}
+
+#[test]
+fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let key = common::SkKey::from_seed(9);
+    let (entered, at_retirement) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let rig = Rig::with_key_and_pause(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+        Some(RemovalPause {
+            entered,
+            release: released,
+        }),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let handler = Arc::clone(rig.handlers.get("service_remove").unwrap());
+    let approval = owner_approval(&key, "pg");
+    let remove = std::thread::spawn(move || {
+        handler.call(
+            json!({"name":"pg","approval":approval}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        )
+    });
+    let plan = at_retirement.recv_timeout(Duration::from_secs(5)).unwrap();
+    // The pending plan exists, but the service call still owns the kernel lock.
+    assert!(matches!(
+        rig.kernel.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    let statement =
+        arca::handlers::plan_statement("node1", &plan.to_hex(), NOW, &"b".repeat(64)).unwrap();
+    let proof = common::approve_statement(&key, &statement);
+    let handler = arca::handlers::plan_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW))
+        .into_iter()
+        .find(|(name, _)| *name == "approval_submit")
+        .unwrap()
+        .1;
+    let (started, waiting) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    let approve = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let result = handler.call(
+            json!({"plan":plan.to_hex(),"approval":proof}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        );
+        finished.send(result).unwrap();
+    });
+    waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    release.send(()).unwrap();
+    assert_eq!(remove.join().unwrap().unwrap(), json!({"removed":true}));
+    assert!(
+        matches!(done.recv_timeout(Duration::from_secs(5)).unwrap(), Err(CallError::Refused { code, .. }) if code == "NoSuchPlan")
+    );
+    approve.join().unwrap();
+    assert_eq!(
+        rig.fake
+            .writes()
+            .iter()
+            .filter(|write| write.method == "DELETE"
+                && write.path == format!("/1.0/instances/pg?project={PROJECT}"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        rig.fake
+            .writes()
+            .iter()
+            .filter(|write| write.method == "DELETE"
+                && write.path == format!("/1.0/network-acls/{PROJECT}-svc-pg?project=default"))
+            .count(),
+        1
+    );
+    assert!(rig.kernel.lock().unwrap().pending_plans().is_empty());
+}
+
+#[test]
+fn service_logs_reads_a_system_services_console_without_a_template_mark() {
     let rig = Rig::new();
     rig.template(
         "dash",
@@ -1526,11 +1956,24 @@ fn service_logs_reads_an_oci_services_console_log_a_system_services_journal() {
     );
     rig.call("service_create", json!({"name":"dash","template":"dash"}))
         .expect("system service");
+    rig.edit(
+        "PATCH",
+        &format!("/1.0/instances/dash?project={PROJECT}"),
+        json!({"config":{"user.arca.template":null}}),
+    );
     rig.fake.set_console_log(PROJECT, "dash", "system line\n");
     let logs = rig
         .call("service_logs", json!({"name":"dash"}))
         .expect("logs");
     assert_eq!(logs["lines"], json!(["system line"]));
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .any(|request| request.method == "GET"
+                && request.path
+                    == format!("/1.0/instances/dash/console?project={PROJECT}&type=log"))
+    );
 }
 
 #[test]
@@ -1618,7 +2061,7 @@ fn template_publishability_automagik_alone_with_its_dash_port() {
 }
 
 #[test]
-fn service_remove_logs_a_running_services_node_out_before_it_deletes_it() {
+fn service_remove_deletes_a_running_service_with_owner_approval() {
     let key = common::SkKey::from_seed(9);
     let rig = Rig::with_key(
         FakeState {

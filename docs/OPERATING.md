@@ -233,7 +233,20 @@ restarted or signalled. The hash files stay mode 0400. The signal uses the host'
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
 
-A service is one template-derived container in the service project. Its template lives in `<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it needs is available. `service_list` and `service_status` derive state from Incus and report instances that Arca did not create as `unknown` without touching them. `service_logs` returns the service's console or journal lines as untrusted text with stored secrets redacted and a capped, truncated result. `service_remove` needs the owner's signed delete approval; the instance, ACL and secret files go, and an adopted record is refused. The four shipped templates live in `templates/`, with their pinned images and vendored npm lockfile.
+A service is one template-derived container in the service project. Its template lives in
+`<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the
+service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it
+needs is available. `service_list` and `service_status` derive state from Incus and report instances that Arca did
+not create as `unknown` without touching them. `service_logs` returns console lines as untrusted text with stored
+secrets redacted and a capped, truncated result. The four shipped templates live in `templates/`, with their pinned
+images and vendored npm lockfile.
+
+`service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
+approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends
+that service-action approval once, then removes the desired entry and runs its pending delete plan under one kernel
+lock. Any reconciliation failure or partial plan run is a typed refusal naming whether the instance and ACL remain;
+the approval is spent, so another try needs a new one. Secret files are removed only after full success. An adopted
+record is refused.
 
 ### Who may call what
 

@@ -304,7 +304,7 @@ static VERBS: [Verb; 20] = [
         untrusted: false,
         output_key: None,
         summary_text: summary_service_list,
-        cut: no_cut,
+        cut: cut_service_list,
         params: service_list_params,
         result: service_list_result,
     },
@@ -1237,10 +1237,46 @@ pub fn cut_service_logs(v: &Value) -> Option<Value> {
         }
         out.push(Value::String(cut));
     }
-    if start > 0 || out.iter().zip(lines).any(|(a, b)| a != b) {
+    if start > 0 || out.iter().zip(&lines[start..]).any(|(a, b)| a != b) {
         Some(json!({ "lines": out }))
     } else {
         None
+    }
+}
+
+/// Caps the service rows while leaving their natural result schema unchanged.
+pub fn cut_service_list(v: &Value) -> Option<Value> {
+    let rows = v["services"].as_array()?;
+    (rows.len() > 256).then(|| json!({ "services": &rows[..256] }))
+}
+
+/// Describes the service data omitted by the MCP cap, without adding natural result fields.
+pub fn service_cut_description(name: &str, original: &Value) -> Option<String> {
+    match name {
+        "service_logs" => {
+            let lines = original["lines"].as_array()?;
+            let dropped = lines.len().saturating_sub(200);
+            let shortened = lines[dropped..]
+                .iter()
+                .filter(|line| {
+                    line.as_str()
+                        .is_some_and(|text| text.chars().count() > 2000)
+                })
+                .count();
+            Some(format!(
+                "{dropped} line(s) dropped, {shortened} line(s) truncated of {} original line(s)",
+                lines.len()
+            ))
+        }
+        "service_list" => {
+            let rows = original["services"].as_array()?;
+            Some(format!(
+                "{} service row(s) omitted of {} original row(s)",
+                rows.len().saturating_sub(256),
+                rows.len()
+            ))
+        }
+        _ => None,
     }
 }
 
