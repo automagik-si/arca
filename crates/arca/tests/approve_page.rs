@@ -1539,7 +1539,7 @@ fn canvas_challenge_cap_is_global_and_resets_after_a_minute() {
 }
 
 #[test]
-fn canvas_failure_logs_are_generic_and_do_not_lock_the_next_sign_in() {
+fn canvas_failure_logs_name_only_the_class_and_do_not_lock_the_next_sign_in() {
     let (rig, key) = Rig::new("canvas-log", true);
     let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
     assert_eq!(status, 200);
@@ -1550,18 +1550,51 @@ fn canvas_failure_logs_are_generic_and_do_not_lock_the_next_sign_in() {
         .to_string();
     let mut wrong = Assert::over(NAMESPACE, statement.as_bytes());
     wrong.origin = Some("https://elsewhere.example".to_string());
+    let proof = key.proof_value(&wrong);
     let (status, _, _) = rig.post_full(
         "/approve/canvas",
         Some(ORIGIN),
-        json!({ "statement": statement, "proof": key.proof_value(&wrong) }),
+        json!({ "statement": &statement, "proof": &proof }),
     );
     assert_eq!(status, 403);
     let logs = rig.logs.lock().expect("logs").clone();
     assert_eq!(
         logs.last().map(String::as_str),
-        Some("arca: canvas sign-in failed")
+        Some("arca: canvas sign-in failed: WrongOrigin (credential known)")
     );
-    assert!(!logs.join("\n").contains(&statement));
+    let lines = logs.join("\n");
+    assert!(!lines.contains(&statement));
+    assert!(!lines.contains(&serde_json::to_string(&proof).expect("proof JSON")));
+    assert!(!lines.contains(&key.cred_text()));
+    assert!(!lines.contains(&key.key_text()));
+
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200);
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let mut unknown = Assert::over(NAMESPACE, statement.as_bytes());
+    unknown.credential_id = Some(vec![0x99; 20]);
+    let proof = key.proof_value(&unknown);
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": &statement, "proof": &proof }),
+    );
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed: BadSignature (credential unknown)")
+    );
+    let lines = logs.join("\n");
+    assert!(!lines.contains(&statement));
+    assert!(!lines.contains(&serde_json::to_string(&proof).expect("proof JSON")));
+    assert!(!lines.contains(&key.cred_text()));
+    assert!(!lines.contains(&key.key_text()));
+
     let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
     assert_eq!(status, 200, "no failure lock");
     let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
@@ -1710,4 +1743,37 @@ fn canvas_cookie_cannot_approve_or_reach_mcp() {
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     let (status, _, _) = rig.post_with_cookie("/mcp", None, json!({}), &pair);
     assert_eq!(status, 401, "a canvas cookie is not an MCP bearer");
+}
+
+#[test]
+fn canvas_failure_classes_name_statement_and_challenge_without_payloads() {
+    let (rig, key) = Rig::new("canvas-classes", true);
+    let bad = json!({ "statement": "{}", "proof": {} });
+    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), bad);
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed: statement")
+    );
+
+    let statement = sign_in_statement(ORIGIN, &"ab".repeat(32), NOW);
+    let assertion = Assert::over(NAMESPACE, statement.as_bytes());
+    let proof = key.proof_value(&assertion);
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": &statement, "proof": &proof }),
+    );
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed: challenge")
+    );
+    let lines = logs.join("\n");
+    assert!(!lines.contains(&statement));
+    assert!(!lines.contains(&serde_json::to_string(&proof).expect("proof JSON")));
+    assert!(!lines.contains(&key.cred_text()));
+    assert!(!lines.contains(&key.key_text()));
 }
