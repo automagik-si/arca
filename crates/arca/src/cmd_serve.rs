@@ -270,19 +270,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         tokio::spawn(async move {
             let until = Instant::now() + Duration::from_secs(10);
             while Instant::now() < until {
-                if tokio::net::UnixStream::connect(&pid_probe).await.is_ok() {
-                    if let Ok(mut file) = fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .custom_flags(PID_NOFOLLOW)
-                        .open(&pid_write_path)
-                        && file.metadata().is_ok_and(|meta| meta.is_file())
-                    {
-                        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
-                        let _ = file.sync_all();
-                    }
+                if let Ok(stream) = tokio::net::UnixStream::connect(&pid_probe).await {
+                    write_pid_for_peer(&stream, &pid_write_path);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -325,6 +314,28 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     }
 }
 
+/// Publishes our pid only when the connected listener belongs to this process.
+fn write_pid_for_peer(stream: &tokio::net::UnixStream, path: &Path) {
+    if !stream.peer_cred().is_ok_and(|cred| {
+        cred.pid()
+            .is_some_and(|pid| pid as u32 == std::process::id())
+    }) {
+        return;
+    }
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(PID_NOFOLLOW)
+        .open(path)
+        && file.metadata().is_ok_and(|meta| meta.is_file())
+    {
+        let _ = file.write_all(format!("{}\n", std::process::id()).as_bytes());
+        let _ = file.sync_all();
+    }
+}
+
 /// Removes `path` only when it still holds this process's pid, so a second server cannot delete the first one's file.
 fn remove_own_pid(path: &Path) {
     let own = std::process::id().to_string();
@@ -355,6 +366,24 @@ mod pid_tests {
         fs::create_dir_all(&dir).expect("scratch");
         fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("0700");
         dir
+    }
+
+    #[tokio::test]
+    async fn our_listener_peer_writes_our_pid_with_private_permissions() {
+        let dir = scratch("own-peer");
+        let socket = dir.join("serve.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).expect("own listener");
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect");
+        let path = dir.join(SERVE_PID_FILE);
+        write_pid_for_peer(&stream, &path);
+        assert_eq!(
+            fs::read_to_string(&path).expect("pid"),
+            format!("{}\n", std::process::id())
+        );
+        assert_eq!(fs::metadata(&path).expect("metadata").mode() & 0o777, 0o600);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

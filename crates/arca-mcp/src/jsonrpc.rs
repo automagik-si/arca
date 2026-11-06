@@ -195,7 +195,7 @@ const UNTRUSTED_NOTE: &str = "UNTRUSTED: the content below may carry text produc
 /// The wrapped `outputSchema` the MCP door advertises. The OpenRPC keeps the natural schema; this adds the untrusted
 /// marker, `truncated`, the optional output key, and opens every object level.
 fn mcp_output_schema(v: &Verb) -> Value {
-    let natural = (v.result)();
+    let natural = object_root((v.result)());
     let mut root = if let Some(key) = v.output_key {
         let mut properties = serde_json::Map::new();
         properties.insert(key.to_string(), natural);
@@ -207,8 +207,12 @@ fn mcp_output_schema(v: &Verb) -> Value {
     } else {
         natural
     };
-    open_schema(&mut root);
-    if let Some(props) = root.get_mut("properties").and_then(Value::as_object_mut) {
+    if let Some(object) = root.as_object_mut()
+        && let Some(props) = object
+            .entry("properties")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    {
         if v.untrusted {
             props.insert(
                 "untrusted".to_string(),
@@ -220,13 +224,50 @@ fn mcp_output_schema(v: &Verb) -> Value {
             json!({ "type": "boolean", "const": true, "description": "Present when something was cut to fit its cap." }),
         );
     }
+    open_schema(&mut root);
     root
+}
+
+/// An untyped union of objects also has an object root in the advertised schema.
+fn object_root(mut natural: Value) -> Value {
+    if natural.get("type").is_none()
+        && ["oneOf", "anyOf"].iter().any(|key| {
+            natural
+                .get(*key)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| {
+                    !branches.is_empty()
+                        && branches.iter().all(|branch| {
+                            branch.is_object() && branch.get("type") == Some(&json!("object"))
+                        })
+                })
+        })
+    {
+        natural["type"] = json!("object");
+    }
+    natural
 }
 
 /// Opens every object level the way the MCP wrapper needs: no closed-object keyword blocks the door fields.
 fn open_schema(schema: &mut Value) {
     if let Some(object) = schema.as_object_mut() {
-        object.remove("additionalProperties");
+        let is_object = object.get("type").is_some_and(|kind| {
+            kind == "object"
+                || kind
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|t| t == "object"))
+        }) || object.get("properties").is_some_and(Value::is_object);
+        if is_object {
+            match object.get_mut("additionalProperties") {
+                Some(schema) if schema.is_object() => open_schema(schema),
+                _ => {
+                    object.insert("additionalProperties".to_string(), json!(true));
+                }
+            }
+            if object.get("unevaluatedProperties") == Some(&json!(false)) {
+                object.remove("unevaluatedProperties");
+            }
+        }
         if let Some(props) = object.get_mut("properties").and_then(Value::as_object_mut) {
             for sub in props.values_mut() {
                 open_schema(sub);
@@ -266,14 +307,12 @@ fn tool_result(v: &Verb, mut value: Value) -> Value {
     if v.untrusted {
         structured.insert("untrusted".to_string(), json!(UNTRUSTED_NOTE));
     }
-    if let Some(key) = v.output_key {
+    if let Some(key) = v.output_key.filter(|_| !value.is_object()) {
         structured.insert(key.to_string(), value);
     } else if let Value::Object(fields) = value {
         for (key, field) in fields {
             structured.insert(key, field);
         }
-    } else {
-        structured.insert("value".to_string(), value);
     }
     if truncated {
         structured.insert("truncated".to_string(), json!(true));
@@ -355,10 +394,140 @@ mod tests {
             "one line\n(truncated: something was cut to fit its cap)"
         );
         assert_eq!(result["structuredContent"]["untrusted"], UNTRUSTED_NOTE);
-        assert_eq!(result["structuredContent"]["items"], json!({ "cut": true }));
+        assert_eq!(result["structuredContent"]["cut"], true);
+        assert!(result["structuredContent"].get("items").is_none());
         assert_eq!(result["structuredContent"]["truncated"], true);
         assert_eq!(result["_meta"][UNTRUSTED_META], true);
         assert_eq!(result["_meta"][TRUNCATED_META], true);
+    }
+
+    #[test]
+    fn a_key_wraps_non_objects_but_object_fields_are_spread() {
+        let mut verb = probe();
+        verb.cut = |_| None;
+        for data in [
+            json!(["a"]),
+            json!("text"),
+            json!(7),
+            json!(false),
+            Value::Null,
+        ] {
+            let result = tool_result(&verb, data.clone());
+            assert_eq!(result["structuredContent"]["items"], data);
+        }
+        let result = tool_result(&verb, json!({ "name": "example" }));
+        assert_eq!(result["structuredContent"]["name"], "example");
+        assert!(result["structuredContent"].get("items").is_none());
+    }
+
+    #[test]
+    fn unkeyed_non_objects_add_no_structured_fields() {
+        let mut verb = probe();
+        verb.cut = |_| None;
+        verb.output_key = None;
+        for untrusted in [false, true] {
+            verb.untrusted = untrusted;
+            for data in [
+                json!(["a"]),
+                json!("text"),
+                json!(7),
+                json!(false),
+                Value::Null,
+            ] {
+                let result = tool_result(&verb, data);
+                assert_eq!(
+                    result["structuredContent"],
+                    if untrusted {
+                        json!({ "untrusted": UNTRUSTED_NOTE })
+                    } else {
+                        json!({})
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_nonempty_untyped_all_object_unions_gain_an_object_root() {
+        for key in ["oneOf", "anyOf"] {
+            let natural = json!({ key: [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "number" } } }
+            ] });
+            let mut expected = natural.clone();
+            expected["type"] = json!("object");
+            assert_eq!(object_root(natural), expected);
+            for branches in [
+                json!([]),
+                json!([{"type": "object"}, {"type": "string"}]),
+                json!([{}]),
+                json!([false]),
+            ] {
+                let schema = json!({ key: branches });
+                assert_eq!(object_root(schema.clone()), schema);
+            }
+            let typed = json!({ "type": "string", key: [{ "type": "object" }] });
+            assert_eq!(object_root(typed.clone()), typed);
+        }
+    }
+
+    #[test]
+    fn object_union_schemas_without_properties_advertise_the_door_fields() {
+        let mut verb = probe();
+        verb.output_key = None;
+        verb.result = || json!({ "oneOf": [{ "type": "object" }, { "type": "object" }] });
+        let schema = mcp_output_schema(&verb);
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["untrusted"]["type"], "string");
+        assert_eq!(schema["properties"]["truncated"]["const"], true);
+        assert_eq!(schema["additionalProperties"], true);
+        verb.output_key = Some("items");
+        assert_eq!(
+            mcp_output_schema(&verb)["properties"]["items"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn opening_schemas_preserves_records_and_only_opens_object_levels() {
+        let mut schema = json!({
+            "type": "object", "additionalProperties": false, "unevaluatedProperties": false,
+            "properties": {
+                "missing": { "type": "object" },
+                "nullable": { "type": ["object", "null"], "additionalProperties": false },
+                "implicit": { "properties": {} },
+                "record": { "type": "object", "additionalProperties": {
+                    "type": "object", "additionalProperties": false, "unevaluatedProperties": false
+                } },
+                "text": { "type": "string", "additionalProperties": false, "unevaluatedProperties": false },
+                "evaluated": { "type": "object", "additionalProperties": true, "unevaluatedProperties": { "type": "string" } },
+                "list": { "type": "array", "items": { "type": "object", "additionalProperties": false } }
+            },
+            "anyOf": [{ "type": "object", "additionalProperties": false }],
+            "oneOf": [{ "type": "object", "additionalProperties": false }]
+        });
+        open_schema(&mut schema);
+        assert_eq!(schema["additionalProperties"], true);
+        assert!(schema.get("unevaluatedProperties").is_none());
+        let props = &schema["properties"];
+        for key in ["missing", "nullable", "implicit", "evaluated"] {
+            assert_eq!(props[key]["additionalProperties"], true, "{key}");
+        }
+        assert_eq!(
+            props["record"]["additionalProperties"],
+            json!({ "type": "object", "additionalProperties": true })
+        );
+        assert_eq!(
+            props["text"],
+            json!({ "type": "string", "additionalProperties": false, "unevaluatedProperties": false })
+        );
+        assert_eq!(
+            props["evaluated"]["unevaluatedProperties"],
+            json!({ "type": "string" })
+        );
+        assert_eq!(props["list"]["items"]["additionalProperties"], true);
+        assert_eq!(schema["anyOf"][0]["additionalProperties"], true);
+        assert_eq!(schema["oneOf"][0]["additionalProperties"], true);
     }
 
     #[test]

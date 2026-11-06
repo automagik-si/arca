@@ -501,8 +501,8 @@ fn a_listed_tool_carries_its_schemas_and_annotations() {
             "{} advertises the truncation marker",
             tool["name"]
         );
-        assert!(
-            tool["outputSchema"].get("additionalProperties").is_none(),
+        assert_eq!(
+            tool["outputSchema"]["additionalProperties"], true,
             "{} is advertised open",
             tool["name"]
         );
