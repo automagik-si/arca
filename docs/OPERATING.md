@@ -233,6 +233,8 @@ restarted or signalled. The hash files stay mode 0400. The signal uses the host'
 The secret file holds the secret and one newline. A client reads that file, strips the newline, and sends the secret as
 `Authorization: Bearer <secret>`. Keep the secret out of command lines, logs and shell history.
 
+A service is one template-derived container in the service project. Its template lives in `<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it needs is available. `service_list` and `service_status` derive state from Incus and report instances that Arca did not create as `unknown` without touching them.
+
 ### Who may call what
 
 | Caller | Result |
@@ -252,8 +254,7 @@ The secret file holds the secret and one newline. A client reads that file, stri
 ## The MCP server
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
-in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`, `plan_decline` and
-`approval_submit`.
+in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`, `plan_decline`, `approval_submit`, the Postgres and ontology verbs, and `service_create`, `service_list` and `service_status`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.

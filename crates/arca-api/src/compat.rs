@@ -389,6 +389,18 @@ fn covers_domain(wide: &Value, narrow: &Value) -> Result<(), String> {
     {
         return Err("maxLength lowered".to_string());
     }
+    if let Some(wide_max) = wide.get("maxItems").and_then(Value::as_u64)
+        && !narrow
+            .get("maxItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|max| max <= wide_max)
+    {
+        return Err("maxItems lowered".to_string());
+    }
+    // A pattern is not related to another pattern by this checker. Any change is conservatively a narrowing.
+    if wide.get("pattern") != narrow.get("pattern") {
+        return Err("pattern changed".to_string());
+    }
     Ok(())
 }
 

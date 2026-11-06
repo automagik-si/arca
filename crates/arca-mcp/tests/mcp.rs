@@ -416,7 +416,9 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "plan_list",
             "alerts_list",
             "postgres_list",
-            "ontology_query"
+            "ontology_query",
+            "service_list",
+            "service_status"
         ]
     );
 }

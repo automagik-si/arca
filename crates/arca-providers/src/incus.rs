@@ -985,6 +985,7 @@ impl Provider for IncusProvider {
                         IncusKind::Instance
                     }
                     ["", "1.0", "network-acls", name] if plain_name(name) => IncusKind::Acl,
+                    ["", "1.0", "profiles", name] if plain_name(name) => IncusKind::Profile,
                     _ => return Err(EffectRefusal::NotDeclared),
                 };
                 self.check_family(kind, project)?;
@@ -996,7 +997,7 @@ impl Provider for IncusProvider {
                 let mut value = self.reader.get(path).map_err(incus_refusal)?;
                 if matches!(
                     kind,
-                    IncusKind::Acl | IncusKind::Project | IncusKind::Network
+                    IncusKind::Acl | IncusKind::Project | IncusKind::Network | IncusKind::Profile
                 ) {
                     let config = value
                         .get("config")

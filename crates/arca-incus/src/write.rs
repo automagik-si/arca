@@ -975,7 +975,7 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     let allowed_keys = source.keys().all(|key| {
         matches!(
             key.as_str(),
-            "type" | "alias" | "fingerprint" | "properties" | "server" | "protocol"
+            "type" | "alias" | "fingerprint" | "properties" | "server" | "protocol" | "mode"
         )
     });
     let server = source.get("server").map(|value| value.as_str());
@@ -983,7 +983,14 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     let pinned = match (server, protocol) {
         (None, None) => true,
         (Some(server), Some(protocol)) => {
-            server == Some(IMAGE_SERVER) && protocol == Some(IMAGE_PROTOCOL)
+            (server == Some(IMAGE_SERVER) && protocol == Some(IMAGE_PROTOCOL))
+                || (protocol == Some("oci")
+                    && source.get("mode").and_then(Value::as_str) == Some("pull")
+                    && server.is_some_and(oci_server_ok)
+                    && source
+                        .get("alias")
+                        .and_then(Value::as_str)
+                        .is_some_and(oci_alias_ok))
         }
         _ => false,
     };
@@ -1004,6 +1011,31 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     } else {
         Err(refused("a create may name only an image source"))
     }
+}
+
+/// An OCI registry server: `https://` and a host, with an optional port. No path, credentials or query.
+fn oci_server_ok(server: &str) -> bool {
+    let Some(host) = server.strip_prefix("https://") else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.contains(['/', '@', '?', '#'])
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+}
+
+/// An OCI alias: a repository and a digest, `repo@sha256:<64 lowercase hex>`.
+fn oci_alias_ok(alias: &str) -> bool {
+    let Some((repository, digest)) = alias.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !repository.is_empty()
+        && repository
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A key the writer sends: `[a-z0-9_.-]`, plus uppercase ASCII after a leading `environment.`. Incus's decoder matches a key to a field whatever its case,

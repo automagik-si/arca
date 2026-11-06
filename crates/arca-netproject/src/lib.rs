@@ -11,6 +11,7 @@ use std::net::Ipv4Addr;
 
 pub const PROJECT: &str = "arcak-svc";
 pub const BRIDGE: &str = "arcak-svcbr";
+pub const PROFILE: &str = "arca-service";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -108,6 +109,7 @@ impl Plugin for NetProject {
             vec![
                 (IncusKind::Project, EffectClass::B),
                 (IncusKind::Network, EffectClass::B),
+                (IncusKind::Profile, EffectClass::A),
             ],
         )
     }
@@ -140,6 +142,20 @@ impl Plugin for NetProject {
                 &cfg.project,
                 &cfg.project,
                 json!({"name":cfg.project,"config":{"limits.virtual-machines":cfg.virtual_machines.to_string(),"restricted.networks.access":cfg.bridge}}),
+            )?;
+        }
+        if observed(
+            ctx,
+            format!("/1.0/profiles/{PROFILE}?project={}", cfg.project),
+        )?
+        .is_none()
+        {
+            create(
+                ctx,
+                IncusKind::Profile,
+                &cfg.project,
+                PROFILE,
+                json!({"name": PROFILE, "config": {}, "devices": {}}),
             )?;
         }
         Ok(())

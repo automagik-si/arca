@@ -65,7 +65,11 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
     let project = read.get(&format!("/1.0/projects/{PROJECT}")).unwrap();
     assert_eq!(project["config"]["limits.virtual-machines"], "0");
     assert_ne!(project["config"]["features.networks"], "true");
-    assert_eq!(fake.writes().len(), 2);
+    let profile = read
+        .get(&format!("/1.0/profiles/{PROFILE}?project={PROJECT}"))
+        .unwrap();
+    assert_eq!(profile["name"], PROFILE);
+    assert_eq!(fake.writes().len(), 3);
     drop(fake);
     std::fs::remove_dir_all(dir).unwrap();
 }

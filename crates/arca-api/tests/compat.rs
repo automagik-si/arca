@@ -379,7 +379,7 @@ fn a_pattern_added_is_one_parameter_narrowing() {
 #[test]
 fn a_result_keyword_outside_the_subset_is_one_type_break() {
     let got = breaks_after(|doc| {
-        result_mut(doc, "watch_report")["properties"]["projects"]["maxItems"] = json!(3);
+        result_mut(doc, "watch_report")["properties"]["projects"]["minItems"] = json!(3);
     });
     assert_eq!(
         got,
