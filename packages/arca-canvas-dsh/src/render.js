@@ -19,7 +19,7 @@ function uptime(seconds) {
 }
 
 function ownerLabel(owner) {
-  return ['droidd', 'kernel', 'retained'].includes(owner?.class ?? owner) ? 'Managed by Arca' : 'External';
+  return ['kernel', 'retained'].includes(owner?.class ?? owner) ? 'Managed by Arca' : 'External';
 }
 
 function cardContent(node, snapshot) {

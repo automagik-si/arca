@@ -124,8 +124,9 @@ empty columns consume no space, and populated columns wrap to keep cards inside 
 Long kinds split into stacks no taller than 690 px; each kind gets its first stack
 before overflow stacks, so phones stay near the top. A muted summary counts
 machines, instances, databases, phones and desktops. Instance ownership reads
-`Managed by Arca` for managed/retained objects and `External` for foreign,
-contested or missing ownership. Waiting-plan badges appear only above zero.
+`Managed by Arca` only for kernel and retained objects; droidd, foreign,
+contested, missing and unknown ownership read `External`. Waiting-plan badges
+appear only above zero.
 Machine uptime reads `Arca up`, keeping short spans such as 85 seconds in seconds
 and rounding longer spans to minutes, hours or days.
 The observer disconnects when the canvas stops.

@@ -93,7 +93,7 @@
     return `${Math.round(seconds / scale)} ${unit}`;
   }
   function ownerLabel(owner) {
-    return ["droidd", "kernel", "retained"].includes(owner?.class ?? owner) ? "Managed by Arca" : "External";
+    return ["kernel", "retained"].includes(owner?.class ?? owner) ? "Managed by Arca" : "External";
   }
   function cardContent(node, snapshot) {
     const row = node.data;

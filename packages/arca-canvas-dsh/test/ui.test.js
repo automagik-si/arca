@@ -222,15 +222,19 @@ test('machine title is a human name and Arca uptime uses sensible units', () => 
   assert.equal(all(machine).find(({ tagName }) => tagName === 'strong').textContent, 'Machine');
 });
 
-test('all watch owner classes and missing owners use owner-facing labels', () => {
-  for (const [ownerClass, label] of [['droidd', 'Managed by Arca'], ['kernel', 'Managed by Arca'],
-    ['retained', 'Managed by Arca'], ['foreign', 'External'], ['contested', 'External'], [undefined, 'External'], ['future-class', 'External']]) {
+test('only kernel and retained are managed; all other owner classes are external', () => {
+  for (const [ownerClass, label] of [['kernel', 'Managed by Arca'], ['retained', 'Managed by Arca'],
+    ['droidd', 'External'], ['foreign', 'External'], ['contested', 'External'],
+    [undefined, 'External'], ['future-class', 'External']]) {
     for (const owner of [ownerClass, ownerClass === undefined ? undefined : { class: ownerClass }]) {
       const target = root();
       renderCanvas(target, { instances: [{ name: 'worker', owner }] });
       const card = all(target).find(({ dataset }) => dataset.kind === 'instance');
       assert.ok(card.textContent.includes(label));
       assert.doesNotMatch(card.textContent, /Owner |droidd|kernel|foreign|retained|contested|future-class/);
+      // The summary counts kinds, never ownership: every instance still contributes.
+      const summary = all(target).find(({ className }) => className === 'arca-summary').textContent;
+      assert.match(summary, /1 instance/);
     }
   }
 });
