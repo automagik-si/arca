@@ -58,7 +58,17 @@ export function renderCanvas(root, snapshot) {
   const status = element(doc, 'div', 'arca-status', snapshot.error ?? `Snapshot ${text(snapshot.at, 'pending')}`);
   status.setAttribute('role', 'status');
   const world = element(doc, 'div', 'arca-world');
-  const layout = layoutCanvas(snapshot);
+  stage.append(status, world);
+  const panel = element(doc, 'aside', 'arca-panel');
+  const steps = element(doc, 'div', 'arca-steps-placeholder');
+  steps.dataset.region = 'steps';
+  steps.append(element(doc, 'h2', '', 'Steps'), element(doc, 'p', '', 'Steps are hidden until the journal is available.'));
+  panel.append(steps);
+  main.append(stage, panel);
+  shell.append(bar, main);
+  root.replaceChildren(shell);
+  // Before an explicit width, this block fills the stage's content box.
+  const layout = layoutCanvas(snapshot, world.clientWidth || undefined);
   world.style.width = `${layout.width}px`;
   world.style.height = `${layout.height}px`;
   for (const node of layout.nodes) {
@@ -78,15 +88,6 @@ export function renderCanvas(root, snapshot) {
     world.append(card);
   }
   if (!layout.nodes.length) world.append(element(doc, 'p', 'arca-empty', 'Waiting for Arca data.'));
-  stage.append(status, world);
-  const panel = element(doc, 'aside', 'arca-panel');
-  const steps = element(doc, 'div', 'arca-steps-placeholder');
-  steps.dataset.region = 'steps';
-  steps.append(element(doc, 'h2', '', 'Steps'), element(doc, 'p', '', 'Steps are hidden until the journal is available.'));
-  panel.append(steps);
-  main.append(stage, panel);
-  shell.append(bar, main);
-  root.replaceChildren(shell);
 }
 
 export function mountCanvas(root, { fetchSnapshot = () => fetch('/arca-canvas/snapshot', { credentials: 'same-origin' }), pollMs = 5000 } = {}) {

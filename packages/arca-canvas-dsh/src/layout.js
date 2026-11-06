@@ -1,9 +1,13 @@
 export const COLUMNS = {
-  machine: { x: 0, w: 230, h: 210 },
-  instance: { x: 270, w: 260, h: 210 },
-  database: { x: 570, w: 210, h: 136 },
-  alert: { x: 820, w: 240, h: 160 },
+  machine: { w: 230, h: 210 },
+  instance: { w: 260, h: 210 },
+  database: { w: 210, h: 136 },
+  alert: { w: 240, h: 160 },
 };
+
+// Default viewport minus the Steps panel and both stage paddings.
+const CONTENT_WIDTH = 1440 - 396 - 2 * 16;
+const COLUMN_GAP = 40;
 
 // Spread cards over at least 480 px, preserving a minimum 30 px gap.
 export function spread(items) {
@@ -27,7 +31,7 @@ export function alertRows(alerts) {
   ];
 }
 
-export function layoutCanvas(snapshot) {
+export function layoutCanvas(snapshot, contentWidth = CONTENT_WIDTH) {
   const groups = {
     machine: snapshot.machine ? [snapshot.machine] : [],
     instance: list(snapshot.instances),
@@ -35,13 +39,25 @@ export function layoutCanvas(snapshot) {
     alert: alertRows(snapshot.alerts),
   };
   const nodes = [];
+  let x = 0;
+  let y = 0;
+  let bottom = 0;
   for (const [kind, rows] of Object.entries(groups)) {
     const column = COLUMNS[kind];
+    const w = Math.min(column.w, contentWidth);
+    // Keep column sizes and gaps; start a row below the tallest prior stack.
+    if (x > 0 && x + w > contentWidth) {
+      x = 0;
+      y = bottom + COLUMN_GAP;
+    }
     const key = (row) => `${row.project ?? ''}/${row.name ?? row.node ?? row.rule ?? ''}`;
     const sorted = [...rows].sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
     for (const [index, item] of spread(sorted.map((data) => ({ data, h: column.h }))).entries()) {
-      nodes.push({ kind, id: `${kind}:${key(item.data)}:${index}`, x: column.x, w: column.w, ...item });
+      const node = { kind, id: `${kind}:${key(item.data)}:${index}`, x, w, ...item, y: y + item.y };
+      nodes.push(node);
+      bottom = Math.max(bottom, node.y + node.h);
     }
+    x += w + COLUMN_GAP;
   }
-  return { width: 1060, height: Math.max(620, ...nodes.map((node) => node.y + node.h + 76)), nodes };
+  return { width: contentWidth, height: Math.max(620, bottom + 76), nodes };
 }

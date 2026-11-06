@@ -1,11 +1,13 @@
 (() => {
   // src/layout.js
   var COLUMNS = {
-    machine: { x: 0, w: 230, h: 210 },
-    instance: { x: 270, w: 260, h: 210 },
-    database: { x: 570, w: 210, h: 136 },
-    alert: { x: 820, w: 240, h: 160 }
+    machine: { w: 230, h: 210 },
+    instance: { w: 260, h: 210 },
+    database: { w: 210, h: 136 },
+    alert: { w: 240, h: 160 }
   };
+  var CONTENT_WIDTH = 1440 - 396 - 2 * 16;
+  var COLUMN_GAP = 40;
   function spread(items) {
     const sum = items.reduce((height2, item) => height2 + item.h, 0);
     const height = Math.max(480, sum + 30 * (items.length - 1));
@@ -25,7 +27,7 @@
       ...list(alerts?.resolvedRecent).map((row) => ({ ...row, state: "resolved" }))
     ];
   }
-  function layoutCanvas(snapshot) {
+  function layoutCanvas(snapshot, contentWidth = CONTENT_WIDTH) {
     const groups = {
       machine: snapshot.machine ? [snapshot.machine] : [],
       instance: list(snapshot.instances),
@@ -33,15 +35,26 @@
       alert: alertRows(snapshot.alerts)
     };
     const nodes = [];
+    let x = 0;
+    let y = 0;
+    let bottom = 0;
     for (const [kind, rows] of Object.entries(groups)) {
       const column = COLUMNS[kind];
+      const w = Math.min(column.w, contentWidth);
+      if (x > 0 && x + w > contentWidth) {
+        x = 0;
+        y = bottom + COLUMN_GAP;
+      }
       const key = (row) => `${row.project ?? ""}/${row.name ?? row.node ?? row.rule ?? ""}`;
       const sorted = [...rows].sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
       for (const [index, item] of spread(sorted.map((data) => ({ data, h: column.h }))).entries()) {
-        nodes.push({ kind, id: `${kind}:${key(item.data)}:${index}`, x: column.x, w: column.w, ...item });
+        const node = { kind, id: `${kind}:${key(item.data)}:${index}`, x, w, ...item, y: y + item.y };
+        nodes.push(node);
+        bottom = Math.max(bottom, node.y + node.h);
       }
+      x += w + COLUMN_GAP;
     }
-    return { width: 1060, height: Math.max(620, ...nodes.map((node) => node.y + node.h + 76)), nodes };
+    return { width: contentWidth, height: Math.max(620, bottom + 76), nodes };
   }
 
   // src/approval.js
@@ -126,7 +139,16 @@
     const status = element(doc, "div", "arca-status", snapshot.error ?? `Snapshot ${text(snapshot.at, "pending")}`);
     status.setAttribute("role", "status");
     const world = element(doc, "div", "arca-world");
-    const layout = layoutCanvas(snapshot);
+    stage.append(status, world);
+    const panel = element(doc, "aside", "arca-panel");
+    const steps = element(doc, "div", "arca-steps-placeholder");
+    steps.dataset.region = "steps";
+    steps.append(element(doc, "h2", "", "Steps"), element(doc, "p", "", "Steps are hidden until the journal is available."));
+    panel.append(steps);
+    main.append(stage, panel);
+    shell.append(bar, main);
+    root.replaceChildren(shell);
+    const layout = layoutCanvas(snapshot, world.clientWidth || void 0);
     world.style.width = `${layout.width}px`;
     world.style.height = `${layout.height}px`;
     for (const node of layout.nodes) {
@@ -146,15 +168,6 @@
       world.append(card);
     }
     if (!layout.nodes.length) world.append(element(doc, "p", "arca-empty", "Waiting for Arca data."));
-    stage.append(status, world);
-    const panel = element(doc, "aside", "arca-panel");
-    const steps = element(doc, "div", "arca-steps-placeholder");
-    steps.dataset.region = "steps";
-    steps.append(element(doc, "h2", "", "Steps"), element(doc, "p", "", "Steps are hidden until the journal is available."));
-    panel.append(steps);
-    main.append(stage, panel);
-    shell.append(bar, main);
-    root.replaceChildren(shell);
   }
   function mountCanvas(root, { fetchSnapshot = () => fetch("/arca-canvas/snapshot", { credentials: "same-origin" }), pollMs = 5e3 } = {}) {
     let stopped = false;

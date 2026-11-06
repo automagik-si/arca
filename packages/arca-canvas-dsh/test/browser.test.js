@@ -63,8 +63,23 @@ test('real fallback renders fixture snapshots safely in light and dark without a
         const { x, y, width, height } = node.getBoundingClientRect();
         return [node.dataset.region, [x, y, width, height]];
       }));
-      return { regions, bg: style.backgroundColor, ink: style.color, surface: getComputedStyle(document.querySelector('.arca-card')).backgroundColor };
+      const stage = document.querySelector('.arca-stage');
+      const stageStyle = getComputedStyle(stage);
+      const contentLeft = stage.getBoundingClientRect().left + parseFloat(stageStyle.paddingLeft);
+      const contentWidth = stage.clientWidth - parseFloat(stageStyle.paddingLeft) - parseFloat(stageStyle.paddingRight);
+      const cards = [...document.querySelectorAll('.arca-card')].map((card) => {
+        const { x, y, width, height } = card.getBoundingClientRect();
+        return { kind: card.dataset.kind, x, y, width, height };
+      });
+      return { regions, contentLeft, contentWidth, worldWidth: document.querySelector('.arca-world').clientWidth, cards,
+        bg: style.backgroundColor, ink: style.color, surface: getComputedStyle(document.querySelector('.arca-card')).backgroundColor };
     });
+    assert.equal(measured.contentWidth, 1012);
+    assert.equal(measured.worldWidth, measured.contentWidth);
+    for (const card of measured.cards) {
+      assert.ok(card.x >= measured.contentLeft && card.x + card.width <= measured.contentLeft + measured.contentWidth, `${scheme} ${card.kind} exceeds content box`);
+      assert.ok(card.y + card.height <= 900, `${scheme} fixture card must be visible`);
+    }
     assert.equal(measured.bg, scheme === 'light' ? 'rgb(244, 244, 247)' : 'rgb(11, 11, 15)');
     assert.equal(measured.ink, scheme === 'light' ? 'rgb(12, 13, 17)' : 'rgb(241, 242, 246)');
     assert.equal(measured.surface, scheme === 'light' ? 'rgb(255, 255, 255)' : 'rgb(21, 22, 28)');

@@ -54,8 +54,29 @@ test('fixture columns use grid and spread positions without changing inputs', ()
 
 test('alerts are the only additional cards; waiting plans remain a badge', () => {
   const layout = layoutCanvas({ ...snapshot, alerts: { firing: [{ rule: 'cpu' }], unknown: [{ rule: 'load' }], resolvedRecent: [{ rule: 'memory' }] }, services: [{ name: 'unused' }] });
-  assert.deepEqual(layout.nodes.filter(({ kind }) => kind === 'alert').map(({ x, y, data }) => [x, y, data.state]), [[820, 0, 'firing'], [820, 190, 'unknown'], [820, 380, 'resolved']]);
+  assert.deepEqual(layout.nodes.filter(({ kind }) => kind === 'alert').map(({ x, y, data }) => [x, y, data.state]), [[0, 520, 'firing'], [0, 710, 'unknown'], [0, 900, 'resolved']]);
   assert.ok(layout.nodes.every(({ kind }) => ['machine', 'instance', 'database', 'alert'].includes(kind)));
+});
+
+test('populated columns wrap within the 1012 px content width at 1440x900', () => {
+  const rows = Array.from({ length: 5 }, (_, i) => ({ name: `${i}` }));
+  const populated = { ...snapshot, instances: rows, databases: rows, alerts: rows };
+  // The machine is a singleton; all list-backed columns have several cards.
+  for (const width of [1440 - 396 - 2 * 16, 780, 500, 200, 1400]) {
+    const layout = layoutCanvas(populated, width);
+    assert.equal(layout.width, width);
+    assert.equal(layout.nodes.length, 16);
+    for (const node of layout.nodes) {
+      assert.ok(node.x >= 0 && node.x + node.w <= width, `${node.kind} exceeds ${width}`);
+      assert.ok(node.y + node.h <= layout.height);
+      for (const other of layout.nodes) {
+        if (other === node) continue;
+        assert.ok(node.x + node.w <= other.x || other.x + other.w <= node.x || node.y + node.h <= other.y || other.y + other.h <= node.y, 'cards must not overlap');
+      }
+    }
+  }
+  assert.equal(layoutCanvas(populated).width, 1012);
+  assert.deepEqual(layoutCanvas(populated).nodes.filter(({ kind }) => kind === 'alert').map(({ x, y }) => [x, y]), [[0, 1210], [0, 1400], [0, 1590], [0, 1780], [0, 1970]]);
 });
 
 test('untrusted snapshot values remain text with no HTML nodes or executable links', () => {
