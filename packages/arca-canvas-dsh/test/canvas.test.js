@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspect } from 'node:util';
 import { runInNewContext } from 'node:vm';
@@ -10,7 +10,7 @@ import { Context } from '@deepseek-ai/cordis';
 import yaml from 'js-yaml';
 import * as plugin from '../index.js';
 import { createArcaClient, PROTOCOL_VERSION } from '../src/arca-client.js';
-import { collectSnapshot, createSnapshotCache } from '../src/snapshot.js';
+import { collectSnapshot, createSnapshotCache, emptySnapshot } from '../src/snapshot.js';
 
 const fixtures = JSON.parse(await readFile(new URL('./fixtures.json', import.meta.url), 'utf8'));
 const sentinel = 'arca_test_bearer_do_not_publish';
@@ -101,7 +101,7 @@ test('all six fixtures become one snapshot with project-qualified instances', as
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans', 'devices', 'phones', 'desktops']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'databases', 'metrics', 'alerts', 'plans', 'devices', 'phones', 'desktops']);
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
   assert.equal(snapshot.error, null);
   assert.equal(snapshot.approvalUrl, '');
@@ -229,6 +229,7 @@ function exchange(socketPath, path, method = 'GET') {
 test('Cordis receives row config, serves cached GET routes without a sidebar, and disposes', async (t) => {
   const { dir, config } = await sandbox(t);
   config.approvalUrl = 'https://example.com/approve';
+  config.nodeName = 'Example machine';
   const calls = await fakeArca(t, config, (body) => toolResult(body,
     body.params.name === 'arca_status' ? { ...fixtures.arca_status, node: '<script>untrusted</script>' } : fixtures[body.params.name]));
   const routes = [];
@@ -255,6 +256,7 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   }
   assert.equal(snapshot.status, 200);
   assert.equal(JSON.parse(snapshot.body).approvalUrl, config.approvalUrl);
+  assert.equal(JSON.parse(snapshot.body).nodeName, 'Example machine');
   assert.equal(JSON.parse(snapshot.body).machine.node, '<script>untrusted</script>');
   assert.equal(snapshot.headers['cache-control'], 'no-store');
   const page = await exchange(socketPath, '/arca-canvas');
@@ -290,6 +292,9 @@ test('bundle patch has one configured row and schema rejects invalid settings', 
   assert.deepEqual(validate(row.config).value, row.config);
   assert.ok(validate({ ...row.config, pollMs: 0 }).issues);
   assert.ok(validate({ ...row.config, socketPath: 'relative.sock' }).issues);
+  assert.ok(validate({ ...row.config, nodeName: 42 }).issues);
+  assert.equal(validate({ ...row.config, nodeName: 'Example machine' }).value.nodeName, 'Example machine');
+  assert.equal(validate({ ...row.config, nodeName: '' }).value.nodeName, '');
   for (const approvalUrl of ['/approve', 'javascript:alert(1)', 'https://', 'https://user:pass@example.com/approve']) {
     assert.ok(validate({ ...row.config, approvalUrl }).issues);
   }
@@ -335,6 +340,8 @@ test('built client registers a browser-only module without host imports', async 
   await fiber.dispose();
   assert.equal(disposed, true);
   assert.equal(source.includes('viewerTokenPath'), false);
+  const page = await readFile(new URL('../page.js', import.meta.url), 'utf8');
+  assert.doesNotMatch(page, /node:os|hostname\s*\(/);
 });
 
 test('host snapshot route returns Arca cards within 100ms while device HTTP never answers', async (t) => {
@@ -380,4 +387,14 @@ test('host snapshot route returns Arca cards within 100ms while device HTTP neve
   await fiber.dispose();
   await until(() => closed === deviceRequests);
   t.diagnostic(`host first snapshot ${elapsed.toFixed(1)}ms (<100ms); pending device request aborted on disposal`);
+});
+
+test('host snapshots resolve a human node name without using the machine id', async () => {
+  const client = { async call(tool) { return fixtures[tool]; } };
+  for (const [nodeName, expected] of [[undefined, hostname().trim() || 'Machine'], ['', 'Machine'], ['  \t ', 'Machine'], ['  Example machine  ', 'Example machine']]) {
+    const snapshot = await collectSnapshot(client, { nodeName });
+    assert.equal(snapshot.nodeName, expected);
+    assert.equal(emptySnapshot({ nodeName }).nodeName, expected);
+    assert.match(snapshot.machine.node, /^[a-f0-9]{64}$/);
+  }
 });

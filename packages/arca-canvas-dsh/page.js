@@ -10,6 +10,7 @@
   };
   var CONTENT_WIDTH = 1440 - 396 - 2 * 16;
   var COLUMN_GAP = 40;
+  var COLUMN_HEIGHT = 690;
   function spread(items) {
     const sum = items.reduce((height2, item) => height2 + item.h, 0);
     const height = Math.max(480, sum + 30 * (items.length - 1));
@@ -23,11 +24,7 @@
   }
   var list = (value) => Array.isArray(value) ? value : [];
   function alertRows(alerts) {
-    return Array.isArray(alerts) ? alerts : [
-      ...list(alerts?.firing).map((row) => ({ ...row, state: "firing" })),
-      ...list(alerts?.unknown).map((row) => ({ ...row, state: "unknown" })),
-      ...list(alerts?.resolvedRecent).map((row) => ({ ...row, state: "resolved" }))
-    ];
+    return Array.isArray(alerts) ? alerts.filter((row) => row.state === "firing") : list(alerts?.firing).map((row) => ({ ...row, state: "firing" }));
   }
   function layoutCanvas(snapshot, contentWidth = CONTENT_WIDTH) {
     const groups = {
@@ -42,22 +39,30 @@
     let x = 0;
     let y = 0;
     let bottom = 0;
-    for (const [kind, rows] of Object.entries(groups)) {
-      if (!rows.length) continue;
-      const column = COLUMNS[kind];
-      const w = Math.min(column.w, contentWidth);
-      if (x > 0 && x + w > contentWidth) {
-        x = 0;
-        y = bottom + COLUMN_GAP;
-      }
-      const key = (row) => `${row.project ?? ""}/${row.name ?? row.node ?? row.rule ?? ""}`;
+    const key = (row) => `${row.project ?? ""}/${row.name ?? row.node ?? row.rule ?? ""}`;
+    const columns = Object.entries(groups).map(([kind, rows]) => {
       const sorted = [...rows].sort((a, b) => key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0);
-      for (const [index, item] of spread(sorted.map((data) => ({ data, h: column.h }))).entries()) {
-        const node = { kind, id: `${kind}:${key(item.data)}:${index}`, x, w, ...item, y: y + item.y };
-        nodes.push(node);
-        bottom = Math.max(bottom, node.y + node.h);
+      const capacity = Math.max(1, Math.floor((COLUMN_HEIGHT + 30) / (COLUMNS[kind].h + 30)));
+      return { kind, sorted, capacity };
+    });
+    for (let offset = 0; columns.some(({ sorted, capacity }) => offset * capacity < sorted.length); offset++) {
+      for (const { kind, sorted, capacity } of columns) {
+        const start = offset * capacity;
+        const rows = sorted.slice(start, start + capacity);
+        if (!rows.length) continue;
+        const column = COLUMNS[kind];
+        const w = Math.min(column.w, contentWidth);
+        if (x > 0 && x + w > contentWidth) {
+          x = 0;
+          y = bottom + COLUMN_GAP;
+        }
+        for (const [index, item] of spread(rows.map((data) => ({ data, h: column.h }))).entries()) {
+          const node = { kind, id: `${kind}:${key(item.data)}:${start + index}`, x, w, ...item, y: y + item.y };
+          nodes.push(node);
+          bottom = Math.max(bottom, node.y + node.h);
+        }
+        x += w + COLUMN_GAP;
       }
-      x += w + COLUMN_GAP;
     }
     return { width: contentWidth, height: Math.max(620, bottom + 76), nodes };
   }
@@ -82,16 +87,24 @@
   }
   var text = (value, fallback = "Not available") => value == null ? fallback : String(value);
   var number = (value, suffix = "") => Number.isFinite(value) ? `${Math.round(value * 10) / 10}${suffix}` : "Not available";
+  function uptime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return "Not available";
+    const [unit, scale] = seconds < 120 ? ["s", 1] : seconds < 3600 ? ["m", 60] : seconds < 86400 ? ["h", 3600] : ["d", 86400];
+    return `${Math.round(seconds / scale)} ${unit}`;
+  }
+  function ownerLabel(owner) {
+    return ["kernel", "retained"].includes(owner?.class ?? owner) ? "Managed by Arca" : "External";
+  }
   function cardContent(node, snapshot) {
     const row = node.data;
     switch (node.kind) {
       case "machine": {
         const metrics = snapshot.metrics?.latest;
         return {
-          title: text(row.node, "Machine"),
+          title: snapshot.nodeName?.trim() || "Machine",
           kind: "Machine",
           icon: "\u25C8",
-          lines: [`CPU ${number(metrics?.cpu?.usedPct, "%")}`, `Load ${number(metrics?.load?.one)}`, `Uptime ${number(row.uptimeS, " s")}`],
+          lines: [`CPU ${number(metrics?.cpu?.usedPct, "%")}`, `Load ${number(metrics?.load?.one)}`, `Arca up ${uptime(row.uptimeS)}`],
           state: row.incusReachable ? "Incus reachable" : "Incus unavailable",
           meta: text(row.mode)
         };
@@ -101,7 +114,7 @@
           title: text(row.name, "Instance"),
           kind: text(row.kind, "Instance"),
           icon: "\u25C7",
-          lines: [`Project ${text(row.project)}`, `Owner ${text(row.owner?.class ?? row.owner, "Not available")}`, row.privileged ? "Privileged" : "Unprivileged"],
+          lines: [`Project ${text(row.project)}`, ownerLabel(row.owner), row.privileged ? "Privileged" : "Unprivileged"],
           state: text(row.status, "Unknown"),
           meta: row.identity ? "Identity" : "Instance"
         };
@@ -156,10 +169,12 @@
     bar.append(element(doc, "span", "arca-mode", text(snapshot.machine?.mode, "Read only")));
     const plans = Array.isArray(snapshot.plans) ? snapshot.plans.length : 0;
     const url = approvalUrl(snapshot.approvalUrl);
-    const badge = element(doc, url && plans ? "a" : "span", "arca-plans", `${plans} waiting plan${plans === 1 ? "" : "s"}`);
-    if (url && plans) badge.href = url;
     if (snapshot.devices === "unavailable") bar.append(element(doc, "span", "arca-devices", "Devices unavailable"));
-    bar.append(badge);
+    if (plans) {
+      const badge = element(doc, url ? "a" : "span", "arca-plans", `${plans} waiting plan${plans === 1 ? "" : "s"}`);
+      if (url) badge.href = url;
+      bar.append(badge);
+    }
     const main = element(doc, "div", "arca-main");
     const stage = element(doc, "section", "arca-stage");
     stage.setAttribute("aria-label", "Infrastructure canvas");
@@ -167,7 +182,18 @@
     const status = element(doc, "div", "arca-status", snapshot.error ?? `Snapshot ${text(snapshot.at, "pending")}`);
     status.setAttribute("role", "status");
     const world = element(doc, "div", "arca-world");
-    stage.append(status, world);
+    const summary = element(doc, "div", "arca-summary");
+    const counts = [
+      ["machine", snapshot.machine ? 1 : 0],
+      ["instance", snapshot.instances?.length ?? 0],
+      ["database", snapshot.databases?.length ?? 0],
+      ["phone", snapshot.phones?.length ?? 0],
+      ["desktop", snapshot.desktops?.length ?? 0]
+    ];
+    summary.append(element(doc, "span", "", counts.map(([kind, count]) => `${count} ${kind}${count === 1 ? "" : "s"}`).join(" \xB7 ")));
+    const unknown = Array.isArray(snapshot.alerts?.unknown) ? snapshot.alerts.unknown.length : 0;
+    if (unknown) summary.append(element(doc, "span", "arca-no-data", `${unknown} check${unknown === 1 ? " has" : "s have"} no data`));
+    stage.append(status, summary, world);
     const panel = element(doc, "aside", "arca-panel");
     const steps = element(doc, "div", "arca-steps-placeholder");
     steps.dataset.region = "steps";

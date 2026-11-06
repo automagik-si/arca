@@ -198,6 +198,14 @@ a.arca-plans:focus-visible {
 .arca-world {
   position: relative;
 }
+.arca-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-bottom: 16px;
+  color: var(--arca-muted);
+  font-size: 12px;
+}
 .arca-panel {
   width: 396px;
   flex: none;

@@ -10,7 +10,6 @@ import * as plugin from '../index.js';
 
 const fixture = JSON.parse(await readFile(new URL('./fixtures.json', import.meta.url), 'utf8'));
 fixture.node_metrics.latest = { cpu: { usedPct: 24.5, cores: 8 }, load: { one: 1.2 } };
-fixture.alerts_list.firing = [{ rule: 'cpu-high', message: 'CPU exceeded its threshold', target: 'example-node' }];
 const devices = JSON.parse(await readFile(new URL('./devices-fixtures.json', import.meta.url), 'utf8'));
 const reference = { topbar: [0, 0, 1440, 56], canvas: [0, 56, 1044, 844], steps: [1045, 124, 395, 616] };
 const evidence = process.env.ARCA_CANVAS_EVIDENCE_DIR;
@@ -54,7 +53,7 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   let route;
   const ctx = new Context();
   ctx.provide('webServer', { register(value) { route = value; return () => {}; } });
-  const fiber = await ctx.plugin(plugin, { socketPath, viewerTokenPath, devicesUrl, devicesTokenPath, pollMs: 100, approvalUrl: 'https://example.com/approve' });
+  const fiber = await ctx.plugin(plugin, { socketPath, viewerTokenPath, devicesUrl, devicesTokenPath, pollMs: 100, nodeName: 'Example machine', approvalUrl: 'https://example.com/approve' });
   t.after(() => fiber.dispose());
   const web = createServer((req, res) => route.handler(req, res));
   await new Promise((resolve) => web.listen(0, '127.0.0.1', resolve));
@@ -70,13 +69,21 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     let snapshotRequests = 0;
     page.on('request', (request) => { if (request.url().endsWith('/snapshot')) snapshotRequests++; });
     await page.goto(`${origin}/arca-canvas`);
-    await page.waitForFunction(() => document.querySelector('[data-kind="machine"]')?.textContent.includes('example-node') && document.querySelector('[data-kind="desktop"]'));
-    assert.equal(await page.locator('.arca-card').count(), 7);
+    await page.waitForFunction(() => document.querySelector('[data-kind="machine"]')?.textContent.includes('Example machine') && document.querySelector('[data-kind="desktop"]'));
+    assert.equal(await page.locator('.arca-card').count(), 6);
     assert.equal(await page.locator('.arca-devices').count(), 0);
+    assert.equal(await page.locator('[data-kind="alert"]').count(), 0);
+    assert.equal(await page.locator('.arca-no-data').textContent(), '2 checks have no data');
+    assert.equal(await page.locator('.arca-no-data').evaluate((node) => getComputedStyle(node).color),
+      await page.locator('.arca-crumb').evaluate((node) => getComputedStyle(node).color));
+    assert.equal(await page.locator('[data-kind="machine"] strong').textContent(), 'Example machine');
+    assert.match(await page.locator('[data-kind="machine"]').textContent(), /Arca up 85 s/);
+    assert.ok(!(await page.locator('[data-kind="machine"]').textContent()).includes(fixture.arca_status.node));
+    assert.match(await page.locator('.arca-summary').textContent(), /1 machine · 2 instances · 1 database · 1 phone · 1 desktop/);
     assert.match(await page.locator('[data-kind="phone"]').textContent(), /Screen 720 × 1280/);
     const instanceText = await page.locator('[data-kind="instance"]').allTextContents();
     assert.equal(instanceText.length, 2);
-    assert.ok(instanceText.every((value) => value.includes('Owner foreign') && !value.includes('[object Object]')));
+    assert.ok(instanceText.every((value) => value.includes('External') && !value.includes('Owner foreign') && !value.includes('[object Object]')));
     assert.equal(await page.locator('.arca-plans').getAttribute('href'), 'https://example.com/approve');
     assert.match(await page.locator('.arca-steps-placeholder').textContent(), /hidden/);
     const measured = await page.evaluate(() => {
@@ -110,7 +117,7 @@ test('real fallback renders fixture snapshots safely in light and dark without a
       assert.ok(measured.regions[region].every((value, i) => Math.abs(value - box[i]) <= 12), `${scheme} ${region}: ${measured.regions[region]}`);
     }
     assert.deepEqual(errors, []);
-    if (evidence) await page.screenshot({ path: join(evidence, `${scheme}-1440x900.png`) });
+    if (evidence) await page.screenshot({ path: join(evidence, `fixture-${scheme}-1440x900.png`) });
     results.push({ scheme, ...measured });
     // Resize the embedding root (sidebar) and then the window, before a poll.
     const requestsBeforeResize = snapshotRequests;
@@ -149,7 +156,7 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(`${origin}/arca-canvas`);
     await page.waitForFunction(() => document.querySelector('.arca-devices')?.textContent === 'Devices unavailable');
-    assert.equal(await page.locator('.arca-card').count(), 5);
+    assert.equal(await page.locator('.arca-card').count(), 4);
     assert.equal(await page.locator('[data-kind="phone"], [data-kind="desktop"]').count(), 0);
     assert.match(await page.locator('.arca-status').textContent(), /^Snapshot /);
     assert.match(await page.locator('.arca-steps-placeholder').textContent(), /hidden/);
@@ -178,11 +185,54 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   }
   if (evidence) await writeFile(join(evidence, 'unavailable-regions.json'), JSON.stringify(unavailableResults, null, 2));
 
+  const largeResults = [];
+  for (const scheme of ['light', 'dark']) {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, colorScheme: scheme });
+    const errors = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    await page.route('**/arca-canvas/snapshot', (route) => route.fulfill({ json: fixture.canvas41 }));
+    await page.goto(`${origin}/arca-canvas`);
+    await page.waitForFunction(() => document.querySelectorAll('.arca-card').length === 41);
+    assert.equal(await page.locator('.arca-plans').count(), 0);
+    assert.equal(await page.locator('[data-kind="alert"]').count(), 3);
+    assert.match(await page.locator('.arca-summary').textContent(), /1 machine · 30 instances · 1 database · 5 phones · 1 desktop/);
+    const measured = await page.evaluate(() => {
+      const stage = document.querySelector('.arca-stage');
+      const world = document.querySelector('.arca-world');
+      const stageTop = stage.getBoundingClientRect().top;
+      const worldBox = world.getBoundingClientRect();
+      return { width: world.clientWidth, cards: [...world.children].map((card) => {
+        const box = card.getBoundingClientRect();
+        return { kind: card.dataset.kind, x: box.x - worldBox.x, y: box.y - worldBox.y,
+          canvasY: box.y - stageTop, w: box.width, h: box.height };
+      }) };
+    });
+    assert.equal(measured.width, 1012);
+    assert.ok(new Set(measured.cards.filter(({ kind }) => kind === 'instance').map(({ x }) => x)).size > 1);
+    assert.ok(Math.min(...measured.cards.filter(({ kind }) => kind === 'phone').map(({ canvasY }) => canvasY)) < 2 * 844);
+    for (const card of measured.cards) {
+      assert.ok(card.x >= 0 && card.x + card.w <= 1012);
+      for (const other of measured.cards) {
+        if (other === card) continue;
+        assert.ok(card.x + card.w <= other.x || other.x + other.w <= card.x || card.y + card.h <= other.y || other.y + other.h <= card.y, 'browser cards must not overlap');
+      }
+    }
+    assert.deepEqual(errors, []);
+    if (evidence) {
+      await page.screenshot({ path: join(evidence, `fixture-41-${scheme}-1440x900.png`) });
+      await page.locator('.arca-stage').evaluate((node) => { node.scrollTop = 720; });
+      await page.screenshot({ path: join(evidence, `fixture-41-${scheme}-phones-1440x900.png`) });
+    }
+    largeResults.push({ scheme, ...measured });
+    await page.close();
+  }
+  if (evidence) await writeFile(join(evidence, 'fixture-41-regions.json'), JSON.stringify(largeResults, null, 2));
+
   const page = await browser.newPage();
   const malicious = '<img src=x onerror="window.injected=1"><script>window.injected=1</script>';
   await page.route('**/arca-canvas/snapshot', (route) => route.fulfill({ json: {
     at: malicious, error: malicious, approvalUrl: 'javascript:window.injected=1',
-    machine: { node: malicious, mode: malicious }, instances: [{ name: malicious }],
+    nodeName: malicious, machine: { node: malicious, mode: malicious }, instances: [{ name: malicious }],
     databases: [{ name: malicious }], phones: [{ name: malicious, network: malicious }], desktops: [{ name: malicious, status: malicious }], alerts: { firing: [{ rule: malicious, message: malicious }] }, plans: [{}],
   } }));
   await page.goto(`${origin}/arca-canvas`);

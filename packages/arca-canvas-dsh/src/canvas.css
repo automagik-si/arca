@@ -118,6 +118,7 @@ a.arca-plans:focus-visible { outline: 2px solid var(--arca-accent); outline-offs
 }
 .arca-status { position: absolute; top: 16px; left: 16px; max-width: calc(100% - 32px); color: var(--arca-muted); font-size: 12px; overflow-wrap: anywhere; }
 .arca-world { position: relative; }
+.arca-summary { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-bottom: 16px; color: var(--arca-muted); font-size: 12px; }
 .arca-panel { width: 396px; flex: none; border-left: 1px solid var(--arca-line-2); background: var(--arca-surface); padding-top: 68px; }
 .arca-steps-placeholder { height: 616px; padding: 20px; color: var(--arca-muted); }
 .arca-steps-placeholder h2 { margin: 0 0 14px; color: var(--arca-ink); font-size: 14px; }

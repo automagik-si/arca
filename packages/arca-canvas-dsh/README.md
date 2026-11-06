@@ -37,6 +37,7 @@ config:
   socketPath: /run/arca/arca.sock
   viewerTokenPath: /path/to/arca-viewer.token
   pollMs: 5000
+  nodeName: 'Example machine'
   approvalUrl: ''
   devicesUrl: ''
   devicesTokenPath: ''
@@ -47,6 +48,7 @@ config:
 | `socketPath` | Required absolute path to Arca's `listen.unix` socket. DSH must run as the same user as Arca. |
 | `viewerTokenPath` | Required absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
 | `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Arca polls never overlap; the device phase runs independently. |
+| `nodeName` | Optional human machine title. Defaults to the host OS hostname; an empty or whitespace-only name becomes `Machine`. The raw Arca node ID is never the card title. |
 | `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
 | `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
 | `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
@@ -75,14 +77,16 @@ readers.
 ## Snapshot
 
 The JSON object always has `at` (ISO timestamp), `error` (null or safe error text),
-`approvalUrl` (empty or the configured approval URL), `machine`, `instances`,
-`databases`, `metrics`, `alerts`, `plans`, `devices`, `phones`, and `desktops`.
+`approvalUrl` (empty or the configured approval URL), `nodeName` (resolved by the
+host), `machine`, `instances`, `databases`, `metrics`, `alerts`, `plans`, `devices`,
+`phones`, and `desktops`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
 - `alerts` holds the full `alerts_list` result, preserving firing, unknown and
-  recent resolved alerts plus health metadata.
+  recent resolved alerts plus health metadata. Only firing alerts get cards; unknown
+  checks appear as a muted no-data count. Resolved alerts have no cards.
 
 Failed reads leave `machine`/`metrics` null or the other fields empty arrays.
 Successful reads survive partial failures. Requests use MCP protocol
@@ -117,6 +121,14 @@ the snapshot or the browser bundle. Arca reads keep their existing error behavio
 A ResizeObserver on the stage batches reflow into an animation frame when the
 window or embedding sidebar changes width. Reflow measures the stage content box;
 empty columns consume no space, and populated columns wrap to keep cards inside it.
+Long kinds split into stacks no taller than 690 px; each kind gets its first stack
+before overflow stacks, so phones stay near the top. A muted summary counts
+machines, instances, databases, phones and desktops. Instance ownership reads
+`Managed by Arca` only for kernel and retained objects; droidd, foreign,
+contested, missing and unknown ownership read `External`. Waiting-plan badges
+appear only above zero.
+Machine uptime reads `Arca up`, keeping short spans such as 85 seconds in seconds
+and rounding longer spans to minutes, hours or days.
 The observer disconnects when the canvas stops.
 
 ## Develop
@@ -139,6 +151,9 @@ into a temporary directory and compare SHA-256 hashes.
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.
 Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test’s
 1440×900 light/dark screenshots and measured rectangles outside the repository.
+The standard fixture has zero firing alerts and two missing checks. The 41-card
+stress fixture has 30 instances, five phones, one desktop, one machine, one
+database and three firing alerts.
 
 The client contract is pinned to the sidebar’s 0.24.1 API: package metadata uses
 `dsh.client.inject: ["dsh-better-sidebar"]` (package IDs), while the client exports

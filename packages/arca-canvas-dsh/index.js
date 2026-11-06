@@ -12,6 +12,7 @@ export const Config = z.object({
   socketPath: z.string().pattern(/^\//).required(),
   viewerTokenPath: z.string().pattern(/^\//).required(),
   pollMs: z.number().min(100).max(2147483647).step(1).default(5000),
+  nodeName: z.string(),
   approvalUrl: z.transform(z.string().default(''), (value) => {
     if (value && !approvalUrl(value)) throw new z.ValidationError('approvalUrl must be an absolute HTTP(S) URL without credentials', { path: ['approvalUrl'] });
     return value;
@@ -32,7 +33,7 @@ const assets = new Map([
 
 export function apply(ctx, config) {
   if (config.approvalUrl && !approvalUrl(config.approvalUrl)) throw new Error('approvalUrl must be an absolute HTTP(S) URL without credentials');
-  const cache = createSnapshotCache(createArcaClient(config), config.pollMs, { approvalUrl: approvalUrl(config.approvalUrl) }, createDevicesClient(config));
+  const cache = createSnapshotCache(createArcaClient(config), config.pollMs, { approvalUrl: approvalUrl(config.approvalUrl), nodeName: config.nodeName }, createDevicesClient(config));
   ctx.effect(() => () => cache.stop());
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
