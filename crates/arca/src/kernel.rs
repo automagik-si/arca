@@ -107,6 +107,19 @@ impl Kernel {
         self.verifier.verifier_mut().replace_passkey_lines(lines);
     }
 
+    /// Verifies a WebAuthn assertion over `statement` against the owner's passkeys, advancing the shared sign count. The
+    /// sign-in route uses this after it has spent its own challenge; approvals use the same store.
+    pub fn verify_passkey(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        self.verifier
+            .verifier()
+            .verify_passkey(namespace, statement, signature)
+    }
+
     /// Proposes `changes` as the next desired-state document and reconciles toward it. The document is persisted before it is
     /// reconciled, and the converged and retained sets are persisted after.
     pub fn propose(

@@ -42,6 +42,10 @@ pub struct NodeConfig {
     /// It is the WebAuthn rp id and origin; it is not the host an approval statement names.
     #[serde(default)]
     pub approval_origin: Option<String>,
+    /// The loopback DSH origin the remote canvas proxies: `http://127.0.0.1:3081` by default. A literal loopback IP and port
+    /// are required; a host name, a non-loopback address, a path or https is refused before anything listens.
+    #[serde(default = "default_canvas_origin")]
+    pub canvas_origin: String,
     /// The node link endpoint and opaque ALPN routes.
     #[serde(default)]
     pub link: Option<arca_link::Config>,
@@ -130,6 +134,8 @@ pub enum ConfigError {
     ApprovalHost,
     /// The approval origin is not an https origin with a host name and at most a non-443 port. The value is left out.
     ApprovalOrigin,
+    /// The canvas origin is not an http literal loopback IP and port. The value is left out.
+    CanvasOrigin,
     /// Kernel projects are named, and no droidd project is listed to exclude.
     DroiddProjectsEmpty,
     /// The link config contains an invalid name or route.
@@ -171,6 +177,10 @@ impl fmt::Display for ConfigError {
             Self::ApprovalOrigin => write!(
                 f,
                 "approvalOrigin is refused: it must be https://, a lowercase host name, and at most a non-443 port, with no path"
+            ),
+            Self::CanvasOrigin => write!(
+                f,
+                "canvasOrigin is refused: it must be http:// and a literal loopback IP with a port, and no path"
             ),
         }
     }
@@ -237,7 +247,26 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::ApprovalOrigin);
     }
+    if canvas_origin_addr(&config.canvas_origin).is_none() {
+        return Err(ConfigError::CanvasOrigin);
+    }
     Ok(())
+}
+
+/// The default canvas DSH origin: literal loopback, the port the stock profile listens on.
+pub fn default_canvas_origin() -> String {
+    "http://127.0.0.1:3081".to_string()
+}
+
+/// The socket address of a literal loopback `http://` origin, or `None` for anything else. A host name, a non-loopback IP, a
+/// path, credentials, https, a missing port or port 0 are refused.
+pub fn canvas_origin_addr(origin: &str) -> Option<SocketAddr> {
+    let authority = origin.strip_prefix("http://")?;
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@']) {
+        return None;
+    }
+    let addr: SocketAddr = authority.parse().ok()?;
+    (addr.ip().is_loopback() && addr.port() != 0).then_some(addr)
 }
 
 /// Whether `origin` is `https://`, a lowercase DNS host name, and at most a port that is not 443, with no path. The host is
@@ -498,5 +527,40 @@ mod tests {
         }
         config.approval_origin = None;
         assert_eq!(check(&config), Ok(()));
+    }
+
+    #[test]
+    fn canvas_origin_must_be_http_loopback_literal_with_a_port() {
+        let mut config = config_with(None);
+        assert_eq!(config.canvas_origin, "http://127.0.0.1:3081");
+        for bad in [
+            "https://127.0.0.1:3081",
+            "http://localhost:3081",
+            "http://192.168.1.5:3081",
+            "http://127.0.0.1",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:3081/",
+            "http://127.0.0.1:3081/canvas",
+            "http://user@127.0.0.1:3081",
+        ] {
+            config.canvas_origin = bad.to_string();
+            assert_eq!(
+                check(&config),
+                Err(ConfigError::CanvasOrigin),
+                "{bad:?} is not a loopback canvas origin"
+            );
+        }
+        for good in [
+            "http://127.0.0.1:3081",
+            "http://127.0.0.2:8080",
+            "http://[::1]:3081",
+        ] {
+            config.canvas_origin = good.to_string();
+            assert_eq!(
+                check(&config),
+                Ok(()),
+                "{good:?} is a loopback canvas origin"
+            );
+        }
     }
 }

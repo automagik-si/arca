@@ -7,18 +7,24 @@ mod webauthn;
 
 use std::fs;
 use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arca::approve_page::{self, SetupCodeDisplay};
+use arca::canvas::Canvas;
 use arca::desired_store::EntryChange;
 use arca::handlers::Clock;
 use arca::kernel::Kernel;
-use arca_approval::{STATE_PASSKEYS_FILE, load_state_passkeys, parse_passkeys};
+use arca_approval::{
+    PASSKEY_COUNTS_FILE, STATE_PASSKEYS_FILE, load_state_passkeys, parse_passkeys,
+};
+use arca_kernel::canon::canonical_json;
 use arca_kernel::desired::EntryId;
 use arca_mcp::{Server, TokenStore, serve_unix};
 use common::*;
@@ -46,6 +52,107 @@ impl SetupCodeDisplay for FakeDisplay {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpstreamMode {
+    Ok,
+    Error,
+    Timeout,
+}
+
+struct UpstreamInner {
+    mode: Mutex<UpstreamMode>,
+    stop: AtomicBool,
+}
+
+/// A loopback fake DSH: one response per request, with upstream headers serve must drop.
+struct TestUpstream {
+    addr: SocketAddr,
+    inner: Arc<UpstreamInner>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TestUpstream {
+    fn start() -> Arc<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a fake DSH listener");
+        listener
+            .set_nonblocking(true)
+            .expect("a nonblocking fake DSH");
+        let addr = listener.local_addr().expect("the fake DSH address");
+        let inner = Arc::new(UpstreamInner {
+            mode: Mutex::new(UpstreamMode::Ok),
+            stop: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&inner);
+        let thread = std::thread::spawn(move || {
+            while !worker.stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mode = *worker.mode.lock().expect("upstream mode");
+                        if mode == UpstreamMode::Timeout {
+                            std::thread::sleep(Duration::from_secs(4));
+                            continue;
+                        }
+                        let mut raw = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => raw.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        let request = String::from_utf8_lossy(&raw);
+                        let path = request
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/");
+                        let (status, body) = if mode == UpstreamMode::Error {
+                            ("500 Internal Server Error", "no")
+                        } else {
+                            match path {
+                                "/arca-canvas/page.css" => ("200 OK", "body { color: black; }"),
+                                "/arca-canvas/page.js" => ("200 OK", "/* canvas */"),
+                                "/arca-canvas/snapshot" => {
+                                    ("200 OK", "{\"instances\":[],\"devices\":\"ok\"}")
+                                }
+                                _ => ("404 Not Found", "missing"),
+                            }
+                        };
+                        let head = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nSet-Cookie: upstream=bad\r\nLocation: /elsewhere\r\nCache-Control: max-age=120\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(head.as_bytes());
+                        let _ = stream.write_all(body.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Arc::new(Self {
+            addr,
+            inner,
+            thread: Some(thread),
+        })
+    }
+
+    fn set_mode(&self, mode: UpstreamMode) {
+        *self.inner.mode.lock().expect("upstream mode") = mode;
+    }
+}
+
+impl Drop for TestUpstream {
+    fn drop(&mut self) {
+        self.inner.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// A node with a fake provider and the merged router served on a unix socket. The passkey may start enrolled (Group 1
 /// developer registration) or absent (the setup-code flow).
 struct Rig {
@@ -58,6 +165,8 @@ struct Rig {
     state_dir: PathBuf,
     clock: Arc<AtomicU64>,
     display: Arc<FakeDisplay>,
+    canvas: Canvas,
+    upstream: Arc<TestUpstream>,
     _runtime: Runtime,
 }
 
@@ -81,6 +190,7 @@ impl Rig {
         refusing: bool,
     ) -> (Rig, SoftPasskey) {
         let scratch = Scratch::new(tag);
+        let upstream = TestUpstream::start();
         let fake = start_fake(&scratch);
         let key = SoftPasskey::from_seed(1);
         let lines = if enrolled {
@@ -127,12 +237,14 @@ impl Rig {
             state_dir.clone(),
             Arc::clone(&display) as Arc<dyn SetupCodeDisplay>,
         )
+        .with_canvas_origin(&format!("http://{}", upstream.addr))
         .with_log(Arc::new(move |line| {
             captured_logs
                 .lock()
                 .expect("log lock")
                 .push(line.to_string())
         }));
+        let canvas = page.canvas().clone();
         let proxy_router = if with_page {
             base.clone().merge(page.router(true))
         } else {
@@ -169,6 +281,8 @@ impl Rig {
             state_dir,
             clock,
             display,
+            canvas,
+            upstream,
             _runtime: runtime,
         };
         (rig, key)
@@ -229,6 +343,23 @@ impl Rig {
         origin: Option<&str>,
         body: &[u8],
     ) -> (u16, Vec<u8>) {
+        let (status, _, body) =
+            self.request_full_on(proxy, forwarded, method, path, origin, body, None, &[]);
+        (status, body)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request_full_on(
+        &self,
+        proxy: bool,
+        forwarded: Option<&str>,
+        method: &str,
+        path: &str,
+        origin: Option<&str>,
+        body: &[u8],
+        cookie: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> (u16, String, Vec<u8>) {
         let socket = if proxy {
             &self.proxy_socket
         } else {
@@ -248,6 +379,12 @@ impl Rig {
         if let Some(origin) = origin {
             head.push_str(&format!("Origin: {origin}\r\n"));
         }
+        if let Some(cookie) = cookie {
+            head.push_str(&format!("Cookie: {cookie}\r\n"));
+        }
+        for (name, value) in extra {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
         if !body.is_empty() {
             head.push_str("Content-Type: application/json\r\n");
         }
@@ -261,14 +398,35 @@ impl Rig {
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
             .expect("a response head");
-        let head = String::from_utf8_lossy(&raw[..split]);
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
         let status = head
             .lines()
             .next()
             .and_then(|line| line.split_whitespace().nth(1))
             .and_then(|status| status.parse().ok())
             .expect("a status");
-        (status, raw[split + 4..].to_vec())
+        (status, head, raw[split + 4..].to_vec())
+    }
+
+    fn get_full(&self, path: &str, origin: Option<&str>) -> (u16, String, Vec<u8>) {
+        self.request_full_on(false, None, "GET", path, origin, &[], None, &[])
+    }
+
+    fn get_with_cookie(&self, path: &str, cookie: &str) -> (u16, String, Vec<u8>) {
+        self.request_full_on(false, None, "GET", path, None, &[], Some(cookie), &[])
+    }
+
+    fn post_full(&self, path: &str, origin: Option<&str>, body: Value) -> (u16, String, Vec<u8>) {
+        self.request_full_on(
+            false,
+            None,
+            "POST",
+            path,
+            origin,
+            &serde_json::to_vec(&body).expect("the body"),
+            None,
+            &[],
+        )
     }
 
     fn get(&self, path: &str, origin: Option<&str>) -> (u16, Vec<u8>) {
@@ -302,6 +460,35 @@ impl Rig {
     fn state_path(&self) -> PathBuf {
         self.state_dir.join(STATE_PASSKEYS_FILE)
     }
+}
+
+fn sign_in_statement(origin: &str, challenge: &str, now: u64) -> String {
+    canonical_json(&json!({
+        "kind": arca::canvas::STATEMENT_KIND,
+        "origin": origin,
+        "challenge": challenge,
+        "issuedMs": now,
+        "expiresMs": now + arca::canvas::CHALLENGE_TTL_MS,
+    }))
+    .expect("a canonical sign-in statement")
+}
+
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+        })
+        .map(|(_, value)| value.trim().to_string())
+}
+
+fn set_cookie(head: &str) -> String {
+    header_value(head, "set-cookie")
+        .expect("a Set-Cookie")
+        .split(';')
+        .next()
+        .expect("a cookie pair")
+        .to_string()
 }
 
 fn approval(key: &SoftPasskey, statement: &str) -> String {
@@ -1025,4 +1212,344 @@ fn refusing_verifier_rolls_back_existing_bytes_and_removes_a_new_file() {
         }
     }
     assert!(rig.logs.lock().expect("logs").is_empty());
+}
+
+#[test]
+fn canvas_signed_out_gets_the_sign_in_page_and_no_snapshot_bytes() {
+    let (rig, _) = Rig::new("canvas-signed-out", true);
+    let (status, head, body) = rig.get_full("/approve/canvas", None);
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("Sign in with passkey"));
+    assert_eq!(
+        header_value(&head, "content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        header_value(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    for path in [
+        "/approve/canvas/page.css",
+        "/approve/canvas/page.js",
+        "/approve/canvas/snapshot",
+    ] {
+        let (status, _, body) = rig.get_full(path, None);
+        assert_eq!(status, 401, "{path} without a session");
+        assert!(body.is_empty(), "{path} leaked bytes without a session");
+    }
+    let (status, head, _) = rig.get_full("/approve/canvas/extra", None);
+    assert_eq!(status, 404, "only the four exact URLs exist");
+    assert!(
+        header_value(&head, "content-security-policy").is_some(),
+        "a refused /approve path still carries the headers"
+    );
+    let (status, _, _) = rig.get_full("/approve/canvas/page.css/..", None);
+    assert_eq!(status, 404, "a traversal path is refused");
+    let (status, _, _) = rig.get_full("/approve/canvas/../plans", None);
+    assert_eq!(status, 404, "a parent traversal is refused");
+}
+
+#[test]
+fn canvas_sign_in_spends_the_challenge_and_sets_the_host_cookie() {
+    let (rig, key) = Rig::new("canvas-sign-in", true);
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200);
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let assertion = Assert::over(NAMESPACE, statement.as_bytes());
+    let request = json!({
+        "statement": statement,
+        "proof": key.proof_value(&assertion),
+    });
+    let (status, head, body) = rig.post_full("/approve/canvas", Some(ORIGIN), request.clone());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let cookie = set_cookie(&head);
+    assert!(cookie.starts_with("__Host-arca-canvas="));
+    let set = header_value(&head, "set-cookie").expect("a Set-Cookie");
+    for attribute in [
+        "Path=/",
+        "Secure",
+        "HttpOnly",
+        "SameSite=Strict",
+        "Max-Age=43200",
+    ] {
+        assert!(set.contains(attribute), "the cookie carries {attribute}");
+    }
+    assert!(!set.contains("Domain="));
+
+    let (status, head, body) = rig.get_with_cookie("/approve/canvas", &cookie);
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("data-arca-base=\"/approve/canvas\""));
+    assert_eq!(
+        header_value(&head, "content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+
+    let (status, head, body) = rig.get_with_cookie("/approve/canvas/snapshot", &cookie);
+    assert_eq!(status, 200);
+    assert_eq!(body, b"{\"instances\":[],\"devices\":\"ok\"}");
+    assert_eq!(
+        header_value(&head, "content-type").as_deref(),
+        Some("application/json; charset=utf-8")
+    );
+    assert_eq!(
+        header_value(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    assert!(header_value(&head, "set-cookie").is_none());
+    assert!(header_value(&head, "location").is_none());
+    assert!(!head.contains("upstream=bad"));
+    assert!(!head.contains("max-age=120"));
+
+    // The challenge is single use, so the same signed request is refused.
+    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), request);
+    assert_eq!(status, 403, "a spent challenge is refused");
+}
+
+#[test]
+fn canvas_rejects_a_request_without_a_live_challenge_before_verifying() {
+    let (rig, key) = Rig::new("canvas-no-live", true);
+    let statement = sign_in_statement(ORIGIN, &"ab".repeat(32), NOW);
+    let mut assertion = Assert::over(NAMESPACE, statement.as_bytes());
+    assertion.sign_count = 1;
+    let proof = key.proof_value(&assertion);
+    let counts = rig.state_dir.join(PASSKEY_COUNTS_FILE);
+    let before = fs::read(&counts).unwrap_or_default();
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": statement, "proof": proof }),
+    );
+    assert_eq!(status, 403);
+    let after = fs::read(&counts).unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "no signature verification ran without a challenge"
+    );
+    assert!(before.is_empty());
+}
+
+#[test]
+fn canvas_spends_the_challenge_before_verifying() {
+    let (rig, key) = Rig::new("canvas-spend-first", true);
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200);
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let mut wrong = Assert::over(NAMESPACE, statement.as_bytes());
+    wrong.origin = Some("https://elsewhere.example".to_string());
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": statement, "proof": key.proof_value(&wrong) }),
+    );
+    assert_eq!(status, 403, "the wrong-origin assertion is refused");
+    let good = Assert::over(NAMESPACE, statement.as_bytes());
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": statement, "proof": key.proof_value(&good) }),
+    );
+    assert_eq!(
+        status, 403,
+        "the challenge was spent before the failed verification"
+    );
+}
+
+#[test]
+fn canvas_expired_and_plan_statements_are_refused() {
+    let (rig, key) = Rig::new("canvas-expired", true);
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200);
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    rig.advance(arca::canvas::CHALLENGE_TTL_MS + 1);
+    let assertion = Assert::over(NAMESPACE, statement.as_bytes());
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": statement, "proof": key.proof_value(&assertion) }),
+    );
+    assert_eq!(status, 403, "an expired statement is refused");
+
+    let (_plan, plan_statement) = rig.waiting_plan();
+    let assertion = Assert::over(NAMESPACE, plan_statement.as_bytes());
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": plan_statement, "proof": key.proof_value(&assertion) }),
+    );
+    assert_eq!(status, 403, "an approval statement is not a sign-in");
+    assert!(
+        arca_approval::parse_statement(sign_in_statement(ORIGIN, &"cd".repeat(32), NOW).as_bytes())
+            .is_err(),
+        "the approval parser refuses a sign-in statement"
+    );
+}
+
+#[test]
+fn canvas_forged_and_expired_sessions_fail_closed() {
+    let (rig, _) = Rig::new("canvas-session", true);
+    let cookie = rig
+        .canvas
+        .issue_session("passkey:test", NOW)
+        .expect("a session cookie");
+    assert!(cookie.contains("SameSite=Strict"));
+    let pair = cookie.split(';').next().expect("cookie pair").to_string();
+    assert_eq!(
+        rig.get_with_cookie("/approve/canvas/snapshot", &pair).0,
+        200
+    );
+    rig.advance(arca::canvas::SESSION_TTL_MS + 1);
+    assert_eq!(
+        rig.get_with_cookie("/approve/canvas/snapshot", &pair).0,
+        401
+    );
+    let forged = format!("__Host-arca-canvas={}", "00".repeat(32));
+    let (status, _, body) = rig.get_with_cookie("/approve/canvas", &forged);
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body).contains("Sign in with passkey"));
+    assert_eq!(
+        rig.get_with_cookie("/approve/canvas/snapshot", &forged).0,
+        401
+    );
+}
+
+#[test]
+fn canvas_headers_and_csp_cover_approval_and_canvas_urls() {
+    let (rig, _) = Rig::new("canvas-headers", true);
+    let cookie = rig
+        .canvas
+        .issue_session("passkey:test", NOW)
+        .expect("a session cookie");
+    let pair = cookie.split(';').next().expect("cookie pair").to_string();
+    for (path, signed) in [
+        ("/approve", false),
+        ("/approve/plans", false),
+        ("/approve/canvas", false),
+        ("/approve/canvas/page.css", true),
+        ("/approve/canvas/page.js", true),
+        ("/approve/canvas/snapshot", true),
+    ] {
+        let (status, head, _) = if signed {
+            rig.get_with_cookie(path, &pair)
+        } else {
+            rig.get_full(path, None)
+        };
+        assert_eq!(status, 200, "{path} rendered");
+        let csp = header_value(&head, "content-security-policy").expect("a CSP");
+        assert!(csp.contains("default-src 'none'"), "{path}");
+        assert!(csp.contains("script-src 'self'"), "{path}");
+        assert!(csp.contains("sha256-"), "{path}");
+        assert!(csp.contains("style-src 'self'"), "{path}");
+        assert!(!csp.contains("unsafe-inline"), "{path}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{path}");
+        assert_eq!(
+            header_value(&head, "x-content-type-options").as_deref(),
+            Some("nosniff")
+        );
+        assert_eq!(
+            header_value(&head, "referrer-policy").as_deref(),
+            Some("no-referrer")
+        );
+    }
+    let (status, head, _) = rig.get_full("/approve/canvas", Some("https://elsewhere.example"));
+    assert_eq!(status, 403, "a foreign Origin is refused");
+    assert!(
+        header_value(&head, "content-security-policy").is_some(),
+        "the refusal carries the same headers"
+    );
+}
+
+#[test]
+fn canvas_dsh_error_and_timeout_show_the_arca_error_page() {
+    let (rig, _) = Rig::new("canvas-upstream", true);
+    let cookie = rig
+        .canvas
+        .issue_session("passkey:test", NOW)
+        .expect("a session cookie");
+    let pair = cookie.split(';').next().expect("cookie pair").to_string();
+    rig.upstream.set_mode(UpstreamMode::Error);
+    let (status, head, body) = rig.get_with_cookie("/approve/canvas/snapshot", &pair);
+    assert_eq!(status, 502);
+    assert!(String::from_utf8_lossy(&body).contains("The canvas is not running"));
+    assert_eq!(
+        header_value(&head, "content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    assert_eq!(
+        header_value(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    rig.upstream.set_mode(UpstreamMode::Timeout);
+    let (status, _, body) = rig.get_with_cookie("/approve/canvas/snapshot", &pair);
+    assert_eq!(status, 502);
+    assert!(String::from_utf8_lossy(&body).contains("The canvas is not running"));
+}
+
+#[test]
+fn canvas_challenge_cap_is_global_and_resets_after_a_minute() {
+    let (rig, _) = Rig::new("canvas-cap", true);
+    for index in 0..60 {
+        let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+        assert_eq!(status, 200, "challenge {index}");
+    }
+    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(
+        status, 429,
+        "the sixty-first challenge in a minute is capped"
+    );
+    rig.advance(60_000);
+    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200, "the cap clears after the minute");
+}
+
+#[test]
+fn canvas_failure_logs_are_generic_and_do_not_lock_the_next_sign_in() {
+    let (rig, key) = Rig::new("canvas-log", true);
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200);
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let mut wrong = Assert::over(NAMESPACE, statement.as_bytes());
+    wrong.origin = Some("https://elsewhere.example".to_string());
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": statement, "proof": key.proof_value(&wrong) }),
+    );
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed")
+    );
+    assert!(!logs.join("\n").contains(&statement));
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200, "no failure lock");
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let good = Assert::over(NAMESPACE, statement.as_bytes());
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": statement, "proof": key.proof_value(&good) }),
+    );
+    assert_eq!(status, 200, "a fresh challenge still signs in");
 }

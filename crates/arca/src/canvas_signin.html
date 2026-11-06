@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Arca canvas</title>
+<style>
+  :root { color-scheme: light dark; --arca-bg: #f4f4f7; --arca-surface: #fff; --arca-ink: #0c0d11; --arca-muted: #5d6170; --arca-accent: #5b54f9; --arca-line: rgba(12, 13, 17, .12); }
+  @media (prefers-color-scheme: dark) { :root { --arca-bg: #0b0b0f; --arca-surface: #15161c; --arca-ink: #f1f2f6; --arca-muted: #a4a9b7; --arca-accent: #8b85ff; --arca-line: rgba(255, 255, 255, .13); } }
+  html, body { height: 100%; margin: 0; background: var(--arca-bg); color: var(--arca-ink); font: 500 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { width: min(28rem, calc(100% - 2rem)); margin: 12vh auto 0; padding: 1.5rem; border: 1px solid var(--arca-line); border-radius: 1rem; background: var(--arca-surface); box-sizing: border-box; }
+  h1 { margin: 0 0 .5rem; font-size: 1.35rem; }
+  p { margin: 0 0 1.25rem; color: var(--arca-muted); }
+  button { width: 100%; border: 0; border-radius: .7rem; padding: .85rem 1rem; background: var(--arca-accent); color: #fff; font: inherit; font-weight: 650; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: wait; }
+  .status { min-height: 1.5rem; margin: 1rem 0 0; color: var(--arca-muted); font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Arca canvas</h1>
+  <p>Sign in with the passkey you use for Arca. It views the canvas; it approves nothing.</p>
+  <button id="sign-in" type="button">Sign in with passkey</button>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+</main>
+<script>
+(() => {
+  const button = document.getElementById("sign-in");
+  const status = document.getElementById("status");
+  const enc = new TextEncoder();
+  const b64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const fail = () => { status.textContent = "Sign-in failed. Try again."; button.disabled = false; };
+  const signIn = async () => {
+    button.disabled = true;
+    status.textContent = "Waiting for your passkey…";
+    const first = await fetch(location.pathname, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    if (!first.ok) throw new Error("challenge");
+    const { statement } = await first.json();
+    const challenge = await crypto.subtle.digest("SHA-256", enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + statement));
+    const credential = await navigator.credentials.get({ publicKey: { challenge, rpId: location.hostname, userVerification: "required", timeout: 60000 } });
+    if (!credential) throw new Error("no passkey");
+    const response = credential.response;
+    const proof = {
+      alg: "ES256",
+      authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
+      clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
+      credentialId: b64url(new Uint8Array(credential.rawId)),
+      kind: "webauthn",
+      signature: b64url(new Uint8Array(response.signature)),
+      v: 1,
+    };
+    const answer = await fetch(location.pathname, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ statement, proof }) });
+    if (!answer.ok) throw new Error("sign-in");
+    location.reload();
+  };
+  button.addEventListener("click", () => { signIn().catch(fail); });
+})();
+</script>
+</body>
+</html>

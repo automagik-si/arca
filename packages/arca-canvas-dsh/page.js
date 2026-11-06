@@ -230,7 +230,9 @@
     reflow();
     return { stage, reflow };
   }
-  function mountCanvas(root, { fetchSnapshot = () => fetch("/arca-canvas/snapshot", { credentials: "same-origin" }), pollMs = 5e3 } = {}) {
+  function mountCanvas(root, { fetchSnapshot, pollMs = 5e3 } = {}) {
+    const base = (root.dataset?.arcaBase ?? "/arca-canvas").replace(/\/+$/, "") || "/arca-canvas";
+    const loadSnapshot = fetchSnapshot ?? (() => fetch(`${base}/snapshot`, { credentials: "same-origin" }));
     let stopped = false;
     let timer;
     let frame;
@@ -256,7 +258,7 @@
     let current = { error: "Waiting for the first Arca snapshot." };
     const refresh = async () => {
       try {
-        const response = await fetchSnapshot();
+        const response = await loadSnapshot();
         if (!response.ok) throw new Error("Snapshot unavailable");
         current = await response.json();
       } catch {

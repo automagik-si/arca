@@ -35,6 +35,17 @@ impl OwnerKeys {
     pub fn replace_passkey_lines(&mut self, lines: Vec<PasskeyLine>) {
         self.passkeys.replace_lines(lines);
     }
+
+    /// Verifies a passkey assertion over `statement`, sharing the approval verifier's sign-count store. SSH proofs are not
+    /// accepted here; the sign-in route only asks this for a WebAuthn proof.
+    pub fn verify_passkey(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        self.passkeys.verify(namespace, statement, signature)
+    }
 }
 
 impl SignatureVerifier for OwnerKeys {
