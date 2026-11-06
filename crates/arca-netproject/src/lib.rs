@@ -11,6 +11,7 @@ use std::net::Ipv4Addr;
 
 pub const PROJECT: &str = "arcak-svc";
 pub const BRIDGE: &str = "arcak-svcbr";
+pub const PROFILE: &str = "arca-service";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -108,6 +109,7 @@ impl Plugin for NetProject {
             vec![
                 (IncusKind::Project, EffectClass::B),
                 (IncusKind::Network, EffectClass::B),
+                (IncusKind::Profile, EffectClass::A),
             ],
         )
     }
@@ -140,6 +142,38 @@ impl Plugin for NetProject {
                 &cfg.project,
                 &cfg.project,
                 json!({"name":cfg.project,"config":{"limits.virtual-machines":cfg.virtual_machines.to_string(),"restricted.networks.access":cfg.bridge}}),
+            )?;
+        }
+        if observed(
+            ctx,
+            format!("/1.0/profiles/{PROFILE}?project={}", cfg.project),
+        )?
+        .is_none()
+        {
+            let default = ctx
+                .observe(Observe::IncusGet {
+                    path: "/1.0/profiles/default?project=default".into(),
+                })
+                .map_err(|_| {
+                    PluginError::Failed("the default profile does not name a storage pool".into())
+                })?;
+            let pool = default["devices"]["root"]["pool"]
+                .as_str()
+                .filter(|pool| !pool.is_empty())
+                .ok_or_else(|| {
+                    PluginError::Failed("the default profile does not name a storage pool".into())
+                })?;
+            create(
+                ctx,
+                IncusKind::Profile,
+                &cfg.project,
+                PROFILE,
+                json!({"name": PROFILE,
+                    "description": format!("Arca service (project {}); managed by Arca", cfg.project),
+                    "config": {"limits.memory":"2GiB", "limits.cpu":"2", "limits.cpu.priority":"5",
+                        "limits.processes":"4096", "security.privileged":"false", "security.nesting":"false",
+                        "security.idmap.isolated":"true", "security.guestapi":"false"},
+                    "devices": {"root":{"type":"disk", "path":"/", "pool":pool, "size":"16GiB"}}}),
             )?;
         }
         Ok(())

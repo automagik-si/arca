@@ -1984,3 +1984,449 @@ impl ToolHandler for PostgresHandler {
         })
     }
 }
+
+// Services: one record in the desired document, plus the live Incus row for state.
+
+pub fn service_handlers(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    let writes = Arc::new(Mutex::new(()));
+    ["service_create", "service_list", "service_status"]
+        .into_iter()
+        .map(|verb| {
+            (
+                verb,
+                Arc::new(ServiceHandler {
+                    verb,
+                    kernel: kernel.clone(),
+                    clock: clock.clone(),
+                    cfg: cfg.clone(),
+                    writes: writes.clone(),
+                }) as Arc<dyn ToolHandler>,
+            )
+        })
+        .collect()
+}
+
+struct ServiceHandler {
+    verb: &'static str,
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+    writes: Arc<Mutex<()>>,
+}
+
+fn service_refused(message: impl Into<String>) -> CallError {
+    CallError::Refused {
+        code: "refused".into(),
+        message: message.into(),
+    }
+}
+
+fn service_not_found(message: impl Into<String>) -> CallError {
+    CallError::Refused {
+        code: "not_found".into(),
+        message: message.into(),
+    }
+}
+
+fn service_template_error(error: crate::service::TemplateError) -> CallError {
+    if error.not_found {
+        service_not_found(error.message)
+    } else {
+        service_refused(error.message)
+    }
+}
+
+/// The service project's CIDR and gateway, or a refusal before any Incus read.
+fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
+    let cidr = cfg
+        .kernel
+        .service_cidr
+        .as_deref()
+        .ok_or_else(|| service_refused("no service project: kernel.serviceCidr is required"))?;
+    let gateway = crate::service::gateway(cidr)
+        .map_err(|_| service_refused("no service project: the service CIDR is invalid"))?;
+    if !cfg
+        .kernel
+        .projects
+        .iter()
+        .any(|project| project == arca_netproject::PROJECT)
+        || cfg
+            .kernel
+            .droidd_projects
+            .iter()
+            .any(|project| project == arca_netproject::PROJECT)
+        || cfg.kernel.scratch
+    {
+        return Err(service_refused(
+            "no service project: the service project is excluded by kernel configuration",
+        ));
+    }
+    Ok((cidr.to_string(), gateway.to_string()))
+}
+
+fn service_listing(read: &UnixIncus, project: Option<&str>) -> Result<Vec<Value>, CallError> {
+    let path = project
+        .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
+        .unwrap_or_else(|| "/1.0/instances?all-projects=true&recursion=2".into());
+    match read.get(&path) {
+        Ok(rows) => Ok(rows.as_array().cloned().unwrap_or_default()),
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
+        Err(_) => Err(internal()),
+    }
+}
+
+fn service_leases(read: &UnixIncus) -> Result<Vec<String>, CallError> {
+    let path = format!(
+        "/1.0/networks/{}/leases?project={}",
+        arca_netproject::BRIDGE,
+        arca_netproject::PROJECT
+    );
+    match read.get(&path) {
+        Ok(rows) => Ok(rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|lease| lease["address"].as_str().map(str::to_string))
+            .collect()),
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
+        Err(_) => Err(internal()),
+    }
+}
+
+fn service_secret_names(dir: &std::path::Path) -> std::io::Result<BTreeSet<std::ffi::OsString>> {
+    match std::fs::read_dir(dir) {
+        Ok(files) => files
+            .map(|file| file.map(|file| file.file_name()))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error),
+    }
+}
+
+fn cleanup_service_secrets(dir: &std::path::Path, seeded: &BTreeSet<std::ffi::OsString>) {
+    if let Ok(names) = service_secret_names(dir) {
+        for name in names.difference(seeded) {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        let _ = std::fs::remove_dir(dir); // Only succeeds when empty.
+    }
+}
+
+fn service_used(
+    rows: &[Value],
+    leases: &[String],
+    entries: &[arca_kernel::desired::Entry],
+) -> BTreeSet<std::net::Ipv4Addr> {
+    let mut used = BTreeSet::new();
+    for row in rows {
+        if let Some(devices) = row["devices"].as_object() {
+            for device in devices.values() {
+                if let Some(ip) = device["ipv4.address"]
+                    .as_str()
+                    .and_then(|ip| ip.parse().ok())
+                {
+                    used.insert(ip);
+                }
+            }
+        }
+        if let Some(network) = row["state"]["network"].as_object() {
+            for nic in network.values() {
+                for address in nic["addresses"].as_array().into_iter().flatten() {
+                    if address["family"] == "inet"
+                        && let Some(ip) = address["address"].as_str().and_then(|ip| ip.parse().ok())
+                    {
+                        used.insert(ip);
+                    }
+                }
+            }
+        }
+    }
+    for lease in leases {
+        if let Ok(ip) = lease.parse() {
+            used.insert(ip);
+        }
+    }
+    for (_, config) in service_entries(entries) {
+        if let Ok(ip) = config.ipv4.parse() {
+            used.insert(ip);
+        }
+    }
+    used
+}
+
+fn service_live<'a>(rows: &'a [Value], name: &str) -> Option<&'a Value> {
+    rows.iter().find(|row| row["name"].as_str() == Some(name))
+}
+
+fn service_entries(
+    entries: &[arca_kernel::desired::Entry],
+) -> Vec<(arca_kernel::desired::Entry, crate::service::ServiceConfig)> {
+    entries
+        .iter()
+        .filter(|entry| entry.plugin.0 == "arca.service")
+        .filter_map(|entry| {
+            serde_json::from_value(entry.config.clone())
+                .ok()
+                .map(|config| (entry.clone(), config))
+        })
+        .collect()
+}
+
+fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConfig, CallError> {
+    let source = crate::service::source(parts.template).map_err(service_template_error)?;
+    let entrypoint = crate::service::entrypoint(parts.template, parts.templates_dir)
+        .map_err(service_template_error)?;
+    let (environment, start) = crate::service::environment(
+        parts.template,
+        parts.name,
+        &parts.ipv4,
+        &parts.gateway,
+        parts.secrets_dir,
+    )
+    .map_err(service_template_error)?;
+    Ok(crate::service::ServiceConfig {
+        name: parts.name.to_string(),
+        template: parts.template.name.clone(),
+        instance: parts.name.to_string(),
+        ipv4: parts.ipv4,
+        ports: parts.template.ports.clone(),
+        links: Vec::new(),
+        published: None,
+        created: parts.now,
+        source,
+        pool: parts.pool,
+        project: arca_netproject::PROJECT.into(),
+        bridge: arca_netproject::BRIDGE.into(),
+        gateway: parts.gateway,
+        entrypoint,
+        environment,
+        droidd_port: parts.template.droidd_port,
+        start,
+    })
+}
+
+struct ServiceParts<'a> {
+    name: &'a str,
+    template: &'a crate::service::Template,
+    ipv4: String,
+    gateway: String,
+    pool: String,
+    now: u64,
+    secrets_dir: &'a std::path::Path,
+    templates_dir: &'a std::path::Path,
+}
+
+fn service_name(args: &Value) -> Result<String, CallError> {
+    args["name"]
+        .as_str()
+        .filter(|name| crate::service::service_name_ok(name))
+        .map(str::to_string)
+        .ok_or_else(|| CallError::Invalid("name: expected a service name".into()))
+}
+
+impl ToolHandler for ServiceHandler {
+    fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
+        let allowed: &[&str] = match self.verb {
+            "service_create" => &["name", "template"],
+            "service_status" => &["name"],
+            _ => &[],
+        };
+        let object = args
+            .as_object()
+            .ok_or_else(|| CallError::Invalid("arguments: expected an object".into()))?;
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            return Err(CallError::Invalid(
+                "arguments: a field the schema does not name".into(),
+            ));
+        }
+        if self.verb == "service_create" && caller.scope < Scope::Doctor {
+            return Err(CallError::Forbidden {
+                verb: self.verb.into(),
+            });
+        }
+        let _write = if self.verb == "service_create" {
+            Some(self.writes.lock().map_err(|_| internal())?)
+        } else {
+            None
+        };
+        let now = (self.clock)();
+        let entries = {
+            let kernel = lock(&self.kernel)?;
+            kernel.entries().to_vec()
+        };
+        let (cidr, gateway) = service_project(&self.cfg)?;
+        let read = UnixIncus::new(self.cfg.incus.socket.clone());
+        let rows = service_listing(
+            &read,
+            (self.verb != "service_create").then_some(arca_netproject::PROJECT),
+        )?;
+        let project_rows: Vec<Value> = rows
+            .iter()
+            .filter(|row| row["project"].as_str() == Some(arca_netproject::PROJECT))
+            .cloned()
+            .collect();
+        match self.verb {
+            "service_list" => {
+                let mut views = Vec::new();
+                let records = service_entries(&entries);
+                let names: BTreeSet<String> = records
+                    .iter()
+                    .map(|(_, config)| config.name.clone())
+                    .collect();
+                for (_, config) in &records {
+                    let live = service_live(&project_rows, &config.name);
+                    views.push(crate::service::view(config, live));
+                }
+                for row in &project_rows {
+                    if let Some(name) = row["name"].as_str()
+                        && !names.contains(name)
+                        && let Some(view) = crate::service::unknown_view(row)
+                    {
+                        views.push(view);
+                    }
+                }
+                views.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+                views.truncate(256);
+                Ok(json!({ "services": views }))
+            }
+            "service_status" => {
+                let name = service_name(&args)?;
+                let record = service_entries(&entries)
+                    .into_iter()
+                    .find(|(_, config)| config.name == name);
+                if let Some((_, config)) = record {
+                    return Ok(crate::service::view(
+                        &config,
+                        service_live(&project_rows, &config.name),
+                    ));
+                }
+                if let Some(row) = service_live(&project_rows, &name)
+                    && let Some(view) = crate::service::unknown_view(row)
+                {
+                    return Ok(view);
+                }
+                Err(service_not_found(format!("service {name}: not found")))
+            }
+            _ => {
+                let name = service_name(&args)?;
+                let template_name = args["template"]
+                    .as_str()
+                    .filter(|name| crate::service::template_name_ok(name))
+                    .ok_or_else(|| {
+                        CallError::Invalid("template: expected a template name".into())
+                    })?;
+                let id = format!("service-{name}");
+                if entries
+                    .iter()
+                    .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
+                {
+                    return Err(service_refused(format!("service {name} exists")));
+                }
+                if project_rows
+                    .iter()
+                    .any(|row| row["name"].as_str() == Some(name.as_str()))
+                {
+                    return Err(service_refused(format!(
+                        "project {} holds an instance named {name} that is not a service of Arca's; it is left alone",
+                        arca_netproject::PROJECT
+                    )));
+                }
+                let templates_dir = self.cfg.state_dir.join("templates");
+                let template = crate::service::load_template(&templates_dir, template_name)
+                    .map_err(service_template_error)?;
+                let candidates =
+                    crate::service::candidates(&cidr).map_err(service_template_error)?;
+                let leases = service_leases(&read)?;
+                let used = service_used(&rows, &leases, &entries);
+                let ipv4 = candidates
+                    .iter()
+                    .find(|ip| !used.contains(ip))
+                    .ok_or_else(|| {
+                        service_refused(format!(
+                            "the service subnet {cidr} has no free address (.10-.239)"
+                        ))
+                    })?
+                    .to_string();
+                let pool = service_pool(&self.cfg).map_err(|_| {
+                    service_refused("the default profile does not name a storage pool")
+                })?;
+                let mut changes = ensure_netproject(&entries, &self.cfg).map_err(|_| {
+                    service_refused("no service project: kernel.serviceCidr is required")
+                })?;
+                let secrets_dir = self.cfg.state_dir.join("secrets");
+                let service_secrets = secrets_dir.join(format!("service-{name}"));
+                let seeded = service_secret_names(&service_secrets).map_err(|_| internal())?;
+                let config = service_config(ServiceParts {
+                    name: &name,
+                    template: &template,
+                    ipv4,
+                    gateway,
+                    pool,
+                    now,
+                    secrets_dir: &secrets_dir,
+                    templates_dir: &templates_dir,
+                })
+                .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
+                changes.push(crate::desired_store::EntryChange::Put(service_entry(
+                    &id,
+                    "arca.service",
+                    serde_json::to_value(&config).map_err(|_| internal())?,
+                )));
+                let outcomes = {
+                    let mut kernel = lock(&self.kernel)?;
+                    kernel.propose(changes, now).map_err(|_| internal())?
+                };
+                let failed = outcomes.iter().any(
+                    |outcome| matches!(outcome, Outcome::Failed { entry, .. } if entry.0 == id),
+                );
+                if failed {
+                    match read.get(&format!(
+                        "/1.0/instances/{name}?project={}",
+                        arca_netproject::PROJECT
+                    )) {
+                        Ok(_) => {
+                            return Err(service_refused(format!(
+                                "start service {name} (created and stopped; service_remove removes it)"
+                            )));
+                        }
+                        Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
+                        Err(_) => return Err(internal()),
+                    }
+                    let _ = {
+                        let mut kernel = lock(&self.kernel)?;
+                        kernel.propose(
+                            vec![crate::desired_store::EntryChange::Remove(EntryId(
+                                id.clone(),
+                            ))],
+                            now,
+                        )
+                    };
+                    cleanup_service_secrets(&service_secrets, &seeded);
+                    return Err(service_refused(format!(
+                        "create service {name} from template {template_name}"
+                    )));
+                }
+                let live = match read.get(&format!(
+                    "/1.0/instances/{name}/state?project={}",
+                    arca_netproject::PROJECT
+                )) {
+                    Ok(state) => Some(state),
+                    Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
+                    Err(_) => return Err(internal()),
+                };
+                let live = live.map(|state| {
+                    let mut row = state;
+                    if row.get("status").is_none() {
+                        row["status"] = json!("Unknown");
+                    }
+                    row
+                });
+                Ok(crate::service::view(&config, live.as_ref()))
+            }
+        }
+    }
+}

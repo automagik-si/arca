@@ -47,6 +47,9 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "postgres_unlink",
             "postgres_delete",
             "ontology_query",
+            "service_create",
+            "service_list",
+            "service_status",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -69,6 +72,9 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("postgres_unlink", VerbClass::L, Scope::Doctor, true, false),
         ("postgres_delete", VerbClass::L, Scope::Doctor, true, true),
         ("ontology_query", VerbClass::L, Scope::Viewer, false, false),
+        ("service_create", VerbClass::L, Scope::Doctor, true, false),
+        ("service_list", VerbClass::L, Scope::Viewer, false, false),
+        ("service_status", VerbClass::L, Scope::Viewer, false, false),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");

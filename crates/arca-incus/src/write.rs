@@ -30,7 +30,7 @@ use arca_kernel::canon::Digest;
 use arca_kernel::desired::{EntryId, PluginId};
 use arca_kernel::journal::AclField;
 use arca_kernel::ownership::{
-    IncusKind, KERNEL_RETIRING_KEY, ObjectRef, OwnerClass, classify, kernel_may_write,
+    IncusKind, KERNEL_RETIRING_KEY, ObjectRef, OwnerClass, classify_object, kernel_may_write,
 };
 use serde_json::{Map, Value, json};
 
@@ -254,7 +254,7 @@ impl UnixIncusWriter {
         let (metadata, etag) = self.fetch(target)?;
         let config = own_config(&metadata)?;
         Ok(Reading {
-            class: classify(&config, &self.retained),
+            class: classify_object(target, &config, &self.retained),
             etag,
             uuid: uuid_of(target.kind, &config),
             config,
@@ -303,7 +303,7 @@ impl UnixIncusWriter {
         if config.contains_key(KERNEL_RETIRING_KEY) {
             return Err(refused("a create may not carry a retiring tombstone"));
         }
-        let class = classify(&config, &self.retained);
+        let class = classify_object(target, &config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
             return Err(refused(
                 "a created object must carry this entry's mark and no other owner's key",
@@ -351,7 +351,10 @@ impl UnixIncusWriter {
             return Err(refused("a patch may not set a volatile config key"));
         }
         let after = apply(&owned.config, changes);
-        if !kernel_may_write(&classify(&after, &self.retained), &self.entry) {
+        if !kernel_may_write(
+            &classify_object(&owned.target, &after, &self.retained),
+            &self.entry,
+        ) {
             return Err(refused(
                 "the change would leave the object owned by another owner",
             ));
@@ -428,7 +431,10 @@ impl UnixIncusWriter {
         }
         let changes = BTreeMap::from([(KERNEL_RETIRING_KEY.to_string(), Some(value.clone()))]);
         let after = apply(&owned.config, &changes);
-        if !kernel_may_write(&classify(&after, &self.retained), &self.entry) {
+        if !kernel_may_write(
+            &classify_object(&owned.target, &after, &self.retained),
+            &self.entry,
+        ) {
             return Err(refused(
                 "the tombstone would leave the object owned by another owner",
             ));
@@ -599,7 +605,7 @@ impl UnixIncusWriter {
         description: String,
         metadata: Value,
     ) -> Result<Owned, Unread> {
-        let class = classify(&config, &self.retained);
+        let class = classify_object(target, &config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
             return Err(Unread {
                 reason: refusal_reason(&class).to_string(),
@@ -676,7 +682,7 @@ impl UnixIncusWriter {
             return Err(refused("the object was read for another entry"));
         }
         self.allow_target(&owned.target)?;
-        let class = classify(&owned.config, &self.retained);
+        let class = classify_object(&owned.target, &owned.config, &self.retained);
         if !kernel_may_write(&class, &self.entry) {
             return Err(refused(refusal_reason(&class)));
         }
@@ -975,7 +981,7 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     let allowed_keys = source.keys().all(|key| {
         matches!(
             key.as_str(),
-            "type" | "alias" | "fingerprint" | "properties" | "server" | "protocol"
+            "type" | "alias" | "fingerprint" | "properties" | "server" | "protocol" | "mode"
         )
     });
     let server = source.get("server").map(|value| value.as_str());
@@ -983,7 +989,14 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     let pinned = match (server, protocol) {
         (None, None) => true,
         (Some(server), Some(protocol)) => {
-            server == Some(IMAGE_SERVER) && protocol == Some(IMAGE_PROTOCOL)
+            (server == Some(IMAGE_SERVER) && protocol == Some(IMAGE_PROTOCOL))
+                || (protocol == Some("oci")
+                    && source.get("mode").and_then(Value::as_str) == Some("pull")
+                    && server.is_some_and(oci_server_ok)
+                    && source
+                        .get("alias")
+                        .and_then(Value::as_str)
+                        .is_some_and(oci_alias_ok))
         }
         _ => false,
     };
@@ -1004,6 +1017,31 @@ fn check_source(fields: &Map<String, Value>) -> Result<(), IncusError> {
     } else {
         Err(refused("a create may name only an image source"))
     }
+}
+
+/// An OCI registry server: `https://` and a host, with an optional port. No path, credentials or query.
+fn oci_server_ok(server: &str) -> bool {
+    let Some(host) = server.strip_prefix("https://") else {
+        return false;
+    };
+    !host.is_empty()
+        && !host.contains(['/', '@', '?', '#'])
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+}
+
+/// An OCI alias: a repository and a digest, `repo@sha256:<64 lowercase hex>`.
+fn oci_alias_ok(alias: &str) -> bool {
+    let Some((repository, digest)) = alias.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !repository.is_empty()
+        && repository
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A key the writer sends: `[a-z0-9_.-]`, plus uppercase ASCII after a leading `environment.`. Incus's decoder matches a key to a field whatever its case,

@@ -1,6 +1,7 @@
 //! A JSON Schema subset, enough to check the arguments and results of the verb table: `type` (a name or an array of names),
 //! `properties`, `required`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `anyOf` and
-//! `additionalProperties: false`. It has no `pattern`: the handlers check name and hex formats themselves.
+//! `additionalProperties: false` and `pattern`. The pattern is an ECMA-style regular expression; the schema is code, not a
+//! caller value, so it is compiled when the schema is checked.
 //!
 //! The schema is checked before the value. A keyword outside the subset is an error, not a silent pass, so a schema that
 //! asks for more than this module checks cannot accept a value it should refuse. Annotation keywords (`title`,
@@ -31,6 +32,9 @@ const SUPPORTED: &[&str] = &[
     "maximum",
     "minLength",
     "maxLength",
+    "maxItems",
+    "const",
+    "pattern",
     "anyOf",
     "additionalProperties",
 ];
@@ -85,6 +89,21 @@ pub(crate) fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
         for option in options {
             check_schema(option, &format!("{at}/anyOf"))?;
         }
+    }
+    if let Some(pattern) = map.get("pattern") {
+        let Some(text) = pattern.as_str() else {
+            return Err(format!("{}: pattern must be a string", here(at)));
+        };
+        regex::Regex::new(text)
+            .map_err(|_| format!("{}: pattern is not a regular expression", here(at)))?;
+    }
+    if let Some(max_items) = map.get("maxItems")
+        && !max_items.is_u64()
+    {
+        return Err(format!(
+            "{}: maxItems must be a non-negative integer",
+            here(at)
+        ));
     }
     if let Some(required) = map.get("required")
         && !required
@@ -155,6 +174,11 @@ fn validate(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
             return Err(format!("{}: expected {}", here(at), names.join(" or ")));
         }
     }
+    if let Some(constant) = map.get("const")
+        && constant != value
+    {
+        return Err(format!("{}: not the required value", here(at)));
+    }
     if let Some(Value::Array(options)) = map.get("enum")
         && !options.contains(value)
     {
@@ -169,8 +193,24 @@ fn validate(schema: &Value, value: &Value, at: &str) -> Result<(), String> {
     }
     match value {
         Value::Number(_) => check_bounds(map, value, at)?,
-        Value::String(text) => check_length(map, text.chars().count(), at)?,
+        Value::String(text) => {
+            check_length(map, text.chars().count(), at)?;
+            if let Some(pattern) = map.get("pattern").and_then(Value::as_str)
+                && !regex::Regex::new(pattern)
+                    .map(|pattern| pattern.is_match(text))
+                    .unwrap_or(false)
+            {
+                return Err(format!("{}: does not match the pattern", here(at)));
+            }
+        }
         Value::Array(items) => {
+            if map
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|max| items.len() as u64 > max)
+            {
+                return Err(format!("{}: longer than the maximum length", here(at)));
+            }
             if let Some(items_schema) = map.get("items") {
                 for (index, item) in items.iter().enumerate() {
                     validate(items_schema, item, &format!("{at}/{index}"))?;
@@ -416,19 +456,37 @@ mod tests {
 
     #[test]
     fn an_unsupported_keyword_fails_closed_even_where_no_value_reaches_it() {
-        let schema = json!({ "type": "string", "pattern": "^a" });
+        let schema = json!({ "type": "array", "minItems": 1 });
         assert!(
-            conforms(&schema, &json!("a")).is_err(),
-            "pattern is not checked, so it is refused"
+            conforms(&schema, &json!([])).is_err(),
+            "minItems is not checked, so it is refused"
         );
         let nested = json!({
             "type": "object",
-            "properties": { "x": { "type": "array", "items": { "pattern": "^a" } } }
+            "properties": { "x": { "type": "array", "items": { "minItems": 1 } } }
         });
         assert!(
             conforms(&nested, &json!({ "x": [] })).is_err(),
             "a nested schema is checked too"
         );
+    }
+
+    #[test]
+    fn a_pattern_matches_the_whole_string_and_checks_arrays() {
+        let schema = json!({
+            "type": "array",
+            "maxItems": 2,
+            "items": {
+                "type": "string",
+                "pattern": "^[a-z](?:[a-z0-9-]{0,3}[a-z0-9])?$"
+            }
+        });
+        assert!(conforms(&schema, &json!(["a", "ab-1"])).is_ok());
+        assert!(conforms(&schema, &json!(["A"])).is_err());
+        assert!(conforms(&schema, &json!(["a", "b", "c"])).is_err());
+        let constant = json!({ "const": 8443 });
+        assert!(conforms(&constant, &json!(8443)).is_ok());
+        assert!(conforms(&constant, &json!(443)).is_err());
     }
 
     #[test]

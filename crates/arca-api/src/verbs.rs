@@ -69,7 +69,7 @@ pub struct Verb {
     pub cut: fn(&Value) -> Option<Value>,
 }
 
-static VERBS: [Verb; 15] = [
+static VERBS: [Verb; 18] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -279,6 +279,48 @@ static VERBS: [Verb; 15] = [
         cut: no_cut,
         params: ontology_query_params,
         result: ontology_query_result,
+    },
+    Verb {
+        name: "service_create",
+        summary: "Create a service from a template, in the service project and under the kernel's mark.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_create,
+        cut: no_cut,
+        params: service_create_params,
+        result: service_create_result,
+    },
+    Verb {
+        name: "service_list",
+        summary: "The services in the service project, each with its address, ports, links and state.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_list,
+        cut: no_cut,
+        params: service_list_params,
+        result: service_list_result,
+    },
+    Verb {
+        name: "service_status",
+        summary: "One service's address, ports, links and state.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_status,
+        cut: no_cut,
+        params: service_status_params,
+        result: service_status_result,
     },
 ];
 
@@ -987,4 +1029,163 @@ fn ontology_query_result() -> Value {
         ("edges", true, array(edge)),
         ("neverOwns", true, boolean()),
     ])
+}
+
+/// A short line for a successful `service_create`.
+pub fn summary_service_create(v: &Value) -> String {
+    format!(
+        "service {} ({}) {} at {}",
+        v["name"].as_str().unwrap_or("?"),
+        v["template"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?"),
+        v["ipv4"].as_str().unwrap_or("?")
+    )
+}
+
+/// A short line for a successful `service_list`.
+pub fn summary_service_list(v: &Value) -> String {
+    format!(
+        "{} service(s)",
+        v["services"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `service_status`.
+pub fn summary_service_status(v: &Value) -> String {
+    format!(
+        "service {} ({}) {} at {}",
+        v["name"].as_str().unwrap_or("?"),
+        v["template"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?"),
+        v["ipv4"].as_str().unwrap_or("?")
+    )
+}
+
+/// The shared natural service view: the golden's `ServiceViewOut`, closed at every object.
+pub fn service_view_schema() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "ipv4": {
+                "description": "Its fixed address on the service bridge.",
+                "maxLength": 15,
+                "type": "string"
+            },
+            "links": {
+                "description": "The services it is linked to, as a consumer, and the port each link opens.",
+                "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                        "port": { "maximum": 65535, "minimum": 1, "type": "integer" },
+                        "to": { "maxLength": 40, "type": "string" }
+                    },
+                    "required": ["to", "port"],
+                    "type": "object"
+                },
+                "maxItems": 64,
+                "type": "array"
+            },
+            "name": { "maxLength": 40, "type": "string" },
+            "ports": {
+                "description": "The ports it listens on; a link opens the first.",
+                "items": { "maximum": 65535, "minimum": 1, "type": "integer" },
+                "maxItems": 16,
+                "type": "array"
+            },
+            "published": {
+                "anyOf": [
+                    {
+                        "additionalProperties": false,
+                        "properties": {
+                            "node": { "maxLength": 63, "type": "string" },
+                            "port": { "const": 8443, "type": "number" },
+                            "reach": { "const": "tailnet", "type": "string" }
+                        },
+                        "required": ["reach", "node", "port"],
+                        "type": "object"
+                    },
+                    { "type": "null" }
+                ],
+                "description": "Its dash on the tailnet (service_publish), or null."
+            },
+            "state": {
+                "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
+                "enum": ["creating", "running", "stopped", "failed", "unknown"],
+                "type": "string"
+            },
+            "template": {
+                "description": "Its template (empty for an instance droidd did not create).",
+                "maxLength": 40,
+                "type": "string"
+            }
+        },
+        "required": ["name", "template", "state", "ipv4", "ports", "links", "published"],
+        "type": "object"
+    })
+}
+
+fn service_name_schema(description: &'static str) -> Value {
+    json!({
+        "description": description,
+        "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+        "type": "string"
+    })
+}
+
+fn service_create_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter)."),
+            "template": {
+                "description": "The template's name.",
+                "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                "type": "string"
+            }
+        },
+        "required": ["template", "name"],
+        "type": "object"
+    })
+}
+
+fn service_create_result() -> Value {
+    service_view_schema()
+}
+
+fn service_list_params() -> Value {
+    json!({ "additionalProperties": false, "properties": {}, "required": [], "type": "object" })
+}
+
+fn service_list_result() -> Value {
+    let mut view = service_view_schema();
+    if let Some(object) = view.as_object_mut() {
+        object.remove("description");
+    }
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "services": {
+                "items": view,
+                "maxItems": 256,
+                "type": "array"
+            }
+        },
+        "required": ["services"],
+        "type": "object"
+    })
+}
+
+fn service_status_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "name": service_name_schema("The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
+        },
+        "required": ["name"],
+        "type": "object"
+    })
+}
+
+fn service_status_result() -> Value {
+    service_view_schema()
 }

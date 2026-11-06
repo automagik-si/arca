@@ -273,3 +273,52 @@ fn only_an_instance_has_a_uuid() {
     }
     assert!(IncusKind::Instance.has_uuid());
 }
+
+#[test]
+fn public_service_metadata_is_scoped_to_kernel_service_objects_and_never_changes_adoption() {
+    use arca_kernel::ownership::classify_object;
+    let mut c = config(&[
+        (KERNEL_ENTRY_KEY, "service-api"),
+        ("user.arca.template", "api"),
+        ("user.arca.address", "192.0.2.10"),
+    ]);
+    let mut object = ObjectRef {
+        kind: IncusKind::Instance,
+        project: "arcak-svc".into(),
+        parent: None,
+        name: "api".into(),
+        uuid: None,
+    };
+    assert_eq!(
+        classify(&c, &none()),
+        OwnerClass::Contested,
+        "adoption remains conservative"
+    );
+    assert_eq!(classify_object(&object, &c, &none()), kernel("service-api"));
+    assert!(matches!(
+        classify_object(&object, &c, &retained("service-api")),
+        OwnerClass::Retained { .. }
+    ));
+    for key in ["user.arca.other", "User.Arca.Template", "user.droid.lease"] {
+        c.insert(key.into(), "value".into());
+        assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Contested);
+        c.remove(key);
+    }
+    object.project = "other".into();
+    assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Contested);
+    object.project = "arcak-svc".into();
+    object.name = "other".into();
+    assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Contested);
+    c.remove(KERNEL_ENTRY_KEY);
+    assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Droidd);
+    let c = config(&[
+        (KERNEL_ENTRY_KEY, "service-api"),
+        ("user.arca.managed", "true"),
+    ]);
+    object.kind = IncusKind::Acl;
+    object.project = "default".into();
+    object.name = "arcak-svc-svc-api".into();
+    assert_eq!(classify_object(&object, &c, &none()), kernel("service-api"));
+    object.name = "another-acl".into();
+    assert_eq!(classify_object(&object, &c, &none()), OwnerClass::Contested);
+}

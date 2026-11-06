@@ -118,6 +118,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .add::<arca_netproject::NetProject>()
         .map_err(kernel_failure)?;
     plugins
+        .add::<crate::service::Service>()
+        .map_err(kernel_failure)?;
+    plugins
         .add::<arca_postgres::Postgres>()
         .map_err(kernel_failure)?;
     plugins
@@ -219,6 +222,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock.clone())
         .into_iter()
         .chain(crate::handlers::postgres_handlers(
+            kernel.clone(),
+            clock.clone(),
+            Arc::new(cfg.clone()),
+        ))
+        .chain(crate::handlers::service_handlers(
             kernel.clone(),
             clock.clone(),
             Arc::new(cfg.clone()),
