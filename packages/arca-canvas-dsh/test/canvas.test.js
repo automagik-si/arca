@@ -262,7 +262,8 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   const page = await exchange(socketPath, '/arca-canvas');
   assert.equal(page.status, 200);
   assert.match(page.body, /Arca canvas/);
-  assert.match(page.body, /src="\/arca-canvas\/page.js"/);
+  assert.match(page.body, /src="arca-canvas\/page.js"/);
+  assert.match(page.body, /data-arca-base="\/arca-canvas"/);
   assert.match(page.headers['content-security-policy'], /script-src 'self'/);
   for (const [asset, type] of [['page.js', 'text/javascript'], ['page.css', 'text/css']]) {
     const result = await exchange(socketPath, `/arca-canvas/${asset}`);

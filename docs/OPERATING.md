@@ -75,12 +75,14 @@ refused without the value being echoed back.
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
+| `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
 
 The config is refused, with exit 2, when:
 
 - a key is unknown, a required key is missing, or a value has the wrong form;
 - `approvalHost` is not a host name: one letter or digit, then up to 252 letters, digits, dots or hyphens;
 - `approvalOrigin` is not `https://`, a lowercase host name, and at most a non-443 port, with no path;
+- `canvasOrigin` is not `http://`, a literal loopback IP, and a nonzero port, with no path;
 - `listen.tailnet` is not a tailnet address: it must be a fixed port, not a wildcard, inside `100.64.0.0/10` or
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
@@ -463,6 +465,17 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
 
 The GETs need no token and admit no `Origin` or the configured one. The POSTs admit only the exact configured `Origin` and
 refuse any other before reading the body. `/mcp` and every other MCP route keep refusing every `Origin`.
+
+With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly four URLs: `GET /approve/canvas`
+(the canvas, or a passkey sign-in page), `GET /approve/canvas/page.css`, `GET /approve/canvas/page.js` and
+`GET /approve/canvas/snapshot`. The CSS, script and snapshot are fetched from `canvasOrigin` over literal loopback; no cookie
+or authorization header is forwarded, only an HTTP 200 body passes, and upstream redirects, cache headers and cookies are
+dropped. A down, slow or non-200 DSH returns an Arca-styled "the canvas is not running" page. The snapshot needs a valid
+`__Host-arca-canvas` session cookie (Secure, Path=/, HttpOnly, SameSite=Strict, twelve hours); only those four URLs read it.
+`POST /approve/canvas` issues a canonical sign-in statement, and a second POST with `{ "statement", "proof" }` spends the
+challenge before verifying the passkey and sets the cookie. The challenge store is in memory, holds 256 entries, lives two
+minutes, is single use, and has one global cap of 60 a minute; it never uses the caller address. Failures are logged without
+detail. This view is tailnet-only behind the existing `/approve/*` proxy route.
 
 To use it:
 

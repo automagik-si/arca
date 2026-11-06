@@ -24,8 +24,8 @@ export const Config = z.object({
 const page = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <meta name="color-scheme" content="light dark"><title>Arca canvas</title>
-<link rel="stylesheet" href="/arca-canvas/page.css"></head>
-<body><main id="arca-root"></main><script src="/arca-canvas/page.js" defer></script></body></html>`;
+<link rel="stylesheet" href="arca-canvas/page.css"></head>
+<body><main id="arca-root" data-arca-base="/arca-canvas"></main><script src="arca-canvas/page.js" defer></script></body></html>`;
 const assets = new Map([
   ['/arca-canvas/page.js', ['text/javascript', readFileSync(new URL('./page.js', import.meta.url))]],
   ['/arca-canvas/page.css', ['text/css', readFileSync(new URL('./page.css', import.meta.url))]],

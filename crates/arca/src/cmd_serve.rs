@@ -263,6 +263,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             cfg.state_dir.clone(),
             Arc::new(crate::approve_page::DesktopDisplay),
         )
+        .with_canvas_origin(&cfg.canvas_origin)
     });
     let proxy_router = match &page {
         Some(page) => router.clone().merge(page.router(true)),

@@ -9,6 +9,7 @@
 
 pub mod adoptions;
 pub mod approve_page;
+pub mod canvas;
 pub mod cmd_adopt;
 pub mod cmd_call;
 pub mod cmd_link;

@@ -148,6 +148,36 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   }
   if (evidence) await writeFile(join(evidence, 'regions.json'), JSON.stringify(results, null, 2));
 
+  const phonePage = await browser.newPage({ viewport: { width: 390, height: 844 }, colorScheme: 'light' });
+  const phoneErrors = [];
+  phonePage.on('pageerror', (error) => phoneErrors.push(error.message));
+  await phonePage.goto(`${origin}/arca-canvas`);
+  await phonePage.waitForFunction(() => document.querySelector('[data-kind="machine"]') && document.querySelector('.arca-card'));
+  const phone = await phonePage.evaluate(() => {
+    const cards = [...document.querySelectorAll('.arca-card')].map((card) => {
+      const box = card.getBoundingClientRect();
+      return { left: box.left, right: box.right, width: box.width };
+    });
+    const stage = document.querySelector('.arca-stage');
+    return {
+      viewport: window.innerWidth,
+      pageScroll: document.documentElement.scrollWidth,
+      stageScroll: stage.scrollWidth,
+      stageClient: stage.clientWidth,
+      panel: getComputedStyle(document.querySelector('.arca-panel')).display,
+      cards,
+    };
+  });
+  assert.equal(phone.pageScroll, 390, 'no horizontal page scroll');
+  assert.ok(phone.stageScroll <= phone.stageClient, 'no horizontal stage scroll');
+  assert.equal(phone.panel, 'none', 'Steps are hidden at phone width');
+  assert.ok(phone.cards.length > 1);
+  assert.equal(new Set(phone.cards.map(({ left }) => Math.round(left))).size, 1, 'cards use one column');
+  assert.ok(phone.cards.every(({ left, right }) => left >= 0 && right <= 390));
+  assert.deepEqual(phoneErrors, []);
+  if (evidence) await phonePage.screenshot({ path: join(evidence, 'fixture-phone-390x844.png') });
+  await phonePage.close();
+
   deviceAvailable = false;
   const unavailableResults = [];
   for (const scheme of ['light', 'dark']) {

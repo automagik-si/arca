@@ -19,17 +19,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use arca_approval::passkey::{STATE_PASSKEYS_FILE, format_passkey_line};
-use arca_approval::{PasskeyLine, load_state_passkeys, parse_passkeys};
+use arca_approval::{ARCA_NAMESPACE, PasskeyLine, load_state_passkeys, parse_passkeys};
+use arca_kernel::canon::canonical_json;
 use arca_mcp::CallError;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
+use crate::canvas::{self, Canvas};
 use crate::handlers::{Clock, approve_plan, list_plans};
 use crate::kernel::Kernel;
 
@@ -98,6 +100,7 @@ struct PageState {
     display: Arc<dyn SetupCodeDisplay>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     trust_forwarded_for: bool,
+    canvas: Arc<Canvas>,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -232,6 +235,7 @@ impl Page {
             .lock()
             .map(|kernel| kernel.owner_passkey_lines())
             .unwrap_or_default();
+        let origin_for_canvas = origin.clone();
         Self {
             state: PageState {
                 origin,
@@ -244,6 +248,13 @@ impl Page {
                 display,
                 log: Arc::new(|line| eprintln!("{line}")),
                 trust_forwarded_for: false,
+                canvas: Arc::new(
+                    Canvas::new(
+                        origin_for_canvas.clone(),
+                        &crate::config::default_canvas_origin(),
+                    )
+                    .expect("the default canvas origin is loopback"),
+                ),
             },
         }
     }
@@ -252,6 +263,19 @@ impl Page {
     pub fn with_log(mut self, log: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         self.state.log = log;
         self
+    }
+
+    /// Replaces the loopback DSH origin. `cmd_serve` passes the validated `canvasOrigin`; tests pass a fresh loopback fake.
+    pub fn with_canvas_origin(mut self, origin: &str) -> Self {
+        self.state.canvas = Arc::new(
+            Canvas::new(self.state.origin.clone(), origin).expect("canvasOrigin is validated"),
+        );
+        self
+    }
+
+    /// The canvas state, for a sign-in test to issue a session directly.
+    pub fn canvas(&self) -> &Canvas {
+        &self.state.canvas
     }
 
     /// Builds a router sharing this binding's setup state. Only the proxy listener trusts forwarded caller addresses.
@@ -266,11 +290,17 @@ impl Page {
             .route("/approve/approve", post(approve))
             .route("/approve/setup-code", post(setup_code))
             .route("/approve/register", post(register))
+            .route(canvas::PAGE_PATH, get(canvas_page).post(canvas_sign_in))
+            .route(canvas::CSS_PATH, get(canvas_css))
+            .route(canvas::JS_PATH, get(canvas_js))
+            .route(canvas::SNAPSHOT_PATH, get(canvas_snapshot))
+            .route("/approve/{*rest}", any(not_found))
             .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 origin_rule,
             ))
+            .layer(middleware::from_fn(security_headers))
             .with_state(state)
     }
 }
@@ -316,12 +346,196 @@ async fn origin_rule(
     next.run(request).await
 }
 
+/// Headers on every `/approve` response, including the existing approval page, refusals and the proxied canvas.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(canvas::csp()),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 async fn page() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_str!("approve_page.html"),
     )
         .into_response()
+}
+
+async fn not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
+}
+
+async fn canvas_page(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
+    let now = (state.clock)();
+    let body = if state.canvas.session(&headers, now).is_some() {
+        canvas::CANVAS_PAGE
+    } else {
+        canvas::SIGN_IN_PAGE
+    };
+    canvas_html(body)
+}
+
+async fn canvas_sign_in(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    let now = (state.clock)();
+    let value: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(_) => return canvas_failure(&state, StatusCode::BAD_REQUEST),
+        }
+    };
+    let Some(object) = value.as_object() else {
+        return canvas_failure(&state, StatusCode::BAD_REQUEST);
+    };
+    if object.is_empty() {
+        let Some(statement) = state.canvas.issue_challenge(now) else {
+            return canvas_json(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "message": "Too many sign-in challenges" }),
+            );
+        };
+        return canvas_json(StatusCode::OK, json!({ "statement": statement }));
+    }
+    let Some(statement) = object.get("statement").and_then(Value::as_str) else {
+        return canvas_failure(&state, StatusCode::BAD_REQUEST);
+    };
+    let Some(proof) = object.get("proof") else {
+        return canvas_failure(&state, StatusCode::BAD_REQUEST);
+    };
+    let Some(parsed) = state.canvas.parse_statement(statement, now) else {
+        return canvas_failure(&state, StatusCode::FORBIDDEN);
+    };
+    // Required order: spend the exact live challenge before any signature work. A missing challenge costs this map lookup and
+    // no verify at all.
+    if !state.canvas.spend_challenge(&parsed, statement, now) {
+        return canvas_failure(&state, StatusCode::FORBIDDEN);
+    }
+    let Some(proof_bytes) = canonical_json(proof).ok() else {
+        return canvas_failure(&state, StatusCode::FORBIDDEN);
+    };
+    let verified = state.kernel.lock().ok().and_then(|kernel| {
+        kernel
+            .verify_passkey(ARCA_NAMESPACE, statement.as_bytes(), proof_bytes.as_bytes())
+            .ok()
+    });
+    let Some(credential) = verified else {
+        return canvas_failure(&state, StatusCode::FORBIDDEN);
+    };
+    let Some(cookie) = state.canvas.issue_session(&credential, now) else {
+        return canvas_failure(&state, StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let mut response = canvas_json(StatusCode::OK, json!({ "signedIn": true }));
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("the canvas cookie is a header value"),
+    );
+    response
+}
+
+async fn canvas_css(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
+    canvas_asset(
+        &state,
+        &headers,
+        canvas::DSH_CSS_PATH,
+        "text/css; charset=utf-8",
+    )
+    .await
+}
+
+async fn canvas_js(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
+    canvas_asset(
+        &state,
+        &headers,
+        canvas::DSH_JS_PATH,
+        "text/javascript; charset=utf-8",
+    )
+    .await
+}
+
+async fn canvas_snapshot(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
+    canvas_asset(
+        &state,
+        &headers,
+        canvas::DSH_SNAPSHOT_PATH,
+        "application/json; charset=utf-8",
+    )
+    .await
+}
+
+async fn canvas_asset(
+    state: &PageState,
+    headers: &HeaderMap,
+    path: &str,
+    content_type: &'static str,
+) -> Response {
+    let now = (state.clock)();
+    if state.canvas.session(headers, now).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match state.canvas.proxy(path).await {
+        Some(body) => {
+            let mut response = (StatusCode::OK, body).into_response();
+            response
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        None => canvas_error(),
+    }
+}
+
+fn canvas_html(body: &'static str) -> Response {
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn canvas_json(status: StatusCode, body: Value) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn canvas_failure(state: &PageState, status: StatusCode) -> Response {
+    // No detail: not the statement, the proof, the challenge or the verifier's reason.
+    (state.log)("arca: canvas sign-in failed");
+    canvas_json(status, json!({ "message": "Sign-in failed" }))
+}
+
+fn canvas_error() -> Response {
+    let mut response = (StatusCode::BAD_GATEWAY, canvas::ERROR_PAGE).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn plans(State(state): State<Arc<PageState>>) -> Response {
@@ -711,11 +925,13 @@ mod tests {
 
     #[test]
     fn a_live_code_is_never_replaced_by_a_fresh_one() {
-        let mut setup = SetupState::default();
-        setup.live = Some(LiveCode {
-            code: "12345678".to_string(),
-            expires: now() + CODE_TTL_MS,
-        });
+        let mut setup = SetupState {
+            live: Some(LiveCode {
+                code: "12345678".to_string(),
+                expires: now() + CODE_TTL_MS,
+            }),
+            ..Default::default()
+        };
         assert!(setup.live_if_fresh(now()).is_some());
         setup.lock(now());
         assert!(

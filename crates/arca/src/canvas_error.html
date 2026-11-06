@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Arca canvas</title>
+<style>
+  :root { color-scheme: light dark; --arca-bg: #f4f4f7; --arca-surface: #fff; --arca-ink: #0c0d11; --arca-muted: #5d6170; --arca-line: rgba(12, 13, 17, .12); }
+  @media (prefers-color-scheme: dark) { :root { --arca-bg: #0b0b0f; --arca-surface: #15161c; --arca-ink: #f1f2f6; --arca-muted: #a4a9b7; --arca-line: rgba(255, 255, 255, .13); } }
+  html, body { height: 100%; margin: 0; background: var(--arca-bg); color: var(--arca-ink); font: 500 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { width: min(28rem, calc(100% - 2rem)); margin: 12vh auto 0; padding: 1.5rem; border: 1px solid var(--arca-line); border-radius: 1rem; background: var(--arca-surface); box-sizing: border-box; }
+  h1 { margin: 0 0 .5rem; font-size: 1.35rem; }
+  p { margin: 0; color: var(--arca-muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>The canvas is not running</h1>
+  <p>Arca could not reach the canvas on this machine. Approvals still work.</p>
+</main>
+</body>
+</html>

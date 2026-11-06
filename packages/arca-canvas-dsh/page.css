@@ -338,3 +338,51 @@ a.arca-plans:focus-visible {
     display: none;
   }
 }
+@media (max-width: 600px) {
+  .arca-canvas {
+    min-height: 100%;
+  }
+  .arca-topbar {
+    height: auto;
+    min-height: 56px;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    padding: 10px 12px;
+  }
+  .arca-main {
+    display: block;
+    overflow: visible;
+  }
+  .arca-panel {
+    display: none;
+  }
+  .arca-stage {
+    min-height: 0;
+    padding: 56px 12px 24px;
+    overflow-x: hidden;
+  }
+  .arca-status {
+    left: 12px;
+    max-width: calc(100% - 24px);
+  }
+  .arca-world {
+    width: auto !important;
+    height: auto !important;
+  }
+  .arca-card {
+    position: relative !important;
+    left: auto !important;
+    top: auto !important;
+    width: auto !important;
+    height: auto !important;
+    margin-bottom: 12px;
+  }
+  .arca-card-title > *,
+  .arca-live > *,
+  .arca-state > * {
+    white-space: normal;
+  }
+  .arca-meta {
+    max-width: 50%;
+  }
+}
