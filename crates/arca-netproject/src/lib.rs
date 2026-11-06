@@ -169,7 +169,7 @@ impl Plugin for NetProject {
                 &cfg.project,
                 PROFILE,
                 json!({"name": PROFILE,
-                    "description": format!("Arca service (project {}); managed by infra/provision-services.mjs", cfg.project),
+                    "description": format!("Arca service (project {}); managed by Arca", cfg.project),
                     "config": {"limits.memory":"2GiB", "limits.cpu":"2", "limits.cpu.priority":"5",
                         "limits.processes":"4096", "security.privileged":"false", "security.nesting":"false",
                         "security.idmap.isolated":"true", "security.guestapi":"false"},

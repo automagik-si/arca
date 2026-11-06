@@ -89,7 +89,7 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
     assert_eq!(profile["name"], PROFILE);
     assert_eq!(
         profile["description"],
-        format!("Arca service (project {PROJECT}); managed by infra/provision-services.mjs")
+        format!("Arca service (project {PROJECT}); managed by Arca")
     );
     let mut config = profile["config"].as_object().unwrap().clone();
     config.remove("user.arcakernel.entry");
