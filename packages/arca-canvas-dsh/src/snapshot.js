@@ -14,6 +14,7 @@ export function emptySnapshot(config = {}) {
     alerts: [],
     plans: [],
     devices: 'off',
+    devicesAt: null,
     phones: [],
     desktops: [],
   };
@@ -47,36 +48,88 @@ export async function collectSnapshot(client, config = {}) {
   return snapshot;
 }
 
-// The caller owns a single deadline for the entire device phase.
-export async function collectDevices(client, signal) {
+const PHONE_STATUS_LIMIT = 2;
+const PHONE_FAILURE_BACKOFF_MS = 60_000;
+
+// The caller owns a single deadline for the entire device phase. One phase reads at most
+// two phone statuses, rotating through the list, and a failed phone waits 60s before a retry.
+export async function collectDevices(client, signal, options = {}) {
   if (!client) return { devices: 'off', phones: [], desktops: [] };
+  const now = options.now ?? Date.now;
+  const lastFailureAt = options.lastFailureAt ?? new Map();
+  const previous = Array.isArray(options.previous) ? options.previous : [];
+  const hasGood = Boolean(options.hasGood);
   try {
     const phones = rows(await client.call('droid_list', {}, signal));
     const desktops = rows(await client.call('desktop_list', {}, signal));
     await client.call('droidd_status', {}, signal);
-    let unavailable = false;
+    const listedAt = now();
+    const prior = new Map(previous.map((entry) => [entry.name, entry]));
+    const entries = phones.map((phone) => {
+      const old = prior.get(phone.name) ?? {};
+      return {
+        name: phone.name, state: old.state ?? phone.state ?? 'unknown',
+        network: old.network ?? null, battery: old.battery ?? null, size: old.size ?? null,
+      };
+    });
+    const start = phones.length ? (options.cursor ?? 0) % phones.length : 0;
+    const selected = [];
+    for (let offset = 0; offset < phones.length && selected.length < PHONE_STATUS_LIMIT; offset++) {
+      const index = (start + offset) % phones.length;
+      const phone = phones[index];
+      const failedAt = lastFailureAt.get(phone.name);
+      if (failedAt !== undefined && listedAt - failedAt < PHONE_FAILURE_BACKOFF_MS) continue;
+      selected.push({ phone, index });
+    }
+    options.cursor = selected.length
+      ? (selected[selected.length - 1].index + 1) % phones.length
+      : start;
+    let unreachable = false;
+    let rateLimited = false;
     let setting;
-    const entries = [];
-    for (const phone of phones) {
-      let status = null;
-      let state = phone.state;
-      if (state === 'ready') {
-        try { status = await client.call('phone_status', { droid: phone.name }, signal); }
-        catch (error) { unavailable = true; state = 'unknown'; setting ??= error.setting; }
+    for (const { phone, index } of selected) {
+      const entry = entries[index];
+      try {
+        const status = await client.call('phone_status', { droid: phone.name }, signal);
+        lastFailureAt.delete(phone.name);
+        entry.state = phone.state ?? 'unknown';
+        entry.network = status?.network?.type ?? null;
+        entry.battery = status?.battery?.level ?? null;
+        entry.size = status?.size ?? null;
+      } catch (error) {
+        if (error.status === 429) { rateLimited = true; setting = error.setting; break; }
+        lastFailureAt.set(phone.name, now());
+        entry.state = 'unreachable';
+        unreachable = true;
+        setting ??= error.setting;
+        if (error.aborted || signal?.aborted) break;
       }
-      entries.push({ name: phone.name, state,
-        network: status?.network?.type ?? null,
-        battery: status?.battery?.level ?? null, size: status?.size ?? null });
+    }
+    for (let index = 0; index < phones.length; index++) {
+      if (selected.some((candidate) => candidate.index === index)) continue;
+      const failedAt = lastFailureAt.get(phones[index].name);
+      if (failedAt !== undefined && now() - failedAt < PHONE_FAILURE_BACKOFF_MS) {
+        entries[index].state = 'unreachable';
+        unreachable = true;
+      } else entries[index].state = phones[index].state ?? 'unknown';
+    }
+    if (rateLimited) {
+      return { devices: hasGood ? 'rate-limited' : 'unavailable', phones: [], desktops: [], setting, lists: false };
     }
     const desktopEntries = desktops.map(({ name, status, memoryBytes }) => ({ name, status, memoryBytes }));
-    return { devices: unavailable ? 'unavailable' : 'ok', phones: entries, desktops: desktopEntries, setting };
+    return { devices: unreachable ? 'unreachable' : 'ok', phones: entries, desktops: desktopEntries, setting, lists: true, at: listedAt };
   } catch (error) {
-    return { devices: 'unavailable', phones: [], desktops: [], setting: error.setting };
+    return {
+      devices: !hasGood ? 'unavailable' : error.status === 429 ? 'rate-limited' : 'unreachable',
+      phones: [], desktops: [], setting: error.setting, lists: false,
+    };
   }
 }
 
 export function createSnapshotCache(client, pollMs, config = {}, devices = null) {
-  let deviceState = { devices: devices ? 'unavailable' : 'off', phones: [], desktops: [] };
+  const now = config.now ?? (() => Date.now());
+  const deviceMeta = { lastFailureAt: new Map(), cursor: 0, now };
+  let deviceState = { devices: devices ? 'unavailable' : 'off', devicesAt: null, phones: [], desktops: [] };
   let cached = { ...emptySnapshot(config), ...deviceState, error: 'Waiting for the first Arca snapshot.' };
   let timer;
   let stopped = false;
@@ -89,15 +142,27 @@ export function createSnapshotCache(client, pollMs, config = {}, devices = null)
     phase = controller;
     const deadline = setTimeout(() => controller.abort(), config.devicesTimeoutMs ?? 5000);
     deadline.unref();
-    void collectDevices(devices, controller.signal).then(({ setting, ...next }) => {
+    Object.assign(deviceMeta, { previous: deviceState.phones, hasGood: Boolean(deviceState.devicesAt) });
+    void collectDevices(devices, controller.signal, deviceMeta).then(({ setting, ...next }) => {
       if (stopped) return;
-      deviceState = next;
+      if (next.devices === 'rate-limited') {
+        // A 429 keeps the last complete list and its timestamp; never invent an empty stale list.
+        if (deviceState.devicesAt) deviceState = { ...deviceState, devices: 'stale' };
+        else deviceState = { devices: 'unavailable', devicesAt: null, phones: [], desktops: [] };
+      } else if (next.devices === 'unreachable' && !next.lists) {
+        if (deviceState.devicesAt) deviceState = { ...deviceState, devices: 'unreachable' };
+        else deviceState = { devices: 'unavailable', devicesAt: null, phones: [], desktops: [] };
+      } else if (next.devices === 'unavailable') {
+        deviceState = { devices: 'unavailable', devicesAt: null, phones: [], desktops: [] };
+      } else {
+        deviceState = { devices: next.devices, phones: next.phones, desktops: next.desktops, devicesAt: new Date(now()).toISOString() };
+      }
       cached = { ...cached, ...deviceState };
-      if (lastState !== next.devices) {
-        lastState = next.devices;
+      if (lastState !== deviceState.devices) {
+        lastState = deviceState.devices;
         // Only known setting names may enter a host log; never upstream details.
         const rejected = ['devicesUrl', 'devicesTokenPath'].includes(setting) ? ` (${setting})` : '';
-        log(`Arca canvas devices: ${next.devices}${rejected}`);
+        log(`Arca canvas devices: ${deviceState.devices}${rejected}`);
       }
     }).finally(() => {
       clearTimeout(deadline);
