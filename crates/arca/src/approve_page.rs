@@ -291,6 +291,7 @@ impl Page {
             .route("/approve/plans", get(plans))
             .route("/approve/approve", post(approve))
             .route("/approve/setup-code", post(setup_code))
+            .route("/approve/setup-code/verify", post(verify_setup_code))
             .route("/approve/register", post(register))
             .route(canvas::PAGE_PATH, get(canvas_page).post(canvas_sign_in))
             .route(canvas::CSS_PATH, get(canvas_css))
@@ -685,6 +686,69 @@ async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> 
     Json(json!({ "issued": true })).into_response()
 }
 
+/// Checks a setup code before the page creates a credential, using the same wrong-try budgets as registration. A correct
+/// code stays live for the registration that follows; this route never trusts or consumes a credential.
+async fn verify_setup_code(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        return missing_setup_code();
+    };
+    let Some(setup_code) = value.get("setupCode").and_then(Value::as_str) else {
+        return missing_setup_code();
+    };
+    if setup_code.trim().is_empty() {
+        return missing_setup_code();
+    }
+    let now = (state.clock)();
+    let mut setup = match state.setup.lock() {
+        Ok(setup) => setup,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let kernel = match state.kernel.lock() {
+        Ok(kernel) => kernel,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if kernel.owner_passkey_count() > 0 {
+        return already_trusted();
+    }
+    setup.prune(now);
+    let caller = state.caller(&headers);
+    if let Some(minutes) = setup
+        .locked_minutes(now)
+        .or_else(|| setup.caller_locked_minutes(&caller, now))
+    {
+        return locked(minutes);
+    }
+    let correct = setup
+        .live_if_fresh(now)
+        .is_some_and(|live| setup_code == live.code);
+    if !correct {
+        if setup.live.is_none() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "message": "The setup code expired" })),
+            )
+                .into_response();
+        }
+        setup.wrong_code(caller.clone(), now);
+        if let Some(minutes) = setup
+            .locked_minutes(now)
+            .or_else(|| setup.caller_locked_minutes(&caller, now))
+        {
+            return locked(minutes);
+        }
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "The setup code is wrong" })),
+        )
+            .into_response();
+    }
+    Json(json!({ "verified": true })).into_response()
+}
+
 async fn register(
     State(state): State<Arc<PageState>>,
     headers: HeaderMap,
@@ -706,12 +770,12 @@ async fn register(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(setup_code) = value.get("setupCode") else {
-        return Json(json!({ "line": line })).into_response();
+    let Some(setup_code) = value.get("setupCode").and_then(Value::as_str) else {
+        return missing_setup_code();
     };
-    let Some(setup_code) = setup_code.as_str() else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
+    if setup_code.trim().is_empty() {
+        return missing_setup_code();
+    }
     let now = (state.clock)();
     let mut setup = match state.setup.lock() {
         Ok(setup) => setup,
@@ -799,7 +863,15 @@ async fn register(
     }
     setup.live = None;
     (state.log)(&format!("arca: passkey trusted, {count} passkey(s) kept"));
-    Json(json!({ "trusted": true, "line": line })).into_response()
+    Json(json!({ "trusted": true })).into_response()
+}
+
+fn missing_setup_code() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "message": "Enter the setup code first" })),
+    )
+        .into_response()
 }
 
 fn already_trusted() -> Response {

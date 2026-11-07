@@ -639,12 +639,20 @@ fn a_valid_approval_runs_the_plan_once_and_every_bad_post_deletes_nothing() {
 
 #[test]
 fn registration_round_trips_through_parse_passkeys_and_refuses_bad_keys() {
-    let (rig, key) = Rig::new("page-register", true);
-    let (status, body) = rig.post("/approve/register", Some(ORIGIN), register_body(&key, None));
-    assert_eq!(status, 200);
+    let (rig, key) = Rig::new_empty("page-register");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    let (status, body) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let body: Value = serde_json::from_slice(&body).expect("registration JSON");
-    let line = body["line"].as_str().expect("the line");
-    let parsed = parse_passkeys(format!("{line}\n").as_bytes()).expect("the line parses");
+    assert_eq!(body["trusted"], true);
+    assert!(body.get("line").is_none());
+    let line = fs::read_to_string(rig.state_path()).expect("the state passkeys file");
+    let parsed = parse_passkeys(line.as_bytes()).expect("the line parses");
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].credential_id, key.credential_id);
     assert_eq!(parsed[0].fingerprint, key.fingerprint());
@@ -671,6 +679,80 @@ fn registration_round_trips_through_parse_passkeys_and_refuses_bad_keys() {
         rig.post("/approve/register", None, register_body(&key, None))
             .0
     ));
+}
+
+#[test]
+fn registration_without_a_setup_code_is_refused_without_a_developer_line() {
+    let (rig, key) = Rig::new_empty("page-no-code");
+    let (status, body) = rig.post("/approve/register", Some(ORIGIN), register_body(&key, None));
+    assert_eq!(status, 400);
+    let body: Value = serde_json::from_slice(&body).expect("refusal JSON");
+    assert_eq!(body["message"], "Enter the setup code first");
+    assert!(body.get("line").is_none());
+    assert!(!rig.state_path().exists());
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
+}
+
+#[test]
+fn setup_code_verification_does_not_trust_or_consume_the_code() {
+    let (rig, key) = Rig::new_empty("page-verify");
+    let (status, body) = rig.post("/approve/setup-code/verify", Some(ORIGIN), json!({}));
+    assert_eq!(status, 400);
+    assert!(String::from_utf8_lossy(&body).contains("Enter the setup code first"));
+    assert!(!rig.state_path().exists());
+    let (status, body) = rig.post(
+        "/approve/setup-code/verify",
+        Some(ORIGIN),
+        json!({ "setupCode": "12345678" }),
+    );
+    assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("expired"));
+    assert!(!rig.state_path().exists());
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
+
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    let (status, body) = rig.post(
+        "/approve/setup-code/verify",
+        Some(ORIGIN),
+        json!({ "setupCode": code }),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let body: Value = serde_json::from_slice(&body).expect("verification JSON");
+    assert_eq!(body["verified"], true);
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
+    assert!(!rig.state_path().exists());
+
+    let (status, body) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 1);
+}
+
+#[test]
+fn wrong_setup_codes_use_the_registration_try_budget_before_any_create() {
+    let (rig, _key) = Rig::new_empty("page-verify-budget");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    for _ in 0..5 {
+        let (status, _) = rig.post(
+            "/approve/setup-code/verify",
+            Some(ORIGIN),
+            json!({ "setupCode": "wrong" }),
+        );
+        assert!(refusal(status), "a wrong code is refused");
+    }
+    let (status, body) = rig.post(
+        "/approve/setup-code/verify",
+        Some(ORIGIN),
+        json!({ "setupCode": "wrong" }),
+    );
+    assert_eq!(status, 429);
+    assert!(String::from_utf8_lossy(&body).contains("locked"));
+    assert!(!rig.state_path().exists());
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
 }
 
 #[test]
@@ -887,13 +969,18 @@ fn wrong_code(code: &str) -> &str {
 }
 
 #[test]
-fn owner_page_hides_the_developer_line_when_a_setup_code_was_sent() {
+fn owner_page_hides_the_developer_line_and_requires_a_checked_code() {
     let (rig, _) = Rig::new_empty("page-owner-source");
     let (status, body) = rig.get("/approve", None);
     assert_eq!(status, 200);
     let source = String::from_utf8(body).expect("page text");
-    // Static source check: no DOM runner is available. The request's setupCode guards the owner branch.
-    assert!(source.contains("if (setupCode) {\n      line.hidden = true;\n      line.textContent = \"\";\n      status(\"Passkey trusted.\");\n    } else if (body.line) {"));
+    // Static source check: no DOM runner is available. The browser ceremony proves the guards at runtime.
+    assert!(!source.contains("For developers"));
+    assert!(!source.contains("id=\"line\""));
+    assert!(!source.contains("body.line"));
+    assert!(!source.contains("Passkey registered"));
+    assert!(source.contains("Enter the 8-digit setup code first."));
+    assert!(source.contains("/approve/setup-code/verify"));
     assert!(source.contains("showTrusted(body.passkeysTrusted || 0)"));
     assert!(source.contains("await loadPlans();"));
 }
@@ -1795,10 +1882,24 @@ fn pages_serve_trusted_credentials_and_check_trust_before_create_source_order() 
     let check = register
         .find("passkeysTrusted")
         .expect("the pre-create trust check");
+    let empty = register
+        .find("if (!setupCode)")
+        .expect("the empty-code guard");
+    let verify = register
+        .find("/approve/setup-code/verify")
+        .expect("the setup-code check");
     let create = register
         .find("navigator.credentials.create")
         .expect("the create call");
-    assert!(check < create, "trust is checked before create");
+    assert!(
+        check < empty,
+        "trust is checked before the empty-code guard"
+    );
+    assert!(
+        empty < verify,
+        "the empty-code guard runs before verification"
+    );
+    assert!(verify < create, "the setup code is checked before create");
     assert!(source.contains("allowCredentials,"));
     assert!(source.contains("No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows."));
 
