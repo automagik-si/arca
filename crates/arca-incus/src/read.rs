@@ -197,6 +197,16 @@ pub(crate) fn exchange(
     timeout: Duration,
     request: &[u8],
 ) -> Result<Framed, IncusError> {
+    exchange_capped(socket, timeout, request, MAX_BODY)
+}
+
+/// Exchanges a response without ever allocating a body beyond the caller's cap.
+pub(crate) fn exchange_capped(
+    socket: &Path,
+    timeout: Duration,
+    request: &[u8],
+    cap: usize,
+) -> Result<Framed, IncusError> {
     guard_request(request)?;
     if timeout.is_zero() {
         return Err(IncusError::Timeout);
@@ -209,7 +219,7 @@ pub(crate) fn exchange(
         stream: &stream,
         deadline,
     });
-    read_framed(&mut reader, MAX_BODY)
+    read_framed(&mut reader, cap)
 }
 
 /// Why [`exchange`] refuses a PATCH to a project.

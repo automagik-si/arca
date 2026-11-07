@@ -542,6 +542,7 @@ fn service_create_sets_an_oci_templates_entrypoint_from_the_template_file_alone_
         to: "provider".into(),
         port: 4222,
         env: vec!["PROVIDER".into()],
+        uuid: provider["config"]["volatile.uuid"].as_str().unwrap().into(),
     });
     config
         .environment
@@ -2089,3 +2090,6 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
             .is_none()
     );
 }
+
+#[path = "services/wiring.rs"]
+mod wiring;

@@ -46,6 +46,11 @@ pub struct NodeConfig {
     /// are required; a host name, a non-loopback address, a path or https is refused before anything listens.
     #[serde(default = "default_canvas_origin")]
     pub canvas_origin: String,
+    /// This process's serve DNS name and the owner's tailnet label, used by service publication.
+    #[serde(default)]
+    pub serve_host: Option<String>,
+    #[serde(default)]
+    pub tailnet: Option<String>,
     /// The node link endpoint and opaque ALPN routes.
     #[serde(default)]
     pub link: Option<arca_link::Config>,

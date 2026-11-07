@@ -196,6 +196,7 @@ pub struct FakeIncus {
 
 /// What every connection shares: the objects, the logs and the switches.
 struct Shared {
+    service: Mutex<ServiceFake>,
     store: Mutex<Store>,
     requests: Mutex<Vec<RecordedRequest>>,
     writes: Mutex<Vec<WriteRecord>>,
@@ -377,6 +378,7 @@ impl Shared {
             store.expand(index, false);
         }
         Shared {
+            service: Mutex::new(ServiceFake::default()),
             store: Mutex::new(store),
             requests: Mutex::new(Vec::new()),
             writes: Mutex::new(Vec::new()),
@@ -795,6 +797,12 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         Ok(None) => return,
         Err(_) => Request::bad(),
     };
+    if let Some((status, body)) = service_response(shared, &request) {
+        record(shared, &request, status);
+        let _ = respond(&mut stream, status, reason(status), "", &body);
+        drain(&mut stream);
+        return;
+    }
     if let Some(console) = console_body(shared, &request) {
         record(shared, &request, console.0);
         let _ = respond(&mut stream, console.0, reason(console.0), "", &console.1);
@@ -891,6 +899,17 @@ fn invalid(message: &str) -> io::Error {
 }
 
 fn record(shared: &Shared, request: &Request, status: u16) {
+    if !request.path().ends_with("/exec")
+        && !request.path().ends_with("/files")
+        && !request.path().contains("/logs/exec-output/")
+    {
+        lock(&shared.service).calls.push(ServiceRequest {
+            method: request.method.clone(),
+            path: request.target.clone(),
+            headers: request.headers.clone(),
+            body: request.body.clone(),
+        });
+    }
     lock(&shared.requests).push(RecordedRequest {
         method: request.method.clone(),
         path: request.target.clone(),
@@ -2797,4 +2816,180 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with('"') && first.ends_with('"'));
     }
+}
+
+/// Hermetic scripts for the closed service seam. Unscripted commands exit 127.
+#[derive(Default)]
+struct ServiceFake {
+    scripts: std::collections::VecDeque<ExecScript>,
+    calls: Vec<ServiceRequest>,
+    recordings: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<String, Vec<u8>>,
+}
+
+/// Request evidence for tests only; bodies may contain test secrets, so this has no Debug implementation.
+#[derive(Clone)]
+pub struct ServiceRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+pub struct ExecScript {
+    pub argv: Vec<String>,
+    pub exit: i64,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub held: bool,
+    pub swap_uuid: bool,
+    pub post_status: u16,
+}
+impl ExecScript {
+    pub fn new(argv: Vec<String>, exit: i64, stdout: &str) -> Self {
+        Self {
+            argv,
+            exit,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            held: false,
+            swap_uuid: false,
+            post_status: 200,
+        }
+    }
+}
+impl FakeIncus {
+    pub fn script_exec(&self, script: ExecScript) {
+        lock(&self.shared.service).scripts.push_back(script);
+    }
+    pub fn service_requests(&self) -> Vec<ServiceRequest> {
+        lock(&self.shared.service).calls.clone()
+    }
+    pub fn recordings(&self) -> usize {
+        lock(&self.shared.service).recordings.len()
+    }
+    pub fn service_files(&self) -> BTreeMap<String, Vec<u8>> {
+        lock(&self.shared.service).files.clone()
+    }
+}
+
+fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
+    let segments: Vec<&str> = request.path().split('/').collect();
+    let ["", "1.0", "instances", name, rest @ ..] = segments.as_slice() else {
+        return None;
+    };
+    if !matches!(rest, ["exec"] | ["files"] | ["logs", "exec-output", _]) {
+        return None;
+    }
+    let query = request.target.split_once('?').map_or("", |(_, q)| q);
+    let project = query_param(query, "project").unwrap_or(DEFAULT_PROJECT);
+    let mut service = lock(&shared.service);
+    service.calls.push(ServiceRequest {
+        method: request.method.clone(),
+        path: request.target.clone(),
+        headers: request.headers.clone(),
+        body: request.body.clone(),
+    });
+    let encoded = |code, message| {
+        (
+            code,
+            serde_json::to_vec(&error_envelope(code, message)).unwrap(),
+        )
+    };
+    let mut store = lock(&shared.store);
+    let Some(index) = store
+        .objects
+        .iter()
+        .position(|o| o.kind == "instance" && o.project == project && o.name == *name)
+    else {
+        return Some(encoded(404, "not found"));
+    };
+    if let ["logs", "exec-output", _] = rest {
+        let key = format!("{project}:{}", request.path());
+        return Some(match request.method.as_str() {
+            "GET" => service
+                .recordings
+                .get(&key)
+                .cloned()
+                .map_or_else(|| encoded(404, "not found"), |bytes| (200, bytes)),
+            "DELETE" => {
+                if service.recordings.remove(&key).is_some() {
+                    (200, b"{}".to_vec())
+                } else {
+                    encoded(404, "not found")
+                }
+            }
+            _ => encoded(405, "method"),
+        });
+    }
+    if rest == ["files"] {
+        let path = crate::read::percent_decode(query_param(query, "path").unwrap_or(""));
+        let key = format!("{project}/{name}:{path}");
+        return Some(match request.method.as_str() {
+            "POST" => {
+                service.files.insert(key, request.body.clone());
+                (200, b"{}".to_vec())
+            }
+            "GET" => service
+                .files
+                .get(&key)
+                .cloned()
+                .map_or_else(|| encoded(404, "not found"), |bytes| (200, bytes)),
+            "DELETE" => {
+                service.files.remove(&key);
+                (200, b"{}".to_vec())
+            }
+            _ => encoded(405, "method"),
+        });
+    }
+    if request.method != "POST" {
+        return Some(encoded(405, "method"));
+    }
+    if store.objects[index].body["status"] != "Running" {
+        return Some(encoded(400, "instance is stopped"));
+    }
+    let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+    let argv: Vec<String> = body["command"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    let script = if service.scripts.front().is_some_and(|s| s.argv == argv) {
+        service.scripts.pop_front().unwrap()
+    } else {
+        ExecScript::new(argv, 127, "")
+    };
+    if script.post_status != 200 {
+        return Some(encoded(script.post_status, "scripted failure"));
+    }
+    let id = shared.next_id();
+    let mut op = running_operation(&id, &place_of_stored(&store.objects[index]));
+    op["description"] = json!("Executing command");
+    op["metadata"] = json!({"return":script.exit});
+    if !script.held {
+        op["status"] = json!("Success");
+        op["status_code"] = json!(200);
+    } else {
+        store.held.insert(id.clone(), Held::default());
+    }
+    if script.swap_uuid {
+        store.objects[index].body["config"]["volatile.uuid"] = json!(shared.next_id());
+    }
+    if body["command"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "/usr/bin/rm"))
+    {
+        service
+            .files
+            .retain(|key, _| !key.starts_with(&format!("{project}/{name}:/run/arca-ts/")));
+    }
+    for (extension, bytes) in [("stdout", script.stdout), ("stderr", script.stderr)] {
+        service.recordings.insert(
+            format!("{project}:/1.0/instances/{name}/logs/exec-output/exec_{id}.{extension}"),
+            bytes,
+        );
+    }
+    store.operations.insert(id, op.clone());
+    Some((200, serde_json::to_vec(&op).unwrap()))
 }

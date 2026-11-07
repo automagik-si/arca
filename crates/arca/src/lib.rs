@@ -23,6 +23,7 @@ pub mod desired_store;
 pub mod handlers;
 pub mod kernel;
 pub mod service;
+pub mod service_exec;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
