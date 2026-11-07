@@ -1539,7 +1539,7 @@ fn canvas_challenge_cap_is_global_and_resets_after_a_minute() {
 }
 
 #[test]
-fn canvas_failure_logs_are_generic_and_do_not_lock_the_next_sign_in() {
+fn canvas_failure_logs_name_only_the_class_and_do_not_lock_the_next_sign_in() {
     let (rig, key) = Rig::new("canvas-log", true);
     let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
     assert_eq!(status, 200);
@@ -1550,18 +1550,51 @@ fn canvas_failure_logs_are_generic_and_do_not_lock_the_next_sign_in() {
         .to_string();
     let mut wrong = Assert::over(NAMESPACE, statement.as_bytes());
     wrong.origin = Some("https://elsewhere.example".to_string());
+    let proof = key.proof_value(&wrong);
     let (status, _, _) = rig.post_full(
         "/approve/canvas",
         Some(ORIGIN),
-        json!({ "statement": statement, "proof": key.proof_value(&wrong) }),
+        json!({ "statement": &statement, "proof": &proof }),
     );
     assert_eq!(status, 403);
     let logs = rig.logs.lock().expect("logs").clone();
     assert_eq!(
         logs.last().map(String::as_str),
-        Some("arca: canvas sign-in failed")
+        Some("arca: canvas sign-in failed: WrongOrigin (credential known)")
     );
-    assert!(!logs.join("\n").contains(&statement));
+    let lines = logs.join("\n");
+    assert!(!lines.contains(&statement));
+    assert!(!lines.contains(&serde_json::to_string(&proof).expect("proof JSON")));
+    assert!(!lines.contains(&key.cred_text()));
+    assert!(!lines.contains(&key.key_text()));
+
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    assert_eq!(status, 200);
+    let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
+    let statement = issued["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let mut unknown = Assert::over(NAMESPACE, statement.as_bytes());
+    unknown.credential_id = Some(vec![0x99; 20]);
+    let proof = key.proof_value(&unknown);
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": &statement, "proof": &proof }),
+    );
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed: BadSignature (credential unknown)")
+    );
+    let lines = logs.join("\n");
+    assert!(!lines.contains(&statement));
+    assert!(!lines.contains(&serde_json::to_string(&proof).expect("proof JSON")));
+    assert!(!lines.contains(&key.cred_text()));
+    assert!(!lines.contains(&key.key_text()));
+
     let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
     assert_eq!(status, 200, "no failure lock");
     let issued: Value = serde_json::from_slice(&body).expect("challenge JSON");
@@ -1710,4 +1743,109 @@ fn canvas_cookie_cannot_approve_or_reach_mcp() {
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     let (status, _, _) = rig.post_with_cookie("/mcp", None, json!({}), &pair);
     assert_eq!(status, 401, "a canvas cookie is not an MCP bearer");
+}
+
+#[test]
+fn canvas_failure_classes_name_statement_and_challenge_without_payloads() {
+    let (rig, key) = Rig::new("canvas-classes", true);
+    let bad = json!({ "statement": "{}", "proof": {} });
+    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), bad);
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed: statement")
+    );
+
+    let statement = sign_in_statement(ORIGIN, &"ab".repeat(32), NOW);
+    let assertion = Assert::over(NAMESPACE, statement.as_bytes());
+    let proof = key.proof_value(&assertion);
+    let (status, _, _) = rig.post_full(
+        "/approve/canvas",
+        Some(ORIGIN),
+        json!({ "statement": &statement, "proof": &proof }),
+    );
+    assert_eq!(status, 403);
+    let logs = rig.logs.lock().expect("logs").clone();
+    assert_eq!(
+        logs.last().map(String::as_str),
+        Some("arca: canvas sign-in failed: challenge")
+    );
+    let lines = logs.join("\n");
+    assert!(!lines.contains(&statement));
+    assert!(!lines.contains(&serde_json::to_string(&proof).expect("proof JSON")));
+    assert!(!lines.contains(&key.cred_text()));
+    assert!(!lines.contains(&key.key_text()));
+}
+
+#[test]
+fn pages_serve_trusted_credentials_and_check_trust_before_create_source_order() {
+    // Source-order only. The runtime proof that no create happens is the browser ceremony step 5.
+    let (rig, key) = Rig::new("canvas-credentials", true);
+    let (status, body) = rig.get("/approve", None);
+    assert_eq!(status, 200);
+    let source = String::from_utf8(body).expect("page text");
+    assert!(source.contains("data-credential-ids=\""));
+    assert!(source.contains(&key.cred_text()));
+    assert!(!source.contains("__ARCA_CREDENTIAL_IDS__"));
+    let register = source
+        .split("async function register()")
+        .nth(1)
+        .expect("the register function");
+    let check = register
+        .find("passkeysTrusted")
+        .expect("the pre-create trust check");
+    let create = register
+        .find("navigator.credentials.create")
+        .expect("the create call");
+    assert!(check < create, "trust is checked before create");
+    assert!(source.contains("allowCredentials,"));
+    assert!(source.contains("No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows."));
+
+    let (status, body) = rig.get("/approve/canvas", None);
+    assert_eq!(status, 200);
+    let signin = String::from_utf8(body).expect("sign-in text");
+    assert!(signin.contains("data-credential-ids=\""));
+    assert!(signin.contains(&key.cred_text()));
+    assert!(!signin.contains("__ARCA_CREDENTIAL_IDS__"));
+    assert!(signin.contains("allowCredentials"));
+    assert!(signin.contains("No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows."));
+}
+
+#[test]
+fn zero_keys_pages_serve_empty_ids_and_skip_webauthn() {
+    let (rig, _) = Rig::new_empty("canvas-zero-keys");
+    for path in ["/approve", "/approve/canvas"] {
+        let (status, body) = rig.get(path, None);
+        assert_eq!(status, 200);
+        let source = String::from_utf8(body).expect("page text");
+        assert!(source.contains("data-credential-ids=\"[]\""), "{path}");
+        assert!(!source.contains("__ARCA_CREDENTIAL_IDS__"), "{path}");
+        assert!(source.contains("if (!allowCredentials.length)"), "{path}");
+    }
+}
+
+#[test]
+fn credential_placeholder_is_only_in_the_body_attribute() {
+    for (label, html) in [
+        ("approval", include_str!("../src/approve_page.html")),
+        ("sign-in", include_str!("../src/canvas_signin.html")),
+    ] {
+        let marker = "__ARCA_CREDENTIAL_IDS__";
+        assert_eq!(html.matches(marker).count(), 1, "{label}");
+        let at = html.find(marker).expect("the placeholder");
+        let body = html
+            .find("<body data-credential-ids=\"")
+            .expect("the body attribute");
+        assert!(at > body, "{label}: inside the body attribute");
+        for (open, close) in [("<script>", "</script>"), ("<style>", "</style>")] {
+            if let Some(start) = html.find(open) {
+                let end = html[start..]
+                    .find(close)
+                    .map(|offset| start + offset)
+                    .expect("a closed block");
+                assert!(!(at >= start && at < end), "{label}: placeholder in {open}");
+            }
+        }
+    }
 }

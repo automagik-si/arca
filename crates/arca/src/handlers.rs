@@ -965,7 +965,7 @@ fn refusal_failure(refusal: ApprovalRefusal) -> CallError {
 }
 
 /// The name of a refusal, as a caller's `refusal` field carries it.
-fn refusal_code(refusal: &ApprovalRefusal) -> &'static str {
+pub(crate) fn refusal_code(refusal: &ApprovalRefusal) -> &'static str {
     match refusal {
         ApprovalRefusal::Malformed(_) => "Malformed",
         ApprovalRefusal::NotCanonical => "NotCanonical",

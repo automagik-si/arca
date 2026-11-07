@@ -311,7 +311,7 @@
   }
 </style>
 </head>
-<body>
+<body data-credential-ids="__ARCA_CREDENTIAL_IDS__">
 <svg width="0" height="0" class="sprite" aria-hidden="true">
   <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3m-3 3 2 2m-4.5.5 2 2"/></symbol>
   <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
@@ -390,6 +390,13 @@
 
 <script>
 const enc = new TextEncoder();
+const NO_PASSKEY = "No Arca passkey was used. If you closed the prompt, try again. If this keeps happening, this device has no passkey Arca knows.";
+const trustedIds = JSON.parse(document.body.dataset.credentialIds || "[]");
+const allowCredentials = trustedIds.map((id) => ({ type: "public-key", id: fromB64url(id) }));
+function fromB64url(value) {
+  const text = atob(value.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(text, (c) => c.charCodeAt(0));
+}
 
 const KINDS = {
   project: "Project",
@@ -437,7 +444,7 @@ function plain(error) {
   const message = String((error && error.message) || error);
   if (error && error.refusal) return REFUSALS[error.refusal] || "Arca did not accept this approval (" + error.refusal + ").";
   if (error && error.name === "TypeError") return "Can't reach Arca. Check your connection, then try again.";
-  if (error && error.name === "NotAllowedError") return "The passkey prompt was closed or ran out of time. Try again when you're ready.";
+  if (error && error.name === "NotAllowedError") return NO_PASSKEY;
   if (error && error.name === "InvalidStateError") return "This device already has a passkey for Arca.";
   if (error && error.name === "SecurityError") return "Passkeys can't be used at this page's address. Open Arca from its usual address.";
   if (message === "A code is already on your screen") return "A code is already showing on the computer that runs Arca. Type that one below.";
@@ -451,7 +458,8 @@ function plain(error) {
 function fail(error) {
   const message = String((error && error.message) || error);
   let tone = "bad";
-  if (/locked|^Wait /.test(message)) tone = "warn";
+  if (error && error.name === "NotAllowedError") tone = "warn";
+  else if (/locked|^Wait /.test(message)) tone = "warn";
   if (message === "A code is already on your screen") tone = "";
   status(plain(error), tone);
 }
@@ -620,8 +628,17 @@ async function register() {
   button.disabled = true;
   const input = document.getElementById("setup-code");
   const setupCode = input.value.trim();
-  status("Follow your device's prompt to save the passkey…", "wait");
   try {
+    status("Checking stored passkeys…", "wait");
+    const check = await fetch("/approve/plans", { headers: { Accept: "application/json" } });
+    if (!check.ok) throw new Error("the passkey check answered " + check.status);
+    const current = await check.json();
+    showTrusted(current.passkeysTrusted || 0);
+    if ((current.passkeysTrusted || 0) > 0) {
+      status("A passkey is already trusted. No new passkey was made.", "warn");
+      return;
+    }
+    status("Follow your device's prompt to save the passkey…", "wait");
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const user = crypto.getRandomValues(new Uint8Array(16));
     const credential = await navigator.credentials.create({
@@ -630,6 +647,7 @@ async function register() {
         rp: { id: location.hostname, name: "Arca approvals" },
         user: { id: user, name: "owner", displayName: "Owner" },
         pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+        excludeCredentials: allowCredentials,
         authenticatorSelection: {
           userVerification: "required",
           residentKey: "required",
@@ -655,6 +673,9 @@ async function register() {
     });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) throw new Error(body.message || ("the registration answered " + answer.status));
+    if (!allowCredentials.some(({ id }) => b64url(new Uint8Array(id)) === payload.credentialId)) {
+      allowCredentials.push({ type: "public-key", id: fromB64url(payload.credentialId) });
+    }
     input.value = "";
     const line = document.getElementById("line");
     if (setupCode) {
@@ -683,12 +704,18 @@ async function approve(plan, button) {
       "SHA-256",
       enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + plan.statement),
     );
+    if (!allowCredentials.length) {
+      status(NO_PASSKEY, "warn");
+      button.disabled = false;
+      return;
+    }
     const credential = await navigator.credentials.get({
       publicKey: {
         challenge,
         rpId: location.hostname,
         userVerification: "required",
         timeout: 60000,
+        allowCredentials,
       },
     });
     if (!credential) throw new Error("no passkey was selected");
