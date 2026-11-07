@@ -35,10 +35,12 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   const devicesTokenPath = join(dir, 'reader');
   await writeFile(devicesTokenPath, 'browser_reader_fixture_bearer', { mode: 0o400 });
   let deviceAvailable = true;
+  let deviceLimited = false;
   const deviceServer = createServer(async (req, res) => {
     let data = '';
     for await (const chunk of req) data += chunk;
     const body = JSON.parse(data);
+    if (deviceLimited) { res.writeHead(429).end(); return; }
     if (!deviceAvailable) { res.writeHead(503).end(); return; }
     const value = devices[body.params.name];
     const result = body.method === 'initialize' ? { protocolVersion: '2025-11-25' }
@@ -179,15 +181,15 @@ test('real fallback renders fixture snapshots safely in light and dark without a
   await phonePage.close();
 
   deviceAvailable = false;
-  const unavailableResults = [];
+  const unreachableResults = [];
   for (const scheme of ['light', 'dark']) {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, colorScheme: scheme });
     const errors = [];
     page.on('pageerror', (error) => errors.push(error.message));
     await page.goto(`${origin}/arca-canvas`);
-    await page.waitForFunction(() => document.querySelector('.arca-devices')?.textContent === 'Devices unavailable');
-    assert.equal(await page.locator('.arca-card').count(), 4);
-    assert.equal(await page.locator('[data-kind="phone"], [data-kind="desktop"]').count(), 0);
+    await page.waitForFunction(() => document.querySelector('.arca-devices')?.textContent === 'Devices unreachable');
+    assert.equal(await page.locator('.arca-card').count(), 6);
+    assert.equal(await page.locator('[data-kind="phone"], [data-kind="desktop"]').count(), 2);
     assert.match(await page.locator('.arca-status').textContent(), /^Snapshot /);
     assert.match(await page.locator('.arca-steps-placeholder').textContent(), /hidden/);
     const measured = await page.evaluate(() => {
@@ -209,11 +211,25 @@ test('real fallback renders fixture snapshots safely in light and dark without a
     }
     for (const card of measured.cards) assert.ok(card.x >= 16 && card.x + card.width <= 1028 && card.y + card.height <= 900);
     assert.deepEqual(errors, []);
-    if (evidence) await page.screenshot({ path: join(evidence, `${scheme}-unavailable-1440x900.png`) });
-    unavailableResults.push({ scheme, ...measured });
+    if (evidence) await page.screenshot({ path: join(evidence, `${scheme}-unreachable-1440x900.png`) });
+    unreachableResults.push({ scheme, ...measured });
     await page.close();
   }
-  if (evidence) await writeFile(join(evidence, 'unavailable-regions.json'), JSON.stringify(unavailableResults, null, 2));
+  if (evidence) await writeFile(join(evidence, 'unreachable-regions.json'), JSON.stringify(unreachableResults, null, 2));
+
+  deviceLimited = true;
+  const stalePage = await browser.newPage({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
+  const staleErrors = [];
+  stalePage.on('pageerror', (error) => staleErrors.push(error.message));
+  await stalePage.goto(`${origin}/arca-canvas`);
+  await stalePage.waitForFunction(() => document.querySelector('.arca-devices')?.textContent.startsWith('Devices stale · '));
+  assert.match(await stalePage.locator('.arca-devices').textContent(), /^Devices stale · [0-9]+s old$/);
+  assert.equal(await stalePage.locator('.arca-card').count(), 6);
+  assert.equal(await stalePage.locator('.arca-devices').evaluate((node) => getComputedStyle(node).color),
+    await stalePage.locator('.arca-crumb').evaluate((node) => getComputedStyle(node).color));
+  assert.deepEqual(staleErrors, []);
+  if (evidence) await stalePage.screenshot({ path: join(evidence, 'light-stale-1440x900.png') });
+  await stalePage.close();
 
   const largeResults = [];
   for (const scheme of ['light', 'dark']) {

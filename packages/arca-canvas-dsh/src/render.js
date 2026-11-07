@@ -22,6 +22,16 @@ function ownerLabel(owner) {
   return ['kernel', 'retained'].includes(owner?.class ?? owner) ? 'Managed by Arca' : 'External';
 }
 
+function deviceAge(at) {
+  const elapsed = Date.now() - Date.parse(at);
+  if (!Number.isFinite(elapsed) || elapsed < 0) return null;
+  const seconds = Math.floor(elapsed / 1000);
+  if (seconds < 60) return `${seconds}s old`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m old`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h old`;
+  return `${Math.floor(seconds / 86400)}d old`;
+}
+
 function cardContent(node, snapshot) {
   const row = node.data;
   switch (node.kind) {
@@ -71,7 +81,16 @@ export function renderCanvas(root, snapshot) {
   bar.append(element(doc, 'span', 'arca-mode', text(snapshot.machine?.mode, 'Read only')));
   const plans = Array.isArray(snapshot.plans) ? snapshot.plans.length : 0;
   const url = approvalUrl(snapshot.approvalUrl);
-  if (snapshot.devices === 'unavailable') bar.append(element(doc, 'span', 'arca-devices', 'Devices unavailable'));
+  const deviceState = snapshot.devices;
+  const staleAge = deviceState === 'stale' ? deviceAge(snapshot.devicesAt) : null;
+  const deviceLabel = deviceState === 'unavailable' ? 'Devices unavailable'
+    : deviceState === 'unreachable' ? 'Devices unreachable'
+      : deviceState === 'stale' ? `Devices stale${staleAge ? ` · ${staleAge}` : ''}` : null;
+  if (deviceLabel) {
+    const chip = element(doc, 'span', 'arca-devices', deviceLabel);
+    chip.dataset.state = deviceState;
+    bar.append(chip);
+  }
   if (plans) {
     const badge = element(doc, url ? 'a' : 'span', 'arca-plans', `${plans} waiting plan${plans === 1 ? '' : 's'}`);
     if (url) badge.href = url;

@@ -194,16 +194,26 @@ test('resize batches in one frame, measures again, and disconnects on stop', () 
   assert.equal(frames, 2);
 });
 
-test('muted text-only device chip appears only for unavailable with Arca cards and no error banner', () => {
-  for (const devices of ['off', 'ok', 'unavailable', '<img src=x>']) {
+test('muted text-only device chip draws unavailable, unreachable and stale age states', () => {
+  const cases = [
+    ['unavailable', 'Devices unavailable'], ['unreachable', 'Devices unreachable'],
+    ['stale', /^Devices stale · [0-9]+s old$/], ['off', null], ['ok', null], ['<img src=x>', null],
+  ];
+  for (const [devices, expected] of cases) {
     const target = root();
-    renderCanvas(target, { ...snapshot, devices });
+    renderCanvas(target, { ...snapshot, devices, devicesAt: new Date(Date.now() - 5000).toISOString() });
     const chips = all(target).filter((node) => node.className === 'arca-devices');
-    assert.equal(chips.length, devices === 'unavailable' ? 1 : 0);
-    if (chips.length) assert.equal(chips[0].textContent, 'Devices unavailable');
+    assert.equal(chips.length, expected ? 1 : 0);
+    if (expected instanceof RegExp) assert.match(chips[0].textContent, expected);
+    else if (expected) assert.equal(chips[0].textContent, expected);
     assert.equal(all(target).filter((node) => node.className === 'arca-card').length, 4);
     assert.match(all(target).find((node) => node.className === 'arca-status').textContent, /^Snapshot /);
   }
+  const target = root();
+  renderCanvas(target, { ...snapshot, devices: 'unreachable',
+    phones: [{ name: 'phone-1', state: 'unreachable', network: null, battery: null, size: null }] });
+  const phone = all(target).find((node) => node.dataset.kind === 'phone');
+  assert.ok(phone.textContent.includes('unreachable'));
 });
 
 test('machine title is a human name and Arca uptime uses sensible units', () => {

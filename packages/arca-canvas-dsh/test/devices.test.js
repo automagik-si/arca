@@ -33,7 +33,7 @@ async function fake(t, respond = reply, initialize = async () => {}) {
     const body = JSON.parse(data);
     calls.push({ body, headers: req.headers, method: req.method, url: req.url });
     if (body.method === 'initialize') await initialize(config);
-    const value = body.method === 'initialize' ? { jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25' } } : respond(body);
+    const value = body.method === 'initialize' ? { jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25' } } : await respond(body);
     res.writeHead(value.status ?? 200, { 'Content-Type': 'application/json' });
     res.end(typeof value === 'string' ? value : JSON.stringify(value));
   });
@@ -165,12 +165,12 @@ test('unreachable or invalid configured URL degrades quietly', async (t) => {
   }
 });
 
-test('stopped phones stay visible without a status read that cannot succeed', async (t) => {
+test('status reads are not skipped from droid_list state alone', async (t) => {
   const { config, calls } = await fake(t, (body) => reply(body, body.params.name === 'droid_list' ? [{ name: 'stopped-phone', state: 'stopped' }] : fixtures[body.params.name]));
   const snapshot = await snapshotWithDevices(arcaClient, {}, createDevicesClient(config));
   assert.equal(snapshot.phones[0].state, 'stopped');
-  assert.equal(snapshot.phones[0].network, null);
-  assert.equal(calls.some(({ body }) => body.params.name === 'phone_status'), false);
+  assert.equal(snapshot.phones[0].network, 'wired');
+  assert.equal(calls.some(({ body }) => body.params.name === 'phone_status'), true);
 });
 
 
@@ -254,16 +254,16 @@ test('refused settings preserve Arca cards, send zero requests and log only the 
   assert.equal(calls.length, 0);
 });
 
-test('one failed phone_status preserves every phone and desktop with unknown details', async (t) => {
+test('one failed phone_status preserves every phone and desktop and marks that phone unreachable', async (t) => {
   const { config } = await fake(t, (body) => {
     if (body.params.name === 'droid_list') return reply(body, [{ name: 'failed-phone', state: 'ready' }, { name: 'other-phone', state: 'ready' }]);
     if (body.params.name === 'phone_status' && body.params.arguments.droid === 'failed-phone') return { jsonrpc: '2.0', id: body.id, result: { isError: true } };
     return reply(body);
   });
   const snapshot = await snapshotWithDevices(arcaClient, {}, createDevicesClient(config));
-  assert.equal(snapshot.devices, 'unavailable');
+  assert.equal(snapshot.devices, 'unreachable');
   assert.equal(snapshot.error, null);
-  assert.deepEqual(snapshot.phones[0], { name: 'failed-phone', state: 'unknown', network: null, battery: null, size: null });
+  assert.deepEqual(snapshot.phones[0], { name: 'failed-phone', state: 'unreachable', network: null, battery: null, size: null });
   assert.equal(snapshot.phones[1].name, 'other-phone');
   assert.equal(snapshot.phones[1].battery, 100);
   assert.equal(snapshot.desktops.length, 1);
@@ -280,14 +280,104 @@ test('background phase updates devices independently and logs only transitions, 
   await until(() => calls.length >= first + 16);
   assert.deepEqual(logs, ['Arca canvas devices: ok']);
   fail = true;
-  await until(() => cache.get().devices === 'unavailable');
+  await until(() => cache.get().devices === 'unreachable');
+  assert.equal(cache.get().phones.length, 1, 'last good list stays visible');
   const failed = calls.length;
   await until(() => calls.length >= failed + 4);
-  assert.deepEqual(logs, ['Arca canvas devices: ok', 'Arca canvas devices: unavailable']);
+  assert.deepEqual(logs, ['Arca canvas devices: ok', 'Arca canvas devices: unreachable']);
   fail = false;
   await until(() => cache.get().devices === 'ok');
-  assert.deepEqual(logs, ['Arca canvas devices: ok', 'Arca canvas devices: unavailable', 'Arca canvas devices: ok']);
+  assert.deepEqual(logs, ['Arca canvas devices: ok', 'Arca canvas devices: unreachable', 'Arca canvas devices: ok']);
   assert.equal(cache.get().error, null);
+});
+
+test('one phase reads at most two phone_status calls and rotates', async (t) => {
+  const phones = ['phone-1', 'phone-2', 'phone-3', 'phone-4'].map((name) => ({ name, state: 'ready' }));
+  const { config, calls } = await fake(t, (body) => reply(body, body.params.name === 'droid_list' ? phones : fixtures[body.params.name]));
+  const client = createDevicesClient(config);
+  const state = { lastFailureAt: new Map(), cursor: 0 };
+  const statusNames = () => calls.filter(({ body }) => body.params?.name === 'phone_status')
+    .map(({ body }) => body.params.arguments.droid);
+  const first = await collectDevices(client, AbortSignal.timeout(1000), state);
+  assert.equal(first.devices, 'ok');
+  assert.deepEqual(statusNames(), ['phone-1', 'phone-2']);
+  const second = await collectDevices(client, AbortSignal.timeout(1000), state);
+  assert.equal(second.devices, 'ok');
+  assert.deepEqual(statusNames(), ['phone-1', 'phone-2', 'phone-3', 'phone-4']);
+});
+
+test('a timed-out phone_status holds that phone for at least sixty seconds', async (t) => {
+  let clock = 1000;
+  const { config, calls } = await fake(t, (body) => body.params.name === 'phone_status'
+    ? new Promise((resolve) => setTimeout(() => resolve(reply(body)), 500))
+    : reply(body));
+  const client = createDevicesClient(config);
+  const state = { lastFailureAt: new Map(), cursor: 0, now: () => clock };
+  const statusCalls = () => calls.filter(({ body }) => body.params?.name === 'phone_status').length;
+  const first = await collectDevices(client, AbortSignal.timeout(100), state);
+  assert.equal(first.devices, 'unreachable');
+  assert.equal(statusCalls(), 1);
+  assert.equal(state.lastFailureAt.has('example-phone'), true);
+  assert.equal(state.lastFailureAt.get('example-phone'), clock);
+
+  const second = await collectDevices(client, AbortSignal.timeout(1000), state);
+  assert.equal(second.devices, 'unreachable');
+  assert.equal(statusCalls(), 1, 'the failed phone is skipped immediately');
+  clock += 59_999;
+  await collectDevices(client, AbortSignal.timeout(1000), state);
+  assert.equal(statusCalls(), 1, 'the phone is skipped just before sixty seconds');
+  clock += 1;
+  const fourth = await collectDevices(client, AbortSignal.timeout(1000), state);
+  assert.equal(statusCalls(), 2, 'the phone is retried at sixty seconds');
+  assert.equal(fourth.devices, 'ok');
+  assert.equal(state.lastFailureAt.has('example-phone'), false);
+});
+
+test('429 keeps the last good device list with its age; a first 429 stays unavailable', async (t) => {
+  let clock = 1_000_000;
+  let rateLimited = false;
+  const { config } = await fake(t, (body) => rateLimited ? { status: 429 } : reply(body));
+  const logs = [];
+  const cache = createSnapshotCache(arcaClient, 10, { now: () => clock, log: (line) => logs.push(line) },
+    createDevicesClient(config));
+  t.after(() => cache.stop());
+  await until(() => cache.get().devices === 'ok');
+  const goodAt = cache.get().devicesAt;
+  const goodPhones = cache.get().phones;
+  assert.ok(goodAt);
+  clock += 5000;
+  rateLimited = true;
+  await until(() => cache.get().devices === 'stale');
+  assert.equal(cache.get().devicesAt, goodAt);
+  assert.deepEqual(cache.get().phones, goodPhones);
+  assert.equal(cache.get().error, null);
+  assert.deepEqual(logs, ['Arca canvas devices: ok', 'Arca canvas devices: stale']);
+
+  const firstLogs = [];
+  const first = createSnapshotCache(arcaClient, 10, { now: () => clock, log: (line) => firstLogs.push(line) },
+    createDevicesClient(config));
+  t.after(() => first.stop());
+  await until(() => firstLogs.length === 1);
+  assert.equal(first.get().devices, 'unavailable');
+  assert.equal(first.get().devicesAt, null);
+  assert.deepEqual(first.get().phones, []);
+  assert.deepEqual(first.get().desktops, []);
+});
+
+test('a device phase is single-flight while its first list read is pending', async (t) => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const { config, calls } = await fake(t, (body) => body.params.name === 'droid_list'
+    ? pending.then(() => reply(body)) : reply(body));
+  const droidLists = () => calls.filter(({ body }) => body.params?.name === 'droid_list').length;
+  const cache = createSnapshotCache(arcaClient, 10, { devicesTimeoutMs: 1000 }, createDevicesClient(config));
+  t.after(() => cache.stop());
+  await until(() => droidLists() === 1);
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(droidLists(), 1, 'a pending device phase blocks another phase');
+  release();
+  await until(() => cache.get().devices === 'ok');
+  await until(() => droidLists() >= 2);
 });
 
 test('never-answering device server cannot block first Arca snapshot or polls and is aborted', async (t) => {

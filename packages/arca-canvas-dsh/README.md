@@ -79,7 +79,8 @@ readers.
 The JSON object always has `at` (ISO timestamp), `error` (null or safe error text),
 `approvalUrl` (empty or the configured approval URL), `nodeName` (resolved by the
 host), `machine`, `instances`, `databases`, `metrics`, `alerts`, `plans`, `devices`,
-`phones`, and `desktops`.
+`devicesAt` (ISO time of the last good device list, or null), `phones`, and `desktops`.
+`devices` is `off`, `ok`, `unavailable`, `unreachable`, or `stale`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
@@ -99,24 +100,34 @@ with the same protocol and initialization sequence and its own per-request beare
 It calls only `droid_list`, `desktop_list`, `droidd_status` and `phone_status`.
 Structured list results use `droids` and `desktops` keys; older JSON text results
 are also accepted. Phone entries retain name, state, network type, battery level
-and screen size (`[width, height]`); desktop entries retain name, status and memory limit. Status is
-read only for ready phones; other states remain visible with unavailable details.
-Both device settings empty means `devices: 'off'`, with no device requests.
-Configured readers report `ok` after successful reads, or `unavailable` on invalid
-settings, missing/refused tokens, unreachable service or any failed required read.
-Device validation happens in the host reader and never prevents canvas startup.
-Refused settings make no device HTTP requests. A failed list or service-status
-read clears device entries; a failed `phone_status` keeps that phone's name with
-state `unknown` and null status fields, alongside all other phones and desktops.
+and screen size (`[width, height]`); desktop entries retain name, status and memory limit.
+Every phone is eligible for a status read regardless of its `droid_list` state;
+one phase reads at most two phone statuses, rotating through the list. A failed or
+timed-out phone is kept with `state: 'unreachable'` and is not retried for at
+least sixty seconds; the skip is based on that last call failure, never on
+`droid_list` state. Both device settings empty means `devices: 'off'`, with no
+device requests. Configured readers report `ok` after a successful phase, or
+`unavailable` on invalid settings, missing/refused tokens, an unreachable service
+or a first failed read with no prior good list. Device validation happens in the
+host reader and never prevents canvas startup. Refused settings make no device
+HTTP requests. A failed list or service-status read keeps the last good phone and
+desktop list and reports `devices: 'unreachable'`; a failed `phone_status` keeps
+that phone visible with `state: 'unreachable'`, alongside all other phones and
+desktops. An HTTP 429 keeps the last good list and reports `devices: 'stale'`;
+`devicesAt` preserves the time of that list, and the topbar chip shows its age.
+With no prior good list, even a 429 reports `unavailable` with empty lists.
 
 Device reads start alongside Arca reads and update cached device cards in the
-background under one five-second deadline. Arca snapshots and paints never wait
-for that phase. In-flight device requests are aborted on deadline or host stop;
-a later poll may retry. A muted `Devices unavailable` topbar chip appears only for
-`unavailable`, with no device error banner. The host logs one safe line per device
-state change, naming `devicesUrl` or `devicesTokenPath` for a rejected setting.
-Setting values, device credentials and upstream error details never enter logs,
-the snapshot or the browser bundle. Arca reads keep their existing error behavior.
+background under one five-second deadline. The phase is single-flight: a poll
+never starts another phase while one is pending. Arca snapshots and paints never
+wait for that phase. In-flight device requests are aborted on deadline or host
+stop; a later poll may retry except for a phone still inside its sixty-second
+failure window. A muted `Devices unavailable`, `Devices unreachable` or aged
+`Devices stale` topbar chip appears for those states, with no device error banner.
+The host logs one safe line per device state change, naming `devicesUrl` or
+`devicesTokenPath` for a rejected setting. Setting values, device credentials and
+upstream error details never enter logs, the snapshot or the browser bundle. Arca
+reads keep their existing error behavior.
 
 A ResizeObserver on the stage batches reflow into an animation frame when the
 window or embedding sidebar changes width. Reflow measures the stage content box;

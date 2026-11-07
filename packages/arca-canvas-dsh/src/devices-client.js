@@ -9,7 +9,9 @@ const READS = new Map([
   ['droid_list', 'droids'], ['desktop_list', 'desktops'],
   ['droidd_status', null], ['phone_status', null],
 ]);
-const failure = (setting) => Object.assign(new Error('Device reader is unavailable.'), { setting });
+const failure = (setting, status, aborted = false) => Object.assign(
+  new Error('Device reader is unavailable.'), { setting, status, aborted },
+);
 
 export function validateDevicesUrl(value) {
   try {
@@ -39,7 +41,7 @@ async function rpc(config, url, id, method, params, bearers, signal) {
   bearers.add(token);
   const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
   return new Promise((resolve, reject) => {
-    const fail = () => { req.destroy(); reject(failure()); };
+    const fail = (status, aborted = false) => { req.destroy(); reject(failure(undefined, status, aborted)); };
     const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, {
       method: 'POST', signal,
       headers: {
@@ -48,7 +50,7 @@ async function rpc(config, url, id, method, params, bearers, signal) {
         'Content-Length': Buffer.byteLength(body),
       },
     }, (res) => {
-      if (res.statusCode !== 200) { fail(); res.destroy(); return; }
+      if (res.statusCode !== 200) { fail(res.statusCode); res.destroy(); return; }
       const chunks = [];
       let size = 0;
       res.on('data', (chunk) => {
@@ -56,7 +58,7 @@ async function rpc(config, url, id, method, params, bearers, signal) {
         if (size > 4 * 1024 * 1024) { fail(); res.destroy(); }
         else chunks.push(chunk);
       });
-      res.on('error', fail);
+      res.on('error', () => fail());
       res.on('end', () => {
         try {
           let data = Buffer.concat(chunks).toString('utf8');
@@ -68,7 +70,7 @@ async function rpc(config, url, id, method, params, bearers, signal) {
         } catch { fail(); }
       });
     });
-    req.on('error', fail);
+    req.on('error', (error) => fail(undefined, error?.name === 'AbortError'));
     req.end(body);
   });
 }
@@ -106,7 +108,7 @@ export function createDevicesClient(config = {}) {
           } catch { /* A notice or summary is not JSON data. */ }
         }
         throw failure();
-      } catch (error) { throw failure(error.setting); }
+      } catch (error) { throw failure(error.setting, error.status, error.aborted); }
     },
   };
 }
