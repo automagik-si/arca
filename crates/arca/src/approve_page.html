@@ -287,21 +287,14 @@
   .done { display: none; align-items: flex-start; gap: var(--arca-space-3); }
   .done .notice-icon { width: 36px; height: 36px; margin: 0; }
   .done .notice-icon .icon { width: 18px; height: 18px; }
-  .if-trusted { display: none; }
   body[data-trusted="yes"] .done { display: flex; }
   body[data-trusted="yes"] .setup-lede,
   body[data-trusted="yes"] .step[data-new],
   body[data-trusted="yes"] .step .num,
   body[data-trusted="yes"] .if-new { display: none; }
-  body[data-trusted="yes"] .if-trusted { display: block; }
   body[data-trusted="yes"] .steps { margin-top: var(--arca-space-4); padding-top: var(--arca-space-4); border-top: 1px solid var(--arca-line); }
   body[data-trusted="yes"] .step { grid-template-columns: 1fr; }
   body[data-trusted="yes"] #register { width: auto; min-height: 40px; font-size: var(--arca-text-sm); background: var(--arca-fill); color: var(--arca-ink); border-color: var(--arca-line-2); box-shadow: none; }
-  .line {
-    margin-top: var(--arca-space-4); padding: var(--arca-space-3);
-    border-radius: var(--arca-r-sm); background: var(--arca-fill);
-    font-size: var(--arca-text-sm); white-space: pre-wrap; overflow-wrap: anywhere;
-  }
 
   .foot { margin-top: var(--arca-space-6); color: var(--arca-faint); font-size: var(--arca-text-sm); text-align: center; }
   .sprite { position: absolute; }
@@ -375,12 +368,10 @@
           <div>
             <p class="step-title if-new">Save your passkey</p>
             <p class="step-text if-new">Your device asks for your fingerprint, face or PIN.</p>
-            <p class="step-text if-trusted">For developers: add a passkey without a code. Arca then shows a line to save by hand.</p>
             <button id="register" class="btn btn-primary btn-big" type="button"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Add passkey</button>
           </div>
         </li>
       </ol>
-      <pre id="line" class="line" hidden></pre>
     </div>
   </section>
   </div>
@@ -638,6 +629,19 @@ async function register() {
       status("A passkey is already trusted. No new passkey was made.", "warn");
       return;
     }
+    if (!setupCode) {
+      status("Enter the 8-digit setup code first.", "warn");
+      return;
+    }
+    status("Checking the setup code…", "wait");
+    const verified = await fetch("/approve/setup-code/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ setupCode }),
+    });
+    const checkBody = await verified.json().catch(() => ({}));
+    if (!verified.ok) throw new Error(checkBody.message || ("the setup code check answered " + verified.status));
+    if (!checkBody.verified) throw new Error("The setup code was not verified");
     status("Follow your device's prompt to save the passkey…", "wait");
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const user = crypto.getRandomValues(new Uint8Array(16));
@@ -665,7 +669,7 @@ async function register() {
       publicKey: b64(new Uint8Array(publicKey)),
       publicKeyAlgorithm: credential.response.getPublicKeyAlgorithm(),
     };
-    if (setupCode) payload.setupCode = setupCode;
+    payload.setupCode = setupCode;
     const answer = await fetch("/approve/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -677,17 +681,7 @@ async function register() {
       allowCredentials.push({ type: "public-key", id: fromB64url(payload.credentialId) });
     }
     input.value = "";
-    const line = document.getElementById("line");
-    if (setupCode) {
-      line.hidden = true;
-      line.textContent = "";
-      status("Passkey trusted.");
-    } else if (body.line) {
-      line.hidden = false;
-      line.textContent = body.line;
-      status("Passkey registered. This developer answer returns the line for a root-owned file.");
-    }
-    if (setupCode || body.line) document.getElementById("status").dataset.tone = "ok";
+    status("Passkey trusted.", "ok");
     await loadPlans();
   } catch (error) {
     fail(error);
