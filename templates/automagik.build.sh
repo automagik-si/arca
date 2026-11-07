@@ -54,6 +54,8 @@ incus exec "$builder" --project "$project" --force-noninteractive \
 set -euo pipefail
 [[ $(uname -m) == x86_64 ]] || { echo 'amd64 base required' >&2; exit 1; }
 for program in curl git xz tar useradd runuser systemctl; do command -v "$program" >/dev/null; done
+# The closed service exec table uses these exact system-template paths.
+for program in /usr/bin/timeout /usr/bin/journalctl /usr/bin/systemctl /usr/bin/rm /usr/bin/mkdir; do test -x "$program"; done
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 cd "$scratch"
@@ -73,6 +75,7 @@ curl --fail --silent --show-error --location -o tailscale.tgz "https://pkgs.tail
 printf '%s  tailscale.tgz\n' '512f613ed7d04fc7282f7dc5bd76aa105aae28168fbb9357eb749ebcbc29f0ae' | sha256sum --check --status
 tar -xzf tailscale.tgz
 install -m 0755 "tailscale_${ts_version}_amd64/tailscale" /usr/bin/tailscale
+test -x /usr/bin/tailscale
 install -m 0755 "tailscale_${ts_version}_amd64/tailscaled" /usr/sbin/tailscaled
 install -m 0644 "tailscale_${ts_version}_amd64/systemd/tailscaled.service" /etc/systemd/system/tailscaled.service
 install -m 0644 "tailscale_${ts_version}_amd64/systemd/tailscaled.defaults" /etc/default/tailscaled

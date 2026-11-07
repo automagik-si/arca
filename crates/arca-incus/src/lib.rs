@@ -1,14 +1,12 @@
-//! Arca's Incus access. The read client sends only GET. The writer is the one module that sends POST, PATCH, PUT or DELETE, and it
-//! sends a PUT only for a project's config. It is compiled only with the `write` feature, and every write it sends is gated by the
-//! project family and the ownership classifier.
-//! The adoption writer (`adopt`, also behind `write`) is the one path that writes outside that family: it moves one allowlisted
-//! container from the default project into its own adoption project and back, through a closed step table. Its one PUT of an
-//! instance gives back a root disk it localized, and its one DELETE removes the adoption project it emptied.
-//! The recording shim answers any method other than GET with 405 without forwarding it. The fake Incus serves a fixture and
-//! accepts the writer's requests in memory.
+//! Arca's Incus access. The read client sends only GET. The journal writer changes kernel-family objects under ownership
+//! checks. The adoption writer has its separate closed migration table. The service exec module adds only closed commands,
+//! fixed file destinations and exact recording cleanup; it is called by serve's audited seam, never by Provider or plugins.
+//! The recording shim refuses every method except GET. The fake serves fixtures and accepts writes only in memory.
 
 #[cfg(feature = "write")]
 pub mod adopt;
+#[cfg(feature = "write")]
+pub mod exec;
 pub mod fake;
 pub mod read;
 pub mod shim;

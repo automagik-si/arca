@@ -1,0 +1,207 @@
+[
+  {
+    "name": "service_connect",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "description": "The consumer: the service whose environment gets the provider's variables.",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        },
+        "to": {
+          "description": "The provider: the service whose first port the link opens.",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "env": {
+          "description": "The environment variable names, never their values.",
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        }
+      },
+      "required": [
+        "env"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "service_disconnect",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "description": "The consumer: the service whose environment gets the provider's variables.",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        },
+        "to": {
+          "description": "The provider: the service whose first port the link opens.",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "env": {
+          "description": "The environment variable names, never their values.",
+          "items": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "maxItems": 64,
+          "type": "array"
+        }
+      },
+      "required": [
+        "env"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "service_publish",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "description": "The service name.",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        },
+        "reach": {
+          "description": "Where the dash is published: \"tailnet\", the only reach there is.",
+          "maxLength": 32,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "reach",
+        "approval"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "description": "The tailnet node the dash is served from: arca-<name>.",
+          "maxLength": 63,
+          "type": "string"
+        },
+        "url": {
+          "description": "Its address on the tailnet: https://<node>.<tailnet>.ts.net:8443/ (no dash token: the dash asks for its own).",
+          "maxLength": 300,
+          "type": "string"
+        }
+      },
+      "required": [
+        "node",
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "service_secret_set",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "description": "The secret's name, one of the template's secrets.",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+          "type": "string"
+        },
+        "name": {
+          "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        },
+        "value": {
+          "description": "The secret, 8 to 4096 characters.",
+          "maxLength": 4096,
+          "minLength": 8,
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "key",
+        "value"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "ok": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "service_unpublish",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "The service name.",
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "unpublished": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "unpublished"
+      ],
+      "type": "object"
+    }
+  }
+]

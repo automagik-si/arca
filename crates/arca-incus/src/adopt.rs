@@ -1634,7 +1634,7 @@ impl AdoptWriter {
                         !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
                     })
                     .ok_or_else(|| decode("the answer names no operation"))?;
-                self.writer.wait_on(id)
+                self.writer.wait_on(id).map(|_| ())
             }
         }
     }

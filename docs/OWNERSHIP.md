@@ -788,6 +788,23 @@ netproject apply retry without adopting a foreign object. No other route is admi
 tests: `own_project_and_network_observe_are_scoped`, `own_project_and_network_observe_refuses_foreign_and_other_routes`.
 
 
+**Rule 50.** Serve may execute only the service module's closed command enum, outside the effect journal and unavailable to
+plugins or Provider. It refuses adopted, OCI, foreign, retained, retiring, stopped and UUID-mismatched instances. Identity
+comes from the newest live class-B instance effect, and a post-exec UUID check discards output from a changed instance.
+Every step has an in-instance SIGKILL timeout, a client deadline, a 64 KiB recording cap, and a synced private exec audit with
+no argv or output. Client deadlines mark that UUID hung; only key cleanup and daemon stop remain permitted. Recordings are
+deleted on every outcome. After acquiring the state lock, startup sweeps at most 256 validated unfinished audit operations,
+newest first, by their exact recording names. A sweep failure does not stop serve.
+
+Tailnet keys travel only in the root:0600 files request at the fixed key path. No environment, argv, result, error, audit,
+journal or public metadata contains them. Publication is serialized by an async mutex; its lock precedes the writes lock
+and kernel lock. Journal reads take no such lock and admit four callers. Removal spends approval under the kernel lock,
+releases it for a total 60-second logout budget, then proposes and runs the removal under one kernel lock. Logout failure
+never prevents deletion. Config, publication records and ACL changes remain normal journal effects. Adopted service writes
+are refused explicitly; their ownership classifier is unchanged.
+Source: `ExecCommand` and `ServiceFile` in `crates/arca-incus/src/exec.rs`; `ServiceExec::{run, check, sweep}` in
+`crates/arca/src/service_exec.rs`; the service wiring and removal tests in `crates/arca/tests/services/wiring.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is

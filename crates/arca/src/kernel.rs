@@ -37,6 +37,11 @@ pub struct ServiceRemoval {
     pub run: Result<Option<PlanRun>, ApprovalRefusal>,
 }
 
+/// A consumed approval, held across logout and consumed once by the proposal/run operation.
+pub struct SpentServiceRemoval {
+    entry: EntryId,
+}
+
 /// Whether removal stopped before approval was spent or during the proposal afterward.
 #[derive(Debug)]
 pub enum ServiceRemovalError {
@@ -93,6 +98,32 @@ impl Kernel {
         self.store
             .current()
             .map_or(&[], |s| s.document.entries.as_slice())
+    }
+
+    /// Identity from the newest live class-B instance effect, never from the desired record or a fresh Incus listing.
+    pub fn service_uuid(&self, entry: &EntryId, instance: &str) -> Option<String> {
+        self.reconciler
+            .journal()
+            .live(entry)
+            .into_iter()
+            .rev()
+            .filter(|r| r.class == arca_kernel::journal::EffectClass::B)
+            .filter_map(|r| r.object)
+            .find(|o| {
+                o.kind == arca_kernel::ownership::IncusKind::Instance
+                    && o.name == instance
+                    && o.project == arca_netproject::PROJECT
+            })
+            .and_then(|o| o.uuid)
+    }
+
+    pub fn retained_entries(
+        &self,
+    ) -> Result<
+        std::collections::BTreeMap<EntryId, (arca_kernel::desired::PluginId, Digest)>,
+        KernelError,
+    > {
+        self.retained.entries().map_err(retained_failure)
     }
 
     /// The host name every approval statement of this kernel names.
@@ -187,6 +218,17 @@ impl Kernel {
         approval: &str,
         now_ms: u64,
     ) -> Result<ServiceRemoval, ServiceRemovalError> {
+        let spent = self.spend_service_removal(entry, name, approval, now_ms)?;
+        self.remove_service_spent(spent, now_ms)
+    }
+
+    pub fn spend_service_removal(
+        &mut self,
+        entry: &EntryId,
+        name: &str,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<SpentServiceRemoval, ServiceRemovalError> {
         self.check_approval(
             ArcaAction::Delete,
             name,
@@ -195,9 +237,79 @@ impl Kernel {
             now_ms,
         )
         .map_err(ServiceRemovalError::Approval)?;
+        Ok(SpentServiceRemoval {
+            entry: entry.clone(),
+        })
+    }
+
+    pub fn remove_service_spent(
+        &mut self,
+        spent: SpentServiceRemoval,
+        now_ms: u64,
+    ) -> Result<ServiceRemoval, ServiceRemovalError> {
+        let entry = &spent.entry;
+        let name = entry.0.strip_prefix("service-").unwrap_or("");
+        let mut changes = Vec::new();
+        for other in self.entries() {
+            if &other.id == entry || other.plugin.0 != "arca.service" {
+                continue;
+            }
+            let Ok(mut cfg) =
+                serde_json::from_value::<crate::service::ServiceConfig>(other.config.clone())
+            else {
+                continue;
+            };
+            if cfg.adopted {
+                continue;
+            }
+            let incoming = cfg.incoming.len();
+            let links = cfg.links.len();
+            cfg.incoming.retain(|g| g.consumer != name);
+            let removed_keys = cfg
+                .links
+                .iter()
+                .filter(|l| l.to == name)
+                .flat_map(|l| l.env.clone())
+                .collect();
+            cfg.environment_patch = Some(removed_keys);
+            for link in cfg.links.iter().filter(|l| l.to == name) {
+                for key in &link.env {
+                    cfg.environment.remove(key);
+                }
+            }
+            cfg.links.retain(|l| l.to != name);
+            if cfg.incoming.len() != incoming || cfg.links.len() != links {
+                let mut updated = other.clone();
+                updated.config = serde_json::to_value(cfg).map_err(|_| {
+                    ServiceRemovalError::Proposal(KernelError::Journal(
+                        "service links cannot be encoded".into(),
+                    ))
+                })?;
+                changes.push(EntryChange::Put(updated));
+            }
+        }
+        let linked = changes
+            .iter()
+            .filter_map(|change| match change {
+                EntryChange::Put(entry) => Some(entry.id.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        changes.push(EntryChange::Remove(entry.clone()));
         let outcomes = self
-            .propose(vec![EntryChange::Remove(entry.clone())], now_ms)
+            .propose(changes, now_ms)
             .map_err(ServiceRemovalError::Proposal)?;
+        // A failed link revocation cannot release this address for another service. Failures retiring this service's own
+        // class-A objects retain the established partial-removal behavior.
+        if outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Failed{entry,..} if linked.contains(entry)))
+        {
+            return Ok(ServiceRemoval {
+                outcomes,
+                run: Ok(None),
+            });
+        }
         let run = self
             .pending_plans()
             .into_iter()

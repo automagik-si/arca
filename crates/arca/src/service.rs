@@ -32,6 +32,18 @@ pub struct ServiceLink {
     pub port: u16,
     #[serde(default)]
     pub env: Vec<String>,
+    #[serde(default)]
+    pub uuid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceGrant {
+    pub consumer: String,
+    pub address: String,
+    pub port: u16,
+    pub uuid: String,
+    pub provider_uuid: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +64,13 @@ pub struct ServiceConfig {
     pub ports: Vec<u16>,
     #[serde(default)]
     pub links: Vec<ServiceLink>,
+    #[serde(default)]
+    pub incoming: Vec<ServiceGrant>,
+    #[serde(default)]
+    pub secret_refs: BTreeMap<String, String>,
+    /// Existing instances apply only these environment keys. Unrelated rendered values need not be available locally.
+    #[serde(default)]
+    pub environment_patch: Option<BTreeSet<String>>,
     #[serde(default)]
     pub published: Option<Published>,
     pub created: u64,
@@ -119,17 +138,9 @@ pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
             "state": "enabled"
         })));
     }
-    let mut links: Vec<&ServiceLink> = cfg.links.iter().collect();
-    links.sort_by(|a, b| a.to.cmp(&b.to).then(a.port.cmp(&b.port)));
-    for link in links {
-        rules.push(rule(json!({
-            "action": "allow",
-            "source": format!("{}/32", cfg.ipv4),
-            "protocol": "tcp",
-            "destination_port": link.port.to_string(),
-            "description": format!("link from {} to port {}", cfg.ipv4, link.port),
-            "state": "enabled"
-        })));
+    for grant in &cfg.incoming {
+        rules.push(rule(json!({"action":"allow","source":format!("{}/32",grant.address),"protocol":"tcp",
+            "destination_port":grant.port.to_string(),"description":format!("link from {} to port {}",grant.address,grant.port),"state":"enabled"})));
     }
     rules
 }
@@ -299,7 +310,31 @@ impl Plugin for Service {
         }
         let acl = cfg.acl();
         let current = observed(ctx, format!("/1.0/network-acls/{acl}?project=default"))?;
-        let rules = ingress(cfg);
+        let mut guarded = cfg.clone();
+        guarded.incoming.retain(|grant| {
+            let Ok(value) = ctx.observe(Observe::IncusGet {
+                path: format!("/1.0/instances/{}?project={}", grant.consumer, cfg.project),
+            }) else {
+                return false;
+            };
+            let own = ctx
+                .observe(Observe::IncusGet {
+                    path: format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
+                })
+                .ok();
+            value["config"]["volatile.uuid"].as_str() == Some(grant.uuid.as_str())
+                && value["devices"]["eth0"]["ipv4.address"].as_str() == Some(grant.address.as_str())
+                && own
+                    .as_ref()
+                    .and_then(|v| v["config"]["volatile.uuid"].as_str())
+                    == Some(grant.provider_uuid.as_str())
+                && value["config"][LINKS_KEY].as_str().is_some_and(|links| {
+                    links.split(',').any(|v| {
+                        v == format!("{}:{}:{}", cfg.name, grant.port, grant.provider_uuid)
+                    })
+                })
+        });
+        let rules = ingress(&guarded);
         let outgoing = egress(cfg, &ctx.observe(Observe::HostAddresses)?);
         match current {
             None => {
@@ -367,23 +402,76 @@ impl Plugin for Service {
                     cfg,
                     &cfg.links
                         .iter()
-                        .map(|link| {
-                            let provider = ctx.observe(Observe::IncusGet {
-                                path: format!("/1.0/instances/{}?project={}", link.to, cfg.project),
-                            })?;
-                            let uuid = provider["config"]["volatile.uuid"]
-                                .as_str()
-                                .filter(|uuid| !uuid.is_empty())
-                                .ok_or_else(|| {
-                                    PluginError::Failed(
-                                        "linked provider has no instance UUID".into(),
-                                    )
-                                })?;
-                            Ok(format!("{}:{}:{uuid}", link.to, link.port))
-                        })
-                        .collect::<Result<Vec<_>, PluginError>>()?,
+                        .map(|link| format!("{}:{}:{}", link.to, link.port, link.uuid))
+                        .collect::<Vec<_>>(),
                 ),
             )?;
+        } else if let Some(instance) = instance {
+            let desired = instance_body(
+                cfg,
+                &cfg.links
+                    .iter()
+                    .map(|link| format!("{}:{}:{}", link.to, link.port, link.uuid))
+                    .collect::<Vec<_>>(),
+            );
+            let current = instance["config"]
+                .as_object()
+                .ok_or_else(|| PluginError::Config("instance has no config".into()))?;
+            let mut changes = BTreeMap::new();
+            let previous = current
+                .get(ENVKEYS_KEY)
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            for key in previous.split(',').filter(|key| !key.is_empty()) {
+                if cfg
+                    .environment_patch
+                    .as_ref()
+                    .is_none_or(|keys| keys.contains(key))
+                    && !cfg.environment.contains_key(key)
+                {
+                    changes.insert(format!("environment.{key}"), None);
+                }
+            }
+            for key in [ENVKEYS_KEY, LINKS_KEY, PUBLISHED_KEY] {
+                let value = desired["config"]
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if current.get(key).and_then(Value::as_str) != value.as_deref() {
+                    changes.insert(key.into(), value);
+                }
+            }
+            for (key, value) in &cfg.environment {
+                if cfg
+                    .environment_patch
+                    .as_ref()
+                    .is_some_and(|keys| !keys.contains(key))
+                {
+                    continue;
+                }
+                if current
+                    .get(&format!("environment.{key}"))
+                    .and_then(Value::as_str)
+                    != Some(value.as_str())
+                {
+                    changes.insert(format!("environment.{key}"), Some(value.clone()));
+                }
+            }
+            if !changes.is_empty() {
+                let uuid = instance["config"]["volatile.uuid"]
+                    .as_str()
+                    .ok_or_else(|| PluginError::Config("instance has no UUID".into()))?;
+                ctx.effect(EffectOp::IncusPatchConfig {
+                    object: arca_kernel::ownership::ObjectRef {
+                        kind: IncusKind::Instance,
+                        project: cfg.project.clone(),
+                        parent: None,
+                        name: cfg.name.clone(),
+                        uuid: Some(uuid.into()),
+                    },
+                    config: changes,
+                })?;
+            }
         }
         Ok(())
     }
@@ -653,8 +741,6 @@ pub fn environment(
                 &value,
             )?;
             references.insert(key.clone(), secret_reference(name, key));
-        } else {
-            start = false;
         }
     }
     let mut env = BTreeMap::new();
@@ -676,12 +762,12 @@ pub fn environment(
     Ok((env, start))
 }
 
-fn secret_reference(name: &str, key: &str) -> String {
+pub fn secret_reference(name: &str, key: &str) -> String {
     format!("{SECRET_PREFIX}service-{name}/{}", secret_name(key))
 }
 
 /// A secret's file name: lowercase, with `_` mapped to `-`, so it is inside the provider's secret-name alphabet.
-fn secret_name(key: &str) -> String {
+pub fn secret_name(key: &str) -> String {
     key.to_ascii_lowercase().replace('_', "-")
 }
 
@@ -742,7 +828,7 @@ mod tests {
     }
 }
 
-fn write_secret(path: &Path, value: &str) -> Result<(), TemplateError> {
+pub fn write_secret(path: &Path, value: &str) -> Result<(), TemplateError> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -780,7 +866,7 @@ fn write_secret(path: &Path, value: &str) -> Result<(), TemplateError> {
 }
 
 /// Replaces `{{name}}`, `{{host}}`, `{{port}}` and `{{secret:KEY}}`; a missing secret makes the whole value absent.
-fn render(
+pub fn render(
     text: &str,
     name: &str,
     ipv4: &str,
@@ -1015,7 +1101,7 @@ fn credential_patterns() -> &'static [(regex::Regex, &'static str)] {
             (r#"(?i)\b((?:access_|refresh_|id_|auth_)?token|api[_-]?key|apikey|auth[_-]?key|client_secret|secret|passw(?:or)?d)=[^\s&"'<>]+"#, "$1=[secret]"),
             (r#"(?i)(authorization["']?\s*[:=]\s*["']?)(?:(?:bearer|basic|token)\s+)?[^\s"',]+"#, "$1[secret]"),
             (r#"(?i)\b(bearer)\s+[A-Za-z0-9._~+/-]{16,}=*"#, "$1 [secret]"),
-            (r"\btskey-[A-Za-z0-9-]+", "[secret]"),
+            (r"\btskey-[A-Za-z0-9-]*", "[secret]"),
             (r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:@/?#]*):[^\s@/?#]+@", "$1:[secret]@"),
             (r"\bomni_sk_[A-Za-z0-9*]+", "[secret]"),
         ]

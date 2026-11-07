@@ -69,7 +69,7 @@ pub struct Verb {
     pub cut: fn(&Value) -> Option<Value>,
 }
 
-static VERBS: [Verb; 20] = [
+static VERBS: [Verb; 25] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -349,6 +349,76 @@ static VERBS: [Verb; 20] = [
         cut: no_cut,
         params: service_remove_params,
         result: service_remove_result,
+    },
+    Verb {
+        name: "service_connect",
+        summary: "Link a consumer to a provider: the provider's network ACL lets the consumer's address reach its first port, and nothing else, and the consumer's environment gets what the provider's template provides (DATABASE_URL, say); the environment applies on its next start. Returns the variable names only.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_connect,
+        cut: no_cut,
+        params: service_connect_params,
+        result: service_connect_result,
+    },
+    Verb {
+        name: "service_disconnect",
+        summary: "Remove a link: the provider's ACL rule for the consumer goes, and so do the variables it gave the consumer (applied on its next start). Returns their names.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_disconnect,
+        cut: no_cut,
+        params: service_disconnect_params,
+        result: service_disconnect_result,
+    },
+    Verb {
+        name: "service_secret_set",
+        summary: "Set one of a service's secrets (its template lists them). Write-only: no tool, log or audit row shows it again. The service's environment, and its consumers', is updated for their next start.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_secret_set,
+        cut: no_cut,
+        params: service_secret_set_params,
+        result: service_secret_set_result,
+    },
+    Verb {
+        name: "service_publish",
+        summary: "Publish a service's dash on the owner's tailnet (droidd's own) and nowhere else: the service joins it as its own node, arca-<name> (tag:arca-svc), and serves HTTPS on port 8443 only, to its dash. Needs the service's tailscale_authkey secret (the owner's tagged, pre-approved Tailscale auth key, service_secret_set) and the owner's signed approval (arca-approve, action publish, target the service, its arguments' digest), which an agent asks the owner for and relays. Returns the node and its https address.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_publish,
+        cut: no_cut,
+        params: service_publish_params,
+        result: service_publish_result,
+    },
+    Verb {
+        name: "service_unpublish",
+        summary: "Take a service's dash off the tailnet: it stops serving 8443, its node logs out and leaves the tailnet, and tailscaled stops. Runs whether or not a publish finished.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_unpublish,
+        cut: no_cut,
+        params: service_unpublish_params,
+        result: service_unpublish_result,
     },
 ];
 
@@ -1342,4 +1412,50 @@ fn service_remove_result() -> Value {
         "required": ["removed"],
         "type": "object"
     })
+}
+
+fn service_connect_params() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"from":{"description":"The consumer: the service whose environment gets the provider's variables.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"to":{"description":"The provider: the service whose first port the link opens.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["from","to"],"type":"object"}"##).expect("fixed service schema")
+}
+fn service_connect_result() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"env":{"description":"The environment variable names, never their values.","items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["env"],"type":"object"}"##).expect("fixed service schema")
+}
+fn summary_service_connect(_: &Value) -> String {
+    "service_connect: complete".into()
+}
+fn service_disconnect_params() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"from":{"description":"The consumer: the service whose environment gets the provider's variables.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"to":{"description":"The provider: the service whose first port the link opens.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["from","to"],"type":"object"}"##).expect("fixed service schema")
+}
+fn service_disconnect_result() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"env":{"description":"The environment variable names, never their values.","items":{"maxLength":64,"type":"string"},"maxItems":64,"type":"array"}},"required":["env"],"type":"object"}"##).expect("fixed service schema")
+}
+fn summary_service_disconnect(_: &Value) -> String {
+    "service_disconnect: complete".into()
+}
+fn service_secret_set_params() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"key":{"description":"The secret's name, one of the template's secrets.","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","type":"string"},"name":{"description":"The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"value":{"description":"The secret, 8 to 4096 characters.","maxLength":4096,"minLength":8,"type":"string"}},"required":["name","key","value"],"type":"object"}"##).expect("fixed service schema")
+}
+fn service_secret_set_result() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"ok":{"const":true,"type":"boolean"}},"required":["ok"],"type":"object"}"##).expect("fixed service schema")
+}
+fn summary_service_secret_set(_: &Value) -> String {
+    "service_secret_set: complete".into()
+}
+fn service_publish_params() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"approval":{"description":"The owner's approval: <base64 statement>.<base64 signature>.","maxLength":16384,"minLength":1,"type":"string"},"name":{"description":"The service name.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"reach":{"description":"Where the dash is published: \"tailnet\", the only reach there is.","maxLength":32,"type":"string"}},"required":["name","reach","approval"],"type":"object"}"##).expect("fixed service schema")
+}
+fn service_publish_result() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"node":{"description":"The tailnet node the dash is served from: arca-<name>.","maxLength":63,"type":"string"},"url":{"description":"Its address on the tailnet: https://<node>.<tailnet>.ts.net:8443/ (no dash token: the dash asks for its own).","maxLength":300,"type":"string"}},"required":["node","url"],"type":"object"}"##).expect("fixed service schema")
+}
+fn summary_service_publish(_: &Value) -> String {
+    "service_publish: complete".into()
+}
+fn service_unpublish_params() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"name":{"description":"The service name.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["name"],"type":"object"}"##).expect("fixed service schema")
+}
+fn service_unpublish_result() -> Value {
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"unpublished":{"const":true,"type":"boolean"}},"required":["unpublished"],"type":"object"}"##).expect("fixed service schema")
+}
+fn summary_service_unpublish(_: &Value) -> String {
+    "service_unpublish: complete".into()
 }

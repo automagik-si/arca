@@ -1151,3 +1151,20 @@ socket's length limit. Run them with `cargo test -p arca`.
 Service database and consumer creates read `devices.root.pool` from the default project's default profile. A missing pool
 refuses creation. The internal desired config carries that pool; each instance creates its root disk there. Database images
 must already be present in the service project's image store at the requested fingerprint.
+
+
+### Service wiring
+
+`service_connect`, `service_disconnect` and `service_secret_set` update config and ACLs through the effect journal. Arca
+currently applies the environment on the instance's next start; it does not start or restart instances for these calls.
+Droidd restarts a running consumer and starts a stopped service once its environment is complete. Adding that state-write
+capability needs a separate review of the closed journal vocabulary.
+
+Publication needs `serveHost` (this process's serve DNS name) and `tailnet` (the owner's tailnet label, without `.ts.net`)
+in node config. Both must agree, for example `host.example.ts.net` and `example`. They are never discovered by a lookup.
+Adopted services support list, status and console logs. Their write verbs return an explicit `adopted` refusal.
+
+The exec audit is local, private and separate from `journal_list`. A crash can leave a key in the private tmpfs key directory
+until unpublish or instance stop, and can leave recordings until the next startup sweep. A crash before the operation id is
+synced leaves a recording the sweep cannot name; deleting the instance removes it. A real tailnet join requires the owner's
+key and is a deployment acceptance check, not a hermetic test.

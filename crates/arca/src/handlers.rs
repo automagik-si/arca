@@ -2024,6 +2024,9 @@ impl ToolHandler for PostgresHandler {
     }
 }
 
+#[path = "service_wiring.rs"]
+mod service_wiring;
+
 // Services: one record in the desired document, plus the live Incus row for state.
 
 pub fn service_handlers(
@@ -2032,7 +2035,13 @@ pub fn service_handlers(
     cfg: Arc<NodeConfig>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let writes = Arc::new(Mutex::new(()));
+    let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
     [
+        "service_connect",
+        "service_disconnect",
+        "service_secret_set",
+        "service_publish",
+        "service_unpublish",
         "service_create",
         "service_list",
         "service_status",
@@ -2049,6 +2058,7 @@ pub fn service_handlers(
                 clock: clock.clone(),
                 cfg: cfg.clone(),
                 writes: writes.clone(),
+                exec: exec.clone(),
             }) as Arc<dyn ToolHandler>,
         )
     })
@@ -2061,6 +2071,7 @@ struct ServiceHandler {
     clock: Clock,
     cfg: Arc<NodeConfig>,
     writes: Arc<Mutex<()>>,
+    exec: Arc<crate::service_exec::ServiceExec>,
 }
 
 fn service_refused(message: impl Into<String>) -> CallError {
@@ -2324,6 +2335,7 @@ fn adopted_config(
             to: to.to_string(),
             port,
             env: Vec::new(),
+            uuid: uuid.to_string(),
         });
     }
     Some(crate::service::ServiceConfig {
@@ -2333,6 +2345,9 @@ fn adopted_config(
         ipv4: ipv4_text.to_string(),
         ports,
         links,
+        incoming: Vec::new(),
+        secret_refs: BTreeMap::new(),
+        environment_patch: None,
         published,
         created: now,
         source: json!({}),
@@ -2463,6 +2478,9 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         ipv4: parts.ipv4,
         ports: parts.template.ports.clone(),
         links: Vec::new(),
+        incoming: Vec::new(),
+        secret_refs: BTreeMap::new(),
+        environment_patch: None,
         published: None,
         created: parts.now,
         source,
@@ -2505,6 +2523,10 @@ impl ToolHandler for ServiceHandler {
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
             "service_remove" => &["name", "approval"],
+            "service_connect" | "service_disconnect" => &["from", "to"],
+            "service_secret_set" => &["name", "key", "value"],
+            "service_publish" => &["name", "reach", "approval"],
+            "service_unpublish" => &["name"],
             _ => &[],
         };
         let object = args
@@ -2520,7 +2542,28 @@ impl ToolHandler for ServiceHandler {
                 verb: self.verb.into(),
             });
         }
-        let _write = if self.verb == "service_create" {
+        if matches!(
+            self.verb,
+            "service_connect"
+                | "service_disconnect"
+                | "service_secret_set"
+                | "service_publish"
+                | "service_unpublish"
+        ) && caller.scope < Scope::Doctor
+        {
+            return Err(CallError::Forbidden {
+                verb: self.verb.into(),
+            });
+        }
+        let _publish = matches!(
+            self.verb,
+            "service_publish" | "service_unpublish" | "service_remove"
+        )
+        .then(|| self.exec.publish_gate.blocking_lock());
+        let _write = if matches!(
+            self.verb,
+            "service_create" | "service_connect" | "service_disconnect" | "service_secret_set"
+        ) {
             Some(self.writes.lock().map_err(|_| internal())?)
         } else {
             None
@@ -2538,6 +2581,16 @@ impl ToolHandler for ServiceHandler {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
         };
+        if matches!(
+            self.verb,
+            "service_connect"
+                | "service_disconnect"
+                | "service_secret_set"
+                | "service_publish"
+                | "service_unpublish"
+        ) {
+            return self.call_wiring(&args, caller, &entries, now);
+        }
         match self.verb {
             "service_list" => {
                 let mut views = Vec::new();
@@ -2596,14 +2649,19 @@ impl ToolHandler for ServiceHandler {
             }
             "service_logs" => {
                 let name = service_name(&args)?;
-                let lines = args.get("lines").and_then(Value::as_u64).unwrap_or(50);
+                let lines = match args.get("lines") {
+                    None => 50,
+                    Some(value) => value
+                        .as_u64()
+                        .ok_or_else(|| CallError::Invalid("lines: expected 1 to 200".into()))?,
+                };
                 if !(1..=200).contains(&lines) {
                     return Err(CallError::Invalid("lines: expected 1 to 200".into()));
                 }
                 let record = service_entries(&entries)
                     .into_iter()
                     .find(|(_, config)| config.name == name);
-                let Some((_, config)) = record else {
+                let Some((entry, config)) = record else {
                     return Err(service_not_found(format!("service {name}: not found")));
                 };
                 let row = service_live_in(&rows, &config.project, &name).ok_or_else(|| {
@@ -2613,12 +2671,41 @@ impl ToolHandler for ServiceHandler {
                     "/1.0/instances/{name}/console?project={}&type=log",
                     config.project
                 );
-                let text = read.get_text(&path).map_err(|error| match error {
-                    arca_incus::IncusError::Status { code: 404, .. } => {
-                        service_not_found(format!("service {name}: no log"))
+                let journal = if !config.adopted && config.source["protocol"] != "oci" {
+                    if let Some(_permit) = self.exec.journal_permit() {
+                        let target = self.exec_target(&entry, &config)?;
+                        let cmd = arca_incus::exec::ExecCommand::Journal(
+                            arca_incus::exec::JournalLines::new(lines).map_err(|_| {
+                                CallError::Invalid("lines: expected 1 to 200".into())
+                            })?,
+                        );
+                        match self.exec.run(
+                            &target,
+                            &caller.token_id,
+                            self.verb,
+                            &cmd,
+                            &service_secret_values(&self.cfg.state_dir.join("secrets")),
+                            None,
+                        ) {
+                            Ok(text) => String::from_utf8(text).ok(),
+                            Err(error) if error.ownership() => return Err(error.call_error()),
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
                     }
-                    _ => service_refused(format!("read service {name}'s log")),
-                })?;
+                } else {
+                    None
+                };
+                let text = match journal {
+                    Some(text) => text,
+                    None => read.get_text(&path).map_err(|error| match error {
+                        arca_incus::IncusError::Status { code: 404, .. } => {
+                            service_not_found(format!("service {name}: no log"))
+                        }
+                        _ => service_refused(format!("read service {name}'s log")),
+                    })?,
+                };
                 let mut secrets = service_secret_values(&self.cfg.state_dir.join("secrets"));
                 let envkeys = row["config"][crate::service::ENVKEYS_KEY]
                     .as_str()
@@ -2655,16 +2742,24 @@ impl ToolHandler for ServiceHandler {
                     return Err(service_not_found(format!("service {name}: not found")));
                 };
                 if config.adopted {
-                    return Err(CallError::Refused {
-                        code: "adopted".into(),
-                        message: format!(
-                            "service {name} was adopted; this build does not remove it"
-                        ),
-                    });
+                    return Err(service_wiring::adopted(&name));
                 }
                 let id = entry.id.clone();
+                let spent = lock(&self.kernel)?
+                    .spend_service_removal(&id, &name, approval, now)
+                    .map_err(|error| match error {
+                        crate::kernel::ServiceRemovalError::Approval(refusal) => {
+                            CallError::Refused {
+                                code: "owner_approval".into(),
+                                message: refusal.to_string(),
+                            }
+                        }
+                        _ => internal(),
+                    })?;
+                self.logout_before_remove(&entry, &config, caller);
+                let _write = self.writes.lock().map_err(|_| internal())?;
                 let removal = lock(&self.kernel)?
-                    .remove_service(&id, &name, approval, now)
+                    .remove_service_spent(spent, now)
                     .map_err(|error| match error {
                         crate::kernel::ServiceRemovalError::Approval(refusal) => {
                             CallError::Refused {

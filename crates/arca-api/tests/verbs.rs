@@ -52,6 +52,11 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_status",
             "service_logs",
             "service_remove",
+            "service_connect",
+            "service_disconnect",
+            "service_secret_set",
+            "service_publish",
+            "service_unpublish",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -775,4 +780,14 @@ fn postgres_delete_accepts_a_waiting_plan_or_a_settled_removal() {
     assert!(conforms(&schema, &json!({"plan":null,"removed":true})).is_ok());
     assert!(conforms(&schema, &json!({"plan":null})).is_err());
     assert!(conforms(&schema, &json!({"plan":null,"removed":"true"})).is_err());
+}
+
+#[test]
+fn service_wiring_schemas_equal_the_frozen_contract() {
+    let rows: Value = serde_json::from_str(include_str!("fixtures/service-wiring.json")).unwrap();
+    for row in rows.as_array().unwrap() {
+        let v = verb(row["name"].as_str().unwrap()).unwrap();
+        assert_eq!((v.params)(), row["inputSchema"]);
+        assert_eq!((v.result)(), row["outputSchema"]);
+    }
 }

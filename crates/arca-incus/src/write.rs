@@ -1,5 +1,5 @@
-//! The Incus writer: the one module in this crate that sends a method other than GET. It is compiled only with the `write`
-//! feature, which only the provider crate enables.
+//! The journalled Incus writer, compiled with the `write` feature. Adoption and the closed service exec/file module use
+//! checked transport helpers for their separate capabilities; neither adds an exec operation to Provider.
 //!
 //! Every write is gated twice. The project family is checked first: a target outside the projects the kernel's configuration
 //! names is refused before any request. The ownership classifier is checked next: a read returns an [`Owned`] only when
@@ -205,11 +205,12 @@ impl ProjectFamily {
 /// entry's own, before it sends.
 #[derive(Debug, Clone)]
 pub struct UnixIncusWriter {
-    socket: PathBuf,
+    pub(crate) socket: PathBuf,
     entry: EntryId,
     retained: BTreeMap<EntryId, (PluginId, Digest)>,
     family: ProjectFamily,
     deadline: Duration,
+    budget: Option<Instant>,
 }
 
 impl UnixIncusWriter {
@@ -227,6 +228,7 @@ impl UnixIncusWriter {
             retained,
             family,
             deadline: OPERATION_DEADLINE,
+            budget: None,
         }
     }
 
@@ -234,6 +236,17 @@ impl UnixIncusWriter {
     pub fn with_operation_deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
         self
+    }
+
+    pub fn with_total_budget(mut self, budget: Duration) -> Self {
+        self.budget = Instant::now().checked_add(budget);
+        self
+    }
+
+    pub(crate) fn request_timeout(&self, timeout: Duration) -> Duration {
+        self.budget.map_or(timeout, |until| {
+            timeout.min(until.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// The entry this writer writes for.
@@ -745,21 +758,33 @@ impl UnixIncusWriter {
             .strip_prefix("/1.0/operations/")
             .filter(|id| operation_id(id))
             .ok_or_else(|| decode("the answer names no operation"))?;
-        self.wait_on(id)
+        self.wait_on(id).map(|_| ())
     }
 
     /// Waits on operation `id` until it ends or the writer's deadline passes. Only status code 200 with the status `Success`
     /// is done. A running code (1xx) is waited on again. A 4xx or 5xx in the operation's metadata is the operation's own failure,
     /// and any other code is a failure too. An error answer to the wait request itself is not the operation's status: it is a
     /// decode failure, so the outcome of the write stays unknown. The adoption writer waits through this too.
-    pub(crate) fn wait_on(&self, id: &str) -> Result<(), IncusError> {
+    pub(crate) fn wait_on(&self, id: &str) -> Result<Value, IncusError> {
+        self.wait_on_in(id, None)
+    }
+
+    pub(crate) fn wait_on_in(&self, id: &str, project: Option<&str>) -> Result<Value, IncusError> {
+        if !operation_id(id) {
+            return Err(decode("invalid operation id"));
+        }
         let started = Instant::now();
         loop {
             if started.elapsed() >= self.deadline {
                 return Err(IncusError::Timeout);
             }
-            let path = format!("/1.0/operations/{id}/wait?timeout={WAIT_SECONDS}");
-            let framed = self.send_within("GET", &path, None, None, WAIT_TIMEOUT)?;
+            let mut path = format!("/1.0/operations/{id}/wait?timeout={WAIT_SECONDS}");
+            if let Some(project) = project {
+                segment(project)?;
+                path.push_str(&format!("&project={project}"));
+            }
+            let remaining = self.deadline.saturating_sub(started.elapsed());
+            let framed = self.send_within("GET", &path, None, None, WAIT_TIMEOUT.min(remaining))?;
             let answer = checked_envelope(&framed.into_raw()).map_err(|error| match error {
                 IncusError::Status { .. } => {
                     decode("the wait answered without the operation's status")
@@ -782,7 +807,9 @@ impl UnixIncusWriter {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             match code {
-                200 if status == "Success" => return Ok(()),
+                200 if status == "Success" => {
+                    return Ok(operation.get("metadata").cloned().unwrap_or(Value::Null));
+                }
                 200 => return Err(decode("the operation reads 200 without Success")),
                 100..=199 => thread::sleep(POLL_PAUSE),
                 400..=599 => {
@@ -812,7 +839,7 @@ impl UnixIncusWriter {
     }
 
     /// Sends one request the caller has already checked, under `timeout`, as [`Self::send_within`] sends it. It skips the
-    /// family and the ownership checks, so only the adoption writer calls it, for the requests of its closed step table. The
+    /// family and the ownership checks, so the adoption and service writers call it only for their closed tables. The
     /// request still passes `exchange`, so its guard applies.
     pub(crate) fn send_checked(
         &self,
@@ -869,7 +896,7 @@ impl UnixIncusWriter {
         if let Some(bytes) = payload {
             request.extend_from_slice(&bytes);
         }
-        exchange(&self.socket, timeout, &request)
+        exchange(&self.socket, self.request_timeout(timeout), &request)
     }
 }
 
@@ -1109,7 +1136,7 @@ fn image_fingerprint(text: &str) -> bool {
 }
 
 /// An operation id: the characters of a uuid.
-fn operation_id(id: &str) -> bool {
+pub(crate) fn operation_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
