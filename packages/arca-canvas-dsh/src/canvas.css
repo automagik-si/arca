@@ -955,6 +955,11 @@ body,
   color: var(--arca-faint);
 }
 
+.arca-thread-note {
+  font-size: 12px;
+  color: var(--arca-muted);
+}
+
 .arca-tool {
   display: flex;
   flex-direction: column;

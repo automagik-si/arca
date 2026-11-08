@@ -4,6 +4,12 @@ import { snapshotError } from './arca-client.js';
 const JOURNAL_PAGE_LIMIT = 500;
 const JOURNAL_MAX_PAGES = 50;
 const JOURNAL_KEEP = 200;
+// A state change appends a new line under the same effect id. Every poll re-reads the newest ids, so a
+// record that went Intent -> Failed (or Applied -> Confirmed/Reverted) is replaced, not skipped.
+const JOURNAL_WINDOW = JOURNAL_KEEP;
+// Pages a snapshot waits for. A deeper read (the first one, or a long gap) continues in the background
+// so the page is not held hostage by a long journal.
+const JOURNAL_SYNC_PAGES = 2;
 
 export function emptySnapshot(config = {}) {
   return {
@@ -21,6 +27,7 @@ export function emptySnapshot(config = {}) {
     plans: [],
     journal: [],
     journalKnown: false,
+    journalPending: false,
     devices: 'off',
     devicesAt: null,
     phones: [],
@@ -33,43 +40,127 @@ function rows(value) {
   return value;
 }
 
-// journal_list pages forward from `after` and returns the oldest records first. Read every page,
-// retain the newest records, and remember the cursor so later polls only ask for new ones.
-async function collectJournal(client, state) {
+// journal_list pages forward from `after` and returns the oldest records first, one newest record per
+// effect id. Read from a trailing window so later states of an id are re-read, then merge by id with the
+// latest record winning.
+function journalId(record) {
+  const id = Number(record?.id);
+  return Number.isFinite(id) ? id : null;
+}
+
+function mergeJournal(previous, fetched) {
+  const merged = [];
+  const position = new Map();
+  for (const record of [...previous, ...fetched]) {
+    if (!record || typeof record !== 'object') continue;
+    const id = journalId(record);
+    if (id === null) {
+      merged.push(record);
+      continue;
+    }
+    const key = String(id);
+    const at = position.get(key);
+    if (at === undefined) {
+      position.set(key, merged.length);
+      merged.push(record);
+    } else {
+      merged[at] = record;
+    }
+  }
+  merged.sort((a, b) => (journalId(a) ?? 0) - (journalId(b) ?? 0));
+  return merged.slice(-JOURNAL_KEEP);
+}
+
+async function readJournalPage(client, after) {
+  const value = await client.call('journal_list', { after, limit: JOURNAL_PAGE_LIMIT });
+  const records = rows(value.records).filter((record) => record && typeof record === 'object');
+  let cursor = after;
+  for (const record of records) {
+    const id = journalId(record);
+    if (id !== null && id > cursor) cursor = id;
+  }
+  // A short page ends the journal; a full page of ids that never moves forward would loop forever.
+  return { records, cursor, done: records.length < JOURNAL_PAGE_LIMIT || cursor === after };
+}
+
+async function readJournal(client, after, maxPages) {
   const fetched = [];
-  let cursor = state.cursor;
-  for (let page = 0; page < JOURNAL_MAX_PAGES; page++) {
-    const value = await client.call('journal_list', { after: cursor, limit: JOURNAL_PAGE_LIMIT });
-    const records = rows(value.records).filter((record) => record && typeof record === 'object');
-    fetched.push(...records);
-    let advanced = false;
-    for (const record of records) {
-      const id = Number(record.id);
-      if (Number.isFinite(id) && id > cursor) {
-        cursor = id;
-        advanced = true;
+  let cursor = after;
+  let pages = 0;
+  let done = false;
+  while (pages < maxPages) {
+    const page = await readJournalPage(client, cursor);
+    pages++;
+    fetched.push(...page.records);
+    cursor = page.cursor;
+    if (page.done) {
+      done = true;
+      break;
+    }
+  }
+  return { fetched, cursor, done };
+}
+
+function highestJournalId(records) {
+  let highest = null;
+  for (const record of records) {
+    const id = journalId(record);
+    if (id !== null && (highest === null || id > highest)) highest = id;
+  }
+  return highest;
+}
+
+// Finish a deep read without making the snapshot wait for it. Each page lands in the cache as it arrives.
+function catchUpJournal(client, state, after) {
+  if (state.task) return;
+  state.pending = true;
+  state.task = (async () => {
+    try {
+      let cursor = after;
+      for (let page = 0; page < JOURNAL_MAX_PAGES; page++) {
+        const read = await readJournalPage(client, cursor);
+        state.records = mergeJournal(state.records, read.records);
+        cursor = read.cursor;
+        if (read.done) break;
       }
+      state.cursor = Math.max(Number(state.cursor) || 0, cursor);
+    } catch {
+      // Keep the records already cached; the next poll retries the read.
+    } finally {
+      state.task = null;
+      state.pending = false;
     }
-    if (!records.length || !advanced) break;
+  })();
+}
+
+async function collectJournal(client, state) {
+  if (state.task) return state.records;
+  const highest = Number(state.cursor) || 0;
+  const hasCache = state.records.length > 0;
+  const after = hasCache ? Math.max(0, highest - JOURNAL_WINDOW) : 0;
+  const read = await readJournal(client, after, JOURNAL_SYNC_PAGES);
+  const fetchedHighest = highestJournalId(read.fetched);
+  // The journal restarted from zero (state wiped): ids went backwards or disappeared. Drop the cache
+  // for this host and read the new journal once from the start.
+  const reset = hasCache && (read.fetched.length === 0 || (fetchedHighest !== null && fetchedHighest < highest));
+  if (reset) {
+    state.records = [];
+    state.cursor = 0;
+    const fresh = await readJournal(client, 0, JOURNAL_SYNC_PAGES);
+    state.records = mergeJournal([], fresh.fetched);
+    state.cursor = fresh.cursor;
+    if (!fresh.done) catchUpJournal(client, state, fresh.cursor);
+    return state.records;
   }
-  const seen = new Set(state.records.map((record) => record.id));
-  const merged = [...state.records];
-  for (const record of fetched) {
-    if (record.id !== undefined) {
-      if (seen.has(record.id)) continue;
-      seen.add(record.id);
-    }
-    merged.push(record);
-  }
-  merged.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
-  state.records = merged.slice(-JOURNAL_KEEP);
-  state.cursor = cursor;
+  state.records = mergeJournal(state.records, read.fetched);
+  state.cursor = Math.max(highest, read.cursor);
+  if (!read.done) catchUpJournal(client, state, read.cursor);
   return state.records;
 }
 
 export async function collectSnapshot(client, config = {}, state = {}) {
   const snapshot = emptySnapshot(config);
-  const journalState = state.journal ??= { cursor: 0, records: [] };
+  const journalState = state.journal ??= { cursor: 0, records: [], pending: false, task: null };
   const read = async (key, tool, run) => {
     try {
       snapshot[key] = await run();
@@ -95,6 +186,7 @@ export async function collectSnapshot(client, config = {}, state = {}) {
     read('journal', 'journal_list', async () => {
       const records = await collectJournal(client, journalState);
       snapshot.journalKnown = true;
+      snapshot.journalPending = journalState.pending === true;
       return records;
     }),
   ]);

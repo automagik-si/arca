@@ -61,7 +61,7 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
 
     assert.equal(await page.locator('.arca-project-select').inputValue(), 'Studio');
     const options = await page.locator('.arca-project-select option').allTextContents();
-    assert.deepEqual(options, ['Studio', 'Automation', 'Automagik', 'Sandbox', 'Tools']);
+    assert.deepEqual(options, ['Studio', 'Automation', 'Web1', 'Sandbox', 'Tools']);
     assert.deepEqual(await page.locator('.arca-project-select optgroup').evaluateAll((nodes) => nodes.map((node) => node.label)),
       ['Your projects', 'Services', 'Machine projects']);
     assert.doesNotMatch(await page.locator('.arca-project-select').innerText(), /arcak-svc|Arca services/i);
@@ -122,6 +122,8 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
     for (const record of data.journal ?? []) {
       assert.match(await page.locator('.arca-tool').filter({ hasText: record.entry }).innerText(), new RegExp(record.host));
     }
+    const dom = await page.evaluate(() => `${document.documentElement.textContent}\n${document.documentElement.outerHTML}`);
+    assert.doesNotMatch(dom, /arcak-svc/i, 'the internal project id never reaches the DOM');
     const approval = page.locator('.arca-chat-view .arca-approval a');
     assert.equal(await approval.getAttribute('href'), fixture.approvalUrl);
     assert.match(await approval.innerText(), /Review approvals/);
@@ -167,9 +169,9 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
     assert.equal(await page.locator('.arca-canvas-title').innerText(), 'Studio');
     assert.equal(await page.locator('.arca-project-select').inputValue(), 'Studio');
 
-    await page.locator('.arca-project-select').selectOption('Automagik');
-    await page.waitForFunction(() => location.hash === '#project/Automagik');
-    assert.equal(await page.locator('.arca-canvas-title').innerText(), 'Automagik');
+    await page.locator('.arca-project-select').selectOption('Web1');
+    await page.waitForFunction(() => location.hash === '#project/Web1');
+    assert.equal(await page.locator('.arca-canvas-title').innerText(), 'Web1');
     assert.match(await page.locator('.arca-node-project .arca-nk').innerText(), /Service · alpha/);
     assert.match(await page.locator('.arca-canvas-chips').innerText(), /alpha · service/);
     assert.doesNotMatch(await page.locator('.arca-stage').innerText(), /arcak-svc|Arca services/i);
@@ -189,6 +191,35 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
     assert.match(await page.locator('.arca-chat-view').innerText(), /Activity journal unavailable/);
     assert.equal(await page.locator('.arca-machine').first().innerText().then((value) => value.includes('No metrics')), true);
     assert.equal(await page.locator('.arca-summary').innerText(), '2 machines');
+    data = fixture;
+    await page.waitForSelector('.arca-tool');
+  });
+
+  await t.test('a nameless internal target is labelled and never leaks its project id', async () => {
+    data = {
+      ...fixture,
+      hosts: fixture.hosts.map((host, index) => ({
+        ...host,
+        journal: index === 0
+          ? [{ id: 99, entry: 'create-app', target: { kind: 'instance', project: 'arcak-svc' }, state: 'Intent', at_ms: 1794160200000 }]
+          : [],
+      })),
+    };
+    await page.waitForFunction(() => document.querySelector('.arca-tool')?.textContent?.includes('instance in Arca service'));
+    assert.match(await page.locator('.arca-tool').first().innerText(), /instance in Arca service - Intent/);
+    const dom = await page.evaluate(() => `${document.documentElement.textContent}\n${document.documentElement.outerHTML}`);
+    assert.doesNotMatch(dom, /arcak-svc/i);
+    data = fixture;
+    await page.waitForFunction(() => document.querySelector('.arca-tool')?.textContent?.includes('rotate-token'));
+  });
+
+  await t.test('a deep journal catch-up reads instead of claiming an empty journal', async () => {
+    data = {
+      ...fixture,
+      hosts: fixture.hosts.map((host) => ({ ...host, journal: [], journalKnown: true, journalPending: true })),
+    };
+    await page.waitForFunction(() => document.querySelector('.arca-chat-view')?.textContent?.includes('Reading Arca activity'));
+    assert.equal(await page.locator('.arca-tool').count(), 0);
     data = fixture;
     await page.waitForSelector('.arca-tool');
   });

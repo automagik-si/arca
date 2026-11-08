@@ -643,7 +643,8 @@ export function createCanvas(root) {
     const journal = list(dashboard?.journal);
     const plans = dashboard?.plans ?? 0;
     const url = approvalUrl(state.envelope.approvalUrl);
-    const signature = JSON.stringify({ journal, plans, url, project: project?.name });
+    const pending = (state.envelope.hosts ?? []).some((host) => host.journalPending);
+    const signature = JSON.stringify({ journal, plans, url, project: project?.name, pending });
     if (signature === state.signatures.panel) return;
     state.signatures.panel = signature;
     const now = Date.now();
@@ -655,14 +656,18 @@ export function createCanvas(root) {
       `Recent Arca activity · ${count(journal.length, 'event')}`));
     if (!journal.length) {
       const known = (state.envelope.hosts ?? []).some((host) => host.journalKnown);
-      thread.append(emptyState(doc,
-        known ? 'No recent Arca activity' : 'Activity journal unavailable',
-        known ? 'Arca has not applied a change recently.' : 'This host did not return a journal.'));
+      thread.append(pending
+        ? emptyState(doc, 'Reading Arca activity…', 'The journal is catching up; this fills in on the next refresh.')
+        : emptyState(doc,
+          known ? 'No recent Arca activity' : 'Activity journal unavailable',
+          known ? 'Arca has not applied a change recently.' : 'This host did not return a journal.'));
+    } else {
+      if (pending) thread.append(el(doc, 'p', 'arca-thread-note', 'Reading older activity…'));
+      for (const record of journal) thread.append(toolCard(doc, record, now));
     }
-    for (const record of journal) thread.append(toolCard(doc, record, now));
     if (plans > 0) thread.append(approvalCard(doc, plans, url));
     if (!journal.length) {
-      steps.append(el(doc, 'p', 'arca-steps-empty', 'No recent Arca steps.'));
+      steps.append(el(doc, 'p', 'arca-steps-empty', pending ? 'Reading older activity…' : 'No recent Arca steps.'));
     }
     for (const record of journal) steps.append(stepCard(doc, record, now));
     if (plans > 0) steps.append(approvalCard(doc, plans, url));

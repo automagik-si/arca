@@ -95,7 +95,7 @@ test('default selection prefers configured, owner, service, then other Incus pro
   assert.equal(ownerFirst.defaultProject.name, 'Studio');
   const fallback = buildDashboard({ ...fixture, defaultProject: '', projects: [] });
   // The standard fixture carries one unlisted service, which outranks the other Incus projects.
-  assert.equal(fallback.defaultProject.name, 'Automagik');
+  assert.equal(fallback.defaultProject.name, 'Web1');
   assert.equal(fallback.defaultProject.kind, 'service');
 });
 
@@ -106,14 +106,14 @@ test('arcak-svc never becomes a project and every unlisted service is first-clas
       instancesKnown: true,
       projects: ['arcak-svc', 'shared'],
       instances: [
-        { name: 'automagik', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'web1', project: 'arcak-svc', kind: 'container', status: 'Running' },
         { name: 'nats', project: 'arcak-svc', kind: 'container', status: 'Running' },
         { name: 'worker', project: 'shared', kind: 'container', status: 'Running' },
       ],
     }],
   });
   assert.deepEqual(dashboard.projects.map((entry) => [entry.name, entry.kind]), [
-    ['Automagik', 'service'], ['Nats', 'service'], ['Shared', 'incus'],
+    ['Nats', 'service'], ['Web1', 'service'], ['Shared', 'incus'],
   ]);
   for (const service of dashboard.projects.filter((entry) => entry.kind === 'service')) {
     assert.equal(service.host, 'alpha');
@@ -121,7 +121,7 @@ test('arcak-svc never becomes a project and every unlisted service is first-clas
     assert.equal(service.cards.length, 1);
   }
   assert.equal(dashboard.projects.some((entry) => /arcak-svc|Arca services/i.test(`${entry.name} ${entry.rawName}`)), false);
-  assert.equal(dashboard.defaultProject.name, 'Automagik');
+  assert.equal(dashboard.defaultProject.name, 'Nats');
   assert.equal(dashboard.defaultProject.kind, 'service');
 });
 
@@ -134,12 +134,12 @@ test('an owner project may group one service while the rest stay first-class', (
       instancesKnown: true,
       projects: ['arcak-svc'],
       instances: [
-        { name: 'automagik', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'web1', project: 'arcak-svc', kind: 'container', status: 'Running' },
         { name: 'nats', project: 'arcak-svc', kind: 'container', status: 'Running' },
       ],
     }],
   });
-  assert.deepEqual(dashboard.projects.map((entry) => entry.name), ['Messaging', 'Automagik']);
+  assert.deepEqual(dashboard.projects.map((entry) => entry.name), ['Messaging', 'Web1']);
   assert.equal(project(dashboard, 'Messaging').cards[0].name, 'nats');
   assert.equal(dashboard.projects.filter((entry) => entry.kind === 'service').length, 1);
   assert.equal(dashboard.projects.some((entry) => entry.kind === 'service' && entry.cards.some((card) => card.name === 'nats')), false);
@@ -243,6 +243,26 @@ test('journal cards are newest-first with host, entry, target and state', () => 
     { key: 'alpha:0', host: 'alpha', entry: 'deploy-app', state: 'Failed', tone: 'bad', target: 'instance app', plugin: '', at: 1 });
 });
 
+test('a journal target without a name never shows the internal project id', () => {
+  const [record] = journalFeed([{ name: 'alpha', journal: [{
+    id: 3,
+    entry: 'create-app',
+    target: { kind: 'instance', project: 'arcak-svc' },
+    state: 'Intent',
+    at_ms: 1,
+  }] }]);
+  assert.equal(record.target, 'instance in Arca service');
+  assert.equal(JSON.stringify(record).includes('arcak-svc'), false);
+  const [other] = journalFeed([{ name: 'alpha', journal: [{
+    id: 4,
+    entry: 'open-volume',
+    target: { kind: 'volume', project: 'plumbing' },
+    state: 'Applied',
+    at_ms: 1,
+  }] }]);
+  assert.equal(other.target, 'volume in Plumbing');
+});
+
 test('journal and plan data stay absent when a host fails', () => {
   const dashboard = buildDashboard({
     ...fixture,
@@ -262,7 +282,10 @@ test('labels keep product language plain', () => {
   assert.equal(statusTone('Running'), 'ok');
   assert.equal(statusTone('Stopped'), 'neutral');
   assert.equal(statusTone('Applied'), 'ok');
+  assert.equal(statusTone('Confirmed'), 'ok');
   assert.equal(statusTone('Failed'), 'bad');
+  assert.equal(statusTone('Reverted'), 'neutral');
+  assert.equal(statusTone('Intent'), 'warn');
   assert.equal(ownerLabel({ class: 'kernel' }), 'Managed by Arca');
   assert.equal(ownerLabel({ class: 'foreign' }), 'External');
 });

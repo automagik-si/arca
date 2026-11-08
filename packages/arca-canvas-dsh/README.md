@@ -107,11 +107,11 @@ member is resolved on its host and appears only inside its owner project. An
 unlisted instance falls back to a project named after its Incus project on that
 host, with one exception: the internal `arcak-svc` grouping is never a project.
 Each unlisted instance in `arcak-svc` becomes its own project named after the
-service (the instance name, humanized; `automagik` becomes `Automagik`), so a
+service (the instance name, humanized; `web1` becomes `Web1`), so a
 service is a first-class project by default and an owner project can group
 several. The internal `arcak-svc` id never appears as a project, in the picker or
 in a project subtitle. To group services, list them like any other member:
-`{ host: alpha, incusProject: arcak-svc, instance: automagik }`. An Incus
+`{ host: alpha, incusProject: arcak-svc, instance: web1 }`. An Incus
 project whose instances are all listed in owner projects is not rendered at all.
 Owner projects render in config order; service projects follow, then the other
 fallback projects by host and project name, with the host appended only when a
@@ -147,19 +147,25 @@ host entry has `name`, `at`, `error` (null or safe error text), `nodeName`
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
 `watch_report` failed), `projects` (the Incus project ids from `watch_report`),
 `databases`, `metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
-`journal_list` failed), `devices`, `devicesAt` (ISO time of the last good device
+`journal_list` failed), `journalPending` (true while a deep journal read finishes
+in the background), `devices`, `devicesAt` (ISO time of the last good device
 list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable`,
 `unreachable`, or `stale`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
-- `journal` holds the newest `journal_list` records, at most 200 per host. The
-  reader pages forward from the last seen id, so the first poll reads the whole
-  journal and later polls only fetch new records; the newest records across hosts
-  feed the Doctor's Chat and Steps views. A failed journal read leaves the array
-  empty and `journalKnown` false, so the page shows an unavailable notice instead
-  of invented rows.
+- `journal` holds the newest `journal_list` records, at most 200 per host. Every
+  poll re-reads a trailing window of the newest ids and merges by id with the
+  latest record winning, so an effect that moved from `Intent` to `Failed` (or
+  `Applied` to `Confirmed`/`Reverted`) updates instead of staying at the first
+  state it was seen in. A snapshot waits for at most two journal pages and a deep
+  first read finishes in the background with `journalPending` true meanwhile. A
+  journal that restarts from zero (its ids go backwards or disappear) is detected
+  and re-read from the start, dropping the stale cache for that host. The newest
+  records across hosts feed the Doctor's Chat and Steps views. A failed journal
+  read leaves the array empty and `journalKnown` false, so the page shows an
+  unavailable notice instead of invented rows.
 - `alerts` holds the full `alerts_list` result, preserving firing, unknown and
   recent resolved alerts plus health metadata. This layout does not draw alert
   cards yet; the data stays in the snapshot for later phases.

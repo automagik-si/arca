@@ -65,7 +65,7 @@
           "identity": false
         },
         {
-          "name": "automagik",
+          "name": "web1",
           "project": "arcak-svc",
           "kind": "container",
           "status": "Running",

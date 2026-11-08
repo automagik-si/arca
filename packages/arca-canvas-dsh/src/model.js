@@ -26,8 +26,8 @@ export function instanceKindLabel(kind) {
 
 export function statusTone(status) {
   const value = text(status).trim().toLowerCase();
-  if (['running', 'ready', 'active', 'started', 'ok', 'up', 'reachable', 'applied', 'committed'].includes(value)) return 'ok';
-  if (['stopped', 'exited', 'off', 'disabled', 'retained'].includes(value)) return 'neutral';
+  if (['running', 'ready', 'active', 'started', 'ok', 'up', 'reachable', 'applied', 'committed', 'confirmed'].includes(value)) return 'ok';
+  if (['stopped', 'exited', 'off', 'disabled', 'retained', 'reverted'].includes(value)) return 'neutral';
   if (['error', 'failed', 'unreachable', 'unavailable', 'down', 'missing', 'rejected'].includes(value)) return 'bad';
   return value ? 'warn' : 'unknown';
 }
@@ -144,7 +144,11 @@ function targetLabel(target) {
   const name = text(target.name);
   if (kind && name) return `${kind} ${name}`;
   if (name) return name;
-  if (kind && target.project) return `${kind} in ${target.project}`;
+  if (kind && target.project) {
+    // The internal project is an implementation detail; never print its raw id.
+    const project = text(target.project);
+    return `${kind} in ${project === INTERNAL_PROJECT ? 'Arca service' : projectLabel(project)}`;
+  }
   return kind;
 }
 

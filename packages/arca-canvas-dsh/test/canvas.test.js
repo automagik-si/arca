@@ -10,6 +10,7 @@ import { Context } from '@deepseek-ai/cordis';
 import yaml from 'js-yaml';
 import * as plugin from '../index.js';
 import { createArcaClient, PROTOCOL_VERSION } from '../src/arca-client.js';
+import { buildDashboard } from '../src/model.js';
 import { collectSnapshot, createSnapshotCache, emptySnapshot } from '../src/snapshot.js';
 
 const fixtures = JSON.parse(await readFile(new URL('./fixtures.json', import.meta.url), 'utf8'));
@@ -101,7 +102,7 @@ test('all seven fixtures become one snapshot with project-qualified instances', 
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'devices', 'devicesAt', 'phones', 'desktops']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
   assert.equal(snapshot.instancesKnown, true);
   assert.deepEqual(snapshot.projects, fixtures.watch_report.projects.map(({ project }) => project));
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
@@ -115,7 +116,7 @@ test('all seven fixtures become one snapshot with project-qualified instances', 
   assert.deepEqual(snapshot.plans, fixtures.plan_list.plans);
   assert.deepEqual(snapshot.journal, fixtures.journal_list.records);
   assert.equal(snapshot.journalKnown, true);
-  assert.equal(calls.length, 16);
+  assert.equal(calls.length, 14);
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
@@ -215,7 +216,7 @@ test('journal_list failure leaves no invented records and keeps the host useful'
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
-test('journal paging shows the newest records and later polls only read new ones', async () => {
+test('journal paging shows the newest records and later polls re-read a trailing window', async () => {
   const records = Array.from({ length: 620 }, (_, index) => ({
     id: index + 1,
     entry: `event-${index + 1}`,
@@ -236,16 +237,159 @@ test('journal paging shows the newest records and later polls only read new ones
   const state = {};
   const snapshot = await collectSnapshot(client, {}, state);
   assert.equal(snapshot.journalKnown, true);
+  assert.equal(snapshot.journalPending, false);
   assert.equal(snapshot.journal.length, 200);
   assert.deepEqual(snapshot.journal.map((record) => record.id), records.slice(-200).map((record) => record.id));
-  assert.deepEqual(calls.map((args) => args.after), [0, 500, 620]);
+  assert.deepEqual(calls.map((args) => args.after), [0, 500]);
 
   calls.length = 0;
   records.push({ id: 621, entry: 'event-621', state: 'Applied', at_ms: 1794160000620 });
   const next = await collectSnapshot(client, {}, state);
-  assert.deepEqual(calls.map((args) => args.after), [620, 621]);
+  // The trailing window starts 200 ids below the cursor, so later states are re-read, not skipped.
+  assert.deepEqual(calls.map((args) => args.after), [420]);
   assert.equal(next.journal.length, 200);
   assert.equal(next.journal.at(-1).id, 621);
+  assert.deepEqual(next.journal.map((record) => record.id), records.slice(-200).map((record) => record.id));
+});
+
+async function latestJournalClient(initial) {
+  const journal = [...initial];
+  return {
+    journal,
+    client: {
+      async call(tool, args = {}) {
+        if (tool !== 'journal_list') {
+          if (tool === 'watch_report') return { projects: [] };
+          if (tool === 'postgres_list') return { databases: [] };
+          if (tool === 'plan_list') return { plans: [] };
+          return {};
+        }
+        assert.equal(tool, 'journal_list');
+        // Mirrors handlers.rs: the newest record per id, ids above `after`, ascending, limited.
+        const latest = new Map();
+        for (const record of journal) latest.set(record.id, record);
+        return {
+          records: [...latest.values()]
+            .sort((a, b) => a.id - b.id)
+            .filter((record) => record.id > (args.after ?? 0))
+            .slice(0, args.limit ?? 100),
+        };
+      },
+    },
+  };
+}
+
+test('a state change under an id already seen reaches the panel', async () => {
+  const host = await latestJournalClient([{
+    id: 7,
+    entry: 'create-app',
+    target: { kind: 'instance', name: 'app' },
+    state: 'Intent',
+    at_ms: 1000,
+  }]);
+  const state = {};
+  const first = await collectSnapshot(host.client, {}, state);
+  assert.equal(first.journal[0].state, 'Intent');
+  assert.equal(buildDashboard({ hosts: [{ name: 'alpha', ...first }] }).journal[0].state, 'Intent');
+
+  host.journal[0] = { ...host.journal[0], state: 'Failed', at_ms: 2000 };
+  const failed = await collectSnapshot(host.client, {}, state);
+  assert.equal(failed.journal.length, 1, 'the same effect is replaced, not duplicated');
+  assert.equal(failed.journal[0].state, 'Failed');
+  assert.equal(failed.journal[0].at_ms, 2000);
+  assert.deepEqual(
+    buildDashboard({ hosts: [{ name: 'alpha', ...failed }] }).journal.map((record) => [record.entry, record.state, record.tone]),
+    [['create-app', 'Failed', 'bad']],
+  );
+
+  host.journal[0] = { ...host.journal[0], state: 'Confirmed', at_ms: 3000 };
+  const confirmed = await collectSnapshot(host.client, {}, state);
+  assert.equal(confirmed.journal[0].state, 'Confirmed');
+  assert.deepEqual(buildDashboard({ hosts: [{ name: 'alpha', ...confirmed }] }).journal.map((record) => [record.state, record.tone]),
+    [['Confirmed', 'ok']]);
+
+  host.journal[0] = { ...host.journal[0], state: 'Reverted', at_ms: 4000 };
+  const reverted = await collectSnapshot(host.client, {}, state);
+  assert.equal(reverted.journal[0].state, 'Reverted');
+  assert.deepEqual(buildDashboard({ hosts: [{ name: 'alpha', ...reverted }] }).journal.map((record) => [record.state, record.tone]),
+    [['Reverted', 'neutral']]);
+});
+
+test('a journal that restarts from zero is re-read and the stale cache dropped', async () => {
+  const host = await latestJournalClient(Array.from({ length: 400 }, (_, index) => ({
+    id: index + 1,
+    entry: `old-${index + 1}`,
+    target: { kind: 'instance', name: `synthetic-${index + 1}` },
+    state: 'Applied',
+    at_ms: 1000 + index,
+  })));
+  const state = {};
+  const first = await collectSnapshot(host.client, {}, state);
+  assert.equal(first.journal.at(-1).id, 400);
+  assert.equal(state.journal.cursor, 400);
+  assert.equal(first.journal.length, 200);
+
+  // The state directory was wiped and the journal restarted with fewer ids than the cursor: lower ids.
+  host.journal.splice(0, host.journal.length, ...Array.from({ length: 250 }, (_, index) => ({
+    id: index + 1,
+    entry: `second-${index + 1}`,
+    target: { kind: 'instance', name: 'fresh' },
+    state: 'Applied',
+    at_ms: 5000 + index,
+  })));
+  const lower = await collectSnapshot(host.client, {}, state);
+  assert.equal(state.journal.cursor, 250);
+  assert.equal(lower.journal.length, 200);
+  assert.equal(lower.journal.at(-1).entry, 'second-250');
+  assert.equal(JSON.stringify(lower.journal).includes('old-'), false);
+
+  // A journal with nothing above the window is the same reset: empty comes back, so rescan from zero.
+  host.journal.splice(0, host.journal.length, {
+    id: 1,
+    entry: 'fresh-effect',
+    target: { kind: 'instance', name: 'app' },
+    state: 'Intent',
+    at_ms: 9000,
+  });
+  const reset = await collectSnapshot(host.client, {}, state);
+  assert.equal(state.journal.cursor, 1);
+  assert.deepEqual(reset.journal.map((record) => [record.id, record.entry, record.state]), [[1, 'fresh-effect', 'Intent']]);
+  assert.equal(JSON.stringify(reset).includes('second-'), false);
+});
+
+test('the first deep journal read returns bounded and catches up in the background', async () => {
+  const records = Array.from({ length: 6000 }, (_, index) => ({
+    id: index + 1,
+    entry: `event-${index + 1}`,
+    state: 'Applied',
+    at_ms: 1794160000000 + index,
+  }));
+  const journalCalls = [];
+  const client = {
+    async call(tool, args = {}) {
+      if (tool !== 'journal_list') {
+        if (tool === 'watch_report') return { projects: [] };
+        if (tool === 'postgres_list') return { databases: [] };
+        if (tool === 'plan_list') return { plans: [] };
+        return {};
+      }
+      journalCalls.push(args.after ?? 0);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      return { records: records.filter((record) => record.id > (args.after ?? 0)).slice(0, args.limit ?? 100) };
+    },
+  };
+  const state = {};
+  const first = await collectSnapshot(client, {}, state);
+  assert.equal(first.journalKnown, true);
+  assert.equal(first.journalPending, true, 'the deep read is still running');
+  assert.ok(journalCalls.length <= 3, `snapshot waited for ${journalCalls.length} journal pages`);
+  assert.equal(first.journal.at(-1).id, 1000, 'only the bounded prefix is visible so far');
+
+  await until(() => state.journal && state.journal.pending === false);
+  assert.equal(state.journal.cursor, 6000);
+  const next = await collectSnapshot(client, {}, state);
+  assert.equal(next.journalPending, false);
+  assert.equal(next.journal.length, 200);
   assert.deepEqual(next.journal.map((record) => record.id), records.slice(-200).map((record) => record.id));
 });
 
