@@ -45,13 +45,50 @@ config:
 
 | Key | Meaning |
 | --- | --- |
-| `socketPath` | Required absolute path to Arca's `listen.unix` socket. DSH must run as the same user as Arca. |
-| `viewerTokenPath` | Required absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
+| `hosts` | Optional non-empty array of host readers, described below. |
+| `socketPath` | Required when `hosts` is absent; absolute path to Arca's `listen.unix` socket. DSH must run as the same user as Arca. |
+| `viewerTokenPath` | Required when `hosts` is absent; absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
 | `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Arca polls never overlap; the device phase runs independently. |
 | `nodeName` | Optional human machine title. Defaults to the host OS hostname; an empty or whitespace-only name becomes `Machine`. The raw Arca node ID is never the card title. |
 | `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
 | `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
 | `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
+
+To show multiple hosts, set `hosts` in the same config map:
+
+```yaml
+config:
+  hosts:
+    - name: alpha
+      socketPath: /example/alpha/arca.sock
+      viewerTokenPath: /example/alpha/viewer.token
+      devicesUrl: https://devices.example.com/mcp
+      devicesTokenPath: /example/alpha/device-reader.token
+    - name: beta
+      socketPath: /example/beta/arca.sock
+      viewerTokenPath: /example/beta/viewer.token
+  pollMs: 5000
+  approvalUrl: https://example.com/approve
+```
+
+Each entry requires a non-empty, unique `name`, used as its Hosts row title,
+and absolute `socketPath` and `viewerTokenPath` paths. Token files follow the
+same regular-file, `0400`, no-symlink rules. Optional `devicesUrl` and
+`devicesTokenPath` use the same validation rules as the top-level settings.
+Hosts appear in array order; the first is the **primary** host. If its device
+settings are omitted, it uses the existing top-level device settings. Other
+hosts never inherit those settings. A host without a device reader shows
+“Device data unavailable.” in its Devices frame.
+
+When `hosts` is absent, the existing single-host keys work unchanged: the name
+comes from `nodeName` or the OS hostname. With `hosts` present, each entry supplies
+its own socket, token and name; top-level `socketPath`, `viewerTokenPath` and
+`nodeName` are unused. Each host polls concurrently on its own `pollMs` schedule.
+An unreachable socket, refused token or failed tool affects only that host;
+successful fields and the other hosts keep rendering. A failed watch report
+shows “Watch report unavailable” instead of implying an empty host. Selecting a
+host scopes the Projects section, tiles, device data and unplaced links to it.
+No per-host mode is inferred from `arca_status`.
 
 All example paths must be replaced with paths on the machine running DSH. Paths
 are literal; `~` and environment variables are not expanded. Config contains
@@ -76,9 +113,10 @@ readers.
 
 ## Snapshot
 
-The JSON object always has `at` (ISO timestamp), `error` (null or safe error text),
-`approvalUrl` (empty or the configured approval URL), `nodeName` (resolved by the
-host), `machine`, `instances`, `instancesKnown` (false when `watch_report` failed),
+The JSON object has `at` (ISO timestamp), `approvalUrl` (empty or the configured
+approval URL), and `hosts` in configured order. Each host entry has `name`, `at`,
+`error` (null or safe error text), `nodeName` (resolved by the host), `machine`,
+`instances`, `instancesKnown` (false when `watch_report` failed),
 `projects` (the Incus project ids from `watch_report`, including empty projects),
 `databases`, `metrics`, `alerts`, `plans`, `devices`,
 `devicesAt` (ISO time of the last good device list, or null), `phones`, and `desktops`.
@@ -135,18 +173,22 @@ The page is a read-only containment canvas. Its left menu has separate,
 collapsible **Hosts** and **Projects** sections; the whole menu folds to a thin
 rail through one button, and that choice is remembered in local storage. A host
 opens the host view, a project opens that project's canvas, and an instance node
-opens its detail pane. Selection lives in the URL fragment: `#host/<node id>`,
-`#project/<Incus project>` and `#project/<Incus project>/instance/<name>`. The
-fragment is matched against the known tree; an unknown value shows a not-found
-state.
+opens its detail pane. Selection lives in the URL fragment: `#host/<host>`,
+`#project/<host>/<project>`, `#project/<host>/<project>/instance/<name>`,
+`#not-placed/<host>` and `#databases/<host>`. Each segment is encoded with
+`encodeURIComponent`. Same-named projects on different hosts stay distinct.
+Legacy `#host/<node id>`, `#project/<project>`,
+`#project/<project>/instance/<name>`, `#not-placed` and `#databases` links open
+the primary host. The fragment is matched against the known tree; an unknown
+value shows a not-found state.
 
 The project canvas nests a host frame, a project frame and instance nodes. Each
 node shows status as text and colour, its kind (Container or VM), and its image
 or IP when the snapshot carries one; stopped instances are dimmed. Databases whose
 name or explicit `instance` field matches exactly one instance are shown in that
 node. Phones and desktops whose name matches exactly one instance are shown in the
-project's Devices frame; unmatched devices remain visible under Hosts as Not
-placed. No database-to-project relation is inferred. Instance ownership reads
+project's Devices frame; unmatched devices remain visible under the selected
+host as Not placed. No database-to-project relation is inferred. Instance ownership reads
 `Managed by Arca` only for kernel and retained objects; droidd, foreign, contested,
 missing and unknown ownership read `External`. Waiting-plan badges appear only
 above zero.
