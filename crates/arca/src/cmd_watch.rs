@@ -68,7 +68,7 @@ pub fn metrics(flags: &Flags) -> Result<Option<Value>, Failure> {
             })?,
     };
     let cfg = config::load(Path::new(flags.required("config")?))?;
-    let mut sampler = handlers::new_sampler(&cfg);
+    let (mut sampler, _) = handlers::new_sampler(&cfg);
     sampler.sample(handlers::now_ms());
     let span = Duration::from_secs(seconds);
     let start = Instant::now();

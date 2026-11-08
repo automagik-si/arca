@@ -88,7 +88,11 @@ pub struct HostSample {
 pub struct Cpu {
     /// The share of all CPUs busy since the previous sample, in percent.
     pub used_pct: Option<f64>,
+    /// The logical CPUs of the managed host. It is 0 only when `cores_known` is false: the schema keeps it an integer, so
+    /// a consumer must read `cores_known` before showing a core count.
     pub cores: u64,
+    /// Whether `cores` is a real count. False when the host total could not be read; `cores` is then 0 as a placeholder.
+    pub cores_known: bool,
     /// Why `used_pct`, and sometimes `cores`, is not known. `None` when a local host reading is simply not available yet.
     /// `Some("not available for a remote host")` on a remote host, and `Some("the Incus resources read failed")` when the
     /// host totals could not be read.
@@ -512,6 +516,7 @@ fn read_host<R: IncusRead>(
                     .zip(cpu.totals)
                     .and_then(|(before, now)| used_pct(before, now)),
                 cores: cpu.cores,
+                cores_known: cpu.cores > 0,
                 reason: None,
             },
             load: procfs::read_load(&cfg.proc_root),
@@ -530,6 +535,7 @@ fn read_host<R: IncusRead>(
             cpu: Cpu {
                 used_pct: None,
                 cores: totals.cpu_threads,
+                cores_known: true,
                 reason: load_reason.clone(),
             },
             load: Load {
@@ -565,6 +571,7 @@ fn read_host<R: IncusRead>(
             cpu: Cpu {
                 used_pct: None,
                 cores: 0,
+                cores_known: false,
                 reason: Some(RESOURCES_REASON.to_string()),
             },
             load: Load {
@@ -609,21 +616,36 @@ pub fn node_metrics(s: &Sampler<impl IncusRead>, minutes: Option<u32>, now_ms: u
 
 /// The mean of a window of samples. `None` for an empty window. Each measurement averages the samples that hold it, and is
 /// `None` when none does. Byte counts and project counts are rounded to whole numbers. A project absent from a sample counts
-/// as zero there. `at` and `cpu.cores` come from the last sample.
+/// as zero there. `at` is the last sample's, `cpu.cores` the last known sample's, and a reason is the newest known sample's:
+/// a failed sample never labels figures averaged from earlier successes.
 pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
     let last = samples.last()?;
+    let known_cores = samples.iter().rev().find(|sample| sample.cpu.cores_known);
     Some(HostSample {
         at: last.at,
         cpu: Cpu {
             used_pct: average(samples.iter().filter_map(|s| s.cpu.used_pct)),
-            cores: last.cpu.cores,
-            reason: last.cpu.reason.clone(),
+            cores: known_cores.map_or(last.cpu.cores, |sample| sample.cpu.cores),
+            cores_known: known_cores.is_some(),
+            reason: mean_reason(
+                samples,
+                |sample| sample.cpu.cores_known || sample.cpu.used_pct.is_some(),
+                |sample| sample.cpu.reason.clone(),
+            ),
         },
         load: Load {
             one: average(samples.iter().filter_map(|s| s.load.one)),
             five: average(samples.iter().filter_map(|s| s.load.five)),
             fifteen: average(samples.iter().filter_map(|s| s.load.fifteen)),
-            reason: last.load.reason.clone(),
+            reason: mean_reason(
+                samples,
+                |sample| {
+                    sample.load.one.is_some()
+                        || sample.load.five.is_some()
+                        || sample.load.fifteen.is_some()
+                },
+                |sample| sample.load.reason.clone(),
+            ),
         },
         memory: Memory {
             total_bytes: average_whole(samples.iter().filter_map(|s| s.memory.total_bytes)),
@@ -633,7 +655,17 @@ pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
                 samples.iter().filter_map(|s| s.memory.swap_total_bytes),
             ),
             swap_free_bytes: average_whole(samples.iter().filter_map(|s| s.memory.swap_free_bytes)),
-            reason: last.memory.reason.clone(),
+            reason: mean_reason(
+                samples,
+                |sample| {
+                    sample.memory.total_bytes.is_some()
+                        || sample.memory.available_bytes.is_some()
+                        || sample.memory.used_bytes.is_some()
+                        || sample.memory.swap_total_bytes.is_some()
+                        || sample.memory.swap_free_bytes.is_some()
+                },
+                |sample| sample.memory.reason.clone(),
+            ),
         },
         psi: Psi {
             memory_some_avg10: average(samples.iter().filter_map(|s| s.psi.memory_some_avg10)),
@@ -747,6 +779,19 @@ fn spawn_probe<'scope, 'env>(
             probe::tcp_connect_seconds(addr, PROBE_TIMEOUT)
         })
         .ok()
+}
+
+/// The reason of the newest sample whose reading was known, or the last sample's reason when none was. A failed sample's
+/// reason therefore never labels figures averaged from earlier successes.
+fn mean_reason(
+    samples: &[HostSample],
+    known: impl Fn(&HostSample) -> bool,
+    reason: impl Fn(&HostSample) -> Option<String>,
+) -> Option<String> {
+    match samples.iter().rev().find(|sample| known(sample)) {
+        Some(sample) => reason(sample),
+        None => samples.last().and_then(reason),
+    }
 }
 
 /// The mean of the finite values, or `None` when there are none.

@@ -62,7 +62,9 @@ fn status_result() -> Value {
         "mode": "watch-only",
         "uptimeS": 12,
         "incusReachable": false,
-        "appliedSeq": null
+        "appliedSeq": null,
+        "metricsSource": "local",
+        "metricsSourceReason": "the test names the local mode"
     })
 }
 

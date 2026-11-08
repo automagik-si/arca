@@ -188,7 +188,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         arca: cfg.listen.unix.clone(),
         shim: alerts_file.shim_socket.clone(),
     };
-    let sampler = new_sampler(&cfg).with_probes(probe_targets(&alerts_file.probes));
+    let (sampler, metrics_source) = new_sampler(&cfg);
+    let sampler = sampler.with_probes(probe_targets(&alerts_file.probes));
     let ticker = Ticker::new(sampler, engine, published.clone(), alerts.clone())
         .with_checks(targets)
         .with_watch(Arc::clone(&watch));
@@ -205,6 +206,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 applied_seq,
                 started,
                 socket: cfg.incus.socket.clone(),
+                metrics_source,
             }),
         )
         .handle(

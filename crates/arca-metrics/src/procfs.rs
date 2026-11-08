@@ -38,6 +38,13 @@ pub fn read_cpu(proc_root: &Path) -> CpuReading {
     parse_stat(&read_text(&proc_root.join("stat")).unwrap_or_default())
 }
 
+/// The local host name, from `sys/kernel/hostname`. `None` when it is missing or empty.
+pub fn read_hostname(proc_root: &Path) -> Option<String> {
+    let text = read_text(&proc_root.join("sys/kernel/hostname"))?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// Node uptime in epoch-independent milliseconds, from the first field of `uptime`. Missing or invalid data is unknown.
 pub fn read_uptime_ms(proc_root: &Path) -> Option<u64> {
     let text = read_text(&proc_root.join("uptime"))?;

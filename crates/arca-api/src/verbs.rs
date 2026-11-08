@@ -680,6 +680,8 @@ fn arca_status_result() -> Value {
         ("uptimeS", true, at_least(0)),
         ("incusReachable", true, boolean()),
         ("appliedSeq", true, nullable(int())),
+        ("metricsSource", true, one_of(&["local", "remote"])),
+        ("metricsSourceReason", true, string()),
     ])
 }
 
@@ -706,6 +708,7 @@ fn host_sample() -> Value {
             result(vec![
                 ("usedPct", true, nullable(num())),
                 ("cores", true, int()),
+                ("coresKnown", true, boolean()),
                 ("reason", true, nullable(string())),
             ]),
         ),
@@ -1003,7 +1006,7 @@ fn alert_event(extra: Vec<Field>) -> Value {
         (
             "reason",
             false,
-            one_of(&["cleared", "rule-disabled", "subject-gone"]),
+            one_of(&["cleared", "rule-disabled", "subject-gone", "no data"]),
         ),
     ];
     fields.extend(extra);

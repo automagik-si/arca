@@ -1,9 +1,10 @@
 //! The rules, the inputs a tick reads, and the evaluator: one state machine per rule and label set.
 //!
 //! A rule fires when `value > threshold` has held for `for_s`, and clears when `value <= threshold - clear_margin` has held for
-//! `clear_for_s`. A reading that is missing, not finite or older than its source's maximum age is unknown: the alert keeps its
-//! state, its timers restart, and no event is written. A fresh, known reading that no longer has an alert's label set resolves
-//! that alert with `subject-gone`, once.
+//! `clear_for_s`. A reading that is missing, not finite or older than its source's maximum age is unknown: a pending alert keeps
+//! its state, a firing alert stays firing and marked unknown, and its timers restart. If the data stays unknown for
+//! `clear_for_s`, the firing alert resolves once with `no data`, so it never fires forever on a dead source. A fresh, known
+//! reading that no longer has an alert's label set resolves that alert with `subject-gone`, once.
 
 use std::collections::BTreeMap;
 
@@ -309,8 +310,10 @@ impl Evaluator {
                 Source::Unknown(reason) => {
                     self.unknown_rules.insert(rule.id, reason);
                     for ((id, _), track) in self.tracks.iter_mut() {
-                        if *id == rule.id {
-                            unknown(track, reason);
+                        if *id == rule.id
+                            && let Some(event) = unknown(rule, track, reason, now)
+                        {
+                            events.push(event);
                         }
                     }
                 }
@@ -540,10 +543,30 @@ fn percent_used(pool: &PoolUse) -> Option<f64> {
     (total > 0).then(|| used as f64 / total as f64 * 100.0)
 }
 
-/// Unknown data: the state is kept, the timer restarts and no event is written.
-fn unknown(track: &mut Track, reason: UnknownReason) {
-    track.timer = None;
+/// Unknown data. A non-firing track keeps its state and its timer restarts. A firing track stays firing and unknown; after
+/// `clear_for_s` without a fresh reading it resolves once with `no data`, so a dead source cannot leave an alert firing
+/// forever. While it stays unknown, the reason is shown with the firing alert.
+fn unknown(rule: &Rule, track: &mut Track, reason: UnknownReason, now: u64) -> Option<AlertEvent> {
+    let was_unknown = track.unknown.is_some();
     track.unknown = Some(reason);
+    if track.state != AlertState::Firing {
+        track.timer = None;
+        return None;
+    }
+    let since = if was_unknown {
+        *track.timer.get_or_insert(now)
+    } else {
+        track.timer = Some(now);
+        now
+    };
+    if !held(now, since, rule.clear_for_s) {
+        return None;
+    }
+    let firing = track.firing.take()?;
+    track.state = AlertState::Ok;
+    track.timer = None;
+    track.unknown = None;
+    Some(resolution(firing, None, ResolveReason::NoData, now))
 }
 
 fn held(now: u64, since: u64, seconds: u64) -> bool {
@@ -559,8 +582,7 @@ fn apply(
     now: u64,
 ) -> Option<AlertEvent> {
     let Some(value) = value.filter(|value| value.is_finite()) else {
-        unknown(track, UnknownReason::Missing);
-        return None;
+        return unknown(rule, track, UnknownReason::Missing, now);
     };
     track.unknown = None;
     match track.state {

@@ -152,6 +152,7 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         cpu: Cpu {
             used_pct: Some(12.5),
             cores: 4,
+            cores_known: true,
             reason: None,
         },
         load: Load {

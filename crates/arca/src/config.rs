@@ -71,20 +71,19 @@ pub struct IncusConfig {
     pub socket: PathBuf,
     #[serde(default)]
     pub pools: Vec<String>,
-    /// Whether `socket` is the local Incus daemon's own socket. When absent, [`LOCAL_INCUS_SOCKET`] is local and every other
-    /// path is a proxy. A proxy that forwards to the local daemon, such as the recording shim, sets `true` explicitly.
+    /// Whether `socket` reaches the local Incus daemon. When absent, the runtime check compares the Incus server name with
+    /// the local host name; the socket path is only the fallback. An explicit value wins.
     #[serde(default)]
     pub local: Option<bool>,
 }
 
 impl IncusConfig {
-    /// Whether this config reaches the local Incus daemon, so the host sampler may read the local `/proc` and `/sys` trees.
-    /// An explicit `local` wins; otherwise only the standard local daemon socket is local.
-    pub fn is_local(&self) -> bool {
-        self.local.unwrap_or_else(|| {
-            self.socket == Path::new(LOCAL_INCUS_SOCKET)
-                || self.socket == Path::new(LOCAL_INCUS_USER_SOCKET)
-        })
+    /// The socket-path rule: whether the standard local daemon socket is configured. It is the fallback for the runtime
+    /// choice of [`crate::handlers::new_sampler`], never the whole answer: a shim path reaches the local daemon too, and a
+    /// host socket mounted at the standard path inside a container does not make the container's `/proc` the host's.
+    pub fn socket_is_local(&self) -> bool {
+        self.socket == Path::new(LOCAL_INCUS_SOCKET)
+            || self.socket == Path::new(LOCAL_INCUS_USER_SOCKET)
     }
 }
 
@@ -523,35 +522,23 @@ mod tests {
     }
 
     #[test]
-    fn incus_local_is_explicit_or_inferred_from_the_standard_local_socket() {
+    fn the_incus_socket_path_rule_marks_only_the_standard_local_sockets() {
         let mut config = config_with(None);
         assert_eq!(config.incus.local, None);
         config.incus.socket = PathBuf::from(LOCAL_INCUS_SOCKET);
         assert!(
-            config.incus.is_local(),
+            config.incus.socket_is_local(),
             "the standard local daemon socket is local"
         );
         config.incus.socket = PathBuf::from("/var/lib/incus/unix.socket.user");
         assert!(
-            config.incus.is_local(),
+            config.incus.socket_is_local(),
             "the local daemon's unprivileged socket is the same daemon"
         );
         config.incus.socket = PathBuf::from("/nonexistent/incus-proxy.sock");
         assert!(
-            !config.incus.is_local(),
-            "any other path is a proxy until the config says otherwise"
-        );
-
-        config.incus.local = Some(true);
-        assert!(
-            config.incus.is_local(),
-            "an explicit local wins over the path"
-        );
-        config.incus.socket = PathBuf::from(LOCAL_INCUS_SOCKET);
-        config.incus.local = Some(false);
-        assert!(
-            !config.incus.is_local(),
-            "an explicit proxy wins over the path"
+            !config.incus.socket_is_local(),
+            "any other path is a proxy for the fallback"
         );
     }
 

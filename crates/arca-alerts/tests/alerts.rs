@@ -20,7 +20,7 @@ use arca_alerts::eval::{
 };
 use arca_alerts::rules::{AlertsFile, Probes, RulesError};
 use arca_alerts::{
-    Engine, QUEUE_LIMIT, STORE_WRITE_FAILED, TickStore, UnknownReason, export, inputs,
+    AlertState, Engine, QUEUE_LIMIT, STORE_WRITE_FAILED, TickStore, UnknownReason, export, inputs,
 };
 use arca_incus::{FakeIncus, FakeState, UnixIncus};
 use arca_metrics::{Sampler, SamplerConfig};
@@ -847,7 +847,7 @@ mod eval {
         use super::*;
 
         #[test]
-        fn pools_and_instances_unreadable_for_10_min_write_no_event_and_keep_the_alerts_firing_and_unknown()
+        fn a_firing_alert_whose_source_stays_unreadable_resolves_once_with_no_data_after_the_window()
          {
             let rules = Rules::default();
             let both = |at: u64| Inputs {
@@ -868,7 +868,8 @@ mod eval {
                 fired += eval.step(&rules, &both(T0 + t), T0 + t).len();
             }
             assert_eq!(fired, 2, "the pool and the crash loop fire at 60 s");
-            for t in (65_000..=665_000).step_by(5_000) {
+            // Until the normal clear window ends, the alerts stay firing and unknown, with no event.
+            for t in (65_000..=180_000).step_by(5_000) {
                 let down = Inputs {
                     at: T0 + t,
                     ..Inputs::default()
@@ -877,10 +878,10 @@ mod eval {
                     eval.step(&rules, &down, T0 + t).is_empty(),
                     "no event at {t} ms"
                 );
+                let firing = eval.firing();
+                assert_eq!(firing.len(), 2, "both stay firing at {t} ms");
+                assert!(firing.iter().all(|alert| alert.unknown), "both are unknown");
             }
-            let firing = eval.firing();
-            assert_eq!(firing.len(), 2, "both stay firing");
-            assert!(firing.iter().all(|alert| alert.unknown), "both are unknown");
             assert_eq!(
                 unknown_of(&eval, RuleId::DiskPoolFull),
                 Some(UnknownReason::Missing)
@@ -888,6 +889,45 @@ mod eval {
             assert_eq!(
                 unknown_of(&eval, RuleId::CrashLoop),
                 Some(UnknownReason::Missing)
+            );
+            // 120 s after the data stopped (65 s), each firing alert resolves once with `no data`.
+            let resolved = eval.step(
+                &rules,
+                &Inputs {
+                    at: T0 + 185_000,
+                    ..Inputs::default()
+                },
+                T0 + 185_000,
+            );
+            assert_eq!(resolved.len(), 2, "both resolve at 185 s");
+            assert!(
+                resolved
+                    .iter()
+                    .all(|event| event.state == EventState::Resolved)
+            );
+            assert!(
+                resolved
+                    .iter()
+                    .all(|event| event.reason == Some(ResolveReason::NoData))
+            );
+            assert!(eval.firing().is_empty(), "neither fires after the window");
+            assert!(
+                eval.unknown()
+                    .iter()
+                    .all(|alert| alert.state == AlertState::Ok),
+                "the rules stay listed as unknown with no firing alert"
+            );
+            // The dead source writes no further event.
+            assert!(
+                eval.step(
+                    &rules,
+                    &Inputs {
+                        at: T0 + 190_000,
+                        ..Inputs::default()
+                    },
+                    T0 + 190_000,
+                )
+                .is_empty()
             );
         }
     }

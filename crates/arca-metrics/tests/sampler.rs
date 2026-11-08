@@ -153,6 +153,7 @@ fn bare(at: u64) -> HostSample {
         cpu: Cpu {
             used_pct: None,
             cores: 4,
+            cores_known: true,
             reason: None,
         },
         load: Load {
@@ -346,6 +347,7 @@ fn a_missing_cpu_file_gives_zero_cores_and_no_percentage() {
         Cpu {
             used_pct: None,
             cores: 0,
+            cores_known: false,
             reason: None
         }
     );
@@ -371,6 +373,7 @@ fn an_unparseable_aggregate_line_reads_no_percentage_but_still_counts_cores() {
         Cpu {
             used_pct: None,
             cores: 2,
+            cores_known: true,
             reason: None
         }
     );
@@ -2218,6 +2221,18 @@ mod host_totals {
             }
         }
 
+        /// Makes the next resources read answer this result.
+        fn answer(&self, result: Result<Value, IncusError>) {
+            *self.answer.lock().expect("the answer is not poisoned") = result;
+        }
+
+        fn fail(&self) {
+            self.answer(Err(IncusError::Status {
+                code: 503,
+                message: "unavailable".to_string(),
+            }));
+        }
+
         /// How many times the resources path itself was asked for.
         fn resources_reads(&self) -> usize {
             self.reads
@@ -2290,6 +2305,7 @@ mod host_totals {
         let sample = sampler.sample(1_000).clone();
 
         assert_eq!(sample.cpu.cores, 16, "cpu.total threads, never the local 4");
+        assert!(sample.cpu.cores_known);
         assert_eq!(sample.cpu.used_pct, None);
         assert_eq!(sample.cpu.reason.as_deref(), Some(REMOTE_REASON));
         assert_eq!(
@@ -2343,6 +2359,7 @@ mod host_totals {
 
         let first = sampler.sample(1_000).clone();
         assert_eq!(first.cpu.cores, 4, "the local /proc count");
+        assert!(first.cpu.cores_known);
         assert_eq!(first.cpu.reason, None);
         assert_eq!(first.load.one, Some(0.52));
         assert_eq!(first.load.reason, None);
@@ -2375,6 +2392,7 @@ mod host_totals {
         let sample = sampler.sample(1_000).clone();
 
         assert_eq!(sample.cpu.cores, 0, "unknown, never the local 4");
+        assert!(!sample.cpu.cores_known);
         assert_eq!(sample.cpu.used_pct, None);
         assert_eq!(sample.cpu.reason.as_deref(), Some(FAILED_REASON));
         assert_eq!(sample.load.reason.as_deref(), Some(REMOTE_REASON));
@@ -2401,9 +2419,54 @@ mod host_totals {
 
         let sample = sampler.sample(1_000).clone();
         assert_eq!(sample.cpu.cores, 0);
+        assert!(!sample.cpu.cores_known);
         assert_eq!(sample.cpu.reason.as_deref(), Some(FAILED_REASON));
         assert_eq!(sample.memory.total_bytes, None);
         assert_eq!(sample.memory.used_bytes, None);
         assert_eq!(sample.memory.reason.as_deref(), Some(FAILED_REASON));
+    }
+
+    #[test]
+    fn the_mean_of_a_window_with_a_late_failure_averages_the_successes_and_drops_the_failure_reason()
+     {
+        let scratch = Scratch::new("remote-mixed-mean");
+        write_first_tree(scratch.path());
+        let incus = Resources::serving(resources(16, 17_045_651_456, 3_417_186_304));
+        let mut sampler = sampler(scratch.path(), incus.clone(), false);
+        sampler.sample(1_000);
+
+        incus.fail();
+        sampler.sample(6_000);
+
+        let window = sampler.history(1);
+        assert_eq!(window.len(), 2, "one success and one failure");
+        let averaged = mean(&window).expect("a window of two samples has a mean");
+        assert_eq!(averaged.cpu.cores, 16, "the last known count");
+        assert!(averaged.cpu.cores_known);
+        assert_eq!(averaged.memory.total_bytes, Some(17_045_651_456));
+        assert_eq!(averaged.memory.used_bytes, Some(3_417_186_304));
+        assert_eq!(
+            averaged.memory.reason, None,
+            "a successful memory read has no reason"
+        );
+        assert_eq!(
+            averaged.cpu.reason.as_deref(),
+            Some(REMOTE_REASON),
+            "the successful read's reason, not the failed read's"
+        );
+        assert_eq!(
+            averaged.load.reason.as_deref(),
+            Some(REMOTE_REASON),
+            "load was never local on this remote host"
+        );
+
+        let failed = mean(&window[1..]).expect("the failure alone has a mean");
+        assert_eq!(failed.cpu.cores, 0);
+        assert!(!failed.cpu.cores_known, "no successful read in the window");
+        assert_eq!(failed.cpu.reason.as_deref(), Some(FAILED_REASON));
+        assert_eq!(failed.memory.total_bytes, None);
+        assert_eq!(failed.memory.used_bytes, None);
+        assert_eq!(failed.memory.reason.as_deref(), Some(FAILED_REASON));
+        assert_eq!(failed.load.reason.as_deref(), Some(REMOTE_REASON));
     }
 }

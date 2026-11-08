@@ -5,6 +5,7 @@
 //! update and Secure Boot reading.
 
 mod incus;
+mod mode;
 mod osd;
 pub mod probe;
 mod procfs;
@@ -12,6 +13,7 @@ mod sample;
 mod smart;
 
 pub use incus::{InstanceKind, InstanceReading};
+pub use mode::{HostMode, HostModeChoice, choose_host_mode};
 pub use osd::OsdReading;
 pub use probe::ProbeTarget;
 pub use sample::{

@@ -351,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outage_stays_unknown_to_the_evaluator_and_a_pool_removed_after_it_resolves() {
+    fn an_outage_resolves_the_firing_alert_with_no_data_and_a_returning_pool_fires_again() {
         const T0: u64 = 1_000_000;
         let live = Live {
             down: Arc::new(AtomicBool::new(false)),
@@ -372,32 +372,47 @@ mod tests {
         }
         assert_eq!(fired, 1, "the pool alert fires at 60 s");
 
-        // Incus is unreachable for ten minutes: no event, the alert stays firing, and its data is missing, not zero.
+        // Incus is unreachable: no event while the normal clear window holds, and the data is missing, not zero.
         live.down.store(true, Ordering::SeqCst);
-        for t in (65_000..=665_000).step_by(5_000) {
+        for t in (65_000..=180_000).step_by(5_000) {
             assert!(
                 tick(&mut sampler, &mut eval, T0 + t).is_empty(),
                 "no event at {t} ms"
             );
+            assert_eq!(eval.firing().len(), 1, "still firing at {t} ms");
+            assert!(eval.firing()[0].unknown, "and marked unknown");
         }
-        assert_eq!(eval.firing().len(), 1, "the alert stays firing");
-        assert!(eval.firing()[0].unknown, "and is marked unknown");
         assert_eq!(
             eval.unknown().first().map(|alert| alert.reason),
             Some(UnknownReason::Missing),
             "an unreachable Incus is missing data"
         );
 
-        // Incus answers again without the pool: the removed pool resolves its alert once, as subject-gone.
+        // 120 s after the outage began (65 s), the alert resolves once with `no data`, not forever unknown.
+        let resolved = tick(&mut sampler, &mut eval, T0 + 185_000);
+        assert_eq!(resolved.len(), 1, "exactly one resolve");
+        assert_eq!(resolved[0].state, EventState::Resolved);
+        assert_eq!(resolved[0].reason, Some(ResolveReason::NoData));
+        assert!(eval.firing().is_empty());
+
+        // Incus answers again without the pool: the already-resolved alert writes nothing.
         live.down.store(false, Ordering::SeqCst);
         live.pools
             .lock()
             .expect("the pool list is not poisoned")
             .clear();
-        let events = tick(&mut sampler, &mut eval, T0 + 670_000);
-        assert_eq!(events.len(), 1, "exactly one resolve");
-        assert_eq!(events[0].state, EventState::Resolved);
-        assert_eq!(events[0].reason, Some(ResolveReason::SubjectGone));
-        assert!(eval.firing().is_empty());
+        assert!(tick(&mut sampler, &mut eval, T0 + 190_000).is_empty());
+
+        // The pool returns: a fresh alert starts and fires once its 60 s has held.
+        live.pools
+            .lock()
+            .expect("the pool list is not poisoned")
+            .push(("default", 95, 100));
+        let mut refired = 0;
+        for t in (195_000..=255_000).step_by(5_000) {
+            refired += tick(&mut sampler, &mut eval, T0 + t).len();
+        }
+        assert_eq!(refired, 1, "the returned pool fires a fresh alert");
+        assert_eq!(eval.firing().len(), 1);
     }
 }

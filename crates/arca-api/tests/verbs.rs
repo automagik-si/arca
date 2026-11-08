@@ -244,7 +244,9 @@ fn arca_status_schemas_equal_its_table_row() {
                 "mode": { "type": "string", "enum": ["watch-only", "kernel"] },
                 "uptimeS": { "type": "integer", "minimum": 0 },
                 "incusReachable": { "type": "boolean" },
-                "appliedSeq": { "type": ["integer", "null"] }
+                "appliedSeq": { "type": ["integer", "null"] },
+                "metricsSource": { "type": "string", "enum": ["local", "remote"] },
+                "metricsSourceReason": { "type": "string" }
             }),
             &[
                 "version",
@@ -252,7 +254,9 @@ fn arca_status_schemas_equal_its_table_row() {
                 "mode",
                 "uptimeS",
                 "incusReachable",
-                "appliedSeq"
+                "appliedSeq",
+                "metricsSource",
+                "metricsSourceReason"
             ]
         )
     );
@@ -283,7 +287,7 @@ fn alerts_list_takes_no_argument_and_requires_every_key_of_its_result_and_events
     assert_eq!(event["required"], json!(fields), "reason is optional");
     assert_eq!(
         event["properties"]["reason"]["enum"],
-        json!(["cleared", "rule-disabled", "subject-gone"])
+        json!(["cleared", "rule-disabled", "subject-gone", "no data"])
     );
     assert_eq!(
         event["properties"]["labels"],
@@ -605,6 +609,8 @@ fn a_result_object_is_open_to_a_field_it_does_not_name() {
         "uptimeS": 12,
         "incusReachable": false,
         "appliedSeq": null,
+        "metricsSource": "local",
+        "metricsSourceReason": "the test names the local mode",
         "addedLater": 1
     });
     assert!(conforms(&result, &value).is_ok(), "a result stays open");
@@ -615,7 +621,7 @@ fn a_host_sample_with_nulls_conforms_to_the_result_schema() {
     let result = (verb("node_metrics").expect("present").result)();
     let sample = json!({
         "at": 1,
-        "cpu": { "usedPct": null, "cores": 8, "reason": null },
+        "cpu": { "usedPct": null, "cores": 8, "coresKnown": true, "reason": null },
         "load": { "one": 0.5, "five": null, "fifteen": 0.1, "reason": null },
         "memory": { "totalBytes": 1, "availableBytes": null, "usedBytes": null, "swapTotalBytes": 0, "swapFreeBytes": null, "reason": null },
         "psi": { "memorySomeAvg10": 0.0, "memoryFullAvg10": null, "cpuSomeAvg10": 1.5 },
@@ -687,9 +693,10 @@ fn host_sample() -> Value {
                 json!({
                     "usedPct": { "type": ["number", "null"] },
                     "cores": { "type": "integer" },
+                    "coresKnown": { "type": "boolean" },
                     "reason": { "type": ["string", "null"] }
                 }),
-                &["usedPct", "cores", "reason"]
+                &["usedPct", "cores", "coresKnown", "reason"]
             ),
             "load": open(
                 json!({
