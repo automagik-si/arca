@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::NodeConfig;
-use crate::kernel::{JOURNAL_FILE, Kernel};
+use crate::kernel::{AppliedSeq, JOURNAL_FILE, Kernel};
 
 /// Answers from the public ontology embedded in the binary, without reading node state.
 pub struct OntologyQuery;
@@ -406,20 +406,23 @@ pub fn run_row<R: IncusRead>(sampler: &Sampler<R>, now: u64) -> Value {
 /// `arca_status`: the node, whether Incus answers now, and how long the server has run.
 pub struct StatusHandler {
     pub node: String,
+    pub mode: &'static str,
+    pub applied_seq: AppliedSeq,
     pub started: Instant,
     pub socket: PathBuf,
 }
 
 impl ToolHandler for StatusHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let applied_seq = self.applied_seq.load();
         let incus_reachable = UnixIncus::new(self.socket.clone()).get("/1.0").is_ok();
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "node": self.node,
-            "mode": "watch-only",
+            "mode": self.mode,
             "uptimeS": self.started.elapsed().as_secs(),
             "incusReachable": incus_reachable,
-            "appliedSeq": Value::Null,
+            "appliedSeq": applied_seq,
         }))
     }
 }
