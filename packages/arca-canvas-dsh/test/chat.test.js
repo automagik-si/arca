@@ -45,10 +45,15 @@ function fakeDsh({
   let turnOpen = false;
   let releaseCreate;
   const createGate = hangCreateOnce ? new Promise((resolve) => { releaseCreate = resolve; }) : null;
+  const guards = [];
   const agentCtx = {
     tools: {
       restrict(filter) {
         restrictions.push(filter);
+        return () => {};
+      },
+      guard(guard) {
+        guards.push(guard);
         return () => {};
       },
     },
@@ -161,6 +166,9 @@ function fakeDsh({
       events.emit('agent/error', { agent, turn: currentTurn, error });
       api.end();
     },
+    errorOnly(error) {
+      events.emit('agent/error', { agent, turn: currentTurn, error });
+    },
     lateText(turn, value) {
       events.emit('agent/assistant-stream', {
         agent,
@@ -211,9 +219,110 @@ function fakeDsh({
     },
   };
   return {
-    dsh, api, created, resumed, followed, cancels, executed, globals,
+    dsh, api, created, resumed, followed, cancels, executed, globals, guards,
     restrictions, sections, releaseCreate: () => releaseCreate?.(),
     title: () => title, events,
+  };
+}
+
+// A minimal DSH whose first create/resume hangs until released, so a newer attempt can publish a live
+// handle before that stale attempt settles.
+function raceDsh() {
+  let resolveGate;
+  let rejectGate;
+  const gate = new Promise((resolve, reject) => { resolveGate = resolve; rejectGate = reject; });
+  const globals = new Map();
+  const guards = [];
+  const disposed = [];
+  const createdIds = [];
+  const resumeIds = [];
+  let createAttempts = 0;
+  let resumeAttempts = 0;
+  let turns = 0;
+  let title = null;
+  const toolRegistry = {
+    register(definition, options = {}) {
+      globals.set(definition.name, { definition, when: options.when });
+      return () => globals.delete(definition.name);
+    },
+    restrict() {
+      return () => {};
+    },
+    definitions() {
+      return [...globals.values()].map(({ definition }) => definition);
+    },
+  };
+  const makeAgent = (id) => {
+    const map = new Map();
+    const bus = {
+      on(name, handler) {
+        if (!map.has(name)) map.set(name, new Set());
+        map.get(name).add(handler);
+        return () => map.get(name)?.delete(handler);
+      },
+      emit(name, ...args) {
+        for (const handler of [...(map.get(name) ?? [])]) handler(...args);
+      },
+    };
+    const agent = {
+      id,
+      session: { id },
+      ctx: {
+        tools: {
+          restrict() { return () => {}; },
+          guard(guard) { guards.push(guard); return () => {}; },
+        },
+        systemPrompt: { section() { return () => {}; } },
+        on: bus.on,
+      },
+      followup() {
+        turns += 1;
+        const turn = turns;
+        bus.emit('session/event', agent.session, { type: 'turn/start', data: { turn } });
+        bus.emit('agent/assistant-stream', {
+          agent,
+          frame: { type: 'chunk', turn, chunk: { type: 'text-delta', index: 0, text: 'live ok' } },
+        });
+        bus.emit('session/event', agent.session, {
+          type: 'turn/end', data: { turn, reason: { kind: 'completed' } },
+        });
+      },
+      cancel() {},
+      whenIdle() { return Promise.resolve(); },
+    };
+    return {
+      agent,
+      dispose: async () => { disposed.push(id); },
+    };
+  };
+  const dsh = {
+    tools: toolRegistry,
+    agents: {
+      async create(options) {
+        createAttempts += 1;
+        createdIds.push(options.sessionId);
+        if (createAttempts === 1) await gate;
+        const handle = makeAgent(options.sessionId);
+        await options.setup?.(handle.agent.ctx);
+        return handle;
+      },
+      async resume(options) {
+        resumeAttempts += 1;
+        resumeIds.push(options.resumeSessionId);
+        if (resumeAttempts === 1) await gate;
+        const handle = makeAgent(options.resumeSessionId);
+        await options.setup?.(handle.agent.ctx);
+        return handle;
+      },
+    },
+    sessionTitle: {
+      get() { return title ? { title } : undefined; },
+      rename(_session, value) { title = value; return { title: value }; },
+    },
+  };
+  return {
+    dsh, globals, guards, disposed, createdIds, resumeIds,
+    resolveGate: () => resolveGate(), rejectGate: () => rejectGate(new Error('stale setup failed')),
   };
 }
 
@@ -221,7 +330,7 @@ async function harness(t, options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'arca-chat-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const statePath = join(dir, 'chat.json');
-  const fake = fakeDsh(options);
+  const fake = options.fake ?? fakeDsh(options);
   const clientCalls = [];
   const chat = createDoctorChat({
     hosts: [{ name: 'alpha' }, { name: 'beta' }],
@@ -358,6 +467,10 @@ test('a turn streams assistant text, one card per real call, and persists the tr
   assert.deepEqual([...restrictions.allow].sort(), [...READ_TOOLS].sort());
   assert.equal(fake.globals.get('arca_status').when({ agent: { id: 'session-doctor-1' } }), true);
   assert.equal(fake.globals.get('arca_status').when({ agent: { id: 'another-session' } }), false);
+  const guard = fake.guards.at(-1);
+  assert.equal(guard({ name: 'arca_status' }), undefined);
+  assert.match(guard({ name: 'bash' }), /read-only/);
+  assert.match(guard({ name: 'run_code' }), /read-only/);
   const sections = fake.sections.map((section) => section.name);
   assert.deepEqual(sections, ['deployment:persona-prefix', 'arca-doctor']);
   const stored = JSON.parse(await readFile(statePath, 'utf8'));
@@ -843,4 +956,91 @@ test('a hanging setup shares the turn deadline and cannot extend the request', a
   const elapsed = Date.now() - started;
   assert.equal(result.events.at(-1).data.reason, 'error');
   assert.ok(elapsed < 1000, `setup must not outlive the turn deadline (${elapsed}ms)`);
+});
+
+test('an agent error with no turn/end releases the turn and the next request', async (t) => {
+  let calls = 0;
+  const { port } = await harness(t, {
+    turnMs: 40,
+    cancelMs: 20,
+    endOnCancel: false,
+    script: async (api) => {
+      calls += 1;
+      if (calls === 1) {
+        api.errorOnly(new Error('no turn end follows'));
+        return;
+      }
+      api.text('recovered');
+      api.end();
+    },
+  });
+  const started = Date.now();
+  const first = await post(port, { message: 'error' });
+  const elapsed = Date.now() - started;
+  assert.equal(first.events.at(-1).data.reason, 'error');
+  assert.ok(elapsed < 500, `the error released the turn in ${elapsed}ms`);
+  const second = await post(port, { message: 'after error' });
+  assert.equal(second.status, 200);
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+});
+
+test('a stale create cannot replace or dispose the live agent', async (t) => {
+  const race = raceDsh();
+  let sequence = 0;
+  const { chat, port } = await harness(t, {
+    fake: race,
+    setupMs: 25,
+    turnMs: 500,
+    cancelMs: 20,
+    uuid: () => `candidate-${++sequence}`,
+  });
+  const first = await post(port, { message: 'stale create' });
+  assert.equal(first.events.at(-1).data.reason, 'error');
+  assert.equal(race.createdIds.length, 1);
+  const second = await post(port, { message: 'live create' });
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(race.createdIds.length, 2);
+  const liveId = chat.sessionId;
+  assert.equal(liveId, race.createdIds[1]);
+  assert.deepEqual(race.disposed, []);
+
+  race.resolveGate();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(race.disposed, [race.createdIds[0]], 'only the stale handle is disposed');
+  assert.equal(chat.sessionId, liveId, 'the live handle is still published');
+  assert.equal(race.globals.get('arca_status').when({ agent: { id: liveId } }), true);
+  assert.equal(race.globals.get('arca_status').when({ agent: { id: race.createdIds[0] } }), false);
+
+  await chat.close();
+  assert.ok(race.disposed.includes(liveId), 'close disposes the live handle');
+});
+
+test('a stale resume rejection cannot corrupt the live agent', async (t) => {
+  const race = raceDsh();
+  let sequence = 0;
+  const { chat, port, statePath } = await harness(t, {
+    fake: race,
+    setupMs: 25,
+    turnMs: 500,
+    cancelMs: 20,
+    uuid: () => `candidate-${++sequence}`,
+  });
+  await writeFile(statePath, JSON.stringify({
+    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 0, messages: [],
+  }));
+  const first = await post(port, { message: 'stale resume' });
+  assert.equal(first.events.at(-1).data.reason, 'error');
+  const second = await post(port, { message: 'live resume' });
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(chat.sessionId, 'saved-doctor');
+  assert.deepEqual(race.disposed, []);
+
+  race.rejectGate();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.deepEqual(race.disposed, [], 'a rejected stale resume disposes nothing');
+  assert.equal(chat.sessionId, 'saved-doctor');
+  assert.equal(race.globals.get('arca_status').when({ agent: { id: 'saved-doctor' } }), true);
+
+  await chat.close();
+  assert.deepEqual(race.disposed, ['saved-doctor']);
 });

@@ -225,9 +225,11 @@ function buildMachine(host) {
 
 // A service Open link is composed only from a real configured LAN address and a real service port. The
 // container's bridge address and the service's published dash are never turned into a URL.
-function serviceUrl(address, lanPort) {
+function serviceUrl(address, lanPort, state) {
   const host = text(address).trim();
   const port = finite(lanPort);
+  // A proxy device on a stopped container is not a listener. Only a running service gets an Open link.
+  if (text(state).toLowerCase() !== 'running') return '';
   if (!host || port === null || port < 1 || port > 65535) return '';
   return `http://${host.includes(':') ? `[${host}]` : host}:${Math.trunc(port)}`;
 }
@@ -245,7 +247,7 @@ function serviceTargets(hosts) {
         ports: list(service.ports).map(finite).filter((port) => port !== null),
         lanPort: finite(service.lanPort),
         published: service.published ?? null,
-        url: serviceUrl(host.address, service.lanPort),
+        url: serviceUrl(host.address, service.lanPort, service.state),
       });
     }
   }

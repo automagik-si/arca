@@ -255,10 +255,11 @@ The Doctor answers only from the eight read-only Arca tools (`arca_status`,
 `watch_report`, `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`,
 `journal_list`, `service_list`). They are registered globally with a per-session
 `when` condition, the Doctor's scope is restricted with
-`restrict({ allow: READ_TOOLS })`, and a scoped `tools/pre-execute` guard denies
-every other name (including the reserved `run_code`) at dispatch. A registry that
-cannot restrict or enumerate fails setup, so the chat sends a fixed
-"Doctor unavailable" error and makes no model call. Write verbs are never
+`restrict({ allow: READ_TOOLS })`, and scoped `tools/pre-execute` and
+`tools.guard` checks deny every other name (including the reserved `run_code`) at
+dispatch. A registry that cannot restrict or enumerate fails setup after the
+`start` event, so the chat sends a fixed "Doctor unavailable" SSE error and makes
+no model call. Write verbs are never
 registered. A request to change something is answered with what the change would
 do and the configured `/approve` link; the panel adds the approval card. Inline
 passkey approval is phase 3. The page never receives a model credential.
@@ -300,8 +301,11 @@ gets no model call.
   "message-required" }`, `405 { "error": "method-not-allowed" }` (with
   `Allow: POST`), `413 { "error": "body-too-large" | "message-too-long" }`,
   `415 { "error": "json-required" }`, `429 { "error": "chat-busy" }` (one turn
-  at a time), and `503 { "error": "chat-unavailable" }` (no DSH agent/tools or
-  the plugin is shutting down). None of these starts a model call.
+  at a time), and `503 { "error": "chat-unavailable" }` (missing DSH agent/tools
+  before the stream starts, or the plugin is shutting down). None of these starts
+  a model call. A setup failure after `start` (the tool registry cannot restrict
+  or enumerate, or setup times out) is instead a `200` SSE stream with a fixed
+  `error` event and `done { "reason": "error" }`; it also makes no model call.
 
 SSE events, in order. Every `data` is one JSON object.
 

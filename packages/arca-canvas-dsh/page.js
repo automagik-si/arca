@@ -202,9 +202,10 @@
       metricsAt: host.metrics?.latest?.at ?? null
     };
   }
-  function serviceUrl(address, lanPort) {
+  function serviceUrl(address, lanPort, state) {
     const host = text(address).trim();
     const port = finite(lanPort);
+    if (text(state).toLowerCase() !== "running") return "";
     if (!host || port === null || port < 1 || port > 65535) return "";
     return `http://${host.includes(":") ? `[${host}]` : host}:${Math.trunc(port)}`;
   }
@@ -221,7 +222,7 @@
           ports: list(service.ports).map(finite).filter((port) => port !== null),
           lanPort: finite(service.lanPort),
           published: service.published ?? null,
-          url: serviceUrl(host.address, service.lanPort)
+          url: serviceUrl(host.address, service.lanPort, service.state)
         });
       }
     }

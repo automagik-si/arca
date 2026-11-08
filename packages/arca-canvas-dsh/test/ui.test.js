@@ -368,6 +368,17 @@ test('only a service with a real lan port gets an Open link', () => {
   }
   assert.equal(project(dashboard, 'Nats').cards[0].service.ports[0], 4222);
   assert.equal(project(dashboard, 'Omni').cards[0].service.ports.length, 2);
+
+  const stopped = buildDashboard({
+    ...fixture,
+    hosts: [{
+      ...host,
+      services: host.services.map((service) => service.name === 'automagik' ? { ...service, state: 'stopped' } : service),
+    }],
+    projects: [],
+  });
+  assert.equal(project(stopped, 'Automagik').cards[0].service.state, 'stopped');
+  assert.equal(project(stopped, 'Automagik').cards[0].url, '', 'a stopped service is not a listener');
 });
 
 test('a remote host with unknown totals reports cores n/a and memory n/a with reasons', () => {

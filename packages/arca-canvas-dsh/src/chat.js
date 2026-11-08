@@ -437,7 +437,7 @@ export function createDoctorChat(options = {}) {
   let closed = false;
   let toolDisposers = [];
   let toolsInstalled = false;
-  let targetSessionId = null;
+  let liveSessionId = null;
   let lastTurn = 0;
   let lastAgentId = null;
   let runSequence = 0;
@@ -450,6 +450,7 @@ export function createDoctorChat(options = {}) {
     const handle = agentHandle;
     agentHandle = undefined;
     agent = undefined;
+    liveSessionId = null;
     try {
       void handle?.dispose?.();
     } catch { /* the runtime is already going away */ }
@@ -469,7 +470,7 @@ export function createDoctorChat(options = {}) {
     try {
       for (const definition of tools) {
         registered.push(registry.register(definition, {
-          when: (context) => Boolean(context?.agent && context.agent.id === targetSessionId),
+          when: (context) => Boolean(context?.agent && context.agent.id === liveSessionId),
         }));
       }
       const known = new Set((registry.definitions(undefined) ?? []).map((definition) => definition.name));
@@ -489,7 +490,7 @@ export function createDoctorChat(options = {}) {
     if (agent) return agent;
     const attempt = ++ensureGeneration;
     const state = await chatStore.read();
-    targetSessionId = state.sessionId ?? uuid();
+    let candidateId = state.sessionId ?? uuid();
     installTools(dsh);
     const setup = (agentCtx) => {
       if (!agentCtx?.tools || typeof agentCtx.tools.restrict !== 'function') {
@@ -504,6 +505,12 @@ export function createDoctorChat(options = {}) {
         }
         return next();
       });
+      // The guard runs after an allow decision, so a later policy cannot open the door this check closes.
+      if (typeof agentCtx.tools.guard === 'function') {
+        agentCtx.tools.guard((exec) => (READ_TOOLS.includes(exec?.name)
+          ? undefined
+          : 'The Doctor is read-only: that tool is not available.'));
+      }
       if (agentCtx.systemPrompt?.section) {
         agentCtx.systemPrompt.section({
           name: 'deployment:persona-prefix',
@@ -522,31 +529,33 @@ export function createDoctorChat(options = {}) {
       model: MODEL.model,
       maxTokens: limits.outputTokensPerTurn,
     };
+    let candidateHandle;
     let created = false;
-    let createId = targetSessionId;
     if (state.sessionId) {
       try {
-        agentHandle = await dsh.agents.resume({ resumeSessionId: state.sessionId, agentOptions, setup });
+        candidateHandle = await dsh.agents.resume({ resumeSessionId: state.sessionId, agentOptions, setup });
       } catch (error) {
-        // A corrupt or missing stored session must not wedge chat: start a fresh Doctor session instead.
-        targetSessionId = uuid();
-        createId = targetSessionId;
+        // A stale attempt must not change the live session or start a replacement; a current attempt may
+        // recover a corrupt/missing stored session by creating a fresh one.
+        if (attempt !== ensureGeneration) throw error;
+        candidateId = uuid();
         log(`Arca canvas chat: stored session could not resume (${safeErrorCode(error)}); starting a new one`);
       }
     }
-    if (!agentHandle) {
-      agentHandle = await dsh.agents.create({ sessionId: createId, agentOptions, setup });
+    if (!candidateHandle) {
+      if (attempt !== ensureGeneration) throw new Error('Doctor setup was superseded');
+      candidateHandle = await dsh.agents.create({ sessionId: candidateId, agentOptions, setup });
       created = true;
     }
-    if (attempt !== ensureGeneration) {
-      // A timed-out setup resolved late. Its agent must never be published as the live Doctor.
-      const stale = agentHandle;
-      agentHandle = undefined;
-      try { await stale?.dispose?.(); } catch { /* already gone */ }
+    if (closed || attempt !== ensureGeneration) {
+      // A timed-out or closed setup resolved late. Dispose only its own handle; the live handle is untouched.
+      try { await candidateHandle?.dispose?.(); } catch { /* already gone */ }
       throw new Error('Doctor setup was superseded');
     }
-    agent = agentHandle.agent;
-    targetSessionId = agent.session.id;
+    // Publish only after the generation check. No shared state is written by a stale attempt.
+    agentHandle = candidateHandle;
+    agent = candidateHandle.agent;
+    liveSessionId = agent.session.id;
     if (lastAgentId !== agent.session.id) {
       // A fresh session starts its turn numbering over; stale counters from another session must not hide it.
       lastAgentId = agent.session.id;
@@ -771,12 +780,18 @@ export function createDoctorChat(options = {}) {
       if (!turn || turn.reason) return;
       turn.reason = 'error';
       if (!sse.closed) sse.send('error', sseError('The Doctor could not reach the model.'));
-      // Do not release the next turn here: the loop still appends turn/end after its failure.
+      // DSH can emit agent/error without a turn/end (for example a failed turn/start append). Cancel and let
+      // turn/end or the bounded cancel fallback release the slot; never wait on a boundary that may not come.
+      cancelRun('error');
     });
     turnTimer = setTimeout(() => {
-      if (!turn || turn.reason) return;
-      turn.reason = 'timeout';
-      if (!sse.closed) sse.send('error', sseError('The Doctor took too long and the answer was stopped.'));
+      if (!turn) return;
+      if (!turn.reason) {
+        turn.reason = 'timeout';
+        if (!sse.closed) sse.send('error', sseError('The Doctor took too long and the answer was stopped.'));
+      }
+      // Always cancel at the deadline, even after an error reason. The cancel fallback resolves done if the
+      // loop never appends its turn/end boundary.
       cancelRun('timeout');
     }, Math.max(1, deadlineAt - now()));
     turnTimer.unref?.();
@@ -945,6 +960,7 @@ export function createDoctorChat(options = {}) {
 
   async function close() {
     closed = true;
+    ensureGeneration += 1;
     cancelCurrent?.('disposed');
     for (const dispose of toolDisposers) {
       try { dispose(); } catch { /* registration already gone */ }
