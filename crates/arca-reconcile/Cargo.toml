@@ -18,6 +18,7 @@ serde_json.workspace = true
 # `cargo test --workspace` runs them without a feature flag.
 arca-reconcile = { path = ".", features = ["toy"] }
 arca-incus.workspace = true
+arca-netproject.workspace = true
 base64.workspace = true
 ed25519-dalek.workspace = true
 sha2.workspace = true

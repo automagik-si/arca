@@ -519,8 +519,14 @@ impl<S: JournalStore> Reconciler<S> {
                 return;
             }
         }
-        // An entry that applied with this config and has not been removed since is not applied again.
-        if self.converged.get(&id) == Some(entry) {
+        // An entry that applied with this config and has not been removed since is not applied again, unless its plugin
+        // asks to reconcile every pass for state it repairs outside the entry config.
+        if self.converged.get(&id) == Some(entry)
+            && !self
+                .plugins
+                .get(&entry.plugin.0)
+                .is_some_and(|plugin| plugin.reconciles_when_unchanged())
+        {
             return;
         }
         if self.blocked() {

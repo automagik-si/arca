@@ -2782,15 +2782,16 @@ impl ToolHandler for ServiceHandler {
                             service_removal_refused(&read, &config)
                         }
                     })?;
-                if removal.outcomes.iter().any(|outcome| {
-                    matches!(
-                        outcome,
-                        Outcome::Failed { .. } | Outcome::Refused(_) | Outcome::Held { .. }
-                    )
-                }) || removal
-                    .run
-                    .as_ref()
-                    .map_or(true, |run| run.as_ref().is_some_and(|run| run.partial))
+                let changed = removal
+                    .changed
+                    .iter()
+                    .map(|entry| entry.0.as_str())
+                    .collect::<Vec<_>>();
+                if service_wiring::failed_for(&removal.outcomes, &changed)
+                    || removal
+                        .run
+                        .as_ref()
+                        .map_or(true, |run| run.as_ref().is_some_and(|run| run.partial))
                 {
                     return Err(service_removal_refused(&read, &config));
                 }
@@ -2866,9 +2867,7 @@ impl ToolHandler for ServiceHandler {
                     let mut kernel = lock(&self.kernel)?;
                     kernel.propose(changes, now).map_err(|_| internal())?
                 };
-                let failed = outcomes.iter().any(
-                    |outcome| matches!(outcome, Outcome::Failed { entry, .. } if entry.0 == id),
-                );
+                let failed = service_wiring::failed_for(&outcomes, &[id.as_str()]);
                 if failed {
                     match read.get(&format!(
                         "/1.0/instances/{name}?project={}",

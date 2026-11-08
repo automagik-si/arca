@@ -24,6 +24,8 @@ pub const PORTS_KEY: &str = "user.arca.ports";
 pub const PUBLISHED_KEY: &str = "user.arca.published";
 pub const LINKS_KEY: &str = "user.arca.links";
 pub const ENVKEYS_KEY: &str = "user.arca.envkeys";
+/// Incus caps a disk device path at 255 bytes; "/" is the rootfs disk's path, not a data path.
+const DATA_PATH_MAX: usize = 255;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -297,12 +299,11 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     }
     let mut devices = Map::new();
     if let Some(data) = &cfg.data {
-        let mut device = json!({"type":"disk", "path":data.path, "pool":cfg.pool,
-            "source":format!("{}-data", cfg.name)});
-        if let Some(size) = &data.size {
-            device["size"] = json!(size);
-        }
-        devices.insert("data".into(), device);
+        devices.insert(
+            "data".into(),
+            json!({"type":"disk", "path":data.path, "pool":cfg.pool,
+            "source":format!("{}-data", cfg.name)}),
+        );
     }
     if let Some(lan) = &cfg.lan {
         // The wildcard bind exposes this port on every IPv4 interface, including a tailnet interface.
@@ -444,6 +445,7 @@ impl Plugin for Service {
         }
         if let Some(data) = &cfg.data {
             let name = format!("{}-data", cfg.name);
+            // `observed` refuses a volume that does not carry this entry's mark, so an existing volume is never adopted.
             if observed(
                 ctx,
                 format!(
@@ -695,7 +697,9 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         )));
     }
     if let Some(data) = &template.data
-        && (!data.path.starts_with('/')
+        && (path_is_root(&data.path)
+            || data.path.len() > DATA_PATH_MAX
+            || !data.path.starts_with('/')
             || data.path.chars().any(|c| c.is_control())
             || data.path.split('/').any(|part| part == "..")
             || data.size.as_deref().is_some_and(|size| !size_ok(size)))
@@ -772,8 +776,17 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     Ok(())
 }
 
+/// Whether the path is the root once repeated separators and `.` segments are dropped.
+fn path_is_root(path: &str) -> bool {
+    path.split('/').all(|part| part.is_empty() || part == ".")
+}
+
 fn decimal(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|first| matches!(first, b'1'..=b'9'))
+        && bytes.all(|b| b.is_ascii_digit())
 }
 
 fn size_ok(value: &str) -> bool {

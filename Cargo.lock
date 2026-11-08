@@ -261,6 +261,7 @@ dependencies = [
  "arca-approval",
  "arca-incus",
  "arca-kernel",
+ "arca-netproject",
  "arca-providers",
  "arca-reconcile",
  "base64 0.23.1",

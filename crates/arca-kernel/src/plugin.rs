@@ -530,6 +530,11 @@ pub trait Plugin {
     fn manifest() -> Manifest;
     /// Applies the config through `ctx`.
     fn apply(ctx: &mut Ctx<'_>, cfg: &Self::Config) -> Result<(), PluginError>;
+    /// Whether the reconciler applies this plugin's entry again when its config has not changed since it last applied. A plugin
+    /// opts in for state it repairs outside the entry config; the default keeps a converged entry skipped.
+    fn reconciles_when_unchanged() -> bool {
+        false
+    }
 }
 
 /// A plugin with its config type erased, so the reconciler can hold any plugin in one collection.
@@ -538,6 +543,10 @@ pub trait ErasedPlugin: Send + Sync {
     fn manifest(&self) -> Manifest;
     /// Deserializes `config` into the plugin's type and applies it. A config that does not deserialize never reaches apply.
     fn apply(&self, ctx: &mut Ctx<'_>, config: &Value) -> Result<(), PluginError>;
+    /// Whether a converged, unchanged entry is applied again. A plugin that does not opt in keeps the reconciler's skip.
+    fn reconciles_when_unchanged(&self) -> bool {
+        false
+    }
 }
 
 /// The erased form of a plugin `P`.
@@ -574,6 +583,10 @@ impl<P: Plugin> ErasedPlugin for Erased<P> {
         let cfg = <P::Config as Deserialize>::deserialize(config)
             .map_err(|e| PluginError::Config(redact(&e.to_string())))?;
         P::apply(ctx, &cfg)
+    }
+
+    fn reconciles_when_unchanged(&self) -> bool {
+        P::reconciles_when_unchanged()
     }
 }
 
