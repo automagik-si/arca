@@ -87,8 +87,15 @@ pub const NETWORK_ACCESS_KEY: &str = "restricted.networks.access";
 /// a `raw.*` key, DNS and every other key is refused.
 const BRIDGE_KEYS: [&str; 3] = ["ipv4.address", "ipv4.nat", "ipv6.address"];
 
-/// Whether a project key is one a plugin may not set unless it is the value the kernel pins: `restricted`, any `restricted.*`
-/// key, and any `features.*` key.
+// Only the service network entry may grant proxy devices, and only in its own project.
+fn service_proxy_allowance(entry: &EntryId, project: &str, key: &str, value: Option<&str>) -> bool {
+    entry.0 == "net-arcak-svc"
+        && project == "arcak-svc"
+        && key == "restricted.devices.proxy"
+        && value == Some("allow")
+}
+
+/// Whether a project key is guarded: `restricted`, any `restricted.*` key, and any `features.*` key.
 fn guarded_project_key(key: &str) -> bool {
     key == RESTRICTED_KEY || key.starts_with("restricted.") || key.starts_with("features.")
 }
@@ -452,14 +459,17 @@ impl IncusProvider {
                 .chain([(RESTRICTED_KEY, "true")])
                 .collect();
             // A plugin may set a guarded key only to the value the kernel pins it at. Any other guarded key, pinned or not,
-            // would loosen the project, so it is refused before any request. The one exception is the list of bridges the
-            // project grants, which is checked name by name.
+            // would loosen the project, so it is refused before any request. Bridge grants are checked name by name;
+            // the service network entry alone may also allow proxy devices in its own project.
             for (key, set) in &config {
                 if key == NETWORK_ACCESS_KEY {
                     let list = set.as_str().ok_or_else(|| {
                         EffectRefusal::Provider("the bridge grant is not text".to_string())
                     })?;
                     self.check_network_access(entry, list)?;
+                    continue;
+                }
+                if service_proxy_allowance(entry, project, key, set.as_str()) {
                     continue;
                 }
                 if !guarded_project_key(key) {
@@ -530,7 +540,7 @@ impl IncusProvider {
         changes: &BTreeMap<String, Option<String>>,
         current: &BTreeMap<String, String>,
     ) -> Result<(), EffectRefusal> {
-        check_patch_keys(object.kind, changes)?;
+        check_patch_keys(entry, object, changes)?;
         let after = apply_changes(current, changes);
         if !kernel_may_write(
             &classify_object(object, &after, &self.retained.snapshot()?),
@@ -558,7 +568,7 @@ impl IncusProvider {
         self.check_family(object.kind, &object.project)?;
         // The key rules come before any read, so a refused key sends no request at all.
         if let Some(changes) = changes {
-            check_patch_keys(object.kind, changes)?;
+            check_patch_keys(entry, object, changes)?;
         }
         let reading = self.read_for_plan(entry, object)?;
         self.check_features(entry, object.kind, &object.project)?;
@@ -989,6 +999,11 @@ impl Provider for IncusProvider {
                     }
                     ["", "1.0", "network-acls", name] if plain_name(name) => IncusKind::Acl,
                     ["", "1.0", "profiles", name] if plain_name(name) => IncusKind::Profile,
+                    ["", "1.0", "storage-pools", pool, "volumes", "custom", name]
+                        if plain_name(pool) && plain_name(name) =>
+                    {
+                        IncusKind::Volume
+                    }
                     _ => return Err(EffectRefusal::NotDeclared),
                 };
                 // The shared service profile derives its pool from this read-only default profile.
@@ -1007,7 +1022,11 @@ impl Provider for IncusProvider {
                 let mut value = self.reader.get(path).map_err(incus_refusal)?;
                 if matches!(
                     kind,
-                    IncusKind::Acl | IncusKind::Project | IncusKind::Network | IncusKind::Profile
+                    IncusKind::Acl
+                        | IncusKind::Project
+                        | IncusKind::Network
+                        | IncusKind::Profile
+                        | IncusKind::Volume
                 ) {
                     let config = value
                         .get("config")
@@ -1018,8 +1037,8 @@ impl Provider for IncusProvider {
                     let object = ObjectRef {
                         kind,
                         project: project.into(),
-                        parent: None,
-                        name: parts[3].into(),
+                        parent: (kind == IncusKind::Volume).then(|| parts[3].into()),
+                        name: parts.last().unwrap().to_string(),
                         uuid: None,
                     };
                     let class = classify_object(&object, &config, &self.retained.snapshot()?);
@@ -1507,14 +1526,18 @@ fn apply_changes(
 }
 
 /// The keys a change may name: plain, and never the kernel's tombstone or Incus's own `volatile` namespace. On a project, no
-/// guarded key at all, whatever its value: a patch may not loosen the project the kernel pinned. The writer refuses the same
-/// keys; the plan refuses them before any read, so a refused change sends no request.
+/// guarded key except the service project's proxy allowance. The plan refuses them before any read, so a refused change
+/// sends no request.
 fn check_patch_keys(
-    kind: IncusKind,
+    entry: &EntryId,
+    object: &ObjectRef,
     changes: &BTreeMap<String, Option<String>>,
 ) -> Result<(), EffectRefusal> {
-    for key in changes.keys() {
-        if kind == IncusKind::Project && guarded_project_key(key) {
+    for (key, value) in changes {
+        if object.kind == IncusKind::Project
+            && guarded_project_key(key)
+            && !service_proxy_allowance(entry, &object.project, key, value.as_deref())
+        {
             return Err(EffectRefusal::Provider(
                 "a plugin may not change a restricted or features key on a project".to_string(),
             ));

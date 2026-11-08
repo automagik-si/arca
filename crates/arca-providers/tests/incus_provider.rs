@@ -4012,3 +4012,121 @@ fn own_project_and_network_observe_refuses_foreign_and_other_routes() {
     );
     assert_eq!(fake.writes().len(), before);
 }
+
+#[test]
+fn proxy_allowance_is_scoped_to_the_service_network_entry_and_project() {
+    let (scratch, fake) = start("proxy-allowance-scope");
+    let mut family = family();
+    family.projects.push("arcak-svc".into());
+    let provider = IncusProvider::new(
+        fake.socket().into(),
+        family,
+        secrets_dir(&scratch),
+        RetainedSet::empty(),
+    )
+    .unwrap();
+    for (owner, project, key, value) in [
+        (
+            "toy",
+            "arcak-svc",
+            "restricted.devices.proxy",
+            Some("allow"),
+        ),
+        (
+            "net-arcak-svc",
+            "svc",
+            "restricted.devices.proxy",
+            Some("allow"),
+        ),
+        (
+            "net-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.proxy",
+            Some("block"),
+        ),
+        (
+            "net-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.proxy",
+            None,
+        ),
+        (
+            "net-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.disk",
+            Some("allow"),
+        ),
+        ("net-arcak-svc", "arcak-svc", "restricted", Some("false")),
+    ] {
+        let op = patch(
+            object(IncusKind::Project, project, None, project),
+            &[(key, value)],
+        );
+        assert!(
+            matches!(
+                provider.plan(&entry(owner), &op),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{owner}: {project} {key}={value:?}"
+        );
+        if let Some(value) = value {
+            let op = create(
+                IncusKind::Project,
+                project,
+                None,
+                project,
+                json!({"config":{key:value}}),
+            );
+            assert!(matches!(
+                provider.plan(&entry(owner), &op),
+                Err(EffectRefusal::Provider(_))
+            ));
+        }
+    }
+    assert!(fake.requests().is_empty(), "refused before any request");
+}
+
+#[test]
+fn custom_volume_observe_checks_pool_route_family_project_and_ownership() {
+    let (scratch, fake) = start("volume-observe");
+    let mut provider = provider(&fake, &secrets_dir(&scratch));
+    let op = create(
+        IncusKind::Volume,
+        "svc",
+        Some("fast"),
+        "own-data",
+        json!({"name":"own-data", "config":{}}),
+    );
+    let plan = provider.plan(&entry("toy"), &op).unwrap();
+    provider.effect(&entry("toy"), &op, &plan).unwrap();
+    let path = "/1.0/storage-pools/fast/volumes/custom/own-data?project=svc";
+    let get = |owner: &str, projects: &[String], path: &str| {
+        provider.observe(
+            &entry(owner),
+            projects,
+            &Observe::IncusGet { path: path.into() },
+        )
+    };
+    assert_eq!(
+        get("toy", &["svc".into()], path).unwrap()["config"][MARK],
+        "toy"
+    );
+    assert!(matches!(
+        get("other", &["svc".into()], path),
+        Err(EffectRefusal::NotOwned(_))
+    ));
+    let before = fake.requests().len();
+    assert_eq!(get("toy", &[], path), Err(EffectRefusal::ProjectNotAllowed));
+    for path in [
+        "/1.0/storage-pools/fast/volumes/custom/own-data?project=foreign",
+        "/1.0/storage-pools/fast/volumes/custom/own-data?project=default",
+        "/1.0/storage-pools/fast/volumes/custom/own-data?project=svc&recursion=1",
+        "/1.0/storage-pools/%66ast/volumes/custom/own-data?project=svc",
+        "/1.0/storage-pools/fast/volumes/custom/own%2ddata?project=svc",
+        "/1.0/storage-pools/fast/volumes/custom?project=svc",
+        "/1.0/storage-pools/fast/volumes/container/own-data?project=svc",
+    ] {
+        assert!(get("toy", &["svc".into()], path).is_err(), "{path}");
+    }
+    assert_eq!(fake.requests().len(), before);
+}

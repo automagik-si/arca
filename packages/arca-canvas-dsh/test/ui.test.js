@@ -144,3 +144,35 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
   }
 });
 
+
+test('multi-host routes encode every segment and resolve both qualified and primary links', () => {
+  const names = ['alpha / %', 'beta / %'];
+  const project = 'shared / %';
+  const instance = 'worker / %';
+  const tree = buildTree({ hosts: names.map((name) => ({
+    ...fixture, name, projects: [project],
+    instances: [{ project, name: instance, status: 'Running' }],
+  })) });
+  assert.notEqual(tree.hosts[0].projects[0].key, tree.hosts[1].projects[0].key);
+  assert.notEqual(tree.hosts[0].projects[0].children[0].key, tree.hosts[1].projects[0].children[0].key);
+  for (const model of tree.hosts) {
+    const hostPart = encodeURIComponent(model.hostId);
+    assert.equal(model.host.route, `#host/${hostPart}`);
+    assert.equal(model.projects[0].route, `#project/${hostPart}/${encodeURIComponent(project)}`);
+    assert.equal(model.projects[0].children[0].route, `#project/${hostPart}/${encodeURIComponent(project)}/instance/${encodeURIComponent(instance)}`);
+    assert.equal(model.notPlaced.route, `#not-placed/${hostPart}`);
+    assert.equal(model.databases.route, `#databases/${hostPart}`);
+    for (const node of [model.host, model.projects[0], model.projects[0].children[0], model.notPlaced, model.databases]) {
+      const route = parseRoute(node.route, tree);
+      assert.equal(route.node, node);
+      assert.equal(route.model, model);
+    }
+  }
+  for (const fragment of ['', `#host/${fixture.machine.node}`, `#project/${encodeURIComponent(project)}`,
+    `#project/${encodeURIComponent(project)}/instance/${encodeURIComponent(instance)}`, '#not-placed', '#databases']) {
+    assert.equal(parseRoute(fragment, tree).model, tree.hosts[0]);
+  }
+  for (const fragment of ['#host/%', '#project/%/x', '#not-placed/missing', '#databases/missing', '#project/missing/shared']) {
+    assert.equal(parseRoute(fragment, tree).kind, 'not-found');
+  }
+});

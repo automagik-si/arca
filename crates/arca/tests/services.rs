@@ -424,6 +424,10 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         entrypoint: None,
         generate: std::collections::BTreeMap::new(),
         droidd_port: None,
+        limits: None,
+        autostart: false,
+        data: None,
+        lan: None,
     }
 }
 
@@ -1584,7 +1588,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_four_templates_and_nothing_else_load_and_are_pinned() {
+fn the_five_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -1596,7 +1600,13 @@ fn the_four_templates_and_nothing_else_load_and_are_pinned() {
     names.sort();
     assert_eq!(
         names,
-        vec!["automagik", "nats", "omni-api", "postgres-autopg"]
+        vec![
+            "automagik",
+            "automagik-server",
+            "nats",
+            "omni-api",
+            "postgres-autopg"
+        ]
     );
     for name in &names {
         let template = service::load_template(&dir, name).expect("the template loads");
@@ -2118,3 +2128,182 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 
 #[path = "services/wiring.rs"]
 mod wiring;
+
+#[test]
+fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
+    let rig = Rig::new();
+    for fields in [
+        json!({"limits":{}}),
+        json!({"limits":{"cpu":"1,2"}}),
+        json!({"limits":{"cpu":" 4"}}),
+        json!({"limits":{"cpu":"{4}"}}),
+        json!({"limits":{"cpu":4}}),
+        json!({"limits":{"memory":"4 GiB"}}),
+        json!({"limits":{"memory":"4GiB,8GiB"}}),
+        json!({"limits":{"memory":"{{memory}}"}}),
+        json!({"limits":{"memory":""}}),
+        json!({"limits":{"other":"4"}}),
+        json!({"data":{"path":"data"}}),
+        json!({"data":{"path":"/data/../etc"}}),
+        json!({"data":{"path":"/data\n"}}),
+        json!({"data":{"path":"/data","uid":-1}}),
+        json!({"data":{"path":"/data","uid":4294967296_u64}}),
+        json!({"data":{"path":"/data","uid":"1000"}}),
+        json!({"data":{"path":"/data","gid":-1}}),
+        json!({"data":{"path":"/data","size":"{{size}}"}}),
+        json!({"data":{"path":"/data","other":true}}),
+        json!({"lan":{"port":3081}}),
+        json!({"lan":{"port":0}}),
+        json!({"lan":{"port":4222,"other":true}}),
+    ] {
+        let mut template = nats_template();
+        template
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        rig.template("nats", template);
+        assert!(
+            service::load_template(&rig.dir.join("templates"), "nats").is_err(),
+            "{fields}"
+        );
+    }
+    for fields in [
+        json!({"limits":{"cpu":"4"}}),
+        json!({"limits":{"memory":"4GiB"}}),
+        json!({"data":{"path":"/data/file..name","size":"8GiB","uid":0,"gid":4294967295_u64}}),
+        json!({"lan":{"port":4222}}),
+    ] {
+        let mut template = nats_template();
+        template
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        rig.template("nats", template);
+        service::load_template(&rig.dir.join("templates"), "nats").unwrap();
+    }
+    rig.template("nats", nats_template());
+    let old = service::load_template(&rig.dir.join("templates"), "nats").unwrap();
+    assert!(old.limits.is_none() && old.data.is_none() && old.lan.is_none() && !old.autostart);
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .unwrap();
+    let mut document = serde_json::to_value(rig.service_config("nats")).unwrap();
+    for key in ["limits", "autostart", "data", "lan"] {
+        document.as_object_mut().unwrap().remove(key);
+    }
+    let old: service::ServiceConfig = serde_json::from_value(document).unwrap();
+    assert!(old.limits.is_none() && old.data.is_none() && old.lan.is_none() && !old.autostart);
+    let instance = rig
+        .get(&format!("/1.0/instances/nats?project={PROJECT}"))
+        .unwrap();
+    assert_eq!(instance["devices"].as_object().unwrap().len(), 2);
+    for key in ["limits.cpu", "limits.memory", "boot.autostart"] {
+        assert!(instance["config"].get(key).is_none());
+    }
+}
+
+#[test]
+fn automagik_server_runtime_shape_and_owned_volume_survive_retry_and_are_removed_together() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let template = service::load_template(&dir, "automagik-server").unwrap();
+    assert_eq!(template.kind, "oci");
+    assert_eq!(template.image, "ghcr.io/automagik-dev/automagik-server");
+    assert_eq!(
+        template.digest.as_deref(),
+        Some("sha256:671cdd101bc48863974c22b8331c4e390bbfaca3de4d2cd7f51491068105e450")
+    );
+    assert_eq!(
+        template.entrypoint,
+        Some(vec![
+            json!("/nodejs/bin/node"),
+            json!("/opt/automagik/entrypoint.mjs")
+        ])
+    );
+    assert_eq!(template.ports, vec![3081]);
+    let data = template.data.unwrap();
+    assert_eq!(data.path, "/data");
+    assert_eq!(
+        (data.uid, data.gid, data.size),
+        (Some(1000), Some(1000), None)
+    );
+    let limits = template.limits.unwrap();
+    assert_eq!(limits.cpu.as_deref(), Some("4"));
+    assert_eq!(limits.memory.as_deref(), Some("4GiB"));
+    assert!(template.autostart);
+    assert_eq!(template.lan.unwrap().port, 3081);
+    assert!(!template.publishable);
+
+    for size in [None, Some("8GiB")] {
+        let key = common::SkKey::from_seed(9);
+        let rig = Rig::with_key(
+            FakeState {
+                server: json!({}),
+                projects: vec![],
+                instances: vec![],
+                networks: vec![],
+                pools: vec![("pool1".into(), json!({}))],
+            },
+            vec![PROJECT.into()],
+            Some("192.0.2.0/24"),
+            Some(&key),
+        );
+        let mut value: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("automagik-server.json")).unwrap())
+                .unwrap();
+        if let Some(size) = size {
+            value["data"]["size"] = json!(size);
+        }
+        rig.template("automagik-server", value);
+        rig.call(
+            "service_create",
+            json!({"name":"server","template":"automagik-server"}),
+        )
+        .unwrap();
+        let instance_path = format!("/1.0/instances/server?project={PROJECT}");
+        let volume_path =
+            format!("/1.0/storage-pools/pool1/volumes/custom/server-data?project={PROJECT}");
+        let acl_path = format!("/1.0/network-acls/{PROJECT}-svc-server?project=default");
+        let instance = rig.get(&instance_path).unwrap();
+        assert_eq!(instance["config"]["limits.cpu"], "4");
+        assert_eq!(instance["config"]["limits.memory"], "4GiB");
+        assert_eq!(instance["config"]["boot.autostart"], "true");
+        assert_eq!(
+            instance["config"]["oci.entrypoint"],
+            "/nodejs/bin/node /opt/automagik/entrypoint.mjs"
+        );
+        let mut disk =
+            json!({"type":"disk", "path":"/data", "pool":"pool1", "source":"server-data"});
+        if let Some(size) = size {
+            disk["size"] = json!(size);
+        }
+        assert_eq!(instance["devices"]["data"], disk);
+        assert_eq!(
+            instance["devices"]["web"],
+            json!({"type":"proxy", "listen":"tcp:0.0.0.0:3081", "connect":"tcp:127.0.0.1:3081"})
+        );
+        let volume = rig.get(&volume_path).unwrap();
+        let mut config = json!({"initial.uid":"1000", "initial.gid":"1000", "user.arcakernel.entry":"service-server"});
+        if let Some(size) = size {
+            config["size"] = json!(size);
+        }
+        assert_eq!(volume["config"], config);
+        let writes = rig.fake.writes().len();
+        rig.apply(&rig.service_config("server")).unwrap();
+        assert_eq!(
+            rig.fake.writes().len(),
+            writes,
+            "second apply writes nothing"
+        );
+        let approval = owner_approval(&key, "server");
+        assert_eq!(
+            rig.call(
+                "service_remove",
+                json!({"name":"server", "approval":approval})
+            )
+            .unwrap(),
+            json!({"removed":true})
+        );
+        for path in [&instance_path, &volume_path, &acl_path] {
+            assert!(rig.get(path).is_none(), "{path} was removed");
+        }
+    }
+}

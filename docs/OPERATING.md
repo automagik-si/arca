@@ -240,8 +240,25 @@ A service is one template-derived container in the service project. Its template
 service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it
 needs is available. `service_list` and `service_status` derive state from Incus and report instances that Arca did
 not create as `unknown` without touching them. `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The four shipped templates live in `templates/`, with their pinned
+secrets redacted and a capped, truncated result. The five shipped templates live in `templates/`, with their pinned
 images and vendored npm lockfile.
+
+Templates may also set `limits` with an optional decimal-string `cpu` and/or a size-string `memory` (for example,
+`{"cpu":"4","memory":"4GiB"}`); at least one is required when `limits` is present. These instance settings override the
+shared profile. `autostart` defaults to false; true sets `boot.autostart=true`.
+
+`data` names an absolute printable mount `path` with no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit),
+and an optional `size` such as `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool
+before the instance, setting `initial.uid`/`initial.gid` when supplied. The disk device mounts that volume at `path`;
+`size`, when supplied, is set on both the volume config and disk device. The volume carries the entry's ownership marker,
+is reused on reconciliation, and is deleted with the instance and ACL on approved service removal.
+
+`lan: {"port":3081}` requires that port in `ports` and adds a `web` proxy device listening on `tcp:0.0.0.0:3081`,
+connecting to `tcp:127.0.0.1:3081` in the container. Known side effect: the wildcard bind exposes the port on every host
+IPv4 interface, including a tailnet interface when present. The service project remains restricted; Arca sets and reconciles
+only `restricted.devices.proxy=allow` to permit these proxy devices. Disk restrictions retain Incus' managed default.
+The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
+4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 
 `service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
 approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends

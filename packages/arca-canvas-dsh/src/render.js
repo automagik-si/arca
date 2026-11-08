@@ -149,7 +149,7 @@ export function createCanvas(root) {
     sections.append(box);
     return body;
   };
-  const hostsBody = section('hosts', 'Hosts', '1');
+  const hostsBody = section('hosts', 'Hosts', '0');
   const projectsBody = section('projects', 'Projects', '0');
 
   const state = {
@@ -194,14 +194,19 @@ export function createCanvas(root) {
 
   function updateRail() {
     const model = state.model;
-    const host = railRow(model.host, 'host', hostsBody);
-    host.label.textContent = model.host.label;
-    host.stateNode.replaceChildren(stateLine(doc, model.host.status, model.host.tone));
-    host.row.setAttribute('aria-selected', String(state.route?.key === model.host.key));
-    host.row.tabIndex = state.focusKey === model.host.key ? 0 : -1;
+    const hosts = state.tree.hosts ?? [state.tree];
+    for (const [index, { host: node }] of hosts.entries()) {
+      const host = railRow(node, 'host', hostsBody);
+      host.label.textContent = node.label;
+      host.stateNode.replaceChildren(stateLine(doc, node.status, node.tone));
+      host.row.setAttribute('aria-selected', String(state.route?.key === node.key));
+      host.row.tabIndex = state.focusKey === node.key ? 0 : -1;
+      if (hostsBody.children[index] !== host.row) hostsBody.insertBefore(host.row, hostsBody.children[index] ?? null);
+    }
+    hostsBody.closest('.arca-section').querySelector('.arca-section-count').textContent = String(hosts.length);
     const projects = model.projects;
     const selectedProject = state.route?.kind === 'instance'
-      ? `${model.hostId}|project:${state.route.node.project}` : state.route?.key;
+      ? state.route.project.key : state.route?.key;
     for (const project of projects) {
       const entry = railRow(project, 'project', projectsBody);
       entry.label.textContent = project.label;
@@ -219,12 +224,12 @@ export function createCanvas(root) {
       entry.row.setAttribute('aria-selected', String(state.route?.key === group.key));
       entry.row.tabIndex = state.focusKey === group.key ? 0 : -1;
     }
-    const wanted = new Set([model.host.key, ...hostGroups.map((group) => group.key), ...projects.map((project) => project.key)]);
+    const wanted = new Set([...hosts.map(({ host }) => host.key), ...hostGroups.map((group) => group.key), ...projects.map((project) => project.key)]);
     for (const [key, entry] of state.rows) {
       if (!wanted.has(key)) { entry.row.remove(); state.rows.delete(key); }
     }
     projectsBody.closest('.arca-section').querySelector('.arca-section-count').textContent = String(projects.length);
-    if (!state.focusKey) state.focusKey = state.route?.key ?? model.host.key;
+    if (!state.rows.has(state.focusKey)) state.focusKey = state.rows.has(selectedProject) ? selectedProject : model.host.key;
     const focus = state.rows.get(state.focusKey);
     if (focus) for (const [key, entry] of state.rows) entry.row.tabIndex = key === state.focusKey ? 0 : -1;
   }
@@ -306,7 +311,7 @@ export function createCanvas(root) {
     projectFrame.append(nodes);
     const devices = el(doc, 'section', 'arca-devices-frame');
     devices.append(el(doc, 'h3', '', 'Devices'));
-    if (!project.devices.length) devices.append(el(doc, 'p', 'arca-frame-empty', 'No phones or desktops matched this project by name.'));
+    if (!project.devices.length) devices.append(el(doc, 'p', 'arca-frame-empty', ['off', 'unavailable', 'unreachable'].includes(state.snapshot.devices) ? 'Device data unavailable.' : 'No phones or desktops matched this project by name.'));
     else {
       for (const device of project.devices) {
         const row = el(doc, 'div', 'arca-device-row');
@@ -334,7 +339,11 @@ export function createCanvas(root) {
     }
     if (snapshot.instancesKnown === false && ['host', 'project', 'instance'].includes(route.kind)) {
       title(model.host.label, 'Host', 'Watch report unavailable');
-      stageEmpty('Instance data unavailable', 'Arca did not return the watch report. This is not an empty host.');
+      state.nodes.clear();
+      const frame = el(doc, 'section', 'arca-frame arca-host-frame');
+      frame.append(frameHeader(doc, model.host.label, model.host.status, model.host.tone, model.host.rawName),
+        emptyNotice(doc, 'Instance data unavailable', 'Arca did not return the watch report. This is not an empty host.'));
+      stageBody.replaceChildren(frame);
       return;
     }
     if (route.kind === 'host') {
@@ -434,8 +443,8 @@ export function createCanvas(root) {
     if (route.kind === 'not-placed') {
       title('Not placed', 'Host', model.notPlaced.status);
       if (!model.notPlaced.devices.length) {
-        stageEmpty(snapshot.devices === 'unavailable' || snapshot.devices === 'unreachable' ? 'Device data unavailable' : 'No unplaced devices',
-          snapshot.devices === 'unavailable' || snapshot.devices === 'unreachable'
+        stageEmpty(['off', 'unavailable', 'unreachable'].includes(snapshot.devices) ? 'Device data unavailable' : 'No unplaced devices',
+          ['off', 'unavailable', 'unreachable'].includes(snapshot.devices)
             ? 'The device reader did not answer. This does not mean the host has no devices.' : 'Every phone and desktop has one unique instance name.');
         return;
       }
@@ -480,7 +489,7 @@ export function createCanvas(root) {
       add('Instances', snapshot.instancesKnown === false ? 'Watch report unavailable' : count(list(snapshot.instances).length, 'instance'));
       add('Incus', snapshot.machine?.incusReachable === false ? 'Unavailable' : 'Reachable');
       add('Devices', text(snapshot.devices, 'off'));
-      add('Alerts', `${list(snapshot.alerts?.firing).length} firing · ${list(snapshot.alerts?.unknown).length} checks with no data`);
+      add('Alerts', `${list(snapshot.alerts?.firing).length} firing · ${count(list(snapshot.alerts?.unknown).length, 'check')} with no data`);
     } else if (route.kind === 'project') {
       add('Friendly name', route.node.label);
       add('Raw Incus project', route.node.rawName, 'mono');
@@ -501,27 +510,24 @@ export function createCanvas(root) {
     detailBody.scrollTop = scroll;
   }
 
-  function renderRoute() {
-    updateRail();
-    renderStage(state.route);
-    renderDetail(state.route);
+  function update(snapshot) {
+    state.envelope = snapshot;
+    state.tree = buildTree(snapshot);
+    const primary = state.tree.hosts?.[0] ?? state.tree;
+    if ((!location.hash || location.hash === '#host/host') && (primary.snapshot.machine || primary.snapshot.instancesKnown)) {
+      history.replaceState(null, '', primary.host.route);
+    }
+    state.route = parseRoute(location.hash, state.tree);
+    if (!state.focusKey) state.focusKey = state.route?.key ?? primary.host.key;
+    renderRoute();
   }
 
-  function update(snapshot) {
-    state.snapshot = snapshot;
-    state.model = buildTree(snapshot);
-    if (!state.route) {
-      state.route = parseRoute(location.hash, state.model);
-      state.focusKey = state.route?.key ?? state.model.host.key;
-    }
-    if ((!location.hash || location.hash === '#host/host') && (snapshot.machine || snapshot.instancesKnown)) {
-      history.replaceState(null, '', state.model.host.route);
-      state.route = parseRoute(location.hash, state.model);
-    } else {
-      state.route = parseRoute(location.hash, state.model);
-    }
+  function renderRoute() {
+    state.model = state.route.model;
+    state.snapshot = state.model.snapshot;
+    const snapshot = state.snapshot;
     const plansCount = list(snapshot.plans).length;
-    const url = approvalUrl(snapshot.approvalUrl);
+    const url = approvalUrl(state.envelope.approvalUrl);
     const plansTag = plansCount && url ? 'a' : 'span';
     if (plans.localName !== plansTag) {
       const next = el(doc, plansTag, 'arca-plans');
@@ -540,17 +546,19 @@ export function createCanvas(root) {
     deviceBadge.textContent = deviceLabelText;
     deviceBadge.hidden = !deviceLabelText;
     deviceBadge.dataset.state = deviceState;
-    renderRoute();
+    updateRail();
+    renderStage(state.route);
+    renderDetail(state.route);
   }
 
   function onHash() {
-    if (!state.model) return;
-    state.route = parseRoute(location.hash, state.model);
+    if (!state.tree) return;
+    state.route = parseRoute(location.hash, state.tree);
+    state.model = state.route.model;
     if (state.route.node) {
       state.focusKey = state.route.key;
       if (state.route.kind === 'instance') {
-        const projectKey = `${state.model.hostId}|project:${state.route.node.project}`;
-        state.focusKey = projectKey;
+        state.focusKey = state.route.project.key;
       }
     }
     state.nodes.clear();

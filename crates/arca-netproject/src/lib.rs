@@ -130,18 +130,30 @@ impl Plugin for NetProject {
                 json!({"name":cfg.bridge,"type":"bridge","config":{"ipv4.address":format!("{gateway}/24"),"ipv4.nat":"true","ipv6.address":"none"}}),
             )?;
         }
-        if observed(
+        let project = observed(
             ctx,
             format!("/1.0/projects/{}?project={}", cfg.project, cfg.project),
-        )?
-        .is_none()
-        {
+        )?;
+        if let Some(project) = project {
+            if project["config"]["restricted.devices.proxy"].as_str() != Some("allow") {
+                ctx.effect(EffectOp::IncusPatchConfig {
+                    object: arca_kernel::ownership::ObjectRef {
+                        kind: IncusKind::Project,
+                        project: cfg.project.clone(),
+                        parent: None,
+                        name: cfg.project.clone(),
+                        uuid: None,
+                    },
+                    config: [("restricted.devices.proxy".into(), Some("allow".into()))].into(),
+                })?;
+            }
+        } else {
             create(
                 ctx,
                 IncusKind::Project,
                 &cfg.project,
                 &cfg.project,
-                json!({"name":cfg.project,"config":{"limits.virtual-machines":cfg.virtual_machines.to_string(),"restricted.networks.access":cfg.bridge}}),
+                json!({"name":cfg.project,"config":{"limits.virtual-machines":cfg.virtual_machines.to_string(),"restricted.networks.access":cfg.bridge,"restricted.devices.proxy":"allow"}}),
             )?;
         }
         if observed(

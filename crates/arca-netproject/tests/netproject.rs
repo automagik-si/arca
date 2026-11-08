@@ -83,6 +83,10 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
     let project = read.get(&format!("/1.0/projects/{PROJECT}")).unwrap();
     assert_eq!(project["config"]["limits.virtual-machines"], "0");
     assert_ne!(project["config"]["features.networks"], "true");
+    assert_eq!(project["config"]["restricted"], "true");
+    assert_eq!(project["config"]["restricted.networks.access"], BRIDGE);
+    assert_eq!(project["config"]["restricted.devices.proxy"], "allow");
+    assert!(project["config"].get("restricted.devices.disk").is_none());
     let profile = read
         .get(&format!("/1.0/profiles/{PROFILE}?project={PROJECT}"))
         .unwrap();
@@ -107,6 +111,44 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
         json!({"root":{"type":"disk","path":"/","pool":"pool1","size":"16GiB"}})
     );
     assert_eq!(fake.writes().len(), 3);
+    // An older project lacks the proxy allowance. An operator's edit simulates that state.
+    let mut legacy = project.clone();
+    legacy["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("restricted.devices.proxy");
+    {
+        use std::io::{Read, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(fake.socket()).unwrap();
+        let body = legacy.to_string();
+        write!(stream, "PUT /1.0/projects/{PROJECT} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+    }
+    for _ in 0..2 {
+        NetProject::apply(
+            &mut Ctx::new(
+                EntryId("net-arcak-svc".into()),
+                &manifest,
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            &cfg,
+        )
+        .unwrap();
+    }
+    let patched = read.get(&format!("/1.0/projects/{PROJECT}")).unwrap();
+    assert_eq!(
+        patched["config"], project["config"],
+        "the patch preserves every other restriction and grant"
+    );
+    assert_eq!(
+        fake.writes().len(),
+        5,
+        "one operator edit and one reconciliation write"
+    );
     drop(fake);
     std::fs::remove_dir_all(dir).unwrap();
 }
