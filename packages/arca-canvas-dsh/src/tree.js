@@ -95,13 +95,14 @@ export function buildTree(snapshot = {}) {
   for (const device of devices) {
     const matches = instancesByName.get(text(device.name)) ?? [];
     if (matches.length !== 1) {
-      unplaced.push({ ...device, reason: matches.length ? 'name matches more than one instance' : 'no instance with this name' });
+      device.reason = matches.length ? 'name matches more than one instance' : 'no instance with this name';
+      unplaced.push(device);
       continue;
     }
     const key = instanceKey(machine ?? {}, matches[0].project, matches[0].name);
-    const matched = { ...device, matched: { project: matches[0].project, name: matches[0].name } };
+    device.matched = { project: text(matches[0].project, 'default'), name: matches[0].name };
     if (!placed.has(key)) placed.set(key, []);
-    placed.get(key).push(matched);
+    placed.get(key).push(device);
   }
   const databases = list(snapshot.databases).map((row) => ({ ...row, kind: 'database' }));
   const databasesByInstance = new Map();
@@ -207,7 +208,5 @@ export function routeFor(node) {
 
 export function ownerLabel(owner) {
   const value = text(owner?.class ?? owner, 'unknown');
-  if (['kernel', 'retained'].includes(value)) return 'Managed by Arca';
-  if (value === 'droidd') return 'Droidd';
-  return humanize(value);
+  return ['kernel', 'retained'].includes(value) ? 'Managed by Arca' : 'External';
 }

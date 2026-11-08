@@ -78,7 +78,7 @@ export function createCanvas(root) {
   const remoteView = (root.dataset?.arcaBase ?? '').includes('/approve/canvas');
   const context = el(doc, 'span', 'arca-context', remoteView ? 'Remote view' : '');
   const deviceBadge = el(doc, 'span', 'arca-devices');
-  const plans = el(doc, 'span', 'arca-plans');
+  let plans = el(doc, 'span', 'arca-plans');
   topbar.append(brand, readOnly, ...(remoteView ? [context] : []), deviceBadge, plans);
   const main = el(doc, 'div', 'arca-main');
   const rail = el(doc, 'nav', 'arca-rail');
@@ -381,7 +381,9 @@ export function createCanvas(root) {
       hostFrame.append(projects);
       const devicesFrame = el(doc, 'section', 'arca-devices-frame arca-host-devices');
       devicesFrame.append(el(doc, 'h3', '', 'Devices'));
-      if (!model.host.devices.length) devicesFrame.append(el(doc, 'p', 'arca-frame-empty', 'No phones or desktops returned.'));
+      if (!model.host.devices.length) devicesFrame.append(el(doc, 'p', 'arca-frame-empty',
+        ['off', 'unavailable', 'unreachable'].includes(snapshot.devices)
+          ? 'Device data unavailable.' : 'No phones or desktops returned.'));
       for (const device of model.host.devices) {
         const row = el(doc, 'div', 'arca-device-row');
         const place = device.matched ? `${device.matched.project}/${device.matched.name} · matched by name` : (device.reason ?? 'not placed');
@@ -520,13 +522,16 @@ export function createCanvas(root) {
     }
     const plansCount = list(snapshot.plans).length;
     const url = approvalUrl(snapshot.approvalUrl);
+    const plansTag = plansCount && url ? 'a' : 'span';
+    if (plans.localName !== plansTag) {
+      const next = el(doc, plansTag, 'arca-plans');
+      plans.replaceWith(next);
+      plans = next;
+    }
     plans.textContent = plansCount ? `${plansCount} waiting plan${plansCount === 1 ? '' : 's'}` : '';
     plans.hidden = plansCount === 0;
-    plans.className = plansCount ? 'arca-plans is-link' : 'arca-plans';
-    if (plansCount && url) plans.setAttribute('role', 'link');
-    else plans.removeAttribute('role');
-    plans.onclick = plansCount && url ? () => { location.href = url; } : null;
-    plans.tabIndex = plansCount && url ? 0 : -1;
+    plans.className = plansCount && url ? 'arca-plans is-link' : 'arca-plans';
+    if (plansCount && url) plans.href = url;
     const deviceState = snapshot.devices;
     const staleAge = deviceState === 'stale' ? ageLabel(snapshot.devicesAt) : null;
     const deviceLabelText = deviceState === 'unavailable' ? 'Devices unavailable'

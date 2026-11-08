@@ -93,13 +93,14 @@
     for (const device of devices) {
       const matches = instancesByName.get(text(device.name)) ?? [];
       if (matches.length !== 1) {
-        unplaced.push({ ...device, reason: matches.length ? "name matches more than one instance" : "no instance with this name" });
+        device.reason = matches.length ? "name matches more than one instance" : "no instance with this name";
+        unplaced.push(device);
         continue;
       }
       const key = instanceKey(machine ?? {}, matches[0].project, matches[0].name);
-      const matched = { ...device, matched: { project: matches[0].project, name: matches[0].name } };
+      device.matched = { project: text(matches[0].project, "default"), name: matches[0].name };
       if (!placed.has(key)) placed.set(key, []);
-      placed.get(key).push(matched);
+      placed.get(key).push(device);
     }
     const databases = list(snapshot.databases).map((row) => ({ ...row, kind: "database" }));
     const databasesByInstance = /* @__PURE__ */ new Map();
@@ -232,9 +233,7 @@
   }
   function ownerLabel(owner) {
     const value = text(owner?.class ?? owner, "unknown");
-    if (["kernel", "retained"].includes(value)) return "Managed by Arca";
-    if (value === "droidd") return "Droidd";
-    return humanize(value);
+    return ["kernel", "retained"].includes(value) ? "Managed by Arca" : "External";
   }
 
   // src/render.js
@@ -311,7 +310,7 @@
     const remoteView = (root2.dataset?.arcaBase ?? "").includes("/approve/canvas");
     const context = el(doc, "span", "arca-context", remoteView ? "Remote view" : "");
     const deviceBadge = el(doc, "span", "arca-devices");
-    const plans = el(doc, "span", "arca-plans");
+    let plans = el(doc, "span", "arca-plans");
     topbar.append(brand, readOnly, ...remoteView ? [context] : [], deviceBadge, plans);
     const main = el(doc, "div", "arca-main");
     const rail = el(doc, "nav", "arca-rail");
@@ -634,7 +633,12 @@
         hostFrame.append(projects);
         const devicesFrame = el(doc, "section", "arca-devices-frame arca-host-devices");
         devicesFrame.append(el(doc, "h3", "", "Devices"));
-        if (!model.host.devices.length) devicesFrame.append(el(doc, "p", "arca-frame-empty", "No phones or desktops returned."));
+        if (!model.host.devices.length) devicesFrame.append(el(
+          doc,
+          "p",
+          "arca-frame-empty",
+          ["off", "unavailable", "unreachable"].includes(snapshot.devices) ? "Device data unavailable." : "No phones or desktops returned."
+        ));
         for (const device of model.host.devices) {
           const row = el(doc, "div", "arca-device-row");
           const place = device.matched ? `${device.matched.project}/${device.matched.name} \xB7 matched by name` : device.reason ?? "not placed";
@@ -790,15 +794,16 @@
       }
       const plansCount = list2(snapshot.plans).length;
       const url = approvalUrl(snapshot.approvalUrl);
+      const plansTag = plansCount && url ? "a" : "span";
+      if (plans.localName !== plansTag) {
+        const next = el(doc, plansTag, "arca-plans");
+        plans.replaceWith(next);
+        plans = next;
+      }
       plans.textContent = plansCount ? `${plansCount} waiting plan${plansCount === 1 ? "" : "s"}` : "";
       plans.hidden = plansCount === 0;
-      plans.className = plansCount ? "arca-plans is-link" : "arca-plans";
-      if (plansCount && url) plans.setAttribute("role", "link");
-      else plans.removeAttribute("role");
-      plans.onclick = plansCount && url ? () => {
-        location.href = url;
-      } : null;
-      plans.tabIndex = plansCount && url ? 0 : -1;
+      plans.className = plansCount && url ? "arca-plans is-link" : "arca-plans";
+      if (plansCount && url) plans.href = url;
       const deviceState = snapshot.devices;
       const staleAge = deviceState === "stale" ? ageLabel(snapshot.devicesAt) : null;
       const deviceLabelText = deviceState === "unavailable" ? "Devices unavailable" : deviceState === "unreachable" ? "Devices unreachable" : deviceState === "stale" ? `Devices stale${staleAge ? ` \xB7 ${staleAge}` : ""}` : "";

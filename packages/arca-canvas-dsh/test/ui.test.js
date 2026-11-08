@@ -35,6 +35,28 @@ test('phones and desktops join only one exact instance name', () => {
   assert.ok(tree.notPlaced.devices.some((device) => device.name === 'phone-x'));
 });
 
+test('host devices retain each exact match or unmatched reason without changing the snapshot', () => {
+  const snapshot = {
+    machine: { node: 'example' },
+    instances: [
+      { name: 'phone', project: 'alpha' }, { name: 'desktop', project: 'beta' },
+      { name: 'worker', project: 'alpha' }, { name: 'worker', project: 'beta' },
+    ],
+    phones: [{ name: 'phone' }, { name: 'worker' }, { name: 'missing' }],
+    desktops: [{ name: 'desktop' }],
+  };
+  const original = structuredClone(snapshot);
+  const tree = buildTree(snapshot);
+  assert.deepEqual(tree.host.devices.map(({ name, matched, reason }) => ({ name, matched, reason })), [
+    { name: 'phone', matched: { project: 'alpha', name: 'phone' }, reason: undefined },
+    { name: 'worker', matched: undefined, reason: 'name matches more than one instance' },
+    { name: 'missing', matched: undefined, reason: 'no instance with this name' },
+    { name: 'desktop', matched: { project: 'beta', name: 'desktop' }, reason: undefined },
+  ]);
+  assert.deepEqual(tree.notPlaced.devices, tree.host.devices.filter((device) => device.reason));
+  assert.deepEqual(snapshot, original);
+});
+
 test('a database is placed in one exactly named instance when known', () => {
   const tree = buildTree({
     ...fixture,
@@ -83,10 +105,16 @@ test('project status leads with running and stopped counts', () => {
   assert.equal(empty.status, 'Empty Incus project');
 });
 
-test('alerts are firing-only and owner labels do not fold classes', () => {
+test('alerts are firing-only and only kernel and retained owners are managed', () => {
   assert.deepEqual(alertRows({ firing: [{ rule: 'cpu' }], unknown: [{ rule: 'disk' }], resolvedRecent: [{ rule: 'old' }] }).map((row) => row.rule), ['cpu']);
-  for (const [owner, label] of [['kernel', 'Managed by Arca'], ['retained', 'Managed by Arca'], ['droidd', 'Droidd'], ['foreign', 'Foreign'], ['contested', 'Contested']]) {
+  for (const [owner, label] of [
+    ['kernel', 'Managed by Arca'], ['retained', 'Managed by Arca'],
+    ['droidd', 'External'], ['foreign', 'External'], ['contested', 'External'],
+    ['unknown', 'External'], ['custom', 'External'], ['', 'External'],
+    [null, 'External'], [undefined, 'External'],
+  ]) {
     assert.equal(ownerLabel({ class: owner }), label);
+    assert.equal(ownerLabel(owner), label);
   }
 });
 
@@ -102,7 +130,7 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
   const dir = await mkdtemp(join(tmpdir(), 'arca-canvas-build-'));
   try {
     await buildBrowser(dir);
-    for (const name of ['page.js', 'page.css']) {
+    for (const name of ['client.js', 'page.js', 'page.css']) {
       const fresh = createHash('sha256').update(await readFile(join(dir, name))).digest('hex');
       const committed = createHash('sha256').update(await readFile(join(here, '..', name))).digest('hex');
       assert.equal(committed, fresh, name);

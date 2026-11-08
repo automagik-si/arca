@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +14,9 @@ const html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta n
 
 test('hosts, projects, selection, URL and retained state survive live polls', async (t) => {
   let data = fixture;
+  const methods = [];
   const server = createServer((req, res) => {
+    methods.push(req.method);
     const path = new URL(req.url, 'http://local').pathname;
     if (path === '/arca-canvas') { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(html); return; }
     if (path === '/arca-canvas/page.js') { res.writeHead(200, { 'Content-Type': 'text/javascript' }); res.end(pageJs); return; }
@@ -49,13 +51,111 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   assert.match(await page.locator('.arca-project-tile').first().innerText(), /\d+ running/);
   assert.doesNotMatch(await page.locator('.arca-project-tile').first().innerText(), /\d+ instances/);
   assert.equal(await page.locator('.arca-host-devices .arca-device-row').count(), 6);
-  assert.match(await page.locator('.arca-host-devices').innerText(), /alpha-node-01/);
+  for (const [name, placement] of [
+    ['alpha-node-01', 'alpha/alpha-node-01 · matched by name'],
+    ['beta-node-01', 'beta/beta-node-01 · matched by name'],
+    ['gamma-node-02', 'gamma/gamma-node-02 · matched by name'],
+    ['worker', 'no instance with this name'],
+    ['phone-x', 'no instance with this name'],
+    ['desk-x', 'no instance with this name'],
+  ]) {
+    const row = await page.locator('.arca-host-devices .arca-device-row').filter({ hasText: name }).innerText();
+    assert.ok(row.includes(placement), `${name}: ${row}`);
+  }
   assert.equal(await page.locator('.arca-rail-row[data-kind="not-placed"]').count(), 1);
   assert.equal(await page.locator('.arca-rail-row[data-kind="databases"]').count(), 1);
   assert.match(await page.locator('.arca-rail-row[data-kind="project"]').first().innerText(), /\d+ running/);
   assert.match(await page.locator('.arca-host-alerts').innerText(), /1 firing alert/);
   assert.match(await page.locator('.arca-host-alerts .arca-no-data').innerText(), /1 check has no data/);
-  assert.equal(await page.locator('.arca-plans').getAttribute('role'), 'link');
+  assert.equal(await page.getByRole('link', { name: '1 waiting plan', exact: true }).getAttribute('href'), fixture.approvalUrl);
+
+  await t.test('light and dark tokens keep the no-data count muted and readable', async () => {
+    const luminance = (rgb) => {
+      const channels = rgb.match(/\d+/g).slice(0, 3).map((value) => {
+        const channel = Number(value) / 255;
+        return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+      });
+      return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+    };
+    const measurements = {};
+    for (const [theme, expected] of [
+      ['light', { bg: '#f4f4f7', surface: '#ffffff', ink: '#0c0d11', muted: '#5d6170', color: 'rgb(93, 97, 112)' }],
+      ['dark', { bg: '#0b0b0f', surface: '#15161c', ink: '#f1f2f6', muted: '#a4a9b7', color: 'rgb(164, 169, 183)' }],
+    ]) {
+      await page.emulateMedia({ colorScheme: theme });
+      const actual = await page.evaluate(() => {
+        const shell = getComputedStyle(document.querySelector('.arca-canvas'));
+        return {
+          tokens: Object.fromEntries(['bg', 'surface', 'ink', 'muted'].map((name) => [name, shell.getPropertyValue(`--arca-${name}`).trim()])),
+          noData: getComputedStyle(document.querySelector('.arca-no-data')).color,
+          firing: getComputedStyle(document.querySelector('.arca-alert-firing')).color,
+          background: getComputedStyle(document.querySelector('.arca-host-frame')).backgroundColor,
+          rectangles: Object.fromEntries(['.arca-rail', '.arca-stage', '.arca-detail', '.arca-host-frame', '.arca-host-devices', '.arca-no-data']
+            .map((selector) => [selector, document.querySelector(selector).getBoundingClientRect().toJSON()])),
+        };
+      });
+      const { color, ...tokens } = expected;
+      assert.deepEqual(actual.tokens, tokens);
+      assert.equal(actual.noData, color);
+      assert.notEqual(actual.noData, actual.firing);
+      const contrast = (Math.max(luminance(actual.noData), luminance(actual.background)) + 0.05)
+        / (Math.min(luminance(actual.noData), luminance(actual.background)) + 0.05);
+      assert.ok(contrast >= 4.5, `${theme} no-data contrast: ${contrast}`);
+      measurements[theme] = { viewport: page.viewportSize(), ...actual, contrast };
+      if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
+        await mkdir(process.env.ARCA_CANVAS_EVIDENCE_DIR, { recursive: true });
+        await page.screenshot({ path: join(process.env.ARCA_CANVAS_EVIDENCE_DIR, `host-${theme}.png`) });
+      }
+    }
+    if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
+      await writeFile(join(process.env.ARCA_CANVAS_EVIDENCE_DIR, 'rectangles.json'), `${JSON.stringify(measurements, null, 2)}\n`);
+    }
+    await page.emulateMedia({ colorScheme: 'light' });
+  });
+
+  await t.test('waiting plans use a native keyboard link only with a valid approval URL', async () => {
+    data = { ...fixture, plans: [] };
+    await page.waitForFunction(() => document.querySelector('.arca-plans').hidden);
+    assert.equal(await page.locator('a.arca-plans').count(), 0);
+    assert.equal(await page.getByRole('link', { name: /waiting plan/ }).count(), 0);
+    assert.equal(await page.locator('.arca-plans').textContent(), '');
+    for (const [index, url] of ['', '/approve', 'javascript:alert(1)', 'https://user:pass@example.com/approve'].entries()) {
+      data = { ...fixture, approvalUrl: url, plans: Array(index + 1).fill(fixture.plans[0]) };
+      const label = `${index + 1} waiting plan${index ? 's' : ''}`;
+      await page.waitForFunction((text) => document.querySelector('.arca-plans').textContent === text, label);
+      assert.equal(await page.locator('.arca-plans').evaluate((node) => node.localName), 'span');
+      assert.equal(await page.locator('.arca-plans').getAttribute('href'), null);
+      assert.equal(await page.getByRole('link', { name: /waiting plan/ }).count(), 0);
+      assert.equal(await page.locator('.arca-plans.is-link').count(), 0);
+    }
+    data = fixture;
+    await page.waitForSelector('a.arca-plans');
+    const link = page.getByRole('link', { name: '1 waiting plan', exact: true });
+    await link.focus();
+    await page.waitForTimeout(250);
+    assert.equal(await link.evaluate((node) => node === document.activeElement), true);
+    await page.route(fixture.approvalUrl, (route) => route.fulfill({ contentType: 'text/html', body: '<p>Approval destination</p>' }));
+    await link.press('Enter');
+    await page.waitForURL(fixture.approvalUrl);
+    await page.goBack();
+    await page.waitForSelector('.arca-project-tile');
+  });
+
+  await t.test('host device rows distinguish ambiguous names and unavailable data from empty lists', async () => {
+    data = { ...fixture, instances: [...fixture.instances, { name: 'worker', project: 'alpha' }, { name: 'worker', project: 'beta' }] };
+    await page.waitForFunction(() => document.querySelector('.arca-host-devices').textContent.includes('name matches more than one instance'));
+    assert.match(await page.locator('.arca-host-devices .arca-device-row').filter({ hasText: 'worker' }).innerText(), /name matches more than one instance/);
+    for (const state of ['off', 'unavailable', 'unreachable', 'ok']) {
+      data = { ...fixture, devices: state, phones: [], desktops: [] };
+      await page.waitForFunction((expected) => [...document.querySelectorAll('.arca-field')]
+        .some((node) => node.firstChild.textContent === 'Devices' && node.lastChild.textContent === expected), state);
+      assert.equal(await page.locator('.arca-host-devices .arca-frame-empty').textContent(),
+        state === 'ok' ? 'No phones or desktops returned.' : 'Device data unavailable.');
+      assert.equal(await page.locator('.arca-host-devices .arca-device-row').count(), 0);
+    }
+    data = fixture;
+    await page.waitForSelector('.arca-host-devices .arca-device-row');
+  });
 
   await page.evaluate(() => {
     document.querySelector('.arca-rail-row[data-kind="host"]').dataset.marker = 'keep';
@@ -79,6 +179,7 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   await page.waitForFunction(() => document.querySelector('.arca-detail-title')?.textContent === 'alpha-node-01');
   assert.equal(new URL(page.url()).hash, '#project/alpha/instance/alpha-node-01');
   assert.equal(await page.locator('.arca-canvas-node.is-selected').count(), 1);
+  assert.match(await page.locator('.arca-field').filter({ hasText: 'Owner' }).innerText(), /External/);
 
   await page.goBack();
   await page.waitForFunction(() => location.hash === '#project/alpha');
@@ -128,5 +229,6 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   assert.equal(await page.locator('.arca-project-tile a').count(), 0);
   assert.equal(await page.locator('.arca-project-tile img').count(), 0);
   assert.doesNotMatch(pageJs.toString(), /\.innerHTML\b/);
+  assert.ok(methods.every((method) => method === 'GET'));
   assert.deepEqual(errors, []);
 });

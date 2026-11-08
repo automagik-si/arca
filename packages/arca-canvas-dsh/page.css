@@ -1108,6 +1108,9 @@ button.arca-node-card:focus-visible {
 .arca-alert-firing {
   color: var(--arca-warn-ink);
 }
+.arca-no-data {
+  color: var(--arca-muted);
+}
 .arca-host-devices .arca-device-row {
   grid-template-columns: auto minmax(0, 1fr);
 }

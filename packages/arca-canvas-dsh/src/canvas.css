@@ -331,5 +331,6 @@ button.arca-node-card:focus-visible { outline: 2px solid var(--arca-accent); out
 
 .arca-host-alerts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--arca-line); font-size: 11px; }
 .arca-alert-firing { color: var(--arca-warn-ink); }
+.arca-no-data { color: var(--arca-muted); }
 .arca-host-devices .arca-device-row { grid-template-columns: auto minmax(0, 1fr); }
 .arca-host-devices .arca-device-match { grid-column: 2; text-align: left; }
