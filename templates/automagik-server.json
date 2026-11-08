@@ -1,0 +1,13 @@
+{
+  "name": "automagik-server",
+  "description": "Automagik server 3.95.0 (ghcr.io/automagik-dev/automagik-server pinned by digest): DeepSeek Harness web on 127.0.0.1:3081; /data is its own volume; reachable at the host's LAN address on :3081.",
+  "kind": "oci",
+  "image": "ghcr.io/automagik-dev/automagik-server",
+  "digest": "sha256:671cdd101bc48863974c22b8331c4e390bbfaca3de4d2cd7f51491068105e450",
+  "entrypoint": ["/nodejs/bin/node", "/opt/automagik/entrypoint.mjs"],
+  "ports": [3081],
+  "data": { "path": "/data", "uid": 1000, "gid": 1000 },
+  "limits": { "cpu": "4", "memory": "4GiB" },
+  "autostart": true,
+  "lan": { "port": 3081 }
+}
