@@ -97,11 +97,11 @@ test('token is read again between initialize and tools/call, and on later calls'
   assert.equal(calls.length, 4);
 });
 
-test('all six fixtures become one snapshot with project-qualified instances', async (t) => {
+test('all seven fixtures become one snapshot with project-qualified instances', async (t) => {
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'metrics', 'alerts', 'plans', 'devices', 'devicesAt', 'phones', 'desktops']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'devices', 'devicesAt', 'phones', 'desktops']);
   assert.equal(snapshot.instancesKnown, true);
   assert.deepEqual(snapshot.projects, fixtures.watch_report.projects.map(({ project }) => project));
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
@@ -113,7 +113,9 @@ test('all six fixtures become one snapshot with project-qualified instances', as
   assert.deepEqual(snapshot.metrics, fixtures.node_metrics);
   assert.deepEqual(snapshot.alerts, fixtures.alerts_list);
   assert.deepEqual(snapshot.plans, fixtures.plan_list.plans);
-  assert.equal(calls.length, 12);
+  assert.deepEqual(snapshot.journal, fixtures.journal_list.records);
+  assert.equal(snapshot.journalKnown, true);
+  assert.equal(calls.length, 14);
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
@@ -200,11 +202,24 @@ test('redacts bearer echoes in structured content, text content and object keys'
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
+test('journal_list failure leaves no invented records and keeps the host useful', async (t) => {
+  const { config } = await sandbox(t);
+  await fakeArca(t, config, (body) => body.params.name === 'journal_list'
+    ? { jsonrpc: '2.0', id: body.id, error: { code: -32000, message: sentinel } }
+    : toolResult(body, fixtures[body.params.name]));
+  const snapshot = await collectSnapshot(createArcaClient(config));
+  assert.match(snapshot.error, /journal_list: Arca could not complete/);
+  assert.deepEqual(snapshot.journal, []);
+  assert.equal(snapshot.journalKnown, false);
+  assert.deepEqual(snapshot.machine, fixtures.arca_status);
+  assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
+});
+
 test('cache polls repeatedly, retains successes, and stops cleanly', async () => {
   let count = 0;
   const cache = createSnapshotCache({ async call(tool) { count++; return fixtures[tool]; } }, 10);
   try {
-    await until(() => count >= 12 && cache.get().error === null);
+    await until(() => count >= 14 && cache.get().error === null);
     assert.deepEqual(cache.get().machine, fixtures.arca_status);
     cache.stop();
     const stoppedAt = count;
@@ -232,6 +247,8 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   const { dir, config } = await sandbox(t);
   config.approvalUrl = 'https://example.com/approve';
   config.nodeName = 'Example machine';
+  config.projects = [{ name: 'Example project', domain: 'example.test', members: [{ host: 'Example machine', incusProject: 'default', instance: 'worker' }] }];
+  config.defaultProject = 'Example project';
   const calls = await fakeArca(t, config, (body) => toolResult(body,
     body.params.name === 'arca_status' ? { ...fixtures.arca_status, node: '<script>untrusted</script>' } : fixtures[body.params.name]));
   const routes = [];
@@ -249,7 +266,7 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   const web = createServer((req, res) => routes[0].handler(req, res));
   await new Promise((resolve) => web.listen(socketPath, resolve));
   t.after(() => new Promise((resolve) => web.close(resolve)));
-  await until(() => calls.length >= 12);
+  await until(() => calls.length >= 14);
   let snapshot;
   for (let attempts = 0; attempts < 100; attempts++) {
     snapshot = await exchange(socketPath, '/arca-canvas/snapshot?cached=1');
@@ -259,6 +276,8 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   assert.equal(snapshot.status, 200);
   assert.equal(JSON.parse(snapshot.body).approvalUrl, config.approvalUrl);
   assert.equal(JSON.parse(snapshot.body).hosts[0].nodeName, 'Example machine');
+  assert.deepEqual(JSON.parse(snapshot.body).projects, config.projects);
+  assert.equal(JSON.parse(snapshot.body).defaultProject, 'Example project');
   assert.equal(JSON.parse(snapshot.body).hosts[0].machine.node, '<script>untrusted</script>');
   assert.equal(snapshot.headers['cache-control'], 'no-store');
   const page = await exchange(socketPath, '/arca-canvas');
@@ -292,7 +311,7 @@ test('bundle patch has one configured row and schema rejects invalid settings', 
   assert.equal(row.failOnStartupError, false);
   assert.deepEqual(plugin.inject, ['webServer']);
   const validate = (config) => plugin.Config['~standard'].validate(config);
-  assert.deepEqual(validate(row.config).value, row.config);
+  assert.deepEqual(validate(row.config).value, { ...row.config, defaultProject: '' });
   assert.ok(validate({ ...row.config, pollMs: 0 }).issues);
   assert.ok(validate({ ...row.config, socketPath: 'relative.sock' }).issues);
   assert.ok(validate({ ...row.config, nodeName: 42 }).issues);
@@ -310,6 +329,39 @@ test('bundle patch has one configured row and schema rejects invalid settings', 
   assert.equal(validate(withoutDevices).value.devicesTokenPath, '');
   const { pollMs, ...minimal } = row.config;
   assert.equal(validate(minimal).value.pollMs, 5000);
+});
+
+test('project config validates owner groups, members and the default project', () => {
+  const validate = (config) => plugin.Config['~standard'].validate(config);
+  const base = {
+    hosts: [
+      { name: 'alpha', socketPath: '/example/alpha.sock', viewerTokenPath: '/example/alpha.token' },
+      { name: 'beta', socketPath: '/example/beta.sock', viewerTokenPath: '/example/beta.token' },
+    ],
+    projects: [
+      { name: 'Studio', domain: 'studio.example', members: [{ host: 'alpha', incusProject: 'plumbing', instance: 'app' }] },
+      { name: 'Automation', members: [{ host: 'beta', incusProject: 'sandbox', instance: 'queue' }] },
+    ],
+    defaultProject: 'Studio',
+  };
+  const valid = validate(base);
+  assert.equal(valid.issues, undefined);
+  assert.equal(valid.value.defaultProject, 'Studio');
+  assert.equal(valid.value.projects[0].domain, 'studio.example');
+  const invalid = [
+    { ...base, projects: [] },
+    { ...base, projects: [{ ...base.projects[0], name: '  ' }] },
+    { ...base, projects: [base.projects[0], { ...base.projects[1], name: 'Studio' }] },
+    { ...base, projects: [{ ...base.projects[0], members: [] }] },
+    { ...base, projects: [{ ...base.projects[0], members: [{ host: 'missing', incusProject: 'p', instance: 'i' }] }] },
+    { ...base, projects: [{ ...base.projects[0], members: [{ host: 'alpha', incusProject: '', instance: 'i' }] }] },
+    { ...base, projects: [base.projects[0], { ...base.projects[1], members: [{ ...base.projects[0].members[0] }] }] },
+    { ...base, defaultProject: 'Missing' },
+    { ...base, projects: undefined },
+  ];
+  for (const config of invalid) assert.ok(validate(config).issues, 'invalid project config must fail');
+  const hostOnly = validate({ ...base, projects: undefined, defaultProject: '' });
+  assert.equal(hostOnly.issues, undefined);
 });
 
 test('built client registers a browser-only module without host imports', async () => {
@@ -386,8 +438,12 @@ test('host snapshot route returns Arca cards within 100ms while device HTTP neve
   await until(() => deviceRequests === 1);
   await new Promise((resolve) => setTimeout(resolve, 130));
   const pollStart = performance.now();
-  const next = (await (await fetch(url)).json()).hosts[0];
+  let next = (await (await fetch(url)).json()).hosts[0];
   assert.ok(performance.now() - pollStart < 100, 'host route must serve cached data promptly');
+  for (let attempt = 0; attempt < 20 && next.at === snapshot.at; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    next = (await (await fetch(url)).json()).hosts[0];
+  }
   assert.notEqual(next.at, snapshot.at, 'Arca keeps polling during the pending device phase');
   assert.equal(next.error, null);
   await fiber.dispose();

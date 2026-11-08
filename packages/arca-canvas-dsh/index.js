@@ -16,6 +16,16 @@ const hostConfig = z.object({
   devicesUrl: z.string(),
   devicesTokenPath: z.string(),
 });
+const memberConfig = z.object({
+  host: z.string().required(),
+  incusProject: z.string().required(),
+  instance: z.string().required(),
+});
+const projectConfig = z.object({
+  name: z.string().required(),
+  domain: z.string().default(''),
+  members: z.array(memberConfig).required(),
+});
 export const Config = z.transform(z.object({
   hosts: z.array(hostConfig).default(undefined),
   socketPath: z.string().pattern(/^\//),
@@ -28,8 +38,12 @@ export const Config = z.transform(z.object({
   }),
   devicesUrl: z.string().default(''),
   devicesTokenPath: z.string().default(''),
+  projects: z.array(projectConfig).default(undefined),
+  defaultProject: z.string().default(''),
 }), (config) => {
   const invalid = (message) => { throw new z.ValidationError(message, { path: ['hosts'] }); };
+  const invalidProjects = (message) => { throw new z.ValidationError(message, { path: ['projects'] }); };
+  let hostNames;
   if (config.hosts !== undefined) {
     if (!config.hosts.length) invalid('hosts must contain at least one host');
     const names = new Set();
@@ -37,8 +51,37 @@ export const Config = z.transform(z.object({
       if (!host.name.trim() || names.has(host.name)) invalid('Host names must be non-empty and unique');
       names.add(host.name);
     }
+    hostNames = names;
   } else if (!config.socketPath || !config.viewerTokenPath) {
     invalid('socketPath and viewerTokenPath are required without hosts');
+  } else {
+    hostNames = new Set([((config.nodeName ?? hostname()).trim() || 'Machine')]);
+  }
+  if (config.projects !== undefined) {
+    if (!config.projects.length) invalidProjects('projects must contain at least one project');
+    const names = new Set();
+    const memberships = new Set();
+    for (const project of config.projects) {
+      project.name = project.name.trim();
+      project.domain = (project.domain ?? '').trim();
+      if (!project.name || names.has(project.name)) invalidProjects('Project names must be non-empty and unique');
+      names.add(project.name);
+      if (!project.members.length) invalidProjects(`Project ${project.name} must contain at least one member`);
+      for (const member of project.members) {
+        member.host = member.host.trim();
+        member.incusProject = member.incusProject.trim();
+        member.instance = member.instance.trim();
+        if (!member.host || !member.incusProject || !member.instance) invalidProjects('Project members require a non-empty host, incusProject and instance');
+        if (hostNames && !hostNames.has(member.host)) invalidProjects(`Project ${project.name} names an unknown host`);
+        const key = JSON.stringify([member.host, member.incusProject, member.instance]);
+        if (memberships.has(key)) invalidProjects('An instance can belong to only one project');
+        memberships.add(key);
+      }
+    }
+    config.defaultProject = (config.defaultProject ?? '').trim();
+    if (config.defaultProject && !names.has(config.defaultProject)) invalidProjects('defaultProject must name a configured project');
+  } else if ((config.defaultProject ?? '').trim()) {
+    invalidProjects('defaultProject requires projects');
   }
   return config;
 });
@@ -87,6 +130,12 @@ export function apply(ctx, config) {
         res.end(JSON.stringify({
           at: new Date().toISOString(),
           approvalUrl: approvalUrl(config.approvalUrl),
+          projects: (config.projects ?? []).map(({ name, domain, members }) => ({
+            name,
+            domain: domain ?? '',
+            members: members.map(({ host, incusProject, instance }) => ({ host, incusProject, instance })),
+          })),
+          defaultProject: (config.defaultProject ?? '').trim(),
           hosts: caches.map(({ name, cache }) => {
             const { approvalUrl: unused, ...snapshot } = cache.get();
             return { name, ...snapshot };

@@ -15,6 +15,8 @@ export function emptySnapshot(config = {}) {
     metrics: null,
     alerts: [],
     plans: [],
+    journal: [],
+    journalKnown: false,
     devices: 'off',
     devicesAt: null,
     phones: [],
@@ -42,6 +44,10 @@ export async function collectSnapshot(client, config = {}) {
     ['metrics', 'node_metrics', (value) => value],
     ['alerts', 'alerts_list', (value) => value],
     ['plans', 'plan_list', (value) => rows(value.plans)],
+    ['journal', 'journal_list', (value) => {
+      snapshot.journalKnown = true;
+      return rows(value.records);
+    }],
   ];
   const errors = await Promise.all(reads.map(async ([key, tool, convert]) => {
     try {
