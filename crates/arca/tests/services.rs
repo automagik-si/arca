@@ -345,20 +345,6 @@ fn nats_template() -> Value {
 #[test]
 fn service_create_list_status_round_trip() {
     let rig = Rig::new();
-    let node_status = StatusHandler {
-        node: "node1".into(),
-        mode: "kernel",
-        kernel: Arc::clone(&rig.kernel),
-        started: std::time::Instant::now(),
-        socket: rig.fake.socket().to_path_buf(),
-    };
-    let doctor = Caller {
-        token_id: "doctor".into(),
-        scope: Scope::Doctor,
-        tools: None,
-    };
-    let before = node_status.call(json!({}), &doctor).expect("node status");
-    assert_eq!(before["appliedSeq"], Value::Null);
     rig.template("nats", nats_template());
     let created = rig
         .call("service_create", json!({"name":"nats","template":"nats"}))
@@ -370,13 +356,6 @@ fn service_create_list_status_round_trip() {
     assert_eq!(created["ports"], json!([4222]));
     assert_eq!(created["links"], json!([]));
     assert_eq!(created["published"], Value::Null);
-    let after = node_status.call(json!({}), &doctor).expect("node status");
-    let desired: Value =
-        serde_json::from_slice(&fs::read(rig.dir.join("desired.json")).expect("desired state"))
-            .expect("desired JSON");
-    assert_eq!(after["mode"], "kernel");
-    assert_eq!(after["appliedSeq"], desired["current"]["document"]["seq"]);
-    assert!(after["appliedSeq"].as_u64().expect("applied sequence") >= 1);
     let listed = rig.call("service_list", json!({})).expect("list");
     assert_eq!(listed["services"], json!([created]));
     let status = rig
@@ -394,6 +373,61 @@ fn service_create_list_status_round_trip() {
         ))
         .expect("acl");
     assert_eq!(acl["config"]["user.arca.managed"], "true");
+}
+
+#[test]
+fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("create");
+    let kernel = rig.kernel.lock().expect("kernel");
+    let seq = kernel.applied_seq().expect("applied sequence");
+    let status = Arc::new(StatusHandler {
+        node: "node1".into(),
+        mode: "kernel",
+        applied_seq: kernel.applied_seq_reader(),
+        started: std::time::Instant::now(),
+        socket: rig.fake.socket().to_path_buf(),
+    });
+    let caller = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = Arc::clone(&status);
+    let worker = std::thread::spawn(move || {
+        send.send(reader.call(json!({}), &caller)).expect("reply");
+    });
+    let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+    drop(kernel);
+    worker.join().expect("status thread");
+    let row = result
+        .expect("status does not wait for the kernel lock")
+        .expect("status");
+    assert_eq!(row["appliedSeq"], seq);
+
+    let kernel = Arc::clone(&rig.kernel);
+    assert!(
+        std::thread::spawn(move || {
+            let _held = kernel.lock().expect("kernel");
+            panic!("poison the kernel lock");
+        })
+        .join()
+        .is_err()
+    );
+    let row = status
+        .call(
+            json!({}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        )
+        .expect("status survives a poisoned kernel lock");
+    assert_eq!(row["appliedSeq"], seq);
 }
 
 fn hand_instance(name: &str, project: &str, devices: Value) -> Value {

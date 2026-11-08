@@ -31,7 +31,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::NodeConfig;
-use crate::kernel::{JOURNAL_FILE, Kernel};
+use crate::kernel::{AppliedSeq, JOURNAL_FILE, Kernel};
 
 /// Answers from the public ontology embedded in the binary, without reading node state.
 pub struct OntologyQuery;
@@ -407,14 +407,14 @@ pub fn run_row<R: IncusRead>(sampler: &Sampler<R>, now: u64) -> Value {
 pub struct StatusHandler {
     pub node: String,
     pub mode: &'static str,
-    pub kernel: Arc<Mutex<Kernel>>,
+    pub applied_seq: AppliedSeq,
     pub started: Instant,
     pub socket: PathBuf,
 }
 
 impl ToolHandler for StatusHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
-        let applied_seq = lock(&self.kernel)?.applied_seq();
+        let applied_seq = self.applied_seq.load();
         let incus_reachable = UnixIncus::new(self.socket.clone()).get("/1.0").is_ok();
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),

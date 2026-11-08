@@ -437,6 +437,86 @@ fn a_node_with_kernel_projects_reports_kernel_mode_before_any_document_applies()
 }
 
 #[test]
+fn kernel_status_reports_the_applied_sequence_after_service_create() {
+    status_after_service_create(false);
+}
+
+#[test]
+fn kernel_status_reloads_the_applied_sequence_after_restart() {
+    status_after_service_create(true);
+}
+
+fn status_after_service_create(restart: bool) {
+    let scratch = Scratch::new("applied-status");
+    let rig = rig(&scratch);
+    rig.fake.add_profile(
+        "default",
+        json!({
+            "name": "default", "config": {},
+            "devices": {"root": {"type": "disk", "pool": "default", "path": "/"}}
+        }),
+    );
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, rig.fake.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["kernel"]["projects"] = json!([arca_netproject::PROJECT]);
+    cfg["kernel"]["serviceCidr"] = json!("192.0.2.0/24");
+    fs::write(&config, cfg.to_string()).expect("write kernel config");
+    let templates = scratch.at("state/templates");
+    fs::create_dir(&templates).expect("templates");
+    fs::write(
+        templates.join("nats.json"),
+        json!({
+            "name": "nats", "kind": "oci", "image": "docker.io/library/nats",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ports": [4222], "env": {}, "publishable": false
+        })
+        .to_string(),
+    )
+    .expect("template");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (status, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(
+            1,
+            "service_create",
+            json!({"name":"nats", "template":"nats"}),
+        ),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(tool_result(&text)["state"], "running");
+    let desired: Value =
+        serde_json::from_slice(&fs::read(scratch.at("state/desired.json")).expect("desired state"))
+            .expect("desired JSON");
+    let seq = desired["current"]["document"]["seq"]
+        .as_u64()
+        .expect("document sequence");
+    assert!(seq >= 1);
+
+    if restart {
+        assert_eq!(serve.terminate().code(), Some(0));
+        serve = start_serve(&config);
+        wait_for_server(&mut serve, &socket);
+    }
+    let (status, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(2, "arca_status", json!({})),
+    );
+    assert_eq!(status, 200);
+    let row = tool_result(&text);
+    conforming("arca_status", &row);
+    assert_eq!(row["mode"], "kernel");
+    assert_eq!(row["appliedSeq"], seq);
+    assert_eq!(serve.terminate().code(), Some(0));
+}
+
+#[test]
 fn a_state_directory_another_user_may_read_is_refused_at_start_and_no_node_key_is_made() {
     let scratch = Scratch::new("statedir");
     let rig = rig(&scratch);

@@ -2,6 +2,10 @@
 //! method takes `&mut self`, so the verbs reach the kernel through one lock, and no two calls run at once.
 
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, ArcaAction, FileNonces, OwnerKeys, PasskeyLine,
@@ -22,9 +26,26 @@ use crate::desired_store::{DesiredStore, EntryChange, STATE_FILE};
 /// The journal's file name in the state directory.
 pub const JOURNAL_FILE: &str = "journal.jsonl";
 
+/// The last applied sequence, readable without taking the kernel lock. Zero means no document has applied; valid sequences
+/// start at one. This value publishes only the sequence, not any other kernel state.
+#[derive(Clone, Default)]
+pub struct AppliedSeq(Arc<AtomicU64>);
+
+impl AppliedSeq {
+    pub fn load(&self) -> Option<u64> {
+        let seq = self.0.load(Ordering::Relaxed);
+        (seq != 0).then_some(seq)
+    }
+
+    fn publish(&self, seq: Option<u64>) {
+        self.0.store(seq.unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
 /// The kernel of one node: its desired-state store, its reconciler and the approval verifier for delete plans.
 pub struct Kernel {
     store: DesiredStore,
+    applied_seq: AppliedSeq,
     reconciler: Reconciler<FileJournal>,
     retained: RetainedSet,
     verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
@@ -84,8 +105,11 @@ impl Kernel {
         let converged = reconciler.converged();
         let retained_entries = retained.entries().map_err(retained_failure)?;
         store.save_applied(converged, retained_entries)?;
+        let applied_seq = AppliedSeq::default();
+        applied_seq.publish(store.applied().map(|applied| applied.seq));
         Ok(Kernel {
             store,
+            applied_seq,
             reconciler,
             retained,
             verifier,
@@ -95,7 +119,12 @@ impl Kernel {
 
     /// The sequence of the desired-state document the gate last applied, if any.
     pub fn applied_seq(&self) -> Option<u64> {
-        self.store.applied().map(|applied| applied.seq)
+        self.applied_seq.load()
+    }
+
+    /// A reader that stays current while another caller holds the kernel lock.
+    pub fn applied_seq_reader(&self) -> AppliedSeq {
+        self.applied_seq.clone()
     }
 
     /// The entries in the current desired-state document, in application order.
@@ -267,6 +296,7 @@ impl Kernel {
         now_ms: u64,
     ) -> Result<Vec<Outcome>, KernelError> {
         let signed = self.store.propose(changes, now_ms)?;
+        self.applied_seq.publish(Some(signed.document.seq));
         let outcomes = self.reconciler.reconcile(&signed, now_ms);
         self.save()?;
         Ok(outcomes)
