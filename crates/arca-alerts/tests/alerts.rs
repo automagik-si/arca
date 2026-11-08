@@ -843,6 +843,65 @@ mod eval {
         }
     }
 
+    #[test]
+    fn a_data_gap_does_not_shorten_the_clear_window() {
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+        for t in (0..=60_000).step_by(5_000) {
+            eval.step(
+                &rules,
+                &reading_of(RuleId::MemPsiHigh, 30.0, T0 + t),
+                T0 + t,
+            );
+        }
+        assert_eq!(eval.firing().len(), 1, "the pressure alert fires at 60 s");
+
+        // 100 s with no data. It is a transient gap, so the alert stays firing and no event is written.
+        for t in (65_000..=165_000).step_by(5_000) {
+            assert!(
+                eval.step(
+                    &rules,
+                    &Inputs {
+                        at: T0 + t,
+                        ..Inputs::default()
+                    },
+                    T0 + t,
+                )
+                .is_empty(),
+                "no event at {t} ms"
+            );
+        }
+
+        // The first real low reading at 170 s starts the clear window. 15 s later it must not clear.
+        for t in [170_000, 185_000] {
+            assert!(
+                eval.step(&rules, &reading_of(RuleId::MemPsiHigh, 0.0, T0 + t), T0 + t,)
+                    .is_empty(),
+                "a 15 s low reading does not clear at {t} ms"
+            );
+        }
+        assert_eq!(eval.firing().len(), 1, "still firing after 15 s low");
+
+        // 119 s after the first low reading is not enough; 120 s is.
+        assert!(
+            eval.step(
+                &rules,
+                &reading_of(RuleId::MemPsiHigh, 0.0, T0 + 289_000),
+                T0 + 289_000,
+            )
+            .is_empty(),
+            "119 s of low readings is not 120"
+        );
+        let cleared = eval.step(
+            &rules,
+            &reading_of(RuleId::MemPsiHigh, 0.0, T0 + 290_000),
+            T0 + 290_000,
+        );
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].state, EventState::Resolved);
+        assert_eq!(cleared[0].reason, Some(ResolveReason::Cleared));
+    }
+
     mod incus_down {
         use super::*;
 
@@ -889,6 +948,43 @@ mod eval {
                 unknown_of(&eval, RuleId::CrashLoop),
                 Some(UnknownReason::Missing)
             );
+        }
+
+        #[test]
+        fn an_alert_whose_reading_can_never_exist_resolves_with_no_data_after_the_window() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
+                eval.step(
+                    &rules,
+                    &reading_of(RuleId::MemPsiHigh, 30.0, T0 + t),
+                    T0 + t,
+                );
+            }
+            assert_eq!(eval.firing().len(), 1, "the pressure alert fires at 60 s");
+            // The reading is known to be unavailable, not merely missing: after the clear window it resolves no data.
+            let unavailable = |t: u64| Inputs {
+                at: T0 + t,
+                unavailable: std::collections::BTreeSet::from([RuleId::MemPsiHigh]),
+                ..Inputs::default()
+            };
+            for t in (65_000..=180_000).step_by(5_000) {
+                assert!(
+                    eval.step(&rules, &unavailable(t), T0 + t).is_empty(),
+                    "no event at {t} ms"
+                );
+                assert_eq!(eval.firing().len(), 1, "still firing at {t} ms");
+                assert!(eval.firing()[0].unknown);
+                assert_eq!(
+                    unknown_of(&eval, RuleId::MemPsiHigh),
+                    Some(UnknownReason::Unavailable)
+                );
+            }
+            let resolved = eval.step(&rules, &unavailable(185_000), T0 + 185_000);
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].state, EventState::Resolved);
+            assert_eq!(resolved[0].reason, Some(ResolveReason::NoData));
+            assert!(eval.firing().is_empty());
         }
     }
 
@@ -1727,6 +1823,8 @@ mod get_only {
                 pools: vec!["default".to_string()],
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
             },
             UnixIncus::new(fake.socket().to_path_buf()),
         );

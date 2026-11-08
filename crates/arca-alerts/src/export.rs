@@ -716,6 +716,8 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
             },
             Osd { served },
         );
@@ -785,6 +787,8 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
             },
             Storage,
         );

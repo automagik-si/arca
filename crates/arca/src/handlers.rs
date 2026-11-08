@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,7 +22,10 @@ use arca_kernel::journal::read_journal;
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::EffectRefusal;
 use arca_mcp::{CallError, Caller, GetHandler, GetReply, TokenStore, ToolHandler};
-use arca_metrics::{DEFAULT_MINUTES, HostSample, Sampler, SamplerConfig, mean};
+use arca_metrics::{
+    DEFAULT_MINUTES, HostModeChoice, HostSample, MODE_PROBE_TIMEOUT, ModeRetry, Sampler,
+    SamplerConfig, choose_host_mode, mean,
+};
 use arca_providers::ReadOnlyIncusProvider;
 use arca_reconcile::{Outcome, PLAN_TTL_MS};
 use arca_store::Store;
@@ -178,18 +181,41 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// A sampler over the host's procfs and sysfs, reading the configured pools through the Incus socket.
-pub fn new_sampler(cfg: &NodeConfig) -> Sampler<UnixIncus> {
-    Sampler::new(
+/// A sampler over the host's procfs and sysfs, reading the configured pools through the Incus socket, and the chosen mode
+/// with the reason it was chosen. The mode is resolved once, here, from the server the socket reaches: the explicit
+/// `incus.local` wins, then the Incus server name against the local host name, then the socket path rule.
+pub fn new_sampler(cfg: &NodeConfig) -> (Sampler<UnixIncus>, Arc<Mutex<HostModeChoice>>) {
+    let probe = UnixIncus::new(cfg.incus.socket.clone()).with_timeout(MODE_PROBE_TIMEOUT);
+    let choice = choose_host_mode(
+        &probe,
+        cfg.incus.local,
+        cfg.incus.socket_is_local(),
+        Path::new(PROC_ROOT),
+    );
+    eprintln!(
+        "arca: metrics source {}: {}",
+        choice.mode.as_str(),
+        choice.reason
+    );
+    let shared = Arc::new(Mutex::new(choice.clone()));
+    let retry = choice.provisional.then_some(ModeRetry {
+        explicit: cfg.incus.local,
+        path_is_local: cfg.incus.socket_is_local(),
+    });
+    let sampler = Sampler::new(
         SamplerConfig {
             proc_root: PathBuf::from(PROC_ROOT),
             sys_root: PathBuf::from(SYS_ROOT),
             pools: cfg.incus.pools.clone(),
             interval_ms: u64::try_from(SAMPLE_INTERVAL.as_millis()).unwrap_or(u64::MAX),
             history_minutes: HISTORY_MINUTES,
+            incus_local: choice.is_local(),
+            mode_retry: retry,
         },
         UnixIncus::new(cfg.incus.socket.clone()),
     )
+    .with_mode_choice(Arc::clone(&shared));
+    (sampler, shared)
 }
 
 /// How many times a watch reads the project index around its listing. The listing is filtered to the projects read before it,
@@ -410,12 +436,20 @@ pub struct StatusHandler {
     pub applied_seq: AppliedSeq,
     pub started: Instant,
     pub socket: PathBuf,
+    /// The host-reading mode chosen at startup, and why. A provisional choice is replaced by the sampler when a later
+    /// server-name probe succeeds.
+    pub metrics_source: Arc<Mutex<HostModeChoice>>,
 }
 
 impl ToolHandler for StatusHandler {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let applied_seq = self.applied_seq.load();
         let incus_reachable = UnixIncus::new(self.socket.clone()).get("/1.0").is_ok();
+        let metrics_source = self
+            .metrics_source
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         Ok(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "node": self.node,
@@ -423,6 +457,8 @@ impl ToolHandler for StatusHandler {
             "uptimeS": self.started.elapsed().as_secs(),
             "incusReachable": incus_reachable,
             "appliedSeq": applied_seq,
+            "metricsSource": metrics_source.mode.as_str(),
+            "metricsSourceReason": metrics_source.reason,
         }))
     }
 }
@@ -1276,6 +1312,8 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: HISTORY_MINUTES,
+                incus_local: true,
+                mode_retry: None,
             },
             incus,
         );
@@ -1312,6 +1350,8 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: HISTORY_MINUTES,
+                incus_local: true,
+                mode_retry: None,
             },
             incus,
         );

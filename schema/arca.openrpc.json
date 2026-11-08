@@ -23,6 +23,16 @@
             "incusReachable": {
               "type": "boolean"
             },
+            "metricsSource": {
+              "enum": [
+                "local",
+                "remote"
+              ],
+              "type": "string"
+            },
+            "metricsSourceReason": {
+              "type": "string"
+            },
             "mode": {
               "enum": [
                 "watch-only",
@@ -49,7 +59,9 @@
             "mode",
             "uptimeS",
             "incusReachable",
-            "appliedSeq"
+            "appliedSeq",
+            "metricsSource",
+            "metricsSourceReason"
           ],
           "type": "object"
         }
@@ -90,6 +102,15 @@
                     "cores": {
                       "type": "integer"
                     },
+                    "coresKnown": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "usedPct": {
                       "type": [
                         "number",
@@ -99,7 +120,9 @@
                   },
                   "required": [
                     "usedPct",
-                    "cores"
+                    "cores",
+                    "coresKnown",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -134,12 +157,19 @@
                         "number",
                         "null"
                       ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "one",
                     "five",
-                    "fifteen"
+                    "fifteen",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -148,6 +178,12 @@
                     "availableBytes": {
                       "type": [
                         "integer",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
                         "null"
                       ]
                     },
@@ -168,13 +204,21 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "usedBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "totalBytes",
                     "availableBytes",
+                    "usedBytes",
                     "swapTotalBytes",
-                    "swapFreeBytes"
+                    "swapFreeBytes",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -309,6 +353,15 @@
                     "cores": {
                       "type": "integer"
                     },
+                    "coresKnown": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "usedPct": {
                       "type": [
                         "number",
@@ -318,7 +371,9 @@
                   },
                   "required": [
                     "usedPct",
-                    "cores"
+                    "cores",
+                    "coresKnown",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -353,12 +408,19 @@
                         "number",
                         "null"
                       ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "one",
                     "five",
-                    "fifteen"
+                    "fifteen",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -367,6 +429,12 @@
                     "availableBytes": {
                       "type": [
                         "integer",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
                         "null"
                       ]
                     },
@@ -387,13 +455,21 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "usedBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "totalBytes",
                     "availableBytes",
+                    "usedBytes",
                     "swapTotalBytes",
-                    "swapFreeBytes"
+                    "swapFreeBytes",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -1234,7 +1310,8 @@
                     "enum": [
                       "cleared",
                       "rule-disabled",
-                      "subject-gone"
+                      "subject-gone",
+                      "no data"
                     ],
                     "type": "string"
                   },
@@ -1335,7 +1412,8 @@
                     "enum": [
                       "cleared",
                       "rule-disabled",
-                      "subject-gone"
+                      "subject-gone",
+                      "no data"
                     ],
                     "type": "string"
                   },
@@ -1446,7 +1524,8 @@
                   "reason": {
                     "enum": [
                       "missing",
-                      "stale"
+                      "stale",
+                      "unavailable"
                     ],
                     "type": "string"
                   },

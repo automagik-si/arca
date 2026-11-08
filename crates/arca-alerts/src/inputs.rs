@@ -1,9 +1,9 @@
 //! The tick's [`Inputs`], built from the sampler's newest sample and its [`Readings`].
 
 use arca_incus::IncusRead;
-use arca_metrics::Sampler;
+use arca_metrics::{REMOTE_HOST_REASON, Sampler};
 
-use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, Timed, UpdateUse};
+use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse};
 
 /// The inputs of the sampler's newest sample, stamped with its time. A read that failed in the sampler is `None` here, so
 /// the rule reads it as unknown. Before the first sample every source is unknown.
@@ -12,8 +12,16 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
         return Inputs::default();
     };
     let at = sample.at;
+    // A remote metrics source never gives its own PSI or CPU temperature. A transient outage gives neither, so it is not
+    // marked here: the evaluator keeps those alerts firing through it.
+    let mut unavailable = std::collections::BTreeSet::new();
+    if sample.load.reason.as_deref() == Some(REMOTE_HOST_REASON) {
+        unavailable.insert(RuleId::MemPsiHigh);
+        unavailable.insert(RuleId::CpuHot);
+    }
     Inputs {
         at,
+        unavailable,
         pools: sampler.readings().pools.as_ref().map(|pools| Timed {
             at,
             value: pools
@@ -83,7 +91,7 @@ mod tests {
 
     use super::from_sampler;
     use crate::UnknownReason;
-    use crate::eval::{Evaluator, Inputs, InstanceUse, PoolUse, Rules, Timed};
+    use crate::eval::{Evaluator, Inputs, InstanceUse, PoolUse, RuleId, Rules, Timed};
 
     /// The pools an Incus lists: each name with its used and total bytes.
     type PoolList = Vec<(&'static str, u64, u64)>;
@@ -130,6 +138,8 @@ mod tests {
                 pools: pools.iter().map(|pool| pool.to_string()).collect(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
             },
             incus,
         )
@@ -238,6 +248,8 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
             },
             Offline,
         );
@@ -397,5 +409,30 @@ mod tests {
         assert_eq!(events[0].state, EventState::Resolved);
         assert_eq!(events[0].reason, Some(ResolveReason::SubjectGone));
         assert!(eval.firing().is_empty());
+    }
+
+    #[test]
+    fn a_remote_source_marks_psi_and_cpu_temperature_never_available() {
+        let mut remote = Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-inputs-remote-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-inputs-remote-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: None,
+            },
+            Offline,
+        );
+        remote.sample(1_000);
+        let inputs = from_sampler(&remote);
+        assert!(inputs.unavailable.contains(&RuleId::MemPsiHigh));
+        assert!(inputs.unavailable.contains(&RuleId::CpuHot));
+
+        // A local source can give both, so it marks neither unavailable; a missing reading there is a transient gap.
+        let mut local = sampler(Offline, &[]);
+        local.sample(1_000);
+        assert!(from_sampler(&local).unavailable.is_empty());
     }
 }

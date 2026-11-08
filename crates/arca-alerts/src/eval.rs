@@ -1,11 +1,13 @@
 //! The rules, the inputs a tick reads, and the evaluator: one state machine per rule and label set.
 //!
 //! A rule fires when `value > threshold` has held for `for_s`, and clears when `value <= threshold - clear_margin` has held for
-//! `clear_for_s`. A reading that is missing, not finite or older than its source's maximum age is unknown: the alert keeps its
-//! state, its timers restart, and no event is written. A fresh, known reading that no longer has an alert's label set resolves
-//! that alert with `subject-gone`, once.
+//! `clear_for_s`. A reading that is missing, not finite or older than its source's maximum age is unknown: a pending alert keeps
+//! its state, a firing alert stays firing and marked unknown, and its timers restart. A reading this node can never provide
+//! (such as PSI or CPU temperature on a remote source) resolves the firing alert once with `no data` after `clear_for_s`; a
+//! transient gap never ends it. A fresh, known reading that no longer has an alert's label set resolves that alert with
+//! `subject-gone`, once.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use arca_store::{AlertEvent, EventState, ResolveReason};
 
@@ -166,6 +168,9 @@ pub struct Inputs {
     pub instances: Option<Timed<Vec<InstanceUse>>>,
     pub update: Option<Timed<UpdateUse>>,
     pub drives: Option<Timed<Vec<DriveUse>>>,
+    /// The rules whose reading this node can never provide, such as PSI and CPU temperature on a remote metrics source.
+    /// A firing alert of one resolves with `no data` after its clear window; a transient outage never does.
+    pub unavailable: BTreeSet<RuleId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +240,9 @@ struct Track {
     firing: Option<AlertEvent>,
     /// Why the newest reading was unknown, while it is.
     unknown: Option<UnknownReason>,
+    /// When a firing alert's input became permanently unavailable, for the no-data resolve. Separate from `timer`, which
+    /// belongs to the fire and clear conditions.
+    unknown_since: Option<u64>,
 }
 
 impl Track {
@@ -244,6 +252,7 @@ impl Track {
             timer: None,
             firing: None,
             unknown: None,
+            unknown_since: None,
         }
     }
 }
@@ -295,6 +304,7 @@ impl Evaluator {
                     timer: None,
                     firing: Some(event),
                     unknown: Some(UnknownReason::Missing),
+                    unknown_since: None,
                 },
             );
         }
@@ -309,8 +319,10 @@ impl Evaluator {
                 Source::Unknown(reason) => {
                     self.unknown_rules.insert(rule.id, reason);
                     for ((id, _), track) in self.tracks.iter_mut() {
-                        if *id == rule.id {
-                            unknown(track, reason);
+                        if *id == rule.id
+                            && let Some(event) = unknown(rule, track, reason, now)
+                        {
+                            events.push(event);
                         }
                     }
                 }
@@ -434,6 +446,15 @@ enum Source {
 }
 
 fn source(id: RuleId, inputs: &Inputs, now: u64) -> Source {
+    let source = source_of(id, inputs, now);
+    if matches!(source, Source::Unknown(_)) && inputs.unavailable.contains(&id) {
+        Source::Unknown(UnknownReason::Unavailable)
+    } else {
+        source
+    }
+}
+
+fn source_of(id: RuleId, inputs: &Inputs, now: u64) -> Source {
     match id {
         RuleId::DiskPoolFull => read(&inputs.pools, SAMPLE_MAX_AGE_MS, now, |pools| {
             pools
@@ -540,10 +561,35 @@ fn percent_used(pool: &PoolUse) -> Option<f64> {
     (total > 0).then(|| used as f64 / total as f64 * 100.0)
 }
 
-/// Unknown data: the state is kept, the timer restarts and no event is written.
-fn unknown(track: &mut Track, reason: UnknownReason) {
-    track.timer = None;
+/// Unknown data. A non-firing track keeps its state and its timer restarts. A firing track stays firing and unknown; only
+/// when the reason is a reading the node can never provide, and after `clear_for_s` without a fresh reading, it resolves
+/// once with `no data`. A transient gap never ends the alert. While it stays unknown, the reason is shown with the firing
+/// alert.
+fn unknown(rule: &Rule, track: &mut Track, reason: UnknownReason, now: u64) -> Option<AlertEvent> {
     track.unknown = Some(reason);
+    if track.state != AlertState::Firing {
+        track.timer = None;
+        track.unknown_since = None;
+        return None;
+    }
+    // A transient gap never ends a firing alert. Only a reading this node can never provide does, and only after the
+    // clear window, measured from its own clock so a later clear timer keeps its full length.
+    if reason != UnknownReason::Unavailable {
+        track.timer = None;
+        track.unknown_since = None;
+        return None;
+    }
+    track.timer = None;
+    let since = *track.unknown_since.get_or_insert(now);
+    if !held(now, since, rule.clear_for_s) {
+        return None;
+    }
+    let firing = track.firing.take()?;
+    track.state = AlertState::Ok;
+    track.timer = None;
+    track.unknown = None;
+    track.unknown_since = None;
+    Some(resolution(firing, None, ResolveReason::NoData, now))
 }
 
 fn held(now: u64, since: u64, seconds: u64) -> bool {
@@ -559,10 +605,10 @@ fn apply(
     now: u64,
 ) -> Option<AlertEvent> {
     let Some(value) = value.filter(|value| value.is_finite()) else {
-        unknown(track, UnknownReason::Missing);
-        return None;
+        return unknown(rule, track, UnknownReason::Missing, now);
     };
     track.unknown = None;
+    track.unknown_since = None;
     match track.state {
         AlertState::Ok | AlertState::Pending if value > rule.threshold => {
             track.state = AlertState::Pending;

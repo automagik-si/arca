@@ -138,6 +138,8 @@ pub enum ResolveReason {
     Cleared,
     RuleDisabled,
     SubjectGone,
+    /// The alert's input stayed unknown for its clear window.
+    NoData,
 }
 
 impl ResolveReason {
@@ -146,13 +148,19 @@ impl ResolveReason {
             Self::Cleared => "cleared",
             Self::RuleDisabled => "rule-disabled",
             Self::SubjectGone => "subject-gone",
+            Self::NoData => "no data",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        [Self::Cleared, Self::RuleDisabled, Self::SubjectGone]
-            .into_iter()
-            .find(|reason| reason.as_str() == text)
+        [
+            Self::Cleared,
+            Self::RuleDisabled,
+            Self::SubjectGone,
+            Self::NoData,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == text)
     }
 }
 

@@ -94,6 +94,8 @@ mod watcher_schedule {
                 pools: vec!["default".to_string()],
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
+                mode_retry: None,
             },
             UnixIncus::new(incus.to_path_buf()),
         );

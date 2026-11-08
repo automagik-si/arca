@@ -19,6 +19,13 @@ use serde_json::error::Category;
 /// The projects no config may name as a kernel project: the host's default project and the bench.
 const FORBIDDEN_PROJECTS: [&str; 2] = ["bench", "default"];
 
+/// The unix socket of the local Incus daemon on a host that installs Incus from its package. Any other socket path is a
+/// proxy until the config says otherwise, because a proxy can reach another machine.
+pub const LOCAL_INCUS_SOCKET: &str = "/var/lib/incus/unix.socket";
+
+/// The local daemon's unprivileged unix socket, when Incus offers one. It reaches the same local daemon.
+const LOCAL_INCUS_USER_SOCKET: &str = "/var/lib/incus/unix.socket.user";
+
 /// The prefix every project of a scratch run carries.
 const SCRATCH_PREFIX: &str = "arcak-scratch-";
 
@@ -64,6 +71,20 @@ pub struct IncusConfig {
     pub socket: PathBuf,
     #[serde(default)]
     pub pools: Vec<String>,
+    /// Whether `socket` reaches the local Incus daemon. When absent, the runtime check compares the Incus server name with
+    /// the local host name; the socket path is only the fallback. An explicit value wins.
+    #[serde(default)]
+    pub local: Option<bool>,
+}
+
+impl IncusConfig {
+    /// The socket-path rule: whether the standard local daemon socket is configured. It is the fallback for the runtime
+    /// choice of [`crate::handlers::new_sampler`], never the whole answer: a shim path reaches the local daemon too, and a
+    /// host socket mounted at the standard path inside a container does not make the container's `/proc` the host's.
+    pub fn socket_is_local(&self) -> bool {
+        self.socket == Path::new(LOCAL_INCUS_SOCKET)
+            || self.socket == Path::new(LOCAL_INCUS_USER_SOCKET)
+    }
 }
 
 /// The listeners: the unix socket, one tailnet address when one is named, and one proxy address when one is named.
@@ -498,6 +519,47 @@ mod tests {
     fn an_approval_host_that_is_a_host_name_or_none_is_accepted() {
         assert_eq!(check(&config_with(Some("node1.example"))), Ok(()));
         assert_eq!(check(&config_with(None)), Ok(()));
+    }
+
+    #[test]
+    fn the_incus_socket_path_rule_marks_only_the_standard_local_sockets() {
+        let mut config = config_with(None);
+        assert_eq!(config.incus.local, None);
+        config.incus.socket = PathBuf::from(LOCAL_INCUS_SOCKET);
+        assert!(
+            config.incus.socket_is_local(),
+            "the standard local daemon socket is local"
+        );
+        config.incus.socket = PathBuf::from("/var/lib/incus/unix.socket.user");
+        assert!(
+            config.incus.socket_is_local(),
+            "the local daemon's unprivileged socket is the same daemon"
+        );
+        config.incus.socket = PathBuf::from("/nonexistent/incus-proxy.sock");
+        assert!(
+            !config.incus.socket_is_local(),
+            "any other path is a proxy for the fallback"
+        );
+    }
+
+    #[test]
+    fn incus_local_parses_as_an_optional_bool_in_the_incus_section() {
+        let mut value = serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock", "local": true },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": ["droid"] }
+        });
+        let config: NodeConfig =
+            serde_json::from_value(value.clone()).expect("the local key parses");
+        assert_eq!(config.incus.local, Some(true));
+
+        value["incus"]["local"] = serde_json::json!("yes");
+        assert!(
+            serde_json::from_value::<NodeConfig>(value).is_err(),
+            "a local that is not a bool is refused"
+        );
     }
 
     #[test]

@@ -60,6 +60,7 @@ refused without the value being echoed back.
 | `stateDir` | yes | An existing directory, mode 0700. The node key and the desired-state files live in it. See the state section below. |
 | `incus.socket` | yes | The Incus unix socket. Reads only. |
 | `incus.pools` | no | An allow-filter on the storage pools Incus lists. Absent, or `[]`, means every pool Incus lists. A non-empty list samples and alerts only the listed pools that Incus also lists. A listed name that Incus does not list has no row, so its firing alert resolves with `subject-gone`. A pool entry with no name makes the pool reading unknown for that tick. See "Alerts". |
+| `incus.local` | no | Whether `incus.socket` reaches the local Incus daemon. When absent, the node asks Incus `GET /1.0` for `environment.server_name` and compares it with the local host name: a match is local, a mismatch is remote. The socket path rule (the standard local daemon sockets) is the fallback only when `/1.0` or the host name cannot be read. An explicit value wins. See "Host metrics". |
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
@@ -297,10 +298,11 @@ The unix socket serves only a peer whose credentials carry the server's own uid.
 its request is read.
 
 - `arca_status` reports the node id, mode (`kernel` when kernel projects are configured, `watch-only` otherwise), uptime,
-  whether Incus answers, and `appliedSeq`: the applied desired-state document's sequence, or `null` before any document applies.
+  whether Incus answers, `appliedSeq`: the applied desired-state document's sequence, or `null` before any document applies,
+  and `metricsSource` (`local` or `remote`) with the reason it was chosen. See "Host metrics".
 - `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
-  `mean` are `null`.
+  `mean` are `null`. See "Host metrics" for where its readings come from.
 - `watch_report` reads every project and instance through Incus GET, but a call never starts a sweep. The `arca-watcher`
   thread sweeps once when `serve` starts and then every 30 seconds, so the GETs do not depend on how often the report is
   asked for. A call answers from the newest successful sweep, and every answer carries `ageMs`, the milliseconds since that
@@ -327,6 +329,48 @@ id with `after` and `limit` (default 100, maximum 500). Each record exposes only
 `state`, `at_ms`, `intent` and `object`; it never exposes `pre_image`, `inverse` or `acl_patch`, which can hold rendered
 secrets. The read decodes the whole append-only file without the journal's open-time integrity checks, so a listing can show a
 sequence `serve` would refuse at open; its cost grows with history.
+
+## Host metrics
+
+`node_metrics`, and `arca metrics --json`, describe the machine the node's Incus serves, never the machine Arca happens to run
+on when the two differ. The mode is chosen at startup, in this order:
+
+1. An explicit `incus.local` wins: `true` means the local daemon, `false` a remote one.
+2. Otherwise the node reads the Incus server document, `GET /1.0`, and compares `environment.server_name` with the local
+   host name, without case. A match is local; a mismatch is remote. A name of `localhost`, `localhost.localdomain` or an
+   empty name identifies no machine and is treated as unknown.
+3. If `/1.0` cannot be read, or it does not carry a usable server name, or the local host name cannot be read, the socket
+   path decides: the standard local daemon sockets (`/var/lib/incus/unix.socket` and `/var/lib/incus/unix.socket.user`) are
+   local and every other path is remote. This choice is provisional: each later sample retries the `/1.0` check, under the
+   same 2 s cap and with no added startup delay, until the server names itself, then keeps that answer.
+
+The chosen mode and a value-free reason are logged at startup, and again if a provisional choice is replaced, and returned
+by `arca_status` as `metricsSource` (`local` or `remote`) and `metricsSourceReason`. The reason never carries a host name. A proxy whose upstream is the local
+daemon, such as the recording shim, therefore needs no `"local": true`: its server name matches the local host name. A
+container that mounts the host's Incus socket at the standard path is still remote when its own host name differs from the
+Incus server name, so the sampler never reports the container's `/proc` as the managed host's.
+
+- **Local daemon.** The sample is this machine's: `cpu.cores` and `cpu.usedPct`, the `load` averages,
+  `memory.totalBytes`, `memory.availableBytes` and `memory.usedBytes`, PSI, CPU temperature, GPU busy, swap and NIC rates come
+  from the node's `/proc` and `/sys` trees. This is the reading the sampler has always taken.
+- **Remote Incus.** The host totals come from the node's own Incus, `GET /1.0/resources`: `cpu.cores` is `cpu.total`
+  (threads), `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
+  `memory.availableBytes` is `memory.total - memory.used`. `cpu.coresKnown` is `true`. No local `/proc` or `/sys` reading is
+  reported: `cpu.usedPct`, every `load` average, PSI, CPU temperature, GPU busy, swap and NIC rates are `null`. `cpu.reason`
+  and `load.reason` say `not available for a remote host`. PSI and CPU temperature are reported to the alert evaluator as
+  readings this node can never provide, so a firing `mem-psi-high` or `cpu-hot` resolves with `no data` after its clear
+  window instead of staying unknown forever. The pools, instance counts, incus-osd reading and SMART state still come from
+  the same Incus, so they describe the remote machine too.
+- **The resources read fails.** On a remote node the totals are `null` and `cpu.coresKnown` is `false`; `cpu.cores` stays an
+  integer in the schema, so its `0` is a placeholder a consumer must not show as a count. `cpu.reason` and `memory.reason`
+  say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong
+  machine. `load.reason` still says `not available for a remote host`.
+
+A mean over a window that holds both successful and failed reads averages the successful ones and takes its reason from the
+newest successful read, so a late failure does not label averaged figures. A window with no successful read is `null` with
+the failure reason. The failure and provenance fields are additions: `cpu.coresKnown`, `memory.usedBytes`, `cpu.reason`,
+`load.reason` and `memory.reason`. Every field the earlier schema carried keeps its name and meaning, and a local node's
+figures do not change.
 
 ## Calling the server
 
@@ -632,6 +676,9 @@ service user's uid, and `<home>` its home directory; the config file takes no sp
 }
 ```
 
+The shim path is not the daemon's standard socket, but the runtime check compares the Incus server name it reaches with the
+local host name, so this node is local without an explicit `incus.local`.
+
 `StateDirectory=arca-node` creates `~/.local/state/arca-node` at mode 0700, which `serve` requires. The state directory is
 not named `arca`: systemd 254 and later turn a user unit's `StateDirectory=arca` into a link to `~/.config/arca`, the config's
 directory, when that exists and `~/.local/state/arca` does not, and `serve` refuses a state directory that is a link. An
@@ -928,9 +975,12 @@ A reading is unknown when its source gave none or it is too old. The maximum age
 components, 15 seconds; the watch sweep and the latency probes, 90 seconds; the incus-osd update status, 15 minutes; the SMART
 result, 2 hours.
 
-- Unknown data never starts or ends an alert. A firing alert stays firing and is marked `unknown: true`, its timers restart,
-  and no event is written.
-- `alerts_list.unknown` lists each unknown rule and label set, with reason `missing` (no reading yet) or `stale` (too old).
+- Unknown data never starts an alert. A pending alert keeps its state. A firing alert stays firing and is marked
+  `unknown: true` while its input is missing, and no event is written, even through a long outage.
+- The one exception is a reading the node can never provide, such as PSI or CPU temperature on a remote metrics source. A
+  firing alert for one resolves once with reason `no data` after `clearForS`; a fresh reading before then keeps it firing.
+- `alerts_list.unknown` lists each unknown rule and label set, with reason `missing` (no reading yet), `stale` (too old) or
+  `unavailable` (a reading this node can never provide).
 - The one exception is `subject-gone`. A fresh, known reading that no longer has a firing alert's label set (a deleted pool
   or instance, or a drive that left the drive list) resolves that alert once.
 - When Incus does not answer, the instance and pool readings are unknown, and no alert ends. `node_metrics` still lists
@@ -1122,7 +1172,7 @@ number is refused with 400.
 
 Each event has these keys: `schema` (`arca.alert.v1`), `seq`, `alertId`, `node`, `rule`, `severity`, `state` (`firing` or
 `resolved`), `labels`, `value` and `threshold` (in the rule's own units), `startedAt`, `resolvedAt` (null while firing), `at`
-(when this event was written), and `reason` on resolved events only: `cleared`, `rule-disabled` or `subject-gone`. A firing
+(when this event was written), and `reason` on resolved events only: `cleared`, `rule-disabled`, `subject-gone` or `no data`. A firing
 event's `alertId` is its own `seq`, and its resolve is a new event with the same `alertId`.
 
 ```json

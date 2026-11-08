@@ -20,6 +20,7 @@ use arca_kernel::plugin::{
     EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
 };
 use arca_mcp::{CallError, Caller, ToolHandler};
+use arca_metrics::{HostMode, HostModeChoice};
 use arca_netproject::PROJECT;
 use arca_providers::incus::{Family, IncusProvider};
 use arca_reconcile::PluginSet;
@@ -404,6 +405,11 @@ fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
         applied_seq: kernel.applied_seq_reader(),
         started: std::time::Instant::now(),
         socket: rig.fake.socket().to_path_buf(),
+        metrics_source: Arc::new(Mutex::new(HostModeChoice {
+            mode: HostMode::Local,
+            reason: "the test names the local mode".to_string(),
+            provisional: false,
+        })),
     });
     let caller = Caller {
         token_id: "doctor".into(),

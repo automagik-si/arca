@@ -680,6 +680,8 @@ fn arca_status_result() -> Value {
         ("uptimeS", true, at_least(0)),
         ("incusReachable", true, boolean()),
         ("appliedSeq", true, nullable(int())),
+        ("metricsSource", true, one_of(&["local", "remote"])),
+        ("metricsSourceReason", true, string()),
     ])
 }
 
@@ -706,6 +708,8 @@ fn host_sample() -> Value {
             result(vec![
                 ("usedPct", true, nullable(num())),
                 ("cores", true, int()),
+                ("coresKnown", true, boolean()),
+                ("reason", true, nullable(string())),
             ]),
         ),
         (
@@ -715,6 +719,7 @@ fn host_sample() -> Value {
                 ("one", true, nullable(num())),
                 ("five", true, nullable(num())),
                 ("fifteen", true, nullable(num())),
+                ("reason", true, nullable(string())),
             ]),
         ),
         (
@@ -723,8 +728,10 @@ fn host_sample() -> Value {
             result(vec![
                 ("totalBytes", true, nullable(int())),
                 ("availableBytes", true, nullable(int())),
+                ("usedBytes", true, nullable(int())),
                 ("swapTotalBytes", true, nullable(int())),
                 ("swapFreeBytes", true, nullable(int())),
+                ("reason", true, nullable(string())),
             ]),
         ),
         (
@@ -958,7 +965,7 @@ fn alerts_list_result() -> Value {
                 ("rule", true, string()),
                 ("labels", true, labels()),
                 ("state", true, one_of(&["ok", "pending", "firing"])),
-                ("reason", true, one_of(&["missing", "stale"])),
+                ("reason", true, one_of(&["missing", "stale", "unavailable"])),
             ])),
         ),
         ("disabled", true, array(string())),
@@ -999,7 +1006,7 @@ fn alert_event(extra: Vec<Field>) -> Value {
         (
             "reason",
             false,
-            one_of(&["cleared", "rule-disabled", "subject-gone"]),
+            one_of(&["cleared", "rule-disabled", "subject-gone", "no data"]),
         ),
     ];
     fields.extend(extra);
