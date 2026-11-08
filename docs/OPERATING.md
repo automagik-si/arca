@@ -513,6 +513,7 @@ changes bind `passkey-<SHA-256 of the full line>` and the digest of `{ "line": <
 date in the line's comment. The statement lasts ten minutes and its nonce is single use. A replay, changed line, wrong
 digest, or proof from an untrusted key is refused. Setup-code budgets apply only to first-key enrolment; later changes
 require a trusted tap and never use the shared proxy caller budget.
+The accepted crash window between renaming the state passkeys file and `replace_owner_passkeys` leaves the new set on disk and the old set in memory until restart, which loads the set from disk.
 `/etc/arca/owner-passkeys` remains readable as a developer option, never the owner path. The state passkeys file is owned by
 the `serve` account with mode 0600 in its 0700 state directory; it has no root anchor, so anything running as that account is a
 trust root (see Decision 11 in the wish).

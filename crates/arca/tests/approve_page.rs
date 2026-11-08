@@ -2067,6 +2067,134 @@ fn passkey_change_trusted_tap_adds_once_and_removes_without_restart() {
 }
 
 #[test]
+fn passkey_change_refuses_a_fresh_duplicate_add_as_malformed() {
+    let (rig, trusted) = Rig::new("passkey-duplicate-add", true);
+    let new = SoftPasskey::from_seed(2);
+    let pending = pending_passkey(&rig, &new);
+    let line = pending["line"].clone();
+    let first_statement = pending["statement"].clone();
+    assert_eq!(
+        rig.post(
+            "/approve/passkeys/change",
+            Some(ORIGIN),
+            signed_change(pending, &trusted)
+        )
+        .0,
+        200
+    );
+    let before = fs::read(rig.state_path()).expect("state file");
+    let count = rig.kernel.lock().expect("kernel").owner_passkey_count();
+    assert_eq!(count, 2);
+    let pending = pending_passkey(&rig, &new);
+    assert_eq!(pending["line"], line);
+    assert_ne!(pending["statement"], first_statement, "a fresh nonce");
+    let (status, body) = rig.post(
+        "/approve/passkeys/change",
+        Some(ORIGIN),
+        signed_change(pending, &trusted),
+    );
+    assert_eq!(status, 403);
+    let body: Value = serde_json::from_slice(&body).expect("refusal JSON");
+    assert_eq!(body["refusal"], "Malformed");
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), before);
+    assert_eq!(
+        fs::read_to_string(rig.state_path())
+            .expect("state file")
+            .lines()
+            .collect::<Vec<_>>(),
+        vec![line.as_str().expect("line")]
+    );
+    assert_eq!(
+        rig.kernel.lock().expect("kernel").owner_passkey_count(),
+        count
+    );
+}
+
+#[test]
+fn register_with_trusted_keys_only_prepares_a_change_and_refuses_setup_code() {
+    let (rig, trusted) = Rig::new_empty("passkey-register-existing");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    let code = rig.last_code();
+    assert_eq!(
+        rig.post(
+            "/approve/register",
+            Some(ORIGIN),
+            register_body(&trusted, Some(&code))
+        )
+        .0,
+        200
+    );
+    let before = fs::read(rig.state_path()).expect("state file");
+    let count = rig.kernel.lock().expect("kernel").owner_passkey_count();
+    assert_eq!(count, 1);
+
+    let (status, body) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&SoftPasskey::from_seed(3), Some(&code)),
+    );
+    assert_eq!(status, 409);
+    let body: Value = serde_json::from_slice(&body).expect("already trusted JSON");
+    assert_eq!(body, json!({ "message": "A passkey is already trusted" }));
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), before);
+    assert_eq!(
+        rig.kernel.lock().expect("kernel").owner_passkey_count(),
+        count
+    );
+
+    let new = SoftPasskey::from_seed(2);
+    let (status, body) = rig.post("/approve/register", Some(ORIGIN), register_body(&new, None));
+    assert_eq!(status, 200);
+    let pending: Value = serde_json::from_slice(&body).expect("pending change");
+    let fields = pending.as_object().expect("registration object");
+    assert_eq!(
+        fields.len(),
+        2,
+        "registration returns only line and statement"
+    );
+    assert!(pending["line"].is_string());
+    assert!(pending["statement"].is_string());
+    assert!(pending.get("trusted").is_none());
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), before);
+    assert_eq!(
+        rig.kernel.lock().expect("kernel").owner_passkey_count(),
+        count
+    );
+
+    let (status, body) = rig.post(
+        "/approve/passkeys/change",
+        Some(ORIGIN),
+        signed_change(pending.clone(), &new),
+    );
+    assert_eq!(status, 403, "the new key cannot approve its own addition");
+    assert!(String::from_utf8_lossy(&body).contains("BadSignature"));
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), before);
+    assert_eq!(
+        rig.kernel.lock().expect("kernel").owner_passkey_count(),
+        count
+    );
+    assert_eq!(
+        rig.post(
+            "/approve/passkeys/change",
+            Some(ORIGIN),
+            signed_change(pending, &trusted)
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        rig.kernel.lock().expect("kernel").owner_passkey_count(),
+        count + 1
+    );
+    assert_eq!(
+        load_state_passkeys(&rig.state_path())
+            .expect("state keys")
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn passkey_change_refuses_new_key_tampered_line_digest_origin_and_non_passkey() {
     let (rig, trusted) = Rig::new("passkey-change-refuse", true);
     let new = SoftPasskey::from_seed(2);
