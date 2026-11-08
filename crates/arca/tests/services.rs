@@ -48,6 +48,7 @@ struct RemovalPause {
 struct PausedProvider {
     inner: IncusProvider,
     pause: Option<RemovalPause>,
+    fail_observe: Arc<Mutex<Option<String>>>,
 }
 
 impl Provider for PausedProvider {
@@ -57,6 +58,11 @@ impl Provider for PausedProvider {
         projects: &[String],
         query: &Observe,
     ) -> Result<Value, EffectRefusal> {
+        if self.fail_observe.lock().expect("failure switch").as_deref() == Some(entry.0.as_str()) {
+            return Err(EffectRefusal::Provider(
+                "Incus answered 503 for a transient read".into(),
+            ));
+        }
         self.inner.observe(entry, projects, query)
     }
     fn plan(&self, entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
@@ -113,6 +119,7 @@ struct Rig {
     fake: FakeIncus,
     kernel: Arc<Mutex<Kernel>>,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
+    fail_observe: Arc<Mutex<Option<String>>>,
 }
 
 impl Rig {
@@ -196,6 +203,8 @@ impl Rig {
         plugins.add::<Service>().expect("service");
         let socket = fake.socket().to_path_buf();
         let secrets = dir.join("secrets");
+        let fail_observe = Arc::new(Mutex::new(None));
+        let provider_fail_observe = Arc::clone(&fail_observe);
         let kernel = Arc::new(Mutex::new(
             Kernel::open(
                 &dir,
@@ -218,6 +227,7 @@ impl Rig {
                         )
                         .expect("provider"),
                         pause,
+                        fail_observe: provider_fail_observe,
                     }))
                 },
                 NOW,
@@ -233,7 +243,12 @@ impl Rig {
             fake,
             kernel,
             handlers,
+            fail_observe,
         }
+    }
+
+    fn fail_observe(&self, entry: &str) {
+        *self.fail_observe.lock().expect("failure switch") = Some(entry.into());
     }
 
     fn call(&self, verb: &str, args: Value) -> Result<Value, CallError> {
@@ -2181,6 +2196,9 @@ fn runtime_template_fields_are_strict_and_old_documents_keep_their_defaults() {
         json!({"limits":{"other":"4"}}),
         json!({"data":{"path":"data"}}),
         json!({"data":{"path":"/"}}),
+        json!({"data":{"path":"//"}}),
+        json!({"data":{"path":"/."}}),
+        json!({"data":{"path":"/./"}}),
         json!({"data":{"path": format!("/{}", "a".repeat(255))}}),
         json!({"data":{"path":"/data/../etc"}}),
         json!({"data":{"path":"/data\n"}}),
@@ -2393,5 +2411,57 @@ fn apply_refuses_a_pre_existing_unmarked_data_volume_and_leaves_it() {
     assert!(
         volume["config"].get(KERNEL_ENTRY_KEY).is_none(),
         "the volume was never adopted"
+    );
+}
+
+#[test]
+fn a_netproject_read_failure_does_not_refuse_a_service_create() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("the first service installs the project entry");
+    rig.fail_observe("net-arcak-svc");
+    rig.call("service_create", json!({"name":"other","template":"nats"}))
+        .expect("the service applies although the project entry cannot be read");
+    assert!(
+        rig.get(&format!("/1.0/instances/other?project={PROJECT}"))
+            .is_some()
+    );
+}
+
+#[test]
+fn a_netproject_read_failure_does_not_refuse_a_service_remove_or_skip_secret_cleanup() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("the service exists");
+    let secrets = rig.dir.join("secrets").join("service-nats");
+    fs::create_dir_all(&secrets).expect("secret directory");
+    fs::write(secrets.join("marker"), b"kept").expect("secret file");
+    rig.fail_observe("net-arcak-svc");
+
+    let approval = owner_approval(&key, "nats");
+    assert_eq!(
+        rig.call("service_remove", json!({"name":"nats","approval":approval}))
+            .expect("removal ignores the project entry's read failure"),
+        json!({"removed":true})
+    );
+    assert!(!secrets.exists(), "the secret directory is cleaned up");
+    assert!(
+        rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
+            .is_none(),
+        "the instance was deleted"
     );
 }

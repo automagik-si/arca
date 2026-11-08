@@ -113,7 +113,8 @@ impl Plugin for NetProject {
             ],
         )
     }
-    /// The project's proxy allowance is repaired on every pass, even when the entry is unchanged.
+    /// The project's proxy allowance is repaired on every pass, even when the entry is unchanged. Opting in also recreates
+    /// a bridge, project or profile deleted outside Arca on the next pass.
     fn reconciles_when_unchanged() -> bool {
         true
     }

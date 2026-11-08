@@ -697,7 +697,7 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         )));
     }
     if let Some(data) = &template.data
-        && (data.path == "/"
+        && (path_is_root(&data.path)
             || data.path.len() > DATA_PATH_MAX
             || !data.path.starts_with('/')
             || data.path.chars().any(|c| c.is_control())
@@ -774,6 +774,11 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     }
     let _ = dir;
     Ok(())
+}
+
+/// Whether the path is the root once repeated separators and `.` segments are dropped.
+fn path_is_root(path: &str) -> bool {
+    path.split('/').all(|part| part.is_empty() || part == ".")
 }
 
 fn decimal(value: &str) -> bool {

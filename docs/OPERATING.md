@@ -245,14 +245,16 @@ images and vendored npm lockfile.
 
 Templates may also set `limits` with an optional decimal-string `cpu` and/or a size-string `memory` (for example,
 `{"cpu":"4","memory":"4GiB"}`); at least one is required when `limits` is present. These instance settings override the
-shared profile. `autostart` defaults to false; true sets `boot.autostart=true`.
+shared profile. `cpu`, `memory` and a data `size` must start with a digit 1-9; zero is refused. `autostart` defaults to
+false; true sets `boot.autostart=true`.
 
-`data` names an absolute printable mount `path` with no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit),
-and an optional `size` such as `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool
-before the instance, setting `initial.uid`/`initial.gid` when supplied. The disk device mounts that volume at `path`;
-`size`, when supplied, is set on the volume config only; Incus supports a disk device's `size` only on the rootfs disk,
-so the data disk carries none. The volume carries the entry's ownership marker,
-is reused on reconciliation, and is deleted with the instance and ACL on approved service removal.
+`data` names an absolute printable mount `path` of at most 255 bytes that is not the root (`/`, `//` and `/.` are
+refused) and has no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit), and an optional `size` such as
+`8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool before the instance, setting
+`initial.uid`/`initial.gid` when supplied. The disk device mounts that volume at `path`; `size`, when supplied, is set on
+the volume config only; Incus supports a disk device's `size` only on the rootfs disk, so the data disk carries none. The
+volume carries the entry's ownership marker, is reused on reconciliation, and is deleted with the instance and ACL on
+approved service removal.
 
 `lan: {"port":3081}` requires that port in `ports` and adds a `web` proxy device listening on `tcp:0.0.0.0:3081`,
 connecting to `tcp:127.0.0.1:3081` in the container. The proxy is a forkproxy device, so it connects to the container

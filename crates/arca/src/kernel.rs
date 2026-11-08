@@ -1,6 +1,7 @@
 //! The kernel: the desired-state store, the reconciler that acts on it, and the owner approvals that release a delete plan. Every
 //! method takes `&mut self`, so the verbs reach the kernel through one lock, and no two calls run at once.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -55,6 +56,8 @@ pub struct Kernel {
 /// The reconciliation and approved plan run of one atomic service removal.
 pub struct ServiceRemoval {
     pub outcomes: Vec<Outcome>,
+    /// The entries this removal changed: the removed entry and every service whose links it revoked.
+    pub changed: BTreeSet<EntryId>,
     pub run: Result<Option<PlanRun>, ApprovalRefusal>,
 }
 
@@ -100,7 +103,12 @@ impl Kernel {
         )?;
         if let Some(signed) = store.current().cloned() {
             // The outcomes of a start are not reported to a caller. A plan the current document implies is listed again.
-            let _ = reconciler.reconcile(&signed, now_ms);
+            let outcomes = reconciler.reconcile(&signed, now_ms);
+            for outcome in outcomes {
+                if let Outcome::Failed { entry, why } = outcome {
+                    eprintln!("arca: startup reconciliation of {} failed: {why}", entry.0);
+                }
+            }
         }
         let converged = reconciler.converged();
         let retained_entries = retained.entries().map_err(retained_failure)?;
@@ -419,8 +427,10 @@ impl Kernel {
                 EntryChange::Put(entry) => Some(entry.id.clone()),
                 _ => None,
             })
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         changes.push(EntryChange::Remove(entry.clone()));
+        let mut changed = linked.clone();
+        changed.insert(entry.clone());
         let outcomes = self
             .propose(changes, now_ms)
             .map_err(ServiceRemovalError::Proposal)?;
@@ -432,6 +442,7 @@ impl Kernel {
         {
             return Ok(ServiceRemoval {
                 outcomes,
+                changed,
                 run: Ok(None),
             });
         }
@@ -441,7 +452,11 @@ impl Kernel {
             .find(|plan| &plan.entry == entry)
             .map(|plan| self.run_plan_authorized(&plan.digest, now_ms))
             .transpose();
-        Ok(ServiceRemoval { outcomes, run })
+        Ok(ServiceRemoval {
+            outcomes,
+            changed,
+            run,
+        })
     }
 
     /// Runs a delete plan whose owner approval was checked and spent by the caller.

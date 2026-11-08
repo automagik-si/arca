@@ -1465,3 +1465,15 @@ fn g5_failed_link_revocation_does_not_release_the_consumers_address() {
                 || r.path != format!("/1.0/instances/app?project={PROJECT}"))
     );
 }
+
+#[test]
+fn a_netproject_read_failure_does_not_refuse_a_service_connect() {
+    let rig = Rig::new();
+    create_pair(&rig);
+    rig.fail_observe("net-arcak-svc");
+    assert_eq!(
+        op(&rig, "service_connect", json!({"from":"app","to":"db"}))
+            .expect("the service update ignores the project entry's read failure"),
+        json!({"env":["DATABASE_URL"]})
+    );
+}

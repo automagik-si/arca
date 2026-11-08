@@ -31,24 +31,12 @@ fn net_entry() -> Entry {
     )
 }
 
-fn start() -> (Scratch, FakeIncus, NodeKey, Reconciler<FileJournal>) {
-    let scratch = Scratch::new("unchanged");
-    let fake = FakeIncus::start(
-        &scratch.dir,
-        FakeState {
-            server: json!({}),
-            projects: vec![],
-            instances: vec![],
-            networks: vec![],
-            pools: vec![],
-        },
-    )
-    .expect("the fake serves");
-    fake.add_profile(
-        "default",
-        json!({"name":"default","config":{},"devices":{"root":{"pool":"pool1"}}}),
-    );
-    let key = node_key();
+fn open_with(
+    scratch: &Scratch,
+    fake: &FakeIncus,
+    key: &NodeKey,
+    converged: Vec<Entry>,
+) -> Reconciler<FileJournal> {
     let retained = RetainedSet::empty();
     let provider = IncusProvider::new(
         fake.socket().to_path_buf(),
@@ -68,15 +56,37 @@ fn start() -> (Scratch, FakeIncus, NodeKey, Reconciler<FileJournal>) {
     .expect("the journal folds");
     let mut plugins = PluginSet::new();
     plugins.add::<NetProject>().expect("the plugin is valid");
-    let reconciler = Reconciler::open(
+    Reconciler::open_resuming(
         DesiredStateGate::new(key.public(), None),
         journal,
         plugins,
         Box::new(provider),
         retained,
+        converged,
         NOW,
     )
-    .expect("the journal has no unresolved intent");
+    .expect("the journal has no unresolved intent")
+}
+
+fn start() -> (Scratch, FakeIncus, NodeKey, Reconciler<FileJournal>) {
+    let scratch = Scratch::new("unchanged");
+    let fake = FakeIncus::start(
+        &scratch.dir,
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+    )
+    .expect("the fake serves");
+    fake.add_profile(
+        "default",
+        json!({"name":"default","config":{},"devices":{"root":{"pool":"pool1"}}}),
+    );
+    let key = node_key();
+    let reconciler = open_with(&scratch, &fake, &key, Vec::new());
     (scratch, fake, key, reconciler)
 }
 
@@ -168,4 +178,41 @@ fn a_converged_unchanged_netproject_entry_writes_nothing_when_the_allowance_is_p
         "the opt-in entry is still reconciled"
     );
     assert_eq!(fake.writes().len(), writes, "no project write is sent");
+}
+
+#[test]
+fn a_restart_with_stored_converged_entries_repairs_the_missing_proxy_allowance() {
+    let (scratch, fake, key, mut reconciler) = start();
+    let first = signed(&key, 1, None, vec![net_entry()]);
+    assert_eq!(reconciler.reconcile(&first, NOW), applied());
+    let converged = reconciler.converged();
+    assert_eq!(
+        converged,
+        vec![net_entry()],
+        "the entry is stored as converged"
+    );
+    drop(reconciler);
+
+    let path = project_path();
+    let project = get(&fake, &path).expect("the project exists");
+    let mut legacy = project.clone();
+    legacy["config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("restricted.devices.proxy");
+    let (status, _) = raw(&fake, "PUT", &path, Some(&legacy));
+    assert_eq!(status, 200, "the operator's edit lands");
+
+    // The restart resumes from the stored converged entries and re-offers the same document.
+    let mut resumed = open_with(&scratch, &fake, &key, converged);
+    assert_eq!(
+        resumed.reconcile(&first, NOW),
+        applied(),
+        "the resumed entry is reconciled against live state"
+    );
+    let repaired = get(&fake, &path).expect("the project remains");
+    assert_eq!(
+        repaired["config"]["restricted.devices.proxy"], "allow",
+        "the startup pass repairs the allowance"
+    );
 }

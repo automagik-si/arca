@@ -35,12 +35,11 @@ fn change(config: &ServiceConfig) -> Result<crate::desired_store::EntryChange, C
         serde_json::to_value(config).map_err(|_| internal())?,
     )))
 }
-fn failed(outcomes: &[Outcome]) -> bool {
-    outcomes.iter().any(|o| {
-        matches!(
-            o,
-            Outcome::Failed { .. } | Outcome::Refused(_) | Outcome::Held { .. }
-        )
+pub(super) fn failed_for(outcomes: &[Outcome], entries: &[&str]) -> bool {
+    outcomes.iter().any(|outcome| match outcome {
+        Outcome::Failed { entry, .. } => entries.iter().any(|id| entry.0 == *id),
+        Outcome::Refused(_) | Outcome::Held { .. } => true,
+        _ => false,
     })
 }
 
@@ -63,7 +62,12 @@ impl ServiceHandler {
         let outcomes = lock(&self.kernel)?
             .propose(changes, now)
             .map_err(|_| internal())?;
-        if failed(&outcomes) {
+        let ids = configs
+            .iter()
+            .map(|config| format!("service-{}", config.name))
+            .collect::<Vec<_>>();
+        let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        if failed_for(&outcomes, &ids) {
             return Err(service_refused("service config or ACL update failed"));
         }
         Ok(())
