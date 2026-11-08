@@ -68,15 +68,19 @@ export function isHostOnline(host = {}) {
 export function hostCpu(host = {}) {
   const cpu = host.metrics?.latest?.cpu;
   const cores = finite(cpu?.cores);
+  // The kernel's coresKnown flag is authoritative. Older snapshots have no flag, so only a positive count is
+  // real there; zero has always been the placeholder for an unread host total.
+  const coresKnown = cores !== null && cores > 0
+    && (typeof cpu?.coresKnown === 'boolean' ? cpu.coresKnown : true);
   const usedPct = finite(cpu?.usedPct);
   const reason = typeof cpu?.reason === 'string' ? cpu.reason.trim() : '';
   if (cores === null && usedPct === null && !reason) return null;
-  // A reason or a zero core count means the host totals are unknown. The load percentage cannot be trusted
-  // against an unknown capacity, so it is reported as unknown and no bar is drawn.
-  const known = !reason && cores !== null && cores > 0;
-  const percent = known && usedPct !== null ? clampPercent(usedPct) : null;
+  // The load percentage cannot be trusted against an unknown capacity, so it is reported as unknown and no bar
+  // is drawn. A reason only explains an absent load; it never invalidates a real core count.
+  const percent = coresKnown && usedPct !== null ? clampPercent(usedPct) : null;
   return {
     cores,
+    coresKnown,
     usedPct: percent,
     usedCores: percent !== null && cores !== null ? (percent / 100) * cores : null,
     reason,
@@ -105,13 +109,18 @@ export function hostMemory(host = {}) {
 
 export function cpuLabel(cpu) {
   if (!cpu) return '';
-  // A remote host may report no core count; a reason or a zero count is unknown capacity, never "0 cores".
-  if (cpu.reason || cpu.cores === 0) return 'cores n/a';
-  // A null load is unknown, never zero: no bar and no invented percentage.
-  if (cpu.usedPct === null) return 'n/a';
-  if (cpu.usedCores !== null && cpu.cores !== null) return `${formatNumber(cpu.usedCores)} / ${count(cpu.cores, 'core')}`;
-  if (cpu.cores !== null) return count(cpu.cores, 'core');
-  return `${formatNumber(cpu.usedPct)}% used`;
+  // Trust coresKnown when present; an older snapshot without it only has a core count when cores is positive.
+  // A reason describes an absent load, not an absent capacity, so it never turns a known count into "cores n/a".
+  const cores = finite(cpu.cores);
+  const coresKnown = cores !== null && cores > 0
+    && (typeof cpu.coresKnown === 'boolean' ? cpu.coresKnown : true);
+  if (!coresKnown) return 'cores n/a';
+  // A null load is unknown, never zero: keep the real capacity and invent no percentage.
+  const usedPct = finite(cpu.usedPct);
+  if (usedPct === null) return `n/a / ${count(cores, 'core')}`;
+  const usedCores = finite(cpu.usedCores);
+  if (usedCores !== null) return `${formatNumber(usedCores)} / ${count(cores, 'core')}`;
+  return `${formatNumber(usedPct)}% used`;
 }
 
 export function memoryLabel(memory) {
@@ -124,7 +133,10 @@ export function memoryLabel(memory) {
 export function fleetSummary(hosts = []) {
   const rows = list(hosts);
   const parts = [count(rows.length, 'machine')];
-  const cores = rows.reduce((sum, host) => sum + (hostCpu(host)?.cores ?? 0), 0);
+  const cores = rows.reduce((sum, host) => {
+    const cpu = hostCpu(host);
+    return sum + (cpu?.coresKnown ? cpu.cores : 0);
+  }, 0);
   if (cores > 0) parts.push(count(cores, 'core'));
   const bytes = rows.reduce((sum, host) => sum + (hostMemory(host)?.totalBytes ?? 0), 0);
   if (bytes > 0) parts.push(`${formatGb(bytes)} GB`);
@@ -212,7 +224,8 @@ function buildMachine(host) {
     tone: online ? 'ok' : 'bad',
     cpu,
     cpuLabel: cpuLabel(cpu),
-    cpuReason: cpu?.reason ?? '',
+    // The reason is the CPU n/a tooltip: it only applies while no load is shown.
+    cpuReason: cpu?.usedPct === null ? (cpu?.reason ?? '') : '',
     memory,
     memoryLabel: memoryLabel(memory),
     memoryReason: memory?.reason ?? '',

@@ -233,11 +233,13 @@ it). The machines strip draws one compact card per configured host with online
 state from `arca_status.incusReachable`, a CPU bar from `latest.cpu.usedPct`
 (shown as used cores / total cores), a memory bar from
 `memory.totalBytes` and `usedBytes` (falling back to `totalBytes -
-availableBytes`), and the instance count. A null CPU load renders `CPU n/a` with
-no bar, never zero. When the host reports `cpu.reason` or `cpu.cores` is zero,
-the card says `cores n/a` and keeps the reason as the meter's tooltip; a memory
-`reason` renders `Mem n/a` with the same tooltip and no bar. A real reading is
-never replaced by an invented one.
+availableBytes`), and the instance count. The card trusts `cpu.coresKnown`: a
+known count is always shown, even when `cpu.reason` explains why the load is
+absent. A null CPU load renders `CPU n/a` as `n/a / N cores` with no bar, never
+zero. Only an unknown core count, from `coresKnown: false` or an older snapshot
+whose `cores` is zero, says `cores n/a` and carries the reason as the meter's
+tooltip. A memory `reason` renders `Mem n/a` with the same tooltip and no bar.
+A real reading is never replaced by an invented one.
 Two dashed placeholder cards leave room for storage and phones. The project
 canvas draws the selected project's instances and matched databases as cards
 connected to a project hub with curved dashed SVG edges on the dotted canvas.
