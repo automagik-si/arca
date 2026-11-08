@@ -331,6 +331,7 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
     assert_eq!(status, 200);
     let status_row = tool_result(&text);
     conforming("arca_status", &status_row);
+    assert_eq!(status_row["mode"], json!("watch-only"));
     assert_eq!(status_row["incusReachable"], json!(true));
     assert_eq!(status_row["appliedSeq"], Value::Null);
 
@@ -405,6 +406,114 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
         rig.fake.requests().iter().all(|r| r.method == "GET"),
         "the fake saw only GET"
     );
+}
+
+#[test]
+fn a_node_with_kernel_projects_reports_kernel_mode_before_any_document_applies() {
+    let scratch = Scratch::new("kernel-status");
+    let rig = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, rig.fake.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["kernel"]["projects"] = json!([arca_netproject::PROJECT]);
+    fs::write(&config, cfg.to_string()).expect("write kernel config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+
+    let (status, text) = post(
+        &socket,
+        &[bearer(secret_of(&secrets, "doctor-1"))],
+        &call(1, "arca_status", json!({})),
+    );
+    assert_eq!(status, 200);
+    let row = tool_result(&text);
+    conforming("arca_status", &row);
+    assert_eq!(row["mode"], json!("kernel"));
+    assert_eq!(row["incusReachable"], json!(true));
+    assert_eq!(row["appliedSeq"], Value::Null);
+    assert_eq!(serve.terminate().code(), Some(0));
+}
+
+#[test]
+fn kernel_status_reports_the_applied_sequence_after_service_create() {
+    status_after_service_create(false);
+}
+
+#[test]
+fn kernel_status_reloads_the_applied_sequence_after_restart() {
+    status_after_service_create(true);
+}
+
+fn status_after_service_create(restart: bool) {
+    let scratch = Scratch::new("applied-status");
+    let rig = rig(&scratch);
+    rig.fake.add_profile(
+        "default",
+        json!({
+            "name": "default", "config": {},
+            "devices": {"root": {"type": "disk", "pool": "default", "path": "/"}}
+        }),
+    );
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, rig.fake.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["kernel"]["projects"] = json!([arca_netproject::PROJECT]);
+    cfg["kernel"]["serviceCidr"] = json!("192.0.2.0/24");
+    fs::write(&config, cfg.to_string()).expect("write kernel config");
+    let templates = scratch.at("state/templates");
+    fs::create_dir(&templates).expect("templates");
+    fs::write(
+        templates.join("nats.json"),
+        json!({
+            "name": "nats", "kind": "oci", "image": "docker.io/library/nats",
+            "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ports": [4222], "env": {}, "publishable": false
+        })
+        .to_string(),
+    )
+    .expect("template");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (status, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(
+            1,
+            "service_create",
+            json!({"name":"nats", "template":"nats"}),
+        ),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(tool_result(&text)["state"], "running");
+    let desired: Value =
+        serde_json::from_slice(&fs::read(scratch.at("state/desired.json")).expect("desired state"))
+            .expect("desired JSON");
+    let seq = desired["current"]["document"]["seq"]
+        .as_u64()
+        .expect("document sequence");
+    assert!(seq >= 1);
+
+    if restart {
+        assert_eq!(serve.terminate().code(), Some(0));
+        serve = start_serve(&config);
+        wait_for_server(&mut serve, &socket);
+    }
+    let (status, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(2, "arca_status", json!({})),
+    );
+    assert_eq!(status, 200);
+    let row = tool_result(&text);
+    conforming("arca_status", &row);
+    assert_eq!(row["mode"], "kernel");
+    assert_eq!(row["appliedSeq"], seq);
+    assert_eq!(serve.terminate().code(), Some(0));
 }
 
 #[test]

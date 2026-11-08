@@ -146,16 +146,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     plugins
         .add::<arca_postgres::consumer::Consumer>()
         .map_err(kernel_failure)?;
+    let kernel_mode = !cfg.kernel.projects.is_empty();
     let kernel = Kernel::open(
         &cfg.state_dir,
         key,
         plugins,
         verifier,
         host,
-        write_provider(&cfg),
+        write_provider(&cfg, kernel_mode),
         now_ms(),
     )
     .map_err(kernel_failure)?;
+    let applied_seq = kernel.applied_seq_reader();
     let kernel = Arc::new(Mutex::new(kernel));
 
     // The store opens before anything listens, so a store that refuses its pragmas stops the start with exit 1. The sampler
@@ -193,11 +195,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));
+    let mode = if kernel_mode { "kernel" } else { "watch-only" };
     let mut server = Server::new(verbs(), tokens.clone())
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
                 node: node.clone(),
+                mode,
+                applied_seq,
                 started,
                 socket: cfg.incus.socket.clone(),
             }),
@@ -532,10 +537,10 @@ fn approval_host(cfg: &NodeConfig) -> Result<String, Failure> {
 /// those projects. A node with none reads only, so no removal can reach Incus.
 fn write_provider(
     cfg: &NodeConfig,
+    kernel_mode: bool,
 ) -> impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError> {
     let socket = cfg.incus.socket.clone();
     let secrets = cfg.state_dir.join(SECRETS_DIR);
-    let writes = !cfg.kernel.projects.is_empty();
     let family = Family {
         projects: cfg.kernel.projects.clone(),
         scratch: cfg.kernel.scratch,
@@ -543,7 +548,7 @@ fn write_provider(
         reserved_cidrs: cfg.kernel.reserved_cidrs.clone(),
     };
     move |retained| {
-        if writes {
+        if kernel_mode {
             let provider = IncusProvider::new(socket, family, secrets, retained)
                 .map_err(|refusal| KernelError::Plugin(refusal.to_string()))?;
             return Ok(Box::new(provider));

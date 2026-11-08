@@ -2,7 +2,11 @@
 mod common;
 
 use arca::{
-    config::NodeConfig, handlers::service_handlers, kernel::Kernel, service, service::Service,
+    config::NodeConfig,
+    handlers::{StatusHandler, service_handlers},
+    kernel::Kernel,
+    service,
+    service::Service,
 };
 use arca_api::Scope;
 use arca_approval::{ApprovalVerifier, FileNonces, OwnerKeys, PasskeyVerifier, SshSigVerifier};
@@ -369,6 +373,61 @@ fn service_create_list_status_round_trip() {
         ))
         .expect("acl");
     assert_eq!(acl["config"]["user.arca.managed"], "true");
+}
+
+#[test]
+fn node_status_answers_while_the_kernel_is_locked_and_after_it_is_poisoned() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("create");
+    let kernel = rig.kernel.lock().expect("kernel");
+    let seq = kernel.applied_seq().expect("applied sequence");
+    let status = Arc::new(StatusHandler {
+        node: "node1".into(),
+        mode: "kernel",
+        applied_seq: kernel.applied_seq_reader(),
+        started: std::time::Instant::now(),
+        socket: rig.fake.socket().to_path_buf(),
+    });
+    let caller = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    let reader = Arc::clone(&status);
+    let worker = std::thread::spawn(move || {
+        send.send(reader.call(json!({}), &caller)).expect("reply");
+    });
+    let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+    drop(kernel);
+    worker.join().expect("status thread");
+    let row = result
+        .expect("status does not wait for the kernel lock")
+        .expect("status");
+    assert_eq!(row["appliedSeq"], seq);
+
+    let kernel = Arc::clone(&rig.kernel);
+    assert!(
+        std::thread::spawn(move || {
+            let _held = kernel.lock().expect("kernel");
+            panic!("poison the kernel lock");
+        })
+        .join()
+        .is_err()
+    );
+    let row = status
+        .call(
+            json!({}),
+            &Caller {
+                token_id: "doctor".into(),
+                scope: Scope::Doctor,
+                tools: None,
+            },
+        )
+        .expect("status survives a poisoned kernel lock");
+    assert_eq!(row["appliedSeq"], seq);
 }
 
 fn hand_instance(name: &str, project: &str, devices: Value) -> Value {
