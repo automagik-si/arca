@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -12,6 +12,9 @@ export const READ_TOOLS = Object.freeze([
 ]);
 
 export const DEFAULTS = Object.freeze({
+  setupMs: 60_000,
+  cancelMs: 5_000,
+  idleMs: 5_000,
   toolCallsPerTurn: 40,
   outputTokensPerTurn: 64_000,
   dailyTokenBudget: 1_000_000,
@@ -97,6 +100,7 @@ function emptyState(ms) {
     sessionId: null,
     day: dayOf(ms),
     dailyTokens: 0,
+    budgetExhausted: false,
     messages: [],
   };
 }
@@ -128,6 +132,8 @@ function normalizeState(raw, ms) {
     sessionId: typeof raw.sessionId === 'string' && raw.sessionId ? raw.sessionId : null,
     day: typeof raw.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(raw.day) ? raw.day : fallback.day,
     dailyTokens: Math.max(0, finite(raw.dailyTokens)),
+    // A quarantined read stays exhausted for the rest of its UTC day, even if a later read succeeds.
+    budgetExhausted: raw.budgetExhausted === true,
     messages,
   };
 }
@@ -139,6 +145,7 @@ export class ChatStore {
     this.path = path;
     this.now = typeof now === 'function' ? now : () => now;
     this.queue = Promise.resolve();
+    this.exhaustedDay = null;
   }
 
   /** Resolve after every queued write has settled and reached durable storage. */
@@ -164,22 +171,61 @@ export class ChatStore {
   #roll(state) {
     const day = dayOf(this.now());
     if (state.day === day) return state;
-    return { ...state, day, dailyTokens: 0 };
+    return { ...state, day, dailyTokens: 0, budgetExhausted: false };
   }
 
   async #load() {
+    let raw;
     try {
-      return normalizeState(JSON.parse(await readFile(this.path, 'utf8')), this.now());
-    } catch {
-      return emptyState(this.now());
+      raw = await readFile(this.path, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        // A quarantine whose marker could not be written still stays exhausted for this process and day.
+        if (this.exhaustedDay === dayOf(this.now())) {
+          return { ...emptyState(this.now()), budgetExhausted: true };
+        }
+        return emptyState(this.now());
+      }
+      return this.#quarantine();
     }
+    try {
+      return normalizeState(JSON.parse(raw), this.now());
+    } catch {
+      return this.#quarantine();
+    }
+  }
+
+  // A corrupt counter must never reset to zero (that would hand out a fresh budget). Keep the bad file for
+  // inspection and persist an exhausted marker for today, so every later read and turn still refuses.
+  async #quarantine() {
+    this.exhaustedDay = dayOf(this.now());
+    const state = { ...emptyState(this.now()), budgetExhausted: true };
+    const stamp = new Date(this.now()).toISOString().replace(/[:.]/g, '-');
+    try {
+      await rename(this.path, `${this.path}.corrupt-${stamp}-${randomUUID().slice(0, 8)}`);
+    } catch { /* keep the exhausted state even when the file cannot be moved */ }
+    try {
+      await this.#write(state);
+    } catch { /* a read-only store still fails closed in memory */ }
+    return state;
   }
 
   async #write(state) {
     await mkdir(dirname(this.path), { recursive: true });
     const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(state)}\n`, { mode: 0o600 });
-    await rename(temporary, this.path);
+    try {
+      const handle = await open(temporary, 'w', 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(state)}\n`);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temporary, this.path);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 }
 
@@ -309,14 +355,24 @@ function toolClient(clientFor, hosts, name, onCall) {
     },
     async execute(args = {}, exec = {}) {
       const requested = text(args?.host).trim();
+      if (requested && !hosts.some((candidate) => candidate.name === requested)) {
+        throw new Error(`Unknown host "${requested}". Valid hosts: ${hosts.map((candidate) => candidate.name).join(', ') || '(none)'}.`);
+      }
       const host = hosts.find((candidate) => candidate.name === requested) ?? hosts[0];
       if (!host) throw new Error('No Arca host is configured.');
       const client = clientFor(host.name);
-      if (!client) throw new Error('No Arca reader is available for that host.');
-      await onCall?.({ name, host: host.name, input: toolInput(name, args), callId: exec.callId });
-      return client.call(name, toolInput(name, args));
+      if (!client) throw new Error(`No Arca reader is available for host "${host.name}".`);
+      const input = toolInput(name, args);
+      await onCall?.({ name, host: host.name, input, callId: exec.callId });
+      return withHost(await client.call(name, input, exec.signal), host.name);
     },
   };
+}
+
+// Every read result names its host, so a model answer cannot attribute one machine's numbers to another.
+function withHost(value, host) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return { ...value, host };
+  return { host, data: value };
 }
 
 function toolInput(name, args) {
@@ -330,7 +386,8 @@ function toolInput(name, args) {
 }
 
 // Tool definitions are plain objects in the DSH registry contract (name, description, parameters, output,
-// execute). They are registered in the Doctor's agent scope, so no other session can see them.
+// execute). They are registered globally with a `when` condition for this Doctor session only, then the
+// Doctor's scope is restricted to their allow-list and a dispatch guard refuses everything else.
 export function createReadTools({ hosts = [], clientFor, onCall } = {}) {
   return READ_TOOLS.map((name) => toolClient(clientFor, hosts, name, onCall));
 }
@@ -360,6 +417,9 @@ export function createDoctorChat(options = {}) {
     uuid = randomUUID,
     heartbeatMs = DEFAULTS.heartbeatMs,
     turnMs = DEFAULTS.turnMs,
+    setupMs = DEFAULTS.setupMs,
+    cancelMs = DEFAULTS.cancelMs,
+    idleMs = DEFAULTS.idleMs,
     toolCallsPerTurn = DEFAULTS.toolCallsPerTurn,
     outputTokensPerTurn = DEFAULTS.outputTokensPerTurn,
     dailyTokenBudget = DEFAULTS.dailyTokenBudget,
@@ -375,25 +435,75 @@ export function createDoctorChat(options = {}) {
   let busy = false;
   let turn;
   let closed = false;
+  let toolDisposers = [];
+  let toolsInstalled = false;
+  let targetSessionId = null;
+  let lastTurn = 0;
+  let lastAgentId = null;
+  let runSequence = 0;
+  let ensureGeneration = 0;
+  let cancelCurrent = null;
 
   const primaryApproval = safeApprovalUrl(approvalUrl);
 
+  function discardAgent() {
+    const handle = agentHandle;
+    agentHandle = undefined;
+    agent = undefined;
+    try {
+      void handle?.dispose?.();
+    } catch { /* the runtime is already going away */ }
+  }
+
+  // The allow-list is the primary fence: every global tool, including one registered after setup, is hidden from
+  // the Doctor unless its name is in READ_TOOLS. The tools are registered globally with a `when` condition for this
+  // Doctor session only; the restriction is applied in the agent scope. A registry that cannot do that fails setup.
+  function installTools(dsh) {
+    if (toolsInstalled) return;
+    const registry = dsh?.tools;
+    if (!registry || typeof registry.register !== 'function'
+      || typeof registry.restrict !== 'function' || typeof registry.definitions !== 'function') {
+      throw new Error('The DSH tool registry cannot enforce a read-only set.');
+    }
+    const registered = [];
+    try {
+      for (const definition of tools) {
+        registered.push(registry.register(definition, {
+          when: (context) => Boolean(context?.agent && context.agent.id === targetSessionId),
+        }));
+      }
+      const known = new Set((registry.definitions(undefined) ?? []).map((definition) => definition.name));
+      const missing = READ_TOOLS.filter((name) => !known.has(name));
+      if (missing.length) throw new Error(`The DSH tool registry is missing ${missing.join(', ')}.`);
+      toolDisposers = registered;
+      toolsInstalled = true;
+    } catch (error) {
+      for (const dispose of registered) {
+        try { dispose(); } catch { /* registration rollback */ }
+      }
+      throw error;
+    }
+  }
+
   async function ensureAgent(dsh) {
     if (agent) return agent;
+    const attempt = ++ensureGeneration;
     const state = await chatStore.read();
-    const sessionId = state.sessionId ?? uuid();
+    targetSessionId = state.sessionId ?? uuid();
+    installTools(dsh);
     const setup = (agentCtx) => {
-      if (!agentCtx?.tools) throw new Error('The DSH tool registry is unavailable.');
-      for (const definition of tools) agentCtx.tools.register(definition);
-      // Hide every deployment tool from the Doctor. Scoped registrations above stay visible; the reserved
-      // `run_code` transport name cannot be named in a restriction, so it is skipped. A registry that cannot
-      // apply this fails the agent setup: the chat must not run with a shell or file tool available.
-      if (typeof agentCtx.tools.restrict === 'function') {
-        const names = (agentCtx.tools.definitions?.(undefined) ?? [])
-          .map((definition) => definition.name)
-          .filter((name) => name !== 'run_code' && !READ_TOOLS.includes(name));
-        if (names.length) agentCtx.tools.restrict({ deny: names });
+      if (!agentCtx?.tools || typeof agentCtx.tools.restrict !== 'function') {
+        throw new Error('The DSH tool restriction is unavailable.');
       }
+      agentCtx.tools.restrict({ allow: [...READ_TOOLS] });
+      // A late registration is hidden by the allow-list; this dispatch guard is the second fence and also denies
+      // the reserved `run_code` transport, which a restriction cannot name.
+      agentCtx.on('tools/pre-execute', (exec, next) => {
+        if (!exec || !READ_TOOLS.includes(exec.name)) {
+          return Promise.resolve({ kind: 'deny', reason: 'The Doctor is read-only: that tool is not available.' });
+        }
+        return next();
+      });
       if (agentCtx.systemPrompt?.section) {
         agentCtx.systemPrompt.section({
           name: 'deployment:persona-prefix',
@@ -413,13 +523,14 @@ export function createDoctorChat(options = {}) {
       maxTokens: limits.outputTokensPerTurn,
     };
     let created = false;
-    let createId = sessionId;
+    let createId = targetSessionId;
     if (state.sessionId) {
       try {
         agentHandle = await dsh.agents.resume({ resumeSessionId: state.sessionId, agentOptions, setup });
       } catch (error) {
         // A corrupt or missing stored session must not wedge chat: start a fresh Doctor session instead.
-        createId = uuid();
+        targetSessionId = uuid();
+        createId = targetSessionId;
         log(`Arca canvas chat: stored session could not resume (${safeErrorCode(error)}); starting a new one`);
       }
     }
@@ -427,7 +538,20 @@ export function createDoctorChat(options = {}) {
       agentHandle = await dsh.agents.create({ sessionId: createId, agentOptions, setup });
       created = true;
     }
+    if (attempt !== ensureGeneration) {
+      // A timed-out setup resolved late. Its agent must never be published as the live Doctor.
+      const stale = agentHandle;
+      agentHandle = undefined;
+      try { await stale?.dispose?.(); } catch { /* already gone */ }
+      throw new Error('Doctor setup was superseded');
+    }
     agent = agentHandle.agent;
+    targetSessionId = agent.session.id;
+    if (lastAgentId !== agent.session.id) {
+      // A fresh session starts its turn numbering over; stale counters from another session must not hide it.
+      lastAgentId = agent.session.id;
+      lastTurn = 0;
+    }
     if (dsh.sessionTitle?.rename) {
       try {
         const current = dsh.sessionTitle.get?.(agent.session)?.title;
@@ -466,21 +590,14 @@ export function createDoctorChat(options = {}) {
     turn.reason = reason;
     const limit = reason === 'tool-calls' ? limits.toolCallsPerTurn : limits.outputTokensPerTurn;
     if (!sse.closed) sse.send('cap', { reason, limit, message: capMessage(reason, limit) });
-    try {
-      agent?.cancel?.(reason);
-    } catch { /* already quiescent */ }
-    settle();
-  }
-
-  function settle() {
-    if (!turn) return;
-    turn.resolve?.();
+    cancelCurrent?.(reason);
   }
 
   let sse;
 
   function onToolCall({ name, host, input, callId }) {
     if (!turn) throw new Error('No active Doctor turn.');
+    if (turn.cancelled) throw new Error('The Doctor turn was stopped.');
     if (turn.toolCalls >= limits.toolCallsPerTurn) {
       cap('tool-calls');
       throw new TurnCap('tool-calls');
@@ -500,8 +617,8 @@ export function createDoctorChat(options = {}) {
     return finite(usage.inputTokens) + finite(usage.outputTokens);
   }
 
-  // Usage is counted synchronously, before any persistence await, so a cap reached on the final event of a turn
-  // still stops the turn instead of racing the settle.
+  // Usage rides the durable `assistant/message` event (normal and interrupted); see dsh-agent-loop/lib/index.js:891-903
+  // and :949-953. It is counted synchronously, before persistence, so a cap on the final event still stops the turn.
   function noteUsage(usage) {
     if (!turn) return;
     const output = Math.max(0, finite(usage?.outputTokens));
@@ -536,21 +653,29 @@ export function createDoctorChat(options = {}) {
           message: 'Daily budget reached, try tomorrow.',
         });
       }
-      try {
-        agent?.cancel?.('budget');
-      } catch { /* already quiescent */ }
-      settle();
+      cancelCurrent?.('budget');
     }
   }
 
-  async function runTurn(message) {
+  async function runTurn(message, deadlineAt) {
     const initial = await chatStore.read();
-    turn = {
-      toolCalls: 0, outputTokens: 0, dailyTokens: initial.dailyTokens, tools: [],
-      reason: null, resolve: null, text: '', persist: Promise.resolve(),
+    const run = {
+      id: ++runSequence,
+      turn: null,
+      reason: null,
+      cancelled: false,
+      toolCalls: 0,
+      outputTokens: 0,
+      dailyTokens: initial.dailyTokens,
+      tools: [],
+      text: '',
+      persist: Promise.resolve(),
+      resolve: null,
     };
-    const done = new Promise((resolve) => { turn.resolve = resolve; });
-    const started = safeApprovalUrl(primaryApproval) && writeIntent(message) ? primaryApproval : '';
+    turn = run;
+    const doctorAgent = agent;
+    const done = new Promise((resolve) => { run.resolve = resolve; });
+    const started = primaryApproval && writeIntent(message) ? primaryApproval : '';
     if (started) {
       sse.send('approval', {
         url: started,
@@ -563,67 +688,131 @@ export function createDoctorChat(options = {}) {
       messages: [...state.messages, { role: 'user', text: message, at: new Date(now()).toISOString() }]
         .slice(-DEFAULTS.historyMessages),
     }));
-    const offStream = agent.ctx.on('agent/assistant-stream', (payload) => {
+
+    let cancelTimer;
+    let turnTimer;
+    let finished = false;
+
+    const settle = () => {
+      if (finished) return;
+      finished = true;
+      run.resolve?.();
+    };
+
+    // Every event that belongs to a turn carries its number. An event at or below the last completed turn is stale
+    // and is dropped, so a late event from a cancelled run can never be charged to the next one.
+    const matchesTurn = (number) => {
+      if (!Number.isInteger(number)) return false;
+      if (run.turn === null) {
+        if (number <= lastTurn) return false;
+        run.turn = number;
+      }
+      return number === run.turn;
+    };
+
+    const cancelRun = (reason) => {
+      if (finished) return;
+      if (!run.reason) run.reason = reason;
+      if (run.cancelled) return;
+      run.cancelled = true;
+      try {
+        doctorAgent?.cancel?.(reason);
+      } catch { /* already quiescent */ }
+      // The loop appends turn/end in its finally. If that never arrives, drop the agent so a stale run cannot
+      // accept another turn, then release the response.
+      cancelTimer = setTimeout(() => {
+        discardAgent();
+        settle();
+      }, cancelMs);
+      cancelTimer.unref?.();
+    };
+    cancelCurrent = cancelRun;
+
+    const offStream = doctorAgent.ctx.on('agent/assistant-stream', (payload) => {
       const frame = payload?.frame;
       if (!frame || frame.type !== 'chunk' || frame.chunk?.type !== 'text-delta') return;
-      turn.text += frame.chunk.text;
+      if (Number.isInteger(frame.turn) && !matchesTurn(frame.turn)) return;
+      run.text += frame.chunk.text;
       if (!sse.closed) sse.send('text', { text: frame.chunk.text });
     });
-    const offEvents = agent.ctx.on('session/event', (session, event) => {
-      if (!event || session?.id !== agent.session.id) return;
-      if (event.type === 'assistant/message' && event.data?.usage) {
-        noteUsage(event.data.usage);
-      } else if (event.type === 'tool/result') {
+    const offEvents = doctorAgent.ctx.on('session/event', (session, event) => {
+      if (!event || session?.id !== doctorAgent.session.id) return;
+      if (event.type === 'turn/start') {
+        if (run.turn === null && Number.isInteger(event.data?.turn) && event.data.turn > lastTurn) {
+          run.turn = event.data.turn;
+        }
+        return;
+      }
+      if (event.type === 'assistant/message') {
+        if (!matchesTurn(event.data?.turn)) return;
+        if (event.data?.usage) noteUsage(event.data.usage);
+        return;
+      }
+      if (event.type === 'tool/result') {
+        if (!matchesTurn(event.data?.turn)) return;
         const callId = event.data?.message?.toolCallId;
         if (!callId) return;
         const failed = event.data?.message?.isError === true;
-        const summary = bound(messageText(event.data?.message?.content), 240);
-        finaliseTool(callId, failed ? 'error' : 'done', summary);
-      } else if (event.type === 'turn/end') {
+        finaliseTool(callId, failed ? 'error' : 'done', bound(messageText(event.data?.message?.content), 240));
+        return;
+      }
+      if (event.type === 'turn/end') {
+        if (!Number.isInteger(event.data?.turn)) return;
+        if (!matchesTurn(event.data.turn)) return;
+        lastTurn = Math.max(lastTurn, event.data.turn);
+        if (cancelTimer) clearTimeout(cancelTimer);
+        if (turnTimer) clearTimeout(turnTimer);
         settle();
       }
     });
-    const offError = agent.ctx.on('agent/error', () => {
+    const offError = doctorAgent.ctx.on('agent/error', (payload) => {
+      const number = payload?.turn;
+      if (Number.isInteger(number) && run.turn !== null && number !== run.turn) return;
       if (!turn || turn.reason) return;
       turn.reason = 'error';
       if (!sse.closed) sse.send('error', sseError('The Doctor could not reach the model.'));
-      settle();
+      // Do not release the next turn here: the loop still appends turn/end after its failure.
     });
-    const timeout = setTimeout(() => {
+    turnTimer = setTimeout(() => {
       if (!turn || turn.reason) return;
       turn.reason = 'timeout';
-      try {
-        agent.cancel?.('timeout');
-      } catch { /* already quiescent */ }
       if (!sse.closed) sse.send('error', sseError('The Doctor took too long and the answer was stopped.'));
-      settle();
-    }, turnMs);
-    timeout.unref?.();
+      cancelRun('timeout');
+    }, Math.max(1, deadlineAt - now()));
+    turnTimer.unref?.();
+
     try {
-      agent.followup({
-        id: uuid(),
-        role: 'user',
-        content: [{ type: 'text', text: message }],
-        source: { kind: 'user' },
-      });
-      await done;
+      if (sse.closed) {
+        run.reason = 'closed';
+        settle();
+      } else {
+        doctorAgent.followup({
+          id: uuid(),
+          role: 'user',
+          content: [{ type: 'text', text: message }],
+          source: { kind: 'user' },
+        });
+        await done;
+      }
     } finally {
-      clearTimeout(timeout);
+      if (turnTimer) clearTimeout(turnTimer);
+      if (cancelTimer) clearTimeout(cancelTimer);
       offStream?.();
       offEvents?.();
       offError?.();
+      cancelCurrent = null;
     }
-    if (!turn.reason) turn.reason = 'complete';
-    await Promise.allSettled([turn.persist]);
+    if (!run.reason) run.reason = 'complete';
+    await Promise.allSettled([run.persist]);
     await chatStore.flush().catch(() => {});
-    if (turn.text || turn.tools.length) {
+    if (run.text || run.tools.length) {
       await chatStore.patch((state) => ({
         ...state,
         messages: [...state.messages, {
           role: 'assistant',
-          text: turn.text,
+          text: run.text,
           at: new Date(now()).toISOString(),
-          tools: turn.tools.map(({ callId, name, state, host, summary }) => ({
+          tools: run.tools.map(({ callId, name, state, host, summary }) => ({
             callId, name, state,
             ...(host ? { host } : {}),
             ...(summary ? { summary: bound(summary, 240) } : {}),
@@ -631,11 +820,20 @@ export function createDoctorChat(options = {}) {
         }].slice(-DEFAULTS.historyMessages),
       })).catch((error) => log(`Arca canvas chat: transcript not written (${safeErrorCode(error)})`));
     }
+    // A new turn may not start until the previous run is actually idle. If the loop cannot prove that quickly,
+    // drop the agent; the next request resumes the persisted session instead of overlapping this run.
+    let idle = false;
+    try {
+      idle = await within(agent?.whenIdle?.() ?? Promise.resolve(), idleMs);
+    } catch {
+      idle = false;
+    }
+    if (!idle) discardAgent();
     if (!sse.closed) {
       sse.send('done', {
-        reason: turn.reason,
-        turnToolCalls: turn.toolCalls,
-        turnOutputTokens: turn.outputTokens,
+        reason: run.reason,
+        turnToolCalls: run.toolCalls,
+        turnOutputTokens: run.outputTokens,
       });
     }
     sse.end();
@@ -670,27 +868,25 @@ export function createDoctorChat(options = {}) {
     if (!dsh?.agents) return writeJson(response, 503, { error: 'chat-unavailable' });
 
     // Reserve the single turn slot before the first await, so two simultaneous requests cannot both start a turn.
+    // Setup and the model run share one deadline, so the whole response stays inside the kernel's ten minutes.
+    const deadlineAt = now() + turnMs;
     busy = true;
     try {
       const state = await chatStore.read();
-      // The first event goes out before any agent or model work so the kernel's idle timer never starts on a
-      // connection that has not spoken yet.
       sse = createSse(response, {
         heartbeatMs,
         onClose() {
-          if (!turn || turn.reason) return;
-          turn.reason = 'closed';
-          try {
-            agent?.cancel?.('client-disconnect');
-          } catch { /* already quiescent */ }
-          settle();
+          cancelCurrent?.('closed');
         },
       });
-      sse.send('start', { session: SESSION_NAME });
-      if (state.dailyTokens >= limits.dailyTokenBudget) {
+      sse.send('start', {
+        session: SESSION_NAME,
+        ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+      });
+      if (state.budgetExhausted || state.dailyTokens >= limits.dailyTokenBudget) {
         sse.send('budget', {
           scope: 'daily',
-          used: state.dailyTokens,
+          used: state.budgetExhausted ? limits.dailyTokenBudget : state.dailyTokens,
           budget: limits.dailyTokenBudget,
           message: 'Daily budget reached, try tomorrow.',
         });
@@ -698,8 +894,16 @@ export function createDoctorChat(options = {}) {
         sse.end();
         return;
       }
-      await ensureAgent(dsh);
-      await runTurn(message);
+      const setup = ensureAgent(dsh);
+      const ready = await within(setup, Math.min(setupMs, Math.max(1, deadlineAt - now())));
+      if (!ready) {
+        // Invalidate the pending attempt: when it resolves it disposes itself instead of publishing an agent.
+        ensureGeneration += 1;
+        discardAgent();
+        throw new Error('Doctor setup timed out');
+      }
+      if (sse.closed) return;
+      await runTurn(message, deadlineAt);
     } catch (error) {
       log(`Arca canvas chat: turn failed (${safeErrorCode(error)})`);
       if (!response.headersSent) {
@@ -730,6 +934,7 @@ export function createDoctorChat(options = {}) {
         day: state.day,
         dailyTokens: state.dailyTokens,
         dailyBudget: limits.dailyTokenBudget,
+        budgetExhausted: state.budgetExhausted,
       },
       limits: {
         toolCallsPerTurn: limits.toolCallsPerTurn,
@@ -740,13 +945,24 @@ export function createDoctorChat(options = {}) {
 
   async function close() {
     closed = true;
+    cancelCurrent?.('disposed');
+    for (const dispose of toolDisposers) {
+      try { dispose(); } catch { /* registration already gone */ }
+    }
+    toolDisposers = [];
     try {
       agent?.cancel?.('disposed');
     } catch { /* already quiescent */ }
-    settle();
+    settleTurn();
     try {
       await agentHandle?.dispose?.();
     } catch { /* the runtime is already going away */ }
+  }
+
+  function settleTurn() {
+    const current = turn;
+    turn = undefined;
+    current?.resolve?.();
   }
 
   return {
@@ -759,6 +975,17 @@ export function createDoctorChat(options = {}) {
       return agent?.session?.id ?? null;
     },
   };
+}
+
+function within(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(false), Math.max(1, ms));
+    timer.unref?.();
+    Promise.resolve(promise).then(
+      () => { clearTimeout(timer); resolve(true); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }
 
 function safeErrorCode(error) {

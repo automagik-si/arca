@@ -1190,6 +1190,13 @@ pub fn service_view_schema() -> Value {
                 "maxItems": 16,
                 "type": "array"
             },
+            "lanPort": {
+                "anyOf": [
+                    { "maximum": 65535, "minimum": 1, "type": "integer" },
+                    { "type": "null" }
+                ],
+                "description": "Its host port when the template has a lan proxy, or null."
+            },
             "published": {
                 "anyOf": [
                     {
@@ -1217,7 +1224,7 @@ pub fn service_view_schema() -> Value {
                 "type": "string"
             }
         },
-        "required": ["name", "template", "state", "ipv4", "ports", "links", "published"],
+        "required": ["name", "template", "state", "ipv4", "ports", "links", "published", "lanPort"],
         "type": "object"
     })
 }

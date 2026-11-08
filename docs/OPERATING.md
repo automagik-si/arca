@@ -239,7 +239,9 @@ A service is one template-derived container in the service project. Its template
 `<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the
 service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it
 needs is available. `service_list` and `service_status` derive state from Incus and report instances that Arca did
-not create as `unknown` without touching them. `service_logs` returns console lines as untrusted text with stored
+not create as `unknown` without touching them. A row's `ports` are the container's own ports;
+`lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
+listener. `service_logs` returns console lines as untrusted text with stored
 secrets redacted and a capped, truncated result. The five shipped templates live in `templates/`, with their pinned
 images and vendored npm lockfile.
 

@@ -738,6 +738,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   const renderChat = () => {
     thread.dataset.streaming = String(chat.streaming);
+    thread.dataset.session = chat.session || 'Doctor';
     const nearBottom = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 48;
     const scrollTop = chatScroll.scrollTop;
     thread.replaceChildren();
@@ -784,6 +785,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   const applyEvent = (event, data) => {
     if (event === 'start') {
+      chat.session = typeof data?.session === 'string' && data.session ? data.session : 'Doctor';
       chat.sessionId = data?.sessionId ?? null;
       chat.error = '';
     } else if (event === 'text') {
@@ -927,6 +929,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         return;
       }
       const data = await response.json();
+      chat.session = typeof data?.session?.name === 'string' ? data.session.name : 'Doctor';
       chat.sessionId = data?.session?.id ?? null;
       if (!chat.messages.length) {
         chat.messages = (Array.isArray(data?.messages) ? data.messages : [])

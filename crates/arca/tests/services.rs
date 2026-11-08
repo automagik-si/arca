@@ -371,6 +371,7 @@ fn service_create_list_status_round_trip() {
     assert_eq!(created["ports"], json!([4222]));
     assert_eq!(created["links"], json!([]));
     assert_eq!(created["published"], Value::Null);
+    assert_eq!(created["lanPort"], Value::Null);
     let listed = rig.call("service_list", json!({})).expect("list");
     assert_eq!(listed["services"], json!([created]));
     let status = rig
@@ -388,6 +389,38 @@ fn service_create_list_status_round_trip() {
         ))
         .expect("acl");
     assert_eq!(acl["config"]["user.arca.managed"], "true");
+}
+
+#[test]
+fn service_list_reports_a_lan_port_only_when_the_template_has_a_lan_proxy() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    let nats = rig
+        .call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("nats create");
+    assert_eq!(nats["lanPort"], Value::Null, "a container port is not a host listener");
+
+    let mut lan = nats_template();
+    lan["name"] = json!("automagik");
+    lan["ports"] = json!([3081]);
+    lan["lan"] = json!({"port": 3081});
+    rig.template("automagik", lan);
+    let automagik = rig
+        .call("service_create", json!({"name":"automagik","template":"automagik"}))
+        .expect("automagik create");
+    assert_eq!(automagik["lanPort"], json!(3081));
+
+    let listed = rig.call("service_list", json!({})).expect("list");
+    let rows = listed["services"].as_array().expect("services");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let expected = match row["name"].as_str() {
+            Some("automagik") => json!(3081),
+            Some("nats") => Value::Null,
+            other => panic!("unexpected service {other:?}"),
+        };
+        assert_eq!(row["lanPort"], expected);
+    }
 }
 
 #[test]
@@ -668,7 +701,7 @@ fn service_create_puts_each_service_in_the_project_with_desired_service_nic_its_
         .expect("create");
     assert_eq!(
         created,
-        json!({"name":"nats","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[4222],"links":[],"published":null})
+        json!({"name":"nats","template":"nats","state":"running","ipv4":"192.0.2.10","ports":[4222],"links":[],"published":null,"lanPort":null})
     );
     let instance = rig
         .get(&format!("/1.0/instances/nats?project={PROJECT}"))

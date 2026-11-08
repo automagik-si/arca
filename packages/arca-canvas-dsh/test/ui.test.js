@@ -321,6 +321,7 @@ test('a service Open link needs a configured host address and a real service por
   assert.equal(web.url, 'http://192.0.2.10:8080');
   assert.equal(web.service.name, 'web1');
   assert.equal(web.service.ports[0], 8080);
+  assert.equal(web.service.lanPort, 8080);
   assert.equal(web.service.url, 'http://192.0.2.10:8080');
 
   const noAddress = buildDashboard({
@@ -329,12 +330,13 @@ test('a service Open link needs a configured host address and a real service por
   });
   assert.equal(project(noAddress, 'Web1').cards[0].url, '');
 
-  const noPort = buildDashboard({
+  const noLanPort = buildDashboard({
     ...fixture,
     hosts: fixture.hosts.map((host) => host.name === 'alpha'
-      ? { ...host, services: [{ ...host.services[0], ports: [] }] } : host),
+      ? { ...host, services: [{ ...host.services[0], lanPort: null }] } : host),
   });
-  assert.equal(project(noPort, 'Web1').cards[0].url, '');
+  assert.equal(project(noLanPort, 'Web1').cards[0].url, '', 'container ports are not host listeners');
+  assert.equal(project(noLanPort, 'Web1').cards[0].service.ports[0], 8080);
 
   // The container bridge address and the service's published dash never become a URL on their own.
   const noService = buildDashboard({
@@ -343,6 +345,29 @@ test('a service Open link needs a configured host address and a real service por
   });
   assert.equal(project(noService, 'Web1').cards[0].url, '');
   assert.doesNotMatch(JSON.stringify(project(noService, 'Web1')), /10\.0\.0\.7/);
+});
+
+test('only a service with a real lan port gets an Open link', () => {
+  const host = structuredClone(fixture.hosts[0]);
+  host.address = '192.0.2.10';
+  for (const name of ['automagik', 'nats', 'postgres', 'omni']) {
+    host.instances.push({
+      name, project: 'arcak-svc', kind: 'container', status: 'Running', owner: { class: 'kernel' }, privileged: false,
+    });
+  }
+  host.services = [
+    { name: 'automagik', template: 'automagik', state: 'running', ipv4: '10.99.0.11', ports: [3081], lanPort: 3081, links: [], published: null },
+    { name: 'nats', template: 'nats', state: 'running', ipv4: '10.99.0.10', ports: [4222], lanPort: null, links: [], published: null },
+    { name: 'postgres', template: 'postgres', state: 'running', ipv4: '10.99.0.12', ports: [5432], lanPort: null, links: [], published: null },
+    { name: 'omni', template: 'omni', state: 'running', ipv4: '10.99.0.13', ports: [8080, 8882], lanPort: null, links: [], published: null },
+  ];
+  const dashboard = buildDashboard({ ...fixture, hosts: [host], projects: [] });
+  assert.equal(project(dashboard, 'Automagik').cards[0].url, 'http://192.0.2.10:3081');
+  for (const name of ['Nats', 'Postgres', 'Omni']) {
+    assert.equal(project(dashboard, name).cards[0].url, '', `${name} has no lan listener`);
+  }
+  assert.equal(project(dashboard, 'Nats').cards[0].service.ports[0], 4222);
+  assert.equal(project(dashboard, 'Omni').cards[0].service.ports.length, 2);
 });
 
 test('a remote host with unknown totals reports cores n/a and memory n/a with reasons', () => {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,12 +19,18 @@ function listeners() {
     emit(name, ...args) {
       for (const handler of [...(map.get(name) ?? [])]) handler(...args);
     },
+    list(name) {
+      return map.get(name);
+    },
   };
 }
 
-function fakeDsh({ sessionId = 'session-doctor-1', script = async () => {} } = {}) {
+function fakeDsh({
+  sessionId = 'session-doctor-1', script = async () => {}, noRestrict = false, noDefinitions = false,
+  hangCreateOnce = false, endOnCancel = true, onCancel = null,
+} = {}) {
   const events = listeners();
-  const tools = new Map();
+  const globals = new Map();
   const restrictions = [];
   const sections = [];
   const created = [];
@@ -34,18 +40,16 @@ function fakeDsh({ sessionId = 'session-doctor-1', script = async () => {} } = {
   const executed = [];
   let title = null;
   let callCounter = 1;
+  let turnCounter = 0;
+  let currentTurn = 0;
+  let turnOpen = false;
+  let releaseCreate;
+  const createGate = hangCreateOnce ? new Promise((resolve) => { releaseCreate = resolve; }) : null;
   const agentCtx = {
     tools: {
-      register(definition) {
-        tools.set(definition.name, definition);
-        return () => tools.delete(definition.name);
-      },
       restrict(filter) {
         restrictions.push(filter);
         return () => {};
-      },
-      definitions() {
-        return [{ name: 'bash' }, { name: 'read' }, { name: 'run_code' }];
       },
     },
     systemPrompt: {
@@ -56,44 +60,91 @@ function fakeDsh({ sessionId = 'session-doctor-1', script = async () => {} } = {
     },
     on: events.on,
   };
+  const globalTools = {
+    register(definition, options = {}) {
+      if (globals.has(definition.name)) throw new Error(`duplicate tool ${definition.name}`);
+      globals.set(definition.name, { definition, when: options.when });
+      return () => globals.delete(definition.name);
+    },
+    restrict(filter) {
+      restrictions.push(filter);
+      return () => {};
+    },
+    definitions() {
+      return [...globals.values()].map(({ definition }) => definition);
+    },
+  };
+  if (noRestrict) {
+    delete globalTools.restrict;
+    agentCtx.tools.restrict = undefined;
+  }
+  if (noDefinitions) delete globalTools.definitions;
   const agent = {
     id: sessionId,
     session: { id: sessionId },
     ctx: agentCtx,
     followup(message) {
       followed.push(message);
+      turnCounter += 1;
+      currentTurn = turnCounter;
+      turnOpen = true;
+      events.emit('session/event', agent.session, { type: 'turn/start', data: { turn: currentTurn } });
       queueMicrotask(() => {
         Promise.resolve(script(api)).catch((error) => {
-          events.emit('agent/error', { agent, error });
+          events.emit('agent/error', { agent, turn: currentTurn, error });
         });
       });
     },
     cancel(cause) {
       cancels.push(cause);
+      if (onCancel) {
+        onCancel(cause, api);
+        return;
+      }
+      if (endOnCancel && turnOpen) queueMicrotask(() => api.end());
     },
+    whenIdle() {
+      return Promise.resolve();
+    },
+  };
+  const preExecute = (name) => {
+    const handlers = [...(events.list('tools/pre-execute') ?? [])];
+    const exec = { name, agent, callId: `attempt-${callCounter++}`, signal: new AbortController().signal };
+    const run = (index) => {
+      if (index >= handlers.length) return Promise.resolve({ kind: 'allow' });
+      return Promise.resolve(handlers[index](exec, () => run(index + 1)));
+    };
+    return run(0);
   };
   const api = {
     agent,
-    tools,
+    globals,
     executed,
+    attempt: preExecute,
+    get turn() {
+      return currentTurn;
+    },
     text(value) {
       events.emit('agent/assistant-stream', {
         agent,
-        frame: { type: 'chunk', index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
+        frame: { type: 'chunk', turn: currentTurn, index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
       });
     },
     usage(usage) {
-      events.emit('session/event', agent.session, { type: 'assistant/message', data: { usage } });
+      events.emit('session/event', agent.session, { type: 'assistant/message', data: { turn: currentTurn, usage } });
     },
     async call(name, args = {}) {
-      const definition = tools.get(name);
-      assert.ok(definition, `${name} is registered`);
+      const registered = globals.get(name);
+      assert.ok(registered, `${name} is registered`);
       const callId = `call-${callCounter++}`;
-      const value = await definition.execute(args, { callId, agent, signal: new AbortController().signal });
+      const value = await registered.definition.execute(args, {
+        callId, agent, signal: new AbortController().signal,
+      });
       executed.push({ name, args });
       events.emit('session/event', agent.session, {
         type: 'tool/result',
         data: {
+          turn: currentTurn,
           message: {
             role: 'tool', toolCallId: callId, content: [{ type: 'text', text: JSON.stringify(value) }], isError: false,
           },
@@ -102,17 +153,43 @@ function fakeDsh({ sessionId = 'session-doctor-1', script = async () => {} } = {
       return value;
     },
     end() {
-      events.emit('session/event', agent.session, { type: 'turn/end', data: {} });
+      if (!turnOpen) return;
+      turnOpen = false;
+      events.emit('session/event', agent.session, { type: 'turn/end', data: { turn: currentTurn, reason: { kind: 'completed' } } });
     },
     error(error) {
-      events.emit('agent/error', { agent, error });
+      events.emit('agent/error', { agent, turn: currentTurn, error });
+      api.end();
+    },
+    lateText(turn, value) {
+      events.emit('agent/assistant-stream', {
+        agent,
+        frame: { type: 'chunk', turn, index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
+      });
+    },
+    lateUsage(turn, usage) {
+      events.emit('session/event', agent.session, { type: 'assistant/message', data: { turn, usage } });
+    },
+    lateEnd(turn) {
+      events.emit('session/event', agent.session, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } });
+    },
+    registerLate(name) {
+      globals.set(name, {
+        definition: {
+          name, description: 'late tool', parameters: { type: 'object', properties: {}, additionalProperties: false },
+          output: { schema: {}, render: () => [] }, execute: async () => ({}),
+        },
+        when: undefined,
+      });
     },
   };
   const dsh = {
+    tools: globalTools,
     agents: {
       async create(options) {
         created.push(options);
         agent.session = { id: options.sessionId };
+        if (createGate && created.length === 1) await createGate;
         await options.setup?.(agentCtx);
         return { agent, dispose: async () => {} };
       },
@@ -133,7 +210,11 @@ function fakeDsh({ sessionId = 'session-doctor-1', script = async () => {} } = {
       },
     },
   };
-  return { dsh, api, created, resumed, followed, cancels, executed, tools, restrictions, sections, title: () => title };
+  return {
+    dsh, api, created, resumed, followed, cancels, executed, globals,
+    restrictions, sections, releaseCreate: () => releaseCreate?.(),
+    title: () => title, events,
+  };
 }
 
 async function harness(t, options = {}) {
@@ -141,17 +222,25 @@ async function harness(t, options = {}) {
   t.after(() => rm(dir, { recursive: true, force: true }));
   const statePath = join(dir, 'chat.json');
   const fake = fakeDsh(options);
-  const clients = new Map();
+  const clientCalls = [];
   const chat = createDoctorChat({
     hosts: [{ name: 'alpha' }, { name: 'beta' }],
     approvalUrl: 'https://example.com/approve',
     resolveDsh: () => (options.noDsh ? null : fake.dsh),
     clientFor(name) {
-      return clients.get(name) ?? { async call(tool) { return { tool, host: name }; } };
+      return options.clientFor?.(name) ?? {
+        async call(tool, args, signal) {
+          clientCalls.push({ host: name, tool, args, signal });
+          return { tool, host: name };
+        },
+      };
     },
     statePath,
     log: options.log ?? (() => {}),
     turnMs: options.turnMs ?? 2000,
+    setupMs: options.setupMs ?? 1000,
+    cancelMs: options.cancelMs ?? 1000,
+    idleMs: options.idleMs ?? 1000,
     heartbeatMs: options.heartbeatMs ?? 1000,
     toolCallsPerTurn: options.toolCallsPerTurn ?? 40,
     outputTokensPerTurn: options.outputTokensPerTurn ?? 64_000,
@@ -171,7 +260,7 @@ async function harness(t, options = {}) {
     server.closeAllConnections?.();
     server.close(resolve);
   }));
-  return { chat, fake, statePath, dir, port: server.address().port };
+  return { chat, fake, statePath, dir, port: server.address().port, clientCalls };
 }
 
 function parseEvents(raw) {
@@ -260,13 +349,15 @@ test('a turn streams assistant text, one card per real call, and persists the tr
   const text = result.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
   assert.equal(text, 'Checking alpha. Everything is up.');
   assert.deepEqual(fake.executed.map((call) => call.name), ['arca_status', 'node_metrics']);
-  assert.equal(fake.tools.has('service_list'), true);
-  for (const name of ['postgres_link', 'postgres_unlink', 'postgres_delete', 'service_start', 'service_remove', 'plan_apply', 'token_mint', 'adopt']) {
-    assert.equal(fake.tools.has(name), false, `${name} is never registered`);
+  assert.equal(fake.globals.has('service_list'), true);
+  for (const name of ['postgres_link', 'postgres_unlink', 'postgres_delete', 'service_start', 'service_remove', 'plan_apply', 'token_mint', 'adopt', 'bash', 'run_code']) {
+    assert.equal(fake.globals.has(name), false, `${name} is never registered`);
   }
-  assert.deepEqual([...fake.tools.keys()].sort(), [...READ_TOOLS].sort());
+  assert.deepEqual([...fake.globals.keys()].sort(), [...READ_TOOLS].sort());
   const restrictions = fake.restrictions.at(-1);
-  assert.deepEqual(restrictions.deny.sort(), ['bash', 'read']);
+  assert.deepEqual([...restrictions.allow].sort(), [...READ_TOOLS].sort());
+  assert.equal(fake.globals.get('arca_status').when({ agent: { id: 'session-doctor-1' } }), true);
+  assert.equal(fake.globals.get('arca_status').when({ agent: { id: 'another-session' } }), false);
   const sections = fake.sections.map((section) => section.name);
   assert.deepEqual(sections, ['deployment:persona-prefix', 'arca-doctor']);
   const stored = JSON.parse(await readFile(statePath, 'utf8'));
@@ -282,7 +373,9 @@ test('a turn streams assistant text, one card per real call, and persists the tr
 test('a write request gets the what-it-would-do answer and the approval card', async (t) => {
   const { fake, port } = await harness(t, {
     script: async (api) => {
-      api.text('That would unlink the automagik service from its database. Approve it at https://example.com/approve.');
+      const denied = {};
+      for (const name of ['bash', 'run_code', 'postgres_link']) denied[name] = (await api.attempt(name)).kind;
+      api.text(`That would unlink the automagik service from its database (${JSON.stringify(denied)}). Approve it at https://example.com/approve.`);
       api.usage({ inputTokens: 5, outputTokens: 8 });
       api.end();
     },
@@ -294,7 +387,10 @@ test('a write request gets the what-it-would-do answer and the approval card', a
   const text = result.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
   assert.match(text, /would unlink/i);
   assert.match(text, /https:\/\/example\.com\/approve/);
-  assert.equal(fake.executed.length, 0);
+  assert.match(text, /"bash":"deny"/);
+  assert.match(text, /"run_code":"deny"/);
+  assert.match(text, /"postgres_link":"deny"/);
+  assert.equal(fake.executed.length, 0, 'a denied write-like tool is never executed');
 });
 
 test('the per-turn tool-call cap stops at 40 by default and never registers the 41st', async (t) => {
@@ -527,4 +623,224 @@ test('a state file with a hostile shape is normalized, never trusted', async () 
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test('agent setup fails closed when the tool registry cannot restrict or enumerate tools', async (t) => {
+  for (const [label, options] of [['restrict', { noRestrict: true }], ['definitions', { noDefinitions: true }]]) {
+    const { fake, port } = await harness(t, { ...options, setupMs: 500 });
+    const result = await post(port, { message: `fail ${label}` });
+    assert.equal(result.events[0].event, 'start');
+    assert.equal(result.events.find((event) => event.event === 'error')?.data.message, 'The Doctor could not answer.');
+    assert.equal(result.events.at(-1).data.reason, 'error');
+    assert.equal(fake.created.length, 0, `${label}: no agent is created`);
+    assert.equal(fake.followed.length, 0, `${label}: no model call`);
+  }
+});
+
+test('the dispatch guard denies run_code and a tool registered after setup', async (t) => {
+  const { fake, port } = await harness(t, {
+    script: async (api) => {
+      api.registerLate('late_tool');
+      const decisions = {};
+      for (const name of ['arca_status', 'bash', 'run_code', 'late_tool']) decisions[name] = (await api.attempt(name)).kind;
+      api.text(JSON.stringify(decisions));
+      api.end();
+    },
+  });
+  const result = await post(port, { message: 'guard check' });
+  const text = result.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
+  assert.deepEqual(JSON.parse(text), {
+    arca_status: 'allow', bash: 'deny', run_code: 'deny', late_tool: 'deny',
+  });
+  assert.equal(fake.executed.length, 0);
+  assert.equal([...fake.globals.keys()].includes('late_tool'), true, 'the late tool really was registered');
+});
+
+test('a cancelled run must end before the next; its late events are dropped', async (t) => {
+  let first = true;
+  const { fake, port, statePath } = await harness(t, {
+    turnMs: 25,
+    cancelMs: 500,
+    endOnCancel: false,
+    script: async (api) => {
+      if (first) {
+        first = false;
+        await new Promise(() => {});
+        return;
+      }
+      api.text('fresh');
+      api.usage({ inputTokens: 1, outputTokens: 2 });
+      api.lateText(1, 'stale text');
+      api.lateUsage(1, { inputTokens: 500, outputTokens: 500 });
+      api.end();
+    },
+  });
+  const firstPost = post(port, { message: 'first' });
+  await until(() => fake.followed.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const busy = await post(port, { message: 'while cancelling' });
+  assert.equal(busy.status, 429, 'the next turn waits for the cancelled run to end');
+  fake.api.lateEnd(1);
+  const firstResult = await firstPost;
+  assert.equal(firstResult.events.at(-1).data.reason, 'timeout');
+
+  const second = await post(port, { message: 'second' });
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  const text = second.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
+  assert.equal(text, 'fresh');
+  const stored = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(stored.dailyTokens, 3, 'only the fresh turn usage is counted');
+  assert.equal(second.events.some((event) => event.event === 'usage' && event.data.turnOutputTokens > 2), false);
+});
+
+test('a hanging agent setup is bounded and busy is cleared for the next request', async (t) => {
+  const { fake, port } = await harness(t, {
+    hangCreateOnce: true, setupMs: 20,
+    script: async (api) => { api.text('ok'); api.end(); },
+  });
+  const first = await post(port, { message: 'hang' });
+  assert.equal(first.events.at(-1).data.reason, 'error');
+  assert.equal(first.events.filter((event) => event.event === 'error').length, 1);
+  fake.releaseCreate();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const second = await post(port, { message: 'after hang' });
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(fake.followed.length, 1);
+});
+
+test('a client disconnect during setup makes no model call', async (t) => {
+  const { fake, port } = await harness(t, {
+    hangCreateOnce: true, setupMs: 500,
+    script: async (api) => { api.text('ok'); api.end(); },
+  });
+  const controller = new AbortController();
+  const pending = fetch(`http://127.0.0.1:${port}/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: 'disconnect' }),
+    signal: controller.signal,
+  }).catch(() => null);
+  await until(() => fake.created.length === 1);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  controller.abort();
+  fake.releaseCreate();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(fake.followed.length, 0, 'no followup after the client went away');
+  await pending;
+  const second = await post(port, { message: 'after disconnect' });
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(fake.followed.length, 1);
+});
+
+test('a corrupt state file is quarantined and the rest of the day stays exhausted', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'arca-chat-corrupt-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'chat.json');
+  await writeFile(path, '{"dailyTokens": 0,');
+  const today = new ChatStore(path, { now: Date.parse('2026-11-08T12:00:00Z') });
+  const state = await today.read();
+  assert.equal(state.budgetExhausted, true);
+  const files = await readdir(dir);
+  assert.equal(files.some((name) => name.includes('.corrupt-')), true, 'the bad file is kept aside');
+  const onDisk = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(onDisk.budgetExhausted, true);
+  const tomorrow = new ChatStore(path, { now: Date.parse('2026-11-09T00:01:00Z') });
+  const rolled = await tomorrow.read();
+  assert.equal(rolled.budgetExhausted, false);
+  assert.equal(rolled.dailyTokens, 0);
+
+  const { fake, port, statePath } = await harness(t);
+  await writeFile(statePath, 'not json');
+  const reply = await post(port, { message: 'budget?' });
+  const budget = reply.events.find((event) => event.event === 'budget');
+  assert.ok(budget);
+  assert.equal(budget.data.message, 'Daily budget reached, try tomorrow.');
+  assert.equal(reply.events.at(-1).data.reason, 'budget');
+  assert.equal(fake.followed.length, 0);
+});
+
+test('a failed state write leaves no temporary file behind', async (t) => {
+  if (process.getuid?.() === 0) return t.skip('root ignores the read-only directory');
+  const dir = await mkdtemp(join(tmpdir(), 'arca-chat-write-'));
+  t.after(async () => {
+    await chmod(dir, 0o700).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+  const locked = join(dir, 'locked');
+  await mkdir(locked);
+  await chmod(locked, 0o500);
+  const store = new ChatStore(join(locked, 'chat.json'));
+  await assert.rejects(store.patch((state) => state));
+  await chmod(locked, 0o700);
+  assert.deepEqual(await readdir(locked), [], 'no .tmp file survives a failed write');
+});
+
+test('tools name the host, reject an unknown host, and pass the execution signal', async (t) => {
+  const { port, clientCalls } = await harness(t, {
+    script: async (api) => {
+      let unknown = '';
+      try {
+        await api.call('arca_status', { host: 'missing' });
+      } catch (error) {
+        unknown = error.message;
+      }
+      const value = await api.call('arca_status', { host: 'alpha' });
+      api.text(JSON.stringify({ unknown, value }));
+      api.end();
+    },
+  });
+  const result = await post(port, { message: 'hosts' });
+  const text = result.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
+  const data = JSON.parse(text);
+  assert.match(data.unknown, /Unknown host "missing"/);
+  assert.match(data.unknown, /alpha, beta/);
+  assert.equal(data.value.host, 'alpha');
+  assert.equal(clientCalls.length, 1, 'an unknown host never falls back to the first host');
+  assert.equal(clientCalls[0].host, 'alpha');
+  assert.ok(clientCalls[0].signal instanceof AbortSignal);
+  assert.equal(clientCalls[0].signal.aborted, false);
+});
+
+test('the start event names the Doctor session and carries the stored id when known', async (t) => {
+  const script = async (api) => { api.text('ok'); api.end(); };
+  const first = await harness(t, { script });
+  const firstReply = await post(first.port, { message: 'hello' });
+  const firstStart = firstReply.events.find((event) => event.event === 'start');
+  assert.deepEqual(firstStart.data, { session: 'Doctor' });
+
+  const second = await harness(t, { script });
+  await writeFile(second.statePath, JSON.stringify({
+    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 0, messages: [],
+  }));
+  const secondReply = await post(second.port, { message: 'hello again' });
+  const secondStart = secondReply.events.find((event) => event.event === 'start');
+  assert.equal(secondStart.data.session, 'Doctor');
+  assert.equal(secondStart.data.sessionId, 'saved-doctor');
+  assert.equal(second.fake.resumed.length, 1);
+});
+
+test('partial usage reported by an interrupted assistant message is counted', async (t) => {
+  const { port, statePath } = await harness(t, {
+    turnMs: 30,
+    script: async (api) => {
+      api.text('partial answer');
+      api.usage({ inputTokens: 10, outputTokens: 20 });
+      await new Promise(() => {});
+    },
+  });
+  const result = await post(port, { message: 'slow' });
+  assert.equal(result.events.at(-1).data.reason, 'timeout');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const stored = JSON.parse(await readFile(statePath, 'utf8'));
+  assert.equal(stored.dailyTokens, 30, 'usage from the interrupted assistant/message is counted');
+  assert.equal(stored.messages.at(-1).text, 'partial answer');
+});
+
+test('a hanging setup shares the turn deadline and cannot extend the request', async (t) => {
+  const { port } = await harness(t, { hangCreateOnce: true, setupMs: 5000, turnMs: 50 });
+  const started = Date.now();
+  const result = await post(port, { message: 'deadline' });
+  const elapsed = Date.now() - started;
+  assert.equal(result.events.at(-1).data.reason, 'error');
+  assert.ok(elapsed < 1000, `setup must not outlive the turn deadline (${elapsed}ms)`);
 });

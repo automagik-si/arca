@@ -225,9 +225,9 @@ function buildMachine(host) {
 
 // A service Open link is composed only from a real configured LAN address and a real service port. The
 // container's bridge address and the service's published dash are never turned into a URL.
-function serviceUrl(address, service) {
+function serviceUrl(address, lanPort) {
   const host = text(address).trim();
-  const port = finite(list(service?.ports)[0]);
+  const port = finite(lanPort);
   if (!host || port === null || port < 1 || port > 65535) return '';
   return `http://${host.includes(':') ? `[${host}]` : host}:${Math.trunc(port)}`;
 }
@@ -243,8 +243,9 @@ function serviceTargets(hosts) {
         state: text(service.state),
         ipv4: text(service.ipv4),
         ports: list(service.ports).map(finite).filter((port) => port !== null),
+        lanPort: finite(service.lanPort),
         published: service.published ?? null,
-        url: serviceUrl(host.address, service),
+        url: serviceUrl(host.address, service.lanPort),
       });
     }
   }

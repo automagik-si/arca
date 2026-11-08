@@ -38,6 +38,16 @@ function chatEvents(message) {
     // No done event: a slow reader (or a proxy) lost the tail.
     return { status: 200, events: [['start', { session: 'Doctor' }], ['text', { text: 'This answer never finished.' }]] };
   }
+  if (message.includes('hostile')) {
+    return {
+      status: 200,
+      events: [
+        ['start', { session: 'Doctor' }],
+        ['text', { text: '<img src=x onerror="window.__arcaXss=1">' }],
+        ['done', { reason: 'complete' }],
+      ],
+    };
+  }
   if (message.includes('delete')) {
     return {
       status: 200,
@@ -239,6 +249,7 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     assert.equal(await tools.count(), 1);
     assert.match(await tools.first().innerText(), /arca_status[\s\S]*alpha[\s\S]*Answered from alpha/);
     assert.equal(await page.locator('.arca-send').getAttribute('aria-disabled'), 'true');
+    assert.equal(await page.locator('.arca-thread').getAttribute('data-session'), 'Doctor');
 
     if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
       await mkdir(process.env.ARCA_CANVAS_EVIDENCE_DIR, { recursive: true });
@@ -261,6 +272,16 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     const dom = await page.evaluate(() => document.documentElement.textContent);
     assert.doesNotMatch(dom, /arcak-svc/i, 'the model cannot leak the internal project id into the DOM');
     assert.match(await page.locator('.arca-msg-assistant').last().innerText(), /Arca service project/);
+  });
+
+  await t.test('model markup renders as text and never as an element', async () => {
+    await send('hostile markup please');
+    await page.waitForFunction(() => [...document.querySelectorAll('.arca-msg-assistant .arca-msg-text')]
+      .some((node) => node.textContent.includes('<img src=x onerror=')));
+    const message = page.locator('.arca-msg-assistant .arca-msg-text').last();
+    assert.match(await message.innerText(), /<img src=x onerror="window\.__arcaXss=1">/);
+    assert.equal(await page.locator('.arca-chat-view img').count(), 0);
+    assert.equal(await page.evaluate(() => window.__arcaXss), undefined);
   });
 
   await t.test('the budget card and the cut-off note render without a done event', async () => {
@@ -349,11 +370,12 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     data = {
       ...fixture,
       hosts: fixture.hosts.map((host) => host.name === 'alpha'
-        ? { ...host, address: '192.0.2.10', services: [{ ...host.services[0], ports: [] }] }
+        ? { ...host, address: '192.0.2.10', services: [{ ...host.services[0], lanPort: null }] }
         : host),
     };
     await page.waitForFunction(() => document.querySelector('.arca-node-instance') !== null);
     assert.equal(await page.locator('.arca-node-instance a.arca-card-link').count(), 0);
+    assert.match(await page.locator('.arca-node-instance').innerText(), /web1/);
     data = fixture;
     await page.locator('.arca-project-select').selectOption('Studio');
     await page.waitForFunction(() => location.hash === '#project/Studio');

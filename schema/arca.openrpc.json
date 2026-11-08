@@ -1995,6 +1995,19 @@
               "maxLength": 15,
               "type": "string"
             },
+            "lanPort": {
+              "anyOf": [
+                {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Its host port when the template has a lan proxy, or null."
+            },
             "links": {
               "description": "The services it is linked to, as a consumer, and the port each link opens.",
               "items": {
@@ -2088,7 +2101,8 @@
             "ipv4",
             "ports",
             "links",
-            "published"
+            "published",
+            "lanPort"
           ],
           "type": "object"
         }
@@ -2115,6 +2129,19 @@
                     "description": "Its fixed address on the service bridge.",
                     "maxLength": 15,
                     "type": "string"
+                  },
+                  "lanPort": {
+                    "anyOf": [
+                      {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "Its host port when the template has a lan proxy, or null."
                   },
                   "links": {
                     "description": "The services it is linked to, as a consumer, and the port each link opens.",
@@ -2209,7 +2236,8 @@
                   "ipv4",
                   "ports",
                   "links",
-                  "published"
+                  "published",
+                  "lanPort"
                 ],
                 "type": "object"
               },
@@ -2251,6 +2279,19 @@
               "description": "Its fixed address on the service bridge.",
               "maxLength": 15,
               "type": "string"
+            },
+            "lanPort": {
+              "anyOf": [
+                {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Its host port when the template has a lan proxy, or null."
             },
             "links": {
               "description": "The services it is linked to, as a consumer, and the port each link opens.",
@@ -2345,7 +2386,8 @@
             "ipv4",
             "ports",
             "links",
-            "published"
+            "published",
+            "lanPort"
           ],
           "type": "object"
         }

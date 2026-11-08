@@ -58,7 +58,7 @@ config:
 | `viewerTokenPath` | Required when `hosts` is absent; absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
 | `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Arca polls never overlap; the device phase runs independently. |
 | `nodeName` | Optional human machine title. Defaults to the host OS hostname; an empty or whitespace-only name becomes `Machine`. The raw Arca node ID is never the card title. |
-| `address` | Optional LAN host name or IP for a service's Open link. Bare host or IP only, no scheme or port. When set, a service card gets `http://<address>:<first service port>` only if the real `service_list` row has that port; otherwise no link. Empty by default. |
+| `address` | Optional LAN host name or IP for a service's Open link. Bare host or IP only, no scheme or port. When set, a service card gets `http://<address>:<lanPort>` only when the real `service_list` row has a `lanPort` host listener; a container port alone never becomes a link. Empty by default. |
 | `chatEnabled` | Enable the Doctor chat routes. Default true; when false the chat routes answer 503 and no model is called. |
 | `chatStatePath` | Optional absolute path of the persisted chat state (DSH session id, daily token counter and the panel transcript). Defaults to `$DSH_HOME/storages/arca-canvas-chat.json`. |
 | `dailyTokenBudget` | Positive integer total-token budget per UTC day, default 1000000. When reached the Doctor answers with the daily-budget card and spends no model call. |
@@ -166,9 +166,10 @@ list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
-- `services` holds the `service_list.services` rows (name, template, state, ipv4, ports, links,
-  published). A service whose instance is on the canvas contributes an Open link only from the
-  configured host `address` and its first real port.
+- `services` holds the `service_list.services` rows (name, template, state, ipv4, ports,
+  lanPort, links, published). `lanPort` is the template's host proxy port, or null when the
+  service has no lan listener. A service whose instance is on the canvas contributes an Open
+  link only from the configured host `address` and its real `lanPort`.
 - `journal` holds the newest `journal_list` records, at most 200 per host. Every
   poll re-reads a trailing window of the newest ids and merges by id with the
   latest record winning, so an effect that moved from `Intent` to `Failed` (or
@@ -252,10 +253,15 @@ chat's waiting-plan card appears under the conversation too.
 
 The Doctor answers only from the eight read-only Arca tools (`arca_status`,
 `watch_report`, `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`,
-`journal_list`, `service_list`). Write verbs are never registered. A request to
-change something is answered with what the change would do and the configured
-`/approve` link; the panel adds the approval card. Inline passkey approval is
-phase 3. The page never receives a model credential.
+`journal_list`, `service_list`). They are registered globally with a per-session
+`when` condition, the Doctor's scope is restricted with
+`restrict({ allow: READ_TOOLS })`, and a scoped `tools/pre-execute` guard denies
+every other name (including the reserved `run_code`) at dispatch. A registry that
+cannot restrict or enumerate fails setup, so the chat sends a fixed
+"Doctor unavailable" error and makes no model call. Write verbs are never
+registered. A request to change something is answered with what the change would
+do and the configured `/approve` link; the panel adds the approval card. Inline
+passkey approval is phase 3. The page never receives a model credential.
 
 Selection lives in the URL fragment as `#project/<name>`, encoded with
 `encodeURIComponent`. Loading with a known project restores it; an unknown or
@@ -286,7 +292,10 @@ One Doctor turn. The kernel exposes it as `POST /approve/canvas/chat`.
   newline inside a string, so model text can never close a frame or forge an
   event. A comment line `: hb` is written at least every 15 seconds, including
   while a tool call is slow, so the kernel's 60-second idle limit is never
-  reached. The turn is bounded at nine minutes, under the kernel's ten.
+  reached. The turn is bounded at nine minutes, under the kernel's ten; agent setup is bounded
+separately, and the single-turn slot is released only after the DSH run reports
+`turn/end` (or its cancel bound expires). A client that disconnects during setup
+gets no model call.
 - Refusals before a stream are JSON: `400 { "error": "invalid-json" |
   "message-required" }`, `405 { "error": "method-not-allowed" }` (with
   `Allow: POST`), `413 { "error": "body-too-large" | "message-too-long" }`,
@@ -298,7 +307,7 @@ SSE events, in order. Every `data` is one JSON object.
 
 | Event | Data | Meaning |
 | --- | --- | --- |
-| `start` | `{ "session": "Doctor" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. |
+| `start` | `{ "session": "Doctor", "sessionId"?: "<dsh-session-id>" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. `sessionId` is present when a persisted session is already known. |
 | `text` | `{ "text": "<delta>" }` | One assistant text delta; concatenate in arrival order. |
 | `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the eight reads. |
 | `approval` | `{ "url", "title", "detail" }` | Advisory card when the message looks like a write request and an approval URL is configured. `url` is the configured `/approve` URL. Presentation only. |
@@ -330,7 +339,8 @@ model call:
       "tools": [{ "callId": "...", "name": "arca_status", "state": "done",
                  "host": "alpha", "summary": "..." }] }
   ],
-  "usage": { "day": "YYYY-MM-DD", "dailyTokens": 0, "dailyBudget": 1000000 },
+  "usage": { "day": "YYYY-MM-DD", "dailyTokens": 0, "dailyBudget": 1000000,
+             "budgetExhausted": false },
   "limits": { "toolCallsPerTurn": 40, "outputTokensPerTurn": 64000 }
 }
 ```
