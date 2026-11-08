@@ -98,11 +98,11 @@ test('token is read again between initialize and tools/call, and on later calls'
   assert.equal(calls.length, 4);
 });
 
-test('all seven fixtures become one snapshot with project-qualified instances', async (t) => {
+test('all eight fixtures become one snapshot with project-qualified instances', async (t) => {
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'services', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
   assert.equal(snapshot.instancesKnown, true);
   assert.deepEqual(snapshot.projects, fixtures.watch_report.projects.map(({ project }) => project));
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
@@ -111,12 +111,13 @@ test('all seven fixtures become one snapshot with project-qualified instances', 
   assert.deepEqual(snapshot.machine, fixtures.arca_status);
   assert.deepEqual(snapshot.instances, fixtures.watch_report.projects.flatMap(({ project, instances }) => instances.map((instance) => ({ ...instance, project }))));
   assert.deepEqual(snapshot.databases, fixtures.postgres_list.databases);
+  assert.deepEqual(snapshot.services, fixtures.service_list.services);
   assert.deepEqual(snapshot.metrics, fixtures.node_metrics);
   assert.deepEqual(snapshot.alerts, fixtures.alerts_list);
   assert.deepEqual(snapshot.plans, fixtures.plan_list.plans);
   assert.deepEqual(snapshot.journal, fixtures.journal_list.records);
   assert.equal(snapshot.journalKnown, true);
-  assert.equal(calls.length, 14);
+  assert.equal(calls.length, 16);
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
@@ -489,12 +490,20 @@ test('bundle patch has one configured row and schema rejects invalid settings', 
   assert.equal(row.failOnStartupError, false);
   assert.deepEqual(plugin.inject, ['webServer']);
   const validate = (config) => plugin.Config['~standard'].validate(config);
-  assert.deepEqual(validate(row.config).value, { ...row.config, defaultProject: '' });
+  assert.deepEqual(validate(row.config).value, { ...row.config, address: '', defaultProject: '', chatEnabled: true, chatStatePath: '', dailyTokenBudget: 1000000 });
   assert.ok(validate({ ...row.config, pollMs: 0 }).issues);
   assert.ok(validate({ ...row.config, socketPath: 'relative.sock' }).issues);
   assert.ok(validate({ ...row.config, nodeName: 42 }).issues);
   assert.equal(validate({ ...row.config, nodeName: 'Example machine' }).value.nodeName, 'Example machine');
   assert.equal(validate({ ...row.config, nodeName: '' }).value.nodeName, '');
+  assert.equal(validate({ ...row.config, address: '192.0.2.10' }).value.address, '192.0.2.10');
+  assert.equal(validate({ ...row.config, address: 'example-host' }).value.address, 'example-host');
+  for (const address of ['http://192.0.2.10', '192.0.2.10:8080', '-edge', 'edge-', 'host/path', 'user@host']) {
+    assert.ok(validate({ ...row.config, address }).issues, address);
+  }
+  assert.ok(validate({ ...row.config, chatStatePath: 'relative.json' }).issues);
+  assert.ok(validate({ ...row.config, dailyTokenBudget: 0 }).issues);
+  assert.ok(validate({ ...row.config, chatEnabled: 'yes' }).issues);
   for (const approvalUrl of ['/approve', 'javascript:alert(1)', 'https://', 'https://user:pass@example.com/approve']) {
     assert.ok(validate({ ...row.config, approvalUrl }).issues);
   }
@@ -636,5 +645,54 @@ test('host snapshots resolve a human node name without using the machine id', as
     assert.equal(snapshot.nodeName, expected);
     assert.equal(emptySnapshot({ nodeName }).nodeName, expected);
     assert.match(snapshot.machine.node, /^[a-f0-9]{64}$/);
+  }
+});
+
+test('stop aborts a journal catch-up before it reads another page', async () => {
+  const records = Array.from({ length: 6000 }, (_, index) => ({
+    id: index + 1,
+    entry: `synthetic-${index + 1}`,
+    state: 'Applied',
+    at_ms: 1794160000000 + index,
+  }));
+  let journalCalls = 0;
+  let aborted = false;
+  const client = {
+    async call(tool, args = {}, signal) {
+      if (tool !== 'journal_list') {
+        if (tool === 'watch_report') return { projects: [] };
+        if (tool === 'postgres_list') return { databases: [] };
+        if (tool === 'plan_list') return { plans: [] };
+        if (tool === 'service_list') return { services: [] };
+        return {};
+      }
+      journalCalls++;
+      if (journalCalls <= 2) {
+        return { records: records.filter((record) => record.id > (args.after ?? 0)).slice(0, args.limit ?? 100) };
+      }
+      await new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          aborted = true;
+          reject(new Error('aborted'));
+          return;
+        }
+        signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new Error('aborted'));
+        }, { once: true });
+      });
+      return { records: [] };
+    },
+  };
+  const cache = createSnapshotCache(client, 10);
+  try {
+    await until(() => journalCalls >= 3);
+    cache.stop();
+    await until(() => aborted);
+    const stoppedAt = journalCalls;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(journalCalls, stoppedAt, 'no page read starts after dispose');
+  } finally {
+    cache.stop();
   }
 });

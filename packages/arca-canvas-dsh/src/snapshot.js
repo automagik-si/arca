@@ -22,6 +22,7 @@ export function emptySnapshot(config = {}) {
     instancesKnown: false,
     projects: [],
     databases: [],
+    services: [],
     metrics: null,
     alerts: [],
     plans: [],
@@ -71,8 +72,8 @@ function mergeJournal(previous, fetched) {
   return merged.slice(-JOURNAL_KEEP);
 }
 
-async function readJournalPage(client, after) {
-  const value = await client.call('journal_list', { after, limit: JOURNAL_PAGE_LIMIT });
+async function readJournalPage(client, after, signal) {
+  const value = await client.call('journal_list', { after, limit: JOURNAL_PAGE_LIMIT }, signal);
   const records = rows(value.records).filter((record) => record && typeof record === 'object');
   let cursor = after;
   for (const record of records) {
@@ -83,13 +84,13 @@ async function readJournalPage(client, after) {
   return { records, cursor, done: records.length < JOURNAL_PAGE_LIMIT || cursor === after };
 }
 
-async function readJournal(client, after, maxPages) {
+async function readJournal(client, after, maxPages, signal) {
   const fetched = [];
   let cursor = after;
   let pages = 0;
   let done = false;
   while (pages < maxPages) {
-    const page = await readJournalPage(client, cursor);
+    const page = await readJournalPage(client, cursor, signal);
     pages++;
     fetched.push(...page.records);
     cursor = page.cursor;
@@ -118,12 +119,14 @@ function catchUpJournal(client, state, after) {
     try {
       let cursor = after;
       for (let page = 0; page < JOURNAL_MAX_PAGES; page++) {
-        const read = await readJournalPage(client, cursor);
+        if (state.signal?.aborted) break;
+        const read = await readJournalPage(client, cursor, state.signal);
+        if (state.signal?.aborted) break;
         state.records = mergeJournal(state.records, read.records);
         cursor = read.cursor;
         if (read.done) break;
       }
-      state.cursor = Math.max(Number(state.cursor) || 0, cursor);
+      if (!state.signal?.aborted) state.cursor = Math.max(Number(state.cursor) || 0, cursor);
     } catch {
       // Keep the records already cached; the next poll retries the read.
     } finally {
@@ -135,10 +138,11 @@ function catchUpJournal(client, state, after) {
 
 async function collectJournal(client, state) {
   if (state.task) return state.records;
+  if (state.signal?.aborted) return state.records;
   const highest = Number(state.cursor) || 0;
   const hasCache = state.records.length > 0;
   const after = hasCache ? Math.max(0, highest - JOURNAL_WINDOW) : 0;
-  const read = await readJournal(client, after, JOURNAL_SYNC_PAGES);
+  const read = await readJournal(client, after, JOURNAL_SYNC_PAGES, state.signal);
   const fetchedHighest = highestJournalId(read.fetched);
   // The journal restarted from zero (state wiped): ids went backwards or disappeared. Drop the cache
   // for this host and read the new journal once from the start.
@@ -146,7 +150,7 @@ async function collectJournal(client, state) {
   if (reset) {
     state.records = [];
     state.cursor = 0;
-    const fresh = await readJournal(client, 0, JOURNAL_SYNC_PAGES);
+    const fresh = await readJournal(client, 0, JOURNAL_SYNC_PAGES, state.signal);
     state.records = mergeJournal([], fresh.fetched);
     state.cursor = fresh.cursor;
     if (!fresh.done) catchUpJournal(client, state, fresh.cursor);
@@ -161,6 +165,8 @@ async function collectJournal(client, state) {
 export async function collectSnapshot(client, config = {}, state = {}) {
   const snapshot = emptySnapshot(config);
   const journalState = state.journal ??= { cursor: 0, records: [], pending: false, task: null };
+  // The cache's stop signal reaches a background catch-up, not only the foreground snapshot read.
+  journalState.signal = state.signal;
   const read = async (key, tool, run) => {
     try {
       snapshot[key] = await run();
@@ -183,6 +189,7 @@ export async function collectSnapshot(client, config = {}, state = {}) {
     read('metrics', 'node_metrics', () => client.call('node_metrics')),
     read('alerts', 'alerts_list', () => client.call('alerts_list')),
     read('plans', 'plan_list', async () => rows((await client.call('plan_list')).plans)),
+    read('services', 'service_list', async () => rows((await client.call('service_list')).services)),
     read('journal', 'journal_list', async () => {
       const records = await collectJournal(client, journalState);
       snapshot.journalKnown = true;
@@ -282,6 +289,8 @@ export function createSnapshotCache(client, pollMs, config = {}, devices = null)
   let stopped = false;
   let phase;
   let lastState;
+  const stopController = new AbortController();
+  collectState.signal = stopController.signal;
   const log = config.log ?? ((message) => console.info(message));
   const refreshDevices = () => {
     if (!devices || phase) return;
@@ -332,6 +341,7 @@ export function createSnapshotCache(client, pollMs, config = {}, devices = null)
     stop() {
       stopped = true;
       clearTimeout(timer);
+      stopController.abort();
       phase?.abort();
     },
   };

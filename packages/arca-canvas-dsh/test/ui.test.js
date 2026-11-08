@@ -314,3 +314,69 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
     assert.doesNotMatch(css, /@import|url\(\s*['"]?https?:/i, name);
   }
 });
+
+test('a service Open link needs a configured host address and a real service port', () => {
+  const dashboard = buildDashboard(fixture);
+  const web = project(dashboard, 'Web1').cards[0];
+  assert.equal(web.url, 'http://192.0.2.10:8080');
+  assert.equal(web.service.name, 'web1');
+  assert.equal(web.service.ports[0], 8080);
+  assert.equal(web.service.url, 'http://192.0.2.10:8080');
+
+  const noAddress = buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha' ? { ...host, address: '' } : host),
+  });
+  assert.equal(project(noAddress, 'Web1').cards[0].url, '');
+
+  const noPort = buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha'
+      ? { ...host, services: [{ ...host.services[0], ports: [] }] } : host),
+  });
+  assert.equal(project(noPort, 'Web1').cards[0].url, '');
+
+  // The container bridge address and the service's published dash never become a URL on their own.
+  const noService = buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha' ? { ...host, services: [] } : host),
+  });
+  assert.equal(project(noService, 'Web1').cards[0].url, '');
+  assert.doesNotMatch(JSON.stringify(project(noService, 'Web1')), /10\.0\.0\.7/);
+});
+
+test('a remote host with unknown totals reports cores n/a and memory n/a with reasons', () => {
+  const host = structuredClone(fixture.hosts[0]);
+  host.metrics.latest.cpu = { cores: 0, usedPct: null, reason: 'the Incus resources read failed' };
+  host.metrics.latest.memory = {
+    totalBytes: null, availableBytes: null, usedBytes: 2_000_000_000,
+    reason: 'the Incus resources read failed',
+  };
+  const machine = buildDashboard({ ...fixture, hosts: [host] }).hosts[0];
+  assert.equal(machine.cpuLabel, 'cores n/a');
+  assert.equal(machine.cpu.usedPct, null);
+  assert.equal(machine.cpu.reason, 'the Incus resources read failed');
+  assert.equal(machine.memoryLabel, 'n/a');
+  assert.equal(machine.memory.usedBytes, 2_000_000_000);
+  assert.equal(machine.memory.usedPct, null);
+  assert.equal(machine.memory.reason, 'the Incus resources read failed');
+
+  const nullLoad = structuredClone(fixture.hosts[0]);
+  nullLoad.metrics.latest.cpu = { cores: 8, usedPct: null, reason: null };
+  const nullMachine = buildDashboard({ ...fixture, hosts: [nullLoad] }).hosts[0];
+  assert.equal(nullMachine.cpuLabel, 'n/a', 'null load with known cores is CPU n/a');
+  assert.equal(nullMachine.cpu.usedPct, null);
+  assert.equal(cpuLabel(hostCpu(nullLoad)), 'n/a');
+  // Real readings are unchanged.
+  assert.equal(cpuLabel(hostCpu(fixture.hosts[0])), '2 / 8 cores');
+  assert.equal(memoryLabel(hostMemory(fixture.hosts[0])), '4 / 16 GB');
+});
+
+test('the host usedBytes figure wins over the total-available derivation', () => {
+  const host = structuredClone(fixture.hosts[0]);
+  host.metrics.latest.memory = { totalBytes: 16_000_000_000, availableBytes: 12_000_000_000, usedBytes: 5_000_000_000 };
+  const machine = buildDashboard({ ...fixture, hosts: [host] }).hosts[0];
+  assert.equal(machine.memory.usedBytes, 5_000_000_000);
+  assert.equal(machine.memory.usedPct, 31.25);
+  assert.equal(machine.memoryLabel, '5 / 16 GB');
+});
