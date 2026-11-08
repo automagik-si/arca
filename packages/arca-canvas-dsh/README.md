@@ -78,7 +78,9 @@ readers.
 
 The JSON object always has `at` (ISO timestamp), `error` (null or safe error text),
 `approvalUrl` (empty or the configured approval URL), `nodeName` (resolved by the
-host), `machine`, `instances`, `databases`, `metrics`, `alerts`, `plans`, `devices`,
+host), `machine`, `instances`, `instancesKnown` (false when `watch_report` failed),
+`projects` (the Incus project ids from `watch_report`, including empty projects),
+`databases`, `metrics`, `alerts`, `plans`, `devices`,
 `devicesAt` (ISO time of the last good device list, or null), `phones`, and `desktops`.
 `devices` is `off`, `ok`, `unavailable`, `unreachable`, or `stale`.
 
@@ -129,18 +131,30 @@ The host logs one safe line per device state change, naming `devicesUrl` or
 upstream error details never enter logs, the snapshot or the browser bundle. Arca
 reads keep their existing error behavior.
 
-A ResizeObserver on the stage batches reflow into an animation frame when the
-window or embedding sidebar changes width. Reflow measures the stage content box;
-empty columns consume no space, and populated columns wrap to keep cards inside it.
-Long kinds split into stacks no taller than 690 px; each kind gets its first stack
-before overflow stacks, so phones stay near the top. A muted summary counts
-machines, instances, databases, phones and desktops. Instance ownership reads
-`Managed by Arca` only for kernel and retained objects; droidd, foreign,
-contested, missing and unknown ownership read `External`. Waiting-plan badges
-appear only above zero.
-Machine uptime reads `Arca up`, keeping short spans such as 85 seconds in seconds
-and rounding longer spans to minutes, hours or days.
-The observer disconnects when the canvas stops.
+The page is a read-only containment canvas. Its left menu has separate,
+collapsible **Hosts** and **Projects** sections; the whole menu folds to a thin
+rail through one button, and that choice is remembered in local storage. A host
+opens the host view, a project opens that project's canvas, and an instance node
+opens its detail pane. Selection lives in the URL fragment: `#host/<node id>`,
+`#project/<Incus project>` and `#project/<Incus project>/instance/<name>`. The
+fragment is matched against the known tree; an unknown value shows a not-found
+state.
+
+The project canvas nests a host frame, a project frame and instance nodes. Each
+node shows status as text and colour, its kind (Container or VM), and its image
+or IP when the snapshot carries one; stopped instances are dimmed. Databases whose
+name or explicit `instance` field matches exactly one instance are shown in that
+node. Phones and desktops whose name matches exactly one instance are shown in the
+project's Devices frame; unmatched devices remain visible under Hosts as Not
+placed. No database-to-project relation is inferred. Instance ownership reads
+`Managed by Arca` only for kernel and retained objects; droidd, foreign, contested,
+missing and unknown ownership read `External`. Waiting-plan badges appear only
+above zero.
+
+The page never pans, zooms or drags. Polls update keyed rows, tiles and nodes in
+place, so section state, menu state, selection, focus and scroll survive a poll.
+There are no write actions and no routes beyond the existing `/arca-canvas`
+assets and snapshot.
 
 ## Develop
 

@@ -9,6 +9,8 @@ export function emptySnapshot(config = {}) {
     nodeName: (config.nodeName ?? hostname()).trim() || 'Machine',
     machine: null,
     instances: [],
+    instancesKnown: false,
+    projects: [],
     databases: [],
     metrics: null,
     alerts: [],
@@ -29,8 +31,13 @@ export async function collectSnapshot(client, config = {}) {
   const snapshot = emptySnapshot(config);
   const reads = [
     ['machine', 'arca_status', (value) => value],
-    ['instances', 'watch_report', (value) => rows(value.projects).flatMap((project) =>
-      rows(project.instances).map((instance) => ({ ...instance, project: project.project })))],
+    ['instances', 'watch_report', (value) => {
+      const projects = rows(value.projects);
+      snapshot.projects = projects.map((project) => String(project.project)).filter(Boolean);
+      snapshot.instancesKnown = true;
+      return projects.flatMap((project) =>
+        rows(project.instances).map((instance) => ({ ...instance, project: project.project })));
+    }],
     ['databases', 'postgres_list', (value) => rows(value.databases)],
     ['metrics', 'node_metrics', (value) => value],
     ['alerts', 'alerts_list', (value) => value],
