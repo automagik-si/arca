@@ -1,6 +1,10 @@
 import { hostname } from 'node:os';
 import { snapshotError } from './arca-client.js';
 
+const JOURNAL_PAGE_LIMIT = 500;
+const JOURNAL_MAX_PAGES = 50;
+const JOURNAL_KEEP = 200;
+
 export function emptySnapshot(config = {}) {
   return {
     at: new Date().toISOString(),
@@ -29,34 +33,71 @@ function rows(value) {
   return value;
 }
 
-export async function collectSnapshot(client, config = {}) {
+// journal_list pages forward from `after` and returns the oldest records first. Read every page,
+// retain the newest records, and remember the cursor so later polls only ask for new ones.
+async function collectJournal(client, state) {
+  const fetched = [];
+  let cursor = state.cursor;
+  for (let page = 0; page < JOURNAL_MAX_PAGES; page++) {
+    const value = await client.call('journal_list', { after: cursor, limit: JOURNAL_PAGE_LIMIT });
+    const records = rows(value.records).filter((record) => record && typeof record === 'object');
+    fetched.push(...records);
+    let advanced = false;
+    for (const record of records) {
+      const id = Number(record.id);
+      if (Number.isFinite(id) && id > cursor) {
+        cursor = id;
+        advanced = true;
+      }
+    }
+    if (!records.length || !advanced) break;
+  }
+  const seen = new Set(state.records.map((record) => record.id));
+  const merged = [...state.records];
+  for (const record of fetched) {
+    if (record.id !== undefined) {
+      if (seen.has(record.id)) continue;
+      seen.add(record.id);
+    }
+    merged.push(record);
+  }
+  merged.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+  state.records = merged.slice(-JOURNAL_KEEP);
+  state.cursor = cursor;
+  return state.records;
+}
+
+export async function collectSnapshot(client, config = {}, state = {}) {
   const snapshot = emptySnapshot(config);
-  const reads = [
-    ['machine', 'arca_status', (value) => value],
-    ['instances', 'watch_report', (value) => {
-      const projects = rows(value.projects);
-      snapshot.projects = projects.map((project) => String(project.project)).filter(Boolean);
-      snapshot.instancesKnown = true;
-      return projects.flatMap((project) =>
-        rows(project.instances).map((instance) => ({ ...instance, project: project.project })));
-    }],
-    ['databases', 'postgres_list', (value) => rows(value.databases)],
-    ['metrics', 'node_metrics', (value) => value],
-    ['alerts', 'alerts_list', (value) => value],
-    ['plans', 'plan_list', (value) => rows(value.plans)],
-    ['journal', 'journal_list', (value) => {
-      snapshot.journalKnown = true;
-      return rows(value.records);
-    }],
-  ];
-  const errors = await Promise.all(reads.map(async ([key, tool, convert]) => {
+  const journalState = state.journal ??= { cursor: 0, records: [] };
+  const read = async (key, tool, run) => {
     try {
-      snapshot[key] = convert(await client.call(tool));
+      snapshot[key] = await run();
       return null;
     } catch (error) {
       return `${tool}: ${snapshotError(error)}`;
     }
-  }));
+  };
+  const errors = await Promise.all([
+    read('machine', 'arca_status', () => client.call('arca_status')),
+    read('instances', 'watch_report', async () => {
+      const projects = rows((await client.call('watch_report')).projects);
+      const instances = projects.flatMap((project) =>
+        rows(project.instances).map((instance) => ({ ...instance, project: project.project })));
+      snapshot.projects = projects.map((project) => String(project.project)).filter(Boolean);
+      snapshot.instancesKnown = true;
+      return instances;
+    }),
+    read('databases', 'postgres_list', async () => rows((await client.call('postgres_list')).databases)),
+    read('metrics', 'node_metrics', () => client.call('node_metrics')),
+    read('alerts', 'alerts_list', () => client.call('alerts_list')),
+    read('plans', 'plan_list', async () => rows((await client.call('plan_list')).plans)),
+    read('journal', 'journal_list', async () => {
+      const records = await collectJournal(client, journalState);
+      snapshot.journalKnown = true;
+      return records;
+    }),
+  ]);
   snapshot.error = errors.filter(Boolean).join(' ') || null;
   return snapshot;
 }
@@ -142,6 +183,7 @@ export async function collectDevices(client, signal, options = {}) {
 export function createSnapshotCache(client, pollMs, config = {}, devices = null) {
   const now = config.now ?? (() => Date.now());
   const deviceMeta = { lastFailureAt: new Map(), cursor: 0, now };
+  const collectState = {};
   let deviceState = { devices: devices ? 'unavailable' : 'off', devicesAt: null, phones: [], desktops: [] };
   let cached = { ...emptySnapshot(config), ...deviceState, error: 'Waiting for the first Arca snapshot.' };
   let timer;
@@ -185,7 +227,7 @@ export function createSnapshotCache(client, pollMs, config = {}, devices = null)
   };
   const refresh = async () => {
     refreshDevices();
-    const snapshot = await collectSnapshot(client, config);
+    const snapshot = await collectSnapshot(client, config, collectState);
     if (!stopped) {
       cached = { ...snapshot, ...deviceState };
       timer = setTimeout(refresh, pollMs);

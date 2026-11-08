@@ -61,9 +61,10 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
 
     assert.equal(await page.locator('.arca-project-select').inputValue(), 'Studio');
     const options = await page.locator('.arca-project-select option').allTextContents();
-    assert.deepEqual(options, ['Studio', 'Automation', 'Sandbox', 'Tools']);
+    assert.deepEqual(options, ['Studio', 'Automation', 'Automagik', 'Sandbox', 'Tools']);
     assert.deepEqual(await page.locator('.arca-project-select optgroup').evaluateAll((nodes) => nodes.map((node) => node.label)),
-      ['Your projects', 'Machine projects']);
+      ['Your projects', 'Services', 'Machine projects']);
+    assert.doesNotMatch(await page.locator('.arca-project-select').innerText(), /arcak-svc|Arca services/i);
     assert.equal(await page.locator('.arca-mode').first().getAttribute('aria-pressed'), 'true');
     assert.equal(await page.locator('.arca-mode').nth(1).isDisabled(), true);
     assert.match(await page.locator('.arca-mode').nth(1).innerText(), /Arca Cloud[\s\S]*coming soon/i);
@@ -81,7 +82,7 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
       assert.equal(await card.locator('.arca-meter-fill').count(), 2);
       const widths = await card.locator('.arca-meter-fill').evaluateAll((nodes) => nodes.map((node) => Number(node.getAttribute('width'))));
       assert.ok(widths.every((width) => width > 0 && width <= 100), `bar widths ${widths}`);
-      assert.equal(await card.locator('.arca-machine-instances').innerText(), '3 instances');
+      assert.equal(await card.locator('.arca-machine-instances').innerText(), index === 0 ? '4 instances' : '3 instances');
     }
     assert.equal(await page.locator('.arca-placeholder').count(), 2);
     assert.match(await page.locator('.arca-placeholder').first().innerText(), /Storage[\s\S]*soon/i);
@@ -108,9 +109,11 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
     assert.match(await database.innerText(), /1 link/);
     assert.equal(await database.locator('a.arca-card-link').count(), 0);
     assert.doesNotMatch(await page.locator('.arca-stage').innerText(), /orphan|orders|customers/);
+    assert.doesNotMatch(await page.locator('.arca-stage').innerText(), /arcak-svc|Arca services/i);
     assert.doesNotMatch(await page.locator('.arca-project-select').innerText(), /Plumbing/);
 
     assert.equal(await page.locator('.arca-panel [role="tab"]').count(), 2);
+    assert.equal(await page.locator('.arca-panel-sub').innerText(), 'Recent activity · all machines');
     assert.equal(await page.locator('[role="tab"]').first().innerText(), 'Chat');
     assert.equal(await page.locator('[role="tab"]').nth(1).innerText(), 'Steps');
     assert.equal(await page.locator('[role="tab"]').first().getAttribute('aria-selected'), 'true');
@@ -163,6 +166,15 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
     await page.waitForFunction(() => location.hash === '#project/Studio');
     assert.equal(await page.locator('.arca-canvas-title').innerText(), 'Studio');
     assert.equal(await page.locator('.arca-project-select').inputValue(), 'Studio');
+
+    await page.locator('.arca-project-select').selectOption('Automagik');
+    await page.waitForFunction(() => location.hash === '#project/Automagik');
+    assert.equal(await page.locator('.arca-canvas-title').innerText(), 'Automagik');
+    assert.match(await page.locator('.arca-node-project .arca-nk').innerText(), /Service · alpha/);
+    assert.match(await page.locator('.arca-canvas-chips').innerText(), /alpha · service/);
+    assert.doesNotMatch(await page.locator('.arca-stage').innerText(), /arcak-svc|Arca services/i);
+    await page.evaluate(() => { location.hash = '#project/Studio'; });
+    await page.waitForFunction(() => location.hash === '#project/Studio');
   });
 
   await t.test('missing journal and metrics degrade without invented rows', async () => {
@@ -179,6 +191,26 @@ test('v28 layout binds both hosts, the selected project and the Doctor feed', as
     assert.equal(await page.locator('.arca-summary').innerText(), '2 machines');
     data = fixture;
     await page.waitForSelector('.arca-tool');
+  });
+
+  await t.test('a failed host report marks its owner members unknown', async () => {
+    data = {
+      ...fixture,
+      projects: [{ name: 'Unknown host', members: [{ host: 'beta', incusProject: 'sandbox', instance: 'api' }] }],
+      defaultProject: 'Unknown host',
+      hosts: fixture.hosts.map((host) => host.name === 'beta'
+        ? { ...host, instancesKnown: false, instances: [] }
+        : host),
+    };
+    await page.waitForFunction(() => document.querySelector('.arca-canvas-title')?.textContent === 'Unknown host');
+    const projectCard = page.locator('.arca-node-project');
+    assert.match(await projectCard.innerText(), /unknown[\s\S]*host data unavailable/i);
+    assert.doesNotMatch(await projectCard.innerText(), /not found|Nothing live yet/i);
+    assert.match(await page.locator('.arca-node-empty').innerText(), /Host data unavailable/);
+    assert.doesNotMatch(await page.locator('.arca-node-empty').innerText(), /No live things/);
+    data = fixture;
+    await page.evaluate(() => { location.hash = '#project/Studio'; });
+    await page.waitForFunction(() => document.querySelector('.arca-canvas-title')?.textContent === 'Studio');
   });
 
   await t.test('hostile snapshot strings render as text and never as markup', async () => {

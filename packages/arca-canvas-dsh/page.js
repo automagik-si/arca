@@ -15,6 +15,7 @@
   var text = (value, fallback = "") => value == null ? fallback : String(value);
   var count = (value, singular, plural = `${singular}s`) => `${value} ${value === 1 ? singular : plural}`;
   var byName = (a, b) => a.localeCompare(b, void 0, { numeric: true, sensitivity: "base" });
+  var INTERNAL_PROJECT = "arcak-svc";
   function humanize(value) {
     const raw = text(value, "Unnamed");
     return raw.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -23,7 +24,6 @@
     const id = text(value, "Unnamed project");
     if (id === "default") return "Default";
     if (id === "bench") return "Bench";
-    if (id === "arcak-svc") return "Arca services";
     if (id.startsWith("arcak-adopt-")) return `Adopted ${humanize(id.slice("arcak-adopt-".length))}`;
     return humanize(id);
   }
@@ -144,21 +144,22 @@
     if (kind && target.project) return `${kind} in ${target.project}`;
     return kind;
   }
-  function rollup(cards) {
-    if (!cards.length) return { tone: "neutral", text: "Nothing live yet" };
+  function rollup(cards, unknown = 0) {
+    if (!cards.length) return unknown > 0 ? { tone: "warn", text: "Host data unavailable" } : { tone: "neutral", text: "Nothing live yet" };
     const tones = cards.map((card) => card.tone);
     const bad = tones.filter((tone2) => tone2 === "bad").length;
     const warn = tones.filter((tone2) => tone2 === "warn").length;
     const running = cards.filter((card) => card.status.toLowerCase() === "running").length;
     const ready = cards.filter((card) => card.status.toLowerCase() === "ready").length;
     const stopped = cards.filter((card) => card.status.toLowerCase() === "stopped").length;
-    const tone = bad ? "bad" : warn ? "warn" : tones.every((value) => value === "neutral") ? "neutral" : "ok";
+    const tone = bad ? "bad" : warn || unknown ? "warn" : tones.every((value) => value === "neutral") ? "neutral" : "ok";
     const parts = [];
     if (running) parts.push(`${running} running`);
     if (ready) parts.push(`${ready} ready`);
     if (stopped) parts.push(`${stopped} stopped`);
     if (bad) parts.push(`${bad} unavailable`);
     else if (warn) parts.push(`${warn} unknown`);
+    if (unknown) parts.push(`${unknown} unknown`);
     return { tone, text: parts.join(" \xB7 ") || "Live" };
   }
   function buildMachine(host) {
@@ -244,18 +245,22 @@
     const machines = hosts.map(buildMachine);
     const usedNames = /* @__PURE__ */ new Set();
     const claimed = /* @__PURE__ */ new Set();
-    const projects = [];
+    const ownerProjects = [];
+    const serviceProjects = [];
+    const fallbackProjects = [];
     const databaseCards = databaseTargets(hosts);
     for (const config of list(envelope.projects)) {
       const name = text(config.name).trim();
       if (!name || usedNames.has(name)) continue;
       const cards = [];
       let missing = 0;
+      let unknown = 0;
       for (const member of list(config.members)) {
         const host = hosts.find((candidate) => candidate.name === member.host);
         const instance = list(host?.instances).find((candidate) => text(candidate.project, "default") === text(member.incusProject) && text(candidate.name) === text(member.instance));
-        if (!host || !instance) {
-          missing++;
+        if (!instance) {
+          if (host && host.instancesKnown === false) unknown++;
+          else missing++;
           continue;
         }
         const card = instanceCard(host.name, instance);
@@ -267,8 +272,8 @@
         if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
       }
       usedNames.add(name);
-      const roll = rollup(cards);
-      projects.push({
+      const roll = rollup(cards, unknown);
+      ownerProjects.push({
         id: `owner:${name}`,
         kind: "owner",
         name,
@@ -280,13 +285,41 @@
         hosts: [...new Set(cards.map((card) => card.host))],
         status: roll.text,
         tone: roll.tone,
-        missing
+        missing,
+        unknown
       });
+    }
+    for (const host of hosts) {
+      const unlisted = list(host.instances).filter((instance) => text(instance.project, "default") === INTERNAL_PROJECT && !claimed.has(instanceKey(host.name, instance.project, instance.name))).sort((a, b) => byName(humanize(text(a.name)), humanize(text(b.name))));
+      for (const instance of unlisted) {
+        const cards = [instanceCard(host.name, instance)];
+        const target = databaseCards.get(cards[0].key);
+        if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
+        const name = uniqueName(humanize(text(instance.name)), usedNames, host.name);
+        usedNames.add(name);
+        const roll = rollup(cards);
+        serviceProjects.push({
+          id: `service:${text(host.name)}/${text(instance.name)}`,
+          kind: "service",
+          name,
+          label: name,
+          rawName: "",
+          host: text(host.name),
+          domain: "",
+          cards,
+          hosts: [text(host.name)],
+          status: roll.text,
+          tone: roll.tone,
+          missing: 0,
+          unknown: 0
+        });
+      }
     }
     for (const host of hosts) {
       const projectIds = new Set(list(host.projects).map((value) => text(value)).filter(Boolean));
       for (const instance of list(host.instances)) projectIds.add(text(instance.project, "default"));
       for (const project of [...projectIds].sort(byName)) {
+        if (project === INTERNAL_PROJECT) continue;
         const unlisted = list(host.instances).filter((instance) => text(instance.project, "default") === project && !claimed.has(instanceKey(host.name, instance.project, instance.name)));
         if (!unlisted.length) continue;
         const cards = unlisted.sort((a, b) => byName(text(a.name), text(b.name))).map((instance) => instanceCard(host.name, instance));
@@ -298,7 +331,7 @@
         const name = uniqueName(base, usedNames, host.name);
         usedNames.add(name);
         const roll = rollup(cards);
-        projects.push({
+        fallbackProjects.push({
           id: `incus:${text(host.name)}/${project}`,
           kind: "incus",
           name,
@@ -310,12 +343,14 @@
           hosts: [text(host.name)],
           status: roll.text,
           tone: roll.tone,
-          missing: 0
+          missing: 0,
+          unknown: 0
         });
       }
     }
+    const projects = [...ownerProjects, ...serviceProjects, ...fallbackProjects];
     const configuredDefault = text(envelope.defaultProject).trim();
-    const defaultProject = projects.find((project) => project.name === configuredDefault) ?? projects.find((project) => project.kind === "owner") ?? projects[0] ?? null;
+    const defaultProject = projects.find((project) => project.name === configuredDefault) ?? projects.find((project) => project.kind === "owner") ?? projects.find((project) => project.kind === "service") ?? projects.find((project) => project.kind === "incus") ?? null;
     return {
       hosts: machines,
       projects,
@@ -584,7 +619,7 @@
     head.append(iconBox(doc, "project"), titleBlock(
       doc,
       project.name,
-      project.kind === "owner" ? "Project" : `Incus project ${project.rawName} \xB7 ${project.host}`
+      project.kind === "owner" ? "Project" : project.kind === "service" ? `Service \xB7 ${project.host}` : `Incus project ${project.rawName} \xB7 ${project.host}`
     ));
     node.append(head);
     const facts = el(doc, "div", "arca-facts");
@@ -594,6 +629,7 @@
     );
     node.append(facts);
     if (project.missing) node.append(el(doc, "p", "arca-card-note", `${count2(project.missing, "configured member")} not found on a machine`));
+    if (project.unknown) node.append(el(doc, "p", "arca-card-note", `${count2(project.unknown, "configured member")} unknown (host data unavailable)`));
     const foot = el(doc, "div", "arca-nf");
     foot.append(dot(doc, project.tone), el(doc, "span", "", project.status), el(doc, "span", "arca-nf-right", "self-hosted"));
     node.append(foot);
@@ -708,7 +744,7 @@
     });
     if (!project.cards.length) {
       const empty = cardShell(doc, "empty", cardsX, TOP, CARD_W, 118);
-      empty.append(emptyState(doc, "No live things in this project", "Configured members that are not on a machine stay hidden."));
+      empty.append(project.unknown ? emptyState(doc, "Host data unavailable", "Configured members on a machine whose instance list could not be read stay hidden.") : emptyState(doc, "No live things in this project", "Configured members that are not on a machine stay hidden."));
       world.append(empty);
     }
     return world;
@@ -924,7 +960,7 @@
       if (signature !== state.signatures.picker) {
         state.signatures.picker = signature;
         const fragment = doc.createDocumentFragment();
-        for (const [kind, label] of [["owner", "Your projects"], ["incus", "Machine projects"]]) {
+        for (const [kind, label] of [["owner", "Your projects"], ["service", "Services"], ["incus", "Machine projects"]]) {
           const rows = projects.filter((project) => project.kind === kind);
           if (!rows.length) continue;
           const group = doc.createElement("optgroup");
@@ -975,6 +1011,7 @@
         `${count2(project.hosts.length, "host")}`
       ];
       if (project.domain) chips.push(project.domain);
+      if (project.kind === "service") chips.push(`${project.host} \xB7 service`);
       if (project.kind === "incus") chips.push(`${project.host} \xB7 ${project.rawName}`);
       canvasChips.replaceChildren(...chips.map((value) => el(doc, "span", "arca-chip", value)));
       const signature = JSON.stringify({
@@ -984,7 +1021,8 @@
         host: project.host,
         status: project.status,
         cards: project.cards,
-        missing: project.missing
+        missing: project.missing,
+        unknown: project.unknown
       });
       if (signature === state.signatures.canvas) return;
       state.signatures.canvas = signature;
@@ -996,7 +1034,7 @@
     };
     const updatePanel = () => {
       const project = state.project;
-      panelSub.textContent = project ? `Recent activity \xB7 ${project.name}` : "Recent activity";
+      panelSub.textContent = "Recent activity \xB7 all machines";
       const dashboard = state.dashboard;
       const journal = list2(dashboard?.journal);
       const plans = dashboard?.plans ?? 0;

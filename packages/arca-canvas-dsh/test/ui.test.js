@@ -79,7 +79,7 @@ test('instance links appear only for a real absolute URL', () => {
   assert.equal(project(dashboard, 'Studio').cards[0].url, '');
 });
 
-test('default project, hash round trip and unknown selection', () => {
+test('default selection prefers configured, owner, service, then other Incus projects', () => {
   const dashboard = buildDashboard(fixture);
   assert.equal(dashboard.defaultProject.name, 'Studio');
   assert.equal(projectHash(dashboard.defaultProject), '#project/Studio');
@@ -89,10 +89,116 @@ test('default project, hash round trip and unknown selection', () => {
   assert.equal(parseProjectHash('#project/%'), null);
   assert.equal(selectProject(dashboard.projects, 'Automation').name, 'Automation');
   assert.equal(selectProject(dashboard.projects, 'missing'), null);
-  const alternate = buildDashboard({ ...fixture, defaultProject: 'Automation' });
-  assert.equal(alternate.defaultProject.name, 'Automation');
+  const configured = buildDashboard({ ...fixture, defaultProject: 'Automation' });
+  assert.equal(configured.defaultProject.name, 'Automation');
+  const ownerFirst = buildDashboard({ ...fixture, defaultProject: '', projects: fixture.projects });
+  assert.equal(ownerFirst.defaultProject.name, 'Studio');
   const fallback = buildDashboard({ ...fixture, defaultProject: '', projects: [] });
-  assert.equal(fallback.defaultProject.name, 'Plumbing');
+  // The standard fixture carries one unlisted service, which outranks the other Incus projects.
+  assert.equal(fallback.defaultProject.name, 'Automagik');
+  assert.equal(fallback.defaultProject.kind, 'service');
+});
+
+test('arcak-svc never becomes a project and every unlisted service is first-class', () => {
+  const dashboard = buildDashboard({
+    hosts: [{
+      name: 'alpha',
+      instancesKnown: true,
+      projects: ['arcak-svc', 'shared'],
+      instances: [
+        { name: 'automagik', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'nats', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'worker', project: 'shared', kind: 'container', status: 'Running' },
+      ],
+    }],
+  });
+  assert.deepEqual(dashboard.projects.map((entry) => [entry.name, entry.kind]), [
+    ['Automagik', 'service'], ['Nats', 'service'], ['Shared', 'incus'],
+  ]);
+  for (const service of dashboard.projects.filter((entry) => entry.kind === 'service')) {
+    assert.equal(service.host, 'alpha');
+    assert.equal(service.rawName, '');
+    assert.equal(service.cards.length, 1);
+  }
+  assert.equal(dashboard.projects.some((entry) => /arcak-svc|Arca services/i.test(`${entry.name} ${entry.rawName}`)), false);
+  assert.equal(dashboard.defaultProject.name, 'Automagik');
+  assert.equal(dashboard.defaultProject.kind, 'service');
+});
+
+test('an owner project may group one service while the rest stay first-class', () => {
+  const dashboard = buildDashboard({
+    projects: [{ name: 'Messaging', members: [{ host: 'alpha', incusProject: 'arcak-svc', instance: 'nats' }] }],
+    defaultProject: 'Messaging',
+    hosts: [{
+      name: 'alpha',
+      instancesKnown: true,
+      projects: ['arcak-svc'],
+      instances: [
+        { name: 'automagik', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'nats', project: 'arcak-svc', kind: 'container', status: 'Running' },
+      ],
+    }],
+  });
+  assert.deepEqual(dashboard.projects.map((entry) => entry.name), ['Messaging', 'Automagik']);
+  assert.equal(project(dashboard, 'Messaging').cards[0].name, 'nats');
+  assert.equal(dashboard.projects.filter((entry) => entry.kind === 'service').length, 1);
+  assert.equal(dashboard.projects.some((entry) => entry.kind === 'service' && entry.cards.some((card) => card.name === 'nats')), false);
+});
+
+test('default selection never picks an internal project', () => {
+  const dashboard = buildDashboard({
+    hosts: [{
+      name: 'alpha',
+      instancesKnown: true,
+      projects: ['aaa', 'arcak-svc'],
+      instances: [
+        { name: 'zulu', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'worker', project: 'aaa', kind: 'container', status: 'Running' },
+      ],
+    }],
+  });
+  assert.equal(dashboard.defaultProject.name, 'Zulu');
+  assert.equal(dashboard.defaultProject.kind, 'service');
+  assert.deepEqual(dashboard.projects.map((entry) => entry.name), ['Zulu', 'Aaa']);
+  assert.equal(dashboard.projects.some((entry) => entry.name === 'Arca services' || entry.rawName === 'arcak-svc'), false);
+});
+
+test('members on a host whose instance report failed are unknown, not missing', () => {
+  const failed = fixture.hosts.map((host) => host.name === 'beta'
+    ? { ...host, instancesKnown: false, instances: [] }
+    : host);
+  const dashboard = buildDashboard({
+    ...fixture,
+    projects: [{
+      name: 'Mixed',
+      members: [
+        { host: 'alpha', incusProject: 'plumbing', instance: 'app' },
+        { host: 'beta', incusProject: 'sandbox', instance: 'api' },
+      ],
+    }],
+    defaultProject: 'Mixed',
+    hosts: failed,
+  });
+  const mixed = project(dashboard, 'Mixed');
+  assert.equal(mixed.cards.length, 1);
+  assert.equal(mixed.missing, 0);
+  assert.equal(mixed.unknown, 1);
+  assert.match(mixed.status, /unknown/);
+  assert.equal(mixed.status.includes('Nothing live yet'), false);
+  assert.equal(mixed.tone, 'warn');
+
+  const only = buildDashboard({
+    ...fixture,
+    projects: [{ name: 'Beta only', members: [{ host: 'beta', incusProject: 'sandbox', instance: 'api' }] }],
+    defaultProject: 'Beta only',
+    hosts: failed,
+  });
+  const beta = project(only, 'Beta only');
+  assert.equal(beta.cards.length, 0);
+  assert.equal(beta.missing, 0);
+  assert.equal(beta.unknown, 1);
+  assert.equal(beta.status, 'Host data unavailable');
+  assert.equal(beta.tone, 'warn');
 });
 
 test('fleet summary sums real cores and memory and omits absent parts', () => {
@@ -113,7 +219,7 @@ test('machines expose online state, capacity and unknown instance counts', () =>
   const dashboard = buildDashboard(fixture);
   assert.equal(dashboard.hosts.length, 2);
   assert.deepEqual(dashboard.hosts.map((machine) => [machine.name, machine.online, machine.instanceCount]), [
-    ['alpha', true, 3], ['beta', true, 3],
+    ['alpha', true, 4], ['beta', true, 3],
   ]);
   const offline = buildDashboard({
     ...fixture,
@@ -150,6 +256,7 @@ test('journal and plan data stay absent when a host fails', () => {
 test('labels keep product language plain', () => {
   assert.equal(projectLabel('default'), 'Default');
   assert.equal(projectLabel('arcak-adopt-home-assistant'), 'Adopted Home Assistant');
+  assert.notEqual(projectLabel('arcak-svc'), 'Arca services');
   assert.equal(instanceKindLabel('virtual-machine'), 'VM');
   assert.equal(instanceKindLabel('container'), 'Container');
   assert.equal(statusTone('Running'), 'ok');

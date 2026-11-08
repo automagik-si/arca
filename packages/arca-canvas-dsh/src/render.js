@@ -205,7 +205,9 @@ function projectCard(doc, project, x, y, width, height) {
   const head = el(doc, 'div', 'arca-nh');
   head.append(iconBox(doc, 'project'), titleBlock(doc,
     project.name,
-    project.kind === 'owner' ? 'Project' : `Incus project ${project.rawName} · ${project.host}`));
+    project.kind === 'owner' ? 'Project'
+      : project.kind === 'service' ? `Service · ${project.host}`
+        : `Incus project ${project.rawName} · ${project.host}`));
   node.append(head);
   const facts = el(doc, 'div', 'arca-facts');
   facts.append(
@@ -214,6 +216,7 @@ function projectCard(doc, project, x, y, width, height) {
   );
   node.append(facts);
   if (project.missing) node.append(el(doc, 'p', 'arca-card-note', `${count(project.missing, 'configured member')} not found on a machine`));
+  if (project.unknown) node.append(el(doc, 'p', 'arca-card-note', `${count(project.unknown, 'configured member')} unknown (host data unavailable)`));
   const foot = el(doc, 'div', 'arca-nf');
   foot.append(dot(doc, project.tone), el(doc, 'span', '', project.status), el(doc, 'span', 'arca-nf-right', 'self-hosted'));
   node.append(foot);
@@ -335,7 +338,9 @@ function buildWorld(doc, project) {
   });
   if (!project.cards.length) {
     const empty = cardShell(doc, 'empty', cardsX, TOP, CARD_W, 118);
-    empty.append(emptyState(doc, 'No live things in this project', 'Configured members that are not on a machine stay hidden.'));
+    empty.append(project.unknown
+      ? emptyState(doc, 'Host data unavailable', 'Configured members on a machine whose instance list could not be read stay hidden.')
+      : emptyState(doc, 'No live things in this project', 'Configured members that are not on a machine stay hidden.'));
     world.append(empty);
   }
   return world;
@@ -560,7 +565,7 @@ export function createCanvas(root) {
     if (signature !== state.signatures.picker) {
       state.signatures.picker = signature;
       const fragment = doc.createDocumentFragment();
-      for (const [kind, label] of [['owner', 'Your projects'], ['incus', 'Machine projects']]) {
+      for (const [kind, label] of [['owner', 'Your projects'], ['service', 'Services'], ['incus', 'Machine projects']]) {
         const rows = projects.filter((project) => project.kind === kind);
         if (!rows.length) continue;
         const group = doc.createElement('optgroup');
@@ -615,11 +620,12 @@ export function createCanvas(root) {
       `${count(project.hosts.length, 'host')}`,
     ];
     if (project.domain) chips.push(project.domain);
+    if (project.kind === 'service') chips.push(`${project.host} · service`);
     if (project.kind === 'incus') chips.push(`${project.host} · ${project.rawName}`);
     canvasChips.replaceChildren(...chips.map((value) => el(doc, 'span', 'arca-chip', value)));
     const signature = JSON.stringify({
       name: project.name, domain: project.domain, kind: project.kind, host: project.host,
-      status: project.status, cards: project.cards, missing: project.missing,
+      status: project.status, cards: project.cards, missing: project.missing, unknown: project.unknown,
     });
     if (signature === state.signatures.canvas) return;
     state.signatures.canvas = signature;
@@ -632,7 +638,7 @@ export function createCanvas(root) {
 
   const updatePanel = () => {
     const project = state.project;
-    panelSub.textContent = project ? `Recent activity · ${project.name}` : 'Recent activity';
+    panelSub.textContent = 'Recent activity · all machines';
     const dashboard = state.dashboard;
     const journal = list(dashboard?.journal);
     const plans = dashboard?.plans ?? 0;

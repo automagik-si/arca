@@ -115,7 +115,7 @@ test('all seven fixtures become one snapshot with project-qualified instances', 
   assert.deepEqual(snapshot.plans, fixtures.plan_list.plans);
   assert.deepEqual(snapshot.journal, fixtures.journal_list.records);
   assert.equal(snapshot.journalKnown, true);
-  assert.equal(calls.length, 14);
+  assert.equal(calls.length, 16);
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
@@ -215,11 +215,45 @@ test('journal_list failure leaves no invented records and keeps the host useful'
   assert.equal(JSON.stringify(snapshot).includes(sentinel), false);
 });
 
+test('journal paging shows the newest records and later polls only read new ones', async () => {
+  const records = Array.from({ length: 620 }, (_, index) => ({
+    id: index + 1,
+    entry: `event-${index + 1}`,
+    target: { kind: 'instance', name: `synthetic-${index + 1}` },
+    state: 'Applied',
+    at_ms: 1794160000000 + index,
+  }));
+  const calls = [];
+  const client = {
+    async call(tool, args = {}) {
+      assert.equal(tool, 'journal_list');
+      calls.push({ ...args });
+      const after = args.after ?? 0;
+      const limit = args.limit ?? 100;
+      return { records: records.filter((record) => record.id > after).slice(0, limit) };
+    },
+  };
+  const state = {};
+  const snapshot = await collectSnapshot(client, {}, state);
+  assert.equal(snapshot.journalKnown, true);
+  assert.equal(snapshot.journal.length, 200);
+  assert.deepEqual(snapshot.journal.map((record) => record.id), records.slice(-200).map((record) => record.id));
+  assert.deepEqual(calls.map((args) => args.after), [0, 500, 620]);
+
+  calls.length = 0;
+  records.push({ id: 621, entry: 'event-621', state: 'Applied', at_ms: 1794160000620 });
+  const next = await collectSnapshot(client, {}, state);
+  assert.deepEqual(calls.map((args) => args.after), [620, 621]);
+  assert.equal(next.journal.length, 200);
+  assert.equal(next.journal.at(-1).id, 621);
+  assert.deepEqual(next.journal.map((record) => record.id), records.slice(-200).map((record) => record.id));
+});
+
 test('cache polls repeatedly, retains successes, and stops cleanly', async () => {
   let count = 0;
   const cache = createSnapshotCache({ async call(tool) { count++; return fixtures[tool]; } }, 10);
   try {
-    await until(() => count >= 14 && cache.get().error === null);
+    await until(() => count >= 16 && cache.get().error === null);
     assert.deepEqual(cache.get().machine, fixtures.arca_status);
     cache.stop();
     const stoppedAt = count;
@@ -266,7 +300,7 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   const web = createServer((req, res) => routes[0].handler(req, res));
   await new Promise((resolve) => web.listen(socketPath, resolve));
   t.after(() => new Promise((resolve) => web.close(resolve)));
-  await until(() => calls.length >= 14);
+  await until(() => calls.length >= 16);
   let snapshot;
   for (let attempts = 0; attempts < 100; attempts++) {
     snapshot = await exchange(socketPath, '/arca-canvas/snapshot?cached=1');

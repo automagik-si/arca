@@ -34,7 +34,7 @@
         "appliedSeq": 4
       },
       "instancesKnown": true,
-      "projects": ["plumbing", "sandbox"],
+      "projects": ["arcak-svc", "plumbing", "sandbox"],
       "instances": [
         {
           "name": "app",
@@ -61,6 +61,15 @@
           "kind": "container",
           "status": "Running",
           "owner": { "class": "foreign" },
+          "privileged": false,
+          "identity": false
+        },
+        {
+          "name": "automagik",
+          "project": "arcak-svc",
+          "kind": "container",
+          "status": "Running",
+          "owner": { "class": "kernel" },
           "privileged": false,
           "identity": false
         }

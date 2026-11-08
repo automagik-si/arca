@@ -57,7 +57,7 @@ config:
 | `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
 | `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
 | `projects` | Optional owner project groups. Each entry has a unique non-empty `name`, an optional `domain`, and a non-empty `members` array of `{ host, incusProject, instance }`. Every member must name a configured host, and one instance can belong to only one project. |
-| `defaultProject` | Optional project name selected on load. Defaults to the first owner project, else the first fallback project. Must name a configured project when `projects` is present. |
+| `defaultProject` | Optional project name selected on load. Otherwise the page selects the first configured project, then the first service project, then the first other Incus project. An internal Arca project is never selected. Must name a configured project when `projects` is present. |
 
 To show multiple hosts, set `hosts` in the same config map:
 
@@ -99,15 +99,23 @@ its own socket, token and name; top-level `socketPath`, `viewerTokenPath` and
 An unreachable socket, refused token or failed tool affects only that host;
 successful fields and the other hosts keep rendering. A failed watch report
 leaves the machine card online but reports that its instance count is unknown;
-it never implies an empty host. No per-host mode is inferred from `arca_status`.
+configured owner-project members on that host are reported as unknown, never as
+missing or as an empty host. No per-host mode is inferred from `arca_status`.
 
 `projects` is the owner's grouping layer, not an Incus project list. A listed
 member is resolved on its host and appears only inside its owner project. An
-instance that is not listed falls back to a project named after its Incus
-project on that host. An Incus project whose instances are all listed in owner
-projects is not rendered at all, so Arca's own plumbing never becomes a project
-folder. Owner projects render in config order; fallback projects follow by host
-and project name, with the host appended only when a display name collides.
+unlisted instance falls back to a project named after its Incus project on that
+host, with one exception: the internal `arcak-svc` grouping is never a project.
+Each unlisted instance in `arcak-svc` becomes its own project named after the
+service (the instance name, humanized; `automagik` becomes `Automagik`), so a
+service is a first-class project by default and an owner project can group
+several. The internal `arcak-svc` id never appears as a project, in the picker or
+in a project subtitle. To group services, list them like any other member:
+`{ host: alpha, incusProject: arcak-svc, instance: automagik }`. An Incus
+project whose instances are all listed in owner projects is not rendered at all.
+Owner projects render in config order; service projects follow, then the other
+fallback projects by host and project name, with the host appended only when a
+display name collides.
 
 All example paths must be replaced with paths on the machine running DSH. Paths
 are literal; `~` and environment variables are not expanded. Config contains
@@ -146,10 +154,12 @@ list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
-- `journal` holds the raw `journal_list.records` array; the newest records across
-  hosts feed the Doctor's Chat and Steps views. A failed journal read leaves the
-  array empty and `journalKnown` false, so the page shows an unavailable notice
-  instead of invented rows.
+- `journal` holds the newest `journal_list` records, at most 200 per host. The
+  reader pages forward from the last seen id, so the first poll reads the whole
+  journal and later polls only fetch new records; the newest records across hosts
+  feed the Doctor's Chat and Steps views. A failed journal read leaves the array
+  empty and `journalKnown` false, so the page shows an unavailable notice instead
+  of invented rows.
 - `alerts` holds the full `alerts_list` result, preserving firing, unknown and
   recent resolved alerts plus health metadata. This layout does not draw alert
   cards yet; the data stays in the snapshot for later phases.
@@ -210,18 +220,20 @@ own absolute URL when present, and database address, port and link count when
 present. A domain card appears only when the project config sets `domain`.
 
 The right-hand Doctor panel has Chat and Steps tabs and a visible but inert
-composer. Both tabs render the newest `journal_list` records across hosts as
-`entry`, target and state with the host name; a waiting-plan card links to the
-configured `approvalUrl`. When `journal_list` is unavailable the panel says so
-without fabricating activity. The composer accepts no input and sends nothing.
+composer. Both tabs render the newest `journal_list` records across every
+machine, and the panel subtitle says `Recent activity · all machines`; a
+waiting-plan card links to the configured `approvalUrl`. When `journal_list` is
+unavailable the panel says so without fabricating activity. The composer accepts
+no input and sends nothing.
 
 Selection lives in the URL fragment as `#project/<name>`, encoded with
 `encodeURIComponent`. Loading with a known project restores it; an unknown or
-missing fragment selects `defaultProject` (or the first owner project) and
-replaces the fragment. The page never pans, zooms or drags. Polls rebuild a
-region only when its data changed, so selection, focus and scroll survive
-unchanged polls. There are no write actions and no routes beyond the existing
-`/arca-canvas` assets and snapshot.
+missing fragment selects `defaultProject`, else the first configured project,
+then the first service project, then the first other Incus project, and replaces
+the fragment. The page never pans, zooms or drags. Polls rebuild a region only
+when its data changed, so selection, focus and scroll survive unchanged polls.
+There are no write actions and no routes beyond the existing `/arca-canvas`
+assets and snapshot.
 
 ## Develop
 
@@ -244,8 +256,8 @@ exact-pinned esbuild. Commit all three artifacts with browser-source changes.
 Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test’s
 1440×900 light/dark screenshots (`canvas-v28-light.png`, `canvas-v28-dark.png`)
 and `rectangles.json` outside the repository. The standard browser fixture has
-two hosts, two owner projects, one fallback project, real-shaped journal rows and
-one waiting plan.
+two hosts, two owner projects, one service project, one fallback project,
+real-shaped journal rows and one waiting plan.
 
 The client contract is pinned to the sidebar’s 0.24.1 API: package metadata uses
 `dsh.client.inject: ["dsh-better-sidebar"]` (package IDs), while the client exports

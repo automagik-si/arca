@@ -2,6 +2,7 @@ const list = (value) => Array.isArray(value) ? value : [];
 const text = (value, fallback = '') => value == null ? fallback : String(value);
 const count = (value, singular, plural = `${singular}s`) => `${value} ${value === 1 ? singular : plural}`;
 const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+const INTERNAL_PROJECT = 'arcak-svc';
 
 export function humanize(value) {
   const raw = text(value, 'Unnamed');
@@ -12,7 +13,6 @@ export function projectLabel(value) {
   const id = text(value, 'Unnamed project');
   if (id === 'default') return 'Default';
   if (id === 'bench') return 'Bench';
-  if (id === 'arcak-svc') return 'Arca services';
   if (id.startsWith('arcak-adopt-')) return `Adopted ${humanize(id.slice('arcak-adopt-'.length))}`;
   return humanize(id);
 }
@@ -148,21 +148,24 @@ function targetLabel(target) {
   return kind;
 }
 
-function rollup(cards) {
-  if (!cards.length) return { tone: 'neutral', text: 'Nothing live yet' };
+function rollup(cards, unknown = 0) {
+  if (!cards.length) return unknown > 0
+    ? { tone: 'warn', text: 'Host data unavailable' }
+    : { tone: 'neutral', text: 'Nothing live yet' };
   const tones = cards.map((card) => card.tone);
   const bad = tones.filter((tone) => tone === 'bad').length;
   const warn = tones.filter((tone) => tone === 'warn').length;
   const running = cards.filter((card) => card.status.toLowerCase() === 'running').length;
   const ready = cards.filter((card) => card.status.toLowerCase() === 'ready').length;
   const stopped = cards.filter((card) => card.status.toLowerCase() === 'stopped').length;
-  const tone = bad ? 'bad' : warn ? 'warn' : tones.every((value) => value === 'neutral') ? 'neutral' : 'ok';
+  const tone = bad ? 'bad' : warn || unknown ? 'warn' : tones.every((value) => value === 'neutral') ? 'neutral' : 'ok';
   const parts = [];
   if (running) parts.push(`${running} running`);
   if (ready) parts.push(`${ready} ready`);
   if (stopped) parts.push(`${stopped} stopped`);
   if (bad) parts.push(`${bad} unavailable`);
   else if (warn) parts.push(`${warn} unknown`);
+  if (unknown) parts.push(`${unknown} unknown`);
   return { tone, text: parts.join(' · ') || 'Live' };
 }
 
@@ -254,7 +257,9 @@ export function buildDashboard(envelope = {}) {
   const machines = hosts.map(buildMachine);
   const usedNames = new Set();
   const claimed = new Set();
-  const projects = [];
+  const ownerProjects = [];
+  const serviceProjects = [];
+  const fallbackProjects = [];
   const databaseCards = databaseTargets(hosts);
 
   for (const config of list(envelope.projects)) {
@@ -262,11 +267,16 @@ export function buildDashboard(envelope = {}) {
     if (!name || usedNames.has(name)) continue;
     const cards = [];
     let missing = 0;
+    let unknown = 0;
     for (const member of list(config.members)) {
       const host = hosts.find((candidate) => candidate.name === member.host);
       const instance = list(host?.instances).find((candidate) =>
         text(candidate.project, 'default') === text(member.incusProject) && text(candidate.name) === text(member.instance));
-      if (!host || !instance) { missing++; continue; }
+      if (!instance) {
+        if (host && host.instancesKnown === false) unknown++;
+        else missing++;
+        continue;
+      }
       const card = instanceCard(host.name, instance);
       cards.push(card);
       claimed.add(card.key);
@@ -276,8 +286,8 @@ export function buildDashboard(envelope = {}) {
       if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
     }
     usedNames.add(name);
-    const roll = rollup(cards);
-    projects.push({
+    const roll = rollup(cards, unknown);
+    ownerProjects.push({
       id: `owner:${name}`,
       kind: 'owner',
       name,
@@ -290,13 +300,47 @@ export function buildDashboard(envelope = {}) {
       status: roll.text,
       tone: roll.tone,
       missing,
+      unknown,
     });
+  }
+
+  // arcak-svc is Arca's own project, never a project of its own. Each service the
+  // owner has not claimed becomes a first-class project named after the instance.
+  for (const host of hosts) {
+    const unlisted = list(host.instances)
+      .filter((instance) => text(instance.project, 'default') === INTERNAL_PROJECT
+        && !claimed.has(instanceKey(host.name, instance.project, instance.name)))
+      .sort((a, b) => byName(humanize(text(a.name)), humanize(text(b.name))));
+    for (const instance of unlisted) {
+      const cards = [instanceCard(host.name, instance)];
+      const target = databaseCards.get(cards[0].key);
+      if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
+      const name = uniqueName(humanize(text(instance.name)), usedNames, host.name);
+      usedNames.add(name);
+      const roll = rollup(cards);
+      serviceProjects.push({
+        id: `service:${text(host.name)}/${text(instance.name)}`,
+        kind: 'service',
+        name,
+        label: name,
+        rawName: '',
+        host: text(host.name),
+        domain: '',
+        cards,
+        hosts: [text(host.name)],
+        status: roll.text,
+        tone: roll.tone,
+        missing: 0,
+        unknown: 0,
+      });
+    }
   }
 
   for (const host of hosts) {
     const projectIds = new Set(list(host.projects).map((value) => text(value)).filter(Boolean));
     for (const instance of list(host.instances)) projectIds.add(text(instance.project, 'default'));
     for (const project of [...projectIds].sort(byName)) {
+      if (project === INTERNAL_PROJECT) continue;
       const unlisted = list(host.instances).filter((instance) =>
         text(instance.project, 'default') === project && !claimed.has(instanceKey(host.name, instance.project, instance.name)));
       if (!unlisted.length) continue;
@@ -309,7 +353,7 @@ export function buildDashboard(envelope = {}) {
       const name = uniqueName(base, usedNames, host.name);
       usedNames.add(name);
       const roll = rollup(cards);
-      projects.push({
+      fallbackProjects.push({
         id: `incus:${text(host.name)}/${project}`,
         kind: 'incus',
         name,
@@ -322,14 +366,17 @@ export function buildDashboard(envelope = {}) {
         status: roll.text,
         tone: roll.tone,
         missing: 0,
+        unknown: 0,
       });
     }
   }
 
+  const projects = [...ownerProjects, ...serviceProjects, ...fallbackProjects];
   const configuredDefault = text(envelope.defaultProject).trim();
   const defaultProject = projects.find((project) => project.name === configuredDefault)
     ?? projects.find((project) => project.kind === 'owner')
-    ?? projects[0]
+    ?? projects.find((project) => project.kind === 'service')
+    ?? projects.find((project) => project.kind === 'incus')
     ?? null;
 
   return {
