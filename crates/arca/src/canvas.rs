@@ -62,6 +62,8 @@ pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CHAT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// A chat response relays at most two MiB, so a broken upstream cannot stream without bound.
 pub const CHAT_STREAM_MAX: usize = 2 * 1024 * 1024;
+/// At most two chat streams hold a listener connection; a third gets 429 before any upstream connect.
+pub const CHAT_CONCURRENCY: usize = 2;
 /// The sign-in statement's kind. The approval parser refuses it structurally, as this parser refuses an approval statement.
 pub const STATEMENT_KIND: &str = "arca.canvas.view.v1";
 
@@ -271,9 +273,16 @@ impl Canvas {
 
     /// Starts one DSH chat turn and relays its body without buffering it. Only a 200 with a streamed content type starts a
     /// stream; the caller has already checked the session, the Origin and the JSON body. Dropping the response receiver aborts
-    /// the upstream connection.
+    /// the upstream connection. One deadline, taken here, covers the connect, the write, the response head and the relay.
     pub(crate) async fn chat(&self, body: &[u8]) -> Option<ChatResponse> {
-        let mut stream = timeout(DSH_TIMEOUT, TcpStream::connect(self.addr))
+        let deadline = Instant::now() + self.chat_total;
+        let connect_wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(DSH_TIMEOUT);
+        if connect_wait.is_zero() {
+            return None;
+        }
+        let mut stream = timeout(connect_wait, TcpStream::connect(self.addr))
             .await
             .ok()?
             .ok()?;
@@ -283,22 +292,27 @@ impl Canvas {
             self.addr,
             body.len()
         );
-        timeout(self.chat_idle, async {
+        let written = timeout_at(deadline, async {
             stream.write_all(request.as_bytes()).await.ok()?;
             stream.write_all(body).await.ok()?;
             Some(())
         })
-        .await
-        .ok()??;
-        let (head, leftover) = read_chat_head(&mut stream, self.chat_idle, self.chat_total).await?;
+        .await;
+        if !matches!(written, Ok(Some(()))) {
+            return None;
+        }
+        let (head, leftover) = read_chat_head(&mut stream, deadline, self.chat_idle).await?;
+        let sse = is_sse(&head.content_type);
         Some(ChatResponse {
             content_type: head.content_type,
             body: spawn_chat_relay(
                 stream,
                 leftover,
                 head.chunked,
+                head.content_length,
+                deadline,
                 self.chat_idle,
-                self.chat_total,
+                sse,
             ),
         })
     }
@@ -420,15 +434,16 @@ fn inline_hash(html: &str, tag: &str) -> Option<String> {
 struct ChatHead {
     content_type: String,
     chunked: bool,
+    content_length: Option<usize>,
 }
 
-/// Reads the chat response head, bounded, leaving any body bytes already received for the relay.
+/// Reads the chat response head, bounded, leaving any body bytes already received for the relay. Every read shares the one
+/// deadline taken in [`Canvas::chat`], so a slowly dripped head cannot extend the stream's total.
 async fn read_chat_head(
     stream: &mut TcpStream,
+    deadline: Instant,
     idle: Duration,
-    total: Duration,
 ) -> Option<(ChatHead, Vec<u8>)> {
-    let deadline = Instant::now() + total;
     let mut raw = Vec::new();
     let mut buffer = [0u8; 8 * 1024];
     loop {
@@ -466,6 +481,7 @@ fn parse_chat_head(head: &[u8]) -> Option<ChatHead> {
     }
     let mut content_type = None;
     let mut chunked = false;
+    let mut content_length = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -477,11 +493,14 @@ fn parse_chat_head(head: &[u8]) -> Option<ChatHead> {
             chunked = value
                 .split(',')
                 .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse::<usize>().ok();
         }
     }
     Some(ChatHead {
         content_type: content_type?,
         chunked,
+        content_length,
     })
 }
 
@@ -498,29 +517,58 @@ fn chat_content_type(value: &str) -> Option<String> {
     }
 }
 
-/// Relays the DSH body as it arrives: each chunk is sent over the channel immediately, so nothing is buffered whole. The
-/// sender waits at most the idle cap for the next chunk and at most the total cap for the stream. Dropping the receiver
-/// (a client disconnect) closes the upstream socket.
+fn is_sse(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// The final event a cut-off answer carries, matching the stream's media type. Only the fixed reason reaches the client.
+fn cut_event(sse: bool, reason: &str) -> Vec<u8> {
+    let data = json!({ "reason": reason });
+    if sse {
+        format!("event: arca-cut\ndata: {data}\n\n").into_bytes()
+    } else {
+        format!("{{\"arcaCut\":{data}}}\n").into_bytes()
+    }
+}
+
+/// Emits the cut event before the body closes. Delivery gets its own short bound, never the already-expired total deadline,
+/// so a total cut can still be reported; a client that has gone away simply drops it.
+async fn cut(sender: &mpsc::Sender<Result<Vec<u8>, io::Error>>, sse: bool, reason: &str) {
+    let _ = timeout(DSH_TIMEOUT, sender.send(Ok(cut_event(sse, reason)))).await;
+}
+
+/// Relays the DSH body as it arrives: each chunk is sent over the channel immediately, so nothing is buffered whole. One
+/// deadline covers the whole stream, while the idle cap limits the wait for each next chunk. Every non-normal ending emits
+/// a cut event, and dropping the receiver (a client disconnect) closes the upstream socket.
 fn spawn_chat_relay(
     mut stream: TcpStream,
     initial: Vec<u8>,
     chunked: bool,
+    content_length: Option<usize>,
+    deadline: Instant,
     idle: Duration,
-    total: Duration,
+    sse: bool,
 ) -> mpsc::Receiver<Result<Vec<u8>, io::Error>> {
     let (sender, receiver) = mpsc::channel(16);
     tokio::spawn(async move {
-        let deadline = Instant::now() + total;
         let mut pending = initial;
         let mut decoder = chunked.then(ChunkedBody::new);
         let mut relayed = 0usize;
+        let mut received = 0usize;
         let mut buffer = [0u8; 16 * 1024];
         loop {
             let data = std::mem::take(&mut pending);
+            received = received.saturating_add(data.len());
             let pieces = match decoder.as_mut() {
                 Some(decoder) => match decoder.push(&data) {
                     Ok(pieces) => pieces,
-                    Err(()) => return,
+                    Err(()) => {
+                        cut(&sender, sse, "upstream").await;
+                        return;
+                    }
                 },
                 None if data.is_empty() => Vec::new(),
                 None => vec![data],
@@ -529,32 +577,57 @@ fn spawn_chat_relay(
                 if piece.is_empty() {
                     continue;
                 }
-                relayed = relayed.saturating_add(piece.len());
-                if relayed > CHAT_STREAM_MAX {
-                    let error = io::Error::other("the chat response is over the stream cap");
-                    let _ = sender.try_send(Err(error));
+                if relayed.saturating_add(piece.len()) > CHAT_STREAM_MAX {
+                    cut(&sender, sse, "cap").await;
                     return;
                 }
-                if !matches!(
-                    timeout_at(deadline, sender.send(Ok(piece))).await,
-                    Ok(Ok(()))
-                ) {
-                    return;
+                relayed = relayed.saturating_add(piece.len());
+                match timeout_at(deadline, sender.send(Ok(piece))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(_) => {
+                        cut(&sender, sse, "total").await;
+                        return;
+                    }
                 }
             }
             if decoder.as_ref().is_some_and(|decoder| decoder.done) {
                 return;
             }
-            let wait = deadline.saturating_duration_since(Instant::now()).min(idle);
-            if wait.is_zero() {
+            let now = Instant::now();
+            if now >= deadline {
+                cut(&sender, sse, "total").await;
                 return;
             }
+            let wait = deadline.saturating_duration_since(now).min(idle);
             let read = tokio::select! {
                 _ = sender.closed() => return,
                 read = timeout(wait, stream.read(&mut buffer)) => read,
             };
             match read {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                Ok(Ok(0)) => {
+                    let early = match decoder.as_ref() {
+                        Some(decoder) => !decoder.done,
+                        None => content_length.is_some_and(|length| received < length),
+                    };
+                    if early {
+                        cut(&sender, sse, "upstream").await;
+                    }
+                    return;
+                }
+                Ok(Err(_)) => {
+                    cut(&sender, sse, "upstream").await;
+                    return;
+                }
+                Err(_) => {
+                    let reason = if Instant::now() >= deadline {
+                        "total"
+                    } else {
+                        "idle"
+                    };
+                    cut(&sender, sse, reason).await;
+                    return;
+                }
                 Ok(Ok(read)) => pending.extend_from_slice(&buffer[..read]),
             }
         }
@@ -800,10 +873,12 @@ mod tests {
         .expect("an SSE head");
         assert_eq!(parsed.content_type, "text/event-stream");
         assert!(parsed.chunked);
-        let parsed =
-            parse_chat_head(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n")
-                .expect("an NDJSON head");
+        let parsed = parse_chat_head(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: 12\r\n\r\n",
+        )
+        .expect("an NDJSON head");
         assert!(!parsed.chunked);
+        assert_eq!(parsed.content_length, Some(12));
         assert!(
             parse_chat_head(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n").is_none(),
             "another content type is refused"
@@ -816,6 +891,18 @@ mod tests {
         assert!(
             parse_chat_head(b"HTTP/1.1 200 OK\r\n\r\n").is_none(),
             "a missing content type is refused"
+        );
+    }
+
+    #[test]
+    fn cut_events_match_the_stream_media_type() {
+        assert_eq!(
+            cut_event(true, "idle"),
+            b"event: arca-cut\ndata: {\"reason\":\"idle\"}\n\n"
+        );
+        assert_eq!(
+            cut_event(false, "cap"),
+            b"{\"arcaCut\":{\"reason\":\"cap\"}}\n"
         );
     }
 

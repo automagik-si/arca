@@ -21,7 +21,7 @@ use arca_approval::passkey::{STATE_PASSKEYS_FILE, format_passkey_line};
 use arca_approval::{ARCA_NAMESPACE, ArcaAction, PasskeyLine, load_state_passkeys, parse_passkeys};
 use arca_kernel::canon::canonical_json;
 use arca_mcp::CallError;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -31,6 +31,8 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::canvas::{self, Canvas};
@@ -104,6 +106,7 @@ struct PageState {
     log: Arc<dyn Fn(&str) + Send + Sync>,
     trust_forwarded_for: bool,
     canvas: Arc<Canvas>,
+    chat_slots: Arc<Semaphore>,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -258,6 +261,7 @@ impl Page {
                     )
                     .expect("the default canvas origin is loopback"),
                 ),
+                chat_slots: Arc::new(Semaphore::new(canvas::CHAT_CONCURRENCY)),
             },
         }
     }
@@ -346,8 +350,8 @@ impl PageState {
 }
 
 /// The page's Origin rule, before any body is read: a POST needs the exact configured Origin; a GET needs none or the exact
-/// one. The canvas chat POST also accepts a browser's `Sec-Fetch-Site: same-origin` when no Origin is sent. A foreign Origin
-/// is always 403.
+/// one. The canvas chat POST also accepts a browser's `Sec-Fetch-Site: same-origin` when no Origin is sent. A present but
+/// non-text Origin is never treated as missing, and a foreign Origin is always 403.
 async fn origin_rule(
     State(state): State<Arc<PageState>>,
     request: Request,
@@ -356,7 +360,9 @@ async fn origin_rule(
     let origin = request
         .headers()
         .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok());
+        .map(|value| value.to_str().ok());
+    let origin_present = origin.is_some();
+    let origin_valid = origin.is_some_and(|value| value.is_some_and(|value| value == state.origin));
     let same_origin_fetch = request
         .headers()
         .get("sec-fetch-site")
@@ -364,9 +370,9 @@ async fn origin_rule(
         == Some("same-origin");
     let chat = request.uri().path() == canvas::CHAT_PATH;
     let allowed = if request.method() == Method::POST {
-        origin == Some(state.origin.as_str()) || (chat && origin.is_none() && same_origin_fetch)
+        origin_valid || (chat && !origin_present && same_origin_fetch)
     } else {
-        origin.is_none() || origin == Some(state.origin.as_str())
+        origin_valid || !origin_present
     };
     if !allowed {
         return StatusCode::FORBIDDEN.into_response();
@@ -527,12 +533,13 @@ async fn canvas_history(State(state): State<Arc<PageState>>, headers: HeaderMap)
     .await
 }
 
-/// One chat turn. The session, Origin and JSON checks run before the upstream connect, so a refused turn is never billed to
-/// the canvas model. The answer is relayed as a stream; the kernel keeps no write.
+/// One chat turn. The session is checked before the body is read, and the Origin, media type, size, JSON and concurrency
+/// checks all run before the upstream connect, so a refused turn is never billed to the canvas model. The answer is relayed
+/// as a stream; the kernel keeps no write.
 async fn canvas_chat(
     State(state): State<Arc<PageState>>,
     headers: HeaderMap,
-    body: Bytes,
+    request: Request,
 ) -> Response {
     let now = (state.clock)();
     if state.canvas.session(&headers, now).is_none() {
@@ -541,18 +548,27 @@ async fn canvas_chat(
     if !is_json_content_type(&headers) {
         return chat_refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
-    if body.len() > canvas::CHAT_BODY_MAX {
-        return chat_refusal(StatusCode::PAYLOAD_TOO_LARGE);
-    }
+    let body = match to_bytes(request.into_body(), canvas::CHAT_BODY_MAX).await {
+        Ok(body) => body,
+        Err(_) => return chat_refusal(StatusCode::PAYLOAD_TOO_LARGE),
+    };
     if serde_json::from_slice::<Value>(&body).is_err() {
         return chat_refusal(StatusCode::BAD_REQUEST);
     }
+    let Ok(slot) = state.chat_slots.clone().try_acquire_owned() else {
+        return chat_refusal(StatusCode::TOO_MANY_REQUESTS);
+    };
     let Some(chat) = state.canvas.chat(&body).await else {
         return chat_refusal(StatusCode::BAD_GATEWAY);
     };
     let content_type = HeaderValue::from_str(&chat.content_type)
         .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream"));
-    let mut response = Response::new(Body::from_stream(ReceiverStream::new(chat.body)));
+    // The permit lives inside the body stream, so a stalled stream keeps its chat slot until the client is gone.
+    let body = ReceiverStream::new(chat.body).map(move |chunk| {
+        let _held = &slot;
+        chunk
+    });
+    let mut response = Response::new(Body::from_stream(body));
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, content_type);

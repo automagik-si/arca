@@ -503,15 +503,19 @@ minutes, is single use, and has one global cap of 60 a minute; it never uses the
 detail. This view is tailnet-only behind the existing `/approve/*` proxy route.
 
 `POST /approve/canvas/chat` is one Doctor chat turn and costs model tokens only for the signed-in owner. The session is
-checked before any upstream connect, so an unsigned or invalid chat gets 401 with no connection. The POST needs the exact
-`Origin`, or a browser's `Sec-Fetch-Site: same-origin` when no `Origin` is sent; anything else is 403 before the upstream.
-The body must be `application/json` and at most 64 KiB (415 or 413 otherwise, also before the upstream). The kernel forwards
-the JSON to `POST /arca-canvas/chat` on the same loopback upstream and adds no write capability. The answer is relayed as a
-stream with the upstream's `Content-Type` (`text/event-stream`, `application/x-ndjson` or `application/json`) as each chunk
-arrives: nothing is buffered whole, an idle gap of 60 seconds ends the stream, the whole stream ends at 10 minutes or 2 MiB,
-and a client disconnect closes the upstream connection. `GET /approve/canvas/chat/history` is the same bounded three-second
-forward to `/arca-canvas/chat/history`. Every canvas route carries the CSP with `frame-ancestors 'none'`, `nosniff`,
-`no-referrer`, and `Cache-Control: no-store` on every canvas body, including refusals.
+checked before the request body is read, so an unsigned or invalid chat gets 401 with no connection and before any body
+limit applies. The POST needs the exact `Origin`, or a browser's `Sec-Fetch-Site: same-origin` when no `Origin` is sent;
+anything else, including an `Origin` that is not valid text, is 403 before the upstream. The body must be `application/json`
+and at most 64 KiB (415 or 413 otherwise, also before the upstream). At most two chats stream at once; a third gets 429 before
+any upstream connect. The kernel forwards the JSON to `POST /arca-canvas/chat` on the same loopback upstream and adds no
+write capability. The answer is relayed as a stream with the upstream's `Content-Type` (`text/event-stream`,
+`application/x-ndjson` or `application/json`) as each chunk arrives: nothing is buffered whole, one ten-minute total covers
+the connect, request write, response head and relay, and an idle gap of 60 seconds or a 2 MiB relay cap also ends the stream.
+A cut answer ends with a final `event: arca-cut` whose data names `idle`, `total`, `cap` or `upstream`
+(`{"arcaCut":{"reason":"..."}}` line for the NDJSON/JSON media types); a client disconnect closes the upstream connection
+without a cut event. `GET /approve/canvas/chat/history` is the same bounded three-second forward to
+`/arca-canvas/chat/history`. Every canvas route carries the CSP with `frame-ancestors 'none'`, `nosniff`, `no-referrer`, and
+`Cache-Control: no-store` on every canvas body, including refusals.
 
 To use it:
 

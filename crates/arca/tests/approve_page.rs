@@ -17,7 +17,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use arca::approve_page::{self, SetupCodeDisplay};
-use arca::canvas::{CHAT_BODY_MAX, CHAT_HISTORY_PATH, CHAT_PATH, Canvas};
+use arca::canvas::{
+    CHAT_BODY_MAX, CHAT_CONCURRENCY, CHAT_HISTORY_PATH, CHAT_PATH, CHAT_STREAM_MAX, Canvas,
+};
 use arca::desired_store::EntryChange;
 use arca::handlers::{Clock, plan_handlers};
 use arca::kernel::Kernel;
@@ -61,6 +63,11 @@ enum UpstreamMode {
     ChatStream,
     ChatStall,
     ChatHold,
+    ChatSilent,
+    ChatDrip,
+    ChatFlood,
+    ChatTruncate,
+    ChatCorrupt,
 }
 
 struct UpstreamInner {
@@ -71,12 +78,14 @@ struct UpstreamInner {
     closed: AtomicBool,
 }
 
-/// A loopback fake DSH: one response per request, with upstream headers serve must drop. Chat modes stream a chunked SSE
-/// body so the proxy tests can observe arrival order, idle expiry and a client disconnect.
+/// A loopback fake DSH: one response per request, with upstream headers serve must drop. Each accepted connection runs on its
+/// own thread so the concurrency test can hold several chat streams at once. Chat modes stream a chunked SSE body so the proxy
+/// tests can observe arrival order, cut events, idle/total expiry and a client disconnect.
 struct TestUpstream {
     addr: SocketAddr,
     inner: Arc<UpstreamInner>,
-    thread: Option<JoinHandle<()>>,
+    listener: Option<JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl TestUpstream {
@@ -94,110 +103,18 @@ impl TestUpstream {
             closed: AtomicBool::new(false),
         });
         let worker = Arc::clone(&inner);
+        let workers = Arc::new(Mutex::new(Vec::new()));
+        let spawned = Arc::clone(&workers);
         let thread = std::thread::spawn(move || {
             while !worker.stop.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
+                    Ok((stream, _)) => {
                         worker.connections.fetch_add(1, Ordering::SeqCst);
-                        let mode = *worker.mode.lock().expect("upstream mode");
-                        if mode == UpstreamMode::Timeout {
-                            std::thread::sleep(Duration::from_secs(4));
-                            continue;
-                        }
-                        let mut raw = Vec::new();
-                        let mut chunk = [0u8; 1024];
-                        while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
-                            match stream.read(&mut chunk) {
-                                Ok(0) | Err(_) => break,
-                                Ok(read) => raw.extend_from_slice(&chunk[..read]),
-                            }
-                        }
-                        let head_end = raw
-                            .windows(4)
-                            .position(|window| window == b"\r\n\r\n")
-                            .map(|split| split + 4)
-                            .unwrap_or(raw.len());
-                        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
-                        let content_length = head
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())
-                                    .flatten()
-                            })
-                            .unwrap_or(0);
-                        while raw.len() < head_end + content_length {
-                            match stream.read(&mut chunk) {
-                                Ok(0) | Err(_) => break,
-                                Ok(read) => raw.extend_from_slice(&chunk[..read]),
-                            }
-                        }
-                        let body = raw
-                            .get(head_end..head_end + content_length)
-                            .unwrap_or_default()
-                            .to_vec();
-                        let path = head
-                            .lines()
-                            .next()
-                            .and_then(|line| line.split_whitespace().nth(1))
-                            .unwrap_or("/")
-                            .to_string();
-                        if path == "/arca-canvas/chat" {
-                            worker
-                                .chat_requests
-                                .lock()
-                                .expect("chat requests")
-                                .push((head.clone(), body));
-                        }
-                        match mode {
-                            UpstreamMode::ChatStream => {
-                                let _ = stream.write_all(sse_head().as_bytes());
-                                let _ = write_chunk(&mut stream, b"data: first\n\n");
-                                std::thread::sleep(Duration::from_millis(400));
-                                let _ = write_chunk(&mut stream, b"data: second\n\n");
-                                let _ = write_chunk(&mut stream, b"");
-                            }
-                            UpstreamMode::ChatStall => {
-                                let _ = stream.write_all(sse_head().as_bytes());
-                                let _ = write_chunk(&mut stream, b"data: first\n\n");
-                                std::thread::sleep(Duration::from_millis(1500));
-                            }
-                            UpstreamMode::ChatHold => {
-                                let _ = stream.write_all(sse_head().as_bytes());
-                                let _ = write_chunk(&mut stream, b"data: first\n\n");
-                                for _ in 0..40 {
-                                    std::thread::sleep(Duration::from_millis(50));
-                                    if write_chunk(&mut stream, b"data: tick\n\n").is_err() {
-                                        worker.closed.store(true, Ordering::SeqCst);
-                                        break;
-                                    }
-                                }
-                            }
-                            _ => {
-                                let (status, body) = if mode == UpstreamMode::Error {
-                                    ("500 Internal Server Error", "no")
-                                } else {
-                                    match path.as_str() {
-                                        "/arca-canvas/page.css" => {
-                                            ("200 OK", "body { color: black; }")
-                                        }
-                                        "/arca-canvas/page.js" => ("200 OK", "/* canvas */"),
-                                        "/arca-canvas/snapshot" => {
-                                            ("200 OK", "{\"instances\":[],\"devices\":\"ok\"}")
-                                        }
-                                        "/arca-canvas/chat/history" => ("200 OK", "{\"turns\":[]}"),
-                                        _ => ("404 Not Found", "missing"),
-                                    }
-                                };
-                                let head = format!(
-                                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nSet-Cookie: upstream=bad\r\nLocation: /elsewhere\r\nCache-Control: max-age=120\r\nConnection: close\r\n\r\n",
-                                    body.len()
-                                );
-                                let _ = stream.write_all(head.as_bytes());
-                                let _ = stream.write_all(body.as_bytes());
-                            }
-                        }
+                        let connection_worker = Arc::clone(&worker);
+                        let handle = std::thread::spawn(move || {
+                            handle_connection(stream, &connection_worker)
+                        });
+                        spawned.lock().expect("workers").push(handle);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(5));
@@ -209,7 +126,8 @@ impl TestUpstream {
         Arc::new(Self {
             addr,
             inner,
-            thread: Some(thread),
+            listener: Some(thread),
+            workers,
         })
     }
 
@@ -234,6 +152,179 @@ impl TestUpstream {
     }
 }
 
+fn handle_connection(mut stream: std::net::TcpStream, worker: &UpstreamInner) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mode = *worker.mode.lock().expect("upstream mode");
+    if mode == UpstreamMode::Timeout {
+        std::thread::sleep(Duration::from_secs(4));
+        return;
+    }
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => raw.extend_from_slice(&chunk[..read]),
+        }
+    }
+    let head_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|split| split + 4)
+        .unwrap_or(raw.len());
+    let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while raw.len() < head_end + content_length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => raw.extend_from_slice(&chunk[..read]),
+        }
+    }
+    let body = raw
+        .get(head_end..head_end + content_length)
+        .unwrap_or_default()
+        .to_vec();
+    let path = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/")
+        .to_string();
+    if path == "/arca-canvas/chat" {
+        worker
+            .chat_requests
+            .lock()
+            .expect("chat requests")
+            .push((head.clone(), body));
+    }
+    match mode {
+        UpstreamMode::ChatStream => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let _ = write_chunk(&mut stream, b"data: first\n\n");
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = write_chunk(&mut stream, b"data: second\n\n");
+            let _ = write_chunk(&mut stream, b"");
+        }
+        UpstreamMode::ChatStall => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let _ = write_chunk(&mut stream, b"data: first\n\n");
+            for _ in 0..30 {
+                if worker.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        UpstreamMode::ChatHold => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let _ = write_chunk(&mut stream, b"data: first\n\n");
+            for _ in 0..600 {
+                if worker.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                if write_chunk(&mut stream, b"data: tick\n\n").is_err() {
+                    worker.closed.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+        UpstreamMode::ChatSilent => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+            let mut buffer = [0u8; 64];
+            loop {
+                if worker.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        worker.closed.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => {
+                        worker.closed.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+        }
+        UpstreamMode::ChatDrip => {
+            let head = sse_head().as_bytes();
+            let part = head.len().div_ceil(8);
+            for piece in head.chunks(part) {
+                if stream.write_all(piece).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            for index in 0..30 {
+                if worker.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let event = format!("data: drip{index}\n\n");
+                if write_chunk(&mut stream, event.as_bytes()).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        UpstreamMode::ChatFlood => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let data = [b'a'; 1024];
+            for _ in 0..2300 {
+                if worker.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                if write_chunk(&mut stream, &data).is_err() {
+                    break;
+                }
+            }
+        }
+        UpstreamMode::ChatTruncate => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let _ = write_chunk(&mut stream, b"data: first\n\n");
+        }
+        UpstreamMode::ChatCorrupt => {
+            let _ = stream.write_all(sse_head().as_bytes());
+            let _ = stream.write_all(b"zz\r\n");
+            let _ = stream.flush();
+        }
+        _ => {
+            let (status, body) = if mode == UpstreamMode::Error {
+                ("500 Internal Server Error", "no")
+            } else {
+                match path.as_str() {
+                    "/arca-canvas/page.css" => ("200 OK", "body { color: black; }"),
+                    "/arca-canvas/page.js" => ("200 OK", "/* canvas */"),
+                    "/arca-canvas/snapshot" => ("200 OK", "{\"instances\":[],\"devices\":\"ok\"}"),
+                    "/arca-canvas/chat/history" => ("200 OK", "{\"turns\":[]}"),
+                    _ => ("404 Not Found", "missing"),
+                }
+            };
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nSet-Cookie: upstream=bad\r\nLocation: /elsewhere\r\nCache-Control: max-age=120\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body.as_bytes());
+        }
+    }
+}
+
 /// The SSE head every chat mode sends, with upstream-only headers the proxy must not relay.
 fn sse_head() -> &'static str {
     "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nSet-Cookie: upstream=bad\r\nLocation: /elsewhere\r\nCache-Control: max-age=120\r\nConnection: close\r\n\r\n"
@@ -251,8 +342,15 @@ fn write_chunk(stream: &mut std::net::TcpStream, data: &[u8]) -> std::io::Result
 impl Drop for TestUpstream {
     fn drop(&mut self) {
         self.inner.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.listener.take() {
             let _ = thread.join();
+        }
+        let workers = {
+            let mut spawned = self.workers.lock().expect("workers");
+            std::mem::take(&mut *spawned)
+        };
+        for worker in workers {
+            let _ = worker.join();
         }
     }
 }
@@ -274,6 +372,9 @@ struct Rig {
     _runtime: Runtime,
 }
 
+const TEST_CHAT_IDLE: Duration = Duration::from_millis(600);
+const TEST_CHAT_TOTAL: Duration = Duration::from_secs(3);
+
 impl Rig {
     fn new(tag: &str, with_page: bool) -> (Rig, SoftPasskey) {
         Self::build(tag, with_page, true)
@@ -284,7 +385,14 @@ impl Rig {
     }
 
     fn build(tag: &str, with_page: bool, enrolled: bool) -> (Rig, SoftPasskey) {
-        Self::build_with_refusal(tag, with_page, enrolled, false)
+        Self::build_full(
+            tag,
+            with_page,
+            enrolled,
+            false,
+            TEST_CHAT_IDLE,
+            TEST_CHAT_TOTAL,
+        )
     }
 
     fn build_with_refusal(
@@ -292,6 +400,28 @@ impl Rig {
         with_page: bool,
         enrolled: bool,
         refusing: bool,
+    ) -> (Rig, SoftPasskey) {
+        Self::build_full(
+            tag,
+            with_page,
+            enrolled,
+            refusing,
+            TEST_CHAT_IDLE,
+            TEST_CHAT_TOTAL,
+        )
+    }
+
+    fn with_chat_timeouts(tag: &str, idle: Duration, total: Duration) -> (Rig, SoftPasskey) {
+        Self::build_full(tag, true, true, false, idle, total)
+    }
+
+    fn build_full(
+        tag: &str,
+        with_page: bool,
+        enrolled: bool,
+        refusing: bool,
+        chat_idle: Duration,
+        chat_total: Duration,
     ) -> (Rig, SoftPasskey) {
         let scratch = Scratch::new(tag);
         let upstream = TestUpstream::start();
@@ -342,7 +472,7 @@ impl Rig {
             Arc::clone(&display) as Arc<dyn SetupCodeDisplay>,
         )
         .with_canvas_origin(&format!("http://{}", upstream.addr))
-        .with_chat_timeouts(Duration::from_millis(600), Duration::from_secs(3))
+        .with_chat_timeouts(chat_idle, chat_total)
         .with_log(Arc::new(move |line| {
             captured_logs
                 .lock()
@@ -566,6 +696,49 @@ impl Rig {
         }
     }
 
+    /// Sends already-built request bytes, tolerating a reset after the server has answered.
+    fn raw_request_response(&self, bytes: &[u8]) -> (u16, String, Vec<u8>) {
+        let mut stream = UnixStream::connect(&self.socket).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let _ = stream.write_all(bytes);
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        assert!(!raw.is_empty(), "a response head");
+        let split = raw
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a response head");
+        let head = String::from_utf8_lossy(&raw[..split]).to_string();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+            .expect("a status");
+        (status, head, raw[split + 4..].to_vec())
+    }
+
+    fn chunked_request(
+        &self,
+        path: &str,
+        cookie: &str,
+        chunks: &[&[u8]],
+    ) -> (u16, String, Vec<u8>) {
+        let mut bytes = format!(
+            "POST {path} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nOrigin: {ORIGIN}\r\nCookie: {cookie}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .into_bytes();
+        for chunk in chunks {
+            bytes.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            bytes.extend_from_slice(chunk);
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(b"0\r\n\r\n");
+        self.raw_request_response(&bytes)
+    }
+
     fn get_full(&self, path: &str, origin: Option<&str>) -> (u16, String, Vec<u8>) {
         self.request_full_on(false, None, "GET", path, origin, &[], None, &[])
     }
@@ -684,6 +857,15 @@ fn canvas_cookie(rig: &Rig) -> String {
 
 fn chat_json() -> Vec<u8> {
     serde_json::to_vec(&json!({ "message": "hello" })).expect("chat JSON")
+}
+
+fn assert_cut(body: &[u8], reason: &str) {
+    let text = String::from_utf8_lossy(body);
+    assert!(text.contains("event: arca-cut"), "a cut event is present");
+    assert!(
+        text.contains(&format!("data: {{\"reason\":\"{reason}\"}}")),
+        "the cut event names {reason}"
+    );
 }
 
 /// Reads until the stream body contains `needle`; a read timeout or an early end fails with the deadline and phrase.
@@ -1951,22 +2133,38 @@ fn canvas_chat_refuses_non_json_and_oversize_before_any_upstream_connect() {
     let mut oversize = Vec::with_capacity(CHAT_BODY_MAX + 1);
     oversize.extend_from_slice(b"{\"message\":\"");
     oversize.resize(CHAT_BODY_MAX + 1, b'a');
-    let (status, head, _) = rig.request_full_on(
-        false,
-        None,
+    let bytes = rig.raw_request("POST", CHAT_PATH, None, Some(ORIGIN), &oversize, None, &[]);
+    let (status, _, _) = rig.raw_request_response(&bytes);
+    assert_eq!(
+        status, 401,
+        "the session is checked before an oversize body is read"
+    );
+    let bytes = rig.raw_request(
         "POST",
         CHAT_PATH,
+        None,
         Some(ORIGIN),
         &oversize,
         Some(&cookie),
         &[],
     );
+    let (status, head, _) = rig.raw_request_response(&bytes);
     assert_eq!(status, 413, "an oversize turn is refused");
     assert_eq!(
         header_value(&head, "cache-control").as_deref(),
         Some("no-store")
     );
     assert!(header_value(&head, "content-security-policy").is_some());
+
+    let first = [b'x'; 40 * 1024];
+    let second = [b'y'; 40 * 1024];
+    let (status, head, _) =
+        rig.chunked_request(CHAT_PATH, &cookie, &[first.as_slice(), second.as_slice()]);
+    assert_eq!(status, 413, "an oversize chunked turn is refused");
+    assert_eq!(
+        header_value(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(
         rig.upstream.connections(),
@@ -2034,6 +2232,10 @@ fn canvas_chat_relays_the_stream_chunk_by_chunk() {
     assert!(text.contains("data: first"));
     assert!(text.contains("data: second"));
     assert!(
+        !text.contains("event: arca-cut"),
+        "a complete stream carries no cut event"
+    );
+    assert!(
         started.elapsed() >= Duration::from_millis(400),
         "the second event waited for the upstream"
     );
@@ -2084,6 +2286,7 @@ fn canvas_chat_idle_timeout_ends_a_stalled_stream() {
         elapsed < Duration::from_millis(1200),
         "the idle cap ended the stalled stream before the upstream did"
     );
+    assert_cut(&body, "idle");
 }
 
 #[test]
@@ -2114,6 +2317,267 @@ fn canvas_chat_client_disconnect_closes_the_upstream() {
     assert!(
         rig.upstream.closed(),
         "dropping the client socket closed the upstream connection"
+    );
+}
+
+#[test]
+fn canvas_chat_cancel_while_the_upstream_is_silent_closes_it() {
+    let (rig, _) = Rig::new("canvas-chat-silent-cancel", true);
+    let cookie = canvas_cookie(&rig);
+    rig.upstream.set_mode(UpstreamMode::ChatSilent);
+    let (stream, status, _, _) = rig.open_stream_on(
+        "POST",
+        CHAT_PATH,
+        Some(ORIGIN),
+        &chat_json(),
+        Some(&cookie),
+        &[],
+    );
+    assert_eq!(status, 200);
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !rig.upstream.closed() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        rig.upstream.closed(),
+        "a cancel while the upstream was silent closed it"
+    );
+}
+
+#[test]
+fn canvas_chat_rejects_other_methods() {
+    let (rig, _) = Rig::new("canvas-chat-methods", true);
+    let cookie = canvas_cookie(&rig);
+    for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE"] {
+        let (status, head, body) = rig.request_full_on(
+            false,
+            None,
+            method,
+            CHAT_PATH,
+            Some(ORIGIN),
+            &[],
+            Some(&cookie),
+            &[],
+        );
+        assert_eq!(status, 405, "{method} on the chat path");
+        assert!(body.is_empty(), "{method} returns no bytes");
+        assert_eq!(
+            header_value(&head, "cache-control").as_deref(),
+            Some("no-store")
+        );
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        rig.upstream.connections(),
+        0,
+        "a refused method never connects upstream"
+    );
+}
+
+#[test]
+fn canvas_chat_upstream_non_200_is_a_bad_gateway() {
+    let (rig, _) = Rig::new("canvas-chat-upstream-status", true);
+    let cookie = canvas_cookie(&rig);
+    rig.upstream.set_mode(UpstreamMode::Error);
+    let (status, head, body) = rig.request_full_on(
+        false,
+        None,
+        "POST",
+        CHAT_PATH,
+        Some(ORIGIN),
+        &chat_json(),
+        Some(&cookie),
+        &[],
+    );
+    assert_eq!(status, 502, "a non-200 upstream is a bad gateway");
+    assert!(body.is_empty(), "no upstream bytes cross the refusal");
+    assert_eq!(
+        header_value(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    assert!(header_value(&head, "content-security-policy").is_some());
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(rig.upstream.connections(), 1);
+}
+
+#[test]
+fn canvas_chat_upstream_end_and_decode_errors_are_cut() {
+    for (tag, mode) in [
+        ("canvas-chat-truncate", UpstreamMode::ChatTruncate),
+        ("canvas-chat-corrupt", UpstreamMode::ChatCorrupt),
+    ] {
+        let (rig, _) = Rig::new(tag, true);
+        let cookie = canvas_cookie(&rig);
+        rig.upstream.set_mode(mode);
+        let (mut stream, status, _, initial) = rig.open_stream_on(
+            "POST",
+            CHAT_PATH,
+            Some(ORIGIN),
+            &chat_json(),
+            Some(&cookie),
+            &[],
+        );
+        assert_eq!(status, 200);
+        let mut body = initial;
+        stream.read_to_end(&mut body).expect("the streamed body");
+        assert_cut(&body, "upstream");
+    }
+}
+
+#[test]
+fn canvas_chat_stream_cap_is_cut() {
+    let (rig, _) = Rig::new("canvas-chat-cap", true);
+    let cookie = canvas_cookie(&rig);
+    rig.upstream.set_mode(UpstreamMode::ChatFlood);
+    let (mut stream, status, _, initial) = rig.open_stream_on(
+        "POST",
+        CHAT_PATH,
+        Some(ORIGIN),
+        &chat_json(),
+        Some(&cookie),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let mut body = initial;
+    stream.read_to_end(&mut body).expect("the streamed body");
+    assert_cut(&body, "cap");
+    assert!(
+        body.len() < CHAT_STREAM_MAX + 64 * 1024,
+        "the cap stopped the upstream stream"
+    );
+}
+
+#[test]
+fn canvas_chat_total_deadline_covers_head_and_body() {
+    let (rig, _) = Rig::with_chat_timeouts(
+        "canvas-chat-total",
+        Duration::from_secs(5),
+        Duration::from_millis(1200),
+    );
+    let cookie = canvas_cookie(&rig);
+    rig.upstream.set_mode(UpstreamMode::ChatDrip);
+    let started = Instant::now();
+    let (mut stream, status, _, initial) = rig.open_stream_on(
+        "POST",
+        CHAT_PATH,
+        Some(ORIGIN),
+        &chat_json(),
+        Some(&cookie),
+        &[],
+    );
+    assert_eq!(status, 200);
+    let mut body = initial;
+    stream.read_to_end(&mut body).expect("the streamed body");
+    let elapsed = started.elapsed();
+    assert_cut(&body, "total");
+    assert!(
+        elapsed >= Duration::from_millis(1100),
+        "the total deadline did not fire early"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1600),
+        "the head and body shared one total deadline"
+    );
+}
+
+#[test]
+fn canvas_chat_concurrency_is_capped_and_other_pages_still_answer() {
+    let (rig, _) = Rig::new("canvas-chat-slots", true);
+    let cookie = canvas_cookie(&rig);
+    rig.upstream.set_mode(UpstreamMode::ChatHold);
+    let mut held = Vec::new();
+    for index in 0..CHAT_CONCURRENCY {
+        let (stream, status, _, _) = rig.open_stream_on(
+            "POST",
+            CHAT_PATH,
+            Some(ORIGIN),
+            &chat_json(),
+            Some(&cookie),
+            &[],
+        );
+        assert_eq!(status, 200, "held chat {index}");
+        held.push(stream);
+    }
+    let (status, head, body) = rig.request_full_on(
+        false,
+        None,
+        "POST",
+        CHAT_PATH,
+        Some(ORIGIN),
+        &chat_json(),
+        Some(&cookie),
+        &[],
+    );
+    assert_eq!(status, 429, "the extra chat is capped");
+    assert!(body.is_empty(), "the capped chat returns no bytes");
+    assert_eq!(
+        header_value(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        rig.upstream.connections(),
+        CHAT_CONCURRENCY as u64,
+        "the capped chat never connected upstream"
+    );
+    let (status, _, _) = rig.request_full_on(false, None, "GET", "/approve", None, &[], None, &[]);
+    assert_eq!(status, 200, "/approve still answers while chats are held");
+
+    drop(held);
+    rig.upstream.set_mode(UpstreamMode::ChatStream);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (mut stream, status, _, initial) = rig.open_stream_on(
+            "POST",
+            CHAT_PATH,
+            Some(ORIGIN),
+            &chat_json(),
+            Some(&cookie),
+            &[],
+        );
+        if status == 429 {
+            assert!(Instant::now() < deadline, "a chat slot was released");
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        assert_eq!(status, 200, "a released slot admits the next chat");
+        let mut body = initial;
+        stream.read_to_end(&mut body).expect("the streamed body");
+        break;
+    }
+}
+
+#[test]
+fn canvas_chat_invalid_origin_is_never_treated_as_missing() {
+    let (rig, _) = Rig::new("canvas-chat-bad-origin", true);
+    let cookie = canvas_cookie(&rig);
+    let body = chat_json();
+    let mut request = format!(
+        "POST {CHAT_PATH} HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nContent-Length: {}\r\nCookie: {cookie}\r\nSec-Fetch-Site: same-origin\r\nOrigin: ",
+        body.len()
+    )
+    .into_bytes();
+    request.push(0xff);
+    request.extend_from_slice(b"\r\n\r\n");
+    request.extend_from_slice(&body);
+    let (status, head, response) = rig.raw_request_response(&request);
+    assert_eq!(status, 403, "a non-text Origin is not missing");
+    assert!(response.is_empty());
+    assert!(header_value(&head, "content-security-policy").is_some());
+
+    let mut get =
+        b"GET /approve/plans HTTP/1.1\r\nHost: box1.example.com\r\nConnection: close\r\nOrigin: "
+            .to_vec();
+    get.push(0xfe);
+    get.extend_from_slice(b"\r\n\r\n");
+    let (status, _, _) = rig.raw_request_response(&get);
+    assert_eq!(status, 403, "a non-text Origin is refused on a GET too");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        rig.upstream.connections(),
+        0,
+        "a bad Origin never connects upstream"
     );
 }
 
