@@ -16,6 +16,8 @@ pub enum ArcaAction {
     Delete,
     Publish,
     Spend,
+    PasskeyAdd,
+    PasskeyRemove,
 }
 
 impl ArcaAction {
@@ -25,6 +27,8 @@ impl ArcaAction {
             Self::Delete => "delete",
             Self::Publish => "publish",
             Self::Spend => "spend",
+            Self::PasskeyAdd => "passkey_add",
+            Self::PasskeyRemove => "passkey_remove",
         }
     }
 
@@ -33,6 +37,8 @@ impl ArcaAction {
             "delete" => Some(Self::Delete),
             "publish" => Some(Self::Publish),
             "spend" => Some(Self::Spend),
+            "passkey_add" => Some(Self::PasskeyAdd),
+            "passkey_remove" => Some(Self::PasskeyRemove),
             _ => None,
         }
     }
@@ -208,8 +214,12 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     if !valid_host(host) {
         return Err(bad("host", "the droidd host's name"));
     }
-    let action = ArcaAction::from_statement(field("action"))
-        .ok_or_else(|| bad("action", "delete, publish or spend"))?;
+    let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
+        bad(
+            "action",
+            "delete, publish, spend, passkey_add or passkey_remove",
+        )
+    })?;
     let target = field("target");
     if !valid_target(target) {
         return Err(bad(

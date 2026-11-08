@@ -497,7 +497,23 @@ another unlocked caller, or the same caller after its rolling-hour lock ends, ca
 The proxy listener uses the last non-empty `X-Forwarded-For` address (or a shared unknown caller when absent); unix and
 tailnet share one direct caller budget.
 
-Once one passkey is trusted, no setup code is issued. Later passkeys are added from one already trusted, not with a code.
+Once one passkey is trusted, no setup code is issued or accepted. To add a phone or computer, open the page there,
+enter a passkey name, and choose **Add passkey**. Save the new passkey when your device asks, then confirm with a passkey
+Arca already trusts. The page shows **Passkey trusted** only after that trusted tap succeeds; the new key cannot approve
+its own addition. No restart is needed.
+
+The page lists trusted keys by name and added date, without public keys or credential ids in the list. Keys enrolled before
+names and dates were recorded have a default name and an unavailable date. Choose **Remove** beside a key and confirm with
+a trusted passkey to remove it immediately. Arca refuses removal of the last trusted key or any key held only in the root
+file. Keep a second trusted passkey before replacing your only one.
+
+`GET /approve/passkeys` returns that list with opaque targets. Registration while keys exist prepares a `passkey_add`
+statement; `POST /approve/passkeys/change` prepares removal by target or submits a statement and WebAuthn proof. Both
+changes bind `passkey-<SHA-256 of the full line>` and the digest of `{ "line": <full line> }`, including the name and added
+date in the line's comment. The statement lasts ten minutes and its nonce is single use. A replay, changed line, wrong
+digest, or proof from an untrusted key is refused. Setup-code budgets apply only to first-key enrolment; later changes
+require a trusted tap and never use the shared proxy caller budget.
+The accepted crash window between renaming the state passkeys file and `replace_owner_passkeys` leaves the new set on disk and the old set in memory until restart, which loads the set from disk.
 `/etc/arca/owner-passkeys` remains readable as a developer option, never the owner path. The state passkeys file is owned by
 the `serve` account with mode 0600 in its 0700 state directory; it has no root anchor, so anything running as that account is a
 trust root (see Decision 11 in the wish).

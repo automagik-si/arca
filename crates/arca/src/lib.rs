@@ -22,6 +22,7 @@ pub mod config;
 pub mod desired_store;
 pub mod handlers;
 pub mod kernel;
+mod passkey_change;
 pub mod service;
 pub mod service_exec;
 

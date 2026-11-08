@@ -11,15 +11,13 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use arca_approval::passkey::{STATE_PASSKEYS_FILE, format_passkey_line};
-use arca_approval::{ARCA_NAMESPACE, PasskeyLine, load_state_passkeys, parse_passkeys};
+use arca_approval::{ARCA_NAMESPACE, ArcaAction, PasskeyLine, load_state_passkeys, parse_passkeys};
 use arca_kernel::canon::canonical_json;
 use arca_mcp::CallError;
 use axum::body::Bytes;
@@ -36,6 +34,7 @@ use serde_json::{Value, json};
 use crate::canvas::{self, Canvas};
 use crate::handlers::{Clock, approve_plan, list_plans};
 use crate::kernel::Kernel;
+use crate::passkey_change::{self, write_state_bytes};
 
 /// The page's own body cap. `arca-mcp`'s 64 KiB layer is private and does not reach merged routes.
 const PAGE_BODY_BYTES: usize = 64 * 1024;
@@ -293,6 +292,8 @@ impl Page {
             .route("/approve/setup-code", post(setup_code))
             .route("/approve/setup-code/verify", post(verify_setup_code))
             .route("/approve/register", post(register))
+            .route("/approve/passkeys", get(passkeys))
+            .route("/approve/passkeys/change", post(passkey_change))
             .route(canvas::PAGE_PATH, get(canvas_page).post(canvas_sign_in))
             .route(canvas::CSS_PATH, get(canvas_css))
             .route(canvas::JS_PATH, get(canvas_js))
@@ -623,6 +624,83 @@ async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
     }
 }
 
+async fn passkeys(State(state): State<Arc<PageState>>) -> Response {
+    let kernel = match state.kernel.lock() {
+        Ok(kernel) => kernel,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match passkey_change::listing(&kernel.owner_passkey_lines(), &state.state_dir) {
+        Ok(keys) => canvas_json(StatusCode::OK, json!({ "passkeys": keys })),
+        Err(error) => change_refused(error),
+    }
+}
+
+/// Without a proof this prepares a removal statement by opaque target; with a proof it spends a signed change.
+async fn passkey_change(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut kernel = match state.kernel.lock() {
+        Ok(kernel) => kernel,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let now = (state.clock)();
+    let line = if let Some(line) = value.get("line").and_then(Value::as_str) {
+        line.to_string()
+    } else if let Some(target) = value.get("target").and_then(Value::as_str) {
+        match passkey_change::state_lines(&state.state_dir) {
+            Ok(lines) => match lines
+                .into_iter()
+                .find(|line| passkey_change::target(line) == target)
+            {
+                Some(line) => line,
+                None => {
+                    return change_refused(arca_approval::ApprovalRefusal::Untrusted(
+                        "only a state-file passkey can be removed".into(),
+                    ));
+                }
+            },
+            Err(error) => return change_refused(error),
+        }
+    } else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let Some(statement) = value.get("statement").and_then(Value::as_str) {
+        let Some(proof) = value.get("proof") else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let Ok(proof) = canonical_json(proof) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        match kernel.approve_passkey_change(
+            &state.state_dir,
+            &line,
+            statement,
+            proof.as_bytes(),
+            now,
+        ) {
+            Ok(()) => {
+                let count = kernel.owner_passkey_count();
+                (state.log)(&format!("arca: passkeys changed, {count} passkey(s) kept"));
+                canvas_json(StatusCode::OK, json!({ "trusted": true }))
+            }
+            Err(error) => change_refused(error),
+        }
+    } else {
+        match passkey_change::statement(kernel.host(), ArcaAction::PasskeyRemove, &line, now) {
+            Ok(statement) => canvas_json(StatusCode::OK, json!({ "statement": statement })),
+            Err(error) => change_refused(error),
+        }
+    }
+}
+
+fn change_refused(error: arca_approval::ApprovalRefusal) -> Response {
+    canvas_json(
+        StatusCode::FORBIDDEN,
+        json!({ "refusal": crate::handlers::refusal_code(&error), "message": error.to_string() }),
+    )
+}
+
 async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
     let now = (state.clock)();
     let mut setup = match state.setup.lock() {
@@ -770,6 +848,38 @@ async fn register(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let now = (state.clock)();
+    let label = value
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or("My passkey");
+    let line = match passkey_change::with_metadata(&line, label, now) {
+        Ok(line) => line,
+        Err(error) => return change_refused(error),
+    };
+    {
+        let kernel = match state.kernel.lock() {
+            Ok(kernel) => kernel,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if kernel.owner_passkey_count() > 0 {
+            if value.get("setupCode").is_some() {
+                return already_trusted();
+            }
+            return match passkey_change::statement(
+                kernel.host(),
+                ArcaAction::PasskeyAdd,
+                &line,
+                now,
+            ) {
+                Ok(statement) => canvas_json(
+                    StatusCode::OK,
+                    json!({ "line": line, "statement": statement }),
+                ),
+                Err(error) => change_refused(error),
+            };
+        }
+    }
     let Some(setup_code) = value.get("setupCode").and_then(Value::as_str) else {
         return missing_setup_code();
     };
@@ -944,23 +1054,6 @@ fn restore_state(dir: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
             }
         }),
     }
-}
-
-fn write_state_bytes(dir: &Path, body: &[u8]) -> std::io::Result<()> {
-    let path = dir.join(STATE_PASSKEYS_FILE);
-    let tmp = dir.join(format!(".{STATE_PASSKEYS_FILE}.{}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    file.write_all(body)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&tmp, &path)?;
-    // Keep the directory entry durable too; a failure here is a storage failure, not a trust change.
-    fs::File::open(dir)?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]
