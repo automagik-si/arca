@@ -55,6 +55,33 @@ pub struct Published {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    #[serde(default)]
+    pub cpu: Option<String>,
+    #[serde(default)]
+    pub memory: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Data {
+    pub path: String,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub gid: Option<u32>,
+    #[serde(default)]
+    pub size: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Lan {
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
@@ -86,6 +113,14 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub droidd_port: Option<u16>,
     #[serde(default)]
+    pub limits: Option<Limits>,
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default)]
+    pub data: Option<Data>,
+    #[serde(default)]
+    pub lan: Option<Lan>,
+    #[serde(default)]
     pub start: bool,
     /// An instance Arca adopted instead of creating; its project is the instance's own.
     #[serde(default)]
@@ -108,6 +143,7 @@ pub fn manifest_for() -> Manifest {
         Service::ID,
         vec![
             (IncusKind::Acl, EffectClass::A),
+            (IncusKind::Volume, EffectClass::B),
             (IncusKind::Instance, EffectClass::B),
         ],
     )
@@ -248,7 +284,35 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     if !links.is_empty() {
         config.insert(LINKS_KEY.to_string(), json!(links.join(",")));
     }
+    if let Some(limits) = &cfg.limits {
+        if let Some(cpu) = &limits.cpu {
+            config.insert("limits.cpu".into(), json!(cpu));
+        }
+        if let Some(memory) = &limits.memory {
+            config.insert("limits.memory".into(), json!(memory));
+        }
+    }
+    if cfg.autostart {
+        config.insert("boot.autostart".into(), json!("true"));
+    }
     let mut devices = Map::new();
+    if let Some(data) = &cfg.data {
+        let mut device = json!({"type":"disk", "path":data.path, "pool":cfg.pool,
+            "source":format!("{}-data", cfg.name)});
+        if let Some(size) = &data.size {
+            device["size"] = json!(size);
+        }
+        devices.insert("data".into(), device);
+    }
+    if let Some(lan) = &cfg.lan {
+        // The wildcard bind exposes this port on every IPv4 interface, including a tailnet interface.
+        devices.insert(
+            "web".into(),
+            json!({"type":"proxy",
+            "listen":format!("tcp:0.0.0.0:{}", lan.port),
+            "connect":format!("tcp:127.0.0.1:{}", lan.port)}),
+        );
+    }
     devices.insert(
         "root".to_string(),
         json!({ "type": "disk", "path": "/", "pool": cfg.pool }),
@@ -376,6 +440,36 @@ impl Plugin for Service {
                         })?;
                     }
                 }
+            }
+        }
+        if let Some(data) = &cfg.data {
+            let name = format!("{}-data", cfg.name);
+            if observed(
+                ctx,
+                format!(
+                    "/1.0/storage-pools/{}/volumes/custom/{name}?project={}",
+                    cfg.pool, cfg.project
+                ),
+            )?
+            .is_none()
+            {
+                let mut config = Map::new();
+                if let Some(uid) = data.uid {
+                    config.insert("initial.uid".into(), json!(uid.to_string()));
+                }
+                if let Some(gid) = data.gid {
+                    config.insert("initial.gid".into(), json!(gid.to_string()));
+                }
+                if let Some(size) = &data.size {
+                    config.insert("size".into(), json!(size));
+                }
+                ctx.effect(EffectOp::IncusCreate {
+                    kind: IncusKind::Volume,
+                    project: cfg.project.clone(),
+                    parent: Some(cfg.pool.clone()),
+                    name: name.clone(),
+                    body: json!({"name":name, "config":config}),
+                })?;
             }
         }
         let instance = observed(
@@ -507,6 +601,14 @@ pub struct Template {
     pub generate: BTreeMap<String, String>,
     #[serde(default)]
     pub droidd_port: Option<u16>,
+    #[serde(default)]
+    pub limits: Option<Limits>,
+    #[serde(default)]
+    pub autostart: bool,
+    #[serde(default)]
+    pub data: Option<Data>,
+    #[serde(default)]
+    pub lan: Option<Lan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -580,6 +682,35 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             )));
         }
     }
+    if let Some(limits) = &template.limits
+        && ((limits.cpu.is_none() && limits.memory.is_none())
+            || limits.cpu.as_deref().is_some_and(|cpu| !decimal(cpu))
+            || limits
+                .memory
+                .as_deref()
+                .is_some_and(|memory| !size_ok(memory)))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: invalid limits"
+        )));
+    }
+    if let Some(data) = &template.data
+        && (!data.path.starts_with('/')
+            || data.path.chars().any(|c| c.is_control())
+            || data.path.split('/').any(|part| part == "..")
+            || data.size.as_deref().is_some_and(|size| !size_ok(size)))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: invalid data path or size"
+        )));
+    }
+    if let Some(lan) = &template.lan
+        && !template.ports.contains(&lan.port)
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: lan port is one of its ports"
+        )));
+    }
     if template.secrets.len() > 16 {
         return Err(TemplateError::refused(format!(
             "template {name}: at most 16 secrets"
@@ -639,6 +770,18 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     }
     let _ = dir;
     Ok(())
+}
+
+fn decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn size_ok(value: &str) -> bool {
+    [
+        "B", "kB", "MB", "GB", "TB", "PB", "EB", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB",
+    ]
+    .iter()
+    .any(|unit| value.strip_suffix(unit).is_some_and(decimal))
 }
 
 fn env_name_ok(name: &str) -> bool {
