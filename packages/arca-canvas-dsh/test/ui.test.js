@@ -314,3 +314,105 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
     assert.doesNotMatch(css, /@import|url\(\s*['"]?https?:/i, name);
   }
 });
+
+test('a service Open link needs a configured host address and a real service port', () => {
+  const dashboard = buildDashboard(fixture);
+  const web = project(dashboard, 'Web1').cards[0];
+  assert.equal(web.url, 'http://192.0.2.10:8080');
+  assert.equal(web.service.name, 'web1');
+  assert.equal(web.service.ports[0], 8080);
+  assert.equal(web.service.lanPort, 8080);
+  assert.equal(web.service.url, 'http://192.0.2.10:8080');
+
+  const noAddress = buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha' ? { ...host, address: '' } : host),
+  });
+  assert.equal(project(noAddress, 'Web1').cards[0].url, '');
+
+  const noLanPort = buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha'
+      ? { ...host, services: [{ ...host.services[0], lanPort: null }] } : host),
+  });
+  assert.equal(project(noLanPort, 'Web1').cards[0].url, '', 'container ports are not host listeners');
+  assert.equal(project(noLanPort, 'Web1').cards[0].service.ports[0], 8080);
+
+  // The container bridge address and the service's published dash never become a URL on their own.
+  const noService = buildDashboard({
+    ...fixture,
+    hosts: fixture.hosts.map((host) => host.name === 'alpha' ? { ...host, services: [] } : host),
+  });
+  assert.equal(project(noService, 'Web1').cards[0].url, '');
+  assert.doesNotMatch(JSON.stringify(project(noService, 'Web1')), /10\.0\.0\.7/);
+});
+
+test('only a service with a real lan port gets an Open link', () => {
+  const host = structuredClone(fixture.hosts[0]);
+  host.address = '192.0.2.10';
+  for (const name of ['automagik', 'nats', 'postgres', 'omni']) {
+    host.instances.push({
+      name, project: 'arcak-svc', kind: 'container', status: 'Running', owner: { class: 'kernel' }, privileged: false,
+    });
+  }
+  host.services = [
+    { name: 'automagik', template: 'automagik', state: 'running', ipv4: '10.99.0.11', ports: [3081], lanPort: 3081, links: [], published: null },
+    { name: 'nats', template: 'nats', state: 'running', ipv4: '10.99.0.10', ports: [4222], lanPort: null, links: [], published: null },
+    { name: 'postgres', template: 'postgres', state: 'running', ipv4: '10.99.0.12', ports: [5432], lanPort: null, links: [], published: null },
+    { name: 'omni', template: 'omni', state: 'running', ipv4: '10.99.0.13', ports: [8080, 8882], lanPort: null, links: [], published: null },
+  ];
+  const dashboard = buildDashboard({ ...fixture, hosts: [host], projects: [] });
+  assert.equal(project(dashboard, 'Automagik').cards[0].url, 'http://192.0.2.10:3081');
+  for (const name of ['Nats', 'Postgres', 'Omni']) {
+    assert.equal(project(dashboard, name).cards[0].url, '', `${name} has no lan listener`);
+  }
+  assert.equal(project(dashboard, 'Nats').cards[0].service.ports[0], 4222);
+  assert.equal(project(dashboard, 'Omni').cards[0].service.ports.length, 2);
+
+  const stopped = buildDashboard({
+    ...fixture,
+    hosts: [{
+      ...host,
+      services: host.services.map((service) => service.name === 'automagik' ? { ...service, state: 'stopped' } : service),
+    }],
+    projects: [],
+  });
+  assert.equal(project(stopped, 'Automagik').cards[0].service.state, 'stopped');
+  assert.equal(project(stopped, 'Automagik').cards[0].url, '', 'a stopped service is not a listener');
+});
+
+test('a remote host with unknown totals reports cores n/a and memory n/a with reasons', () => {
+  const host = structuredClone(fixture.hosts[0]);
+  host.metrics.latest.cpu = { cores: 0, usedPct: null, reason: 'the Incus resources read failed' };
+  host.metrics.latest.memory = {
+    totalBytes: null, availableBytes: null, usedBytes: 2_000_000_000,
+    reason: 'the Incus resources read failed',
+  };
+  const machine = buildDashboard({ ...fixture, hosts: [host] }).hosts[0];
+  assert.equal(machine.cpuLabel, 'cores n/a');
+  assert.equal(machine.cpu.usedPct, null);
+  assert.equal(machine.cpu.reason, 'the Incus resources read failed');
+  assert.equal(machine.memoryLabel, 'n/a');
+  assert.equal(machine.memory.usedBytes, 2_000_000_000);
+  assert.equal(machine.memory.usedPct, null);
+  assert.equal(machine.memory.reason, 'the Incus resources read failed');
+
+  const nullLoad = structuredClone(fixture.hosts[0]);
+  nullLoad.metrics.latest.cpu = { cores: 8, usedPct: null, reason: null };
+  const nullMachine = buildDashboard({ ...fixture, hosts: [nullLoad] }).hosts[0];
+  assert.equal(nullMachine.cpuLabel, 'n/a', 'null load with known cores is CPU n/a');
+  assert.equal(nullMachine.cpu.usedPct, null);
+  assert.equal(cpuLabel(hostCpu(nullLoad)), 'n/a');
+  // Real readings are unchanged.
+  assert.equal(cpuLabel(hostCpu(fixture.hosts[0])), '2 / 8 cores');
+  assert.equal(memoryLabel(hostMemory(fixture.hosts[0])), '4 / 16 GB');
+});
+
+test('the host usedBytes figure wins over the total-available derivation', () => {
+  const host = structuredClone(fixture.hosts[0]);
+  host.metrics.latest.memory = { totalBytes: 16_000_000_000, availableBytes: 12_000_000_000, usedBytes: 5_000_000_000 };
+  const machine = buildDashboard({ ...fixture, hosts: [host] }).hosts[0];
+  assert.equal(machine.memory.usedBytes, 5_000_000_000);
+  assert.equal(machine.memory.usedPct, 31.25);
+  assert.equal(machine.memoryLabel, '5 / 16 GB');
+});

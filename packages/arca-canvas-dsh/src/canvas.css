@@ -1410,3 +1410,97 @@ body,
     transition: none !important;
   }
 }
+
+/* Doctor chat (phase 2) */
+.arca-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  animation: arca-rise 160ms var(--arca-ease) both;
+}
+
+.arca-msg-user {
+  align-items: flex-end;
+}
+
+.arca-msg-user .arca-msg-text {
+  max-width: 88%;
+  padding: 8px 12px;
+  border-radius: 14px 14px 4px 14px;
+  background: var(--arca-ink);
+  color: var(--arca-bg);
+  font-size: 13.5px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.arca-msg-assistant .arca-msg-text {
+  color: var(--arca-ink);
+  font-size: 13.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.arca-msg-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.arca-typing {
+  color: var(--arca-muted);
+  font-style: italic;
+}
+
+.arca-chat-empty {
+  margin-top: 4px;
+}
+
+.arca-chat-view .arca-approval,
+.arca-chat-view .arca-budget,
+.arca-chat-view .arca-cap,
+.arca-chat-view .arca-error {
+  margin-top: 2px;
+}
+
+.arca-composer-box:focus-within {
+  border-color: color-mix(in srgb, var(--arca-accent) 55%, var(--arca-line-2));
+  box-shadow: var(--arca-shadow-1), 0 0 0 3px var(--arca-accent-soft);
+}
+
+.arca-send {
+  cursor: pointer;
+  transition: transform 150ms var(--arca-ease), opacity 150ms var(--arca-ease);
+}
+
+.arca-send[aria-disabled="false"]:active {
+  transform: scale(.96);
+}
+
+.arca-send[aria-disabled="true"] {
+  cursor: default;
+}
+
+.arca-chat-banner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: var(--arca-fill);
+  color: var(--arca-muted);
+  font-size: 11.5px;
+  line-height: 1.35;
+}
+
+.arca-chat-banner-icon {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--arca-ok);
+}

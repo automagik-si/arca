@@ -1,7 +1,7 @@
 {
   "name": "arca-canvas-dsh",
   "version": "0.1.0",
-  "description": "Read-only Arca snapshots for a DSH canvas",
+  "description": "Read-only Arca snapshots and a Doctor chat for a DSH canvas",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -26,7 +26,13 @@
     "README.md",
     "src/approval.js",
     "page.js",
-    "page.css"
+    "page.css",
+    "src/chat.js",
+    "src/model.js",
+    "src/render.js",
+    "src/page.js",
+    "src/client.js",
+    "src/canvas.css"
   ],
   "engines": {
     "node": ">=24.9.0",

@@ -38,6 +38,8 @@ export function ownerLabel(owner) {
 }
 
 function finite(value) {
+  // null is a distinct fact from zero: a missing reading must stay missing.
+  if (value === null || value === undefined || value === '') return null;
   const number = Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -67,11 +69,17 @@ export function hostCpu(host = {}) {
   const cpu = host.metrics?.latest?.cpu;
   const cores = finite(cpu?.cores);
   const usedPct = finite(cpu?.usedPct);
-  if (cores === null && usedPct === null) return null;
+  const reason = typeof cpu?.reason === 'string' ? cpu.reason.trim() : '';
+  if (cores === null && usedPct === null && !reason) return null;
+  // A reason or a zero core count means the host totals are unknown. The load percentage cannot be trusted
+  // against an unknown capacity, so it is reported as unknown and no bar is drawn.
+  const known = !reason && cores !== null && cores > 0;
+  const percent = known && usedPct !== null ? clampPercent(usedPct) : null;
   return {
     cores,
-    usedPct: usedPct === null ? null : clampPercent(usedPct),
-    usedCores: cores !== null && usedPct !== null ? (clampPercent(usedPct) / 100) * cores : null,
+    usedPct: percent,
+    usedCores: percent !== null && cores !== null ? (percent / 100) * cores : null,
+    reason,
   };
 }
 
@@ -79,18 +87,28 @@ export function hostMemory(host = {}) {
   const memory = host.metrics?.latest?.memory;
   const totalBytes = finite(memory?.totalBytes);
   const availableBytes = finite(memory?.availableBytes);
-  if (totalBytes === null && availableBytes === null) return null;
-  const usedBytes = totalBytes !== null && availableBytes !== null ? Math.max(0, totalBytes - availableBytes) : null;
+  const reportedUsed = finite(memory?.usedBytes);
+  const reason = typeof memory?.reason === 'string' ? memory.reason.trim() : '';
+  if (totalBytes === null && availableBytes === null && reportedUsed === null && !reason) return null;
+  const derivedUsed = totalBytes !== null && availableBytes !== null ? Math.max(0, totalBytes - availableBytes) : null;
+  // The host's own used figure wins when present; the total-available derivation is only a fallback.
+  const usedBytes = reportedUsed ?? derivedUsed;
   return {
     totalBytes,
     availableBytes,
     usedBytes,
-    usedPct: usedBytes !== null && totalBytes > 0 ? clampPercent((usedBytes / totalBytes) * 100) : null,
+    usedPct: !reason && usedBytes !== null && totalBytes !== null && totalBytes > 0
+      ? clampPercent((usedBytes / totalBytes) * 100) : null,
+    reason,
   };
 }
 
 export function cpuLabel(cpu) {
   if (!cpu) return '';
+  // A remote host may report no core count; a reason or a zero count is unknown capacity, never "0 cores".
+  if (cpu.reason || cpu.cores === 0) return 'cores n/a';
+  // A null load is unknown, never zero: no bar and no invented percentage.
+  if (cpu.usedPct === null) return 'n/a';
   if (cpu.usedCores !== null && cpu.cores !== null) return `${formatNumber(cpu.usedCores)} / ${count(cpu.cores, 'core')}`;
   if (cpu.cores !== null) return count(cpu.cores, 'core');
   return `${formatNumber(cpu.usedPct)}% used`;
@@ -98,9 +116,9 @@ export function cpuLabel(cpu) {
 
 export function memoryLabel(memory) {
   if (!memory) return '';
-  if (memory.usedBytes !== null && memory.totalBytes !== null) return `${formatGb(memory.usedBytes)} / ${formatGb(memory.totalBytes)} GB`;
-  if (memory.totalBytes !== null) return `${formatGb(memory.totalBytes)} GB total`;
-  return '';
+  if (memory.reason || memory.totalBytes === null) return 'n/a';
+  if (memory.usedBytes !== null) return `${formatGb(memory.usedBytes)} / ${formatGb(memory.totalBytes)} GB`;
+  return `${formatGb(memory.totalBytes)} GB total`;
 }
 
 export function fleetSummary(hosts = []) {
@@ -137,11 +155,19 @@ function instanceUrl(instance) {
   return '';
 }
 
+// The service ACL target is an implementation id (`arcak-svc-svc-<name>`). It is presented as a firewall on
+// the service, and the internal project id never reaches the DOM.
+function aclLabel(value) {
+  return text(value)
+    .replace(/\barcak-svc-svc-([a-z0-9-]+)\b/gi, (_, name) => `${humanize(name)} firewall`)
+    .replace(/arcak-svc/gi, 'Arca service');
+}
+
 function targetLabel(target) {
-  if (typeof target === 'string') return target;
+  if (typeof target === 'string') return aclLabel(target);
   if (!target || typeof target !== 'object') return '';
   const kind = text(target.kind);
-  const name = text(target.name);
+  const name = aclLabel(target.name);
   if (kind && name) return `${kind} ${name}`;
   if (name) return name;
   if (kind && target.project) {
@@ -180,13 +206,16 @@ function buildMachine(host) {
   return {
     name: text(host.name, text(host.nodeName, 'Machine')),
     label: text(host.name, text(host.nodeName, 'Machine')),
+    address: text(host.address).trim(),
     online,
     status: online ? 'Online' : 'Offline',
     tone: online ? 'ok' : 'bad',
     cpu,
     cpuLabel: cpuLabel(cpu),
+    cpuReason: cpu?.reason ?? '',
     memory,
     memoryLabel: memoryLabel(memory),
+    memoryReason: memory?.reason ?? '',
     instanceCount: host.instancesKnown === false ? null : list(host.instances).length,
     instancesKnown: host.instancesKnown !== false,
     error: host.error ?? null,
@@ -194,8 +223,40 @@ function buildMachine(host) {
   };
 }
 
-function instanceCard(hostName, instance) {
+// A service Open link is composed only from a real configured LAN address and a real service port. The
+// container's bridge address and the service's published dash are never turned into a URL.
+function serviceUrl(address, lanPort, state) {
+  const host = text(address).trim();
+  const port = finite(lanPort);
+  // A proxy device on a stopped container is not a listener. Only a running service gets an Open link.
+  if (text(state).toLowerCase() !== 'running') return '';
+  if (!host || port === null || port < 1 || port > 65535) return '';
+  return `http://${host.includes(':') ? `[${host}]` : host}:${Math.trunc(port)}`;
+}
+
+function serviceTargets(hosts) {
+  const targets = new Map();
+  for (const host of hosts) {
+    for (const service of list(host.services)) {
+      const name = text(service?.name).trim();
+      if (!name) continue;
+      targets.set(instanceKey(host.name, INTERNAL_PROJECT, name), {
+        name,
+        state: text(service.state),
+        ipv4: text(service.ipv4),
+        ports: list(service.ports).map(finite).filter((port) => port !== null),
+        lanPort: finite(service.lanPort),
+        published: service.published ?? null,
+        url: serviceUrl(host.address, service.lanPort, service.state),
+      });
+    }
+  }
+  return targets;
+}
+
+function instanceCard(hostName, instance, services) {
   const status = text(instance.status, 'Unknown');
+  const service = services?.get(instanceKey(hostName, instance.project, instance.name)) ?? null;
   return {
     kind: 'instance',
     key: instanceKey(hostName, instance.project, instance.name),
@@ -207,7 +268,8 @@ function instanceCard(hostName, instance) {
     type: instanceKindLabel(instance.kind),
     owner: ownerLabel(instance.owner),
     privileged: Boolean(instance.privileged),
-    url: instanceUrl(instance),
+    service,
+    url: instanceUrl(instance) || service?.url || '',
   };
 }
 
@@ -265,6 +327,7 @@ export function buildDashboard(envelope = {}) {
   const serviceProjects = [];
   const fallbackProjects = [];
   const databaseCards = databaseTargets(hosts);
+  const serviceCards = serviceTargets(hosts);
 
   for (const config of list(envelope.projects)) {
     const name = text(config.name).trim();
@@ -281,7 +344,7 @@ export function buildDashboard(envelope = {}) {
         else missing++;
         continue;
       }
-      const card = instanceCard(host.name, instance);
+      const card = instanceCard(host.name, instance, serviceCards);
       cards.push(card);
       claimed.add(card.key);
     }
@@ -316,7 +379,7 @@ export function buildDashboard(envelope = {}) {
         && !claimed.has(instanceKey(host.name, instance.project, instance.name)))
       .sort((a, b) => byName(humanize(text(a.name)), humanize(text(b.name))));
     for (const instance of unlisted) {
-      const cards = [instanceCard(host.name, instance)];
+      const cards = [instanceCard(host.name, instance, serviceCards)];
       const target = databaseCards.get(cards[0].key);
       if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));
       const name = uniqueName(humanize(text(instance.name)), usedNames, host.name);
@@ -348,7 +411,7 @@ export function buildDashboard(envelope = {}) {
       const unlisted = list(host.instances).filter((instance) =>
         text(instance.project, 'default') === project && !claimed.has(instanceKey(host.name, instance.project, instance.name)));
       if (!unlisted.length) continue;
-      const cards = unlisted.sort((a, b) => byName(text(a.name), text(b.name))).map((instance) => instanceCard(host.name, instance));
+      const cards = unlisted.sort((a, b) => byName(text(a.name), text(b.name))).map((instance) => instanceCard(host.name, instance, serviceCards));
       for (const card of [...cards]) {
         const target = databaseCards.get(card.key);
         if (target) cards.push(databaseCard(target.host.name, target.instance, target.database));

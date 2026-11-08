@@ -1,6 +1,6 @@
 import { approvalUrl } from './approval.js';
 import {
-  buildDashboard, parseProjectHash, projectHash, relativeAge,
+  buildDashboard, humanize, parseProjectHash, projectHash, relativeAge,
 } from './model.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -127,17 +127,23 @@ function brandMark(doc) {
   return svg;
 }
 
-function meter(doc, label, value, percent, emptyText) {
+function meter(doc, label, value, percent, emptyText, title = '') {
   const row = el(doc, 'div', 'arca-meter');
+  row.dataset.empty = String(percent == null);
+  if (title) row.title = title;
   row.append(el(doc, 'span', 'arca-meter-label', label));
-  const bar = svgEl(doc, 'svg', {
-    class: 'arca-meter-bar', viewBox: '0 0 100 6', preserveAspectRatio: 'none', 'aria-hidden': 'true',
-  }, [
-    svgEl(doc, 'rect', { class: 'arca-meter-track', width: 100, height: 6, rx: 3 }),
-    svgEl(doc, 'rect', { class: 'arca-meter-fill', width: percent == null ? 0 : Math.max(0, Math.min(100, percent)), height: 6, rx: 3 }),
-  ]);
+  // A null reading has no bar at all: an empty track reads as zero, which is a different fact.
+  if (percent != null) {
+    const bar = svgEl(doc, 'svg', {
+      class: 'arca-meter-bar', viewBox: '0 0 100 6', preserveAspectRatio: 'none', 'aria-hidden': 'true',
+    }, [
+      svgEl(doc, 'rect', { class: 'arca-meter-track', width: 100, height: 6, rx: 3 }),
+      svgEl(doc, 'rect', { class: 'arca-meter-fill', width: Math.max(0, Math.min(100, percent)), height: 6, rx: 3 }),
+    ]);
+    row.append(bar);
+  }
   const valueNode = el(doc, 'span', 'arca-meter-value mono', value || emptyText || '');
-  row.append(bar, valueNode);
+  row.append(valueNode);
   return row;
 }
 
@@ -150,8 +156,8 @@ function machineCard(doc, machine) {
   card.append(head);
   const meters = el(doc, 'div', 'arca-meters');
   meters.append(
-    meter(doc, 'CPU', machine.cpuLabel, machine.cpu?.usedPct, 'No metrics'),
-    meter(doc, 'Mem', machine.memoryLabel, machine.memory?.usedPct, 'No metrics'),
+    meter(doc, 'CPU', machine.cpuLabel, machine.cpu?.usedPct, 'No metrics', machine.cpuReason),
+    meter(doc, 'Mem', machine.memoryLabel, machine.memory?.usedPct, 'No metrics', machine.memoryReason),
   );
   card.append(meters);
   const foot = el(doc, 'div', 'arca-machine-foot');
@@ -401,7 +407,89 @@ function approvalCard(doc, plans, url) {
   return card;
 }
 
-export function createCanvas(root) {
+function sseBlocks(buffer) {
+  const parts = buffer.split(/\r?\n\r?\n/);
+  return { blocks: parts.slice(0, -1), rest: parts.at(-1) ?? '' };
+}
+
+function parseSseBlock(block) {
+  let event = 'message';
+  const data = [];
+  for (const line of block.split(/\r?\n/)) {
+    if (!line || line.startsWith(':')) continue;
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+  }
+  if (!data.length) return null;
+  try {
+    return { event, data: JSON.parse(data.join('\n')) };
+  } catch {
+    return { event, data: null };
+  }
+}
+
+// Presentation only: the model reads the raw service project id, but the canvas never shows it. ACL names
+// become "<Name> firewall"; any leftover internal id is described as the Arca service project.
+function chatLabel(value) {
+  return text(value)
+    .replace(/\barcak-svc-svc-([a-z0-9-]+)\b/gi, (_, name) => `${humanize(name)} firewall`)
+    .replace(/arcak-svc/gi, 'Arca service');
+}
+
+function chatStatusText(status) {
+  if (status === 401) return 'Sign in to Arca to chat with the Doctor.';
+  if (status === 403) return 'This page is not allowed to chat with the Doctor.';
+  if (status === 413) return 'That message is too long for the Doctor.';
+  if (status === 415) return 'The Doctor could not read that message.';
+  if (status === 429) return 'The Doctor is busy with another answer. Try again shortly.';
+  if (status === 503) return 'The Doctor is not available right now.';
+  return 'The Doctor could not answer.';
+}
+
+function toolSummary(card) {
+  if (card.state === 'running') return card.host ? `Reading ${card.host}…` : 'Reading Arca…';
+  if (card.state === 'error') return card.host ? `${card.host} · failed` : 'Failed';
+  const summary = typeof card.summary === 'string' ? card.summary.trim() : '';
+  if (summary && !summary.startsWith('{') && !summary.startsWith('[')) return chatLabel(summary.slice(0, 120));
+  return card.host ? `Answered from ${card.host}` : 'Answered from Arca';
+}
+
+function chatToolCard(doc, card) {
+  const node = el(doc, 'article', 'arca-tool');
+  node.dataset.state = card.state === 'running' ? 'wait' : card.state === 'error' ? 'bad' : 'done';
+  node.dataset.tool = card.name;
+  const head = el(doc, 'div', 'arca-tool-head');
+  const ic = el(doc, 'span', 'arca-tool-icon');
+  ic.append(icon(doc, card.state === 'error' ? 'shield' : 'check'));
+  head.append(ic, el(doc, 'span', 'arca-tool-name mono', card.name));
+  head.append(el(doc, 'span', 'arca-tool-meta', card.host ?? ''));
+  node.append(head, el(doc, 'p', 'arca-tool-text', toolSummary(card)));
+  return node;
+}
+
+function chatApprovalCard(doc, approval) {
+  const card = el(doc, 'article', 'arca-card arca-card-warn arca-approval');
+  const head = el(doc, 'div', 'arca-card-head');
+  head.append(el(doc, 'span', 'arca-badge wait', 'Approval needed'), el(doc, 'span', 'arca-card-meta', 'read only'));
+  card.append(head, el(doc, 'p', 'arca-card-text', approval.detail || 'This chat cannot change anything.'));
+  if (approval.url) {
+    const link = el(doc, 'a', 'arca-btn arca-btn-ink', 'Review approvals');
+    link.href = approval.url;
+    card.append(link);
+  } else {
+    card.append(el(doc, 'span', 'arca-card-note', 'The approval page is not configured.'));
+  }
+  return card;
+}
+
+function chatNotice(doc, kind, title, body) {
+  if (kind === 'cutoff') return el(doc, 'p', 'arca-thread-note arca-cutoff', body);
+  const card = el(doc, 'article', `arca-card arca-card-warn arca-${kind}`);
+  card.append(el(doc, 'p', 'arca-card-text', title), el(doc, 'p', 'arca-card-text', body));
+  return card;
+}
+
+export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   const doc = root.ownerDocument;
   const shell = el(doc, 'div', 'arca-canvas');
   const topbar = el(doc, 'header', 'arca-topbar');
@@ -504,10 +592,11 @@ export function createCanvas(root) {
   const composerRow = el(doc, 'div', 'arca-composer-row');
   const input = el(doc, 'input', 'arca-composer-input');
   input.type = 'text';
-  input.readOnly = true;
   input.id = 'arca-chat-input';
-  input.placeholder = 'Chat is coming in phase 2';
+  input.placeholder = 'Ask the Doctor about your machines';
   input.setAttribute('aria-label', 'Message the Doctor');
+  input.setAttribute('autocomplete', 'off');
+  input.setAttribute('maxlength', '16000');
   composerRow.append(input);
   const composerBar = el(doc, 'div', 'arca-composer-bar');
   const plus = el(doc, 'button', 'arca-icon-button');
@@ -518,7 +607,7 @@ export function createCanvas(root) {
   const perm = el(doc, 'span', 'arca-perm');
   perm.append(icon(doc, 'shield'), el(doc, 'span', '', 'Approval required'));
   const barSpacer = el(doc, 'span', 'arca-spacer');
-  const model = el(doc, 'span', 'arca-model', 'Doctor');
+  const model = el(doc, 'span', 'arca-model', 'deepseek-flash');
   const send = el(doc, 'button', 'arca-send');
   send.type = 'button';
   send.setAttribute('aria-label', 'Send');
@@ -526,7 +615,7 @@ export function createCanvas(root) {
   send.append(icon(doc, 'send'));
   composerBar.append(plus, perm, barSpacer, model, send);
   composerBox.append(composerRow, composerBar);
-  const composerNote = el(doc, 'p', 'arca-composer-note', 'The composer is inert in this delivery.');
+  const composerNote = el(doc, 'p', 'arca-composer-note', 'Read only · changes need your passkey on the approval page.');
   composer.append(composerBox, composerNote);
 
   panel.append(panelHead, chatScroll, stepsScroll, composer);
@@ -535,8 +624,11 @@ export function createCanvas(root) {
   root.replaceChildren(shell);
 
   const state = {
-    envelope: {}, dashboard: null, project: null, tab: 'chat',
+    envelope: {}, dashboard: null, project: null, tab: 'chat', plans: 0, approvalUrl: '',
     signatures: { machines: '', canvas: '', panel: '', picker: '' },
+  };
+  const chat = {
+    messages: [], streaming: false, error: '', loaded: false, controller: null, sessionId: null,
   };
   let clockTimer;
   const tick = () => {
@@ -549,12 +641,20 @@ export function createCanvas(root) {
   tick();
   clockTimer = setInterval(tick, 1000);
 
+  const updateSubtitle = () => {
+    panelSub.textContent = state.tab === 'chat'
+      ? 'Read only · deepseek-flash'
+      : 'Recent activity · all machines';
+  };
+  updateSubtitle();
+
   const setTab = (name) => {
     state.tab = name;
     chatTab.setAttribute('aria-selected', String(name === 'chat'));
     stepsTab.setAttribute('aria-selected', String(name === 'steps'));
     chatScroll.hidden = name !== 'chat';
     stepsScroll.hidden = name !== 'steps';
+    updateSubtitle();
   };
   chatTab.addEventListener('click', () => setTab('chat'));
   stepsTab.addEventListener('click', () => setTab('steps'));
@@ -591,8 +691,8 @@ export function createCanvas(root) {
 
   const updateMachines = () => {
     const hosts = state.dashboard?.hosts ?? [];
-    const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel, memoryLabel, instanceCount, error, cpu, memory }) =>
-      ({ name, online, cpuLabel, memoryLabel, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct })));
+    const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel, cpuReason, memoryLabel, memoryReason, instanceCount, error, cpu, memory }) =>
+      ({ name, online, cpuLabel, cpuReason, memoryLabel, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct })));
     if (signature === state.signatures.machines) return;
     state.signatures.machines = signature;
     const nodes = hosts.map((machine) => machineCard(doc, machine));
@@ -636,43 +736,248 @@ export function createCanvas(root) {
     scroller.scrollLeft = scrollLeft;
   };
 
+  const renderChat = () => {
+    thread.dataset.streaming = String(chat.streaming);
+    thread.dataset.session = chat.session || 'Doctor';
+    const nearBottom = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 48;
+    const scrollTop = chatScroll.scrollTop;
+    thread.replaceChildren();
+    const banner = el(doc, 'div', 'arca-chat-banner');
+    const shield = el(doc, 'span', 'arca-chat-banner-icon');
+    shield.append(icon(doc, 'shield'));
+    banner.append(shield, el(doc, 'span', '', 'Read only · changes need your passkey on the approval page'));
+    thread.append(banner);
+    if (chat.error) {
+      thread.append(chatNotice(doc, 'error', 'Doctor unavailable', chat.error));
+    }
+    if (!chat.messages.length && !chat.error) {
+      const empty = emptyState(doc, 'Ask the Doctor', 'A read-only assistant for this Arca deployment. It reads live hosts and services; any change needs your passkey on the approval page.');
+      empty.classList.add('arca-chat-empty');
+      thread.append(empty);
+    }
+    for (const message of chat.messages) {
+      const node = el(doc, 'article', `arca-msg arca-msg-${message.role}`);
+      if (message.role === 'assistant' && !message.text && !message.tools.length && chat.streaming) {
+        node.append(el(doc, 'p', 'arca-msg-text arca-typing', 'Reading Arca…'));
+      } else if (message.text) {
+        node.append(el(doc, 'p', 'arca-msg-text', chatLabel(message.text)));
+      }
+      if (message.tools.length) {
+        const tools = el(doc, 'div', 'arca-msg-tools');
+        for (const tool of message.tools) tools.append(chatToolCard(doc, tool));
+        node.append(tools);
+      }
+      if (message.approval) node.append(chatApprovalCard(doc, message.approval));
+      for (const note of message.notes ?? []) node.append(chatNotice(doc, note.kind, note.title, note.body));
+      thread.append(node);
+    }
+    if (state.plans > 0) thread.append(approvalCard(doc, state.plans, state.approvalUrl));
+    if (nearBottom) chatScroll.scrollTop = chatScroll.scrollHeight;
+    else chatScroll.scrollTop = scrollTop;
+  };
+
+  const updateSend = () => {
+    const ready = input.value.trim().length > 0 && !chat.streaming;
+    send.setAttribute('aria-disabled', String(!ready));
+  };
+
+  const activeAssistant = () => chat.messages.at(-1)?.role === 'assistant' ? chat.messages.at(-1) : null;
+
+  const applyEvent = (event, data) => {
+    if (event === 'start') {
+      chat.session = typeof data?.session === 'string' && data.session ? data.session : 'Doctor';
+      chat.sessionId = data?.sessionId ?? null;
+      chat.error = '';
+    } else if (event === 'text') {
+      const message = activeAssistant();
+      if (message && typeof data?.text === 'string') message.text += data.text;
+    } else if (event === 'tool') {
+      const message = activeAssistant();
+      if (!message || !data?.callId) return;
+      const card = message.tools.find((tool) => tool.callId === data.callId);
+      if (card) Object.assign(card, data);
+      else message.tools.push({ ...data });
+    } else if (event === 'approval') {
+      const message = activeAssistant();
+      if (message) message.approval = { url: approvalUrl(data?.url), detail: String(data?.detail ?? '') };
+    } else if (event === 'budget') {
+      const message = activeAssistant();
+      const body = String(data?.message ?? 'Daily budget reached, try tomorrow.');
+      if (message) message.notes.push({
+        kind: 'budget', title: 'Daily budget reached',
+        body: `${body} (${Number(data?.used ?? 0)} of ${Number(data?.budget ?? 0)} tokens used today.)`,
+      });
+    } else if (event === 'cap') {
+      const message = activeAssistant();
+      if (message) message.notes.push({
+        kind: 'cap', title: 'Answer stopped', body: String(data?.message ?? 'This answer reached a per-turn limit.'),
+      });
+    } else if (event === 'error') {
+      const message = activeAssistant();
+      if (message) message.notes.push({
+        kind: 'error', title: 'Doctor unavailable', body: String(data?.message ?? 'The Doctor could not answer.'),
+      });
+    } else if (event === 'usage') {
+      chat.usage = data;
+    } else if (event === 'arca-cut') {
+      // Advisory presentation only: the kernel may add this when it bounds a stream. It is never trusted for security.
+      const message = activeAssistant();
+      if (message) message.notes.push({
+        kind: 'cutoff', title: 'Cut off', body: 'The answer was cut off.',
+      });
+    } else if (event === 'done') {
+      chat.done = true;
+      chat.reason = data?.reason ?? 'complete';
+    }
+  };
+
+  const finishChat = () => {
+    if (!chat.done) {
+      const message = activeAssistant();
+      if (message && !message.notes.some((note) => note.kind === 'cutoff')) {
+        message.notes.push({ kind: 'cutoff', title: 'Cut off', body: 'The answer was cut off.' });
+      }
+    }
+    chat.streaming = false;
+    chat.done = false;
+    chat.controller = null;
+    renderChat();
+    updateSend();
+    input.focus();
+  };
+
+  const sendChat = async () => {
+    const text = input.value.trim();
+    if (!text || chat.streaming) return;
+    input.value = '';
+    updateSend();
+    chat.messages.push({ role: 'user', text, tools: [], notes: [] });
+    chat.messages.push({ role: 'assistant', text: '', tools: [], notes: [] });
+    chat.streaming = true;
+    chat.done = false;
+    chat.error = '';
+    renderChat();
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+    const controller = new AbortController();
+    chat.controller = controller;
+    try {
+      const response = await fetch(`${base}/chat`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify({ message: text }),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        chat.error = chatStatusText(response.status);
+        chat.messages.pop();
+        return;
+      }
+      if (!response.body) {
+        chat.error = chatStatusText(0);
+        chat.messages.pop();
+        return;
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const { blocks, rest } = sseBlocks(buffer);
+        buffer = rest;
+        for (const block of blocks) {
+          const parsed = parseSseBlock(block);
+          if (parsed) applyEvent(parsed.event, parsed.data);
+        }
+        renderChat();
+        if (chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight < 48) {
+          chatScroll.scrollTop = chatScroll.scrollHeight;
+        }
+      }
+      buffer += decoder.decode();
+      const { blocks } = sseBlocks(`${buffer}\n\n`);
+      for (const block of blocks) {
+        const parsed = parseSseBlock(block);
+        if (parsed) applyEvent(parsed.event, parsed.data);
+      }
+    } catch (error) {
+      if (error?.name !== 'AbortError') chat.error = 'The connection to the Doctor was lost.';
+    } finally {
+      finishChat();
+    }
+  };
+
+  send.addEventListener('click', () => { void sendChat(); });
+  input.addEventListener('input', updateSend);
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void sendChat();
+    }
+  });
+  updateSend();
+
+  const loadHistory = async () => {
+    try {
+      const response = await fetch(`${base}/chat/history`, { credentials: 'same-origin' });
+      if (!response.ok) {
+        if (!chat.messages.length) chat.error = chatStatusText(response.status);
+        chat.loaded = true;
+        renderChat();
+        return;
+      }
+      const data = await response.json();
+      chat.session = typeof data?.session?.name === 'string' ? data.session.name : 'Doctor';
+      chat.sessionId = data?.session?.id ?? null;
+      if (!chat.messages.length) {
+        chat.messages = (Array.isArray(data?.messages) ? data.messages : [])
+          .filter((message) => message && (message.role === 'user' || message.role === 'assistant'))
+          .map((message) => ({
+            role: message.role,
+            text: String(message.text ?? ''),
+            tools: Array.isArray(message.tools) ? message.tools.map((tool) => ({ ...tool })) : [],
+            notes: [],
+            approval: null,
+          }));
+      }
+      chat.usage = data?.usage ?? null;
+      chat.loaded = true;
+      renderChat();
+    } catch {
+      chat.loaded = true;
+    }
+  };
+
   const updatePanel = () => {
-    const project = state.project;
-    panelSub.textContent = 'Recent activity · all machines';
     const dashboard = state.dashboard;
     const journal = list(dashboard?.journal);
     const plans = dashboard?.plans ?? 0;
     const url = approvalUrl(state.envelope.approvalUrl);
     const pending = (state.envelope.hosts ?? []).some((host) => host.journalPending);
-    const signature = JSON.stringify({ journal, plans, url, project: project?.name, pending });
+    state.plans = plans;
+    state.approvalUrl = url;
+    const signature = JSON.stringify({ journal, plans, url, pending });
     if (signature === state.signatures.panel) return;
     state.signatures.panel = signature;
     const now = Date.now();
-    const chatScrollTop = chatScroll.scrollTop;
     const stepsScrollTop = stepsScroll.scrollTop;
-    thread.replaceChildren();
     steps.replaceChildren();
-    thread.append(el(doc, 'div', 'arca-thread-head',
-      `Recent Arca activity · ${count(journal.length, 'event')}`));
     if (!journal.length) {
       const known = (state.envelope.hosts ?? []).some((host) => host.journalKnown);
-      thread.append(pending
-        ? emptyState(doc, 'Reading Arca activity…', 'The journal is catching up; this fills in on the next refresh.')
+      steps.append(pending
+        ? emptyState(doc, 'Reading the latest activity…', 'The journal is catching up; this fills in on the next refresh.')
         : emptyState(doc,
           known ? 'No recent Arca activity' : 'Activity journal unavailable',
           known ? 'Arca has not applied a change recently.' : 'This host did not return a journal.'));
     } else {
-      if (pending) thread.append(el(doc, 'p', 'arca-thread-note', 'Reading older activity…'));
-      for (const record of journal) thread.append(toolCard(doc, record, now));
+      if (pending) steps.append(el(doc, 'p', 'arca-thread-note', 'Reading the latest activity…'));
+      for (const record of journal) steps.append(stepCard(doc, record, now));
     }
-    if (plans > 0) thread.append(approvalCard(doc, plans, url));
-    if (!journal.length) {
-      steps.append(el(doc, 'p', 'arca-steps-empty', pending ? 'Reading older activity…' : 'No recent Arca steps.'));
-    }
-    for (const record of journal) steps.append(stepCard(doc, record, now));
     if (plans > 0) steps.append(approvalCard(doc, plans, url));
-    chatScroll.scrollTop = chatScrollTop;
     stepsScroll.scrollTop = stepsScrollTop;
+    renderChat();
   };
 
   const selectProject = (project, { updateHash = true } = {}) => {
@@ -730,11 +1035,15 @@ export function createCanvas(root) {
     updatePanel();
   };
 
+  void loadHistory();
+  renderChat();
+
   return {
     update,
     stop() {
       clearInterval(clockTimer);
       window.removeEventListener('hashchange', onHash);
+      chat.controller?.abort();
     },
   };
 }
@@ -748,7 +1057,7 @@ export function renderCanvas(root, snapshot) {
 export function mountCanvas(root, { fetchSnapshot, pollMs = 5000 } = {}) {
   const base = (root.dataset?.arcaBase ?? '/arca-canvas').replace(/\/+$/, '') || '/arca-canvas';
   const load = fetchSnapshot ?? (() => fetch(`${base}/snapshot`, { credentials: 'same-origin' }));
-  const view = createCanvas(root);
+  const view = createCanvas(root, { base });
   let stopped = false;
   let timer;
   let current = {

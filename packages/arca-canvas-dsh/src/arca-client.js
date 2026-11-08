@@ -26,7 +26,7 @@ export function snapshotError(error) {
     ? messages[error.code] : 'Arca request failed.';
 }
 
-async function rpc(config, id, method, params) {
+async function rpc(config, id, method, params, signal) {
   // Authentication is refreshed for every HTTP call, including initialize.
   const token = await readToken(config.viewerTokenPath).catch(() => { throw new ArcaError('token'); });
   const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
@@ -36,7 +36,7 @@ async function rpc(config, id, method, params) {
       socketPath: config.socketPath,
       path: '/mcp',
       method: 'POST',
-      signal: AbortSignal.timeout(5000),
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(5000), signal]) : AbortSignal.timeout(5000),
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -82,14 +82,14 @@ async function rpc(config, id, method, params) {
 export function createArcaClient(config) {
   let nextId = 0;
   return {
-    async call(name, args = {}) {
+    async call(name, args = {}, signal) {
       const initialized = await rpc(config, ++nextId, 'initialize', {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: 'arca-canvas', version: '0.1.0' },
-      });
+      }, signal);
       if (initialized.protocolVersion !== PROTOCOL_VERSION) throw new ArcaError('protocol');
-      const result = await rpc(config, ++nextId, 'tools/call', { name, arguments: args });
+      const result = await rpc(config, ++nextId, 'tools/call', { name, arguments: args }, signal);
       if (result.structuredContent && typeof result.structuredContent === 'object') {
         return result.structuredContent;
       }

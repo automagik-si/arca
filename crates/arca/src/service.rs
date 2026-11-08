@@ -1162,7 +1162,9 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
         "ipv4": ipv4,
         "ports": cfg.ports,
         "links": links,
-        "published": published
+        "published": published,
+        // The host port only exists when the service has a lan proxy. Container ports are not host listeners.
+        "lanPort": cfg.lan.as_ref().map(|lan| lan.port)
     })
 }
 
@@ -1185,7 +1187,8 @@ pub fn unknown_view(row: &Value) -> Option<Value> {
         "ipv4": ipv4,
         "ports": [],
         "links": [],
-        "published": null
+        "published": null,
+        "lanPort": null
     }))
 }
 
@@ -1205,7 +1208,8 @@ pub fn failed_view(row: &Value) -> Option<Value> {
         "ipv4": ipv4,
         "ports": [],
         "links": [],
-        "published": null
+        "published": null,
+        "lanPort": null
     }))
 }
 

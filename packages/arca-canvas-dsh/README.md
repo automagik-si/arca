@@ -6,7 +6,8 @@ through a Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot
 picker, local clock and fleet summary; a machines strip with CPU and memory bars;
 the selected project's cards on a dotted canvas with curved SVG edges; and a
 Doctor panel with Chat and Steps tabs, recent Arca activity and waiting approvals.
-The composer is visible but inert in this delivery. It works without a sidebar.
+The Doctor composer is a working read-only chat backed by a persisted DSH session named
+`Doctor` (model `deepseek-flash`). It works without a sidebar.
 When the sidebar is installed, an Arca canvas tab embeds this same page, sharing
 its renderer, polling and styles. The canvas is read only; waiting plans link to
 the configured approval page.
@@ -41,9 +42,13 @@ config:
   viewerTokenPath: /path/to/arca-viewer.token
   pollMs: 5000
   nodeName: 'Example machine'
+  address: ''
   approvalUrl: ''
   devicesUrl: ''
   devicesTokenPath: ''
+  chatEnabled: true
+  chatStatePath: ''
+  dailyTokenBudget: 1000000
 ```
 
 | Key | Meaning |
@@ -53,6 +58,10 @@ config:
 | `viewerTokenPath` | Required when `hosts` is absent; absolute path to a regular token file with mode exactly `0400`. Symlinks are refused. |
 | `pollMs` | Integer delay between completed polls, at least 100 ms; default 5000. Arca polls never overlap; the device phase runs independently. |
 | `nodeName` | Optional human machine title. Defaults to the host OS hostname; an empty or whitespace-only name becomes `Machine`. The raw Arca node ID is never the card title. |
+| `address` | Optional LAN host name or IP for a service's Open link. Bare host or IP only, no scheme or port. When set, a service card gets `http://<address>:<lanPort>` only when the real `service_list` row has a `lanPort` host listener; a container port alone never becomes a link. Empty by default. |
+| `chatEnabled` | Enable the Doctor chat routes. Default true; when false the chat routes answer 503 and no model is called. |
+| `chatStatePath` | Optional absolute path of the persisted chat state (DSH session id, daily token counter and the panel transcript). Defaults to `$DSH_HOME/storages/arca-canvas-chat.json`. |
+| `dailyTokenBudget` | Positive integer total-token budget per UTC day, default 1000000. When reached the Doctor answers with the daily-budget card and spends no model call. |
 | `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
 | `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
 | `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
@@ -67,6 +76,7 @@ config:
     - name: alpha
       socketPath: /example/alpha/arca.sock
       viewerTokenPath: /example/alpha/viewer.token
+      address: 192.0.2.10
       devicesUrl: https://devices.example.com/mcp
       devicesTokenPath: /example/alpha/device-reader.token
     - name: beta
@@ -143,10 +153,11 @@ readers.
 The JSON object has `at` (ISO timestamp), `approvalUrl` (empty or the configured
 approval URL), `projects` (the configured owner groups, each with `name`,
 `domain` and `members`), `defaultProject`, and `hosts` in configured order. Each
-host entry has `name`, `at`, `error` (null or safe error text), `nodeName`
+host entry has `name`, `address` (the configured LAN address or empty), `at`,
+`error` (null or safe error text), `nodeName`
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
 `watch_report` failed), `projects` (the Incus project ids from `watch_report`),
-`databases`, `metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
+`databases`, `services`, `metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
 `journal_list` failed), `journalPending` (true while a deep journal read finishes
 in the background), `devices`, `devicesAt` (ISO time of the last good device
 list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable`,
@@ -155,6 +166,10 @@ list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
+- `services` holds the `service_list.services` rows (name, template, state, ipv4, ports,
+  lanPort, links, published). `lanPort` is the template's host proxy port, or null when the
+  service has no lan listener. A service whose instance is on the canvas contributes an Open
+  link only from the configured host `address` and its real `lanPort`.
 - `journal` holds the newest `journal_list` records, at most 200 per host. Every
   poll re-reads a trailing window of the newest ids and merges by id with the
   latest record winning, so an effect that moved from `Intent` to `Failed` (or
@@ -217,7 +232,12 @@ coming soon), the local clock and a fleet summary computed from the latest
 it). The machines strip draws one compact card per configured host with online
 state from `arca_status.incusReachable`, a CPU bar from `latest.cpu.usedPct`
 (shown as used cores / total cores), a memory bar from
-`memory.totalBytes` and `availableBytes` (used / total), and the instance count.
+`memory.totalBytes` and `usedBytes` (falling back to `totalBytes -
+availableBytes`), and the instance count. A null CPU load renders `CPU n/a` with
+no bar, never zero. When the host reports `cpu.reason` or `cpu.cores` is zero,
+the card says `cores n/a` and keeps the reason as the meter's tooltip; a memory
+`reason` renders `Mem n/a` with the same tooltip and no bar. A real reading is
+never replaced by an invented one.
 Two dashed placeholder cards leave room for storage and phones. The project
 canvas draws the selected project's instances and matched databases as cards
 connected to a project hub with curved dashed SVG edges on the dotted canvas.
@@ -225,12 +245,24 @@ Cards carry only real snapshot data: status, kind, owner class, the instance's
 own absolute URL when present, and database address, port and link count when
 present. A domain card appears only when the project config sets `domain`.
 
-The right-hand Doctor panel has Chat and Steps tabs and a visible but inert
-composer. Both tabs render the newest `journal_list` records across every
-machine, and the panel subtitle says `Recent activity · all machines`; a
-waiting-plan card links to the configured `approvalUrl`. When `journal_list` is
-unavailable the panel says so without fabricating activity. The composer accepts
-no input and sends nothing.
+The right-hand Doctor panel has Chat and Steps tabs. Chat is a real read-only
+conversation; Steps renders the newest `journal_list` records across every
+machine. A waiting-plan card links to the configured `approvalUrl`. When
+`journal_list` is unavailable Steps says so without fabricating activity. The
+chat's waiting-plan card appears under the conversation too.
+
+The Doctor answers only from the eight read-only Arca tools (`arca_status`,
+`watch_report`, `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`,
+`journal_list`, `service_list`). They are registered globally with a per-session
+`when` condition, the Doctor's scope is restricted with
+`restrict({ allow: READ_TOOLS })`, and scoped `tools/pre-execute` and
+`tools.guard` checks deny every other name (including the reserved `run_code`) at
+dispatch. A registry that cannot restrict or enumerate fails setup after the
+`start` event, so the chat sends a fixed "Doctor unavailable" SSE error and makes
+no model call. Write verbs are never
+registered. A request to change something is answered with what the change would
+do and the configured `/approve` link; the panel adds the approval card. Inline
+passkey approval is phase 3. The page never receives a model credential.
 
 Selection lives in the URL fragment as `#project/<name>`, encoded with
 `encodeURIComponent`. Loading with a known project restores it; an unknown or
@@ -240,6 +272,98 @@ the fragment. The page never pans, zooms or drags. Polls rebuild a region only
 when its data changed, so selection, focus and scroll survive unchanged polls.
 There are no write actions and no routes beyond the existing `/arca-canvas`
 assets and snapshot.
+
+## Doctor chat contract
+
+The Doctor chat is served by this package on the DSH listener. The kernel proxies
+the two routes behind the `__Host-arca-canvas` passkey cookie and its `Origin`
+check, then relays the stream. The DSH routes themselves are loopback-only and
+trust the kernel's gate; they read no cookie and hold no page secret. A direct
+loopback caller is inside the same trust boundary as the snapshot route.
+
+### `POST /arca-canvas/chat`
+
+One Doctor turn. The kernel exposes it as `POST /approve/canvas/chat`.
+
+- Request `Content-Type: application/json`; UTF-8 body `{ "message": "<text>" }`.
+  The body is capped at 64 KiB and the message at 16384 characters.
+- Success is `200 text/event-stream; charset=utf-8` (`Cache-Control: no-store`,
+  `X-Accel-Buffering: no`, `Connection: keep-alive`). Every frame is `event:
+  <name>` plus exactly one `data: <json>` line; `JSON.stringify` escapes every
+  newline inside a string, so model text can never close a frame or forge an
+  event. A comment line `: hb` is written at least every 15 seconds, including
+  while a tool call is slow, so the kernel's 60-second idle limit is never
+  reached. The turn is bounded at nine minutes, under the kernel's ten; agent setup is bounded
+separately, and the single-turn slot is released only after the DSH run reports
+`turn/end` (or its cancel bound expires). A client that disconnects during setup
+gets no model call.
+- Refusals before a stream are JSON: `400 { "error": "invalid-json" |
+  "message-required" }`, `405 { "error": "method-not-allowed" }` (with
+  `Allow: POST`), `413 { "error": "body-too-large" | "message-too-long" }`,
+  `415 { "error": "json-required" }`, `429 { "error": "chat-busy" }` (one turn
+  at a time), and `503 { "error": "chat-unavailable" }` (missing DSH agent/tools
+  before the stream starts, or the plugin is shutting down). None of these starts
+  a model call. A setup failure after `start` (the tool registry cannot restrict
+  or enumerate, or setup times out) is instead a `200` SSE stream with a fixed
+  `error` event and `done { "reason": "error" }`; it also makes no model call.
+
+SSE events, in order. Every `data` is one JSON object.
+
+| Event | Data | Meaning |
+| --- | --- | --- |
+| `start` | `{ "session": "Doctor", "sessionId"?: "<dsh-session-id>" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. `sessionId` is present when a persisted session is already known. |
+| `text` | `{ "text": "<delta>" }` | One assistant text delta; concatenate in arrival order. |
+| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the eight reads. |
+| `approval` | `{ "url", "title", "detail" }` | Advisory card when the message looks like a write request and an approval URL is configured. `url` is the configured `/approve` URL. Presentation only. |
+| `usage` | `{ "turnToolCalls", "turnOutputTokens", "dailyTokens", "dailyBudget", "day" }` | Token accounting from the model's own usage; `dailyTokens` counts input plus output for the UTC day. |
+| `budget` | `{ "scope": "daily", "used", "budget", "message" }` | Daily budget reached; the message is `Daily budget reached, try tomorrow.`. The turn then ends. |
+| `cap` | `{ "reason", "limit", "message" }` | Per-turn cap reached: `reason` is `tool-calls` (40) or `output-tokens` (64000). |
+| `error` | `{ "message": "<safe text>" }` | Safe, fixed text; upstream details and the model key never enter the stream. |
+| `done` | `{ "reason", "turnToolCalls", "turnOutputTokens" }` | Terminal. `reason` is `complete`, `tool-calls`, `output-tokens`, `budget`, `timeout`, `error`, or `closed`. |
+
+A stream always ends cleanly. A client must treat an `event: arca-cut` added by
+the kernel as advisory (`The answer was cut off.`) and must also show that
+notice when the stream ends without `done`; the kernel's cut is never a security
+decision. Caps are enforced from the model's own usage and the tool dispatcher:
+a 41st tool call fails before dispatch and the turn ends with `tool-calls`; more
+than 64000 output tokens ends it with `output-tokens`; the daily counter persists
+in `chatStatePath` and blocks the next turn before any model call.
+
+### `GET /arca-canvas/chat/history`
+
+The kernel exposes it as `GET /approve/canvas/chat/history`. Plain JSON, no
+model call:
+
+```json
+{
+  "session": { "id": "<dsh-session-id>", "name": "Doctor" },
+  "messages": [
+    { "role": "user", "text": "...", "at": "<ISO time>" },
+    { "role": "assistant", "text": "...", "at": "<ISO time>",
+      "tools": [{ "callId": "...", "name": "arca_status", "state": "done",
+                 "host": "alpha", "summary": "..." }] }
+  ],
+  "usage": { "day": "YYYY-MM-DD", "dailyTokens": 0, "dailyBudget": 1000000,
+             "budgetExhausted": false },
+  "limits": { "toolCallsPerTurn": 40, "outputTokensPerTurn": 64000 }
+}
+```
+
+`tools[].host` and `tools[].summary` are optional. `session` is `null` before the first turn.
+The transcript is capped at the newest
+200 messages and the body is kept under 1.5 MiB (oldest replay rows are dropped)
+so it fits the kernel's 2 MiB forward cap. The model transcript itself is the
+persisted DSH session; this JSON is the panel's replay.
+
+### Session, model, and credential
+
+The first turn resumes the persisted session id in `chatStatePath`, or creates one
+and names it `Doctor`; later turns and restarts reuse it. The route selects the
+DSH model `deepseek-flash` on the `deepseek-official` provider from the runtime's
+own credentials. The plugin never reads, receives, logs or returns that
+credential; it appears in no page asset, SSE frame, snapshot or log line. Message
+bodies are never logged either. A model credential failure becomes the safe
+`error` event.
 
 ## Develop
 
@@ -255,7 +379,11 @@ Tests use fixture data, temporary Unix sockets and an ephemeral loopback browser
 server. Playwright 1.64.0 is pinned to the Chromium used by the rendering checks.
 The tests assert light/dark colors, layout regions and literal rendering of
 untrusted strings in a real browser. They also rebuild every browser artifact
-into a temporary directory and compare SHA-256 hashes.
+into a temporary directory and compare SHA-256 hashes. Chat tests use a fake
+DSH agent/stream and the synthetic Arca socket fixtures: they cover streamed
+text, one card per real call, the approval card and read-only refusal, the tool
+and token caps, the daily budget, the persisted `Doctor` session, and the
+absence of the model key from the page.
 
 `npm run build` regenerates the browser module and standalone page assets using
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.
