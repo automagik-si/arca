@@ -90,6 +90,12 @@
                     "cores": {
                       "type": "integer"
                     },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "usedPct": {
                       "type": [
                         "number",
@@ -99,7 +105,8 @@
                   },
                   "required": [
                     "usedPct",
-                    "cores"
+                    "cores",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -134,12 +141,19 @@
                         "number",
                         "null"
                       ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "one",
                     "five",
-                    "fifteen"
+                    "fifteen",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -148,6 +162,12 @@
                     "availableBytes": {
                       "type": [
                         "integer",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
                         "null"
                       ]
                     },
@@ -168,13 +188,21 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "usedBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "totalBytes",
                     "availableBytes",
+                    "usedBytes",
                     "swapTotalBytes",
-                    "swapFreeBytes"
+                    "swapFreeBytes",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -309,6 +337,12 @@
                     "cores": {
                       "type": "integer"
                     },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
                     "usedPct": {
                       "type": [
                         "number",
@@ -318,7 +352,8 @@
                   },
                   "required": [
                     "usedPct",
-                    "cores"
+                    "cores",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -353,12 +388,19 @@
                         "number",
                         "null"
                       ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "one",
                     "five",
-                    "fifteen"
+                    "fifteen",
+                    "reason"
                   ],
                   "type": "object"
                 },
@@ -367,6 +409,12 @@
                     "availableBytes": {
                       "type": [
                         "integer",
+                        "null"
+                      ]
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
                         "null"
                       ]
                     },
@@ -387,13 +435,21 @@
                         "integer",
                         "null"
                       ]
+                    },
+                    "usedBytes": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "totalBytes",
                     "availableBytes",
+                    "usedBytes",
                     "swapTotalBytes",
-                    "swapFreeBytes"
+                    "swapFreeBytes",
+                    "reason"
                   ],
                   "type": "object"
                 },

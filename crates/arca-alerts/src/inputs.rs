@@ -130,6 +130,7 @@ mod tests {
                 pools: pools.iter().map(|pool| pool.to_string()).collect(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             incus,
         )
@@ -238,6 +239,7 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             Offline,
         );

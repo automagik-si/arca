@@ -60,6 +60,7 @@ refused without the value being echoed back.
 | `stateDir` | yes | An existing directory, mode 0700. The node key and the desired-state files live in it. See the state section below. |
 | `incus.socket` | yes | The Incus unix socket. Reads only. |
 | `incus.pools` | no | An allow-filter on the storage pools Incus lists. Absent, or `[]`, means every pool Incus lists. A non-empty list samples and alerts only the listed pools that Incus also lists. A listed name that Incus does not list has no row, so its firing alert resolves with `subject-gone`. A pool entry with no name makes the pool reading unknown for that tick. See "Alerts". |
+| `incus.local` | no | Whether `incus.socket` is the local Incus daemon's own socket. When absent, the standard local daemon sockets (`/var/lib/incus/unix.socket` and `/var/lib/incus/unix.socket.user`) are local and every other path is a proxy to another machine. A proxy that forwards to the local daemon, such as the recording shim, sets `true` explicitly. See "Host metrics". |
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
@@ -300,7 +301,7 @@ its request is read.
   whether Incus answers, and `appliedSeq`: the applied desired-state document's sequence, or `null` before any document applies.
 - `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
-  `mean` are `null`.
+  `mean` are `null`. See "Host metrics" for where its readings come from.
 - `watch_report` reads every project and instance through Incus GET, but a call never starts a sweep. The `arca-watcher`
   thread sweeps once when `serve` starts and then every 30 seconds, so the GETs do not depend on how often the report is
   asked for. A call answers from the newest successful sweep, and every answer carries `ageMs`, the milliseconds since that
@@ -327,6 +328,31 @@ id with `after` and `limit` (default 100, maximum 500). Each record exposes only
 `state`, `at_ms`, `intent` and `object`; it never exposes `pre_image`, `inverse` or `acl_patch`, which can hold rendered
 secrets. The read decodes the whole append-only file without the journal's open-time integrity checks, so a listing can show a
 sequence `serve` would refuse at open; its cost grows with history.
+
+## Host metrics
+
+`node_metrics`, and `arca metrics --json`, describe the machine the node's Incus serves, never the machine Arca happens to run
+on when the two differ. `incus.local` says which case the node is in. When it is absent, the standard local daemon sockets
+(`/var/lib/incus/unix.socket` and `/var/lib/incus/unix.socket.user`) are local, and every other socket path is a proxy to
+another machine. A proxy whose upstream is the local daemon, such as the recording shim, sets `"local": true` beside its
+socket so the local readings stay available.
+
+- **Local daemon (`incus.local` true).** The sample is this machine's: `cpu.cores` and `cpu.usedPct`, the `load` averages,
+  `memory.totalBytes`, `memory.availableBytes` and `memory.usedBytes`, PSI, CPU temperature, GPU busy, swap and NIC rates come
+  from the node's `/proc` and `/sys` trees. This is the reading the sampler has always taken.
+- **Remote Incus (`incus.local` false).** The host totals come from the node's own Incus, `GET /1.0/resources`:
+  `cpu.cores` is `cpu.total` (threads), `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
+  `memory.availableBytes` is `memory.total - memory.used`. No local `/proc` or `/sys` reading is reported: `cpu.usedPct`,
+  every `load` average, PSI, CPU temperature, GPU busy, swap and NIC rates are `null`. `cpu.reason` and `load.reason` say
+  `not available for a remote host`. The pools, instance counts, incus-osd reading and SMART state still come from the same
+  Incus, so they describe the remote machine too.
+- **The resources read fails.** On a remote node the totals are `null` (`cpu.cores` stays an integer in the schema, so `0`
+  marks it unknown), and `cpu.reason` and `memory.reason` say `the Incus resources read failed`. The node never falls back to
+  its own `/proc`: a failed read is unknown, not the wrong machine. `load.reason` still says `not available for a remote
+  host`.
+
+The failure and provenance fields are additions: `memory.usedBytes`, `cpu.reason`, `load.reason` and `memory.reason`. Every
+field the earlier schema carried keeps its name and meaning, and a local node's figures do not change.
 
 ## Calling the server
 
@@ -624,13 +650,16 @@ service user's uid, and `<home>` its home directory; the config file takes no sp
 ```json
 {
   "stateDir": "<home>/.local/state/arca-node",
-  "incus": { "socket": "/run/user/<uid>/arca-shim/incus.sock", "pools": ["default"] },
+  "incus": { "socket": "/run/user/<uid>/arca-shim/incus.sock", "pools": ["default"], "local": true },
   "identityPhones": [],
   "listen": { "unix": "/run/user/<uid>/arca/arca.sock", "tailnet": null, "proxy": null },
   "tokens": { "hashDir": "<home>/.config/arca/tokens" },
   "kernel": { "projects": [], "scratch": false, "droiddProjects": ["app1"], "reservedCidrs": [] }
 }
 ```
+
+`local` is `true` here because the recording shim forwards to the host's own Incus daemon. Without it the shim's path would
+read as a proxy, and the CPU load would be reported as not available, although the machine is the same.
 
 `StateDirectory=arca-node` creates `~/.local/state/arca-node` at mode 0700, which `serve` requires. The state directory is
 not named `arca`: systemd 254 and later turn a user unit's `StateDirectory=arca` into a link to `~/.config/arca`, the config's

@@ -706,6 +706,7 @@ fn host_sample() -> Value {
             result(vec![
                 ("usedPct", true, nullable(num())),
                 ("cores", true, int()),
+                ("reason", true, nullable(string())),
             ]),
         ),
         (
@@ -715,6 +716,7 @@ fn host_sample() -> Value {
                 ("one", true, nullable(num())),
                 ("five", true, nullable(num())),
                 ("fifteen", true, nullable(num())),
+                ("reason", true, nullable(string())),
             ]),
         ),
         (
@@ -723,8 +725,10 @@ fn host_sample() -> Value {
             result(vec![
                 ("totalBytes", true, nullable(int())),
                 ("availableBytes", true, nullable(int())),
+                ("usedBytes", true, nullable(int())),
                 ("swapTotalBytes", true, nullable(int())),
                 ("swapFreeBytes", true, nullable(int())),
+                ("reason", true, nullable(string())),
             ]),
         ),
         (

@@ -1,7 +1,8 @@
-//! The Incus readings a host sample carries: the storage pools the allow-filter admits, with each one's space, and the
-//! instances, with each one's state, starts and usage. Both are GET requests through [`IncusRead`]. An answer that fails is
-//! `None`, so the caller can tell an unreachable Incus from an empty one. The sample's own lists stay empty on a failure,
-//! because the `node_metrics` schema has no nullable list; the alerts read the `None` through [`crate::Readings`].
+//! The Incus readings a host sample carries: the host totals of the machine Incus serves, the storage pools the allow-filter
+//! admits, with each one's space, and the instances, with each one's state, starts and usage. All are GET requests through
+//! [`IncusRead`]. An answer that fails is `None`, so the caller can tell an unreachable Incus from an empty one. The sample's
+//! own lists stay empty on a failure, because the `node_metrics` schema has no nullable list; the alerts read the `None`
+//! through [`crate::Readings`].
 
 use std::collections::BTreeMap;
 
@@ -10,9 +11,43 @@ use serde_json::Value;
 
 use crate::sample::{Pool, ProjectCount};
 
+/// The host resources of the machine the node's Incus serves. This is the machine Arca manages, which is not the machine Arca
+/// runs on when the socket is a proxy to a remote Incus.
+pub const RESOURCES_PATH: &str = "/1.0/resources";
+
 /// The instance list every tick reads: every project, recursed twice, so that each row carries its `state`. One GET serves the
 /// instance readings and the project counts.
 pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=2";
+
+/// The host totals Incus reports: its logical CPUs (threads), its memory total and its used memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTotals {
+    /// The logical CPUs the host has, from `/cpu/total`. Incus counts threads here.
+    pub cpu_threads: u64,
+    /// The host's memory, in bytes, from `/memory/total`.
+    pub memory_total_bytes: u64,
+    /// The memory in use, in bytes, from `/memory/used`.
+    pub memory_used_bytes: u64,
+}
+
+/// Reads the host totals through the node's own Incus socket. `None` when the GET fails, or when the document lacks a
+/// positive CPU count or the memory total and used figures: a malformed answer is unknown, never a zero host.
+pub fn read_host_totals<R: IncusRead>(incus: &R) -> Option<HostTotals> {
+    let document = incus.get(RESOURCES_PATH).ok()?;
+    host_totals(&document)
+}
+
+/// The totals of a `/1.0/resources` document. `None` unless the three figures are whole numbers and the host has a CPU.
+fn host_totals(document: &Value) -> Option<HostTotals> {
+    let cpu_threads = document.pointer("/cpu/total")?.as_u64()?;
+    let memory_total_bytes = document.pointer("/memory/total")?.as_u64()?;
+    let memory_used_bytes = document.pointer("/memory/used")?.as_u64()?;
+    (cpu_threads > 0 && memory_total_bytes > 0).then_some(HostTotals {
+        cpu_threads,
+        memory_total_bytes,
+        memory_used_bytes,
+    })
+}
 
 /// The kind of an instance. Incus has two: a container, and a virtual machine (`virtual-machine` on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +249,31 @@ mod tests {
         assert_eq!(read_pools(&nameless, &filter), None);
         let not_text = Listing(json!([{ "name": 7 }]));
         assert_eq!(read_pools(&not_text, &filter), None);
+    }
+
+    #[test]
+    fn host_totals_read_the_three_resources_figures_and_refuse_a_partial_document() {
+        let full = json!({
+            "cpu": { "total": 16 },
+            "memory": { "total": 17_045_651_456u64, "used": 3_417_186_304u64 },
+        });
+        assert_eq!(
+            host_totals(&full),
+            Some(HostTotals {
+                cpu_threads: 16,
+                memory_total_bytes: 17_045_651_456,
+                memory_used_bytes: 3_417_186_304,
+            })
+        );
+        for partial in [
+            json!({ "cpu": { "total": 16 }, "memory": { "total": 17_045_651_456u64 } }),
+            json!({ "cpu": { "total": 16 }, "memory": { "used": 3u64 } }),
+            json!({ "cpu": { "total": 0 }, "memory": { "total": 1u64, "used": 0u64 } }),
+            json!({ "cpu": { "total": "16" }, "memory": { "total": 1u64, "used": 0u64 } }),
+            json!({}),
+        ] {
+            assert_eq!(host_totals(&partial), None, "{partial}");
+        }
     }
 
     #[test]

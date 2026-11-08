@@ -74,16 +74,23 @@ pub fn read_load(proc_root: &Path) -> Load {
         one: values.next().flatten(),
         five: values.next().flatten(),
         fifteen: values.next().flatten(),
+        reason: None,
     }
 }
 
 pub fn read_memory(proc_root: &Path) -> Memory {
     let text = read_text(&proc_root.join("meminfo")).unwrap_or_default();
+    let total_bytes = meminfo_bytes(&text, "MemTotal");
+    let available_bytes = meminfo_bytes(&text, "MemAvailable");
     Memory {
-        total_bytes: meminfo_bytes(&text, "MemTotal"),
-        available_bytes: meminfo_bytes(&text, "MemAvailable"),
+        total_bytes,
+        available_bytes,
+        used_bytes: total_bytes
+            .zip(available_bytes)
+            .map(|(total, available)| total.saturating_sub(available)),
         swap_total_bytes: meminfo_bytes(&text, "SwapTotal"),
         swap_free_bytes: meminfo_bytes(&text, "SwapFree"),
+        reason: None,
     }
 }
 

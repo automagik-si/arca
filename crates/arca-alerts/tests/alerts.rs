@@ -1727,6 +1727,7 @@ mod get_only {
                 pools: vec!["default".to_string()],
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             UnixIncus::new(fake.socket().to_path_buf()),
         );

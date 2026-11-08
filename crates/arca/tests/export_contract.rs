@@ -152,17 +152,21 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         cpu: Cpu {
             used_pct: Some(12.5),
             cores: 4,
+            reason: None,
         },
         load: Load {
             one: Some(0.5),
             five: Some(0.25),
             fifteen: Some(0.125),
+            reason: None,
         },
         memory: Memory {
             total_bytes: Some(8_589_934_592),
             available_bytes: Some(4_294_967_296),
+            used_bytes: Some(4_294_967_296),
             swap_total_bytes: Some(2_147_483_648),
             swap_free_bytes: Some(2_147_483_648),
+            reason: None,
         },
         psi: Psi {
             memory_some_avg10: Some(1.5),

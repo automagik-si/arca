@@ -187,6 +187,7 @@ pub fn new_sampler(cfg: &NodeConfig) -> Sampler<UnixIncus> {
             pools: cfg.incus.pools.clone(),
             interval_ms: u64::try_from(SAMPLE_INTERVAL.as_millis()).unwrap_or(u64::MAX),
             history_minutes: HISTORY_MINUTES,
+            incus_local: cfg.incus.is_local(),
         },
         UnixIncus::new(cfg.incus.socket.clone()),
     )
@@ -1276,6 +1277,7 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: HISTORY_MINUTES,
+                incus_local: true,
             },
             incus,
         );
@@ -1312,6 +1314,7 @@ mod tests {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: HISTORY_MINUTES,
+                incus_local: true,
             },
             incus,
         );

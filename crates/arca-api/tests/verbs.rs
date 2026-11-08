@@ -615,9 +615,9 @@ fn a_host_sample_with_nulls_conforms_to_the_result_schema() {
     let result = (verb("node_metrics").expect("present").result)();
     let sample = json!({
         "at": 1,
-        "cpu": { "usedPct": null, "cores": 8 },
-        "load": { "one": 0.5, "five": null, "fifteen": 0.1 },
-        "memory": { "totalBytes": 1, "availableBytes": null, "swapTotalBytes": 0, "swapFreeBytes": null },
+        "cpu": { "usedPct": null, "cores": 8, "reason": null },
+        "load": { "one": 0.5, "five": null, "fifteen": 0.1, "reason": null },
+        "memory": { "totalBytes": 1, "availableBytes": null, "usedBytes": null, "swapTotalBytes": 0, "swapFreeBytes": null, "reason": null },
         "psi": { "memorySomeAvg10": 0.0, "memoryFullAvg10": null, "cpuSomeAvg10": 1.5 },
         "cpuTempC": null,
         "gpuBusyPct": null,
@@ -684,25 +684,32 @@ fn host_sample() -> Value {
         "properties": {
             "at": { "type": "integer" },
             "cpu": open(
-                json!({ "usedPct": { "type": ["number", "null"] }, "cores": { "type": "integer" } }),
-                &["usedPct", "cores"]
+                json!({
+                    "usedPct": { "type": ["number", "null"] },
+                    "cores": { "type": "integer" },
+                    "reason": { "type": ["string", "null"] }
+                }),
+                &["usedPct", "cores", "reason"]
             ),
             "load": open(
                 json!({
                     "one": { "type": ["number", "null"] },
                     "five": { "type": ["number", "null"] },
-                    "fifteen": { "type": ["number", "null"] }
+                    "fifteen": { "type": ["number", "null"] },
+                    "reason": { "type": ["string", "null"] }
                 }),
-                &["one", "five", "fifteen"]
+                &["one", "five", "fifteen", "reason"]
             ),
             "memory": open(
                 json!({
                     "totalBytes": { "type": ["integer", "null"] },
                     "availableBytes": { "type": ["integer", "null"] },
+                    "usedBytes": { "type": ["integer", "null"] },
                     "swapTotalBytes": { "type": ["integer", "null"] },
-                    "swapFreeBytes": { "type": ["integer", "null"] }
+                    "swapFreeBytes": { "type": ["integer", "null"] },
+                    "reason": { "type": ["string", "null"] }
                 }),
-                &["totalBytes", "availableBytes", "swapTotalBytes", "swapFreeBytes"]
+                &["totalBytes", "availableBytes", "usedBytes", "swapTotalBytes", "swapFreeBytes", "reason"]
             ),
             "psi": open(
                 json!({

@@ -20,6 +20,13 @@ use crate::smart::{self, DrivesReading};
 /// The window `node_metrics` reads when the caller names no minutes.
 pub const DEFAULT_MINUTES: u32 = 1;
 
+/// The reason a local `/proc` and `/sys` reading is absent: it would describe the machine Arca runs on, not the remote
+/// machine the node's Incus serves.
+pub const REMOTE_HOST_REASON: &str = "not available for a remote host";
+
+/// The reason the host totals are absent: the node's Incus did not answer `GET /1.0/resources`.
+pub const RESOURCES_REASON: &str = "the Incus resources read failed";
+
 /// The window `starts_10m` counts, in milliseconds: a start counts while it is less than this old.
 const START_WINDOW_MS: u64 = 600_000;
 
@@ -49,10 +56,15 @@ pub struct SamplerConfig {
     pub interval_ms: u64,
     /// How many minutes of samples the ring keeps.
     pub history_minutes: u32,
+    /// Whether the node's Incus is the local daemon. When true, the host totals and the CPU load are read from the local
+    /// `proc_root` and `sys_root`. When false, the totals come from the node's Incus `GET /1.0/resources`, and every local
+    /// reading is left out: it would describe the machine Arca runs on, not the remote machine Incus serves.
+    pub incus_local: bool,
 }
 
-/// One host sample. A reading the host cannot give is `null`, never a guessed zero, except `cpu.cores` (an integer in the
-/// schema), which is 0 when `/proc/stat` cannot be read.
+/// One host sample of the machine the node's Incus serves. A reading the host cannot give is `null`, never a guessed zero,
+/// except `cpu.cores` (an integer in the schema), which is 0 when the count is unknown. A remote host reports no local
+/// `/proc` or `/sys` reading; the reason fields name why the figures are absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostSample {
@@ -77,6 +89,10 @@ pub struct Cpu {
     /// The share of all CPUs busy since the previous sample, in percent.
     pub used_pct: Option<f64>,
     pub cores: u64,
+    /// Why `used_pct`, and sometimes `cores`, is not known. `None` when a local host reading is simply not available yet.
+    /// `Some("not available for a remote host")` on a remote host, and `Some("the Incus resources read failed")` when the
+    /// host totals could not be read.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -85,15 +101,25 @@ pub struct Load {
     pub one: Option<f64>,
     pub five: Option<f64>,
     pub fifteen: Option<f64>,
+    /// Why the load averages are null. `Some("not available for a remote host")` on a remote host, `None` otherwise.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Memory {
     pub total_bytes: Option<u64>,
+    /// The memory available to start applications. On a remote host this is `total_bytes - used_bytes`, the only figure
+    /// the Incus host resources document supports.
     pub available_bytes: Option<u64>,
+    /// The memory in use, in bytes. On a local host this is `total_bytes - available_bytes`; on a remote host it is the
+    /// Incus resources `memory.used` figure.
+    pub used_bytes: Option<u64>,
     pub swap_total_bytes: Option<u64>,
     pub swap_free_bytes: Option<u64>,
+    /// Why a memory figure is not known. `Some("the Incus resources read failed")` when the host totals could not be read,
+    /// `None` otherwise. Swap is never read from a remote host, so its figures stay null without a separate reason.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,10 +282,12 @@ impl<R: IncusRead> Sampler<R> {
     /// When the pool listing fails, the sample's pool rows are the last listing's names with null fields, or, before any
     /// listing has succeeded, the allow-filter's names with null fields. When the instance list fails, the sample has no project
     /// rows. [`Sampler::readings`] keeps the `None`s, which the alerts read as unknown.
+    ///
+    /// A remote host's totals are read from its Incus every tick; a failed read is null with [`RESOURCES_REASON`], never the
+    /// local machine's numbers. A local host keeps reading its own procfs and sysfs.
     pub fn sample(&mut self, now_ms: u64) -> &HostSample {
         let previous = self.previous;
-        let cpu = procfs::read_cpu(&self.cfg.proc_root);
-        let nic = procfs::read_nic_totals(&self.cfg.proc_root, &self.cfg.sys_root);
+        let host = read_host(&self.cfg, &self.incus, previous, now_ms);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
         let instances =
             incus::read_instances(&self.incus).map(|listed| self.count_starts(listed, now_ms));
@@ -271,7 +299,12 @@ impl<R: IncusRead> Sampler<R> {
         };
         let osd = if self.osd_due(now_ms) {
             self.osd_read_at = Some(now_ms);
-            let uptime_ms = procfs::read_uptime_ms(&self.cfg.proc_root);
+            // The uptime is a local reading, so it says nothing about a remote incus-osd's update age.
+            let uptime_ms = self
+                .cfg
+                .incus_local
+                .then(|| procfs::read_uptime_ms(&self.cfg.proc_root))
+                .flatten();
             osd::read(&self.incus, now_ms, &mut self.osd_memory, uptime_ms)
         } else {
             self.readings.osd.clone()
@@ -297,26 +330,20 @@ impl<R: IncusRead> Sampler<R> {
         };
         let sample = HostSample {
             at: now_ms,
-            cpu: Cpu {
-                used_pct: previous
-                    .and_then(|before| before.cpu)
-                    .zip(cpu.totals)
-                    .and_then(|(before, now)| used_pct(before, now)),
-                cores: cpu.cores,
-            },
-            load: procfs::read_load(&self.cfg.proc_root),
-            memory: procfs::read_memory(&self.cfg.proc_root),
-            psi: procfs::read_psi(&self.cfg.proc_root),
-            cpu_temp_c: procfs::read_cpu_temp_c(&self.cfg.sys_root),
-            gpu_busy_pct: procfs::read_gpu_busy_pct(&self.cfg.sys_root),
+            cpu: host.cpu,
+            load: host.load,
+            memory: host.memory,
+            psi: host.psi,
+            cpu_temp_c: host.cpu_temp_c,
+            gpu_busy_pct: host.gpu_busy_pct,
             pools: rows,
-            network: previous.and_then(|before| network_rates(before, nic, now_ms)),
+            network: host.network,
             projects: projects.clone().unwrap_or_default(),
         };
         self.readings = Readings {
             pools,
             projects,
-            nic: nic.map(|totals| NicCounters {
+            nic: host.nic.map(|totals| NicCounters {
                 rx_bytes: totals.rx_bytes,
                 tx_bytes: totals.tx_bytes,
             }),
@@ -327,8 +354,8 @@ impl<R: IncusRead> Sampler<R> {
         };
         self.previous = Some(Previous {
             at: now_ms,
-            cpu: cpu.totals,
-            net: nic,
+            cpu: host.cpu_totals,
+            net: host.nic,
         });
         self.ring.push_back(sample);
         while self.ring.len() > self.capacity {
@@ -451,6 +478,123 @@ impl<R: IncusRead> Sampler<R> {
     }
 }
 
+/// The host readings of one sample, and the local counters the next sample measures its rates against. On a remote host the
+/// counters are absent, because no local reading is taken.
+struct HostReadings {
+    cpu: Cpu,
+    load: Load,
+    memory: Memory,
+    psi: Psi,
+    cpu_temp_c: Option<f64>,
+    gpu_busy_pct: Option<f64>,
+    network: Option<Network>,
+    cpu_totals: Option<CpuTotals>,
+    nic: Option<NicTotals>,
+}
+
+/// The host readings of one sample. A local Incus daemon's host is this machine, so the readings come from the local `/proc`
+/// and `/sys` trees, as they always have. A remote daemon's host is another machine: its totals come from the daemon's
+/// `GET /1.0/resources`, and every local reading is left null with its reason. A failed resources read is null too, never the
+/// local machine's numbers.
+fn read_host<R: IncusRead>(
+    cfg: &SamplerConfig,
+    incus: &R,
+    previous: Option<Previous>,
+    now_ms: u64,
+) -> HostReadings {
+    if cfg.incus_local {
+        let cpu = procfs::read_cpu(&cfg.proc_root);
+        let nic = procfs::read_nic_totals(&cfg.proc_root, &cfg.sys_root);
+        return HostReadings {
+            cpu: Cpu {
+                used_pct: previous
+                    .and_then(|before| before.cpu)
+                    .zip(cpu.totals)
+                    .and_then(|(before, now)| used_pct(before, now)),
+                cores: cpu.cores,
+                reason: None,
+            },
+            load: procfs::read_load(&cfg.proc_root),
+            memory: procfs::read_memory(&cfg.proc_root),
+            psi: procfs::read_psi(&cfg.proc_root),
+            cpu_temp_c: procfs::read_cpu_temp_c(&cfg.sys_root),
+            gpu_busy_pct: procfs::read_gpu_busy_pct(&cfg.sys_root),
+            network: previous.and_then(|before| network_rates(before, nic, now_ms)),
+            cpu_totals: cpu.totals,
+            nic,
+        };
+    }
+    let load_reason = Some(REMOTE_HOST_REASON.to_string());
+    match incus::read_host_totals(incus) {
+        Some(totals) => HostReadings {
+            cpu: Cpu {
+                used_pct: None,
+                cores: totals.cpu_threads,
+                reason: load_reason.clone(),
+            },
+            load: Load {
+                one: None,
+                five: None,
+                fifteen: None,
+                reason: load_reason,
+            },
+            memory: Memory {
+                total_bytes: Some(totals.memory_total_bytes),
+                available_bytes: Some(
+                    totals
+                        .memory_total_bytes
+                        .saturating_sub(totals.memory_used_bytes),
+                ),
+                used_bytes: Some(totals.memory_used_bytes),
+                swap_total_bytes: None,
+                swap_free_bytes: None,
+                reason: None,
+            },
+            psi: Psi {
+                memory_some_avg10: None,
+                memory_full_avg10: None,
+                cpu_some_avg10: None,
+            },
+            cpu_temp_c: None,
+            gpu_busy_pct: None,
+            network: None,
+            cpu_totals: None,
+            nic: None,
+        },
+        None => HostReadings {
+            cpu: Cpu {
+                used_pct: None,
+                cores: 0,
+                reason: Some(RESOURCES_REASON.to_string()),
+            },
+            load: Load {
+                one: None,
+                five: None,
+                fifteen: None,
+                reason: load_reason,
+            },
+            memory: Memory {
+                total_bytes: None,
+                available_bytes: None,
+                used_bytes: None,
+                swap_total_bytes: None,
+                swap_free_bytes: None,
+                reason: Some(RESOURCES_REASON.to_string()),
+            },
+            psi: Psi {
+                memory_some_avg10: None,
+                memory_full_avg10: None,
+                cpu_some_avg10: None,
+            },
+            cpu_temp_c: None,
+            gpu_busy_pct: None,
+            network: None,
+            cpu_totals: None,
+            nic: None,
+        },
+    }
+}
+
 /// The `node_metrics` result row: the sample time, the window in minutes, the latest sample and the mean over the window.
 /// Without minutes the window is [`DEFAULT_MINUTES`].
 pub fn node_metrics(s: &Sampler<impl IncusRead>, minutes: Option<u32>, now_ms: u64) -> Value {
@@ -473,19 +617,23 @@ pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
         cpu: Cpu {
             used_pct: average(samples.iter().filter_map(|s| s.cpu.used_pct)),
             cores: last.cpu.cores,
+            reason: last.cpu.reason.clone(),
         },
         load: Load {
             one: average(samples.iter().filter_map(|s| s.load.one)),
             five: average(samples.iter().filter_map(|s| s.load.five)),
             fifteen: average(samples.iter().filter_map(|s| s.load.fifteen)),
+            reason: last.load.reason.clone(),
         },
         memory: Memory {
             total_bytes: average_whole(samples.iter().filter_map(|s| s.memory.total_bytes)),
             available_bytes: average_whole(samples.iter().filter_map(|s| s.memory.available_bytes)),
+            used_bytes: average_whole(samples.iter().filter_map(|s| s.memory.used_bytes)),
             swap_total_bytes: average_whole(
                 samples.iter().filter_map(|s| s.memory.swap_total_bytes),
             ),
             swap_free_bytes: average_whole(samples.iter().filter_map(|s| s.memory.swap_free_bytes)),
+            reason: last.memory.reason.clone(),
         },
         psi: Psi {
             memory_some_avg10: average(samples.iter().filter_map(|s| s.psi.memory_some_avg10)),

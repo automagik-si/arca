@@ -133,6 +133,7 @@ fn sampler_for(
         pools: pools.iter().map(|pool| pool.to_string()).collect(),
         interval_ms,
         history_minutes,
+        incus_local: true,
     };
     Sampler::new(cfg, UnixIncus::new(socket.to_path_buf()))
 }
@@ -152,17 +153,21 @@ fn bare(at: u64) -> HostSample {
         cpu: Cpu {
             used_pct: None,
             cores: 4,
+            reason: None,
         },
         load: Load {
             one: None,
             five: None,
             fifteen: None,
+            reason: None,
         },
         memory: Memory {
             total_bytes: None,
             available_bytes: None,
+            used_bytes: None,
             swap_total_bytes: None,
             swap_free_bytes: None,
+            reason: None,
         },
         psi: Psi {
             memory_some_avg10: None,
@@ -206,7 +211,8 @@ fn every_field_matches_the_value_worked_out_by_hand() {
         Load {
             one: Some(0.52),
             five: Some(0.48),
-            fifteen: Some(0.40)
+            fifteen: Some(0.40),
+            reason: None
         }
     );
     // 16000000, 8000000, 2000000 and 1500000 kB, each times 1024.
@@ -215,8 +221,10 @@ fn every_field_matches_the_value_worked_out_by_hand() {
         Memory {
             total_bytes: Some(16_384_000_000),
             available_bytes: Some(8_192_000_000),
+            used_bytes: Some(8_192_000_000),
             swap_total_bytes: Some(2_048_000_000),
             swap_free_bytes: Some(1_536_000_000),
+            reason: None,
         }
     );
     assert_eq!(
@@ -290,8 +298,10 @@ fn a_missing_file_reads_null_for_its_field_and_nothing_panics() {
         Memory {
             total_bytes: None,
             available_bytes: None,
+            used_bytes: None,
             swap_total_bytes: None,
             swap_free_bytes: None,
+            reason: None,
         }
     );
     assert_eq!(
@@ -299,7 +309,8 @@ fn a_missing_file_reads_null_for_its_field_and_nothing_panics() {
         Load {
             one: None,
             five: None,
-            fifteen: None
+            fifteen: None,
+            reason: None
         }
     );
     assert_eq!(sample.psi.memory_some_avg10, None);
@@ -334,7 +345,8 @@ fn a_missing_cpu_file_gives_zero_cores_and_no_percentage() {
         sample.cpu,
         Cpu {
             used_pct: None,
-            cores: 0
+            cores: 0,
+            reason: None
         }
     );
 }
@@ -358,7 +370,8 @@ fn an_unparseable_aggregate_line_reads_no_percentage_but_still_counts_cores() {
         sample.cpu,
         Cpu {
             used_pct: None,
-            cores: 2
+            cores: 2,
+            reason: None
         }
     );
 }
@@ -733,6 +746,7 @@ mod pools_from_incus {
                 pools: pools.iter().map(|pool| pool.to_string()).collect(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             incus,
         )
@@ -1039,6 +1053,7 @@ mod instance_readings {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             incus,
         )
@@ -1528,6 +1543,7 @@ mod osd_readings {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             docs.clone(),
         )
@@ -1557,6 +1573,7 @@ mod osd_readings {
             pools: Vec::new(),
             interval_ms: 5_000,
             history_minutes: 60,
+            incus_local: true,
         };
         let mut sampler = Sampler::new(cfg.clone(), docs.clone());
         sampler.sample(CHECKED);
@@ -2072,6 +2089,7 @@ mod smart_readings {
                 pools: Vec::new(),
                 interval_ms: 5_000,
                 history_minutes: 60,
+                incus_local: true,
             },
             storage.clone(),
         )
@@ -2158,5 +2176,234 @@ mod smart_readings {
             None,
             "a failing drive is never hidden as absent"
         );
+    }
+}
+
+/// The host totals of the machine the node's Incus serves, and the local readings that must never stand in for them.
+mod host_totals {
+    use std::sync::{Arc, Mutex};
+
+    use arca_incus::{IncusError, IncusRead};
+
+    use super::*;
+
+    /// The path the host totals are read from.
+    const RESOURCES: &str = "/1.0/resources";
+    const REMOTE_REASON: &str = "not available for a remote host";
+    const FAILED_REASON: &str = "the Incus resources read failed";
+
+    /// An Incus that answers one `/1.0/resources` result, and 404 for every other path, recording each path it is asked
+    /// for.
+    #[derive(Clone)]
+    struct Resources {
+        answer: Arc<Mutex<Result<Value, IncusError>>>,
+        reads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Resources {
+        fn serving(document: Value) -> Resources {
+            Resources {
+                answer: Arc::new(Mutex::new(Ok(document))),
+                reads: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn failing() -> Resources {
+            Resources {
+                answer: Arc::new(Mutex::new(Err(IncusError::Status {
+                    code: 503,
+                    message: "unavailable".to_string(),
+                }))),
+                reads: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        /// How many times the resources path itself was asked for.
+        fn resources_reads(&self) -> usize {
+            self.reads
+                .lock()
+                .expect("the reads are not poisoned")
+                .iter()
+                .filter(|path| path.as_str() == RESOURCES)
+                .count()
+        }
+    }
+
+    impl IncusRead for Resources {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            self.reads
+                .lock()
+                .expect("the reads are not poisoned")
+                .push(path.to_string());
+            if path != RESOURCES {
+                return Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                });
+            }
+            self.answer
+                .lock()
+                .expect("the answer is not poisoned")
+                .clone()
+        }
+    }
+
+    /// The part of a `/1.0/resources` answer this sampler reads.
+    fn resources(cpu_threads: u64, memory_total: u64, memory_used: u64) -> Value {
+        json!({
+            "cpu": { "total": cpu_threads },
+            "memory": { "total": memory_total, "used": memory_used },
+        })
+    }
+
+    fn sampler(root: &Path, incus: Resources, incus_local: bool) -> Sampler<Resources> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: root.join("proc"),
+                sys_root: root.join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local,
+            },
+            incus,
+        )
+    }
+
+    /// A sample with no host reading at all, for the empty pressure comparison.
+    fn no_psi() -> Psi {
+        Psi {
+            memory_some_avg10: None,
+            memory_full_avg10: None,
+            cpu_some_avg10: None,
+        }
+    }
+
+    #[test]
+    fn a_remote_host_reports_the_incus_totals_and_leaves_every_local_reading_null() {
+        let scratch = Scratch::new("remote-totals");
+        // The local tree says 4 threads and 16 GiB. A remote node must never report those.
+        write_first_tree(scratch.path());
+        let incus = Resources::serving(resources(16, 17_045_651_456, 3_417_186_304));
+        let mut sampler = sampler(scratch.path(), incus.clone(), false);
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert_eq!(sample.cpu.cores, 16, "cpu.total threads, never the local 4");
+        assert_eq!(sample.cpu.used_pct, None);
+        assert_eq!(sample.cpu.reason.as_deref(), Some(REMOTE_REASON));
+        assert_eq!(
+            sample.load,
+            Load {
+                one: None,
+                five: None,
+                fifteen: None,
+                reason: Some(REMOTE_REASON.to_string()),
+            }
+        );
+        assert_eq!(sample.memory.total_bytes, Some(17_045_651_456));
+        assert_eq!(sample.memory.used_bytes, Some(3_417_186_304));
+        assert_eq!(
+            sample.memory.available_bytes,
+            Some(17_045_651_456 - 3_417_186_304)
+        );
+        assert_eq!(sample.memory.reason, None);
+        assert_eq!(sample.memory.swap_total_bytes, None);
+        assert_eq!(sample.memory.swap_free_bytes, None);
+        assert_eq!(sample.psi, no_psi());
+        assert_eq!(sample.cpu_temp_c, None);
+        assert_eq!(sample.gpu_busy_pct, None);
+        assert_eq!(sample.network, None);
+        assert_eq!(incus.resources_reads(), 1, "the totals came from Incus");
+
+        let value = node_metrics(&sampler, Some(1), 1_000);
+        let schema = (verb("node_metrics")
+            .expect("node_metrics is in the verb table")
+            .result)();
+        conforms(&schema, &value).expect("a remote node_metrics result conforms to its schema");
+        assert_eq!(value["latest"]["cpu"]["cores"], json!(16));
+        assert_eq!(
+            value["latest"]["memory"]["totalBytes"],
+            json!(17_045_651_456u64)
+        );
+        assert_eq!(
+            value["mean"]["memory"]["usedBytes"],
+            json!(3_417_186_304u64)
+        );
+        assert_eq!(value["mean"]["load"]["reason"], json!(REMOTE_REASON));
+    }
+
+    #[test]
+    fn a_local_host_keeps_the_proc_readings_and_never_asks_incus_for_totals() {
+        let scratch = Scratch::new("local-proc");
+        write_first_tree(scratch.path());
+        // Incus would call this host a different machine. A local node must not read it.
+        let incus = Resources::serving(resources(16, 17_045_651_456, 3_417_186_304));
+        let mut sampler = sampler(scratch.path(), incus.clone(), true);
+
+        let first = sampler.sample(1_000).clone();
+        assert_eq!(first.cpu.cores, 4, "the local /proc count");
+        assert_eq!(first.cpu.reason, None);
+        assert_eq!(first.load.one, Some(0.52));
+        assert_eq!(first.load.reason, None);
+        assert_eq!(first.memory.total_bytes, Some(16_384_000_000));
+        assert_eq!(first.memory.available_bytes, Some(8_192_000_000));
+        assert_eq!(
+            first.memory.used_bytes,
+            Some(16_384_000_000 - 8_192_000_000)
+        );
+        assert_eq!(first.memory.reason, None);
+
+        write_second_counters(scratch.path());
+        let second = sampler.sample(6_000).clone();
+        assert_eq!(second.cpu.used_pct, Some(25.0));
+        assert_eq!(
+            incus.resources_reads(),
+            0,
+            "a local host keeps its own /proc totals and asks Incus for none"
+        );
+    }
+
+    #[test]
+    fn a_failed_resources_read_is_null_with_a_reason_and_never_the_local_numbers() {
+        let scratch = Scratch::new("remote-failed");
+        // The local tree would answer 4 threads and 16 GiB. A failed resources read must not fall back to it.
+        write_first_tree(scratch.path());
+        let incus = Resources::failing();
+        let mut sampler = sampler(scratch.path(), incus.clone(), false);
+
+        let sample = sampler.sample(1_000).clone();
+
+        assert_eq!(sample.cpu.cores, 0, "unknown, never the local 4");
+        assert_eq!(sample.cpu.used_pct, None);
+        assert_eq!(sample.cpu.reason.as_deref(), Some(FAILED_REASON));
+        assert_eq!(sample.load.reason.as_deref(), Some(REMOTE_REASON));
+        assert_eq!(sample.memory.total_bytes, None);
+        assert_eq!(sample.memory.available_bytes, None);
+        assert_eq!(sample.memory.used_bytes, None);
+        assert_eq!(sample.memory.reason.as_deref(), Some(FAILED_REASON));
+        assert_eq!(sample.psi, no_psi());
+        assert_eq!(sample.cpu_temp_c, None);
+        assert_eq!(sample.gpu_busy_pct, None);
+        assert_eq!(sample.network, None);
+        assert_eq!(incus.resources_reads(), 1);
+    }
+
+    #[test]
+    fn a_malformed_resources_document_is_unknown_not_a_zero_or_partial_host() {
+        let scratch = Scratch::new("remote-malformed");
+        write_first_tree(scratch.path());
+        let incus = Resources::serving(json!({
+            "cpu": { "total": 16 },
+            "memory": { "total": 17_045_651_456u64 },
+        }));
+        let mut sampler = sampler(scratch.path(), incus, false);
+
+        let sample = sampler.sample(1_000).clone();
+        assert_eq!(sample.cpu.cores, 0);
+        assert_eq!(sample.cpu.reason.as_deref(), Some(FAILED_REASON));
+        assert_eq!(sample.memory.total_bytes, None);
+        assert_eq!(sample.memory.used_bytes, None);
+        assert_eq!(sample.memory.reason.as_deref(), Some(FAILED_REASON));
     }
 }
