@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -245,11 +244,8 @@ fn post(
     stream
         .write_all(request.as_bytes())
         .map_err(|_| unreachable())?;
-    if peer.is_some() {
-        stream
-            .shutdown(Shutdown::Write)
-            .map_err(|_| unreachable())?;
-    }
+    // Content-Length frames the POST. Keep the write side open while awaiting
+    // the reply: forwarding an EOF can cancel the HTTP server's pending response.
     let mut reply = Vec::new();
     stream.read_to_end(&mut reply).map_err(|_| unreachable())?;
     split_reply(&reply)
