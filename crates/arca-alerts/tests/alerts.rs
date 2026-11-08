@@ -20,7 +20,7 @@ use arca_alerts::eval::{
 };
 use arca_alerts::rules::{AlertsFile, Probes, RulesError};
 use arca_alerts::{
-    AlertState, Engine, QUEUE_LIMIT, STORE_WRITE_FAILED, TickStore, UnknownReason, export, inputs,
+    Engine, QUEUE_LIMIT, STORE_WRITE_FAILED, TickStore, UnknownReason, export, inputs,
 };
 use arca_incus::{FakeIncus, FakeState, UnixIncus};
 use arca_metrics::{Sampler, SamplerConfig};
@@ -843,11 +843,70 @@ mod eval {
         }
     }
 
+    #[test]
+    fn a_data_gap_does_not_shorten_the_clear_window() {
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+        for t in (0..=60_000).step_by(5_000) {
+            eval.step(
+                &rules,
+                &reading_of(RuleId::MemPsiHigh, 30.0, T0 + t),
+                T0 + t,
+            );
+        }
+        assert_eq!(eval.firing().len(), 1, "the pressure alert fires at 60 s");
+
+        // 100 s with no data. It is a transient gap, so the alert stays firing and no event is written.
+        for t in (65_000..=165_000).step_by(5_000) {
+            assert!(
+                eval.step(
+                    &rules,
+                    &Inputs {
+                        at: T0 + t,
+                        ..Inputs::default()
+                    },
+                    T0 + t,
+                )
+                .is_empty(),
+                "no event at {t} ms"
+            );
+        }
+
+        // The first real low reading at 170 s starts the clear window. 15 s later it must not clear.
+        for t in [170_000, 185_000] {
+            assert!(
+                eval.step(&rules, &reading_of(RuleId::MemPsiHigh, 0.0, T0 + t), T0 + t,)
+                    .is_empty(),
+                "a 15 s low reading does not clear at {t} ms"
+            );
+        }
+        assert_eq!(eval.firing().len(), 1, "still firing after 15 s low");
+
+        // 119 s after the first low reading is not enough; 120 s is.
+        assert!(
+            eval.step(
+                &rules,
+                &reading_of(RuleId::MemPsiHigh, 0.0, T0 + 289_000),
+                T0 + 289_000,
+            )
+            .is_empty(),
+            "119 s of low readings is not 120"
+        );
+        let cleared = eval.step(
+            &rules,
+            &reading_of(RuleId::MemPsiHigh, 0.0, T0 + 290_000),
+            T0 + 290_000,
+        );
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].state, EventState::Resolved);
+        assert_eq!(cleared[0].reason, Some(ResolveReason::Cleared));
+    }
+
     mod incus_down {
         use super::*;
 
         #[test]
-        fn a_firing_alert_whose_source_stays_unreadable_resolves_once_with_no_data_after_the_window()
+        fn pools_and_instances_unreadable_for_10_min_write_no_event_and_keep_the_alerts_firing_and_unknown()
          {
             let rules = Rules::default();
             let both = |at: u64| Inputs {
@@ -868,8 +927,7 @@ mod eval {
                 fired += eval.step(&rules, &both(T0 + t), T0 + t).len();
             }
             assert_eq!(fired, 2, "the pool and the crash loop fire at 60 s");
-            // Until the normal clear window ends, the alerts stay firing and unknown, with no event.
-            for t in (65_000..=180_000).step_by(5_000) {
+            for t in (65_000..=665_000).step_by(5_000) {
                 let down = Inputs {
                     at: T0 + t,
                     ..Inputs::default()
@@ -878,10 +936,10 @@ mod eval {
                     eval.step(&rules, &down, T0 + t).is_empty(),
                     "no event at {t} ms"
                 );
-                let firing = eval.firing();
-                assert_eq!(firing.len(), 2, "both stay firing at {t} ms");
-                assert!(firing.iter().all(|alert| alert.unknown), "both are unknown");
             }
+            let firing = eval.firing();
+            assert_eq!(firing.len(), 2, "both stay firing");
+            assert!(firing.iter().all(|alert| alert.unknown), "both are unknown");
             assert_eq!(
                 unknown_of(&eval, RuleId::DiskPoolFull),
                 Some(UnknownReason::Missing)
@@ -890,45 +948,43 @@ mod eval {
                 unknown_of(&eval, RuleId::CrashLoop),
                 Some(UnknownReason::Missing)
             );
-            // 120 s after the data stopped (65 s), each firing alert resolves once with `no data`.
-            let resolved = eval.step(
-                &rules,
-                &Inputs {
-                    at: T0 + 185_000,
-                    ..Inputs::default()
-                },
-                T0 + 185_000,
-            );
-            assert_eq!(resolved.len(), 2, "both resolve at 185 s");
-            assert!(
-                resolved
-                    .iter()
-                    .all(|event| event.state == EventState::Resolved)
-            );
-            assert!(
-                resolved
-                    .iter()
-                    .all(|event| event.reason == Some(ResolveReason::NoData))
-            );
-            assert!(eval.firing().is_empty(), "neither fires after the window");
-            assert!(
-                eval.unknown()
-                    .iter()
-                    .all(|alert| alert.state == AlertState::Ok),
-                "the rules stay listed as unknown with no firing alert"
-            );
-            // The dead source writes no further event.
-            assert!(
+        }
+
+        #[test]
+        fn an_alert_whose_reading_can_never_exist_resolves_with_no_data_after_the_window() {
+            let rules = Rules::default();
+            let mut eval = Evaluator::default();
+            for t in (0..=60_000).step_by(5_000) {
                 eval.step(
                     &rules,
-                    &Inputs {
-                        at: T0 + 190_000,
-                        ..Inputs::default()
-                    },
-                    T0 + 190_000,
-                )
-                .is_empty()
-            );
+                    &reading_of(RuleId::MemPsiHigh, 30.0, T0 + t),
+                    T0 + t,
+                );
+            }
+            assert_eq!(eval.firing().len(), 1, "the pressure alert fires at 60 s");
+            // The reading is known to be unavailable, not merely missing: after the clear window it resolves no data.
+            let unavailable = |t: u64| Inputs {
+                at: T0 + t,
+                unavailable: std::collections::BTreeSet::from([RuleId::MemPsiHigh]),
+                ..Inputs::default()
+            };
+            for t in (65_000..=180_000).step_by(5_000) {
+                assert!(
+                    eval.step(&rules, &unavailable(t), T0 + t).is_empty(),
+                    "no event at {t} ms"
+                );
+                assert_eq!(eval.firing().len(), 1, "still firing at {t} ms");
+                assert!(eval.firing()[0].unknown);
+                assert_eq!(
+                    unknown_of(&eval, RuleId::MemPsiHigh),
+                    Some(UnknownReason::Unavailable)
+                );
+            }
+            let resolved = eval.step(&rules, &unavailable(185_000), T0 + 185_000);
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].state, EventState::Resolved);
+            assert_eq!(resolved[0].reason, Some(ResolveReason::NoData));
+            assert!(eval.firing().is_empty());
         }
     }
 
@@ -1768,6 +1824,7 @@ mod get_only {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             UnixIncus::new(fake.socket().to_path_buf()),
         );

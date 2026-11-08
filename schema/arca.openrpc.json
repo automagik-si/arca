@@ -1524,7 +1524,8 @@
                   "reason": {
                     "enum": [
                       "missing",
-                      "stale"
+                      "stale",
+                      "unavailable"
                     ],
                     "type": "string"
                   },

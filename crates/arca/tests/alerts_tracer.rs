@@ -86,6 +86,7 @@ fn a_full_pool_fires_at_60_s_and_reaches_the_store_alerts_list_and_metrics() {
             interval_ms: 5_000,
             history_minutes: 60,
             incus_local: true,
+            mode_retry: None,
         },
         UnixIncus::new(fake.socket().to_path_buf()),
     );

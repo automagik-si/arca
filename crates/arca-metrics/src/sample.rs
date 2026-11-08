@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::incus::{self, InstanceReading};
+use crate::mode::{HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode_within};
 use crate::osd::{self, OsdReading, UpdateMemory};
 use crate::probe::{self, ProbeTarget};
 use crate::procfs::{self, CpuTotals, NicTotals};
@@ -60,6 +62,8 @@ pub struct SamplerConfig {
     /// `proc_root` and `sys_root`. When false, the totals come from the node's Incus `GET /1.0/resources`, and every local
     /// reading is left out: it would describe the machine Arca runs on, not the remote machine Incus serves.
     pub incus_local: bool,
+    /// The explicit config value and socket-path rule to retry a provisional mode. `None` keeps `incus_local` fixed.
+    pub mode_retry: Option<ModeRetry>,
 }
 
 /// One host sample of the machine the node's Incus serves. A reading the host cannot give is `null`, never a guessed zero,
@@ -251,11 +255,17 @@ pub struct Sampler<R: IncusRead> {
     osd_memory: UpdateMemory,
     /// When the incus-osd storage document was last read for SMART, in epoch milliseconds. `None` until the first read.
     smart_read_at: Option<u64>,
+    /// How to retry a provisional mode. Cleared once a server-name answer decides it.
+    mode_retry: Option<ModeRetry>,
+    /// The choice `arca_status` reads, when the server shares it. A provisional choice is replaced here when a retry
+    /// succeeds. `None` for a sampler a test builds directly.
+    mode_choice: Option<Arc<Mutex<HostModeChoice>>>,
 }
 
 impl<R: IncusRead> Sampler<R> {
     pub fn new(cfg: SamplerConfig, incus: R) -> Self {
         let capacity = ring_capacity(&cfg);
+        let mode_retry = cfg.mode_retry.clone();
         Self {
             cfg,
             incus,
@@ -270,7 +280,15 @@ impl<R: IncusRead> Sampler<R> {
             osd_read_at: None,
             osd_memory: UpdateMemory::default(),
             smart_read_at: None,
+            mode_retry,
+            mode_choice: None,
         }
+    }
+
+    /// Shares the startup mode choice with `arca_status`, so a retry that succeeds replaces the provisional answer there too.
+    pub fn with_mode_choice(mut self, choice: Arc<Mutex<HostModeChoice>>) -> Self {
+        self.mode_choice = Some(choice);
+        self
     }
 
     /// Names the latency targets to probe, each with its TCP address. A sampler with no target never probes, and a target that
@@ -290,6 +308,7 @@ impl<R: IncusRead> Sampler<R> {
     /// A remote host's totals are read from its Incus every tick; a failed read is null with [`RESOURCES_REASON`], never the
     /// local machine's numbers. A local host keeps reading its own procfs and sysfs.
     pub fn sample(&mut self, now_ms: u64) -> &HostSample {
+        self.retry_mode();
         let previous = self.previous;
         let host = read_host(&self.cfg, &self.incus, previous, now_ms);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
@@ -368,6 +387,35 @@ impl<R: IncusRead> Sampler<R> {
         self.ring
             .back()
             .expect("the sample just pushed is in the ring")
+    }
+
+    /// Retries a provisional mode's `/1.0` name check, under [`MODE_PROBE_TIMEOUT`]. Once the server names itself and the
+    /// name comparison succeeds, the answer is kept and no later sample probes again. A mode from `incus.local` or from a
+    /// real name comparison is never provisional, so this does nothing for it.
+    fn retry_mode(&mut self) {
+        let Some(retry) = self.mode_retry.clone() else {
+            return;
+        };
+        let choice = choose_host_mode_within(
+            &self.incus,
+            retry.explicit,
+            retry.path_is_local,
+            &self.cfg.proc_root,
+            MODE_PROBE_TIMEOUT,
+        );
+        if choice.provisional {
+            return;
+        }
+        self.cfg.incus_local = choice.is_local();
+        self.mode_retry = None;
+        if let Some(shared) = &self.mode_choice {
+            *shared.lock().unwrap_or_else(PoisonError::into_inner) = choice.clone();
+        }
+        eprintln!(
+            "arca: metrics source {}: {}",
+            choice.mode.as_str(),
+            choice.reason
+        );
     }
 
     /// Counts each instance's starts against the previous listing and returns the readings with the counts filled in. A start is

@@ -13,7 +13,10 @@ mod sample;
 mod smart;
 
 pub use incus::{InstanceKind, InstanceReading};
-pub use mode::{HostMode, HostModeChoice, choose_host_mode};
+pub use mode::{
+    HostMode, HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode,
+    choose_host_mode_within,
+};
 pub use osd::OsdReading;
 pub use probe::ProbeTarget;
 pub use sample::{

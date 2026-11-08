@@ -97,6 +97,13 @@ impl std::error::Error for IncusError {}
 /// Reads Incus. The only method is GET, and the result is the answer's unwrapped `metadata`.
 pub trait IncusRead: Send + Sync {
     fn get(&self, path: &str) -> Result<Value, IncusError>;
+
+    /// Reads one path under a shorter deadline than the client's own. The default keeps `get`'s deadline, so a fake or a
+    /// client without a configurable deadline needs no override. The startup host-mode probe uses it so a hung Incus costs
+    /// at most its own short deadline.
+    fn get_within(&self, path: &str, _timeout: Duration) -> Result<Value, IncusError> {
+        self.get(path)
+    }
 }
 
 /// A GET-only client for Incus's unix socket.
@@ -155,6 +162,15 @@ impl IncusRead for UnixIncus {
             "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
         );
         let framed = exchange(&self.socket, self.timeout, request.as_bytes())?;
+        decode(framed.into_raw())
+    }
+
+    fn get_within(&self, path: &str, timeout: Duration) -> Result<Value, IncusError> {
+        check_path(path)?;
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: incus\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        );
+        let framed = exchange(&self.socket, timeout, request.as_bytes())?;
         decode(framed.into_raw())
     }
 }

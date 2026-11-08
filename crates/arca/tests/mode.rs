@@ -5,6 +5,7 @@ mod common;
 
 use std::path::Path;
 
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arca::config::NodeConfig;
@@ -13,7 +14,7 @@ use arca::kernel::AppliedSeq;
 use arca_api::Scope;
 use arca_incus::{FakeIncus, FakeState};
 use arca_mcp::{Caller, ToolHandler};
-use arca_metrics::HostMode;
+use arca_metrics::{HostMode, HostModeChoice};
 use common::Scratch;
 use serde_json::json;
 
@@ -59,6 +60,11 @@ fn local_hostname() -> String {
         .to_string()
 }
 
+/// The current shared mode choice.
+fn chosen(shared: &Arc<Mutex<HostModeChoice>>) -> HostModeChoice {
+    shared.lock().expect("the choice is not poisoned").clone()
+}
+
 fn resource_reads(fake: &FakeIncus) -> usize {
     fake.requests()
         .into_iter()
@@ -72,6 +78,7 @@ fn a_shim_style_socket_to_the_local_daemon_is_local_and_keeps_proc_readings() {
     let fake = fake(&scratch, &local_hostname());
     let (mut sampler, choice) = new_sampler(&config(fake.socket(), None));
 
+    let choice = chosen(&choice);
     assert_eq!(choice.mode, HostMode::Local);
     assert_eq!(
         choice.reason,
@@ -94,6 +101,7 @@ fn a_proxy_to_another_host_is_remote_and_reports_no_local_reading() {
     let fake = fake(&scratch, "another-host");
     let (mut sampler, choice) = new_sampler(&config(fake.socket(), None));
 
+    let choice = chosen(&choice);
     assert_eq!(choice.mode, HostMode::Remote);
     assert_eq!(
         choice.reason,
@@ -115,12 +123,12 @@ fn an_explicit_local_or_remote_wins_over_the_server_name() {
     let fake = fake(&scratch, &local_hostname());
 
     let (_, forced_remote) = new_sampler(&config(fake.socket(), Some(false)));
-    assert_eq!(forced_remote.mode, HostMode::Remote);
-    assert_eq!(forced_remote.reason, "incus.local is false");
+    assert_eq!(chosen(&forced_remote).mode, HostMode::Remote);
+    assert_eq!(chosen(&forced_remote).reason, "incus.local is false");
 
     let (_, forced_local) = new_sampler(&config(fake.socket(), Some(true)));
-    assert_eq!(forced_local.mode, HostMode::Local);
-    assert_eq!(forced_local.reason, "incus.local is true");
+    assert_eq!(chosen(&forced_local).mode, HostMode::Local);
+    assert_eq!(chosen(&forced_local).reason, "incus.local is true");
 }
 
 #[test]

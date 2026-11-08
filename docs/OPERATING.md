@@ -337,13 +337,15 @@ on when the two differ. The mode is chosen at startup, in this order:
 
 1. An explicit `incus.local` wins: `true` means the local daemon, `false` a remote one.
 2. Otherwise the node reads the Incus server document, `GET /1.0`, and compares `environment.server_name` with the local
-   host name, without case. A match is local; a mismatch is remote.
-3. If `/1.0` cannot be read, or it does not carry a server name, or the local host name cannot be read, the socket path
-   decides: the standard local daemon sockets (`/var/lib/incus/unix.socket` and `/var/lib/incus/unix.socket.user`) are local
-   and every other path is remote.
+   host name, without case. A match is local; a mismatch is remote. A name of `localhost`, `localhost.localdomain` or an
+   empty name identifies no machine and is treated as unknown.
+3. If `/1.0` cannot be read, or it does not carry a usable server name, or the local host name cannot be read, the socket
+   path decides: the standard local daemon sockets (`/var/lib/incus/unix.socket` and `/var/lib/incus/unix.socket.user`) are
+   local and every other path is remote. This choice is provisional: each later sample retries the `/1.0` check, under the
+   same 2 s cap and with no added startup delay, until the server names itself, then keeps that answer.
 
-The chosen mode and a value-free reason are logged once at startup and returned by `arca_status` as `metricsSource`
-(`local` or `remote`) and `metricsSourceReason`. The reason never carries a host name. A proxy whose upstream is the local
+The chosen mode and a value-free reason are logged at startup, and again if a provisional choice is replaced, and returned
+by `arca_status` as `metricsSource` (`local` or `remote`) and `metricsSourceReason`. The reason never carries a host name. A proxy whose upstream is the local
 daemon, such as the recording shim, therefore needs no `"local": true`: its server name matches the local host name. A
 container that mounts the host's Incus socket at the standard path is still remote when its own host name differs from the
 Incus server name, so the sampler never reports the container's `/proc` as the managed host's.
@@ -355,8 +357,10 @@ Incus server name, so the sampler never reports the container's `/proc` as the m
   (threads), `memory.totalBytes` is `memory.total`, and `memory.usedBytes` is `memory.used`.
   `memory.availableBytes` is `memory.total - memory.used`. `cpu.coresKnown` is `true`. No local `/proc` or `/sys` reading is
   reported: `cpu.usedPct`, every `load` average, PSI, CPU temperature, GPU busy, swap and NIC rates are `null`. `cpu.reason`
-  and `load.reason` say `not available for a remote host`. The pools, instance counts, incus-osd reading and SMART state
-  still come from the same Incus, so they describe the remote machine too.
+  and `load.reason` say `not available for a remote host`. PSI and CPU temperature are reported to the alert evaluator as
+  readings this node can never provide, so a firing `mem-psi-high` or `cpu-hot` resolves with `no data` after its clear
+  window instead of staying unknown forever. The pools, instance counts, incus-osd reading and SMART state still come from
+  the same Incus, so they describe the remote machine too.
 - **The resources read fails.** On a remote node the totals are `null` and `cpu.coresKnown` is `false`; `cpu.cores` stays an
   integer in the schema, so its `0` is a placeholder a consumer must not show as a count. `cpu.reason` and `memory.reason`
   say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong
@@ -972,19 +976,20 @@ components, 15 seconds; the watch sweep and the latency probes, 90 seconds; the 
 result, 2 hours.
 
 - Unknown data never starts an alert. A pending alert keeps its state. A firing alert stays firing and is marked
-  `unknown: true` while its input is missing, and no event is written; if the input stays unknown for `clearForS`, the alert
-  resolves once with reason `no data` instead of firing forever. A fresh reading before then clears the unknown and keeps the
-  alert firing.
-- `alerts_list.unknown` lists each unknown rule and label set, with reason `missing` (no reading yet) or `stale` (too old).
+  `unknown: true` while its input is missing, and no event is written, even through a long outage.
+- The one exception is a reading the node can never provide, such as PSI or CPU temperature on a remote metrics source. A
+  firing alert for one resolves once with reason `no data` after `clearForS`; a fresh reading before then keeps it firing.
+- `alerts_list.unknown` lists each unknown rule and label set, with reason `missing` (no reading yet), `stale` (too old) or
+  `unavailable` (a reading this node can never provide).
 - The one exception is `subject-gone`. A fresh, known reading that no longer has a firing alert's label set (a deleted pool
   or instance, or a drive that left the drive list) resolves that alert once.
-- When Incus does not answer, the instance and pool readings are unknown. A firing alert stays firing and marked unknown
-  until `clearForS` passes without a fresh reading, then resolves once with `no data`. `node_metrics` still lists `projects`
-  and `pools` as empty arrays, because its released schema has no null, so those lists alone do not show an outage.
+- When Incus does not answer, the instance and pool readings are unknown, and no alert ends. `node_metrics` still lists
+  `projects` and `pools` as empty arrays, because its released schema has no null, so those lists alone do not show an
+  outage.
 - A drive listed with an ID but no usable SMART result (its SMART block is missing, null or disabled) is unknown, not passed.
-  A firing `smart-warning` for it is held as unknown, and resolves with `no data` after `clearForS` without a result; a drive
-  that was OK and then loses its SMART result stays listed as unknown while the holding window lasts. A SMART block with a
-  non-empty `error` makes the whole SMART reading unknown.
+  A firing `smart-warning` for it is held as unknown. A drive that was OK and then loses its SMART result stays listed as
+  unknown, and it resolves only when it leaves the drive list. A SMART block with a non-empty `error` makes the whole SMART
+  reading unknown.
 - When incus-osd hangs, one tick can take about 20 seconds. The HEALTH line then reads `alerts stale`, and it recovers at
   the next tick that finishes.
 

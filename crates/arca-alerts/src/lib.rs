@@ -86,6 +86,8 @@ impl AlertState {
 pub enum UnknownReason {
     Missing,
     Stale,
+    /// The node can never provide this reading, as a remote metrics source cannot provide its own PSI or CPU temperature.
+    Unavailable,
 }
 
 impl UnknownReason {
@@ -93,6 +95,7 @@ impl UnknownReason {
         match self {
             Self::Missing => "missing",
             Self::Stale => "stale",
+            Self::Unavailable => "unavailable",
         }
     }
 }

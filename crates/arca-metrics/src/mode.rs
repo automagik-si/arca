@@ -5,14 +5,19 @@
 //! differ, so the sampler never reports the container's `/proc` as the managed host's.
 
 use std::path::Path;
+use std::time::Duration;
 
-use arca_incus::IncusRead;
+use arca_incus::{IncusError, IncusRead};
 use serde_json::Value;
 
 use crate::procfs;
 
 /// The Incus server document: its `environment.server_name` names the daemon.
 pub const SERVER_PATH: &str = "/1.0";
+
+/// The most a host-mode probe may take. The startup probe and each retry of a provisional choice use it, so a hung Incus
+/// never delays startup or a sample by the sampler's ordinary deadline.
+pub const MODE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Where a node's host readings come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +43,9 @@ impl HostMode {
 pub struct HostModeChoice {
     pub mode: HostMode,
     pub reason: String,
+    /// True when the choice is only the socket-path fallback. The sampler retries the server-name check on later samples
+    /// until it gets a real answer, then keeps that answer.
+    pub provisional: bool,
 }
 
 impl HostModeChoice {
@@ -47,11 +55,44 @@ impl HostModeChoice {
     }
 }
 
+/// How to retry a provisional choice: the explicit config value and the socket-path rule, which are all the resolver
+/// needs besides the Incus client and the local host name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeRetry {
+    pub explicit: Option<bool>,
+    pub path_is_local: bool,
+}
+
 /// Chooses the host mode. An explicit `local` wins. Otherwise `GET /1.0`'s `environment.server_name` is compared, without
 /// case, with the local host name from `proc_root`. The socket path rule (`path_is_local`) is the fallback only when the
 /// server or the local host name cannot be read.
 pub fn choose_host_mode<R: IncusRead>(
     incus: &R,
+    explicit: Option<bool>,
+    path_is_local: bool,
+    proc_root: &Path,
+) -> HostModeChoice {
+    resolve(incus.get(SERVER_PATH), explicit, path_is_local, proc_root)
+}
+
+/// Like [`choose_host_mode`], but the `/1.0` read may take at most `timeout`.
+pub fn choose_host_mode_within<R: IncusRead>(
+    incus: &R,
+    explicit: Option<bool>,
+    path_is_local: bool,
+    proc_root: &Path,
+    timeout: Duration,
+) -> HostModeChoice {
+    resolve(
+        incus.get_within(SERVER_PATH, timeout),
+        explicit,
+        path_is_local,
+        proc_root,
+    )
+}
+
+fn resolve(
+    server: Result<Value, IncusError>,
     explicit: Option<bool>,
     path_is_local: bool,
     proc_root: &Path,
@@ -64,6 +105,7 @@ pub fn choose_host_mode<R: IncusRead>(
                 "incus.local is false"
             },
             local,
+            false,
         );
     }
     let path_reason = if path_is_local {
@@ -71,12 +113,13 @@ pub fn choose_host_mode<R: IncusRead>(
     } else {
         "the socket path is not a standard local Incus socket"
     };
-    let server = match incus.get(SERVER_PATH) {
+    let server = match server {
         Ok(document) => document,
         Err(_) => {
             return choice(
                 &format!("the Incus server could not be read; {path_reason}"),
                 path_is_local,
+                true,
             );
         }
     };
@@ -84,25 +127,33 @@ pub fn choose_host_mode<R: IncusRead>(
         return choice(
             &format!("the Incus server did not name itself; {path_reason}"),
             path_is_local,
+            true,
         );
     };
-    let Some(hostname) = procfs::read_hostname(proc_root) else {
+    let Some(hostname) = procfs::read_hostname(proc_root).and_then(|name| usable_name(&name))
+    else {
         return choice(
             &format!("the local host name could not be read; {path_reason}"),
             path_is_local,
+            true,
         );
     };
     if server_name.eq_ignore_ascii_case(&hostname) {
-        choice("the Incus server name matches the local host name", true)
+        choice(
+            "the Incus server name matches the local host name",
+            true,
+            false,
+        )
     } else {
         choice(
             "the Incus server name does not match the local host name",
+            false,
             false,
         )
     }
 }
 
-fn choice(reason: &str, local: bool) -> HostModeChoice {
+fn choice(reason: &str, local: bool, provisional: bool) -> HostModeChoice {
     HostModeChoice {
         mode: if local {
             HostMode::Local
@@ -110,16 +161,23 @@ fn choice(reason: &str, local: bool) -> HostModeChoice {
             HostMode::Remote
         },
         reason: reason.to_string(),
+        provisional,
     }
 }
 
-/// The `environment.server_name` of a server document, when it is a non-empty string.
+/// The `environment.server_name` of a server document, when it is a name that identifies a daemon. Empty, `localhost` and
+/// `localhost.localdomain` name no machine, so they leave the choice to the socket-path fallback.
 fn server_name(document: &Value) -> Option<String> {
-    let name = document
-        .pointer("/environment/server_name")?
-        .as_str()?
-        .trim();
-    (!name.is_empty()).then(|| name.to_string())
+    usable_name(document.pointer("/environment/server_name")?.as_str()?)
+}
+
+/// A host name that can identify a machine, without case. Empty, `localhost` and `localhost.localdomain` are unknown.
+fn usable_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    (!name.is_empty()
+        && !name.eq_ignore_ascii_case("localhost")
+        && !name.eq_ignore_ascii_case("localhost.localdomain"))
+    .then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -223,6 +281,7 @@ mod tests {
             choice.reason,
             "the Incus server name matches the local host name"
         );
+        assert!(!choice.provisional, "a name comparison is a real answer");
         assert_eq!(incus.reads(), vec![SERVER_PATH.to_string()]);
     }
 
@@ -237,6 +296,7 @@ mod tests {
             choice.reason,
             "the Incus server name does not match the local host name"
         );
+        assert!(!choice.provisional, "a name comparison is a real answer");
     }
 
     #[test]
@@ -258,11 +318,19 @@ mod tests {
         let forced_remote = choose_host_mode(&incus, Some(false), true, scratch.path());
         assert_eq!(forced_remote.mode, HostMode::Remote);
         assert_eq!(forced_remote.reason, "incus.local is false");
+        assert!(
+            !forced_remote.provisional,
+            "an explicit value is a real answer"
+        );
 
         let incus = Server::naming("other");
         let forced_local = choose_host_mode(&incus, Some(true), false, scratch.path());
         assert_eq!(forced_local.mode, HostMode::Local);
         assert_eq!(forced_local.reason, "incus.local is true");
+        assert!(
+            !forced_local.provisional,
+            "an explicit value is a real answer"
+        );
     }
 
     #[test]
@@ -276,12 +344,14 @@ mod tests {
             local.reason,
             "the Incus server could not be read; the socket path is a standard local Incus socket"
         );
+        assert!(local.provisional, "a path fallback is worth retrying");
         let remote = choose_host_mode(&incus, None, false, scratch.path());
         assert_eq!(remote.mode, HostMode::Remote);
         assert_eq!(
             remote.reason,
             "the Incus server could not be read; the socket path is not a standard local Incus socket"
         );
+        assert!(remote.provisional, "a path fallback is worth retrying");
         assert_eq!(incus.reads().len(), 2);
     }
 
@@ -299,6 +369,7 @@ mod tests {
             choice.reason,
             "the Incus server did not name itself; the socket path is a standard local Incus socket"
         );
+        assert!(choice.provisional, "a path fallback is worth retrying");
     }
 
     #[test]
@@ -311,5 +382,37 @@ mod tests {
             choice.reason,
             "the local host name could not be read; the socket path is not a standard local Incus socket"
         );
+        assert!(choice.provisional, "a path fallback is worth retrying");
+    }
+
+    #[test]
+    fn localhost_and_empty_names_are_unknown_and_leave_the_path_fallback() {
+        for name in ["localhost", "LOCALHOST.localdomain", ""] {
+            let scratch = Scratch::new("reserved-server");
+            scratch.hostname("node1");
+            let incus = Server::naming(name);
+            let choice = choose_host_mode(&incus, None, false, scratch.path());
+            assert_eq!(choice.mode, HostMode::Remote, "{name:?}");
+            assert_eq!(
+                choice.reason,
+                "the Incus server did not name itself; the socket path is not a standard local Incus socket",
+                "{name:?}"
+            );
+            assert!(choice.provisional, "{name:?}");
+        }
+
+        for name in ["localhost", "localhost.localdomain", ""] {
+            let scratch = Scratch::new("reserved-host");
+            scratch.hostname(name);
+            let incus = Server::naming("node1");
+            let choice = choose_host_mode(&incus, None, true, scratch.path());
+            assert_eq!(choice.mode, HostMode::Local, "{name:?}");
+            assert_eq!(
+                choice.reason,
+                "the local host name could not be read; the socket path is a standard local Incus socket",
+                "{name:?}"
+            );
+            assert!(choice.provisional, "{name:?}");
+        }
     }
 }

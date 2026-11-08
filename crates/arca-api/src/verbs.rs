@@ -965,7 +965,7 @@ fn alerts_list_result() -> Value {
                 ("rule", true, string()),
                 ("labels", true, labels()),
                 ("state", true, one_of(&["ok", "pending", "firing"])),
-                ("reason", true, one_of(&["missing", "stale"])),
+                ("reason", true, one_of(&["missing", "stale", "unavailable"])),
             ])),
         ),
         ("disabled", true, array(string())),

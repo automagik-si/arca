@@ -1,9 +1,9 @@
 //! The tick's [`Inputs`], built from the sampler's newest sample and its [`Readings`].
 
 use arca_incus::IncusRead;
-use arca_metrics::Sampler;
+use arca_metrics::{REMOTE_HOST_REASON, Sampler};
 
-use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, Timed, UpdateUse};
+use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse};
 
 /// The inputs of the sampler's newest sample, stamped with its time. A read that failed in the sampler is `None` here, so
 /// the rule reads it as unknown. Before the first sample every source is unknown.
@@ -12,8 +12,16 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
         return Inputs::default();
     };
     let at = sample.at;
+    // A remote metrics source never gives its own PSI or CPU temperature. A transient outage gives neither, so it is not
+    // marked here: the evaluator keeps those alerts firing through it.
+    let mut unavailable = std::collections::BTreeSet::new();
+    if sample.load.reason.as_deref() == Some(REMOTE_HOST_REASON) {
+        unavailable.insert(RuleId::MemPsiHigh);
+        unavailable.insert(RuleId::CpuHot);
+    }
     Inputs {
         at,
+        unavailable,
         pools: sampler.readings().pools.as_ref().map(|pools| Timed {
             at,
             value: pools
@@ -83,7 +91,7 @@ mod tests {
 
     use super::from_sampler;
     use crate::UnknownReason;
-    use crate::eval::{Evaluator, Inputs, InstanceUse, PoolUse, Rules, Timed};
+    use crate::eval::{Evaluator, Inputs, InstanceUse, PoolUse, RuleId, Rules, Timed};
 
     /// The pools an Incus lists: each name with its used and total bytes.
     type PoolList = Vec<(&'static str, u64, u64)>;
@@ -131,6 +139,7 @@ mod tests {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             incus,
         )
@@ -240,6 +249,7 @@ mod tests {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             Offline,
         );
@@ -351,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn an_outage_resolves_the_firing_alert_with_no_data_and_a_returning_pool_fires_again() {
+    fn an_outage_stays_unknown_to_the_evaluator_and_a_pool_removed_after_it_resolves() {
         const T0: u64 = 1_000_000;
         let live = Live {
             down: Arc::new(AtomicBool::new(false)),
@@ -372,47 +382,57 @@ mod tests {
         }
         assert_eq!(fired, 1, "the pool alert fires at 60 s");
 
-        // Incus is unreachable: no event while the normal clear window holds, and the data is missing, not zero.
+        // Incus is unreachable for ten minutes: no event, the alert stays firing, and its data is missing, not zero.
         live.down.store(true, Ordering::SeqCst);
-        for t in (65_000..=180_000).step_by(5_000) {
+        for t in (65_000..=665_000).step_by(5_000) {
             assert!(
                 tick(&mut sampler, &mut eval, T0 + t).is_empty(),
                 "no event at {t} ms"
             );
-            assert_eq!(eval.firing().len(), 1, "still firing at {t} ms");
-            assert!(eval.firing()[0].unknown, "and marked unknown");
         }
+        assert_eq!(eval.firing().len(), 1, "the alert stays firing");
+        assert!(eval.firing()[0].unknown, "and is marked unknown");
         assert_eq!(
             eval.unknown().first().map(|alert| alert.reason),
             Some(UnknownReason::Missing),
             "an unreachable Incus is missing data"
         );
 
-        // 120 s after the outage began (65 s), the alert resolves once with `no data`, not forever unknown.
-        let resolved = tick(&mut sampler, &mut eval, T0 + 185_000);
-        assert_eq!(resolved.len(), 1, "exactly one resolve");
-        assert_eq!(resolved[0].state, EventState::Resolved);
-        assert_eq!(resolved[0].reason, Some(ResolveReason::NoData));
-        assert!(eval.firing().is_empty());
-
-        // Incus answers again without the pool: the already-resolved alert writes nothing.
+        // Incus answers again without the pool: the removed pool resolves its alert once, as subject-gone.
         live.down.store(false, Ordering::SeqCst);
         live.pools
             .lock()
             .expect("the pool list is not poisoned")
             .clear();
-        assert!(tick(&mut sampler, &mut eval, T0 + 190_000).is_empty());
+        let events = tick(&mut sampler, &mut eval, T0 + 670_000);
+        assert_eq!(events.len(), 1, "exactly one resolve");
+        assert_eq!(events[0].state, EventState::Resolved);
+        assert_eq!(events[0].reason, Some(ResolveReason::SubjectGone));
+        assert!(eval.firing().is_empty());
+    }
 
-        // The pool returns: a fresh alert starts and fires once its 60 s has held.
-        live.pools
-            .lock()
-            .expect("the pool list is not poisoned")
-            .push(("default", 95, 100));
-        let mut refired = 0;
-        for t in (195_000..=255_000).step_by(5_000) {
-            refired += tick(&mut sampler, &mut eval, T0 + t).len();
-        }
-        assert_eq!(refired, 1, "the returned pool fires a fresh alert");
-        assert_eq!(eval.firing().len(), 1);
+    #[test]
+    fn a_remote_source_marks_psi_and_cpu_temperature_never_available() {
+        let mut remote = Sampler::new(
+            SamplerConfig {
+                proc_root: PathBuf::from("/nonexistent/arca-inputs-remote-proc"),
+                sys_root: PathBuf::from("/nonexistent/arca-inputs-remote-sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: None,
+            },
+            Offline,
+        );
+        remote.sample(1_000);
+        let inputs = from_sampler(&remote);
+        assert!(inputs.unavailable.contains(&RuleId::MemPsiHigh));
+        assert!(inputs.unavailable.contains(&RuleId::CpuHot));
+
+        // A local source can give both, so it marks neither unavailable; a missing reading there is a transient gap.
+        let mut local = sampler(Offline, &[]);
+        local.sample(1_000);
+        assert!(from_sampler(&local).unavailable.is_empty());
     }
 }

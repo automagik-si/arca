@@ -134,6 +134,7 @@ fn sampler_for(
         interval_ms,
         history_minutes,
         incus_local: true,
+        mode_retry: None,
     };
     Sampler::new(cfg, UnixIncus::new(socket.to_path_buf()))
 }
@@ -750,6 +751,7 @@ mod pools_from_incus {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             incus,
         )
@@ -1057,6 +1059,7 @@ mod instance_readings {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             incus,
         )
@@ -1547,6 +1550,7 @@ mod osd_readings {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             docs.clone(),
         )
@@ -1577,6 +1581,7 @@ mod osd_readings {
             interval_ms: 5_000,
             history_minutes: 60,
             incus_local: true,
+            mode_retry: None,
         };
         let mut sampler = Sampler::new(cfg.clone(), docs.clone());
         sampler.sample(CHECKED);
@@ -2093,6 +2098,7 @@ mod smart_readings {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local: true,
+                mode_retry: None,
             },
             storage.clone(),
         )
@@ -2184,9 +2190,11 @@ mod smart_readings {
 
 /// The host totals of the machine the node's Incus serves, and the local readings that must never stand in for them.
 mod host_totals {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use arca_incus::{IncusError, IncusRead};
+    use arca_metrics::{HostMode, HostModeChoice, ModeRetry};
 
     use super::*;
 
@@ -2280,6 +2288,7 @@ mod host_totals {
                 interval_ms: 5_000,
                 history_minutes: 60,
                 incus_local,
+                mode_retry: None,
             },
             incus,
         )
@@ -2468,5 +2477,111 @@ mod host_totals {
         assert_eq!(failed.memory.used_bytes, None);
         assert_eq!(failed.memory.reason.as_deref(), Some(FAILED_REASON));
         assert_eq!(failed.load.reason.as_deref(), Some(REMOTE_REASON));
+    }
+
+    /// An Incus whose `/1.0` is unavailable until `up` is set, then names `hostname`; its resources read always fails.
+    #[derive(Clone)]
+    struct LateName {
+        up: Arc<AtomicBool>,
+        hostname: String,
+        reads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl IncusRead for LateName {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            self.reads
+                .lock()
+                .expect("the reads are not poisoned")
+                .push(path.to_string());
+            if path == "/1.0" {
+                return if self.up.load(Ordering::SeqCst) {
+                    Ok(json!({ "environment": { "server_name": self.hostname } }))
+                } else {
+                    Err(IncusError::Timeout)
+                };
+            }
+            Err(IncusError::Status {
+                code: 404,
+                message: "not found".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_provisional_mode_retries_on_a_later_sample_and_switches_to_local() {
+        let scratch = Scratch::new("provisional-retry");
+        write_first_tree(scratch.path());
+        write(scratch.path(), "proc/sys/kernel/hostname", "node1\n");
+        let up = Arc::new(AtomicBool::new(false));
+        let incus = LateName {
+            up: Arc::clone(&up),
+            hostname: "node1".to_string(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let shared = Arc::new(Mutex::new(HostModeChoice {
+            mode: HostMode::Remote,
+            reason: "the Incus server could not be read; the socket path is not a standard local Incus socket"
+                .to_string(),
+            provisional: true,
+        }));
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            incus.clone(),
+        )
+        .with_mode_choice(Arc::clone(&shared));
+
+        // The first probe times out, so the path fallback holds for this sample.
+        let first = sampler.sample(1_000).clone();
+        assert!(!first.cpu.cores_known, "the remote resources read failed");
+        assert_eq!(shared.lock().unwrap().mode, HostMode::Remote);
+        assert!(shared.lock().unwrap().provisional);
+
+        // A later sample's /1.0 succeeds and names this host: the mode switches to local and stays there.
+        up.store(true, Ordering::SeqCst);
+        let second = sampler.sample(6_000).clone();
+        {
+            let choice = shared.lock().expect("the choice is not poisoned");
+            assert_eq!(choice.mode, HostMode::Local);
+            assert_eq!(
+                choice.reason,
+                "the Incus server name matches the local host name"
+            );
+            assert!(!choice.provisional, "the retry is done");
+        }
+        assert_eq!(
+            second.cpu.cores, 4,
+            "the local /proc count after the switch"
+        );
+        assert!(second.cpu.cores_known);
+        assert_eq!(second.load.one, Some(0.52));
+
+        // The answer is kept: later samples do not probe /1.0 again.
+        let probes_before = incus
+            .reads
+            .lock()
+            .expect("the reads are not poisoned")
+            .iter()
+            .filter(|path| path.as_str() == "/1.0")
+            .count();
+        sampler.sample(11_000);
+        let probes_after = incus
+            .reads
+            .lock()
+            .expect("the reads are not poisoned")
+            .iter()
+            .filter(|path| path.as_str() == "/1.0")
+            .count();
+        assert_eq!(probes_before, probes_after, "no further mode probe");
     }
 }
