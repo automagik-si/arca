@@ -93,6 +93,11 @@ impl Kernel {
         })
     }
 
+    /// The sequence of the desired-state document the gate last applied, if any.
+    pub fn applied_seq(&self) -> Option<u64> {
+        self.store.applied().map(|applied| applied.seq)
+    }
+
     /// The entries in the current desired-state document, in application order.
     pub fn entries(&self) -> &[arca_kernel::desired::Entry] {
         self.store

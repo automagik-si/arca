@@ -274,7 +274,8 @@ in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
 
-- `arca_status` reports the node id, `watch-only` mode, uptime, whether Incus answers, and `appliedSeq` as `null`.
+- `arca_status` reports the node id, mode (`kernel` when kernel projects are configured, `watch-only` otherwise), uptime,
+  whether Incus answers, and `appliedSeq`: the applied desired-state document's sequence, or `null` before any document applies.
 - `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
   `mean` are `null`.

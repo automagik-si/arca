@@ -2,7 +2,11 @@
 mod common;
 
 use arca::{
-    config::NodeConfig, handlers::service_handlers, kernel::Kernel, service, service::Service,
+    config::NodeConfig,
+    handlers::{StatusHandler, service_handlers},
+    kernel::Kernel,
+    service,
+    service::Service,
 };
 use arca_api::Scope;
 use arca_approval::{ApprovalVerifier, FileNonces, OwnerKeys, PasskeyVerifier, SshSigVerifier};
@@ -341,6 +345,20 @@ fn nats_template() -> Value {
 #[test]
 fn service_create_list_status_round_trip() {
     let rig = Rig::new();
+    let node_status = StatusHandler {
+        node: "node1".into(),
+        mode: "kernel",
+        kernel: Arc::clone(&rig.kernel),
+        started: std::time::Instant::now(),
+        socket: rig.fake.socket().to_path_buf(),
+    };
+    let doctor = Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let before = node_status.call(json!({}), &doctor).expect("node status");
+    assert_eq!(before["appliedSeq"], Value::Null);
     rig.template("nats", nats_template());
     let created = rig
         .call("service_create", json!({"name":"nats","template":"nats"}))
@@ -352,6 +370,13 @@ fn service_create_list_status_round_trip() {
     assert_eq!(created["ports"], json!([4222]));
     assert_eq!(created["links"], json!([]));
     assert_eq!(created["published"], Value::Null);
+    let after = node_status.call(json!({}), &doctor).expect("node status");
+    let desired: Value =
+        serde_json::from_slice(&fs::read(rig.dir.join("desired.json")).expect("desired state"))
+            .expect("desired JSON");
+    assert_eq!(after["mode"], "kernel");
+    assert_eq!(after["appliedSeq"], desired["current"]["document"]["seq"]);
+    assert!(after["appliedSeq"].as_u64().expect("applied sequence") >= 1);
     let listed = rig.call("service_list", json!({})).expect("list");
     assert_eq!(listed["services"], json!([created]));
     let status = rig

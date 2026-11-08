@@ -193,11 +193,18 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     spawn_sampler(ticker).map_err(|e| Failure::Runtime(e.to_string()))?;
 
     let reader = Arc::new(Mutex::new(reader));
+    let mode = if cfg.kernel.projects.is_empty() {
+        "watch-only"
+    } else {
+        "kernel"
+    };
     let mut server = Server::new(verbs(), tokens.clone())
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
                 node: node.clone(),
+                mode,
+                kernel: Arc::clone(&kernel),
                 started,
                 socket: cfg.incus.socket.clone(),
             }),

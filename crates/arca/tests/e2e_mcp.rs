@@ -331,6 +331,7 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
     assert_eq!(status, 200);
     let status_row = tool_result(&text);
     conforming("arca_status", &status_row);
+    assert_eq!(status_row["mode"], json!("watch-only"));
     assert_eq!(status_row["incusReachable"], json!(true));
     assert_eq!(status_row["appliedSeq"], Value::Null);
 
@@ -405,6 +406,34 @@ fn a_viewer_reads_the_watch_and_the_metrics_and_the_shim_saw_only_gets() {
         rig.fake.requests().iter().all(|r| r.method == "GET"),
         "the fake saw only GET"
     );
+}
+
+#[test]
+fn a_node_with_kernel_projects_reports_kernel_mode_before_any_document_applies() {
+    let scratch = Scratch::new("kernel-status");
+    let rig = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, rig.fake.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["kernel"]["projects"] = json!([arca_netproject::PROJECT]);
+    fs::write(&config, cfg.to_string()).expect("write kernel config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+
+    let (status, text) = post(
+        &socket,
+        &[bearer(secret_of(&secrets, "doctor-1"))],
+        &call(1, "arca_status", json!({})),
+    );
+    assert_eq!(status, 200);
+    let row = tool_result(&text);
+    conforming("arca_status", &row);
+    assert_eq!(row["mode"], json!("kernel"));
+    assert_eq!(row["incusReachable"], json!(true));
+    assert_eq!(row["appliedSeq"], Value::Null);
+    assert_eq!(serve.terminate().code(), Some(0));
 }
 
 #[test]

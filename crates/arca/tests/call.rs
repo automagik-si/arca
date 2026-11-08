@@ -336,7 +336,7 @@ fn a_viewer_reads_the_node_status_and_the_call_exits_0_with_the_result() {
     let out = call(&node, &node.viewer, "arca_status", &[]);
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let result = stdout_json(&out);
-    assert_eq!(result["mode"], json!("watch-only"));
+    assert_eq!(result["mode"], json!("kernel"));
     assert!(result["node"].is_string());
 }
 
