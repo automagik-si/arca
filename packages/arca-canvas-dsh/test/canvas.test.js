@@ -253,13 +253,13 @@ test('Cordis receives row config, serves cached GET routes without a sidebar, an
   let snapshot;
   for (let attempts = 0; attempts < 100; attempts++) {
     snapshot = await exchange(socketPath, '/arca-canvas/snapshot?cached=1');
-    if (JSON.parse(snapshot.body).machine) break;
+    if (JSON.parse(snapshot.body).hosts[0].machine) break;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   assert.equal(snapshot.status, 200);
   assert.equal(JSON.parse(snapshot.body).approvalUrl, config.approvalUrl);
-  assert.equal(JSON.parse(snapshot.body).nodeName, 'Example machine');
-  assert.equal(JSON.parse(snapshot.body).machine.node, '<script>untrusted</script>');
+  assert.equal(JSON.parse(snapshot.body).hosts[0].nodeName, 'Example machine');
+  assert.equal(JSON.parse(snapshot.body).hosts[0].machine.node, '<script>untrusted</script>');
   assert.equal(snapshot.headers['cache-control'], 'no-store');
   const page = await exchange(socketPath, '/arca-canvas');
   assert.equal(page.status, 200);
@@ -370,12 +370,12 @@ test('host snapshot route returns Arca cards within 100ms while device HTTP neve
   const url = `http://127.0.0.1:${web.address().port}/arca-canvas/snapshot`;
   // Measure the route phase alone: the cached snapshot must answer without waiting for Arca or devices.
   const routeStart = performance.now();
-  let snapshot = await (await fetch(url)).json();
+  let snapshot = (await (await fetch(url)).json()).hosts[0];
   const routeElapsed = performance.now() - routeStart;
   assert.ok(routeElapsed < 100, `host snapshot route took ${routeElapsed}ms`);
   const start = performance.now();
   for (let attempt = 0; attempt < 20 && !snapshot.machine; attempt++) {
-    snapshot = await (await fetch(url)).json();
+    snapshot = (await (await fetch(url)).json()).hosts[0];
     if (!snapshot.machine) await new Promise((resolve) => setTimeout(resolve, 10));
   }
   const readyElapsed = performance.now() - start;
@@ -386,7 +386,7 @@ test('host snapshot route returns Arca cards within 100ms while device HTTP neve
   await until(() => deviceRequests === 1);
   await new Promise((resolve) => setTimeout(resolve, 130));
   const pollStart = performance.now();
-  const next = await (await fetch(url)).json();
+  const next = (await (await fetch(url)).json()).hosts[0];
   assert.ok(performance.now() - pollStart < 100, 'host route must serve cached data promptly');
   assert.notEqual(next.at, snapshot.at, 'Arca keeps polling during the pending device phase');
   assert.equal(next.error, null);

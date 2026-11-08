@@ -108,7 +108,7 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
       }
     }
     if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
-      await writeFile(join(process.env.ARCA_CANVAS_EVIDENCE_DIR, 'rectangles.json'), `${JSON.stringify(measurements, null, 2)}\n`);
+      await writeFile(join(process.env.ARCA_CANVAS_EVIDENCE_DIR, 'host-rectangles.json'), `${JSON.stringify(measurements, null, 2)}\n`);
     }
     await page.emulateMedia({ colorScheme: 'light' });
   });
