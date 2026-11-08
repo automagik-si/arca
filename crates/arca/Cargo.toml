@@ -36,6 +36,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream.workspace = true
 
 [dev-dependencies]
 iroh-tickets.workspace = true

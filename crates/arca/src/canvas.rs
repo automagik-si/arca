@@ -1,11 +1,12 @@
-//! The remote canvas behind the approval passkey: the four exact `/approve/canvas` URLs, the sign-in statement store, the
+//! The remote canvas behind the approval passkey: the exact `/approve/canvas` URLs, the sign-in statement store, the
 //! 12-hour session cookie, the DSH proxy and the response headers that keep the shared approval origin first-party only.
 //!
 //! The remote switch never writes. A sign-in is one challenge lookup, a challenge spend before any signature check, then the
-//! existing `PasskeyVerifier`; the session only admits the four canvas URLs. No caller address is read: every tailnet caller
+//! existing `PasskeyVerifier`; the session only admits the canvas URLs. No caller address is read: every tailnet caller
 //! reaches the reverse proxy from one address, so a caller bucket would be one shared bucket.
 
 use std::collections::{HashMap, VecDeque};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -17,13 +18,14 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::sync::mpsc;
+use tokio::time::{Instant, timeout, timeout_at};
 
 use arca_kernel::canon::canonical_json;
 
 use crate::config::canvas_origin_addr;
 
-/// The exact remote URL and the DSH path each of its four assets maps to.
+/// The exact remote URL and the DSH path each of its assets maps to.
 pub const PAGE_PATH: &str = "/approve/canvas";
 pub const CSS_PATH: &str = "/approve/canvas/page.css";
 pub const JS_PATH: &str = "/approve/canvas/page.js";
@@ -31,8 +33,14 @@ pub const SNAPSHOT_PATH: &str = "/approve/canvas/snapshot";
 pub const DSH_CSS_PATH: &str = "/arca-canvas/page.css";
 pub const DSH_JS_PATH: &str = "/arca-canvas/page.js";
 pub const DSH_SNAPSHOT_PATH: &str = "/arca-canvas/snapshot";
+/// The one chat turn URL and its DSH path. The response is relayed as a stream.
+pub const CHAT_PATH: &str = "/approve/canvas/chat";
+pub const DSH_CHAT_PATH: &str = "/arca-canvas/chat";
+/// The chat history URL and its DSH path. It is a plain, bounded forward like the assets.
+pub const CHAT_HISTORY_PATH: &str = "/approve/canvas/chat/history";
+pub const DSH_CHAT_HISTORY_PATH: &str = "/arca-canvas/chat/history";
 
-/// The one cookie the four canvas URLs read. `__Host-` requires Secure, Path=/ and no Domain.
+/// The one cookie the canvas URLs read. `__Host-` requires Secure, Path=/ and no Domain.
 pub const COOKIE: &str = "__Host-arca-canvas";
 /// A session lives twelve hours.
 pub const SESSION_TTL_MS: u64 = 12 * 60 * 60 * 1000;
@@ -46,6 +54,14 @@ const CHALLENGE_PER_MINUTE: usize = 60;
 const DSH_TIMEOUT: Duration = Duration::from_secs(3);
 /// A DSH body is bounded, so a broken upstream cannot grow the server's memory.
 const DSH_BODY_MAX: usize = 2 * 1024 * 1024;
+/// One chat turn is bounded; the page request cap is the same 64 KiB.
+pub const CHAT_BODY_MAX: usize = 64 * 1024;
+/// A chat stream ends after this much silence between chunks.
+pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A chat stream lasts at most ten minutes, even while it keeps trickling.
+pub const CHAT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// A chat response relays at most two MiB, so a broken upstream cannot stream without bound.
+pub const CHAT_STREAM_MAX: usize = 2 * 1024 * 1024;
 /// The sign-in statement's kind. The approval parser refuses it structurally, as this parser refuses an approval statement.
 pub const STATEMENT_KIND: &str = "arca.canvas.view.v1";
 
@@ -64,13 +80,22 @@ pub struct SignInStatement {
     pub expires_ms: u64,
 }
 
-/// The remote canvas state: its approval origin, its DSH loopback address, the two in-memory stores.
+/// The remote canvas state: its approval origin, its DSH loopback address, the two in-memory stores and the chat stream caps.
 #[derive(Clone)]
 pub struct Canvas {
     origin: String,
     addr: SocketAddr,
     challenges: Arc<Mutex<Challenges>>,
     sessions: Arc<Mutex<Sessions>>,
+    chat_idle: Duration,
+    chat_total: Duration,
+}
+
+/// A started chat stream: the upstream's content type and the chunks as they arrive. The receiver closes when the upstream
+/// ends, the idle or total cap fires, or the client disconnects.
+pub(crate) struct ChatResponse {
+    pub(crate) content_type: String,
+    pub(crate) body: mpsc::Receiver<Result<Vec<u8>, io::Error>>,
 }
 
 #[derive(Default)]
@@ -104,7 +129,16 @@ impl Canvas {
             addr,
             challenges: Arc::new(Mutex::new(Challenges::default())),
             sessions: Arc::new(Mutex::new(Sessions::default())),
+            chat_idle: CHAT_IDLE_TIMEOUT,
+            chat_total: CHAT_TOTAL_TIMEOUT,
         })
+    }
+
+    /// Replaces the chat stream caps. Tests use short values; `serve` keeps the sixty-second idle and ten-minute total caps.
+    pub(crate) fn with_chat_timeouts(mut self, idle: Duration, total: Duration) -> Self {
+        self.chat_idle = idle;
+        self.chat_total = total;
+        self
     }
 
     /// The approval origin a sign-in statement names.
@@ -198,7 +232,7 @@ impl Canvas {
         ))
     }
 
-    /// The credential a valid, unexpired canvas cookie names. Only the four canvas handlers call this.
+    /// The credential a valid, unexpired canvas cookie names. Only the canvas handlers call this.
     pub fn session(&self, headers: &axum::http::HeaderMap, now: u64) -> Option<String> {
         let id = cookie_id(headers)?;
         let Ok(mut store) = self.sessions.lock() else {
@@ -233,6 +267,40 @@ impl Canvas {
         .await
         .ok()??;
         parse_upstream(&raw).ok()
+    }
+
+    /// Starts one DSH chat turn and relays its body without buffering it. Only a 200 with a streamed content type starts a
+    /// stream; the caller has already checked the session, the Origin and the JSON body. Dropping the response receiver aborts
+    /// the upstream connection.
+    pub(crate) async fn chat(&self, body: &[u8]) -> Option<ChatResponse> {
+        let mut stream = timeout(DSH_TIMEOUT, TcpStream::connect(self.addr))
+            .await
+            .ok()?
+            .ok()?;
+        let request = format!(
+            "POST {DSH_CHAT_PATH} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+            self.addr,
+            body.len()
+        );
+        timeout(self.chat_idle, async {
+            stream.write_all(request.as_bytes()).await.ok()?;
+            stream.write_all(body).await.ok()?;
+            Some(())
+        })
+        .await
+        .ok()??;
+        let (head, leftover) = read_chat_head(&mut stream, self.chat_idle, self.chat_total).await?;
+        Some(ChatResponse {
+            content_type: head.content_type,
+            body: spawn_chat_relay(
+                stream,
+                leftover,
+                head.chunked,
+                self.chat_idle,
+                self.chat_total,
+            ),
+        })
     }
 }
 
@@ -346,6 +414,217 @@ fn inline_hash(html: &str, tag: &str) -> Option<String> {
     let end = start + html[start..].find(&close)?;
     let digest = Sha256::digest(&html.as_bytes()[start..end]);
     Some(format!("'sha256-{}'", STANDARD.encode(digest)))
+}
+
+/// The parsed head of one streamed DSH chat response.
+struct ChatHead {
+    content_type: String,
+    chunked: bool,
+}
+
+/// Reads the chat response head, bounded, leaving any body bytes already received for the relay.
+async fn read_chat_head(
+    stream: &mut TcpStream,
+    idle: Duration,
+    total: Duration,
+) -> Option<(ChatHead, Vec<u8>)> {
+    let deadline = Instant::now() + total;
+    let mut raw = Vec::new();
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        if let Some(split) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = parse_chat_head(&raw[..split])?;
+            return Some((head, raw[split + 4..].to_vec()));
+        }
+        if raw.len() >= 64 * 1024 {
+            return None;
+        }
+        let wait = deadline.saturating_duration_since(Instant::now()).min(idle);
+        if wait.is_zero() {
+            return None;
+        }
+        let read = timeout(wait, stream.read(&mut buffer)).await.ok()?.ok()?;
+        if read == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&buffer[..read]);
+    }
+}
+
+/// Only a 200 with a streamed content type starts a chat stream. Upstream hops, cookies and cache headers are dropped.
+fn parse_chat_head(head: &[u8]) -> Option<ChatHead> {
+    let head = std::str::from_utf8(head).ok()?;
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u16>()
+        .ok()?;
+    if status != 200 {
+        return None;
+    }
+    let mut content_type = None;
+    let mut chunked = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("content-type") {
+            content_type = Some(chat_content_type(value)?);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+    Some(ChatHead {
+        content_type: content_type?,
+        chunked,
+    })
+}
+
+/// The content type the relay preserves. Every other type is refused rather than sniffed past the `nosniff` header.
+fn chat_content_type(value: &str) -> Option<String> {
+    let media = value.split(';').next()?.trim();
+    if media.eq_ignore_ascii_case("text/event-stream")
+        || media.eq_ignore_ascii_case("application/x-ndjson")
+        || media.eq_ignore_ascii_case("application/json")
+    {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// Relays the DSH body as it arrives: each chunk is sent over the channel immediately, so nothing is buffered whole. The
+/// sender waits at most the idle cap for the next chunk and at most the total cap for the stream. Dropping the receiver
+/// (a client disconnect) closes the upstream socket.
+fn spawn_chat_relay(
+    mut stream: TcpStream,
+    initial: Vec<u8>,
+    chunked: bool,
+    idle: Duration,
+    total: Duration,
+) -> mpsc::Receiver<Result<Vec<u8>, io::Error>> {
+    let (sender, receiver) = mpsc::channel(16);
+    tokio::spawn(async move {
+        let deadline = Instant::now() + total;
+        let mut pending = initial;
+        let mut decoder = chunked.then(ChunkedBody::new);
+        let mut relayed = 0usize;
+        let mut buffer = [0u8; 16 * 1024];
+        loop {
+            let data = std::mem::take(&mut pending);
+            let pieces = match decoder.as_mut() {
+                Some(decoder) => match decoder.push(&data) {
+                    Ok(pieces) => pieces,
+                    Err(()) => return,
+                },
+                None if data.is_empty() => Vec::new(),
+                None => vec![data],
+            };
+            for piece in pieces {
+                if piece.is_empty() {
+                    continue;
+                }
+                relayed = relayed.saturating_add(piece.len());
+                if relayed > CHAT_STREAM_MAX {
+                    let error = io::Error::other("the chat response is over the stream cap");
+                    let _ = sender.try_send(Err(error));
+                    return;
+                }
+                if !matches!(
+                    timeout_at(deadline, sender.send(Ok(piece))).await,
+                    Ok(Ok(()))
+                ) {
+                    return;
+                }
+            }
+            if decoder.as_ref().is_some_and(|decoder| decoder.done) {
+                return;
+            }
+            let wait = deadline.saturating_duration_since(Instant::now()).min(idle);
+            if wait.is_zero() {
+                return;
+            }
+            let read = tokio::select! {
+                _ = sender.closed() => return,
+                read = timeout(wait, stream.read(&mut buffer)) => read,
+            };
+            match read {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                Ok(Ok(read)) => pending.extend_from_slice(&buffer[..read]),
+            }
+        }
+    });
+    receiver
+}
+
+/// One incremental `Transfer-Encoding: chunked` decoder. A chunk is forwarded as soon as its bytes and CRLF are complete.
+struct ChunkedBody {
+    buffer: Vec<u8>,
+    state: ChunkState,
+    done: bool,
+}
+
+enum ChunkState {
+    Size,
+    Data(usize),
+}
+
+impl ChunkedBody {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            state: ChunkState::Size,
+            done: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        self.buffer.extend_from_slice(bytes);
+        if self.buffer.len() > CHAT_STREAM_MAX + 64 * 1024 {
+            return Err(());
+        }
+        let mut out = Vec::new();
+        loop {
+            match self.state {
+                ChunkState::Size => {
+                    let Some(end) = self.buffer.windows(2).position(|window| window == b"\r\n")
+                    else {
+                        break;
+                    };
+                    let line = std::str::from_utf8(&self.buffer[..end]).map_err(|_| ())?;
+                    let size =
+                        usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+                            .map_err(|_| ())?;
+                    self.buffer.drain(..end + 2);
+                    if size == 0 {
+                        self.done = true;
+                        break;
+                    }
+                    if size > CHAT_STREAM_MAX {
+                        return Err(());
+                    }
+                    self.state = ChunkState::Data(size);
+                }
+                ChunkState::Data(size) => {
+                    if self.buffer.len() < size + 2 {
+                        break;
+                    }
+                    if &self.buffer[size..size + 2] != b"\r\n" {
+                        return Err(());
+                    }
+                    out.push(self.buffer[..size].to_vec());
+                    self.buffer.drain(..size + 2);
+                    self.state = ChunkState::Size;
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Parses one HTTP/1.1 response from DSH. Only a 200 passes, and the body is bounded.
@@ -511,5 +790,54 @@ mod tests {
             assert!(policy.contains(&hash), "{tag} hash is in the CSP");
         }
         assert!(!include_str!("approve_page.html").contains("style=\""));
+    }
+
+    #[test]
+    fn only_a_200_streamed_chat_head_passes() {
+        let parsed = parse_chat_head(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
+        .expect("an SSE head");
+        assert_eq!(parsed.content_type, "text/event-stream");
+        assert!(parsed.chunked);
+        let parsed =
+            parse_chat_head(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n")
+                .expect("an NDJSON head");
+        assert!(!parsed.chunked);
+        assert!(
+            parse_chat_head(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n").is_none(),
+            "another content type is refused"
+        );
+        assert!(
+            parse_chat_head(b"HTTP/1.1 500 Oops\r\nContent-Type: text/event-stream\r\n\r\n")
+                .is_none(),
+            "a non-200 answer is refused"
+        );
+        assert!(
+            parse_chat_head(b"HTTP/1.1 200 OK\r\n\r\n").is_none(),
+            "a missing content type is refused"
+        );
+    }
+
+    #[test]
+    fn chunked_bodies_decode_across_read_boundaries() {
+        let wire = b"d\r\ndata: first\n\n\r\ne\r\ndata: second\n\n\r\n0\r\n\r\n";
+        let mut decoder = ChunkedBody::new();
+        let mut chunks = Vec::new();
+        for part in wire.chunks(3) {
+            chunks.extend(decoder.push(part).expect("a valid chunked body"));
+        }
+        assert!(decoder.done);
+        assert_eq!(
+            chunks,
+            vec![b"data: first\n\n".to_vec(), b"data: second\n\n".to_vec()]
+        );
+        let mut bad = ChunkedBody::new();
+        assert!(bad.push(b"zz\r\n").is_err(), "a bad size is refused");
+        let mut bad = ChunkedBody::new();
+        assert!(
+            bad.push(b"5\r\ndata!\rX").is_err(),
+            "a chunk without its CRLF is refused"
+        );
     }
 }

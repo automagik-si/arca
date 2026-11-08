@@ -3,7 +3,8 @@
 //!
 //! The page routes are mounted only when `approvalOrigin` is configured. They sit outside the MCP bearer check and outside
 //! the MCP `Origin` refusal: GETs admit no `Origin` or the exact configured one, and POSTs admit only the exact configured
-//! one, before any body is read. `/mcp` and every other MCP route keep refusing every `Origin`; `crates/arca-mcp/src/http.rs`
+//! one, before any body is read. The canvas chat POST is the one exception: with no `Origin`, it accepts a browser's
+//! `Sec-Fetch-Site: same-origin`. `/mcp` and every other MCP route keep refusing every `Origin`; `crates/arca-mcp/src/http.rs`
 //! is unchanged, and this router is merged into its result in `cmd_serve`.
 //!
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
@@ -20,7 +21,7 @@ use arca_approval::passkey::{STATE_PASSKEYS_FILE, format_passkey_line};
 use arca_approval::{ARCA_NAMESPACE, ArcaAction, PasskeyLine, load_state_passkeys, parse_passkeys};
 use arca_kernel::canon::canonical_json;
 use arca_mcp::CallError;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -30,6 +31,7 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::canvas::{self, Canvas};
 use crate::handlers::{Clock, approve_plan, list_plans};
@@ -274,6 +276,19 @@ impl Page {
         self
     }
 
+    /// Replaces the chat stream idle and total caps. Tests use short values; `serve` keeps the sixty-second and ten-minute
+    /// caps. Call it after [`Page::with_canvas_origin`], which builds a fresh canvas state.
+    pub fn with_chat_timeouts(mut self, idle: Duration, total: Duration) -> Self {
+        self.state.canvas = Arc::new(
+            self.state
+                .canvas
+                .as_ref()
+                .clone()
+                .with_chat_timeouts(idle, total),
+        );
+        self
+    }
+
     /// The canvas state, for a sign-in test to issue a session directly.
     pub fn canvas(&self) -> &Canvas {
         &self.state.canvas
@@ -298,6 +313,8 @@ impl Page {
             .route(canvas::CSS_PATH, get(canvas_css))
             .route(canvas::JS_PATH, get(canvas_js))
             .route(canvas::SNAPSHOT_PATH, get(canvas_snapshot))
+            .route(canvas::CHAT_PATH, post(canvas_chat))
+            .route(canvas::CHAT_HISTORY_PATH, get(canvas_history))
             .route("/approve/{*rest}", any(not_found))
             .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
             .layer(middleware::from_fn_with_state(
@@ -329,7 +346,8 @@ impl PageState {
 }
 
 /// The page's Origin rule, before any body is read: a POST needs the exact configured Origin; a GET needs none or the exact
-/// one. Anything else is 403.
+/// one. The canvas chat POST also accepts a browser's `Sec-Fetch-Site: same-origin` when no Origin is sent. A foreign Origin
+/// is always 403.
 async fn origin_rule(
     State(state): State<Arc<PageState>>,
     request: Request,
@@ -339,8 +357,14 @@ async fn origin_rule(
         .headers()
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
+    let same_origin_fetch = request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        == Some("same-origin");
+    let chat = request.uri().path() == canvas::CHAT_PATH;
     let allowed = if request.method() == Method::POST {
-        origin == Some(state.origin.as_str())
+        origin == Some(state.origin.as_str()) || (chat && origin.is_none() && same_origin_fetch)
     } else {
         origin.is_none() || origin == Some(state.origin.as_str())
     };
@@ -350,7 +374,8 @@ async fn origin_rule(
     next.run(request).await
 }
 
-/// Headers on every `/approve` response, including the existing approval page, refusals and the proxied canvas.
+/// Headers on every `/approve` response, including the existing approval page, refusals and the proxied canvas. No response,
+/// including a 403 or 404, is cacheable.
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
@@ -366,6 +391,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
     );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -489,6 +515,75 @@ async fn canvas_snapshot(State(state): State<Arc<PageState>>, headers: HeaderMap
         "application/json; charset=utf-8",
     )
     .await
+}
+
+async fn canvas_history(State(state): State<Arc<PageState>>, headers: HeaderMap) -> Response {
+    canvas_asset(
+        &state,
+        &headers,
+        canvas::DSH_CHAT_HISTORY_PATH,
+        "application/json; charset=utf-8",
+    )
+    .await
+}
+
+/// One chat turn. The session, Origin and JSON checks run before the upstream connect, so a refused turn is never billed to
+/// the canvas model. The answer is relayed as a stream; the kernel keeps no write.
+async fn canvas_chat(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = (state.clock)();
+    if state.canvas.session(&headers, now).is_none() {
+        return chat_refusal(StatusCode::UNAUTHORIZED);
+    }
+    if !is_json_content_type(&headers) {
+        return chat_refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    if body.len() > canvas::CHAT_BODY_MAX {
+        return chat_refusal(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    if serde_json::from_slice::<Value>(&body).is_err() {
+        return chat_refusal(StatusCode::BAD_REQUEST);
+    }
+    let Some(chat) = state.canvas.chat(&body).await else {
+        return chat_refusal(StatusCode::BAD_GATEWAY);
+    };
+    let content_type = HeaderValue::from_str(&chat.content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("text/event-stream"));
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(chat.body)));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type);
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // Ask a buffering reverse proxy to pass each event through instead of holding the stream.
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
+/// A JSON media type with optional parameters, and nothing else. The body is parsed separately, so `text/plain` JSON is
+/// refused rather than forwarded.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// A chat refusal carries no upstream bytes and is never cached.
+fn chat_refusal(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn canvas_asset(

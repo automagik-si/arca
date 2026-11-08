@@ -486,19 +486,32 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.
 
-The GETs need no token and admit no `Origin` or the configured one. The POSTs admit only the exact configured `Origin` and
-refuse any other before reading the body. `/mcp` and every other MCP route keep refusing every `Origin`.
+The GETs need no token and admit no `Origin` or the configured one. Apart from the canvas chat POST described below, the
+POSTs admit only the exact configured `Origin` and refuse any other before reading the body. `/mcp` and every other MCP route
+keep refusing every `Origin`.
 
-With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly four URLs: `GET /approve/canvas`
-(the canvas, or a passkey sign-in page), `GET /approve/canvas/page.css`, `GET /approve/canvas/page.js` and
-`GET /approve/canvas/snapshot`. The CSS, script and snapshot are fetched from `canvasOrigin` over literal loopback; no cookie
-or authorization header is forwarded, only an HTTP 200 body passes, and upstream redirects, cache headers and cookies are
-dropped. A down, slow or non-200 DSH returns an Arca-styled "the canvas is not running" page. The snapshot needs a valid
-`__Host-arca-canvas` session cookie (Secure, Path=/, HttpOnly, SameSite=Strict, twelve hours); only those four URLs read it.
+With `approvalOrigin` set, the same page origin also serves the remote canvas at exactly these URLs: `GET /approve/canvas`
+(the canvas, or a passkey sign-in page), `GET /approve/canvas/page.css`, `GET /approve/canvas/page.js`,
+`GET /approve/canvas/snapshot`, `POST /approve/canvas/chat` and `GET /approve/canvas/chat/history`. The CSS, script,
+snapshot and history are fetched from `canvasOrigin` over literal loopback; no cookie or authorization header is forwarded,
+only an HTTP 200 body passes, and upstream redirects, cache headers and cookies are dropped. A down, slow or non-200 DSH
+returns an Arca-styled "the canvas is not running" page. The snapshot, history and chat need a valid `__Host-arca-canvas`
+session cookie (Secure, Path=/, HttpOnly, SameSite=Strict, twelve hours); only the canvas URLs read it.
 `POST /approve/canvas` issues a canonical sign-in statement, and a second POST with `{ "statement", "proof" }` spends the
 challenge before verifying the passkey and sets the cookie. The challenge store is in memory, holds 256 entries, lives two
 minutes, is single use, and has one global cap of 60 a minute; it never uses the caller address. Failures are logged without
 detail. This view is tailnet-only behind the existing `/approve/*` proxy route.
+
+`POST /approve/canvas/chat` is one Doctor chat turn and costs model tokens only for the signed-in owner. The session is
+checked before any upstream connect, so an unsigned or invalid chat gets 401 with no connection. The POST needs the exact
+`Origin`, or a browser's `Sec-Fetch-Site: same-origin` when no `Origin` is sent; anything else is 403 before the upstream.
+The body must be `application/json` and at most 64 KiB (415 or 413 otherwise, also before the upstream). The kernel forwards
+the JSON to `POST /arca-canvas/chat` on the same loopback upstream and adds no write capability. The answer is relayed as a
+stream with the upstream's `Content-Type` (`text/event-stream`, `application/x-ndjson` or `application/json`) as each chunk
+arrives: nothing is buffered whole, an idle gap of 60 seconds ends the stream, the whole stream ends at 10 minutes or 2 MiB,
+and a client disconnect closes the upstream connection. `GET /approve/canvas/chat/history` is the same bounded three-second
+forward to `/arca-canvas/chat/history`. Every canvas route carries the CSP with `frame-ancestors 'none'`, `nosniff`,
+`no-referrer`, and `Cache-Control: no-store` on every canvas body, including refusals.
 
 To use it:
 
