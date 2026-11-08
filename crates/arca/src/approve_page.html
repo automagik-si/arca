@@ -274,6 +274,13 @@
   }
   .step-title { display: block; font-weight: 600; line-height: 28px; }
   .step-text { color: var(--arca-muted); font-size: var(--arca-text-sm); margin-bottom: 10px; }
+  .name-input {
+    display: block; width: 100%; min-height: 44px; margin: var(--arca-space-1) 0 var(--arca-space-3);
+    padding: var(--arca-space-2) var(--arca-space-3);
+    border: 1px solid var(--arca-hair); border-radius: var(--arca-r-md);
+    background: var(--arca-surface-2); color: var(--arca-ink); font: inherit;
+  }
+  .name-input:focus { border-color: var(--arca-accent); box-shadow: 0 0 0 4px var(--arca-accent-soft); outline: none; }
   .code-input {
     display: block; width: 100%; height: 60px; margin-top: var(--arca-space-1);
     padding: 0 var(--arca-space-3);
@@ -337,7 +344,8 @@
   </section>
 
   <section class="setup" aria-labelledby="setup-title">
-    <h2 id="setup-title">Your passkey</h2>
+    <h2 id="setup-title">Your passkeys</h2>
+    <div id="passkeys" class="plans"></div>
     <div class="card">
       <div class="done">
         <span class="notice-icon"><svg class="icon" aria-hidden="true"><use href="#i-check"/></svg></span>
@@ -368,6 +376,8 @@
           <div>
             <p class="step-title if-new">Save your passkey</p>
             <p class="step-text if-new">Your device asks for your fingerprint, face or PIN.</p>
+            <label class="step-title" for="passkey-label">Passkey name</label>
+            <input id="passkey-label" class="name-input" maxlength="80" value="My passkey" autocomplete="off">
             <button id="register" class="btn btn-primary btn-big" type="button"><svg class="icon" aria-hidden="true"><use href="#i-key"/></svg>Add passkey</button>
           </div>
         </li>
@@ -625,23 +635,22 @@ async function register() {
     if (!check.ok) throw new Error("the passkey check answered " + check.status);
     const current = await check.json();
     showTrusted(current.passkeysTrusted || 0);
-    if ((current.passkeysTrusted || 0) > 0) {
-      status("A passkey is already trusted. No new passkey was made.", "warn");
-      return;
+    const adding = (current.passkeysTrusted || 0) > 0;
+    if (!adding) {
+      if (!setupCode) {
+        status("Enter the 8-digit setup code first.", "warn");
+        return;
+      }
+      status("Checking the setup code…", "wait");
+      const verified = await fetch("/approve/setup-code/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ setupCode }),
+      });
+      const checkBody = await verified.json().catch(() => ({}));
+      if (!verified.ok) throw new Error(checkBody.message || ("the setup code check answered " + verified.status));
+      if (!checkBody.verified) throw new Error("The setup code was not verified");
     }
-    if (!setupCode) {
-      status("Enter the 8-digit setup code first.", "warn");
-      return;
-    }
-    status("Checking the setup code…", "wait");
-    const verified = await fetch("/approve/setup-code/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ setupCode }),
-    });
-    const checkBody = await verified.json().catch(() => ({}));
-    if (!verified.ok) throw new Error(checkBody.message || ("the setup code check answered " + verified.status));
-    if (!checkBody.verified) throw new Error("The setup code was not verified");
     status("Follow your device's prompt to save the passkey…", "wait");
     const challenge = crypto.getRandomValues(new Uint8Array(32));
     const user = crypto.getRandomValues(new Uint8Array(16));
@@ -669,7 +678,8 @@ async function register() {
       publicKey: b64(new Uint8Array(publicKey)),
       publicKeyAlgorithm: credential.response.getPublicKeyAlgorithm(),
     };
-    payload.setupCode = setupCode;
+    payload.label = document.getElementById("passkey-label").value.trim();
+    if (!adding) payload.setupCode = setupCode;
     const answer = await fetch("/approve/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -677,12 +687,17 @@ async function register() {
     });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) throw new Error(body.message || ("the registration answered " + answer.status));
+    if (adding) {
+      status("Confirm with a passkey Arca already trusts…", "wait");
+      await submitChange(body);
+    }
     if (!allowCredentials.some(({ id }) => b64url(new Uint8Array(id)) === payload.credentialId)) {
       allowCredentials.push({ type: "public-key", id: fromB64url(payload.credentialId) });
     }
     input.value = "";
     status("Passkey trusted.", "ok");
     await loadPlans();
+    await loadPasskeys();
   } catch (error) {
     fail(error);
   } finally {
@@ -690,39 +705,97 @@ async function register() {
   }
 }
 
+async function trustedProof(statement) {
+  const challenge = await crypto.subtle.digest(
+    "SHA-256",
+    enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + statement),
+  );
+  if (!allowCredentials.length) {
+    throw new Error(NO_PASSKEY);
+  }
+  const credential = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      rpId: location.hostname,
+      userVerification: "required",
+      timeout: 60000,
+      allowCredentials,
+    },
+  });
+  if (!credential) throw new Error("no passkey was selected");
+  const response = credential.response;
+  const proof = {
+    alg: "ES256",
+    authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
+    clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
+    credentialId: b64url(new Uint8Array(credential.rawId)),
+    kind: "webauthn",
+    signature: b64url(new Uint8Array(response.signature)),
+    v: 1,
+  };
+  return proof;
+}
+
+async function submitChange(change) {
+  const proof = await trustedProof(change.statement);
+  const answer = await fetch("/approve/passkeys/change", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...change, proof }),
+  });
+  const result = await answer.json().catch(() => ({}));
+  if (!answer.ok) {
+    const error = new Error(result.message || "Passkey change refused");
+    error.refusal = result.refusal;
+    throw error;
+  }
+}
+
+async function loadPasskeys() {
+  const answer = await fetch("/approve/passkeys");
+  if (!answer.ok) throw new Error("the passkey list answered " + answer.status);
+  const body = await answer.json();
+  const target = document.getElementById("passkeys");
+  target.replaceChildren();
+  for (const key of body.passkeys) {
+    const card = el("article", "card");
+    const added = key.addedAt ? "Added " + new Date(key.addedAt).toLocaleDateString() : "Added date unavailable";
+    card.append(el("h3", "", key.label), el("p", "notice-text", added));
+    const remove = el("button", "btn btn-secondary", "Remove");
+    remove.type = "button";
+    remove.addEventListener("click", async () => {
+      remove.disabled = true;
+      try {
+        const answer = await fetch("/approve/passkeys/change", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ target: key.target }),
+        });
+        const pending = await answer.json().catch(() => ({}));
+        if (!answer.ok) throw new Error(pending.message || "Passkey removal refused");
+        status("Confirm removal with a trusted passkey…", "wait");
+        await submitChange({ target: key.target, statement: pending.statement });
+        status("Passkey removed.", "ok");
+        allowCredentials.splice(0);
+        const freshPage = await fetch("/approve");
+        if (!freshPage.ok) throw new Error("the passkey list answered " + freshPage.status);
+        const doc = new DOMParser().parseFromString(await freshPage.text(), "text/html");
+        for (const id of JSON.parse(doc.body.dataset.credentialIds || "[]")) {
+          allowCredentials.push({ type: "public-key", id: fromB64url(id) });
+        }
+        await loadPlans();
+        await loadPasskeys();
+      } catch (error) { fail(error); remove.disabled = false; }
+    });
+    card.append(remove);
+    target.append(card);
+  }
+}
+
 async function approve(plan, button) {
   button.disabled = true;
   status("Confirm with your passkey…", "wait");
   try {
-    const challenge = await crypto.subtle.digest(
-      "SHA-256",
-      enc.encode("arca-kernel-approval/v1\narca-kernel-approve\n" + plan.statement),
-    );
-    if (!allowCredentials.length) {
-      status(NO_PASSKEY, "warn");
-      button.disabled = false;
-      return;
-    }
-    const credential = await navigator.credentials.get({
-      publicKey: {
-        challenge,
-        rpId: location.hostname,
-        userVerification: "required",
-        timeout: 60000,
-        allowCredentials,
-      },
-    });
-    if (!credential) throw new Error("no passkey was selected");
-    const response = credential.response;
-    const proof = {
-      alg: "ES256",
-      authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
-      clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
-      credentialId: b64url(new Uint8Array(credential.rawId)),
-      kind: "webauthn",
-      signature: b64url(new Uint8Array(response.signature)),
-      v: 1,
-    };
+    const proof = await trustedProof(plan.statement);
     const approval = b64(enc.encode(plan.statement)) + "." + b64(enc.encode(JSON.stringify(proof)));
     const answer = await fetch("/approve/approve", {
       method: "POST",
@@ -738,6 +811,7 @@ async function approve(plan, button) {
     const deleted = (body.deleted || []).length;
     status("Approved. " + deleted + " item" + (deleted === 1 ? "" : "s") + " deleted.", "ok");
     await loadPlans();
+    await loadPasskeys();
   } catch (error) {
     fail(error);
     button.disabled = false;
@@ -747,6 +821,7 @@ async function approve(plan, button) {
 document.getElementById("get-code").addEventListener("click", getCode);
 document.getElementById("register").addEventListener("click", register);
 loadPlans();
+loadPasskeys().catch(fail);
 </script>
 </body>
 </html>

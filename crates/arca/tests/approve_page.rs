@@ -1950,3 +1950,337 @@ fn credential_placeholder_is_only_in_the_body_attribute() {
         }
     }
 }
+
+fn pending_passkey(rig: &Rig, key: &SoftPasskey) -> Value {
+    let mut request = register_body(key, None);
+    request["label"] = json!("Second phone");
+    let (status, body) = rig.post("/approve/register", Some(ORIGIN), request);
+    assert_eq!(status, 200);
+    let pending: Value = serde_json::from_slice(&body).expect("pending change");
+    assert!(pending["statement"].is_string());
+    assert!(
+        pending.get("trusted").is_none(),
+        "registration alone does not trust the new key"
+    );
+    pending
+}
+
+fn signed_change(mut pending: Value, key: &SoftPasskey) -> Value {
+    let statement = pending["statement"].as_str().expect("statement");
+    pending["proof"] = key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+    pending
+}
+
+fn removal(rig: &Rig, label: &str) -> Value {
+    let (status, body) = rig.get("/approve/passkeys", None);
+    assert_eq!(status, 200);
+    let list: Value = serde_json::from_slice(&body).expect("keys");
+    let key = list["passkeys"]
+        .as_array()
+        .expect("list")
+        .iter()
+        .find(|key| key["label"] == label)
+        .expect("label");
+    let (status, body) = rig.post(
+        "/approve/passkeys/change",
+        Some(ORIGIN),
+        json!({ "target": key["target"] }),
+    );
+    assert_eq!(status, 200);
+    let mut pending: Value = serde_json::from_slice(&body).expect("removal statement");
+    pending["target"] = key["target"].clone();
+    pending
+}
+
+#[test]
+fn passkey_change_trusted_tap_adds_once_and_removes_without_restart() {
+    let (rig, trusted) = Rig::new("passkey-change", true);
+    let new = SoftPasskey::from_seed(2);
+    let pending = pending_passkey(&rig, &new);
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 1);
+    assert!(!rig.state_path().exists());
+    let statement = pending["statement"].as_str().expect("statement");
+    let parsed = arca_approval::parse_statement(statement.as_bytes()).expect("accepted action");
+    assert_eq!(parsed.action, arca_approval::ArcaAction::PasskeyAdd);
+    let line = pending["line"].as_str().expect("line");
+    assert_eq!(
+        parsed.target,
+        format!(
+            "passkey-{}",
+            arca_kernel::canon::Digest::of(line.as_bytes()).to_hex()
+        )
+    );
+    assert_eq!(
+        parsed.params_digest,
+        arca_kernel::canon::params_digest(&json!({ "line": line })).expect("digest")
+    );
+    let request = signed_change(pending, &trusted);
+    assert_eq!(
+        rig.post("/approve/passkeys/change", Some(ORIGIN), request.clone())
+            .0,
+        200
+    );
+    let bytes = fs::read(rig.state_path()).expect("state file");
+    let (status, body) = rig.post("/approve/passkeys/change", Some(ORIGIN), request);
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("Replayed"));
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), bytes);
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 2);
+    // The new key can approve immediately, with the same verifier and nonce/count stores.
+    let (plan, statement) = rig.waiting_plan();
+    assert_eq!(
+        rig.post(
+            "/approve/approve",
+            Some(ORIGIN),
+            json!({ "plan": plan, "approval": approval(&new, &statement) })
+        )
+        .0,
+        200
+    );
+    let request = signed_change(removal(&rig, "Second phone"), &trusted);
+    assert_eq!(
+        rig.post("/approve/passkeys/change", Some(ORIGIN), request.clone())
+            .0,
+        200
+    );
+    assert!(refusal(
+        rig.post("/approve/passkeys/change", Some(ORIGIN), request)
+            .0
+    ));
+    assert!(
+        load_state_passkeys(&rig.state_path())
+            .expect("empty state")
+            .is_empty()
+    );
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 1);
+    let pending = pending_passkey(&rig, &SoftPasskey::from_seed(3));
+    assert_eq!(
+        rig.post(
+            "/approve/passkeys/change",
+            Some(ORIGIN),
+            signed_change(pending, &new)
+        )
+        .0,
+        403,
+        "removed key loses authority immediately"
+    );
+}
+
+#[test]
+fn passkey_change_refuses_new_key_tampered_line_digest_origin_and_non_passkey() {
+    let (rig, trusted) = Rig::new("passkey-change-refuse", true);
+    let new = SoftPasskey::from_seed(2);
+    let pending = pending_passkey(&rig, &new);
+    let (status, body) = rig.post(
+        "/approve/passkeys/change",
+        Some(ORIGIN),
+        signed_change(pending.clone(), &new),
+    );
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("BadSignature"));
+    let mut tampered = pending.clone();
+    tampered["line"] = json!(format!(
+        "{} changed",
+        pending["line"].as_str().expect("line")
+    ));
+    let (status, body) = rig.post(
+        "/approve/passkeys/change",
+        Some(ORIGIN),
+        signed_change(tampered.clone(), &trusted),
+    );
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("WrongTarget"));
+    let mut statement: Value =
+        serde_json::from_str(pending["statement"].as_str().expect("statement")).expect("JSON");
+    statement["target"] = json!(format!(
+        "passkey-{}",
+        arca_kernel::canon::Digest::of(tampered["line"].as_str().expect("line").as_bytes())
+            .to_hex()
+    ));
+    tampered["statement"] = json!(canonical_json(&statement).expect("canonical"));
+    let (status, body) = rig.post(
+        "/approve/passkeys/change",
+        Some(ORIGIN),
+        signed_change(tampered, &trusted),
+    );
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("WrongParams"));
+    for origin in [None, Some("https://other.example.com")] {
+        assert_eq!(
+            rig.post(
+                "/approve/passkeys/change",
+                origin,
+                signed_change(pending.clone(), &trusted)
+            )
+            .0,
+            403
+        );
+        assert_eq!(
+            rig.get("/approve/passkeys", origin).0,
+            if origin.is_none() { 200 } else { 403 }
+        );
+    }
+    let mut invalid = pending.clone();
+    invalid["proof"] = json!("not a WebAuthn proof");
+    assert_eq!(
+        rig.post("/approve/passkeys/change", Some(ORIGIN), invalid)
+            .0,
+        403
+    );
+    assert!(!rig.state_path().exists());
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 1);
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 409);
+    assert_eq!(
+        rig.post(
+            "/approve/register",
+            Some(ORIGIN),
+            register_body(&new, Some("00000000"))
+        )
+        .0,
+        409
+    );
+    // Refused binding checks have not spent the nonce, so the original statement still works.
+    assert_eq!(
+        rig.post(
+            "/approve/passkeys/change",
+            Some(ORIGIN),
+            signed_change(pending, &trusted)
+        )
+        .0,
+        200
+    );
+}
+
+#[test]
+fn passkey_change_refuses_last_key_and_root_file_removal() {
+    let (rig, key) = Rig::new_empty("passkey-last-remove");
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
+    assert_eq!(
+        rig.post(
+            "/approve/register",
+            Some(ORIGIN),
+            register_body(&key, Some(&rig.last_code()))
+        )
+        .0,
+        200
+    );
+    let before = fs::read(rig.state_path()).expect("state");
+    let request = signed_change(removal(&rig, "My passkey"), &key);
+    let (status, body) = rig.post("/approve/passkeys/change", Some(ORIGIN), request);
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("last trusted passkey"));
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), before);
+
+    let (rig, root) = Rig::new("passkey-root-remove", true);
+    let new = SoftPasskey::from_seed(2);
+    let pending = pending_passkey(&rig, &new);
+    assert_eq!(
+        rig.post(
+            "/approve/passkeys/change",
+            Some(ORIGIN),
+            signed_change(pending, &root)
+        )
+        .0,
+        200
+    );
+    let before = fs::read(rig.state_path()).expect("state");
+    // Exercise the kernel boundary directly too, even when a caller supplies a root line rather than a list target.
+    let line = root.line(NAMESPACE);
+    let statement = canonical_json(&json!({
+        "action": "passkey_remove", "host": HOST,
+        "target": format!("passkey-{}", arca_kernel::canon::Digest::of(line.as_bytes()).to_hex()),
+        "paramsDigest": arca_kernel::canon::params_digest(&json!({ "line": line })).expect("digest"),
+        "issuedAt": arca::handlers::iso_utc(NOW), "expiresAt": arca::handlers::iso_utc(NOW + 600_000),
+        "nonce": "12121212121212121212121212121212",
+    })).expect("statement");
+    let result = rig.kernel.lock().expect("kernel").approve_passkey_change(
+        &rig.state_dir,
+        &line,
+        &statement,
+        &root.assert(&Assert::over(NAMESPACE, statement.as_bytes())),
+        NOW,
+    );
+    assert!(matches!(
+        result,
+        Err(arca_approval::ApprovalRefusal::Untrusted(_))
+    ));
+    assert_eq!(fs::read(rig.state_path()).expect("unchanged"), before);
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 2);
+}
+
+#[test]
+fn passkey_list_exposes_only_labels_dates_and_opaque_targets_and_persists_metadata() {
+    let (rig, root) = Rig::new("passkey-list", true);
+    let new = SoftPasskey::from_seed(2);
+    let pending = pending_passkey(&rig, &new);
+    assert_eq!(
+        rig.post(
+            "/approve/passkeys/change",
+            Some(ORIGIN),
+            signed_change(pending, &root)
+        )
+        .0,
+        200
+    );
+    let (status, bytes) = rig.get("/approve/passkeys", None);
+    assert_eq!(status, 200);
+    let text = String::from_utf8(bytes).expect("UTF-8");
+    for key in [&root, &new] {
+        assert!(!text.contains(&key.key_text()));
+        assert!(!text.contains(&key.cred_text()));
+    }
+    let list: Value = serde_json::from_str(&text).expect("list");
+    for key in list["passkeys"].as_array().expect("keys") {
+        let fields = key.as_object().expect("entry");
+        assert_eq!(fields.len(), 3);
+        assert!(
+            fields.contains_key("label")
+                && fields.contains_key("addedAt")
+                && fields.contains_key("target")
+        );
+    }
+    assert!(text.contains("Second phone"));
+    assert!(text.contains(&arca::handlers::iso_utc(NOW)));
+    assert!(
+        fs::read_to_string(rig.state_path())
+            .expect("metadata persisted")
+            .contains("label=Second phone")
+    );
+}
+
+#[test]
+fn passkey_change_preserves_the_trusted_keys_sign_count_across_reload() {
+    let (rig, trusted) = Rig::new("passkey-change-count", true);
+    let first = SoftPasskey::from_seed(2);
+    let mut pending = pending_passkey(&rig, &first);
+    let mut assertion = Assert::over(
+        NAMESPACE,
+        pending["statement"].as_str().expect("statement").as_bytes(),
+    );
+    assertion.sign_count = 5;
+    pending["proof"] = trusted.proof_value(&assertion);
+    assert_eq!(
+        rig.post("/approve/passkeys/change", Some(ORIGIN), pending)
+            .0,
+        200
+    );
+    let second = SoftPasskey::from_seed(3);
+    let mut pending = pending_passkey(&rig, &second);
+    let mut assertion = Assert::over(
+        NAMESPACE,
+        pending["statement"].as_str().expect("statement").as_bytes(),
+    );
+    assertion.sign_count = 4;
+    pending["proof"] = trusted.proof_value(&assertion);
+    let (status, body) = rig.post("/approve/passkeys/change", Some(ORIGIN), pending.clone());
+    assert_eq!(status, 403);
+    assert!(String::from_utf8_lossy(&body).contains("SignCountRegressed"));
+    assertion.sign_count = 6;
+    pending["proof"] = trusted.proof_value(&assertion);
+    assert_eq!(
+        rig.post("/approve/passkeys/change", Some(ORIGIN), pending)
+            .0,
+        200
+    );
+    assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 3);
+}

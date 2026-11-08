@@ -151,6 +151,96 @@ impl Kernel {
         self.verifier.verifier_mut().replace_passkey_lines(lines);
     }
 
+    /// Checks a single-use statement signed by an already trusted passkey, then atomically changes only the state file.
+    /// The caller holds the kernel lock across the check, disk write and live key replacement. SSH proofs are refused.
+    pub fn approve_passkey_change(
+        &mut self,
+        state_dir: &Path,
+        line: &str,
+        statement: &str,
+        proof: &[u8],
+        now_ms: u64,
+    ) -> Result<(), ApprovalRefusal> {
+        use crate::passkey_change as change;
+        use arca_approval::{parse_passkeys, parse_proof, parse_statement};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let incoming = change::single_line(line)?;
+        let parsed = parse_statement(statement.as_bytes())?;
+        if !matches!(
+            parsed.action,
+            ArcaAction::PasskeyAdd | ArcaAction::PasskeyRemove
+        ) {
+            return Err(ApprovalRefusal::WrongAction);
+        }
+        // A parsed WebAuthn proof is mandatory before OwnerKeys' dispatch; no other proof can change trust.
+        parse_proof(proof)?;
+        let approval = format!("{}.{}", STANDARD.encode(statement), STANDARD.encode(proof));
+        self.verifier.check(
+            parsed.action,
+            &change::target(line),
+            &json!({ "line": line }),
+            &approval,
+            now_ms,
+        )?;
+
+        let mut state = change::state_lines(state_dir)?;
+        let previous = parse_passkeys(state.join("\n").as_bytes())?;
+        let mut roots = self.owner_passkey_lines();
+        roots.retain(|key| {
+            !previous
+                .iter()
+                .any(|old| old.credential_id == key.credential_id)
+        });
+        match parsed.action {
+            ArcaAction::PasskeyAdd => {
+                if self.owner_passkey_lines().iter().any(|key| {
+                    key.credential_id == incoming.credential_id
+                        || key.fingerprint == incoming.fingerprint
+                }) {
+                    return Err(change::malformed());
+                }
+                state.push(line.to_string());
+            }
+            ArcaAction::PasskeyRemove => {
+                // Membership is the exact state-file line, never a root-file line or an equivalent reformatting.
+                let index = state
+                    .iter()
+                    .position(|stored| stored == line)
+                    .ok_or_else(|| {
+                        ApprovalRefusal::Untrusted(
+                            "only a state-file passkey can be removed".into(),
+                        )
+                    })?;
+                if self.owner_passkey_count() <= 1 {
+                    return Err(ApprovalRefusal::Untrusted(
+                        "the last trusted passkey cannot be removed".into(),
+                    ));
+                }
+                state.remove(index);
+            }
+            _ => return Err(ApprovalRefusal::WrongAction),
+        }
+        let body = if state.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", state.join("\n"))
+        };
+        let mut next = parse_passkeys(body.as_bytes())?;
+        // Validate the union before writing: the root keys stay in memory and are never written by serve.
+        if next.iter().any(|key| {
+            roots.iter().any(|root| {
+                root.credential_id == key.credential_id || root.fingerprint == key.fingerprint
+            })
+        }) {
+            return Err(change::malformed());
+        }
+        next.extend(roots);
+        change::write_state_bytes(state_dir, body.as_bytes()).map_err(|_| change::storage())?;
+        self.replace_owner_passkeys(next);
+        Ok(())
+    }
+
     /// Verifies a WebAuthn assertion over `statement` against the owner's passkeys, advancing the shared sign count. The
     /// sign-in route uses this after it has spent its own challenge; approvals use the same store.
     pub fn verify_passkey(
