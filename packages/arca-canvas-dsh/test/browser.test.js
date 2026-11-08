@@ -28,6 +28,14 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   t.after(() => browser.close());
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
+  await page.addInitScript(() => {
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+    Object.defineProperty(Element.prototype, 'innerHTML', {
+      configurable: true,
+      get: descriptor.get,
+      set() { throw new Error('innerHTML is forbidden'); },
+    });
+  });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -38,7 +46,16 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   assert.equal(await page.locator('.arca-rail-row[data-kind="host"]').count(), 1);
   assert.equal(await page.locator('.arca-project-tile').count(), 12);
   assert.match(await page.locator('.arca-rail-row[data-kind="host"]').innerText(), /12 projects · 32 instances/);
-  assert.equal((await page.locator('.arca-project-tile').first().innerText()).match(/5 instances/g)?.length, 1);
+  assert.match(await page.locator('.arca-project-tile').first().innerText(), /\d+ running/);
+  assert.doesNotMatch(await page.locator('.arca-project-tile').first().innerText(), /\d+ instances/);
+  assert.equal(await page.locator('.arca-host-devices .arca-device-row').count(), 6);
+  assert.match(await page.locator('.arca-host-devices').innerText(), /alpha-node-01/);
+  assert.equal(await page.locator('.arca-rail-row[data-kind="not-placed"]').count(), 1);
+  assert.equal(await page.locator('.arca-rail-row[data-kind="databases"]').count(), 1);
+  assert.match(await page.locator('.arca-rail-row[data-kind="project"]').first().innerText(), /\d+ running/);
+  assert.match(await page.locator('.arca-host-alerts').innerText(), /1 firing alert/);
+  assert.match(await page.locator('.arca-host-alerts .arca-no-data').innerText(), /1 check has no data/);
+  assert.equal(await page.locator('.arca-plans').getAttribute('role'), 'link');
 
   await page.evaluate(() => {
     document.querySelector('.arca-rail-row[data-kind="host"]').dataset.marker = 'keep';
@@ -53,7 +70,8 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   assert.equal(new URL(page.url()).hash, '#project/alpha');
   assert.equal(await page.locator('.arca-canvas-node').count(), 5);
   assert.match(await page.locator('.arca-canvas-node').first().innerText(), /Container/);
-  assert.match(await page.locator('.arca-canvas-node').first().innerText(), /No image or IP reported/);
+  assert.doesNotMatch(await page.locator('.arca-canvas-node').first().innerText(), /No image or IP reported/);
+  assert.equal(await page.locator('.arca-canvas-node .arca-canvas-node-short:not([hidden])').count(), 0);
   assert.match(await page.locator('.arca-devices-frame').innerText(), /alpha-node-01/);
 
   await page.locator('.arca-canvas-node').first().click();
@@ -96,7 +114,7 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   assert.ok(phone.stageTop >= phone.rail.bottom - 1);
   assert.ok(pageJs.length < 2 * 1024 * 1024);
 
-  const hostileProject = '<img src=x onerror="window.__arcaXss=1">';
+  const hostileProject = '<a href="javascript:window.__arcaXss=1">x</a>';
   data = {
     ...fixture,
     projects: [...fixture.projects, hostileProject],
@@ -107,6 +125,8 @@ test('hosts, projects, selection, URL and retained state survive live polls', as
   await page.waitForSelector('.arca-project-tile');
   assert.equal(await page.locator('.arca-project-tile').filter({ hasText: hostileProject }).count(), 1);
   assert.equal(await page.evaluate(() => window.__arcaXss), undefined);
+  assert.equal(await page.locator('.arca-project-tile a').count(), 0);
   assert.equal(await page.locator('.arca-project-tile img').count(), 0);
+  assert.doesNotMatch(pageJs.toString(), /\.innerHTML\b/);
   assert.deepEqual(errors, []);
 });

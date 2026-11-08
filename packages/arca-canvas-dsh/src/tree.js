@@ -54,7 +54,7 @@ function shortLine(instance) {
   const address = instance.address ?? instance.ipv4 ?? instance.ip;
   if (image) return `Image ${text(image)}`;
   if (address) return `IP ${text(address)}`;
-  return 'No image or IP reported';
+  return null;
 }
 
 function rollup(children, emptyText) {
@@ -62,9 +62,10 @@ function rollup(children, emptyText) {
   const tones = children.map((child) => child.tone);
   const bad = tones.filter((tone) => tone === 'bad').length;
   const warn = tones.filter((tone) => tone === 'warn').length;
+  const running = children.filter((child) => child.rawStatus?.toLowerCase() === 'running').length;
   const stopped = children.filter((child) => child.rawStatus?.toLowerCase() === 'stopped').length;
   const tone = bad ? 'bad' : warn ? 'warn' : tones.every((tone) => tone === 'neutral') ? 'neutral' : 'ok';
-  const parts = [count(children.length, 'instance')];
+  const parts = [`${running} running`];
   if (stopped) parts.push(`${stopped} stopped`);
   if (bad) parts.push(`${bad} unavailable`);
   else if (warn) parts.push(`${warn} unknown`);
@@ -98,8 +99,9 @@ export function buildTree(snapshot = {}) {
       continue;
     }
     const key = instanceKey(machine ?? {}, matches[0].project, matches[0].name);
+    const matched = { ...device, matched: { project: matches[0].project, name: matches[0].name } };
     if (!placed.has(key)) placed.set(key, []);
-    placed.get(key).push(device);
+    placed.get(key).push(matched);
   }
   const databases = list(snapshot.databases).map((row) => ({ ...row, kind: 'database' }));
   const databasesByInstance = new Map();
@@ -162,7 +164,7 @@ export function buildTree(snapshot = {}) {
     status: unplacedDatabases.length ? `${count(unplacedDatabases.length, 'database')} without one instance name` : 'No unplaced databases',
     tone: unplacedDatabases.length ? 'warn' : 'neutral', rows: unplacedDatabases, route: '#databases',
   };
-  host.devices = [];
+  host.devices = devices;
   host.databases = databaseNode;
   host.notPlaced = notPlaced;
   const nodes = new Map();

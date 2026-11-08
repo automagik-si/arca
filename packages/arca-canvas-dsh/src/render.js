@@ -209,7 +209,17 @@ export function createCanvas(root) {
       entry.row.setAttribute('aria-selected', String(selectedProject === project.key));
       entry.row.tabIndex = state.focusKey === project.key ? 0 : -1;
     }
-    const wanted = new Set([model.host.key, ...projects.map((project) => project.key)]);
+    const hostGroups = [];
+    if (model.notPlaced.devices.length) hostGroups.push({ ...model.notPlaced, label: 'Not placed' });
+    if (model.databases.rows.length) hostGroups.push({ ...model.databases, label: 'Databases not placed' });
+    for (const group of hostGroups) {
+      const entry = railRow(group, group.kind, hostsBody);
+      entry.label.textContent = group.label;
+      entry.stateNode.replaceChildren(stateLine(doc, group.status, group.tone));
+      entry.row.setAttribute('aria-selected', String(state.route?.key === group.key));
+      entry.row.tabIndex = state.focusKey === group.key ? 0 : -1;
+    }
+    const wanted = new Set([model.host.key, ...hostGroups.map((group) => group.key), ...projects.map((project) => project.key)]);
     for (const [key, entry] of state.rows) {
       if (!wanted.has(key)) { entry.row.remove(); state.rows.delete(key); }
     }
@@ -247,7 +257,8 @@ export function createCanvas(root) {
     item.name.textContent = nodeEntry.name;
     item.type.textContent = nodeEntry.type;
     item.stateNode.replaceChildren(dot(doc, nodeEntry.tone), el(doc, 'span', '', nodeEntry.status));
-    item.short.textContent = nodeEntry.short;
+    item.short.textContent = nodeEntry.short ?? '';
+    item.short.hidden = !nodeEntry.short;
     item.extra.replaceChildren();
     for (const database of nodeEntry.databases ?? []) {
       const badge = el(doc, 'div', 'arca-instance-db');
@@ -368,6 +379,24 @@ export function createCanvas(root) {
         hostFrame.append(links);
       }
       hostFrame.append(projects);
+      const devicesFrame = el(doc, 'section', 'arca-devices-frame arca-host-devices');
+      devicesFrame.append(el(doc, 'h3', '', 'Devices'));
+      if (!model.host.devices.length) devicesFrame.append(el(doc, 'p', 'arca-frame-empty', 'No phones or desktops returned.'));
+      for (const device of model.host.devices) {
+        const row = el(doc, 'div', 'arca-device-row');
+        const place = device.matched ? `${device.matched.project}/${device.matched.name} · matched by name` : (device.reason ?? 'not placed');
+        row.append(dot(doc, statusTone(device.state)), el(doc, 'span', '', `${deviceLabel(device.kind)} · ${device.name}`), el(doc, 'span', 'arca-device-match', `${device.state ?? 'Unknown'} · ${place}`));
+        devicesFrame.append(row);
+      }
+      hostFrame.append(devicesFrame);
+      const firing = list(snapshot.alerts?.firing).length;
+      const unknown = list(snapshot.alerts?.unknown).length;
+      if (firing || unknown) {
+        const alerts = el(doc, 'div', 'arca-host-alerts');
+        if (firing) alerts.append(el(doc, 'span', 'arca-alert-firing', `${firing} firing alert${firing === 1 ? '' : 's'}`));
+        if (unknown) alerts.append(el(doc, 'span', 'arca-no-data', `${unknown} check${unknown === 1 ? ' has' : 's have'} no data`));
+        hostFrame.append(alerts);
+      }
       state.nodes.clear();
       stageBody.replaceChildren(hostFrame);
       return;
@@ -449,6 +478,7 @@ export function createCanvas(root) {
       add('Instances', snapshot.instancesKnown === false ? 'Watch report unavailable' : count(list(snapshot.instances).length, 'instance'));
       add('Incus', snapshot.machine?.incusReachable === false ? 'Unavailable' : 'Reachable');
       add('Devices', text(snapshot.devices, 'off'));
+      add('Alerts', `${list(snapshot.alerts?.firing).length} firing · ${list(snapshot.alerts?.unknown).length} checks with no data`);
     } else if (route.kind === 'project') {
       add('Friendly name', route.node.label);
       add('Raw Incus project', route.node.rawName, 'mono');
@@ -462,7 +492,7 @@ export function createCanvas(root) {
       add('Type', route.node.type);
       add('Owner', ownerLabel(route.node.owner));
       add('Privileged', route.node.privileged ? 'Yes' : 'No');
-      add('Image or IP', route.node.shortLine);
+      if (route.node.shortLine) add('Image or IP', route.node.shortLine);
       for (const database of route.node.databases) add('Database', database.name ?? database.entry ?? 'unnamed', 'mono');
       for (const device of route.node.devices) add('Matched by name', `${deviceLabel(device.kind)} ${device.name}`, 'mono');
     }
@@ -493,6 +523,8 @@ export function createCanvas(root) {
     plans.textContent = plansCount ? `${plansCount} waiting plan${plansCount === 1 ? '' : 's'}` : '';
     plans.hidden = plansCount === 0;
     plans.className = plansCount ? 'arca-plans is-link' : 'arca-plans';
+    if (plansCount && url) plans.setAttribute('role', 'link');
+    else plans.removeAttribute('role');
     plans.onclick = plansCount && url ? () => { location.href = url; } : null;
     plans.tabIndex = plansCount && url ? 0 : -1;
     const deviceState = snapshot.devices;

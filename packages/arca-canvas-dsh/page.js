@@ -54,16 +54,17 @@
     const address = instance.address ?? instance.ipv4 ?? instance.ip;
     if (image) return `Image ${text(image)}`;
     if (address) return `IP ${text(address)}`;
-    return "No image or IP reported";
+    return null;
   }
   function rollup(children, emptyText) {
     if (!children.length) return { tone: "neutral", text: emptyText };
     const tones = children.map((child) => child.tone);
     const bad = tones.filter((tone2) => tone2 === "bad").length;
     const warn = tones.filter((tone2) => tone2 === "warn").length;
+    const running = children.filter((child) => child.rawStatus?.toLowerCase() === "running").length;
     const stopped = children.filter((child) => child.rawStatus?.toLowerCase() === "stopped").length;
     const tone = bad ? "bad" : warn ? "warn" : tones.every((tone2) => tone2 === "neutral") ? "neutral" : "ok";
-    const parts = [count(children.length, "instance")];
+    const parts = [`${running} running`];
     if (stopped) parts.push(`${stopped} stopped`);
     if (bad) parts.push(`${bad} unavailable`);
     else if (warn) parts.push(`${warn} unknown`);
@@ -96,8 +97,9 @@
         continue;
       }
       const key = instanceKey(machine ?? {}, matches[0].project, matches[0].name);
+      const matched = { ...device, matched: { project: matches[0].project, name: matches[0].name } };
       if (!placed.has(key)) placed.set(key, []);
-      placed.get(key).push(device);
+      placed.get(key).push(matched);
     }
     const databases = list(snapshot.databases).map((row) => ({ ...row, kind: "database" }));
     const databasesByInstance = /* @__PURE__ */ new Map();
@@ -189,7 +191,7 @@
       rows: unplacedDatabases,
       route: "#databases"
     };
-    host.devices = [];
+    host.devices = devices;
     host.databases = databaseNode;
     host.notPlaced = notPlaced;
     const nodes = /* @__PURE__ */ new Map();
@@ -457,7 +459,17 @@
         entry.row.setAttribute("aria-selected", String(selectedProject === project.key));
         entry.row.tabIndex = state.focusKey === project.key ? 0 : -1;
       }
-      const wanted = /* @__PURE__ */ new Set([model.host.key, ...projects.map((project) => project.key)]);
+      const hostGroups = [];
+      if (model.notPlaced.devices.length) hostGroups.push({ ...model.notPlaced, label: "Not placed" });
+      if (model.databases.rows.length) hostGroups.push({ ...model.databases, label: "Databases not placed" });
+      for (const group of hostGroups) {
+        const entry = railRow(group, group.kind, hostsBody);
+        entry.label.textContent = group.label;
+        entry.stateNode.replaceChildren(stateLine(doc, group.status, group.tone));
+        entry.row.setAttribute("aria-selected", String(state.route?.key === group.key));
+        entry.row.tabIndex = state.focusKey === group.key ? 0 : -1;
+      }
+      const wanted = /* @__PURE__ */ new Set([model.host.key, ...hostGroups.map((group) => group.key), ...projects.map((project) => project.key)]);
       for (const [key, entry] of state.rows) {
         if (!wanted.has(key)) {
           entry.row.remove();
@@ -496,7 +508,8 @@
       item.name.textContent = nodeEntry.name;
       item.type.textContent = nodeEntry.type;
       item.stateNode.replaceChildren(dot(doc, nodeEntry.tone), el(doc, "span", "", nodeEntry.status));
-      item.short.textContent = nodeEntry.short;
+      item.short.textContent = nodeEntry.short ?? "";
+      item.short.hidden = !nodeEntry.short;
       item.extra.replaceChildren();
       for (const database of nodeEntry.databases ?? []) {
         const badge = el(doc, "div", "arca-instance-db");
@@ -619,6 +632,24 @@
           hostFrame.append(links);
         }
         hostFrame.append(projects);
+        const devicesFrame = el(doc, "section", "arca-devices-frame arca-host-devices");
+        devicesFrame.append(el(doc, "h3", "", "Devices"));
+        if (!model.host.devices.length) devicesFrame.append(el(doc, "p", "arca-frame-empty", "No phones or desktops returned."));
+        for (const device of model.host.devices) {
+          const row = el(doc, "div", "arca-device-row");
+          const place = device.matched ? `${device.matched.project}/${device.matched.name} \xB7 matched by name` : device.reason ?? "not placed";
+          row.append(dot(doc, statusTone(device.state)), el(doc, "span", "", `${deviceLabel(device.kind)} \xB7 ${device.name}`), el(doc, "span", "arca-device-match", `${device.state ?? "Unknown"} \xB7 ${place}`));
+          devicesFrame.append(row);
+        }
+        hostFrame.append(devicesFrame);
+        const firing = list2(snapshot.alerts?.firing).length;
+        const unknown = list2(snapshot.alerts?.unknown).length;
+        if (firing || unknown) {
+          const alerts = el(doc, "div", "arca-host-alerts");
+          if (firing) alerts.append(el(doc, "span", "arca-alert-firing", `${firing} firing alert${firing === 1 ? "" : "s"}`));
+          if (unknown) alerts.append(el(doc, "span", "arca-no-data", `${unknown} check${unknown === 1 ? " has" : "s have"} no data`));
+          hostFrame.append(alerts);
+        }
         state.nodes.clear();
         stageBody.replaceChildren(hostFrame);
         return;
@@ -719,6 +750,7 @@
         add("Instances", snapshot.instancesKnown === false ? "Watch report unavailable" : count2(list2(snapshot.instances).length, "instance"));
         add("Incus", snapshot.machine?.incusReachable === false ? "Unavailable" : "Reachable");
         add("Devices", text2(snapshot.devices, "off"));
+        add("Alerts", `${list2(snapshot.alerts?.firing).length} firing \xB7 ${list2(snapshot.alerts?.unknown).length} checks with no data`);
       } else if (route.kind === "project") {
         add("Friendly name", route.node.label);
         add("Raw Incus project", route.node.rawName, "mono");
@@ -732,7 +764,7 @@
         add("Type", route.node.type);
         add("Owner", ownerLabel(route.node.owner));
         add("Privileged", route.node.privileged ? "Yes" : "No");
-        add("Image or IP", route.node.shortLine);
+        if (route.node.shortLine) add("Image or IP", route.node.shortLine);
         for (const database of route.node.databases) add("Database", database.name ?? database.entry ?? "unnamed", "mono");
         for (const device of route.node.devices) add("Matched by name", `${deviceLabel(device.kind)} ${device.name}`, "mono");
       }
@@ -761,6 +793,8 @@
       plans.textContent = plansCount ? `${plansCount} waiting plan${plansCount === 1 ? "" : "s"}` : "";
       plans.hidden = plansCount === 0;
       plans.className = plansCount ? "arca-plans is-link" : "arca-plans";
+      if (plansCount && url) plans.setAttribute("role", "link");
+      else plans.removeAttribute("role");
       plans.onclick = plansCount && url ? () => {
         location.href = url;
       } : null;

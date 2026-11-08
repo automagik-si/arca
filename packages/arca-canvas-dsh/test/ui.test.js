@@ -1,10 +1,17 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { approvalUrl } from '../src/approval.js';
+import { buildBrowser } from '../build.mjs';
 import {
-  buildTree, kindLabel, parseRoute, projectLabel, statusTone,
+  alertRows, buildTree, kindLabel, ownerLabel, parseRoute, projectLabel, statusTone,
 } from '../src/tree.js';
 
+const here = fileURLToPath(new URL('.', import.meta.url));
 const fixture = JSON.parse(await readFile(new URL('./tree-fixtures.json', import.meta.url), 'utf8'));
 
 test('tree keeps hosts, Incus projects and empty projects distinct', () => {
@@ -66,3 +73,46 @@ test('project labels and status words stay plain', () => {
   assert.equal(statusTone('Running'), 'ok');
   assert.equal(statusTone('unreachable'), 'bad');
 });
+
+test('project status leads with running and stopped counts', () => {
+  const tree = buildTree(fixture);
+  const alpha = tree.projects.find((project) => project.project === 'alpha');
+  assert.match(alpha.status, /^[0-9]+ running/);
+  assert.match(alpha.status, /stopped/);
+  const empty = tree.projects.find((project) => project.project === 'empty');
+  assert.equal(empty.status, 'Empty Incus project');
+});
+
+test('alerts are firing-only and owner labels do not fold classes', () => {
+  assert.deepEqual(alertRows({ firing: [{ rule: 'cpu' }], unknown: [{ rule: 'disk' }], resolvedRecent: [{ rule: 'old' }] }).map((row) => row.rule), ['cpu']);
+  for (const [owner, label] of [['kernel', 'Managed by Arca'], ['retained', 'Managed by Arca'], ['droidd', 'Droidd'], ['foreign', 'Foreign'], ['contested', 'Contested']]) {
+    assert.equal(ownerLabel({ class: owner }), label);
+  }
+});
+
+test('approval links require absolute HTTP(S) URLs', () => {
+  assert.equal(approvalUrl('https://example.com/approve'), 'https://example.com/approve');
+  assert.equal(approvalUrl('http://127.0.0.1:8080/approve'), 'http://127.0.0.1:8080/approve');
+  for (const value of ['', '/approve', 'javascript:alert(1)', 'ftp://example.com', 'https://user:pass@example.com/approve']) {
+    assert.equal(approvalUrl(value), '');
+  }
+});
+
+test('committed browser artifacts equal a fresh build and use no external CSS', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'arca-canvas-build-'));
+  try {
+    await buildBrowser(dir);
+    for (const name of ['page.js', 'page.css']) {
+      const fresh = createHash('sha256').update(await readFile(join(dir, name))).digest('hex');
+      const committed = createHash('sha256').update(await readFile(join(here, '..', name))).digest('hex');
+      assert.equal(committed, fresh, name);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  for (const name of ['src/canvas.css', 'page.css']) {
+    const css = await readFile(join(here, '..', name), 'utf8');
+    assert.doesNotMatch(css, /@import|url\(\s*['"]?https?:/i, name);
+  }
+});
+

@@ -328,3 +328,8 @@ button.arca-node-card:focus-visible { outline: 2px solid var(--arca-accent); out
 .arca-host-links { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
 .arca-linkish { border: 1px solid var(--arca-line-2); border-radius: 5px; background: var(--arca-surface); color: var(--arca-muted); padding: 4px 7px; font: 11px var(--arca-font); cursor: pointer; }
 .arca-linkish:hover, .arca-linkish:focus-visible { color: var(--arca-ink); border-color: var(--arca-accent); outline: none; }
+
+.arca-host-alerts { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--arca-line); font-size: 11px; }
+.arca-alert-firing { color: var(--arca-warn-ink); }
+.arca-host-devices .arca-device-row { grid-template-columns: auto minmax(0, 1fr); }
+.arca-host-devices .arca-device-match { grid-column: 2; text-align: left; }
