@@ -1,0 +1,211 @@
+{
+  "at": "2026-11-08T16:00:00.000Z",
+  "approvalUrl": "https://example.com/approve",
+  "defaultProject": "Studio",
+  "projects": [
+    {
+      "name": "Studio",
+      "domain": "studio.example",
+      "members": [
+        { "host": "alpha", "incusProject": "plumbing", "instance": "app" },
+        { "host": "alpha", "incusProject": "plumbing", "instance": "db" },
+        { "host": "beta", "incusProject": "sandbox", "instance": "api" }
+      ]
+    },
+    {
+      "name": "Automation",
+      "members": [
+        { "host": "beta", "incusProject": "sandbox", "instance": "queue" }
+      ]
+    }
+  ],
+  "hosts": [
+    {
+      "name": "alpha",
+      "at": "2026-11-08T16:00:00.000Z",
+      "error": null,
+      "nodeName": "alpha",
+      "machine": {
+        "version": "0.1.0",
+        "node": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "mode": "kernel",
+        "incusReachable": true,
+        "uptimeS": 3600,
+        "appliedSeq": 4
+      },
+      "instancesKnown": true,
+      "projects": ["arcak-svc", "plumbing", "sandbox"],
+      "instances": [
+        {
+          "name": "app",
+          "project": "plumbing",
+          "kind": "container",
+          "status": "Running",
+          "owner": { "class": "kernel" },
+          "privileged": false,
+          "identity": false,
+          "url": "https://app.example.test"
+        },
+        {
+          "name": "db",
+          "project": "plumbing",
+          "kind": "container",
+          "status": "Running",
+          "owner": { "class": "kernel" },
+          "privileged": false,
+          "identity": false
+        },
+        {
+          "name": "worker",
+          "project": "sandbox",
+          "kind": "container",
+          "status": "Running",
+          "owner": { "class": "foreign" },
+          "privileged": false,
+          "identity": false
+        },
+        {
+          "name": "web1",
+          "project": "arcak-svc",
+          "kind": "container",
+          "status": "Running",
+          "owner": { "class": "kernel" },
+          "privileged": false,
+          "identity": false
+        }
+      ],
+      "databases": [
+        {
+          "name": "db",
+          "entry": "db",
+          "status": "ready",
+          "address": "10.0.0.5",
+          "port": 5432,
+          "links": [{ "name": "app" }]
+        },
+        {
+          "name": "orphan",
+          "entry": "orphan",
+          "status": "pending",
+          "address": null,
+          "port": 5432,
+          "links": []
+        }
+      ],
+      "metrics": {
+        "at": 1794160000000,
+        "latest": {
+          "at": 1794160000000,
+          "cpu": { "cores": 8, "usedPct": 25 },
+          "memory": { "totalBytes": 16000000000, "availableBytes": 12000000000 },
+          "load": { "one": 1.2, "five": 1.1, "fifteen": 1.0 }
+        }
+      },
+      "alerts": { "firing": [], "unknown": [], "resolvedRecent": [] },
+      "plans": [],
+      "journal": [
+        {
+          "id": 1,
+          "entry": "deploy-app",
+          "target": { "kind": "instance", "name": "app", "project": "plumbing" },
+          "state": "Applied",
+          "at_ms": 1794159900000,
+          "plugin": "plugin.deploy"
+        },
+        {
+          "id": 2,
+          "entry": "backup-db",
+          "target": { "kind": "volume", "name": "db-data", "project": "plumbing" },
+          "state": "Applied",
+          "at_ms": 1794159300000,
+          "plugin": "plugin.backup"
+        }
+      ],
+      "journalKnown": true,
+      "devices": "off",
+      "devicesAt": null,
+      "phones": [],
+      "desktops": []
+    },
+    {
+      "name": "beta",
+      "at": "2026-11-08T16:00:00.000Z",
+      "error": null,
+      "nodeName": "beta",
+      "machine": {
+        "version": "0.1.0",
+        "node": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "mode": "kernel",
+        "incusReachable": true,
+        "uptimeS": 7200,
+        "appliedSeq": 6
+      },
+      "instancesKnown": true,
+      "projects": ["sandbox", "tools"],
+      "instances": [
+        {
+          "name": "api",
+          "project": "sandbox",
+          "kind": "virtual-machine",
+          "status": "Running",
+          "owner": { "class": "kernel" },
+          "privileged": false,
+          "identity": false
+        },
+        {
+          "name": "queue",
+          "project": "sandbox",
+          "kind": "container",
+          "status": "Stopped",
+          "owner": { "class": "kernel" },
+          "privileged": false,
+          "identity": false
+        },
+        {
+          "name": "rogue",
+          "project": "tools",
+          "kind": "container",
+          "status": "Error",
+          "owner": { "class": "foreign" },
+          "privileged": true,
+          "identity": false
+        }
+      ],
+      "databases": [],
+      "metrics": {
+        "at": 1794160000000,
+        "latest": {
+          "at": 1794160000000,
+          "cpu": { "cores": 4, "usedPct": 50 },
+          "memory": { "totalBytes": 8000000000, "availableBytes": 2000000000 },
+          "load": { "one": 2.2, "five": 2.0, "fifteen": 1.8 }
+        }
+      },
+      "alerts": { "firing": [], "unknown": [], "resolvedRecent": [] },
+      "plans": [{ "digest": "plan-example", "kind": "expose", "expiresAt": 1794163600000 }],
+      "journal": [
+        {
+          "id": 1,
+          "entry": "rotate-token",
+          "target": { "kind": "token", "name": "viewer", "project": "default" },
+          "state": "Applied",
+          "at_ms": 1794160100000,
+          "plugin": "plugin.tokens"
+        },
+        {
+          "id": 2,
+          "entry": "snapshot-api",
+          "target": { "kind": "instance", "name": "api", "project": "sandbox" },
+          "state": "Applied",
+          "at_ms": 1794159700000,
+          "plugin": "plugin.backup"
+        }
+      ],
+      "journalKnown": true,
+      "devices": "off",
+      "devicesAt": null,
+      "phones": [],
+      "desktops": []
+    }
+  ]
+}

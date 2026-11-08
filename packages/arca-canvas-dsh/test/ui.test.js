@@ -1,132 +1,303 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { approvalUrl } from '../src/approval.js';
-import { buildBrowser } from '../build.mjs';
 import {
-  alertRows, buildTree, kindLabel, ownerLabel, parseRoute, projectLabel, statusTone,
-} from '../src/tree.js';
+  buildDashboard, cpuLabel, fleetSummary, hostCpu, hostMemory, instanceKindLabel, journalFeed,
+  memoryLabel, ownerLabel, parseProjectHash, projectHash, projectLabel, selectProject, statusTone,
+} from '../src/model.js';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const fixture = JSON.parse(await readFile(new URL('./tree-fixtures.json', import.meta.url), 'utf8'));
+const fixture = JSON.parse(await readFile(new URL('./dashboard-fixtures.json', import.meta.url), 'utf8'));
+const clone = () => structuredClone(fixture);
 
-test('tree keeps hosts, Incus projects and empty projects distinct', () => {
-  const tree = buildTree(fixture);
-  assert.equal(tree.host.label, 'Example machine');
-  assert.equal(tree.host.status, '12 projects · 32 instances');
-  assert.equal(tree.projects.length, 12);
-  assert.equal(tree.projects.reduce((sum, project) => sum + project.children.length, 0), 32);
-  assert.equal(tree.projects.find((project) => project.project === 'empty').children.length, 0);
-  assert.equal(tree.host.rawName, fixture.machine.node);
-  assert.equal(tree.projects.find((project) => project.project === 'alpha').label, 'Alpha');
+function project(dashboard, name) {
+  return dashboard.projects.find((entry) => entry.name === name);
+}
+
+test('owner members land in their project across hosts', () => {
+  const dashboard = buildDashboard(fixture);
+  const studio = project(dashboard, 'Studio');
+  assert.ok(studio, 'Studio project exists');
+  assert.equal(studio.kind, 'owner');
+  assert.equal(studio.domain, 'studio.example');
+  assert.deepEqual(studio.cards.map((card) => card.name), ['app', 'db', 'api', 'db']);
+  assert.deepEqual(studio.cards.map((card) => card.kind), ['instance', 'instance', 'instance', 'database']);
+  assert.deepEqual(studio.hosts, ['alpha', 'beta']);
+  assert.equal(studio.cards[0].host, 'alpha');
+  assert.equal(studio.cards[2].host, 'beta');
+  assert.equal(project(dashboard, 'Automation').cards[0].name, 'queue');
+  assert.equal(project(dashboard, 'Automation').domain, '');
 });
 
-test('phones and desktops join only one exact instance name', () => {
-  const tree = buildTree(fixture);
-  const alpha = tree.projects.find((project) => project.project === 'alpha');
-  const beta = tree.projects.find((project) => project.project === 'beta');
-  assert.deepEqual(alpha.devices.map((device) => device.name), ['alpha-node-01']);
-  assert.deepEqual(beta.devices.map((device) => device.name), ['beta-node-01']);
-  assert.ok(tree.notPlaced.devices.some((device) => device.name === 'worker'));
-  assert.ok(tree.notPlaced.devices.some((device) => device.name === 'phone-x'));
+test('an unlisted instance falls back to its Incus project', () => {
+  const dashboard = buildDashboard(fixture);
+  const sandbox = project(dashboard, 'Sandbox');
+  assert.ok(sandbox, 'alpha sandbox renders as a fallback project');
+  assert.deepEqual(sandbox.cards.map((card) => card.name), ['worker']);
+  assert.equal(sandbox.kind, 'incus');
+  assert.equal(sandbox.rawName, 'sandbox');
+  assert.equal(sandbox.host, 'alpha');
+  assert.equal(project(dashboard, 'Tools').cards[0].name, 'rogue');
 });
 
-test('host devices retain each exact match or unmatched reason without changing the snapshot', () => {
-  const snapshot = {
-    machine: { node: 'example' },
-    instances: [
-      { name: 'phone', project: 'alpha' }, { name: 'desktop', project: 'beta' },
-      { name: 'worker', project: 'alpha' }, { name: 'worker', project: 'beta' },
-    ],
-    phones: [{ name: 'phone' }, { name: 'worker' }, { name: 'missing' }],
-    desktops: [{ name: 'desktop' }],
-  };
-  const original = structuredClone(snapshot);
-  const tree = buildTree(snapshot);
-  assert.deepEqual(tree.host.devices.map(({ name, matched, reason }) => ({ name, matched, reason })), [
-    { name: 'phone', matched: { project: 'alpha', name: 'phone' }, reason: undefined },
-    { name: 'worker', matched: undefined, reason: 'name matches more than one instance' },
-    { name: 'missing', matched: undefined, reason: 'no instance with this name' },
-    { name: 'desktop', matched: { project: 'beta', name: 'desktop' }, reason: undefined },
-  ]);
-  assert.deepEqual(tree.notPlaced.devices, tree.host.devices.filter((device) => device.reason));
-  assert.deepEqual(snapshot, original);
+test('an Incus project fully assigned to owner projects never renders', () => {
+  const dashboard = buildDashboard(fixture);
+  assert.equal(project(dashboard, 'Plumbing'), undefined);
+  assert.equal(dashboard.projects.filter((entry) => entry.kind === 'incus' && entry.rawName === 'plumbing').length, 0);
+  // beta/sandbox has only members of owner projects, so only alpha's unlisted worker creates a Sandbox project.
+  assert.equal(dashboard.projects.filter((entry) => entry.kind === 'incus' && entry.rawName === 'sandbox').length, 1);
+  assert.equal(dashboard.projects.filter((entry) => entry.kind === 'incus' && entry.rawName === 'sandbox')[0].host, 'alpha');
 });
 
-test('a database is placed in one exactly named instance when known', () => {
-  const tree = buildTree({
+test('database cards use only real snapshot fields and never invent rows', () => {
+  const studio = project(buildDashboard(fixture), 'Studio');
+  const database = studio.cards.find((card) => card.kind === 'database');
+  assert.equal(database.name, 'db');
+  assert.equal(database.type, 'PostgreSQL');
+  assert.equal(database.status, 'ready');
+  assert.equal(database.address, '10.0.0.5');
+  assert.equal(database.port, 5432);
+  assert.equal(database.links.length, 1);
+  assert.equal(database.instance, 'db');
+  assert.equal(JSON.stringify(studio).includes('orphan'), false, 'unmatched databases do not appear');
+  assert.equal(JSON.stringify(studio).includes('orders'), false);
+  assert.equal(JSON.stringify(studio).includes('customers'), false);
+});
+
+test('instance links appear only for a real absolute URL', () => {
+  const studio = project(buildDashboard(fixture), 'Studio');
+  const app = studio.cards.find((card) => card.name === 'app');
+  const db = studio.cards.find((card) => card.kind === 'instance' && card.name === 'db');
+  assert.equal(app.url, 'https://app.example.test');
+  assert.equal(db.url, '');
+  const dashboard = buildDashboard({
     ...fixture,
-    databases: [
-      { name: 'alpha-node-01', entry: 'alpha-node-01', status: 'ready' },
-      { name: 'unknown-db', entry: 'unknown-db', status: 'ready' },
-    ],
+    hosts: fixture.hosts.map((host) => ({
+      ...host,
+      instances: host.instances.map((instance) => ({ ...instance, url: 'javascript:alert(1)' })),
+    })),
   });
-  const instance = tree.projects.find((project) => project.project === 'alpha').children
-    .find((row) => row.name === 'alpha-node-01');
-  assert.equal(instance.databases.length, 1);
-  assert.equal(instance.databases[0].name, 'alpha-node-01');
-  assert.equal(tree.databases.rows.length, 1);
-  assert.equal(tree.databases.rows[0].name, 'unknown-db');
+  assert.equal(project(dashboard, 'Studio').cards[0].url, '');
 });
 
-test('routes follow host, project and selected instance', () => {
-  const tree = buildTree(fixture);
-  const host = parseRoute(tree.host.route, tree);
-  assert.equal(host.kind, 'host');
-  const project = parseRoute('#project/alpha', tree);
-  assert.equal(project.kind, 'project');
-  const instance = parseRoute('#project/alpha/instance/alpha-node-01', tree);
-  assert.equal(instance.kind, 'instance');
-  assert.equal(instance.node.name, 'alpha-node-01');
-  assert.equal(parseRoute('#project/missing', tree).kind, 'not-found');
-  assert.equal(parseRoute('#host/not-this-host', tree).kind, 'not-found');
+test('default selection prefers configured, owner, service, then other Incus projects', () => {
+  const dashboard = buildDashboard(fixture);
+  assert.equal(dashboard.defaultProject.name, 'Studio');
+  assert.equal(projectHash(dashboard.defaultProject), '#project/Studio');
+  assert.equal(parseProjectHash('#project/Studio'), 'Studio');
+  assert.equal(parseProjectHash('#project/Arca%20tests'), 'Arca tests');
+  assert.equal(parseProjectHash('#host/alpha'), null);
+  assert.equal(parseProjectHash('#project/%'), null);
+  assert.equal(selectProject(dashboard.projects, 'Automation').name, 'Automation');
+  assert.equal(selectProject(dashboard.projects, 'missing'), null);
+  const configured = buildDashboard({ ...fixture, defaultProject: 'Automation' });
+  assert.equal(configured.defaultProject.name, 'Automation');
+  const ownerFirst = buildDashboard({ ...fixture, defaultProject: '', projects: fixture.projects });
+  assert.equal(ownerFirst.defaultProject.name, 'Studio');
+  const fallback = buildDashboard({ ...fixture, defaultProject: '', projects: [] });
+  // The standard fixture carries one unlisted service, which outranks the other Incus projects.
+  assert.equal(fallback.defaultProject.name, 'Web1');
+  assert.equal(fallback.defaultProject.kind, 'service');
 });
 
-test('project labels and status words stay plain', () => {
+test('arcak-svc never becomes a project and every unlisted service is first-class', () => {
+  const dashboard = buildDashboard({
+    hosts: [{
+      name: 'alpha',
+      instancesKnown: true,
+      projects: ['arcak-svc', 'shared'],
+      instances: [
+        { name: 'web1', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'nats', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'worker', project: 'shared', kind: 'container', status: 'Running' },
+      ],
+    }],
+  });
+  assert.deepEqual(dashboard.projects.map((entry) => [entry.name, entry.kind]), [
+    ['Nats', 'service'], ['Web1', 'service'], ['Shared', 'incus'],
+  ]);
+  for (const service of dashboard.projects.filter((entry) => entry.kind === 'service')) {
+    assert.equal(service.host, 'alpha');
+    assert.equal(service.rawName, '');
+    assert.equal(service.cards.length, 1);
+  }
+  assert.equal(dashboard.projects.some((entry) => /arcak-svc|Arca services/i.test(`${entry.name} ${entry.rawName}`)), false);
+  assert.equal(dashboard.defaultProject.name, 'Nats');
+  assert.equal(dashboard.defaultProject.kind, 'service');
+});
+
+test('an owner project may group one service while the rest stay first-class', () => {
+  const dashboard = buildDashboard({
+    projects: [{ name: 'Messaging', members: [{ host: 'alpha', incusProject: 'arcak-svc', instance: 'nats' }] }],
+    defaultProject: 'Messaging',
+    hosts: [{
+      name: 'alpha',
+      instancesKnown: true,
+      projects: ['arcak-svc'],
+      instances: [
+        { name: 'web1', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'nats', project: 'arcak-svc', kind: 'container', status: 'Running' },
+      ],
+    }],
+  });
+  assert.deepEqual(dashboard.projects.map((entry) => entry.name), ['Messaging', 'Web1']);
+  assert.equal(project(dashboard, 'Messaging').cards[0].name, 'nats');
+  assert.equal(dashboard.projects.filter((entry) => entry.kind === 'service').length, 1);
+  assert.equal(dashboard.projects.some((entry) => entry.kind === 'service' && entry.cards.some((card) => card.name === 'nats')), false);
+});
+
+test('default selection never picks an internal project', () => {
+  const dashboard = buildDashboard({
+    hosts: [{
+      name: 'alpha',
+      instancesKnown: true,
+      projects: ['aaa', 'arcak-svc'],
+      instances: [
+        { name: 'zulu', project: 'arcak-svc', kind: 'container', status: 'Running' },
+        { name: 'worker', project: 'aaa', kind: 'container', status: 'Running' },
+      ],
+    }],
+  });
+  assert.equal(dashboard.defaultProject.name, 'Zulu');
+  assert.equal(dashboard.defaultProject.kind, 'service');
+  assert.deepEqual(dashboard.projects.map((entry) => entry.name), ['Zulu', 'Aaa']);
+  assert.equal(dashboard.projects.some((entry) => entry.name === 'Arca services' || entry.rawName === 'arcak-svc'), false);
+});
+
+test('members on a host whose instance report failed are unknown, not missing', () => {
+  const failed = fixture.hosts.map((host) => host.name === 'beta'
+    ? { ...host, instancesKnown: false, instances: [] }
+    : host);
+  const dashboard = buildDashboard({
+    ...fixture,
+    projects: [{
+      name: 'Mixed',
+      members: [
+        { host: 'alpha', incusProject: 'plumbing', instance: 'app' },
+        { host: 'beta', incusProject: 'sandbox', instance: 'api' },
+      ],
+    }],
+    defaultProject: 'Mixed',
+    hosts: failed,
+  });
+  const mixed = project(dashboard, 'Mixed');
+  assert.equal(mixed.cards.length, 1);
+  assert.equal(mixed.missing, 0);
+  assert.equal(mixed.unknown, 1);
+  assert.match(mixed.status, /unknown/);
+  assert.equal(mixed.status.includes('Nothing live yet'), false);
+  assert.equal(mixed.tone, 'warn');
+
+  const only = buildDashboard({
+    ...fixture,
+    projects: [{ name: 'Beta only', members: [{ host: 'beta', incusProject: 'sandbox', instance: 'api' }] }],
+    defaultProject: 'Beta only',
+    hosts: failed,
+  });
+  const beta = project(only, 'Beta only');
+  assert.equal(beta.cards.length, 0);
+  assert.equal(beta.missing, 0);
+  assert.equal(beta.unknown, 1);
+  assert.equal(beta.status, 'Host data unavailable');
+  assert.equal(beta.tone, 'warn');
+});
+
+test('fleet summary sums real cores and memory and omits absent parts', () => {
+  const dashboard = buildDashboard(fixture);
+  assert.equal(dashboard.summary, '2 machines · 12 cores · 24 GB');
+  assert.equal(cpuLabel(hostCpu(fixture.hosts[0])), '2 / 8 cores');
+  assert.equal(memoryLabel(hostMemory(fixture.hosts[0])), '4 / 16 GB');
+  assert.equal(cpuLabel(hostCpu(fixture.hosts[1])), '2 / 4 cores');
+  assert.equal(memoryLabel(hostMemory(fixture.hosts[1])), '6 / 8 GB');
+  const noMetrics = fixture.hosts.map((host) => ({ ...host, metrics: null }));
+  assert.equal(fleetSummary(noMetrics), '2 machines');
+  const oneMetric = fixture.hosts.map((host, index) => index === 0 ? host : { ...host, metrics: null });
+  assert.equal(fleetSummary(oneMetric), '2 machines · 8 cores · 16 GB');
+  assert.equal(fleetSummary([{ name: 'alpha' }]), '1 machine');
+});
+
+test('machines expose online state, capacity and unknown instance counts', () => {
+  const dashboard = buildDashboard(fixture);
+  assert.equal(dashboard.hosts.length, 2);
+  assert.deepEqual(dashboard.hosts.map((machine) => [machine.name, machine.online, machine.instanceCount]), [
+    ['alpha', true, 4], ['beta', true, 3],
+  ]);
+  const offline = buildDashboard({
+    ...fixture,
+    hosts: [{ ...fixture.hosts[0], machine: { ...fixture.hosts[0].machine, incusReachable: false }, instancesKnown: false }],
+  });
+  assert.equal(offline.hosts[0].online, false);
+  assert.equal(offline.hosts[0].status, 'Offline');
+  assert.equal(offline.hosts[0].instanceCount, null);
+});
+
+test('journal cards are newest-first with host, entry, target and state', () => {
+  const dashboard = buildDashboard(fixture);
+  assert.deepEqual(dashboard.journal.map((record) => [record.entry, record.host, record.target, record.state]), [
+    ['rotate-token', 'beta', 'token viewer', 'Applied'],
+    ['deploy-app', 'alpha', 'instance app', 'Applied'],
+    ['snapshot-api', 'beta', 'instance api', 'Applied'],
+    ['backup-db', 'alpha', 'volume db-data', 'Applied'],
+  ]);
+  assert.equal(journalFeed(fixture.hosts, 2).length, 2);
+  assert.deepEqual(journalFeed([{ name: 'alpha', journal: [{ entry: 'deploy-app', target: { kind: 'instance', name: 'app' }, state: 'Failed', at_ms: 1 }] }])[0],
+    { key: 'alpha:0', host: 'alpha', entry: 'deploy-app', state: 'Failed', tone: 'bad', target: 'instance app', plugin: '', at: 1 });
+});
+
+test('a journal target without a name never shows the internal project id', () => {
+  const [record] = journalFeed([{ name: 'alpha', journal: [{
+    id: 3,
+    entry: 'create-app',
+    target: { kind: 'instance', project: 'arcak-svc' },
+    state: 'Intent',
+    at_ms: 1,
+  }] }]);
+  assert.equal(record.target, 'instance in Arca service');
+  assert.equal(JSON.stringify(record).includes('arcak-svc'), false);
+  const [other] = journalFeed([{ name: 'alpha', journal: [{
+    id: 4,
+    entry: 'open-volume',
+    target: { kind: 'volume', project: 'plumbing' },
+    state: 'Applied',
+    at_ms: 1,
+  }] }]);
+  assert.equal(other.target, 'volume in Plumbing');
+});
+
+test('journal and plan data stay absent when a host fails', () => {
+  const dashboard = buildDashboard({
+    ...fixture,
+    hosts: [{ ...fixture.hosts[0], journal: [], journalKnown: false, plans: [] }],
+  });
+  assert.deepEqual(dashboard.journal, []);
+  assert.equal(dashboard.plans, 0);
+  assert.equal(dashboard.projects.some((entry) => entry.cards.some((card) => card.name === 'api')), false);
+});
+
+test('labels keep product language plain', () => {
   assert.equal(projectLabel('default'), 'Default');
   assert.equal(projectLabel('arcak-adopt-home-assistant'), 'Adopted Home Assistant');
-  assert.equal(kindLabel('virtual-machine'), 'VM');
-  assert.equal(kindLabel('container'), 'Container');
-  assert.equal(statusTone('Stopped'), 'neutral');
+  assert.notEqual(projectLabel('arcak-svc'), 'Arca services');
+  assert.equal(instanceKindLabel('virtual-machine'), 'VM');
+  assert.equal(instanceKindLabel('container'), 'Container');
   assert.equal(statusTone('Running'), 'ok');
-  assert.equal(statusTone('unreachable'), 'bad');
-});
-
-test('project status leads with running and stopped counts', () => {
-  const tree = buildTree(fixture);
-  const alpha = tree.projects.find((project) => project.project === 'alpha');
-  assert.match(alpha.status, /^[0-9]+ running/);
-  assert.match(alpha.status, /stopped/);
-  const empty = tree.projects.find((project) => project.project === 'empty');
-  assert.equal(empty.status, 'Empty Incus project');
-});
-
-test('alerts are firing-only and only kernel and retained owners are managed', () => {
-  assert.deepEqual(alertRows({ firing: [{ rule: 'cpu' }], unknown: [{ rule: 'disk' }], resolvedRecent: [{ rule: 'old' }] }).map((row) => row.rule), ['cpu']);
-  for (const [owner, label] of [
-    ['kernel', 'Managed by Arca'], ['retained', 'Managed by Arca'],
-    ['droidd', 'External'], ['foreign', 'External'], ['contested', 'External'],
-    ['unknown', 'External'], ['custom', 'External'], ['', 'External'],
-    [null, 'External'], [undefined, 'External'],
-  ]) {
-    assert.equal(ownerLabel({ class: owner }), label);
-    assert.equal(ownerLabel(owner), label);
-  }
-});
-
-test('approval links require absolute HTTP(S) URLs', () => {
-  assert.equal(approvalUrl('https://example.com/approve'), 'https://example.com/approve');
-  assert.equal(approvalUrl('http://127.0.0.1:8080/approve'), 'http://127.0.0.1:8080/approve');
-  for (const value of ['', '/approve', 'javascript:alert(1)', 'ftp://example.com', 'https://user:pass@example.com/approve']) {
-    assert.equal(approvalUrl(value), '');
-  }
+  assert.equal(statusTone('Stopped'), 'neutral');
+  assert.equal(statusTone('Applied'), 'ok');
+  assert.equal(statusTone('Confirmed'), 'ok');
+  assert.equal(statusTone('Failed'), 'bad');
+  assert.equal(statusTone('Reverted'), 'neutral');
+  assert.equal(statusTone('Intent'), 'warn');
+  assert.equal(ownerLabel({ class: 'kernel' }), 'Managed by Arca');
+  assert.equal(ownerLabel({ class: 'foreign' }), 'External');
 });
 
 test('committed browser artifacts equal a fresh build and use no external CSS', async () => {
+  const { createHash } = await import('node:crypto');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const { buildBrowser } = await import('../build.mjs');
+  const here = fileURLToPath(new URL('.', import.meta.url));
   const dir = await mkdtemp(join(tmpdir(), 'arca-canvas-build-'));
   try {
     await buildBrowser(dir);
@@ -139,40 +310,7 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
     await rm(dir, { recursive: true, force: true });
   }
   for (const name of ['src/canvas.css', 'page.css']) {
-    const css = await readFile(join(here, '..', name), 'utf8');
+    const css = await readFile(new URL(`../${name}`, import.meta.url), 'utf8');
     assert.doesNotMatch(css, /@import|url\(\s*['"]?https?:/i, name);
-  }
-});
-
-
-test('multi-host routes encode every segment and resolve both qualified and primary links', () => {
-  const names = ['alpha / %', 'beta / %'];
-  const project = 'shared / %';
-  const instance = 'worker / %';
-  const tree = buildTree({ hosts: names.map((name) => ({
-    ...fixture, name, projects: [project],
-    instances: [{ project, name: instance, status: 'Running' }],
-  })) });
-  assert.notEqual(tree.hosts[0].projects[0].key, tree.hosts[1].projects[0].key);
-  assert.notEqual(tree.hosts[0].projects[0].children[0].key, tree.hosts[1].projects[0].children[0].key);
-  for (const model of tree.hosts) {
-    const hostPart = encodeURIComponent(model.hostId);
-    assert.equal(model.host.route, `#host/${hostPart}`);
-    assert.equal(model.projects[0].route, `#project/${hostPart}/${encodeURIComponent(project)}`);
-    assert.equal(model.projects[0].children[0].route, `#project/${hostPart}/${encodeURIComponent(project)}/instance/${encodeURIComponent(instance)}`);
-    assert.equal(model.notPlaced.route, `#not-placed/${hostPart}`);
-    assert.equal(model.databases.route, `#databases/${hostPart}`);
-    for (const node of [model.host, model.projects[0], model.projects[0].children[0], model.notPlaced, model.databases]) {
-      const route = parseRoute(node.route, tree);
-      assert.equal(route.node, node);
-      assert.equal(route.model, model);
-    }
-  }
-  for (const fragment of ['', `#host/${fixture.machine.node}`, `#project/${encodeURIComponent(project)}`,
-    `#project/${encodeURIComponent(project)}/instance/${encodeURIComponent(instance)}`, '#not-placed', '#databases']) {
-    assert.equal(parseRoute(fragment, tree).model, tree.hosts[0]);
-  }
-  for (const fragment of ['#host/%', '#project/%/x', '#not-placed/missing', '#databases/missing', '#project/missing/shared']) {
-    assert.equal(parseRoute(fragment, tree).kind, 'not-found');
   }
 });

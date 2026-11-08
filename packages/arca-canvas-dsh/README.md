@@ -2,11 +2,14 @@
 
 A read-only host plugin for stock DSH and an embedding DSH host. It polls Arca
 through a Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
-`GET /arca-canvas` draws machine, instance, database, alert, phone and desktop cards from the
-snapshot. It works without a sidebar. When the sidebar is installed, an Arca
-canvas tab embeds this same page, sharing its renderer, polling and styles.
-Steps shows a hidden-state placeholder until the journal adapter is available.
-The canvas is read only; waiting plans open the configured approval page.
+`GET /arca-canvas` draws a workspace from the snapshot: a top bar with the project
+picker, local clock and fleet summary; a machines strip with CPU and memory bars;
+the selected project's cards on a dotted canvas with curved SVG edges; and a
+Doctor panel with Chat and Steps tabs, recent Arca activity and waiting approvals.
+The composer is visible but inert in this delivery. It works without a sidebar.
+When the sidebar is installed, an Arca canvas tab embeds this same page, sharing
+its renderer, polling and styles. The canvas is read only; waiting plans link to
+the configured approval page.
 
 ## Install
 
@@ -53,6 +56,8 @@ config:
 | `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
 | `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
 | `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
+| `projects` | Optional owner project groups. Each entry has a unique non-empty `name`, an optional `domain`, and a non-empty `members` array of `{ host, incusProject, instance }`. Every member must name a configured host, and one instance can belong to only one project. |
+| `defaultProject` | Optional project name selected on load. Otherwise the page selects the first configured project, then the first service project, then the first other Incus project. An internal Arca project is never selected. Must name a configured project when `projects` is present. |
 
 To show multiple hosts, set `hosts` in the same config map:
 
@@ -69,16 +74,23 @@ config:
       viewerTokenPath: /example/beta/viewer.token
   pollMs: 5000
   approvalUrl: https://example.com/approve
+  defaultProject: Studio
+  projects:
+    - name: Studio
+      domain: studio.example
+      members:
+        - { host: alpha, incusProject: service, instance: app }
+        - { host: beta, incusProject: service, instance: api }
 ```
 
-Each entry requires a non-empty, unique `name`, used as its Hosts row title,
-and absolute `socketPath` and `viewerTokenPath` paths. Token files follow the
-same regular-file, `0400`, no-symlink rules. Optional `devicesUrl` and
-`devicesTokenPath` use the same validation rules as the top-level settings.
-Hosts appear in array order; the first is the **primary** host. If its device
-settings are omitted, it uses the existing top-level device settings. Other
-hosts never inherit those settings. A host without a device reader shows
-“Device data unavailable.” in its Devices frame.
+Each entry requires a non-empty, unique `name`, used as its machine card and
+project host title, and absolute `socketPath` and `viewerTokenPath` paths. Token
+files follow the same regular-file, `0400`, no-symlink rules. Optional
+`devicesUrl` and `devicesTokenPath` use the same validation rules as the
+top-level settings. Hosts appear in array order; the first is the **primary**
+host. If its device settings are omitted, it uses the existing top-level device
+settings. Other hosts never inherit those settings. Devices are collected for
+compatibility but are not drawn in this layout.
 
 When `hosts` is absent, the existing single-host keys work unchanged: the name
 comes from `nodeName` or the OS hostname. With `hosts` present, each entry supplies
@@ -86,9 +98,24 @@ its own socket, token and name; top-level `socketPath`, `viewerTokenPath` and
 `nodeName` are unused. Each host polls concurrently on its own `pollMs` schedule.
 An unreachable socket, refused token or failed tool affects only that host;
 successful fields and the other hosts keep rendering. A failed watch report
-shows “Watch report unavailable” instead of implying an empty host. Selecting a
-host scopes the Projects section, tiles, device data and unplaced links to it.
-No per-host mode is inferred from `arca_status`.
+leaves the machine card online but reports that its instance count is unknown;
+configured owner-project members on that host are reported as unknown, never as
+missing or as an empty host. No per-host mode is inferred from `arca_status`.
+
+`projects` is the owner's grouping layer, not an Incus project list. A listed
+member is resolved on its host and appears only inside its owner project. An
+unlisted instance falls back to a project named after its Incus project on that
+host, with one exception: the internal `arcak-svc` grouping is never a project.
+Each unlisted instance in `arcak-svc` becomes its own project named after the
+service (the instance name, humanized; `web1` becomes `Web1`), so a
+service is a first-class project by default and an owner project can group
+several. The internal `arcak-svc` id never appears as a project, in the picker or
+in a project subtitle. To group services, list them like any other member:
+`{ host: alpha, incusProject: arcak-svc, instance: web1 }`. An Incus
+project whose instances are all listed in owner projects is not rendered at all.
+Owner projects render in config order; service projects follow, then the other
+fallback projects by host and project name, with the host appended only when a
+display name collides.
 
 All example paths must be replaced with paths on the machine running DSH. Paths
 are literal; `~` and environment variables are not expanded. Config contains
@@ -114,20 +141,34 @@ readers.
 ## Snapshot
 
 The JSON object has `at` (ISO timestamp), `approvalUrl` (empty or the configured
-approval URL), and `hosts` in configured order. Each host entry has `name`, `at`,
-`error` (null or safe error text), `nodeName` (resolved by the host), `machine`,
-`instances`, `instancesKnown` (false when `watch_report` failed),
-`projects` (the Incus project ids from `watch_report`, including empty projects),
-`databases`, `metrics`, `alerts`, `plans`, `devices`,
-`devicesAt` (ISO time of the last good device list, or null), `phones`, and `desktops`.
-`devices` is `off`, `ok`, `unavailable`, `unreachable`, or `stale`.
+approval URL), `projects` (the configured owner groups, each with `name`,
+`domain` and `members`), `defaultProject`, and `hosts` in configured order. Each
+host entry has `name`, `at`, `error` (null or safe error text), `nodeName`
+(resolved by the host), `machine`, `instances`, `instancesKnown` (false when
+`watch_report` failed), `projects` (the Incus project ids from `watch_report`),
+`databases`, `metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
+`journal_list` failed), `journalPending` (true while a deep journal read finishes
+in the background), `devices`, `devicesAt` (ISO time of the last good device
+list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable`,
+`unreachable`, or `stale`.
 
 - `machine` and `metrics` hold `arca_status` and `node_metrics` results.
 - `instances` flattens `watch_report.projects[].instances[]`, adding `project`.
 - `databases` and `plans` contain the arrays from `postgres_list` and `plan_list`.
+- `journal` holds the newest `journal_list` records, at most 200 per host. Every
+  poll re-reads a trailing window of the newest ids and merges by id with the
+  latest record winning, so an effect that moved from `Intent` to `Failed` (or
+  `Applied` to `Confirmed`/`Reverted`) updates instead of staying at the first
+  state it was seen in. A snapshot waits for at most two journal pages and a deep
+  first read finishes in the background with `journalPending` true meanwhile. A
+  journal that restarts from zero (its ids go backwards or disappear) is detected
+  and re-read from the start, dropping the stale cache for that host. The newest
+  records across hosts feed the Doctor's Chat and Steps views. A failed journal
+  read leaves the array empty and `journalKnown` false, so the page shows an
+  unavailable notice instead of invented rows.
 - `alerts` holds the full `alerts_list` result, preserving firing, unknown and
-  recent resolved alerts plus health metadata. Only firing alerts get cards; unknown
-  checks appear as a muted no-data count. Resolved alerts have no cards.
+  recent resolved alerts plus health metadata. This layout does not draw alert
+  cards yet; the data stays in the snapshot for later phases.
 
 Failed reads leave `machine`/`metrics` null or the other fields empty arrays.
 Successful reads survive partial failures. Requests use MCP protocol
@@ -169,32 +210,34 @@ The host logs one safe line per device state change, naming `devicesUrl` or
 upstream error details never enter logs, the snapshot or the browser bundle. Arca
 reads keep their existing error behavior.
 
-The page is a read-only containment canvas. Its left menu has separate,
-collapsible **Hosts** and **Projects** sections; the whole menu folds to a thin
-rail through one button, and that choice is remembered in local storage. A host
-opens the host view, a project opens that project's canvas, and an instance node
-opens its detail pane. Selection lives in the URL fragment: `#host/<host>`,
-`#project/<host>/<project>`, `#project/<host>/<project>/instance/<name>`,
-`#not-placed/<host>` and `#databases/<host>`. Each segment is encoded with
-`encodeURIComponent`. Same-named projects on different hosts stay distinct.
-Legacy `#host/<node id>`, `#project/<project>`,
-`#project/<project>/instance/<name>`, `#not-placed` and `#databases` links open
-the primary host. The fragment is matched against the known tree; an unknown
-value shows a not-found state.
+The page has four regions. The top bar holds the project picker, the
+`Arca self-hosted | Arca Cloud` segmented control (Cloud is disabled and marked
+coming soon), the local clock and a fleet summary computed from the latest
+`node_metrics` (`machines · cores · GB`; a part disappears when no host reports
+it). The machines strip draws one compact card per configured host with online
+state from `arca_status.incusReachable`, a CPU bar from `latest.cpu.usedPct`
+(shown as used cores / total cores), a memory bar from
+`memory.totalBytes` and `availableBytes` (used / total), and the instance count.
+Two dashed placeholder cards leave room for storage and phones. The project
+canvas draws the selected project's instances and matched databases as cards
+connected to a project hub with curved dashed SVG edges on the dotted canvas.
+Cards carry only real snapshot data: status, kind, owner class, the instance's
+own absolute URL when present, and database address, port and link count when
+present. A domain card appears only when the project config sets `domain`.
 
-The project canvas nests a host frame, a project frame and instance nodes. Each
-node shows status as text and colour, its kind (Container or VM), and its image
-or IP when the snapshot carries one; stopped instances are dimmed. Databases whose
-name or explicit `instance` field matches exactly one instance are shown in that
-node. Phones and desktops whose name matches exactly one instance are shown in the
-project's Devices frame; unmatched devices remain visible under the selected
-host as Not placed. No database-to-project relation is inferred. Instance ownership reads
-`Managed by Arca` only for kernel and retained objects; droidd, foreign, contested,
-missing and unknown ownership read `External`. Waiting-plan badges appear only
-above zero.
+The right-hand Doctor panel has Chat and Steps tabs and a visible but inert
+composer. Both tabs render the newest `journal_list` records across every
+machine, and the panel subtitle says `Recent activity · all machines`; a
+waiting-plan card links to the configured `approvalUrl`. When `journal_list` is
+unavailable the panel says so without fabricating activity. The composer accepts
+no input and sends nothing.
 
-The page never pans, zooms or drags. Polls update keyed rows, tiles and nodes in
-place, so section state, menu state, selection, focus and scroll survive a poll.
+Selection lives in the URL fragment as `#project/<name>`, encoded with
+`encodeURIComponent`. Loading with a known project restores it; an unknown or
+missing fragment selects `defaultProject`, else the first configured project,
+then the first service project, then the first other Incus project, and replaces
+the fragment. The page never pans, zooms or drags. Polls rebuild a region only
+when its data changed, so selection, focus and scroll survive unchanged polls.
 There are no write actions and no routes beyond the existing `/arca-canvas`
 assets and snapshot.
 
@@ -217,10 +260,10 @@ into a temporary directory and compare SHA-256 hashes.
 `npm run build` regenerates the browser module and standalone page assets using
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.
 Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test’s
-1440×900 light/dark screenshots and measured rectangles outside the repository.
-The standard fixture has zero firing alerts and two missing checks. The 41-card
-stress fixture has 30 instances, five phones, one desktop, one machine, one
-database and three firing alerts.
+1440×900 light/dark screenshots (`canvas-v28-light.png`, `canvas-v28-dark.png`)
+and `rectangles.json` outside the repository. The standard browser fixture has
+two hosts, two owner projects, one service project, one fallback project,
+real-shaped journal rows and one waiting plan.
 
 The client contract is pinned to the sidebar’s 0.24.1 API: package metadata uses
 `dsh.client.inject: ["dsh-better-sidebar"]` (package IDs), while the client exports
