@@ -113,6 +113,10 @@ impl Plugin for NetProject {
             ],
         )
     }
+    /// The project's proxy allowance is repaired on every pass, even when the entry is unchanged.
+    fn reconciles_when_unchanged() -> bool {
+        true
+    }
     fn apply(ctx: &mut Ctx<'_>, cfg: &NetProjectConfig) -> Result<(), PluginError> {
         if cfg.project != PROJECT || cfg.bridge != BRIDGE {
             return Err(PluginError::Config(

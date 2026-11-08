@@ -250,13 +250,16 @@ shared profile. `autostart` defaults to false; true sets `boot.autostart=true`.
 `data` names an absolute printable mount `path` with no `..` segment, optional numeric `uid` and `gid` (unsigned 32-bit),
 and an optional `size` such as `8GiB`. Arca creates a custom volume `<service>-data` in the service project's storage pool
 before the instance, setting `initial.uid`/`initial.gid` when supplied. The disk device mounts that volume at `path`;
-`size`, when supplied, is set on both the volume config and disk device. The volume carries the entry's ownership marker,
+`size`, when supplied, is set on the volume config only; Incus supports a disk device's `size` only on the rootfs disk,
+so the data disk carries none. The volume carries the entry's ownership marker,
 is reused on reconciliation, and is deleted with the instance and ACL on approved service removal.
 
 `lan: {"port":3081}` requires that port in `ports` and adds a `web` proxy device listening on `tcp:0.0.0.0:3081`,
-connecting to `tcp:127.0.0.1:3081` in the container. Known side effect: the wildcard bind exposes the port on every host
-IPv4 interface, including a tailnet interface when present. The service project remains restricted; Arca sets and reconciles
-only `restricted.devices.proxy=allow` to permit these proxy devices. Disk restrictions retain Incus' managed default.
+connecting to `tcp:127.0.0.1:3081` in the container. The proxy is a forkproxy device, so it connects to the container
+from the host; LAN traffic on `lan.port` therefore bypasses the service NIC ingress ACL. Known side effect: the wildcard
+bind exposes the port on every host IPv4 interface, including a tailnet interface when present. The service project
+remains restricted; Arca sets and reconciles only `restricted.devices.proxy=allow` to permit these proxy devices. Disk
+restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 
