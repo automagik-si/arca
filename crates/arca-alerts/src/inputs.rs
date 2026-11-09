@@ -13,9 +13,10 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
     };
     let at = sample.at;
     // A remote metrics source never gives its own PSI or CPU temperature. A transient outage gives neither, so it is not
-    // marked here: the evaluator keeps those alerts firing through it.
+    // marked here: the evaluator keeps those alerts firing through it. A provisional mode is not marked either: it may
+    // still resolve local, and a no-data resolve now would let the same alert fire again after the switch.
     let mut unavailable = std::collections::BTreeSet::new();
-    if sample.load.reason.as_deref() == Some(REMOTE_HOST_REASON) {
+    if sample.load.reason.as_deref() == Some(REMOTE_HOST_REASON) && !sampler.mode_provisional() {
         unavailable.insert(RuleId::MemPsiHigh);
         unavailable.insert(RuleId::CpuHot);
     }
@@ -81,10 +82,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use arca_incus::{IncusError, IncusRead};
-    use arca_metrics::{Sampler, SamplerConfig};
+    use arca_metrics::{
+        MODE_PROBE_EVERY_MS, ModeRetry, MonotonicClock, PROVISIONAL_WINDOW_MS, Sampler,
+        SamplerConfig,
+    };
     use serde_json::{Value, json};
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use arca_store::{EventState, ResolveReason};
@@ -434,5 +438,264 @@ mod tests {
         let mut local = sampler(Offline, &[]);
         local.sample(1_000);
         assert!(from_sampler(&local).unavailable.is_empty());
+    }
+
+    /// An Incus whose `/1.0` is unreadable until `up` is set, then names `hostname`; every other path answers 404.
+    struct SlowName {
+        up: Arc<AtomicBool>,
+        hostname: String,
+    }
+
+    impl IncusRead for SlowName {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            if path == "/1.0" {
+                return if self.up.load(Ordering::SeqCst) {
+                    Ok(json!({ "environment": { "server_name": self.hostname } }))
+                } else {
+                    Err(IncusError::Timeout)
+                };
+            }
+            Err(IncusError::Status {
+                code: 404,
+                message: "not found".to_string(),
+            })
+        }
+    }
+
+    /// A monotonic clock the test advances by hand, so window and cadence tests never sleep.
+    #[derive(Clone)]
+    struct FakeClock(Arc<AtomicU64>);
+
+    impl FakeClock {
+        fn new() -> FakeClock {
+            FakeClock(Arc::new(AtomicU64::new(0)))
+        }
+
+        fn advance(&self, ms: u64) {
+            self.0.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_provisional_remote_mode_does_not_resolve_a_firing_alert_and_then_refire_it() {
+        const T0: u64 = 1_000_000;
+        let host = Host::new("provisional-alert");
+        host.write("proc/sys/kernel/hostname", "node1\n");
+        host.write(
+            "proc/pressure/memory",
+            "some avg10=30.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        );
+        let up = Arc::new(AtomicBool::new(false));
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: host.proc_root().join("proc"),
+                sys_root: host.proc_root().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            SlowName {
+                up: Arc::clone(&up),
+                hostname: "node1".to_string(),
+            },
+        );
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+
+        // A local reading fired the pressure alert before Incus answered.
+        for t in (0..=60_000).step_by(5_000) {
+            let inputs = Inputs {
+                at: T0 + t,
+                memory_some_avg10: Some(Timed {
+                    at: T0 + t,
+                    value: 30.0,
+                }),
+                ..Inputs::default()
+            };
+            eval.step(&rules, &inputs, T0 + t);
+        }
+        assert_eq!(eval.firing().len(), 1, "the pressure alert fires at 60 s");
+
+        // Incus is slow, so the mode is still provisional remote and the sampler cannot read PSI. That must not count as
+        // permanence: the alert stays firing through the wait instead of resolving no data and firing again later.
+        for t in (65_000..=200_000).step_by(5_000) {
+            sampler.sample(T0 + t);
+            let inputs = from_sampler(&sampler);
+            assert!(
+                inputs.unavailable.is_empty(),
+                "a provisional mode marks nothing never-available at {t} ms"
+            );
+            assert!(
+                eval.step(&rules, &inputs, T0 + t).is_empty(),
+                "no event at {t} ms"
+            );
+            assert_eq!(eval.firing().len(), 1, "still firing at {t} ms");
+            assert!(
+                eval.unknown().iter().any(|alert| {
+                    alert.rule == RuleId::MemPsiHigh.as_str()
+                        && alert.reason == UnknownReason::Missing
+                }),
+                "a data gap, never a no-data resolve, at {t} ms"
+            );
+        }
+
+        // Incus answers and names this host: the mode settles local, PSI is readable again, and the alert keeps firing
+        // without a second notification.
+        up.store(true, Ordering::SeqCst);
+        sampler.sample(T0 + 205_000);
+        assert!(!sampler.mode_provisional(), "the retry settled the mode");
+        let inputs = from_sampler(&sampler);
+        assert_eq!(
+            inputs.memory_some_avg10.as_ref().map(|timed| timed.value),
+            Some(30.0)
+        );
+        assert!(
+            eval.step(&rules, &inputs, T0 + 205_000).is_empty(),
+            "the recovered reading does not fire the alert again"
+        );
+        assert_eq!(eval.firing().len(), 1);
+        assert!(!eval.firing()[0].unknown, "a fresh reading is known again");
+
+        // A resolved alert would have re-fired 60 s after the recovery. The still-firing alert must not.
+        for t in (210_000..=265_000).step_by(5_000) {
+            sampler.sample(T0 + t);
+            assert!(
+                eval.step(&rules, &from_sampler(&sampler), T0 + t)
+                    .is_empty(),
+                "no re-fire at {t} ms"
+            );
+        }
+        assert_eq!(eval.firing().len(), 1);
+    }
+
+    #[test]
+    fn a_late_name_after_twenty_minutes_restores_the_mode_and_the_alert() {
+        const T0: u64 = 3_000_000;
+        let host = Host::new("late-name-alert");
+        host.write("proc/sys/kernel/hostname", "node1\n");
+        host.write(
+            "proc/pressure/memory",
+            "some avg10=30.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        );
+        let up = Arc::new(AtomicBool::new(false));
+        let clock = FakeClock::new();
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: host.proc_root().join("proc"),
+                sys_root: host.proc_root().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            SlowName {
+                up: Arc::clone(&up),
+                hostname: "node1".to_string(),
+            },
+        )
+        .with_clock(Arc::new(clock.clone()));
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+
+        // The pressure alert is already firing when the sampler's provisional samples begin.
+        for t in (0..=60_000).step_by(5_000) {
+            let inputs = Inputs {
+                at: T0 + t,
+                memory_some_avg10: Some(Timed {
+                    at: T0 + t,
+                    value: 30.0,
+                }),
+                ..Inputs::default()
+            };
+            eval.step(&rules, &inputs, T0 + t);
+        }
+        assert_eq!(eval.firing().len(), 1);
+
+        // The first sample starts the window; the alert keeps firing with a data gap.
+        let started = 65_000;
+        sampler.sample(T0 + started);
+        assert!(sampler.mode_provisional());
+        let inputs = from_sampler(&sampler);
+        assert!(inputs.unavailable.is_empty());
+        assert!(eval.step(&rules, &inputs, T0 + started).is_empty());
+        assert_eq!(eval.firing().len(), 1);
+        assert!(eval.unknown().iter().any(|alert| {
+            alert.rule == RuleId::MemPsiHigh.as_str() && alert.reason == UnknownReason::Missing
+        }));
+
+        // At 10 minutes it settles on the remote fallback for alerts and starts the no-data clock.
+        clock.advance(PROVISIONAL_WINDOW_MS);
+        let settled_epoch = T0 + started + PROVISIONAL_WINDOW_MS;
+        sampler.sample(settled_epoch);
+        assert!(!sampler.mode_provisional(), "the window ended");
+        let inputs = from_sampler(&sampler);
+        assert!(inputs.unavailable.contains(&RuleId::MemPsiHigh));
+        assert!(eval.step(&rules, &inputs, settled_epoch).is_empty());
+        assert_eq!(eval.firing().len(), 1);
+        assert!(eval.unknown().iter().any(|alert| {
+            alert.rule == RuleId::MemPsiHigh.as_str() && alert.reason == UnknownReason::Unavailable
+        }));
+
+        // It stays unreadable to 20 minutes. The slow probe runs, and after the clear window the restored alert
+        // resolves no data exactly once.
+        let mut fake = PROVISIONAL_WINDOW_MS;
+        let mut epoch = settled_epoch;
+        let mut events = Vec::new();
+        while fake < 1_200_000 {
+            clock.advance(5_000);
+            fake += 5_000;
+            epoch += 5_000;
+            sampler.sample(epoch);
+            events.extend(eval.step(&rules, &from_sampler(&sampler), epoch));
+        }
+        assert_eq!(events.len(), 1, "exactly one no-data resolve");
+        assert_eq!(events[0].state, EventState::Resolved);
+        assert_eq!(events[0].reason, Some(ResolveReason::NoData));
+        assert!(eval.firing().is_empty());
+        assert!(!sampler.mode_provisional());
+
+        // After 20 minutes the server names this host behind the shim: the next slow probe switches to local.
+        up.store(true, Ordering::SeqCst);
+        clock.advance(MODE_PROBE_EVERY_MS);
+        epoch += MODE_PROBE_EVERY_MS;
+        sampler.sample(epoch);
+        assert!(!sampler.mode_provisional(), "the name decided the mode");
+        let inputs = from_sampler(&sampler);
+        assert!(inputs.unavailable.is_empty());
+        assert_eq!(
+            inputs.memory_some_avg10.as_ref().map(|timed| timed.value),
+            Some(30.0)
+        );
+        assert!(
+            eval.step(&rules, &inputs, epoch).is_empty(),
+            "the restored reading starts pending, not firing"
+        );
+        assert!(eval.firing().is_empty());
+
+        // The restored high PSI held for 60 s fires the alert again.
+        let mut fired = 0;
+        for _ in 0..12 {
+            clock.advance(5_000);
+            epoch += 5_000;
+            sampler.sample(epoch);
+            fired += eval.step(&rules, &from_sampler(&sampler), epoch).len();
+        }
+        assert_eq!(fired, 1, "the restored alert fires again");
+        assert_eq!(eval.firing().len(), 1);
     }
 }

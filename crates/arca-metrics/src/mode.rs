@@ -415,4 +415,56 @@ mod tests {
             assert!(choice.provisional, "{name:?}");
         }
     }
+
+    #[test]
+    fn an_unreadable_server_and_a_server_that_does_not_name_itself_say_which_happened() {
+        let scratch = Scratch::new("reason-text");
+        scratch.hostname("node1");
+        let unreadable = choose_host_mode(&Server::unreadable(), None, false, scratch.path());
+        let unnamed = choose_host_mode(
+            &Server(
+                Ok(serde_json::json!({ "environment": {} })),
+                Default::default(),
+            ),
+            None,
+            false,
+            scratch.path(),
+        );
+        assert_eq!(
+            unreadable.reason,
+            "the Incus server could not be read; the socket path is not a standard local Incus socket"
+        );
+        assert_eq!(
+            unnamed.reason,
+            "the Incus server did not name itself; the socket path is not a standard local Incus socket"
+        );
+    }
+
+    #[test]
+    fn default_image_names_are_ordinary_names() {
+        // A stock default such as "ubuntu" is a real name. Two machines can share it, which the comparison cannot tell
+        // apart; a match still reads as this machine, as it did before, and the limitation is documented.
+        let scratch = Scratch::new("default-match");
+        scratch.hostname("ubuntu");
+        let incus = Server::naming("ubuntu");
+        let choice = choose_host_mode(&incus, None, false, scratch.path());
+        assert_eq!(choice.mode, HostMode::Local);
+        assert!(!choice.provisional, "a name match is a real answer");
+        assert_eq!(
+            choice.reason,
+            "the Incus server name matches the local host name"
+        );
+
+        // Two different names stay decisive, even when both are image defaults.
+        let scratch = Scratch::new("default-mismatch");
+        scratch.hostname("debian");
+        let incus = Server::naming("ubuntu");
+        let choice = choose_host_mode(&incus, None, false, scratch.path());
+        assert_eq!(choice.mode, HostMode::Remote);
+        assert!(!choice.provisional, "a name mismatch is a real answer");
+        assert_eq!(
+            choice.reason,
+            "the Incus server name does not match the local host name"
+        );
+    }
 }
