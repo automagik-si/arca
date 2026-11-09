@@ -478,18 +478,32 @@
     "service_disconnect",
     "postgres_create"
   ]);
+  var APPROVAL_TIMEOUT_MS = 3e4;
+  var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
+  var MISSING_PROPOSAL = "The proposal is not waiting any more.";
+  var APPROVAL_REFUSALS = /* @__PURE__ */ new Set([
+    "Expired",
+    "Replayed",
+    "NoSuchPlan",
+    "Untrusted",
+    "BadSignature",
+    "NoUserPresence",
+    "NoUserVerification",
+    "WrongOrigin",
+    "WrongRp",
+    "WrongHost"
+  ]);
   var REFUSALS = Object.freeze({
     Expired: "This proposal ran out of time. Nothing changed.",
     Replayed: "This approval was already used. Reload the page to see what is still waiting.",
-    NoSuchPlan: "This proposal is no longer waiting in Arca.",
+    NoSuchPlan: NO_SUCH_PLAN,
     Untrusted: "Arca does not trust this passkey. Use the passkey you set up for Arca.",
     BadSignature: "Arca could not check the passkey's answer. Try again.",
     NoUserPresence: "Your device did not confirm it was you. Try again.",
     NoUserVerification: "Your device did not confirm it was you. Try again.",
     WrongOrigin: "This page's address does not match Arca's settings.",
     WrongRp: "This page's address does not match Arca's settings.",
-    WrongHost: "This approval was made for a different Arca.",
-    owner_approval: "Arca did not accept this approval. Try again from the card."
+    WrongHost: "This approval was made for a different Arca."
   });
   var text2 = (value, fallback = "") => value == null ? fallback : String(value);
   var list2 = (value) => Array.isArray(value) ? value : [];
@@ -521,6 +535,12 @@
     if (status === 404) return "This proposal is no longer waiting in Arca.";
     if (status === 429) return "Arca is busy. Try again shortly.";
     return "Arca could not complete this just now. Try again in a moment.";
+  }
+  function plainActionError(body) {
+    const message = typeof body?.message === "string" ? body.message.trim() : "";
+    if (!message) return "The change was approved, but Arca could not run it just now. Try again.";
+    const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
+    return /[.!?]$/.test(sentence) ? `The change was approved, but Arca could not run it: ${sentence}` : `The change was approved, but Arca could not run it: ${sentence}.`;
   }
   function plainError(error) {
     if (!error) return "Something went wrong. Try again.";
@@ -1133,8 +1153,11 @@
       loaded: false,
       error: "",
       fetching: false,
-      credentialIds: null
+      credentialIds: null,
+      announced: /* @__PURE__ */ new Map(),
+      fetchStartedAt: 0
     };
+    let approvalInflight = null;
     let clockTimer;
     const tick = () => {
       try {
@@ -1273,13 +1296,18 @@
           for (const tool of message.tools) tools.append(chatToolCard(doc, tool));
           node.append(tools);
         }
+        const pageHost = text2(state.envelope.pageHost).trim();
         const proposed = /* @__PURE__ */ new Set();
         for (const tool of message.tools) {
           const id = proposalId(tool.proposal);
           if (!id || proposed.has(id)) continue;
+          if (!pageHost || tool.host !== pageHost) continue;
           proposed.add(id);
           const card = proposalCard(doc, id);
           if (card) node.append(card);
+          else if (approvals.loaded && !approvals.error && approvals.announced.has(id) && approvals.fetchStartedAt >= (approvals.announced.get(id) ?? 0)) {
+            node.append(missingProposalNote(doc, id));
+          }
         }
         for (const note of message.notes ?? []) node.append(chatNotice(doc, note.kind, note.title, note.body));
         thread.append(node);
@@ -1328,6 +1356,16 @@
           const details = approvalDetails(row.details);
           const expiresAt = Number(row.expiresAt);
           if (!id || !summary2 || !digest || !details || !Number.isFinite(expiresAt) || expiresAt <= 0) continue;
+          let statement;
+          try {
+            statement = JSON.parse(row.statement);
+          } catch {
+            statement = null;
+          }
+          if (!statement || typeof statement !== "object" || Array.isArray(statement)) continue;
+          if (statement.target !== id || statement.action !== row.action || statement.paramsDigest !== digest) continue;
+          const host = typeof statement.host === "string" ? statement.host.trim() : "";
+          if (!host) continue;
           plans.set(id, {
             kind: "action",
             id,
@@ -1336,7 +1374,8 @@
             argsDigest: digest,
             details,
             expiresAt,
-            statement: typeof row.statement === "string" ? row.statement : ""
+            host,
+            statement: row.statement
           });
         } else if (typeof row.plan === "string" && /^[0-9a-f]{64}$/.test(row.plan)) {
           deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
@@ -1355,40 +1394,67 @@
       return parseApprovalPlans(await response.json());
     }
     async function refreshApprovals() {
-      if (approvals.fetching) return;
+      if (approvals.fetching) return approvalInflight;
       if (!approvalConfigured()) {
         approvals.loaded = true;
         approvals.error = "The approval page is not configured on this canvas.";
         updatePanel();
-        return;
+        return null;
       }
       approvals.fetching = true;
-      try {
-        const next = await readApprovalPlans();
-        const now = Date.now();
-        for (const [id, plan] of next.plans) {
-          const existing = approvals.cards.get(id);
-          if (existing) existing.plan = plan;
-        }
-        for (const [id, card] of approvals.cards) {
-          if (next.plans.has(id) || card.state !== "waiting") continue;
-          if (card.plan && now >= card.plan.expiresAt) card.state = "expired";
-          else {
-            card.state = "failed";
-            card.reason = "This proposal is no longer waiting in Arca.";
+      approvalInflight = (async () => {
+        approvals.fetchStartedAt = Date.now();
+        try {
+          const next = await readApprovalPlans();
+          const now = Date.now();
+          for (const [id, plan] of next.plans) {
+            const card = approvals.cards.get(id);
+            if (!card) continue;
+            card.plan = plan;
+            if (!["done", "declined", "failed", "expired"].includes(card.state)) continue;
+            if (card.state === "expired" && plan.expiresAt <= now) continue;
+            const failedReason = card.state === "failed" ? card.reason || card.note : "";
+            card.state = "waiting";
+            card.result = "";
+            card.reason = "";
+            card.busy = "";
+            if (failedReason) {
+              card.retry = true;
+              card.note = failedReason;
+            } else {
+              card.retry = false;
+              card.note = "";
+            }
           }
+          for (const [id, card] of approvals.cards) {
+            if (next.plans.has(id) || card.state !== "waiting") continue;
+            if (card.plan && now >= card.plan.expiresAt) card.state = "expired";
+            else {
+              card.state = "failed";
+              card.reason = NO_SUCH_PLAN;
+              card.retry = false;
+            }
+          }
+          approvals.plans = next.plans;
+          approvals.deletes = next.deletes;
+          approvals.passkeysTrusted = next.passkeysTrusted;
+          approvals.error = "";
+        } catch (error) {
+          approvals.error = plainError(error);
+        } finally {
+          approvals.fetching = false;
+          approvalInflight = null;
+          approvals.loaded = true;
+          updatePanel();
         }
-        approvals.plans = next.plans;
-        approvals.deletes = next.deletes;
-        approvals.passkeysTrusted = next.passkeysTrusted;
-        approvals.error = "";
-      } catch (error) {
-        approvals.error = plainError(error);
-      } finally {
-        approvals.fetching = false;
-        approvals.loaded = true;
-        updatePanel();
-      }
+      })();
+      return approvalInflight;
+    }
+    async function confirmProposal(id) {
+      approvals.announced.set(id, Date.now());
+      if (approvals.fetching) await approvalInflight?.catch(() => {
+      });
+      await refreshApprovals();
     }
     function expireApprovals(now = Date.now()) {
       let changed = false;
@@ -1415,6 +1481,11 @@
       if (card.state === "failed") return ["bad", "Failed"];
       return ["wait", "Waiting for approval"];
     }
+    function missingProposalNote(doc2, id) {
+      const note = el(doc2, "p", "arca-thread-note arca-approval-missing", MISSING_PROPOSAL);
+      note.dataset.proposal = id;
+      return note;
+    }
     function proposalCard(doc2, id) {
       const key = proposalId({ id });
       const card = approvalCardFor(key);
@@ -1439,6 +1510,10 @@
       head.append(meta);
       article.append(head, el(doc2, "p", "arca-card-text arca-approval-summary", plan.summary));
       const facts = el(doc2, "dl", "arca-approval-facts");
+      const hostRow = el(doc2, "div", "arca-approval-fact");
+      hostRow.dataset.detail = "host";
+      hostRow.append(el(doc2, "dt", "", "Host"), el(doc2, "dd", "", plan.host));
+      facts.append(hostRow);
       for (const row of plan.details) {
         const line = el(doc2, "div", "arca-approval-fact");
         line.dataset.detail = "true";
@@ -1457,10 +1532,12 @@
       article.append(facts);
       if (card.state === "waiting") {
         const actions = el(doc2, "div", "arca-approval-actions");
-        const approve = el(doc2, "button", "arca-btn arca-btn-ink arca-approve", "Approve");
+        const approveLabel = card.retry ? "Retry" : "Approve";
+        const approve = el(doc2, "button", "arca-btn arca-btn-ink arca-approve", approveLabel);
         approve.type = "button";
         approve.dataset.approve = key;
-        approve.setAttribute("aria-label", `Approve: ${plan.summary}`);
+        if (card.retry) approve.dataset.retry = "true";
+        approve.setAttribute("aria-label", `${approveLabel}: ${plan.summary}`);
         approve.disabled = Boolean(card.busy) || !plan.statement || approvals.passkeysTrusted < 1;
         approve.addEventListener("click", () => {
           void approveProposal(key);
@@ -1576,24 +1653,43 @@ ${statement}`)
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ plan: id, approval })
+          body: JSON.stringify({ plan: id, approval }),
+          signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS)
         });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
-          card.state = body?.refusal === "Expired" || body?.refusal === "NoSuchPlan" ? "expired" : "failed";
-          card.reason = plainRefusal(body?.refusal, response.status);
+          const refusal = body?.refusal;
+          card.retry = false;
+          if (refusal === "NoSuchPlan") {
+            card.state = "failed";
+            card.reason = NO_SUCH_PLAN;
+          } else if (refusal === "Expired") {
+            card.state = "expired";
+          } else if (APPROVAL_REFUSALS.has(refusal)) {
+            card.state = "failed";
+            card.reason = plainRefusal(refusal, response.status);
+          } else {
+            card.state = "failed";
+            card.reason = plainActionError(body);
+          }
           return;
         }
         card.state = "done";
         card.result = plainResult(plan.action, body?.result);
         approvals.plans.delete(id);
       } catch (error) {
-        if (error?.name === "NotAllowedError" || error?.name === "AbortError") {
+        if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+          card.state = "waiting";
+          card.note = "No answer from Arca, try again.";
+          card.retry = true;
+        } else if (error?.name === "NotAllowedError") {
           card.state = "waiting";
           card.note = "Passkey cancelled.";
+          card.retry = false;
         } else {
           card.state = "failed";
           card.reason = plainError(error);
+          card.retry = false;
         }
       } finally {
         updatePanel();
@@ -1616,8 +1712,16 @@ ${statement}`)
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
           card.busy = "";
-          card.state = body?.refusal === "Expired" || body?.refusal === "NoSuchPlan" ? "expired" : "failed";
-          card.reason = plainRefusal(body?.refusal, response.status);
+          card.retry = false;
+          if (body?.refusal === "NoSuchPlan") {
+            card.state = "failed";
+            card.reason = NO_SUCH_PLAN;
+          } else if (body?.refusal === "Expired") {
+            card.state = "expired";
+          } else {
+            card.state = "failed";
+            card.reason = plainRefusal(body?.refusal, response.status);
+          }
           return;
         }
         card.state = "declined";
@@ -1631,6 +1735,18 @@ ${statement}`)
         void refreshApprovals();
       }
     }
+    function announcedMissing() {
+      if (!approvals.loaded || approvals.error) return [];
+      const missing = [];
+      for (const [id, announcedAt] of approvals.announced) {
+        if (approvals.fetchStartedAt < announcedAt) continue;
+        if (approvals.plans.has(id)) continue;
+        const card = approvals.cards.get(id);
+        if (card?.plan) continue;
+        missing.push(id);
+      }
+      return missing;
+    }
     function approvalSignature() {
       return JSON.stringify({
         plans: [...approvals.plans.values()].map((plan) => [plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.details]),
@@ -1638,6 +1754,7 @@ ${statement}`)
         cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),
         passkeysTrusted: approvals.passkeysTrusted,
         loaded: approvals.loaded,
+        missing: announcedMissing(),
         error: approvals.error
       });
     }
@@ -1662,7 +1779,8 @@ ${statement}`)
         const card = message.tools.find((tool) => tool.callId === data.callId);
         if (card) Object.assign(card, data);
         else message.tools.push({ ...data });
-        if (proposalId(data?.proposal)) void refreshApprovals();
+        const proposedId = proposalId(data?.proposal);
+        if (proposedId && data?.host === text2(state.envelope.pageHost).trim()) void confirmProposal(proposedId);
       } else if (event === "budget") {
         const message = activeAssistant();
         const body = String(data?.message ?? "Daily budget reached, try tomorrow.");
@@ -1788,6 +1906,20 @@ ${statement}`)
       }
     });
     updateSend();
+    function announceHistoryProposals() {
+      const pageHost = text2(state.envelope.pageHost).trim();
+      if (!pageHost) return [];
+      const added = [];
+      for (const message of chat.messages) {
+        for (const tool of message.tools ?? []) {
+          const id = proposalId(tool.proposal);
+          if (!id || tool.host !== pageHost || approvals.announced.has(id)) continue;
+          approvals.announced.set(id, Date.now());
+          added.push(id);
+        }
+      }
+      return added;
+    }
     const loadHistory = async () => {
       try {
         const response = await fetch(`${base}/chat/history`, { credentials: "same-origin" });
@@ -1811,7 +1943,9 @@ ${statement}`)
         chat.usage = data?.usage ?? null;
         chat.loaded = true;
         renderChat();
-        if (approvalsWanted()) void refreshApprovals();
+        const announced = announceHistoryProposals();
+        if (announced.length) void confirmProposal(announced[0]);
+        else if (approvalsWanted()) void refreshApprovals();
       } catch {
         chat.loaded = true;
       }
@@ -1911,7 +2045,9 @@ ${statement}`)
       updatePicker();
       updateCanvas();
       updatePanel();
-      if (approvalsWanted()) void refreshApprovals();
+      const announced = announceHistoryProposals();
+      if (announced.length) void confirmProposal(announced[0]);
+      else if (approvalsWanted()) void refreshApprovals();
     };
     const approvalTimer = setInterval(() => {
       if (expireApprovals()) updatePanel();

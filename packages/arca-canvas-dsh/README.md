@@ -153,8 +153,10 @@ readers.
 ## Snapshot
 
 The JSON object has `at` (ISO timestamp), `approvalUrl` (empty or the configured
-approval URL), `projects` (the configured owner groups, each with `name`,
-`domain` and `members`), `defaultProject`, and `hosts` in configured order. Each
+approval URL), `pageHost` (the first configured host, whose kernel serves the
+canvas and its approval origin), `projects` (the configured owner groups, each
+with `name`, `domain` and `members`), `defaultProject`, and `hosts` in configured
+order. Each
 host entry has `name`, `address` (the configured LAN address or empty), `at`,
 `error` (null or safe error text), `nodeName`
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
@@ -263,7 +265,10 @@ The Doctor has the eight read-only Arca tools (`arca_status`, `watch_report`,
 kernel's `action_propose` viewer verb and records an inert proposal for one of
 seven actions (`service_create`, `service_remove`, `service_publish`,
 `service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`);
-it changes nothing and a database delete cannot be proposed. The tools are
+it changes nothing and a database delete cannot be proposed. `arca_propose` may
+target only `pageHost`, the host whose kernel serves this canvas and its approval
+page; a proposal for any other configured reader is refused in plain words
+because that host's approval page is not this one. The tools are
 registered globally with a per-session `when` condition, the Doctor's scope is
 restricted with `restrict({ allow: DOCTOR_TOOLS })` (the eight reads plus
 `arca_propose`), and scoped `tools/pre-execute` and `tools.guard` checks deny every
@@ -301,16 +306,26 @@ snapshot.
 
 ## Approval cards
 
-The cards are served by the kernel-served canvas at `/approve/canvas`; they use
-the page's own origin, not the DSH listener. With that page open, the browser
-reads `GET /approve/plans` and posts to `POST /approve/approve` and
-`POST /approve/decline`. Those three routes are kernel routes on the approval
-origin; they are never proxied through DSH. A page opened directly from the DSH
-listener has no `/approve/plans`, so it keeps the waiting count and the
-configured approval link instead of an action card.
+The canvas page at `/approve/canvas` is this package's DSH page relayed by the
+kernel from the DSH listener. The card uses the page's own origin: it reads
+`GET /approve/plans` and posts to `POST /approve/approve` and
+`POST /approve/decline`, which are kernel routes on the approval origin and are
+never proxied through DSH. A page opened directly from the DSH listener has no
+`/approve/plans`, so it keeps the waiting count and the configured approval link
+instead of an action card.
+
+The trust claim is precise: the card protects against model text and chat data.
+Those cannot choose its summary, details, host, action, digest or target, and
+cannot make the owner sign a different kernel statement. It is **not** a defence
+against a compromised DSH: a DSH that can rewrite this page's JavaScript can
+mislead the owner. The passkey still binds the approval to the kernel's
+`statement`, so such a page cannot change the action the kernel verifies without
+the owner signing that statement.
 
 An approval card shows, from the kernel's `/approve/plans` row matched by id:
 
+- the **host from the signed statement**, so two hosts with the same action and
+  arguments (the id hashes only those) are never confused;
 - the kernel-built `summary`, as text;
 - every `details` row (`label` and `value`) in kernel order, as text;
 - the action, the target id and the first 12 hex characters of `argsDigest`;
@@ -320,12 +335,18 @@ All text is assigned with `textContent`; no kernel field is parsed as markup. A
 row without a string `label` and `value` fails the whole proposal closed, so a
 card is never shown with a missing behaviour-changing argument. A proposal whose
 action is not one of the seven allowed actions (for example an older
-`postgres_delete`) is not rendered.
+`postgres_delete`) is not rendered. The card parses the `statement` and drops the
+proposal unless `statement.target` is the entry id, `statement.action` is the
+entry action and `statement.paramsDigest` is the entry `argsDigest`.
 
 A proposal id reaches the panel only from a real `arca_propose` tool result, and
-it only selects which kernel row to draw. Model text never supplies a card
-field: a contradicting or hostile answer cannot change what the owner signs.
-The kernel row must carry a `statement`; the card signs exactly that string.
+it only selects which kernel row to draw. A chat card is attached only when the
+tool ran on `pageHost` and the page kernel listed that id. An id the kernel did
+not list draws no card; the panel says "The proposal is not waiting any more."
+A foreign host's tool event never attaches this page's row. Model text never
+supplies a card field: a contradicting or hostile answer cannot change what the
+owner signs. The kernel row must carry a `statement`; the card signs exactly that
+string.
 
 Approve reads the trusted credential ids from `GET /approve` and calls
 `navigator.credentials.get` exactly like the approval page: `rpId` is
@@ -338,9 +359,15 @@ from a card.
 
 States are `waiting`, `approving` (the passkey prompt), `done` (the verb's result
 in plain words), `declined`, `expired` and `failed` (a plain reason). A cancelled
-passkey prompt returns the card to `waiting`. While a card is open, the page
-refreshes `/approve/plans` with the snapshot poll; an expired card disables its
-buttons and says nothing changed.
+passkey prompt returns the card to `waiting`. A failed approval whose entry is
+still listed becomes `waiting` again with a Retry button; a new waiting entry
+with the same id after a decline is waiting again. An approve POST that gets no
+answer after 30 seconds returns to `waiting` with "No answer from Arca, try
+again." A `NoSuchPlan` answer says the proposal may have been approved or
+declined elsewhere and points at Steps, never "Nothing changed". An approval the
+kernel accepted but whose action handler refused shows the action's own plain
+error. While a card is open, the page refreshes `/approve/plans` with the
+snapshot poll; an expired card disables its buttons and says nothing changed.
 
 ## Doctor chat contract
 
@@ -451,9 +478,11 @@ untrusted strings in a real browser. They also rebuild every browser artifact
 into a temporary directory and compare SHA-256 hashes. Chat tests use a fake
 DSH agent/stream and the synthetic Arca socket fixtures: they cover streamed
 text, one card per real call, the inert proposal tool and the full allow-list,
-the approval card's kernel-only text, exact approve and decline bodies, expiry,
-failure and passkey cancellation, the tool and token caps, the daily budget, the
-persisted `Doctor` session, and the absence of the model key from the page.
+the approval card's kernel-only text, exact approve and decline bodies, the
+host row and statement integrity, a foreign host and an unknown id, expiry,
+action refusal, retry, NoSuchPlan, a hanging approval timeout, passkey
+cancellation, the tool and token caps, the daily budget, the persisted `Doctor`
+session, and the absence of the model key from the page.
 
 `npm run build` regenerates the browser module and standalone page assets using
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.
@@ -463,8 +492,9 @@ Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test
 `approval-card-done-light.png`, `approval-card-done-dark.png`)
 and `rectangles.json` outside the repository. The standard browser fixture has
 two hosts, two owner projects, one service project, one fallback project,
-real-shaped journal rows, one waiting delete plan and five waiting action proposals
-(including a hostile row and an old database-delete row the card must not draw).
+real-shaped journal rows, one waiting delete plan and eight waiting action proposals
+(including a hostile row, a mismatched statement, a foreign-host candidate and an old
+database-delete row the card must not draw).
 
 The client contract is pinned to the sidebar’s 0.24.1 API: package metadata uses
 `dsh.client.inject: ["dsh-better-sidebar"]` (package IDs), while the client exports

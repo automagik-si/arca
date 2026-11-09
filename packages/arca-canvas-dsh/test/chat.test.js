@@ -471,8 +471,10 @@ test('the proposal tool offers exactly the seven allowed actions, never a databa
     'service_connect', 'service_disconnect', 'postgres_create',
   ]);
   assert.equal(PROPOSE_ACTIONS.includes('postgres_delete'), false);
-  const tool = createProposeTool({ hosts: [{ name: 'alpha' }] });
+  const tool = createProposeTool({ hosts: [{ name: 'alpha' }], proposalHost: 'alpha' });
   assert.equal(tool.name, PROPOSE_TOOL);
+  assert.match(tool.description, /only on alpha from here for now/);
+  assert.match(tool.parameters.properties.host.description, /Only alpha can be proposed/);
   assert.deepEqual(tool.parameters.properties.action.enum, [...PROPOSE_ACTIONS]);
   assert.equal(tool.parameters.properties.action.enum.includes('postgres_delete'), false);
   assert.equal(tool.parameters.required.includes('action'), true);
@@ -481,11 +483,38 @@ test('the proposal tool offers exactly the seven allowed actions, never a databa
   assert.doesNotMatch(tool.description, /postgres_delete|image/);
 });
 
+test('the same proposal on two hosts: only the page host is offered, the other is refused', async () => {
+  const calls = [];
+  const tool = createProposeTool({
+    hosts: [{ name: 'alpha' }, { name: 'beta' }],
+    proposalHost: 'alpha',
+    clientFor(name) {
+      return {
+        async call(verb, args) {
+          calls.push({ host: name, verb, args });
+          return { ...structuredClone(PROPOSAL), host: name };
+        },
+      };
+    },
+  });
+  const exec = { callId: 'call-alpha', signal: new AbortController().signal };
+  const accepted = await tool.execute({ action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec);
+  assert.equal(accepted.id, PROPOSAL.id);
+  assert.equal(accepted.host, 'alpha');
+  await assert.rejects(
+    tool.execute({ host: 'beta', action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec),
+    /I can only propose changes on alpha from here for now\./,
+  );
+  assert.deepEqual(calls.map((call) => [call.host, call.verb]), [['alpha', 'action_propose']], 'the refused host never reaches Arca');
+  assert.deepEqual(calls[0].args, { action: 'service_create', args: { name: 'nats', template: 'nats' } });
+});
+
 test('the prompt pins the propose-and-approve contract', () => {
   const prompt = doctorPrompt({ hosts: [{ name: 'alpha' }], approvalUrl: 'https://example.com/approve' });
   assert.match(prompt, /arca_propose/);
   assert.match(prompt, /tap Approve on the card/);
   assert.match(prompt, /Never claim the change is done/);
+  assert.match(prompt, /only on alpha from here for now/);
   assert.match(prompt, /never propose a database delete/);
   assert.match(prompt, /https:\/\/example\.com\/approve/);
   assert.match(prompt, /Never invent/i);
@@ -526,6 +555,8 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- For a change request, call arca_propose with the action and its arguments, then tell the owner in one',
     '  plain sentence what will happen and to tap Approve on the card. Never claim the change is done before',
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
+    '- You can propose changes only on alpha from here for now. Another host is refused because its',
+    '  approval page is not this one.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
     '- The approval page is at https://example.com/approve. The canvas card uses the same passkey.',
   ].join('\n');

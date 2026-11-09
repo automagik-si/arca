@@ -1,6 +1,7 @@
 {
   "at": "2026-11-08T16:00:00.000Z",
   "approvalUrl": "https://example.com/approve",
+  "pageHost": "alpha",
   "defaultProject": "Studio",
   "projects": [
     {

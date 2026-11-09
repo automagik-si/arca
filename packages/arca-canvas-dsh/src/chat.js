@@ -305,9 +305,10 @@ export function createSse(response, { heartbeatMs = DEFAULTS.heartbeatMs, onClos
   };
 }
 
-export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } = {}) {
+export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', now = Date.now() } = {}) {
   const names = hosts.map((host) => text(host?.name)).filter(Boolean);
   const hostLine = names.length ? names.join(', ') : 'the configured host';
+  const proposeHost = text(proposalHost).trim() || names[0] || 'the configured host';
   const approval = safeApprovalUrl(approvalUrl);
   const approvalLine = approval
     ? `- The approval page is at ${approval}. The canvas card uses the same passkey.`
@@ -338,6 +339,8 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
     '- For a change request, call arca_propose with the action and its arguments, then tell the owner in one',
     '  plain sentence what will happen and to tap Approve on the card. Never claim the change is done before',
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
+    `- You can propose changes only on ${proposeHost} from here for now. Another host is refused because its`,
+    '  approval page is not this one.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
     approvalLine,
   ].join('\n');
@@ -657,16 +660,17 @@ const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name
 
 // The one non-read tool: it records an inert proposal for the owner and changes nothing. The kernel checks the
 // action name and its arguments again, so this list is an explicit fence rather than the only validation.
-export function createProposeTool({ hosts = [], clientFor, onCall, onProposal } = {}) {
+export function createProposeTool({ hosts = [], clientFor, onCall, onProposal, proposalHost = '' } = {}) {
+  const pageHost = hosts.find((host) => host.name === proposalHost)?.name ?? hosts[0]?.name ?? '';
   return {
     name: PROPOSE_TOOL,
-    description: `Ask the owner to approve one change. It records a proposal and changes nothing. Actions: ${PROPOSE_ARGUMENTS}`,
+    description: `Ask the owner to approve one change. It records a proposal and changes nothing. Actions: ${PROPOSE_ARGUMENTS} You can propose only on ${pageHost || 'the configured host'} from here for now.`,
     parameters: {
       type: 'object',
       properties: {
         host: {
           type: 'string',
-          description: `Host to propose on. One of: ${hosts.map((host) => host.name).join(', ')}. Defaults to ${hosts[0]?.name ?? 'the first host'}.`,
+          description: `Host to propose on. One of: ${hosts.map((host) => host.name).join(', ')}. Defaults to ${hosts[0]?.name ?? 'the first host'}. Only ${pageHost || 'the first host'} can be proposed from this page; another host is refused.`,
           ...(hosts.length ? { enum: hosts.map((host) => host.name) } : {}),
         },
         action: {
@@ -704,6 +708,9 @@ export function createProposeTool({ hosts = [], clientFor, onCall, onProposal } 
       }
       const host = hosts.find((candidate) => candidate.name === requested) ?? hosts[0];
       if (!host) throw new Error('No Arca host is configured.');
+      if (pageHost && host.name !== pageHost) {
+        throw new Error(`I can only propose changes on ${pageHost} from here for now.`);
+      }
       const client = clientFor(host.name);
       if (!client) throw new Error(`No Arca reader is available for host "${host.name}".`);
       const action = text(args?.action).trim();
@@ -749,6 +756,7 @@ function sseError(message) {
 export function createDoctorChat(options = {}) {
   const {
     hosts = [],
+    proposalHost = '',
     approvalUrl = '',
     resolveDsh = () => null,
     clientFor = () => null,
@@ -791,6 +799,7 @@ export function createDoctorChat(options = {}) {
   const sessionAttempts = new Map();
 
   const primaryApproval = safeApprovalUrl(approvalUrl);
+  const primaryProposalHost = text(proposalHost).trim() || text(hosts[0]?.name).trim();
 
   function beginSessionAttempt(sessionId) {
     const entry = { sessionId, promise: null, resolve: null };
@@ -903,7 +912,7 @@ export function createDoctorChat(options = {}) {
         agentCtx.systemPrompt.section({
           name: 'arca-doctor',
           order: 100,
-          text: doctorPrompt({ hosts, approvalUrl: primaryApproval, now: now() }),
+          text: doctorPrompt({ hosts, approvalUrl: primaryApproval, proposalHost: primaryProposalHost, now: now() }),
         });
       }
     };
@@ -1032,7 +1041,7 @@ export function createDoctorChat(options = {}) {
 
   const tools = [
     ...createReadTools({ hosts, clientFor, onCall: onToolCall }),
-    createProposeTool({ hosts, clientFor, onCall: onToolCall, onProposal }),
+    createProposeTool({ hosts, clientFor, onCall: onToolCall, onProposal, proposalHost: primaryProposalHost }),
   ];
 
   function usageTotal(usage) {
@@ -1402,7 +1411,7 @@ export function createDoctorChat(options = {}) {
     history,
     close,
     ensureAgent: async () => ensureAgent(resolveDsh()),
-    doctorPrompt: () => doctorPrompt({ hosts, approvalUrl: primaryApproval, now: now() }),
+    doctorPrompt: () => doctorPrompt({ hosts, approvalUrl: primaryApproval, proposalHost: primaryProposalHost, now: now() }),
     get sessionId() {
       return agent?.session?.id ?? null;
     },
