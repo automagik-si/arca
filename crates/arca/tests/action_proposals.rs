@@ -1079,6 +1079,75 @@ fn a_vm_attach_refuses_an_in_use_nvidia_card_and_states_the_whole_card_effect() 
 }
 
 #[test]
+fn a_vm_attach_refuses_an_unknown_in_use_card_at_proposal_time() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-unknown", &key);
+    rig.gpu
+        .set_instances(vec![gpu_instance("alpha", "arcak-gpu", "virtual-machine")]);
+    // The local consumer list cannot be read: unknown is never treated as a free card.
+    rig.gpu.set_in_use("0000:02:00.0", None);
+    let refused = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("an unknown in-use state refuses a VM attach");
+    match refused {
+        CallError::Refused { code, message } => {
+            assert_eq!(code, "GpuInUseUnknown");
+            assert_eq!(
+                message,
+                "Arca could not check whether the card is in use; try again"
+            );
+        }
+        other => panic!("a refusal was expected, got {other:?}"),
+    }
+    assert_eq!(rig.list()["plans"], json!([]), "nothing was recorded");
+}
+
+#[test]
+fn a_vm_attach_refuses_an_unknown_in_use_card_again_when_it_runs() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-unknown-run", &key);
+    rig.gpu
+        .set_instances(vec![gpu_instance("alpha", "arcak-gpu", "virtual-machine")]);
+    rig.gpu.set_in_use("0000:02:00.0", Some(false));
+    let proposed = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect("a free card is proposed");
+    let id = proposed["id"].as_str().expect("an id");
+    let digest = proposed["argsDigest"].as_str().expect("a digest");
+    let approval = approve_statement(
+        &key,
+        &statement(HOST, id, "gpu_attach", digest, &"d".repeat(32)),
+    );
+    let approved = rig
+        .approve(id, &approval, NOW)
+        .expect("the approval verifies");
+
+    // The consumer list becomes unreadable after the proposal: execution re-reads it and refuses, never attaches.
+    rig.gpu.set_in_use("0000:02:00.0", None);
+    let refused = rig
+        .executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect_err("execution re-reads the in-use state");
+    match refused {
+        CallError::Refused { code, message } => {
+            assert_eq!(code, "GpuInUseUnknown");
+            assert_eq!(
+                message,
+                "Arca could not check whether the card is in use; try again"
+            );
+        }
+        other => panic!("a refusal was expected, got {other:?}"),
+    }
+    assert!(rig.gpu.calls().is_empty(), "nothing was attached");
+}
+
+#[test]
 fn a_detach_refuses_an_absent_or_foreign_device_at_proposal_time() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("proposal-gpu-device", &key);

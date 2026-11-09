@@ -716,12 +716,32 @@ impl ActionProposalStore {
         bytes.push(b'\n');
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .mode(0o600)
             .open(&self.path)?;
+        // A crash can leave the last line torn without its newline. Start the new event on a fresh line, so the torn tail
+        // cannot glue itself to it and the line stays readable.
+        if journal_tail_needs_newline(&mut file)? {
+            file.write_all(b"\n")?;
+        }
         file.write_all(&bytes)?;
         file.sync_all()
     }
+}
+
+/// Whether the journal's last byte is not a newline, so the next event must start on a fresh line. An empty journal needs
+/// no leading newline.
+fn journal_tail_needs_newline(file: &mut fs::File) -> io::Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 fn monotonic_nonce() -> u64 {
@@ -1154,6 +1174,31 @@ mod tests {
         for proposal in store.waiting() {
             assert!(text.contains(&proposal.id));
         }
+    }
+
+    #[test]
+    fn an_append_after_a_torn_tail_starts_on_a_new_line() {
+        let dir = Temp::new("torn-append");
+        let first = proposed_line("service_create", &create_args("nats"), 1_000);
+        // A complete last event whose terminating newline was never written.
+        let path = write_journal(&dir.0, &first);
+        let mut store = ActionProposalStore {
+            path: path.clone(),
+            waiting: Vec::new(),
+        };
+        let fresh = store
+            .propose(ActionKind::ServiceCreate, create_args("fresh"), 2_000, None)
+            .expect("the append");
+
+        let text = fs::read_to_string(&path).expect("the journal");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "the new event is not glued to the torn line"
+        );
+        assert_eq!(lines[0], first, "the torn line keeps its own content");
+        assert!(lines[1].contains(&fresh.id));
     }
 
     #[test]

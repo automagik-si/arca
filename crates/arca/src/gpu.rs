@@ -86,6 +86,9 @@ pub enum GpuRefusal {
     Bound(Vec<String>),
     /// A virtual machine may not take a driver-bound card another consumer uses.
     InUse(String),
+    /// The local consumer list could not be read, so a virtual machine's card use is unknown. The attach is refused; an
+    /// unknown answer is never treated as a free card.
+    InUseUnknown,
     /// The instance is outside the kernel's project family.
     Project(String),
     /// The instance could not be read, or no instance has this name.
@@ -115,6 +118,9 @@ impl std::fmt::Display for GpuRefusal {
                 f,
                 "the PCI address {pci} is in use by other consumers; a virtual machine may not take it"
             ),
+            Self::InUseUnknown => {
+                f.write_str("Arca could not check whether the card is in use; try again")
+            }
             Self::Project(_) => f.write_str("the instance is outside the kernel's project family"),
             Self::Instance(why) => write!(f, "the instance could not be read: {why}"),
             Self::Identity(why) => write!(f, "the instance changed after the proposal: {why}"),
@@ -748,5 +754,110 @@ impl GpuBackend for FakeGpu {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&key);
         Ok(GpuChange { device, changed })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// A scratch directory removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_nanos();
+            let path =
+                std::env::temp_dir().join(format!("arca-gpu-{}-{nanos}-{tag}", std::process::id()));
+            fs::create_dir(&path).expect("the scratch directory");
+            Scratch(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn script(path: &std::path::Path, text: String) {
+        fs::write(path, text).expect("the script");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+    }
+
+    #[test]
+    fn in_use_waits_for_the_shared_gate_and_then_answers() {
+        let scratch = Scratch::new("in-use-wait");
+        let started = scratch.path().join("started");
+        let release = scratch.path().join("release");
+        let slow = scratch.path().join("slow.sh");
+        // A read that holds the process-wide gate until the test releases it, as a slow sampler tick does.
+        script(
+            &slow,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.01; done\n",
+                started.display(),
+                release.display()
+            ),
+        );
+        let answer = scratch.path().join("answer.sh");
+        // A read that lists one consumer for the card, so a successful in_use is Some(true).
+        script(
+            &answer,
+            "#!/bin/sh\nprintf '%s\\n' '00000000:01:00.0, 4242, 512'\n".to_string(),
+        );
+
+        let slow_reader = NvidiaSmi::shared_at(slow);
+        let slow_thread = std::thread::spawn(move || slow_reader.processes());
+        let until = Instant::now() + Duration::from_secs(5);
+        while !started.exists() {
+            assert!(Instant::now() < until, "the slow program started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut backend = IncusGpu::new(
+            scratch.path().join("incus.sock"),
+            ProjectFamily::new(["arcak-gpu"], []).expect("the family is valid"),
+            GpuRuntime::new(|| true, || Ok(BTreeMap::new())),
+        );
+        backend.nvidia = NvidiaSmi::shared_at(answer);
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = sent.send(backend.in_use("0000:01:00.0"));
+        });
+        assert!(
+            received.recv_timeout(Duration::from_millis(100)).is_err(),
+            "in_use waits while another read holds the shared gate"
+        );
+        fs::write(&release, b"go").expect("release the slow read");
+        let in_use = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("in_use answers")
+            .expect("the local consumer list is read");
+        assert_eq!(
+            in_use,
+            Some(true),
+            "in_use waited and answered instead of returning None"
+        );
+
+        let processes = slow_thread
+            .join()
+            .expect("the slow reader thread")
+            .expect("the slow read answers");
+        assert!(processes.is_empty());
+        reader.join().expect("the in_use thread");
     }
 }

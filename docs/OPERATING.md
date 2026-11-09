@@ -419,12 +419,12 @@ for each card's numbers and `nvidia-smi --query-compute-apps=gpu_bus_id,pid,used
 killed after 5 seconds and reads at most 1 MiB of output, so a hanging tool never blocks the tick. Each card carries
 `telemetry` and a `reason` when it has none: `not measurable from here` on a remote host, `nvidia-smi is not installed`,
 `the nvidia-smi read timed out`, `the nvidia-smi read failed`, or `no reading yet` when the tool ran but did not list the
-card. One query runs at a time: a shared gate refuses a second query with `the previous nvidia-smi read has not finished`
-while one is in flight, and a killed child that the kernel cannot reap is handed to a background reaper that keeps the gate
-closed until the child and its reader are gone; the approval path's in-use read uses the same gate. A query that cannot
-spawn its child gives its place back. A missing number is `null`, never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and an `owner`: an
-Incus `instance` with its `project` and `name` (and a `container` id when the process is in a Docker container inside that
-instance), a Docker `container` named by exactly 64 hex digits in its `docker-<id>.scope` cgroup, or `host`.
+card. One query runs at a time: a second query waits up to five seconds for the running one, then gets
+`the previous nvidia-smi read has not finished`, and a killed child that the kernel cannot reap keeps the gate closed until
+the child and its reader are gone; the approval path's in-use read uses the same gate. A query that cannot spawn its child
+gives its place back. A missing number is `null`, never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and
+an `owner`: an Incus `instance` with its `project` and `name` (and a `container` id when the process is in a Docker container
+inside that instance), a Docker `container` named by exactly 64 hex digits in its `docker-<id>.scope` cgroup, or `host`.
 
 Attribution reads `/proc/<pid>/cgroup` by the host's PID, so a process in another PID namespace resolves the same way. The
 cgroup v2 `0::` line is used when present; on v1 the first path that is not `/` is. `lxc.payload.` counts only as the first
@@ -523,9 +523,12 @@ kernel-mode node writes, and only an instance in `kernel.projects` whose own con
 droidd, `bench`, foreign, contested or retained instance is refused even inside the family. The metrics mode is read again
 at each call, so a later local/remote change is respected. `gpu_attach`
 refuses an address that is not in the inventory, a card bound to `vfio-pci` when the target is a container, and a
-driver-bound NVIDIA card another consumer uses when the target is a virtual machine. `gpu_detach` still names a card that has
-left the inventory by the address in the instance's own `gpu-<pci>` device. At execution the instance is re-read under the
-bound project: one that moved, changed type or was recreated (another `volatile.uuid`) is refused. The GPU rows are
+driver-bound NVIDIA card another consumer uses when the target is a virtual machine. A virtual machine's attach is refused
+too when that use cannot be checked, with `Arca could not check whether the card is in use; try again`: an unknown answer is
+never treated as a free card. The check is repeated when an approved attach runs, so a card that becomes unreadable is never
+attached. `gpu_detach` still names a card that has left the inventory by the address in the instance's own `gpu-<pci>`
+device. At execution the instance is re-read under the bound project: one that moved, changed type or was recreated
+(another `volatile.uuid`) is refused. The GPU rows are
 `Project`, `Instance` (with its type), `GPU` (the product and the exact PCI address), and `Effect`. A container's effect
 says its memory is shared with every other user of the card, never isolated; a virtual machine's effect says the VM takes the
 whole card while it runs and the host and every container lose it until it stops.

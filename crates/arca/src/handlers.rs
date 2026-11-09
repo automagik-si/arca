@@ -1128,11 +1128,16 @@ fn prepare_attach(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuTarget, CallE
     if card.usage == arca_metrics::GpuUse::VfioPci && instance.is_container() {
         return Err(gpu_refusal(GpuRefusal::Bound(vec![card.pci.clone()])));
     }
-    if instance.is_vm()
-        && card.driver.as_deref() == Some("nvidia")
-        && gpu.in_use(&card.pci).map_err(gpu_refusal)? == Some(true)
-    {
-        return Err(gpu_refusal(GpuRefusal::InUse(card.pci.clone())));
+    if instance.is_vm() && card.driver.as_deref() == Some("nvidia") {
+        match gpu.in_use(&card.pci) {
+            Ok(Some(true)) => {
+                return Err(gpu_refusal(GpuRefusal::InUse(card.pci.clone())));
+            }
+            Ok(Some(false)) => {}
+            // Unknown is never free: a VM may not take a card whose users this node cannot list. The check runs again
+            // when an approved action executes, so a card that becomes unreadable later is refused there too.
+            Ok(None) | Err(_) => return Err(gpu_refusal(GpuRefusal::InUseUnknown)),
+        }
     }
     Ok(GpuTarget {
         instance,
@@ -1172,6 +1177,7 @@ fn gpu_refusal(refusal: GpuRefusal) -> CallError {
         GpuRefusal::NotInInventory(_) => "GpuNotInInventory",
         GpuRefusal::Bound(_) => "GpuBoundToVfio",
         GpuRefusal::InUse(_) => "GpuInUse",
+        GpuRefusal::InUseUnknown => "GpuInUseUnknown",
         GpuRefusal::Project(_) => "GpuProjectRefused",
         GpuRefusal::Instance(_) => "GpuInstanceUnknown",
         GpuRefusal::Identity(_) => "GpuInstanceChanged",
