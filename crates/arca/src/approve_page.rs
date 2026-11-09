@@ -36,7 +36,9 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::canvas::{self, Canvas};
-use crate::handlers::{Clock, approve_plan, list_plans};
+use crate::handlers::{
+    ActionExecutor, Clock, approve_action, approve_plan, decline_plan, list_plans,
+};
 use crate::kernel::Kernel;
 use crate::passkey_change::{self, write_state_bytes};
 
@@ -107,6 +109,7 @@ struct PageState {
     trust_forwarded_for: bool,
     canvas: Arc<Canvas>,
     chat_slots: Arc<Semaphore>,
+    actions: ActionExecutor,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -262,8 +265,16 @@ impl Page {
                     .expect("the default canvas origin is loopback"),
                 ),
                 chat_slots: Arc::new(Semaphore::new(canvas::CHAT_CONCURRENCY)),
+                actions: ActionExecutor::default(),
             },
         }
+    }
+
+    /// Supplies the handlers an approved action runs through. `cmd_serve` passes the same handler set the MCP door holds;
+    /// tests may pass a fake. Without them an action proposal can still be listed and declined, but not approved.
+    pub fn with_actions(mut self, actions: ActionExecutor) -> Self {
+        self.state.actions = actions;
+        self
     }
 
     /// Replaces the enrolment log sink; tests capture only the public log message.
@@ -308,6 +319,7 @@ impl Page {
             .route("/approve", get(page))
             .route("/approve/plans", get(plans))
             .route("/approve/approve", post(approve))
+            .route("/approve/decline", post(decline))
             .route("/approve/setup-code", post(setup_code))
             .route("/approve/setup-code/verify", post(verify_setup_code))
             .route("/approve/register", post(register))
@@ -396,6 +408,10 @@ async fn security_headers(request: Request, next: Next) -> Response {
     headers.insert(
         HeaderName::from_static("referrer-policy"),
         HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("publickey-credentials-get=(self)"),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
@@ -705,7 +721,7 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
         Ok(kernel) => kernel,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    match list_plans(&kernel, now) {
+    match list_plans(&kernel, now, true) {
         Ok(mut body) => {
             body["passkeysTrusted"] = json!(kernel.owner_passkey_count());
             Json(body).into_response()
@@ -719,19 +735,79 @@ async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let now = (state.clock)();
+    let action = args
+        .get("plan")
+        .or_else(|| args.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("act-"));
+    if action {
+        let approved = {
+            let mut kernel = match state.kernel.lock() {
+                Ok(kernel) => kernel,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            match approve_action(&mut kernel, &args, now) {
+                Ok(approved) => approved,
+                Err(error) => return call_error_response(error),
+            }
+        };
+        let outcome = state
+            .actions
+            .run(&approved.action, &approved.args, &approved.grant);
+        let code = match &outcome {
+            Ok(_) => None,
+            Err(CallError::Refused { code, .. }) => Some(code.as_str()),
+            Err(CallError::Invalid(_)) => Some("Invalid"),
+            Err(_) => Some("Internal"),
+        };
+        if let Ok(mut kernel) = state.kernel.lock() {
+            kernel.revoke_action_grant(&approved.grant);
+            kernel.journal_action_result(&approved, outcome.is_ok(), code);
+        }
+        return match outcome {
+            Ok(result) => Json(json!({
+                "plan": approved.id,
+                "id": approved.id,
+                "action": approved.action,
+                "result": result,
+            }))
+            .into_response(),
+            Err(error) => call_error_response(error),
+        };
+    }
     let mut kernel = match state.kernel.lock() {
         Ok(kernel) => kernel,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     match approve_plan(&mut kernel, &args, now) {
         Ok(result) => Json(result).into_response(),
-        Err(CallError::Refused { code, message }) => (
+        Err(error) => call_error_response(error),
+    }
+}
+
+async fn decline(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    let Ok(args) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut kernel = match state.kernel.lock() {
+        Ok(kernel) => kernel,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match decline_plan(&mut kernel, &args) {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => call_error_response(error),
+    }
+}
+
+fn call_error_response(error: CallError) -> Response {
+    match error {
+        CallError::Refused { code, message } => (
             StatusCode::FORBIDDEN,
             Json(json!({ "refusal": code, "message": message })),
         )
             .into_response(),
-        Err(CallError::Invalid(_)) => StatusCode::BAD_REQUEST.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        CallError::Invalid(_) => StatusCode::BAD_REQUEST.into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

@@ -38,6 +38,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "token_list",
             "journal_list",
             "plan_list",
+            "action_propose",
             "plan_decline",
             "approval_submit",
             "alerts_list",
@@ -70,6 +71,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("watch_report", VerbClass::L, Scope::Viewer, false, false),
         ("token_list", VerbClass::L, Scope::Operator, false, false),
         ("plan_list", VerbClass::L, Scope::Viewer, false, false),
+        ("action_propose", VerbClass::L, Scope::Viewer, false, false),
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
         ("alerts_list", VerbClass::L, Scope::Viewer, false, false),
@@ -180,26 +182,84 @@ fn plan_verb_schemas_equal_their_table_rows() {
         ],
     );
 
+    let action_names = [
+        "service_create",
+        "service_remove",
+        "service_publish",
+        "service_unpublish",
+        "service_connect",
+        "service_disconnect",
+        "postgres_create",
+        "postgres_delete",
+    ];
+    let action_proposal = open(
+        json!({
+            "kind": { "const": "action", "type": "string" },
+            "id": {
+                "type": "string",
+                "minLength": 16,
+                "maxLength": 16,
+                "pattern": "^act-[0-9a-f]{12}$",
+            },
+            "action": { "type": "string", "enum": action_names },
+            "summary": { "type": "string" },
+            "args": { "type": "object" },
+            "argsDigest": hex64(),
+            "createdAt": { "type": "integer" },
+            "expiresAt": { "type": "integer" },
+            "statement": { "type": "string" },
+        }),
+        &[
+            "kind",
+            "id",
+            "action",
+            "summary",
+            "args",
+            "argsDigest",
+            "createdAt",
+            "expiresAt",
+        ],
+    );
+    let plan_ref = json!({
+        "type": "string",
+        "minLength": 16,
+        "maxLength": 68,
+        "pattern": "^(?:[0-9a-f]{64}|act-[0-9a-f]{12})$",
+    });
+
     let list = verb("plan_list").expect("present");
     assert_eq!((list.params)(), closed(json!({})));
     assert_eq!(
         (list.result)(),
         open(
-            json!({ "plans": { "type": "array", "items": plan } }),
+            json!({ "plans": { "type": "array", "items": { "anyOf": [plan, action_proposal.clone()] } } }),
             &["plans"]
         )
     );
 
+    let propose = verb("action_propose").expect("present");
+    assert_eq!(
+        (propose.params)(),
+        closed_with(
+            json!({
+                "action": { "type": "string", "enum": action_names },
+                "args": { "type": "object" },
+            }),
+            &["action", "args"]
+        )
+    );
+    assert_eq!((propose.result)(), action_proposal.clone());
+
     let decline = verb("plan_decline").expect("present");
     assert_eq!(
         (decline.params)(),
-        closed_with(json!({ "plan": hex64() }), &["plan"])
+        closed_with(json!({ "plan": plan_ref.clone() }), &["plan"])
     );
     assert_eq!(
         (decline.result)(),
         open(
             json!({
-                "plan": hex64(),
+                "plan": plan_ref.clone(),
                 "retained": { "type": "array", "items": obj.clone() },
             }),
             &["plan", "retained"]

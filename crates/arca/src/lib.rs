@@ -7,6 +7,7 @@
 //! it refuses before any write: a preflight check, a stale plan digest, an instance the config does not list, or a record that
 //! does not hold the adoption it is asked to resume, release or verify.
 
+pub mod action_proposal;
 pub mod adoptions;
 pub mod approve_page;
 pub mod canvas;

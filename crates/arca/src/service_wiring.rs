@@ -207,6 +207,7 @@ impl ServiceHandler {
         caller: &Caller,
         entries: &[Entry],
         now: u64,
+        preapproved: bool,
     ) -> Result<Value, CallError> {
         if matches!(self.verb, "service_connect" | "service_disconnect") {
             return self.link(args, entries, now);
@@ -299,7 +300,7 @@ impl ServiceHandler {
             }
             return Ok(json!({"ok":true}));
         }
-        self.publication(args, caller, &entry, &mut cfg, now)
+        self.publication(args, caller, &entry, &mut cfg, now, preapproved)
     }
     fn link(&self, args: &Value, entries: &[Entry], now: u64) -> Result<Value, CallError> {
         let from = arg_name(args, "from")?;
@@ -458,6 +459,7 @@ impl ServiceHandler {
         entry: &Entry,
         cfg: &mut ServiceConfig,
         now: u64,
+        preapproved: bool,
     ) -> Result<Value, CallError> {
         let target = self.exec_target(entry, cfg)?;
         let secrets = service_secret_values(&self.cfg.state_dir.join("secrets"));
@@ -543,18 +545,20 @@ impl ServiceHandler {
         let approval = args["approval"]
             .as_str()
             .ok_or_else(|| CallError::Invalid("approval: expected a string".into()))?;
-        lock(&self.kernel)?
-            .check_approval(
-                ArcaAction::Publish,
-                &cfg.name,
-                &json!({"name":cfg.name,"reach":"tailnet"}),
-                approval,
-                now,
-            )
-            .map_err(|e| CallError::Refused {
-                code: "owner_approval".into(),
-                message: e.to_string(),
-            })?;
+        if !preapproved {
+            lock(&self.kernel)?
+                .check_approval(
+                    ArcaAction::Publish,
+                    &cfg.name,
+                    &json!({"name":cfg.name,"reach":"tailnet"}),
+                    approval,
+                    now,
+                )
+                .map_err(|e| CallError::Refused {
+                    code: "owner_approval".into(),
+                    message: e.to_string(),
+                })?;
+        }
         let fqdn = format!("{}.{tailnet}.ts.net", node.as_str());
         let result = (|| {
             run(&ExecCommand::StartDaemon)?;

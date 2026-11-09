@@ -2,7 +2,7 @@
 //! and `metrics` commands call the same functions, so a command's JSON output equals the MCP result of its verb. The three
 //! plan verbs run over the kernel, through one lock and one clock.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -33,8 +33,9 @@ use arca_watch::{WatchConfig, watch_once};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::action_proposal::{ActionKind, ActionProposal, ProposeError};
 use crate::config::NodeConfig;
-use crate::kernel::{AppliedSeq, JOURNAL_FILE, Kernel};
+use crate::kernel::{ActionApprovalError, AppliedSeq, ApprovedAction, JOURNAL_FILE, Kernel};
 
 /// Answers from the public ontology embedded in the binary, without reading node state.
 pub struct OntologyQuery;
@@ -856,7 +857,7 @@ impl ToolHandler for TokenListHandler {
     }
 }
 
-/// The handlers of the three plan verbs, keyed by verb name, over one kernel and one clock.
+/// The handlers of the four plan verbs, keyed by verb name, over one kernel and one clock.
 pub fn plan_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -865,6 +866,13 @@ pub fn plan_handlers(
         (
             "plan_list",
             Arc::new(PlanList {
+                kernel: Arc::clone(&kernel),
+                clock: Arc::clone(&clock),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "action_propose",
+            Arc::new(ActionPropose {
                 kernel: Arc::clone(&kernel),
                 clock: Arc::clone(&clock),
             }) as Arc<dyn ToolHandler>,
@@ -882,8 +890,8 @@ pub fn plan_handlers(
     ]
 }
 
-/// `plan_list`: each waiting delete plan that has not lapsed, with the statement the owner signs for it. Every listing draws a
-/// new nonce, so each statement is built fresh. A lapsed plan is left out, since its run is refused as expired.
+/// `plan_list`: each waiting delete plan and action proposal that has not lapsed. A delete plan carries the statement the
+/// owner signs; an action proposal's statement is added only by the open approval page.
 struct PlanList {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -893,43 +901,152 @@ impl ToolHandler for PlanList {
     fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let now = (self.clock)();
         let kernel = lock(&self.kernel)?;
-        list_plans(&kernel, now)
+        list_plans(&kernel, now, false)
     }
 }
 
-/// The waiting plan list, shared by `plan_list` and the open approval page. Each listing draws a new nonce, so every
-/// statement is built fresh.
-pub(crate) fn list_plans(kernel: &Kernel, now: u64) -> Result<Value, CallError> {
-    let plans = kernel
+/// The waiting plan list, shared by `plan_list` and the open approval page. Every statement is built fresh with a new
+/// nonce. `action_statements` is true only for the page, whose cards sign an action proposal too.
+pub(crate) fn list_plans(
+    kernel: &Kernel,
+    now: u64,
+    action_statements: bool,
+) -> Result<Value, CallError> {
+    let mut plans = kernel
         .pending_plans()
         .iter()
         .filter(|plan| now.saturating_sub(plan.created_ms) <= PLAN_TTL_MS)
         .map(|plan| plan_json(kernel.host(), plan, now))
         .collect::<Result<Vec<Value>, CallError>>()?;
+    for proposal in kernel
+        .action_proposals()
+        .iter()
+        .filter(|proposal| !proposal.expired(now))
+    {
+        plans.push(action_json(
+            kernel.host(),
+            proposal,
+            now,
+            action_statements,
+        )?);
+    }
     Ok(json!({ "plans": plans }))
 }
 
-/// `plan_decline`: declines one waiting plan. Its objects are retained, and the decline is final.
+/// One action proposal in a listing. The page gets the exact statement the owner signs; `plan_list` does not.
+fn action_json(
+    host: &str,
+    proposal: &ActionProposal,
+    now: u64,
+    statement: bool,
+) -> Result<Value, CallError> {
+    let mut value = json!({
+        "kind": "action",
+        "id": proposal.id,
+        "action": proposal.action,
+        "summary": proposal.summary,
+        "args": proposal.args,
+        "argsDigest": proposal.args_digest,
+        "createdAt": proposal.created_ms,
+        "expiresAt": proposal.expires_at,
+    });
+    if statement {
+        value["statement"] = json!(action_statement(
+            host,
+            &proposal.id,
+            &proposal.action,
+            &proposal.args_digest,
+            now,
+            &fresh_nonce()?,
+        )?);
+    }
+    Ok(value)
+}
+
+/// `action_propose`: validates one allowed action's arguments and records an inert proposal. A disallowed action is an
+/// invalid call and leaves no record.
+struct ActionPropose {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+}
+
+impl ToolHandler for ActionPropose {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let name = args["action"]
+            .as_str()
+            .ok_or_else(|| CallError::Invalid("action is required".to_string()))?;
+        let action = ActionKind::from_name(name).ok_or_else(|| {
+            CallError::Invalid("action: not one of the actions this build allows".to_string())
+        })?;
+        let payload = args
+            .get("args")
+            .cloned()
+            .ok_or_else(|| CallError::Invalid("args is required".to_string()))?;
+        action.validate(&payload).map_err(CallError::Invalid)?;
+        let now = (self.clock)();
+        let mut kernel = lock(&self.kernel)?;
+        let proposal = kernel
+            .propose_action(action, payload, now)
+            .map_err(propose_failure)?;
+        Ok(json!({
+            "id": proposal.id,
+            "action": proposal.action,
+            "summary": proposal.summary,
+            "args": proposal.args,
+            "argsDigest": proposal.args_digest,
+            "createdAt": proposal.created_ms,
+            "expiresAt": proposal.expires_at,
+        }))
+    }
+}
+
+fn propose_failure(error: ProposeError) -> CallError {
+    match error {
+        ProposeError::TooMany => CallError::Refused {
+            code: "TooManyProposals".to_string(),
+            message: "eight action proposals already wait; approve or decline one first"
+                .to_string(),
+        },
+        ProposeError::IdCollision => CallError::Refused {
+            code: "IdCollision".to_string(),
+            message: "another action proposal already uses this id".to_string(),
+        },
+        ProposeError::Store(_) => internal(),
+    }
+}
+
+/// `plan_decline`: declines one waiting delete plan or action proposal. A delete plan's objects are retained, and the
+/// decline is final.
 struct PlanDecline {
     kernel: Arc<Mutex<Kernel>>,
 }
 
 impl ToolHandler for PlanDecline {
     fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
-        let digest = plan_argument(&args)?;
         let mut kernel = lock(&self.kernel)?;
-        match kernel.decline(&digest).map_err(|_| internal())? {
+        decline_plan(&mut kernel, &args)
+    }
+}
+
+/// The decline path shared by the verb and the approval page.
+pub(crate) fn decline_plan(kernel: &mut Kernel, args: &Value) -> Result<Value, CallError> {
+    match plan_argument(args)? {
+        PlanRef::Delete(digest) => match kernel.decline(&digest).map_err(|_| internal())? {
             None => Err(no_such_plan()),
             Some(objects) => Ok(json!({
                 "plan": digest.to_hex(),
                 "retained": objects_json(&objects)?,
             })),
-        }
+        },
+        PlanRef::Action(id) => match kernel.decline_action(&id).map_err(|_| internal())? {
+            false => Err(no_such_plan()),
+            true => Ok(json!({ "plan": id, "retained": [] })),
+        },
     }
 }
 
-/// `approval_submit`: checks an owner's approval for one waiting plan and, when it holds, runs the plan's delete. The approval
-/// is read here and never stored or echoed.
+/// `approval_submit`: checks an owner's approval for one waiting delete plan and, when it holds, runs the plan's delete.
+/// An action proposal is approved by the owner on the approval page, which can also run its verb; this door refuses it.
 struct ApprovalSubmit {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -943,14 +1060,17 @@ impl ToolHandler for ApprovalSubmit {
     }
 }
 
-/// The approval path shared by `approval_submit` and the open approval page: check the proof for the named waiting plan and
-/// run its delete once. The approval string is read and never stored or echoed.
+/// The delete-plan approval path shared by `approval_submit` and the open approval page: check the proof for the named
+/// waiting plan and run its delete once. The approval string is read and never stored or echoed.
 pub(crate) fn approve_plan(
     kernel: &mut Kernel,
     args: &Value,
     now: u64,
 ) -> Result<Value, CallError> {
-    let digest = plan_argument(args)?;
+    let digest = match plan_argument(args)? {
+        PlanRef::Delete(digest) => digest,
+        PlanRef::Action(_) => return Err(no_such_plan()),
+    };
     let approval = args
         .get("approval")
         .and_then(Value::as_str)
@@ -967,6 +1087,73 @@ pub(crate) fn approve_plan(
     }
 }
 
+/// Checks and spends an owner's approval for one action proposal, retires it and arms exactly one execution grant. The
+/// caller runs the action outside the kernel lock, then journals its result.
+pub fn approve_action(
+    kernel: &mut Kernel,
+    args: &Value,
+    now: u64,
+) -> Result<ApprovedAction, CallError> {
+    let id = match plan_argument(args)? {
+        PlanRef::Action(id) => id,
+        PlanRef::Delete(_) => return Err(no_such_plan()),
+    };
+    let approval = args
+        .get("approval")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CallError::Invalid("approval is required".to_string()))?;
+    kernel
+        .approve_action(&id, approval, now)
+        .map_err(action_approval_failure)
+}
+
+fn action_approval_failure(error: ActionApprovalError) -> CallError {
+    match error {
+        ActionApprovalError::NoSuch => no_such_plan(),
+        ActionApprovalError::Expired => CallError::Refused {
+            code: "Expired".to_string(),
+            message: "the action proposal has expired".to_string(),
+        },
+        ActionApprovalError::Approval(refusal) => refusal_failure(refusal),
+        ActionApprovalError::Store(_) => internal(),
+    }
+}
+
+/// Runs one already approved action through the same handler its gated verb uses. Only `service_remove` and
+/// `service_publish` take an inline approval; the random grant is passed in that field and consumed by the handler, so the
+/// owner's real approval is never stored or replayed.
+#[derive(Clone, Default)]
+pub struct ActionExecutor {
+    handlers: Arc<HashMap<&'static str, Arc<dyn ToolHandler>>>,
+}
+
+impl ActionExecutor {
+    pub fn new(handlers: impl IntoIterator<Item = (&'static str, Arc<dyn ToolHandler>)>) -> Self {
+        Self {
+            handlers: Arc::new(handlers.into_iter().collect()),
+        }
+    }
+
+    pub fn run(&self, action: &str, args: &Value, grant: &str) -> Result<Value, CallError> {
+        let handler =
+            self.handlers.get(action).cloned().ok_or_else(|| {
+                CallError::Internal("the approved action has no handler".to_string())
+            })?;
+        let mut call = args.clone();
+        if matches!(action, "service_remove" | "service_publish") {
+            call["approval"] = json!(grant);
+        }
+        handler.call(
+            call,
+            &Caller {
+                token_id: "owner-approval".to_string(),
+                scope: Scope::Operator,
+                tools: None,
+            },
+        )
+    }
+}
+
 fn lock(kernel: &Mutex<Kernel>) -> Result<MutexGuard<'_, Kernel>, CallError> {
     kernel.lock().map_err(|_| internal())
 }
@@ -979,17 +1166,37 @@ fn internal() -> CallError {
 fn no_such_plan() -> CallError {
     CallError::Refused {
         code: "NoSuchPlan".to_string(),
-        message: "no delete plan waits under this digest".to_string(),
+        message: "no delete plan or action proposal waits under this id".to_string(),
     }
 }
 
-/// The plan digest a call names. The schema has checked its length; this checks its digits.
-fn plan_argument(args: &Value) -> Result<Digest, CallError> {
+/// A delete plan digest or an action proposal id.
+enum PlanRef {
+    Delete(Digest),
+    Action(String),
+}
+
+fn plan_argument(args: &Value) -> Result<PlanRef, CallError> {
     let text = args
         .get("plan")
+        .or_else(|| args.get("id"))
         .and_then(Value::as_str)
         .ok_or_else(|| CallError::Invalid("plan is required".to_string()))?;
-    Digest::from_hex(text).map_err(|_| CallError::Invalid("plan is not a digest".to_string()))
+    if let Some(hex) = text.strip_prefix("act-") {
+        if hex.len() == 12
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Ok(PlanRef::Action(text.to_string()));
+        }
+        return Err(CallError::Invalid(
+            "plan is not an action proposal id".to_string(),
+        ));
+    }
+    Digest::from_hex(text)
+        .map(PlanRef::Delete)
+        .map_err(|_| CallError::Invalid("plan is not a digest".to_string()))
 }
 
 /// A refused approval as a call's refusal. A storage failure is the server's own, and is not a refusal of the approval.
@@ -1056,8 +1263,39 @@ pub fn plan_statement(
     nonce: &str,
 ) -> Result<String, CallError> {
     let params = params_digest(&json!({ "plan": plan })).map_err(|_| internal())?;
+    statement_text(
+        host,
+        "delete",
+        &format!("plan-{plan}"),
+        &params,
+        issued_ms,
+        nonce,
+    )
+}
+
+/// The statement an owner signs to approve an action proposal: the action is the gated verb, the target is the proposal's
+/// id, and `paramsDigest` is the proposal's `argsDigest`. The same parser reads it back before a listing carries it.
+pub fn action_statement(
+    host: &str,
+    id: &str,
+    action: &str,
+    args_digest: &str,
+    issued_ms: u64,
+    nonce: &str,
+) -> Result<String, CallError> {
+    statement_text(host, action, id, args_digest, issued_ms, nonce)
+}
+
+fn statement_text(
+    host: &str,
+    action: &str,
+    target: &str,
+    params: &str,
+    issued_ms: u64,
+    nonce: &str,
+) -> Result<String, CallError> {
     let text = format!(
-        r#"{{"action":"delete","expiresAt":"{}","host":"{host}","issuedAt":"{}","nonce":"{nonce}","paramsDigest":"{params}","target":"plan-{plan}"}}"#,
+        r#"{{"action":"{action}","expiresAt":"{}","host":"{host}","issuedAt":"{}","nonce":"{nonce}","paramsDigest":"{params}","target":"{target}"}}"#,
         iso_utc(issued_ms.saturating_add(STATEMENT_TTL_MS)),
         iso_utc(issued_ms),
     );
@@ -2606,6 +2844,15 @@ impl ToolHandler for ServiceHandler {
                 verb: self.verb.into(),
             });
         }
+        let preapproved = matches!(self.verb, "service_remove" | "service_publish")
+            && args
+                .get("approval")
+                .and_then(Value::as_str)
+                .is_some_and(|grant| {
+                    lock(&self.kernel)
+                        .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
+                        .unwrap_or(false)
+                });
         let _publish = matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_remove"
@@ -2640,7 +2887,7 @@ impl ToolHandler for ServiceHandler {
                 | "service_publish"
                 | "service_unpublish"
         ) {
-            return self.call_wiring(&args, caller, &entries, now);
+            return self.call_wiring(&args, caller, &entries, now, preapproved);
         }
         match self.verb {
             "service_list" => {
@@ -2796,17 +3043,21 @@ impl ToolHandler for ServiceHandler {
                     return Err(service_wiring::adopted(&name));
                 }
                 let id = entry.id.clone();
-                let spent = lock(&self.kernel)?
-                    .spend_service_removal(&id, &name, approval, now)
-                    .map_err(|error| match error {
-                        crate::kernel::ServiceRemovalError::Approval(refusal) => {
-                            CallError::Refused {
-                                code: "owner_approval".into(),
-                                message: refusal.to_string(),
+                let spent = if preapproved {
+                    lock(&self.kernel)?.spend_service_removal_authorized(&id)
+                } else {
+                    lock(&self.kernel)?
+                        .spend_service_removal(&id, &name, approval, now)
+                        .map_err(|error| match error {
+                            crate::kernel::ServiceRemovalError::Approval(refusal) => {
+                                CallError::Refused {
+                                    code: "owner_approval".into(),
+                                    message: refusal.to_string(),
+                                }
                             }
-                        }
-                        _ => internal(),
-                    })?;
+                            _ => internal(),
+                        })?
+                };
                 self.logout_before_remove(&entry, &config, caller);
                 let _write = self.writes.lock().map_err(|_| internal())?;
                 let removal = lock(&self.kernel)?

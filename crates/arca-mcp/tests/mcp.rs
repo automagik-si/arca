@@ -416,6 +416,7 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "watch_report",
             "journal_list",
             "plan_list",
+            "action_propose",
             "alerts_list",
             "postgres_list",
             "ontology_query",

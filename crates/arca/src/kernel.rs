@@ -20,8 +20,12 @@ use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::Provider;
 use arca_providers::incus::RetainedSet;
 use arca_reconcile::{Outcome, PlanRun, PluginSet, Reconciler};
-use serde_json::json;
+use serde_json::{Value, json};
 
+use crate::action_proposal::{
+    ACTION_PROPOSALS_FILE, ActionKind, ActionProposal, ActionProposalStore, ProposeError,
+    action_args_digest,
+};
 use crate::desired_store::{DesiredStore, EntryChange, STATE_FILE};
 
 /// The journal's file name in the state directory.
@@ -43,7 +47,8 @@ impl AppliedSeq {
     }
 }
 
-/// The kernel of one node: its desired-state store, its reconciler and the approval verifier for delete plans.
+/// The kernel of one node: its desired-state store, its reconciler, the approval verifier for delete plans, and the inert
+/// action proposals an owner may approve with a passkey.
 pub struct Kernel {
     store: DesiredStore,
     applied_seq: AppliedSeq,
@@ -51,6 +56,38 @@ pub struct Kernel {
     retained: RetainedSet,
     verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
     host: String,
+    action_proposals: ActionProposalStore,
+    action_grants: Vec<ActionGrant>,
+}
+
+/// A one-shot permission to run an already approved action through its gated verb. The token is random, not the owner's
+/// approval, and the handler consumes it before doing any work.
+struct ActionGrant {
+    action: String,
+    args_digest: String,
+    token: String,
+}
+
+/// An action proposal whose owner approval verified and whose nonce was spent, ready to run once.
+#[derive(Debug, Clone)]
+pub struct ApprovedAction {
+    pub id: String,
+    pub action: String,
+    pub args: Value,
+    pub grant: String,
+}
+
+/// Why an action proposal could not be approved. Nothing ran.
+#[derive(Debug)]
+pub enum ActionApprovalError {
+    /// No unexpired proposal waits under this id.
+    NoSuch,
+    /// The proposal's fifteen minutes have run.
+    Expired,
+    /// The owner's statement or proof was refused.
+    Approval(ApprovalRefusal),
+    /// The proposals journal could not be read or made durable.
+    Store(KernelError),
 }
 
 /// The reconciliation and approved plan run of one atomic service removal.
@@ -88,6 +125,11 @@ impl Kernel {
         now_ms: u64,
     ) -> Result<Self, KernelError> {
         let mut store = DesiredStore::open(state_dir, key)?;
+        let action_proposals =
+            ActionProposalStore::open(state_dir).map_err(|error| KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: error.to_string(),
+            })?;
         let retained = RetainedSet::new(store.retained().clone());
         let provider = provider(retained.clone())?;
         let journal = Journal::open(FileJournal::open(&state_dir.join(JOURNAL_FILE))?)?;
@@ -122,6 +164,8 @@ impl Kernel {
             retained,
             verifier,
             host,
+            action_proposals,
+            action_grants: Vec::new(),
         })
     }
 
@@ -176,6 +220,144 @@ impl Kernel {
     /// The delete plans waiting for an owner's approval, in the order the reconciler holds them.
     pub fn pending_plans(&self) -> Vec<DeletePlan> {
         self.reconciler.pending_plans()
+    }
+
+    /// The action proposals still on disk. Callers leave out the lapsed ones.
+    pub fn action_proposals(&self) -> &[ActionProposal] {
+        self.action_proposals.waiting()
+    }
+
+    /// Records an inert action proposal. The action's arguments have already been checked against its verb's schema. A
+    /// ninth unexpired proposal is refused, and the same digest returns the record that already waits.
+    pub fn propose_action(
+        &mut self,
+        action: ActionKind,
+        args: Value,
+        now_ms: u64,
+    ) -> Result<ActionProposal, ProposeError> {
+        self.action_proposals.propose(action, args, now_ms)
+    }
+
+    /// Declines one waiting action proposal, whatever its age. Returns whether one waited under `id`.
+    pub fn decline_action(&mut self, id: &str) -> Result<bool, KernelError> {
+        self.action_proposals
+            .decline(id)
+            .map(|proposal| proposal.is_some())
+            .map_err(|error| KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: error.to_string(),
+            })
+    }
+
+    /// Checks the owner's approval for the action proposal `id`, spends its nonce, retires the proposal and arms one
+    /// execution grant. Nothing runs here: the caller runs the action after the lock is released, then journals its result.
+    pub fn approve_action(
+        &mut self,
+        id: &str,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<ApprovedAction, ActionApprovalError> {
+        let proposal = self
+            .action_proposals
+            .get(id)
+            .cloned()
+            .ok_or(ActionApprovalError::NoSuch)?;
+        if proposal.expired(now_ms) {
+            return Err(ActionApprovalError::Expired);
+        }
+        let action = ActionKind::from_name(&proposal.action).ok_or_else(|| {
+            ActionApprovalError::Store(KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: "the waiting proposal names an action this build does not allow".to_string(),
+            })
+        })?;
+        let digest = action_args_digest(&proposal.action, &proposal.args).ok_or_else(|| {
+            ActionApprovalError::Store(KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: "the waiting proposal's arguments do not canonicalize".to_string(),
+            })
+        })?;
+        if digest != proposal.args_digest {
+            return Err(ActionApprovalError::Store(KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: "the waiting proposal's digest does not match its arguments".to_string(),
+            }));
+        }
+        let statement_action = ArcaAction::from_name(&proposal.action).ok_or_else(|| {
+            ActionApprovalError::Store(KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: "the waiting proposal names an action the verifier does not know".to_string(),
+            })
+        })?;
+        let grant = fresh_grant().ok_or_else(|| {
+            ActionApprovalError::Store(KernelError::Io {
+                path: ACTION_PROPOSALS_FILE.to_string(),
+                why: "a one-shot execution grant could not be generated".to_string(),
+            })
+        })?;
+        let payload = json!({ "action": proposal.action.clone(), "args": proposal.args.clone() });
+        self.verifier
+            .check(statement_action, id, &payload, approval, now_ms)
+            .map_err(ActionApprovalError::Approval)?;
+        self.action_proposals
+            .approve(id)
+            .map_err(|error| {
+                ActionApprovalError::Store(KernelError::Io {
+                    path: ACTION_PROPOSALS_FILE.to_string(),
+                    why: error.to_string(),
+                })
+            })?
+            .ok_or(ActionApprovalError::NoSuch)?;
+        self.action_grants.push(ActionGrant {
+            action: action.as_str().to_string(),
+            args_digest: digest,
+            token: grant.clone(),
+        });
+        Ok(ApprovedAction {
+            id: proposal.id,
+            action: action.as_str().to_string(),
+            args: proposal.args,
+            grant,
+        })
+    }
+
+    /// Consumes the one-shot grant that lets an approved action's own handler skip its inline approval. The handler's
+    /// arguments may still carry the grant under `approval`; that key is not part of the digest.
+    pub fn consume_action_grant(&mut self, action: &str, args: &Value, token: &str) -> bool {
+        let mut bare = args.clone();
+        if let Some(object) = bare.as_object_mut() {
+            object.remove("approval");
+        }
+        let Some(digest) = action_args_digest(action, &bare) else {
+            return false;
+        };
+        let Some(index) = self.action_grants.iter().position(|grant| {
+            grant.token == token && grant.action == action && grant.args_digest == digest
+        }) else {
+            return false;
+        };
+        self.action_grants.remove(index);
+        true
+    }
+
+    /// Drops a grant that was never consumed, so no later call can use it.
+    pub fn revoke_action_grant(&mut self, token: &str) {
+        self.action_grants.retain(|grant| grant.token != token);
+    }
+
+    /// Journals whether one approved action ran. Called after the action handler returns, so the record is its result.
+    pub fn journal_action_result(
+        &mut self,
+        approved: &ApprovedAction,
+        ok: bool,
+        code: Option<&str>,
+    ) {
+        if let Err(error) = self.action_proposals.journal_result(&approved.id, ok, code) {
+            eprintln!(
+                "arca: the result of action proposal {} was not journalled: {error}",
+                approved.id
+            );
+        }
     }
 
     /// The passkey lines the owner verifier currently trusts, root-file and state-file lines together.
@@ -375,6 +557,14 @@ impl Kernel {
         })
     }
 
+    /// The same spent removal as [`Kernel::spend_service_removal`], for an action whose owner approval was already checked
+    /// against its proposal and whose one-shot grant the caller consumed.
+    pub fn spend_service_removal_authorized(&mut self, entry: &EntryId) -> SpentServiceRemoval {
+        SpentServiceRemoval {
+            entry: entry.clone(),
+        }
+    }
+
     pub fn remove_service_spent(
         &mut self,
         spent: SpentServiceRemoval,
@@ -509,4 +699,11 @@ fn retained_failure(_refusal: arca_kernel::plugin::EffectRefusal) -> KernelError
         path: STATE_FILE.to_string(),
         why: "the retained set could not be read".to_string(),
     }
+}
+
+/// A random one-shot token for an approved action. It is not the owner's approval and carries no secret.
+fn fresh_grant() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }

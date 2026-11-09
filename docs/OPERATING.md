@@ -294,7 +294,9 @@ record is refused.
 ## The MCP server
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
-in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`, `plan_decline`, `approval_submit`, the Postgres and ontology verbs, and `service_create`, `service_list` and `service_status`.
+in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
+`action_propose`, `plan_decline`, `approval_submit`, the Postgres and ontology verbs, and `service_create`, `service_list` and
+`service_status`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -317,9 +319,14 @@ its request is read.
 - `alerts_list` answers the node's alerts: the firing ones, the unknown ones, the disabled rules, the resolves of the last
   24 hours and the store's health. It reads the newest published tick and never waits on Incus. See "Alerts".
 - `token_list` lists each live token's id, scope and optional tool list. It never lists a secret or a digest.
-- `plan_list` lists each waiting delete plan with the statement its owner signs. See the next section.
-- `plan_decline` retains a waiting plan's objects. A decline is final and survives a restart.
-- `approval_submit` checks an owner's approval for a waiting plan and, when it holds, deletes the plan's objects once.
+- `plan_list` lists each waiting delete plan and action proposal. A delete plan carries the statement its owner signs; an
+  action proposal carries its action, arguments and kernel-built summary. See the next section.
+- `action_propose` takes `{action, args}` and records an inert action proposal. It is a viewer verb: it changes no desired
+  state and applies nothing. The owner approves it on the approval page with a passkey.
+- `plan_decline` retains a waiting delete plan's objects, or declines a waiting action proposal. A decline is final and
+  survives a restart.
+- `approval_submit` checks an owner's approval for a waiting delete plan and, when it holds, deletes the plan's objects once.
+  Action proposals are approved and run by the approval page, which can reach the gated verb's handler.
 
 `serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
@@ -412,6 +419,7 @@ A call sends `initialize` and then `tools/call`, each on its own connection. Its
 | `desired.json` | the current signed desired-state document, with the entries that converged and the plans that were declined. Mode 0600 |
 | `desired.lock` | the lock held while `serve` runs. A second process over the same directory is refused |
 | `journal.jsonl` | the journal of every effect the reconciler sent, as intents and outcomes |
+| `action-proposals.jsonl` | the action proposals and their `proposed`, `approved`, `declined` and `result` events |
 | `approval-nonces.jsonl` | the approval nonces that were spent |
 | `passkey-counts.jsonl` | the last sign count kept for each passkey. Mode 0600 |
 | `secrets/` | the secret files the writer reads, if any |
@@ -438,9 +446,38 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-The owner approves that text in the namespace `arca-kernel-approve`, with an SSH key or a passkey. The approval string is the
-base64 of the statement, a dot, and the base64 of the proof. A proof whose first byte is `{` is a passkey proof. Any other proof
-is an armoured SSH signature.
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of eight gated verbs:
+`service_create`, `service_remove`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect`,
+`postgres_create` or `postgres_delete`. `action_propose` takes `{action, args}`; `args` is checked against that verb's own
+parameter schema, with the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid
+call and leaves no record. The record is:
+
+```json
+{"id":"act-<12 hex>","action":"service_create","args":{"name":"nats","template":"nats"},"argsDigest":"<sha256 of canonical {action,args}>","createdAt":<ms>,"expiresAt":<createdAt+15 min>,"summary":"Create the service nats"}
+```
+
+The `summary` is built in the kernel from the checked fields; a caller cannot supply one. At most eight unexpired proposals
+wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same `argsDigest` returns the
+record that already waits instead of adding another. A proposal lapses fifteen minutes after it was made. The journal writes
+`proposed` when the record is made, `approved` when its proof verifies, `declined` on a decline, and `result` after the one
+run. A restart replays the journal, so an unexpired waiting proposal survives it.
+
+`plan_list` carries an action proposal as
+`{"kind":"action","id":"act-…","action":"…","summary":"…","args":{…},"argsDigest":"…","createdAt":<ms>,"expiresAt":<ms>}`.
+`GET /approve/plans` carries the same item plus `statement`, the exact text the owner signs:
+
+```
+{"action":"<the verb>","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<argsDigest>","target":"act-<12 hex>"}
+```
+
+`plan_decline` accepts either a delete plan's digest or an action proposal's `act-…` id. The approval page dispatches
+`POST /approve/approve` by the same id: a 64-hex id keeps the delete-plan path, and an `act-…` id verifies the proof against
+the proposal, spends the nonce, retires the proposal, and then runs its verb through the same handler the gated verb uses,
+exactly once. A failure is journalled as the action's result and returned; the approval is spent either way.
+
+The owner approves the delete statement or the action statement in the namespace `arca-kernel-approve`, with an SSH key or a
+passkey. The approval string is the base64 of the statement, a dot, and the base64 of the proof. A proof whose first byte is `{`
+is a passkey proof. Any other proof is an armoured SSH signature.
 
 - **An SSH key.** The owner signs the statement with `ssh-keygen -Y sign -n arca-kernel-approve` and an `sk-ssh-ed25519` key.
   The key is read from the signers file `/etc/arca/owner-signers`, which lists the owner's keys for that namespace.
@@ -524,10 +561,12 @@ A plan that waits under no digest is `NoSuchPlan`. A valid approval for such a p
 With `approvalOrigin` set, `serve` serves an approval page and mounts its routes outside the MCP bearer check:
 
 - `GET /approve` returns the page.
-- `GET /approve/plans` returns the waiting plans with the same fields as `plan_list`.
+- `GET /approve/plans` returns the waiting delete plans and action proposals. A delete plan has the same fields as
+  `plan_list`; an action proposal adds `statement`, the exact passkey statement for that proposal.
 - `POST /approve/setup-code` issues a one-time 8-digit setup code to the machine's own screen while no passkey is trusted.
-- `POST /approve/approve` takes `{ "plan": "<digest>", "approval": "<string>" }` and runs the plan through the same kernel
-  approval path as `approval_submit`.
+- `POST /approve/approve` takes `{ "plan": "<digest or act-id>", "approval": "<string>" }`. A delete plan keeps the
+  `approval_submit` path; an `act-…` id verifies the passkey against the proposal's statement and runs its action once.
+- `POST /approve/decline` takes `{ "plan": "<digest or act-id>" }` and declines that delete plan or action proposal.
 - `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }`,
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.

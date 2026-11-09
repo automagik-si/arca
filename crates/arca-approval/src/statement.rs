@@ -10,7 +10,8 @@ use serde_json::{Map, Value};
 use crate::ApprovalRefusal;
 use crate::passkey::parse_proof;
 
-/// What an owner approval admits. Droidd's `ARCA_ACTIONS`. `install` belongs to the recipes tier and is refused here.
+/// What an owner approval admits. Droidd's `ARCA_ACTIONS`, plus the service and database verbs an action proposal names.
+/// `install` belongs to the recipes tier and is refused here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArcaAction {
     Delete,
@@ -18,10 +19,18 @@ pub enum ArcaAction {
     Spend,
     PasskeyAdd,
     PasskeyRemove,
+    ServiceCreate,
+    ServiceRemove,
+    ServicePublish,
+    ServiceUnpublish,
+    ServiceConnect,
+    ServiceDisconnect,
+    PostgresCreate,
+    PostgresDelete,
 }
 
 impl ArcaAction {
-    /// The action's name as a statement writes it.
+    /// The action's name as a statement writes it. For an action proposal it is the gated verb's own name.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Delete => "delete",
@@ -29,18 +38,39 @@ impl ArcaAction {
             Self::Spend => "spend",
             Self::PasskeyAdd => "passkey_add",
             Self::PasskeyRemove => "passkey_remove",
+            Self::ServiceCreate => "service_create",
+            Self::ServiceRemove => "service_remove",
+            Self::ServicePublish => "service_publish",
+            Self::ServiceUnpublish => "service_unpublish",
+            Self::ServiceConnect => "service_connect",
+            Self::ServiceDisconnect => "service_disconnect",
+            Self::PostgresCreate => "postgres_create",
+            Self::PostgresDelete => "postgres_delete",
         }
     }
 
-    fn from_statement(text: &str) -> Option<ArcaAction> {
+    /// The action a verb name writes, or `None` when no approval admits it.
+    pub fn from_name(text: &str) -> Option<ArcaAction> {
         match text {
             "delete" => Some(Self::Delete),
             "publish" => Some(Self::Publish),
             "spend" => Some(Self::Spend),
             "passkey_add" => Some(Self::PasskeyAdd),
             "passkey_remove" => Some(Self::PasskeyRemove),
+            "service_create" => Some(Self::ServiceCreate),
+            "service_remove" => Some(Self::ServiceRemove),
+            "service_publish" => Some(Self::ServicePublish),
+            "service_unpublish" => Some(Self::ServiceUnpublish),
+            "service_connect" => Some(Self::ServiceConnect),
+            "service_disconnect" => Some(Self::ServiceDisconnect),
+            "postgres_create" => Some(Self::PostgresCreate),
+            "postgres_delete" => Some(Self::PostgresDelete),
             _ => None,
         }
+    }
+
+    fn from_statement(text: &str) -> Option<ArcaAction> {
+        Self::from_name(text)
     }
 }
 
@@ -217,7 +247,7 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
         bad(
             "action",
-            "delete, publish, spend, passkey_add or passkey_remove",
+            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create or postgres_delete",
         )
     })?;
     let target = field("target");

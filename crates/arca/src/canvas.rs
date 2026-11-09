@@ -62,6 +62,10 @@ pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CHAT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// A chat response relays at most two MiB, so a broken upstream cannot stream without bound.
 pub const CHAT_STREAM_MAX: usize = 2 * 1024 * 1024;
+/// The data chunks the relay may buffer for a slow client. One further slot is kept empty so the final cut event always
+/// has room, however full the data queue is.
+const RELAY_CHANNEL: usize = 16;
+const RELAY_QUEUE: usize = RELAY_CHANNEL + 1;
 /// At most two chat streams hold a listener connection; a third gets 429 before any upstream connect.
 pub const CHAT_CONCURRENCY: usize = 2;
 /// The sign-in statement's kind. The approval parser refuses it structurally, as this parser refuses an approval statement.
@@ -525,17 +529,25 @@ fn is_sse(content_type: &str) -> bool {
 }
 
 /// The final event a cut-off answer carries, matching the stream's media type. Only the fixed reason reaches the client.
+/// It starts with a blank line, so a cut that lands in the middle of an event terminates that partial event first: SSE
+/// ends a block with two newlines, and NDJSON ends a line with one.
 fn cut_event(sse: bool, reason: &str) -> Vec<u8> {
     let data = json!({ "reason": reason });
     if sse {
-        format!("event: arca-cut\ndata: {data}\n\n").into_bytes()
+        format!("\n\nevent: arca-cut\ndata: {data}\n\n").into_bytes()
     } else {
-        format!("{{\"arcaCut\":{data}}}\n").into_bytes()
+        format!("\n{{\"arcaCut\":{data}}}\n").into_bytes()
     }
 }
 
+/// Whether one more data chunk fits without consuming the slot the cut event needs.
+fn data_fits(sender: &mpsc::Sender<Result<Vec<u8>, io::Error>>) -> bool {
+    sender.capacity() > 1
+}
+
 /// Emits the cut event before the body closes. Delivery gets its own short bound, never the already-expired total deadline,
-/// so a total cut can still be reported; a client that has gone away simply drops it.
+/// so a total cut can still be reported; a client that has gone away simply drops it. The relay never fills the last
+/// channel slot with data, so this send waits for the client, not for room.
 async fn cut(sender: &mpsc::Sender<Result<Vec<u8>, io::Error>>, sse: bool, reason: &str) {
     let _ = timeout(DSH_TIMEOUT, sender.send(Ok(cut_event(sse, reason)))).await;
 }
@@ -552,7 +564,7 @@ fn spawn_chat_relay(
     idle: Duration,
     sse: bool,
 ) -> mpsc::Receiver<Result<Vec<u8>, io::Error>> {
-    let (sender, receiver) = mpsc::channel(16);
+    let (sender, receiver) = mpsc::channel(RELAY_QUEUE);
     tokio::spawn(async move {
         let mut pending = initial;
         let mut decoder = chunked.then(ChunkedBody::new);
@@ -579,6 +591,12 @@ fn spawn_chat_relay(
                 }
                 if relayed.saturating_add(piece.len()) > CHAT_STREAM_MAX {
                     cut(&sender, sse, "cap").await;
+                    return;
+                }
+                if !data_fits(&sender) {
+                    // The queue is full. Cut now, while the reserved slot still exists, rather than letting the cut
+                    // time out behind a client that is not reading.
+                    cut(&sender, sse, "full").await;
                     return;
                 }
                 relayed = relayed.saturating_add(piece.len());
@@ -894,15 +912,67 @@ mod tests {
         );
     }
 
+    /// The SSE events of a body, as `(event, data)`. A leading blank line, which a cut writes to terminate a partial
+    /// event, is an empty block and is skipped.
+    fn sse_events(body: &str) -> Vec<(String, String)> {
+        let mut events = Vec::new();
+        for block in body.split("\n\n") {
+            let mut event = "message".to_string();
+            let mut data = Vec::new();
+            for line in block.lines() {
+                if let Some(value) = line.strip_prefix("event: ") {
+                    event = value.to_string();
+                } else if let Some(value) = line.strip_prefix("data: ") {
+                    data.push(value.to_string());
+                }
+            }
+            if !data.is_empty() {
+                events.push((event, data.join("\n")));
+            }
+        }
+        events
+    }
+
     #[test]
     fn cut_events_match_the_stream_media_type() {
         assert_eq!(
             cut_event(true, "idle"),
-            b"event: arca-cut\ndata: {\"reason\":\"idle\"}\n\n"
+            b"\n\nevent: arca-cut\ndata: {\"reason\":\"idle\"}\n\n"
         );
         assert_eq!(
             cut_event(false, "cap"),
-            b"{\"arcaCut\":{\"reason\":\"cap\"}}\n"
+            b"\n{\"arcaCut\":{\"reason\":\"cap\"}}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_relay_queue_keeps_room_for_the_cut() {
+        let (sender, mut receiver) = mpsc::channel(RELAY_QUEUE);
+        for index in 0..RELAY_CHANNEL {
+            sender
+                .send(Ok(format!("data: {index}\n\n").into_bytes()))
+                .await
+                .expect("the queue takes its data chunks");
+        }
+        assert_eq!(sender.capacity(), 1, "the cut slot is still empty");
+        assert!(
+            !data_fits(&sender),
+            "no further data may consume the cut slot"
+        );
+        cut(&sender, true, "full").await;
+        drop(sender);
+        let mut body = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            body.extend(chunk.expect("a relayed chunk"));
+        }
+        let text = String::from_utf8(body).expect("UTF-8");
+        let events = sse_events(&text);
+        assert_eq!(events.len(), RELAY_CHANNEL + 1);
+        let (event, data) = events.last().expect("the cut event");
+        assert_eq!(event, "arca-cut");
+        assert_eq!(
+            serde_json::from_str::<Value>(data).expect("cut JSON"),
+            json!({ "reason": "full" })
         );
     }
 

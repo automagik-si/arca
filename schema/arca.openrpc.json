@@ -973,80 +973,142 @@
           "properties": {
             "plans": {
               "items": {
-                "properties": {
-                  "createdAt": {
-                    "type": "integer"
-                  },
-                  "entry": {
-                    "type": "string"
-                  },
-                  "expiresAt": {
-                    "type": "integer"
-                  },
-                  "objects": {
-                    "items": {
-                      "properties": {
-                        "kind": {
-                          "enum": [
-                            "project",
-                            "instance",
-                            "network",
-                            "acl",
-                            "profile",
-                            "volume",
-                            "zone",
-                            "forward",
-                            "bucket"
-                          ],
-                          "type": "string"
-                        },
-                        "name": {
-                          "type": "string"
-                        },
-                        "project": {
-                          "type": "string"
-                        },
-                        "uuid": {
-                          "type": [
-                            "string",
-                            "null"
-                          ]
-                        }
+                "anyOf": [
+                  {
+                    "properties": {
+                      "createdAt": {
+                        "type": "integer"
                       },
-                      "required": [
-                        "kind",
-                        "project",
-                        "name",
-                        "uuid"
-                      ],
-                      "type": "object"
+                      "entry": {
+                        "type": "string"
+                      },
+                      "expiresAt": {
+                        "type": "integer"
+                      },
+                      "objects": {
+                        "items": {
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "project",
+                                "instance",
+                                "network",
+                                "acl",
+                                "profile",
+                                "volume",
+                                "zone",
+                                "forward",
+                                "bucket"
+                              ],
+                              "type": "string"
+                            },
+                            "name": {
+                              "type": "string"
+                            },
+                            "project": {
+                              "type": "string"
+                            },
+                            "uuid": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "project",
+                            "name",
+                            "uuid"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
+                      },
+                      "paramsDigest": {
+                        "maxLength": 64,
+                        "minLength": 64,
+                        "type": "string"
+                      },
+                      "plan": {
+                        "maxLength": 64,
+                        "minLength": 64,
+                        "type": "string"
+                      },
+                      "statement": {
+                        "type": "string"
+                      }
                     },
-                    "type": "array"
+                    "required": [
+                      "plan",
+                      "entry",
+                      "createdAt",
+                      "expiresAt",
+                      "objects",
+                      "paramsDigest",
+                      "statement"
+                    ],
+                    "type": "object"
                   },
-                  "paramsDigest": {
-                    "maxLength": 64,
-                    "minLength": 64,
-                    "type": "string"
-                  },
-                  "plan": {
-                    "maxLength": 64,
-                    "minLength": 64,
-                    "type": "string"
-                  },
-                  "statement": {
-                    "type": "string"
+                  {
+                    "properties": {
+                      "action": {
+                        "enum": [
+                          "service_create",
+                          "service_remove",
+                          "service_publish",
+                          "service_unpublish",
+                          "service_connect",
+                          "service_disconnect",
+                          "postgres_create",
+                          "postgres_delete"
+                        ],
+                        "type": "string"
+                      },
+                      "args": {
+                        "type": "object"
+                      },
+                      "argsDigest": {
+                        "maxLength": 64,
+                        "minLength": 64,
+                        "type": "string"
+                      },
+                      "createdAt": {
+                        "type": "integer"
+                      },
+                      "expiresAt": {
+                        "type": "integer"
+                      },
+                      "id": {
+                        "maxLength": 16,
+                        "minLength": 16,
+                        "pattern": "^act-[0-9a-f]{12}$",
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "action",
+                        "type": "string"
+                      },
+                      "statement": {
+                        "type": "string"
+                      },
+                      "summary": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "id",
+                      "action",
+                      "summary",
+                      "args",
+                      "argsDigest",
+                      "createdAt",
+                      "expiresAt"
+                    ],
+                    "type": "object"
                   }
-                },
-                "required": [
-                  "plan",
-                  "entry",
-                  "createdAt",
-                  "expiresAt",
-                  "objects",
-                  "paramsDigest",
-                  "statement"
-                ],
-                "type": "object"
+                ]
               },
               "type": "array"
             }
@@ -1057,7 +1119,102 @@
           "type": "object"
         }
       },
-      "summary": "The delete plans waiting for an owner's approval, each with the exact statement the owner signs.",
+      "summary": "The delete plans and action proposals waiting for an owner's approval. Delete plans carry the exact statement the owner signs; action proposals carry their action, arguments and kernel-built summary.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "action_propose",
+      "params": [
+        {
+          "name": "action",
+          "required": true,
+          "schema": {
+            "enum": [
+              "service_create",
+              "service_remove",
+              "service_publish",
+              "service_unpublish",
+              "service_connect",
+              "service_disconnect",
+              "postgres_create",
+              "postgres_delete"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "args",
+          "required": true,
+          "schema": {
+            "type": "object"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "action": {
+              "enum": [
+                "service_create",
+                "service_remove",
+                "service_publish",
+                "service_unpublish",
+                "service_connect",
+                "service_disconnect",
+                "postgres_create",
+                "postgres_delete"
+              ],
+              "type": "string"
+            },
+            "args": {
+              "type": "object"
+            },
+            "argsDigest": {
+              "maxLength": 64,
+              "minLength": 64,
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "integer"
+            },
+            "expiresAt": {
+              "type": "integer"
+            },
+            "id": {
+              "maxLength": 16,
+              "minLength": 16,
+              "pattern": "^act-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "action",
+              "type": "string"
+            },
+            "statement": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "action",
+            "summary",
+            "args",
+            "argsDigest",
+            "createdAt",
+            "expiresAt"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Records an inert service or database action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
@@ -1070,8 +1227,9 @@
           "name": "plan",
           "required": true,
           "schema": {
-            "maxLength": 64,
-            "minLength": 64,
+            "maxLength": 68,
+            "minLength": 16,
+            "pattern": "^(?:[0-9a-f]{64}|act-[0-9a-f]{12})$",
             "type": "string"
           }
         }
@@ -1081,8 +1239,9 @@
         "schema": {
           "properties": {
             "plan": {
-              "maxLength": 64,
-              "minLength": 64,
+              "maxLength": 68,
+              "minLength": 16,
+              "pattern": "^(?:[0-9a-f]{64}|act-[0-9a-f]{12})$",
               "type": "string"
             },
             "retained": {
