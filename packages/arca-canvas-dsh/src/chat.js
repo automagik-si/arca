@@ -170,10 +170,16 @@ export class ChatStore {
     return run;
   }
 
+  /** Mark the rest of the UTC day exhausted after a state read/write failure that could lose token counts. */
+  exhaust() {
+    this.exhaustedDay = dayOf(this.now());
+  }
+
   #roll(state) {
     const day = dayOf(this.now());
-    if (state.day === day) return state;
-    return { ...state, day, dailyTokens: 0, budgetExhausted: false };
+    const rolled = state.day === day ? state : { ...state, day, dailyTokens: 0, budgetExhausted: false };
+    // A quarantine or an uncounted usage write stays exhausted for the day, even if a later read succeeds.
+    return this.exhaustedDay === day ? { ...rolled, budgetExhausted: true } : rolled;
   }
 
   async #load() {
@@ -338,9 +344,21 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
 }
 
 const NOT_MEASURABLE = 'not measurable from here';
+const COULD_NOT_READ = 'could not be read just now';
+const NO_READING = 'no reading yet';
+const REMOTE_HOST_REASON = 'not available for a remote host';
 const KILOBYTE = 1_000;
 const MEGABYTE = 1_000_000;
 const GIGABYTE = 1_000_000_000;
+
+// The kernel explains a missing sample with one of two reasons (crates/arca-metrics/src/sample.rs): a remote
+// host can never give the reading, or a read failed. A local reading with no reason simply is not there yet.
+function readingStatus(reason) {
+  const value = typeof reason === 'string' ? reason.trim() : '';
+  if (!value) return NO_READING;
+  if (value === REMOTE_HOST_REASON) return NOT_MEASURABLE;
+  return COULD_NOT_READ;
+}
 
 const RESOLVED_REASONS = Object.freeze({
   cleared: 'the problem cleared',
@@ -369,8 +387,9 @@ export function formatGigabytes(bytes) {
 function formatRate(bytes) {
   const value = measured(bytes);
   if (value === null || value < 0) return '';
-  if (value >= GIGABYTE) return `${(value / GIGABYTE).toFixed(1)} GB/s`;
-  if (value >= MEGABYTE) return `${(value / MEGABYTE).toFixed(1)} MB/s`;
+  // Pick the unit from the rounded value: 999,960 B/s rounds to 1000.0 KB/s, so it is shown as 1.0 MB/s.
+  if (value / MEGABYTE >= 999.95) return `${(value / GIGABYTE).toFixed(1)} GB/s`;
+  if (value / KILOBYTE >= 999.95) return `${(value / MEGABYTE).toFixed(1)} MB/s`;
   return `${(value / KILOBYTE).toFixed(1)} KB/s`;
 }
 
@@ -384,24 +403,25 @@ function coreLabel(cores) {
 }
 
 function cpuLine(cpu) {
-  if (!cpu) return `CPU: ${NOT_MEASURABLE}.`;
+  if (!cpu) return `CPU: ${NO_READING}.`;
   const cores = measured(cpu.cores);
   // The same shared rule as the machine card and the fleet total: a reason only explains a missing load.
-  if (!cpuCoresKnown(cpu)) return `CPU: core count ${NOT_MEASURABLE}.`;
+  if (!cpuCoresKnown(cpu)) return `CPU: core count ${readingStatus(cpu.reason)}.`;
   const percent = formatPercent(cpu.usedPct);
   return percent
     ? `CPU: ${percent} used across ${coreLabel(cores)}.`
-    : `CPU: ${coreLabel(cores)}; load ${NOT_MEASURABLE}.`;
+    : `CPU: ${coreLabel(cores)}; load ${readingStatus(cpu.reason)}.`;
 }
 
 function memoryLine(memory) {
-  if (!memory || memory.reason) return `Memory: ${NOT_MEASURABLE}.`;
+  if (!memory) return `Memory: ${NO_READING}.`;
+  if (memory.reason) return `Memory: ${readingStatus(memory.reason)}.`;
   const total = measured(memory.totalBytes);
   const available = measured(memory.availableBytes);
   const reportedUsed = measured(memory.usedBytes);
   const used = reportedUsed ?? (total !== null && available !== null ? Math.max(0, total - available) : null);
   const totalText = formatGigabytes(total);
-  if (!totalText) return `Memory: ${NOT_MEASURABLE}.`;
+  if (!totalText) return `Memory: ${NO_READING}.`;
   const usedText = formatGigabytes(used);
   const availableText = formatGigabytes(available);
   if (usedText && availableText) return `Memory: ${usedText} used of ${totalText}, ${availableText} available.`;
@@ -411,14 +431,15 @@ function memoryLine(memory) {
 }
 
 function loadLine(load) {
-  if (!load || load.reason) return `Load: ${NOT_MEASURABLE}.`;
+  if (!load) return `Load: ${NO_READING}.`;
+  if (load.reason) return `Load: ${readingStatus(load.reason)}.`;
   const values = [
     ['one', '1 minute'], ['five', '5 minutes'], ['fifteen', '15 minutes'],
   ].flatMap(([key, label]) => {
     const number = measured(load[key]);
     return number === null ? [] : [`${number.toFixed(1)} (${label})`];
   });
-  return values.length ? `Load: ${values.join(', ')}.` : `Load: ${NOT_MEASURABLE}.`;
+  return values.length ? `Load: ${values.join(', ')}.` : `Load: ${NO_READING}.`;
 }
 
 function pressureLines(psi) {
@@ -446,7 +467,7 @@ function poolLines(pools) {
     if (used) parts.push(`${used} used`);
     if (total) parts.push(`${total} total`);
     if (free) parts.push(`${free} free`);
-    return `${name ? `Disk pool ${name}` : 'Disk pool'}: ${parts.length ? `${parts.join(', ')}.` : `${NOT_MEASURABLE}.`}`;
+    return `${name ? `Disk pool ${name}` : 'Disk pool'}: ${parts.length ? `${parts.join(', ')}.` : `${NO_READING}.`}`;
   });
 }
 
@@ -457,7 +478,7 @@ function networkLine(network) {
   const parts = [];
   if (received) parts.push(`${received} received`);
   if (sent) parts.push(`${sent} sent`);
-  return parts.length ? `Network: ${parts.join(', ')}.` : `Network: ${NOT_MEASURABLE}.`;
+  return parts.length ? `Network: ${parts.join(', ')}.` : `Network: ${NO_READING}.`;
 }
 
 function projectLine(projects) {
@@ -502,7 +523,7 @@ function formatNodeMetrics(value) {
     lines.push('Latest reading:');
     lines.push(...sampleLines(data.latest));
   } else {
-    lines.push(`Latest reading: ${NOT_MEASURABLE}.`);
+    lines.push(`Latest reading: ${NO_READING}.`);
   }
   if (data.mean) {
     const span = minutes !== null
@@ -823,11 +844,16 @@ export function createDoctorChat(options = {}) {
         } catch (error) {
           // A stale attempt must not change the live session or start a replacement.
           if (attempt !== ensureGeneration) throw error;
-          // A session another writer owns is not a missing session: creating a fresh id would fork the Doctor.
-          if (alreadyOwned(error)) throw new Error('The Doctor session is already in use.');
-          // A current attempt may recover a corrupt or missing stored session by creating a fresh one.
+          if (alreadyOwned(error)) {
+            // No overlapping attempt is left to wait for: the previous holder may be a discarded agent whose
+            // dispose never finished. Do not leave the Doctor down; log the conflict and recover with a fresh
+            // session, as before this batch.
+            log(`Arca canvas chat: stored session is still owned (${safeErrorCode(error)}); starting a new one`);
+          } else {
+            // A current attempt may recover a corrupt or missing stored session by creating a fresh one.
+            log(`Arca canvas chat: stored session could not resume (${safeErrorCode(error)}); starting a new one`);
+          }
           candidateId = uuid();
-          log(`Arca canvas chat: stored session could not resume (${safeErrorCode(error)}); starting a new one`);
         }
       }
       if (!candidateHandle) {
@@ -897,10 +923,11 @@ export function createDoctorChat(options = {}) {
 
   function onToolCall({ name, host, input, callId }) {
     if (!turn) throw new Error('No active Doctor turn.');
-    if (turn.cancelled) throw new Error('The Doctor turn was stopped.');
     // A cap can land between two steps of the same model response (usage arrives after the text). Any tool
-    // call that follows it must not dispatch, or the cap overshoots by one response.
+    // call that follows it must not dispatch, or the cap overshoots by one response. This reason is checked
+    // before the coarse cancellation state so the refusal names the cap that caused it.
     if (turn.reason) throw new TurnCap(turn.reason);
+    if (turn.cancelled) throw new Error('The Doctor turn was stopped.');
     if (turn.toolCalls >= limits.toolCallsPerTurn) {
       cap('tool-calls');
       throw new TurnCap('tool-calls');
@@ -920,6 +947,13 @@ export function createDoctorChat(options = {}) {
     return finite(usage.inputTokens) + finite(usage.outputTokens);
   }
 
+  function noteStoreFailure(kind, error) {
+    // The tokens were counted in memory but could not reach the state file. Keep the rest of the day safe
+    // rather than silently handing out a fresh budget if the file becomes readable again.
+    chatStore.exhaust();
+    log(`Arca canvas chat: ${kind} not written (${safeErrorCode(error)}); daily budget exhausted for the day`);
+  }
+
   // Usage rides the durable `assistant/message` event (normal and interrupted); see dsh-agent-loop/lib/index.js:891-903
   // and :949-953. It is counted synchronously, before persistence, so a cap on the final event still stops the turn.
   function noteUsage(usage) {
@@ -931,7 +965,7 @@ export function createDoctorChat(options = {}) {
     turn.persist = turn.persist.then(() => chatStore.patch((state) => ({
       ...state,
       dailyTokens: state.dailyTokens + total,
-    }))).catch((error) => log(`Arca canvas chat: usage counter not written (${safeErrorCode(error)})`));
+    }))).catch((error) => noteStoreFailure('usage counter', error));
     if (!sse.closed) {
       sse.send('usage', {
         turnToolCalls: turn.toolCalls,
@@ -1127,7 +1161,7 @@ export function createDoctorChat(options = {}) {
             ...(summary ? { summary: bound(summary, 240) } : {}),
           })),
         }].slice(-DEFAULTS.historyMessages),
-      })).catch((error) => log(`Arca canvas chat: transcript not written (${safeErrorCode(error)})`));
+      })).catch((error) => noteStoreFailure('transcript', error));
     }
     // A new turn may not start until the previous run is actually idle. If the loop cannot prove that quickly,
     // drop the agent; the next request resumes the persisted session instead of overlapping this run.
