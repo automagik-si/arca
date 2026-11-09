@@ -13,23 +13,44 @@ const PROPOSE_ACTIONS = new Set([
 const APPROVAL_TIMEOUT_MS = 30_000;
 const NO_SUCH_PLAN = 'This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.';
 const MISSING_PROPOSAL = 'The proposal is not waiting any more.';
-// These refusals mean the kernel did not accept the owner's approval itself. Any other refusal on an
-// approve POST means the approval was accepted and the action's own handler refused to run it.
-const APPROVAL_REFUSALS = new Set([
-  'Expired', 'Replayed', 'NoSuchPlan', 'Untrusted', 'BadSignature',
-  'NoUserPresence', 'NoUserVerification', 'WrongOrigin', 'WrongRp', 'WrongHost',
+// An approval refusal names the approval itself, so it gets a plain sentence. A handler refusal after
+// the passkey was spent names the action, not the approval; an empty or unreadable body is neither.
+const NEUTRAL_REFUSAL = 'Arca did not accept this approval. Try again from the card.';
+const UNCLEAR_APPROVAL = 'Arca could not finish this. Check Steps to see whether it ran.';
+// Every refusal code `refusal_code` can return from the approval endpoint (crates/arca/src/handlers.rs),
+// plus NoSuchPlan, which no_such_plan() returns once the entry is gone.
+export const APPROVAL_REFUSAL_CODES = Object.freeze([
+  'Malformed', 'NotCanonical', 'NoVerifier', 'BadSignature', 'NotHardwareKey',
+  'NoUserPresence', 'NoUserVerification', 'WrongOrigin', 'WrongRp', 'SignCountRegressed',
+  'WrongNamespace', 'WrongHost', 'WrongAction', 'WrongTarget', 'WrongParams', 'IssuedAhead',
+  'Expired', 'TtlTooLong', 'Replayed', 'Untrusted', 'Storage', 'Unresolved', 'NoSuchPlan',
 ]);
+const APPROVAL_REFUSALS = new Set(APPROVAL_REFUSAL_CODES);
+const FINISHED_STATES = new Set(['done', 'declined', 'failed', 'expired']);
 const REFUSALS = Object.freeze({
-  Expired: 'This proposal ran out of time. Nothing changed.',
+  Malformed: 'Arca could not read this approval. Try again from the card.',
+  NotCanonical: 'Arca could not read this approval as signed. Try again from the card.',
+  NoVerifier: 'Arca has no trusted passkey verifier for this approval.',
+  BadSignature: "Arca could not check the passkey's answer. Try again from the card.",
+  NotHardwareKey: 'Arca needs a hardware-backed passkey for this approval.',
+  NoUserPresence: 'The passkey did not confirm that you were present. Try again from the card.',
+  NoUserVerification: 'The passkey did not confirm that it was you. Try again from the card.',
+  WrongOrigin: 'This approval came from a page address Arca does not allow.',
+  WrongRp: 'This approval came from the wrong passkey relying party.',
+  SignCountRegressed: "The passkey's signature counter went backwards, so Arca refused this approval.",
+  WrongNamespace: 'This approval was signed for a different Arca operation.',
+  WrongHost: 'This approval was made for a different Arca host.',
+  WrongAction: 'This approval does not match the proposed action.',
+  WrongTarget: 'This approval does not match the proposed target.',
+  WrongParams: 'This approval does not match the proposed arguments.',
+  IssuedAhead: "This approval is dated in the future. Check this machine's clock and try again.",
+  Expired: 'This proposal has expired. Nothing changed.',
+  TtlTooLong: 'This approval was valid for longer than Arca allows.',
   Replayed: 'This approval was already used. Reload the page to see what is still waiting.',
-  NoSuchPlan: NO_SUCH_PLAN,
   Untrusted: 'Arca does not trust this passkey. Use the passkey you set up for Arca.',
-  BadSignature: "Arca could not check the passkey's answer. Try again.",
-  NoUserPresence: 'Your device did not confirm it was you. Try again.',
-  NoUserVerification: 'Your device did not confirm it was you. Try again.',
-  WrongOrigin: "This page's address does not match Arca's settings.",
-  WrongRp: "This page's address does not match Arca's settings.",
-  WrongHost: 'This approval was made for a different Arca.',
+  Storage: 'Arca could not record this approval. Try again from the card.',
+  Unresolved: 'Arca could not match this approval to a waiting proposal.',
+  NoSuchPlan: NO_SUCH_PLAN,
 });
 const text = (value, fallback = '') => value == null ? fallback : String(value);
 const list = (value) => Array.isArray(value) ? value : [];
@@ -60,23 +81,33 @@ function expiryText(expiresAt, now = Date.now()) {
   return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-function plainRefusal(refusal, status) {
-  if (typeof refusal === 'string' && REFUSALS[refusal]) return REFUSALS[refusal];
-  if (status === 401 || status === 403) return 'Arca did not accept this approval.';
-  if (status === 404) return 'This proposal is no longer waiting in Arca.';
-  if (status === 429) return 'Arca is busy. Try again shortly.';
-  return 'Arca could not complete this just now. Try again in a moment.';
+// A refusal code the kernel named as an approval refusal gets its plain sentence. This is also the
+// decline path, where any unrecognized refusal stays neutral.
+export function approvalRefusalText(refusal) {
+  if (typeof refusal === 'string' && APPROVAL_REFUSALS.has(refusal)) return REFUSALS[refusal];
+  return NEUTRAL_REFUSAL;
 }
 
-// The kernel accepted the approval and ran (or tried to run) the action. Its own message is the plain
-// reason the action refused; do not replace it with an approval-refusal sentence.
+// After the approve POST spends the passkey, the action runs and its own handler may refuse with a
+// snake_case code and a message. That refusal is not a refusal of the approval.
 function plainActionError(body) {
   const message = typeof body?.message === 'string' ? body.message.trim() : '';
-  if (!message) return 'The change was approved, but Arca could not run it just now. Try again.';
+  if (!message) return 'The change was approved, but Arca could not run it.';
   const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
   return /[.!?]$/.test(sentence)
     ? `The change was approved, but Arca could not run it: ${sentence}`
     : `The change was approved, but Arca could not run it: ${sentence}.`;
+}
+
+// An approval refusal keeps its neutral sentence. Any other non-empty refusal, or a message, is the
+// action's own refusal after the approval was spent. Only an empty or unreadable body stays unknown.
+export function approvalErrorText(body) {
+  const refusal = body?.refusal;
+  if (typeof refusal === 'string' && refusal) {
+    return APPROVAL_REFUSALS.has(refusal) ? REFUSALS[refusal] : plainActionError(body);
+  }
+  if (typeof body?.message === 'string' && body.message.trim()) return plainActionError(body);
+  return UNCLEAR_APPROVAL;
 }
 
 function plainError(error) {
@@ -900,11 +931,19 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       // A tool may name an id whose kernel row is not here yet. Do not create a card from the tool alone:
       // wait until /approve/plans actually carries that id.
       if (!approvals.plans.has(key)) return null;
-      card = { plan: null, state: 'waiting', reason: '', note: '', result: '', busy: '' };
+      card = { plan: null, state: 'waiting', reason: '', note: '', result: '', busy: '', settledAt: 0 };
       approvals.cards.set(key, card);
     }
     if (!card.plan && approvals.plans.has(key)) card.plan = approvals.plans.get(key);
     return card;
+  }
+
+  // A finished card keeps the moment it finished on the monotonic clock. A poll that started before
+  // that moment may still be carrying a plan row from before the click, so it may not put the card
+  // back to waiting. Wall-clock Date.now() is not used here because it can move backwards.
+  function setCardState(card, state, now = performance.now()) {
+    card.state = state;
+    card.settledAt = FINISHED_STATES.has(state) ? now : 0;
   }
 
   // A details row is only drawn as the kernel sent it. A malformed row fails the whole proposal closed: the
@@ -972,6 +1011,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     }
     approvals.fetching = true;
     approvalInflight = (async () => {
+      // The settle guard uses the monotonic clock; fetchStartedAt stays on the wall clock because the
+      // announced-missing note compares it with Date.now() times.
+      const startedAt = performance.now();
       approvals.fetchStartedAt = Date.now();
       try {
         const next = await readApprovalPlans();
@@ -980,12 +1022,14 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
           const card = approvals.cards.get(id);
           if (!card) continue;
           card.plan = plan;
-          if (!['done', 'declined', 'failed', 'expired'].includes(card.state)) continue;
+          if (!FINISHED_STATES.has(card.state)) continue;
+          // A poll that started before the card finished is stale even if its body still lists the plan.
+          if (startedAt <= card.settledAt) continue;
           // The kernel is authoritative: an entry that is listed again (a re-proposal with the same id,
           // or a failure while the proposal still waits) is waiting again.
           if (card.state === 'expired' && plan.expiresAt <= now) continue;
           const failedReason = card.state === 'failed' ? (card.reason || card.note) : '';
-          card.state = 'waiting';
+          setCardState(card, 'waiting');
           card.result = '';
           card.reason = '';
           card.busy = '';
@@ -999,9 +1043,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         }
         for (const [id, card] of approvals.cards) {
           if (next.plans.has(id) || card.state !== 'waiting') continue;
-          if (card.plan && now >= card.plan.expiresAt) card.state = 'expired';
+          if (card.plan && now >= card.plan.expiresAt) setCardState(card, 'expired');
           else {
-            card.state = 'failed';
+            setCardState(card, 'failed');
             card.reason = NO_SUCH_PLAN;
             card.retry = false;
           }
@@ -1033,7 +1077,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     let changed = false;
     for (const card of approvals.cards.values()) {
       if (card.state === 'waiting' && card.plan && now >= card.plan.expiresAt) {
-        card.state = 'expired';
+        setCardState(card, 'expired');
         card.busy = '';
         changed = true;
       }
@@ -1202,17 +1246,17 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     const plan = card?.plan;
     if (!card || card.state !== 'waiting' || !plan) return;
     if (!plan.statement) {
-      card.state = 'failed';
+      setCardState(card, 'failed');
       card.reason = 'Arca did not send the approval statement. Reload the page.';
       updatePanel();
       return;
     }
     if (Date.now() >= plan.expiresAt) {
-      card.state = 'expired';
+      setCardState(card, 'expired');
       updatePanel();
       return;
     }
-    card.state = 'approving';
+    setCardState(card, 'approving');
     card.busy = '';
     card.reason = '';
     card.note = '';
@@ -1234,34 +1278,32 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         const refusal = body?.refusal;
         card.retry = false;
         if (refusal === 'NoSuchPlan') {
-          card.state = 'failed';
+          setCardState(card, 'failed');
           card.reason = NO_SUCH_PLAN;
         } else if (refusal === 'Expired') {
-          card.state = 'expired';
-        } else if (APPROVAL_REFUSALS.has(refusal)) {
-          card.state = 'failed';
-          card.reason = plainRefusal(refusal, response.status);
+          setCardState(card, 'expired');
         } else {
-          // The approval was accepted; the action's own handler refused to run it.
-          card.state = 'failed';
-          card.reason = plainActionError(body);
+          // A known refusal gets its sentence. An unknown code or an unreadable body stays neutral:
+          // only a body without any refusal is the action's own error after a spent approval.
+          setCardState(card, 'failed');
+          card.reason = approvalErrorText(body);
         }
         return;
       }
-      card.state = 'done';
+      setCardState(card, 'done');
       card.result = plainResult(plan.action, body?.result);
       approvals.plans.delete(id);
     } catch (error) {
       if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
-        card.state = 'waiting';
+        setCardState(card, 'waiting');
         card.note = 'No answer from Arca, try again.';
         card.retry = true;
       } else if (error?.name === 'NotAllowedError') {
-        card.state = 'waiting';
+        setCardState(card, 'waiting');
         card.note = 'Passkey cancelled.';
         card.retry = false;
       } else {
-        card.state = 'failed';
+        setCardState(card, 'failed');
         card.reason = plainError(error);
         card.retry = false;
       }
@@ -1290,20 +1332,21 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         card.busy = '';
         card.retry = false;
         if (body?.refusal === 'NoSuchPlan') {
-          card.state = 'failed';
+          setCardState(card, 'failed');
           card.reason = NO_SUCH_PLAN;
         } else if (body?.refusal === 'Expired') {
-          card.state = 'expired';
+          setCardState(card, 'expired');
         } else {
-          card.state = 'failed';
-          card.reason = plainRefusal(body?.refusal, response.status);
+          setCardState(card, 'failed');
+          // A decline is never an approved change, so a refusal-less body stays neutral here too.
+          card.reason = approvalRefusalText(body?.refusal);
         }
         return;
       }
-      card.state = 'declined';
+      setCardState(card, 'declined');
       approvals.plans.delete(id);
     } catch (error) {
-      card.state = 'failed';
+      setCardState(card, 'failed');
       card.reason = plainError(error);
     } finally {
       card.busy = '';
@@ -1329,7 +1372,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   function approvalSignature() {
     return JSON.stringify({
-      plans: [...approvals.plans.values()].map((plan) => [plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.details]),
+      plans: [...approvals.plans.values()].map((plan) => [
+        plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.host, plan.details,
+      ]),
       deletes: approvals.deletes.map((plan) => plan.id),
       cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),
       passkeysTrusted: approvals.passkeysTrusted,

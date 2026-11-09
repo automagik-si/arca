@@ -325,7 +325,8 @@ the owner signing that statement.
 An approval card shows, from the kernel's `/approve/plans` row matched by id:
 
 - the **host from the signed statement**, so two hosts with the same action and
-  arguments (the id hashes only those) are never confused;
+  arguments (the id hashes only those) are never confused; the card signature
+  includes it, so a changed host re-renders the card;
 - the kernel-built `summary`, as text;
 - every `details` row (`label` and `value`) in kernel order, as text;
 - the action, the target id and the first 12 hex characters of `argsDigest`;
@@ -364,10 +365,17 @@ still listed becomes `waiting` again with a Retry button; a new waiting entry
 with the same id after a decline is waiting again. An approve POST that gets no
 answer after 30 seconds returns to `waiting` with "No answer from Arca, try
 again." A `NoSuchPlan` answer says the proposal may have been approved or
-declined elsewhere and points at Steps, never "Nothing changed". An approval the
-kernel accepted but whose action handler refused shows the action's own plain
-error. While a card is open, the page refreshes `/approve/plans` with the
-snapshot poll; an expired card disables its buttons and says nothing changed.
+declined elsewhere and points at Steps, never "Nothing changed". Every kernel
+approval refusal code has its own plain sentence. A refusal after the passkey
+was spent is the action handler's own snake_case refusal: the card says the
+change was approved but Arca could not run it, with the handler's message, and
+keeps no Retry. An empty or unreadable 400/500 says only that Arca could not
+finish it and points at Steps, without claiming either outcome or suggesting a
+retry. Each finished card records when it settled: a poll that started before
+that moment cannot put it back to waiting, while a later poll that lists the id
+again (a re-proposal) can. While a card is open, the page refreshes
+`/approve/plans` with the snapshot poll; an expired card disables its buttons and
+says nothing changed.
 
 ## Doctor chat contract
 

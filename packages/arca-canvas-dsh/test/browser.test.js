@@ -24,6 +24,10 @@ const RETRY_ID = 'act-666666666666';
 const GONE_ID = 'act-777777777777';
 const HANG_ID = 'act-888888888888';
 const UNKNOWN_ID = 'act-999999999999';
+const REFUSAL_ID = 'act-bbbbbbbbbbbb';
+const EMPTY_REFUSAL_ID = 'act-eeeeeeeeeeee';
+const HOST_ID = 'act-cccccccccccc';
+const STALE_ID = 'act-dddddddddddd';
 const DELETE_ID = 'd'.repeat(64);
 
 function digestFor(id) {
@@ -91,6 +95,26 @@ function approvalFixture() {
       id: HANG_ID, action: 'service_create', summary: 'Create the service hang',
       args: { name: 'hang', template: 'nats' },
       details: [{ label: 'Name', value: 'hang' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: REFUSAL_ID, action: 'service_create', summary: 'Create the service refusal',
+      args: { name: 'refusal', template: 'nats' },
+      details: [{ label: 'Name', value: 'refusal' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: EMPTY_REFUSAL_ID, action: 'service_create', summary: 'Create the service empty',
+      args: { name: 'empty', template: 'nats' },
+      details: [{ label: 'Name', value: 'empty' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: HOST_ID, action: 'service_create', summary: 'Create the service host',
+      args: { name: 'host', template: 'nats' },
+      details: [{ label: 'Name', value: 'host' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: STALE_ID, action: 'service_create', summary: 'Create the service stale',
+      args: { name: 'stale', template: 'nats' },
+      details: [{ label: 'Name', value: 'stale' }, { label: 'Template', value: 'nats' }],
     }),
     actionPlan({
       id: DISALLOWED_ID, action: 'postgres_delete', summary: 'Delete the database legacy',
@@ -265,6 +289,15 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
   const approvalRequests = [];
   const declines = [];
   let retryAttempts = 0;
+  let holdNextPlans = null;
+  const holdPlans = () => {
+    let capturedResolve;
+    const captured = new Promise((resolve) => { capturedResolve = resolve; });
+    let releaseResolve;
+    const released = new Promise((resolve) => { releaseResolve = resolve; });
+    holdNextPlans = { capturedResolve, released };
+    return { captured, release: () => releaseResolve() };
+  };
   const server = createServer(async (req, res) => {
     const path = new URL(req.url, 'http://local').pathname;
     requests.push({ method: req.method, path });
@@ -294,8 +327,38 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       return;
     }
     if (path === '/approve/plans') {
+      // Snapshot the row list before a held response waits: a poll that started before a click may
+      // still carry the plan after the card has finished.
+      const payload = JSON.stringify({ plans: approvalPlans, passkeysTrusted: 1 });
+      const hold = holdNextPlans;
+      if (hold) {
+        holdNextPlans = null;
+        hold.capturedResolve();
+        await hold.released;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-      res.end(JSON.stringify({ plans: approvalPlans, passkeysTrusted: 1 }));
+      res.end(payload);
+      return;
+    }
+    if (path === '/test/repropose-stale') {
+      if (!approvalPlans.some((row) => row.id === STALE_ID)) {
+        approvalPlans = [...approvalPlans, actionPlan({
+          id: STALE_ID, action: 'service_create', summary: 'Create the service stale',
+          args: { name: 'stale', template: 'nats' },
+          details: [{ label: 'Name', value: 'stale' }, { label: 'Template', value: 'nats' }],
+        })];
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+    if (path === '/test/host') {
+      const plan = approvalPlans.find((row) => row.id === HOST_ID);
+      const statement = JSON.parse(plan.statement);
+      statement.host = 'beta.example';
+      plan.statement = JSON.stringify(statement);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
       return;
     }
     if (path === '/test/expire') {
@@ -333,7 +396,18 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       if (payload.plan === FAILED_ID) {
         approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ refusal: 'service_not_found', message: 'The service nats: not found' }));
+        res.end(JSON.stringify({ refusal: 'not_found', message: 'The service nats: not found' }));
+        return;
+      }
+      if (payload.plan === REFUSAL_ID || payload.plan === EMPTY_REFUSAL_ID) {
+        approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
+        if (payload.plan === REFUSAL_ID) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ refusal: 'stopped', message: 'The service refusal was stopped' }));
+        } else {
+          // An empty 500 after the passkey was spent: the outcome is unreadable.
+          res.writeHead(500).end();
+        }
         return;
       }
       if (payload.plan === GONE_ID) {
@@ -521,7 +595,7 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     assert.equal(await page.locator('.arca-step').count(), 4);
     assert.match(await page.locator('.arca-step').first().innerText(), /rotate-token[\s\S]*beta[\s\S]*Applied/);
     await page.waitForFunction((id) => Boolean(document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)), CHAT_ID);
-    assert.equal(await page.locator('.arca-steps-view .arca-proposal').count(), 8, 'the seven-action contract, less the removed delete action');
+    assert.equal(await page.locator('.arca-steps-view .arca-proposal').count(), 12, 'the listed action plans, less the removed delete and the mismatched statement');
     assert.equal(await page.locator(`.arca-steps-view .arca-proposal[data-proposal="${DISALLOWED_ID}"]`).count(), 0, 'a database delete proposal is not rendered');
     assert.equal(await page.locator(`.arca-steps-view .arca-proposal[data-proposal="${MISMATCH_ID}"]`).count(), 0, 'a statement that does not match its entry is dropped');
     const approval = page.locator('.arca-steps-view .arca-approval-delete a');
@@ -685,6 +759,16 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     assert.match(await unknown.locator('.arca-approval-missing').innerText(), /The proposal is not waiting any more\./);
   });
 
+  await t.test('a plan whose host changes re-renders the card', async () => {
+    await goSteps();
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${HOST_ID}"]`);
+    await card.waitFor();
+    assert.equal(await card.locator('.arca-approval-fact[data-detail="host"] dd').innerText(), 'alpha.example');
+    await fetch(`${origin}/test/host`);
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)
+      ?.querySelector('.arca-approval-fact[data-detail="host"] dd')?.textContent === 'beta.example', HOST_ID, { timeout: 10000 });
+  });
+
   await t.test('a proposal expires with no buttons', async () => {
     await goSteps();
     const expiring = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${EXPIRING_ID}"]`);
@@ -700,7 +784,7 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     await failed.locator('.arca-approve').click();
     await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', FAILED_ID);
     const text = await failed.innerText();
-    assert.match(text, /The service nats: not found/);
+    assert.match(text, /The change was approved, but Arca could not run it: The service nats: not found\./);
     assert.doesNotMatch(text, /did not accept this approval|Nothing changed/);
   });
 
@@ -716,6 +800,24 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     assert.match(await card.locator('.arca-approval-status').innerText(), /The service retry was created and is running/);
   });
 
+  await t.test('a handler refusal after the passkey is spent shows approved but could not run', async () => {
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${REFUSAL_ID}"]`);
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', REFUSAL_ID);
+    const text = await card.innerText();
+    assert.match(text, /The change was approved, but Arca could not run it: The service refusal was stopped\./);
+    assert.doesNotMatch(text, /did not accept this approval|Try again/);
+    assert.equal(await card.locator('.arca-approve').count(), 0, 'a spent approval has no retry');
+
+    const empty = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${EMPTY_REFUSAL_ID}"]`);
+    await empty.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', EMPTY_REFUSAL_ID);
+    const emptyText = await empty.innerText();
+    assert.match(emptyText, /Arca could not finish this\. Check Steps to see whether it ran\./);
+    assert.doesNotMatch(emptyText, /Try again|The change was approved|did not accept this approval/);
+    assert.equal(await empty.locator('.arca-approve').count(), 0, 'an unreadable outcome offers no retry');
+  });
+
   await t.test('NoSuchPlan says it may have been handled elsewhere, never Nothing changed', async () => {
     const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${GONE_ID}"]`);
     await card.locator('.arca-approve').click();
@@ -723,6 +825,27 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     const text = await card.innerText();
     assert.match(text, /This proposal is no longer waiting\. It may have been approved or declined elsewhere\. Check Steps\./);
     assert.doesNotMatch(text, /Nothing changed/);
+  });
+
+  await t.test('a poll that started before the click never reverts a done card to waiting', async () => {
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${STALE_ID}"]`);
+    await card.waitFor();
+    assert.equal(await card.getAttribute('data-state'), 'waiting');
+    // Hold a /approve/plans answer that still carries this plan, then finish the card.
+    const held = holdPlans();
+    await held.captured;
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'done', STALE_ID);
+    held.release();
+    await page.waitForTimeout(300);
+    assert.equal(await card.getAttribute('data-state'), 'done', 'the stale poll may not put the card back to waiting');
+    assert.match(await card.locator('.arca-approval-status').innerText(), /The service stale was created and is running/);
+
+    // A poll that starts after the card settled and finds the id listed again is a re-proposal.
+    await fetch(`${origin}/test/repropose-stale`);
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'waiting', STALE_ID, { timeout: 10000 });
+    assert.equal(await card.locator('.arca-approval-status').count(), 0);
+    assert.equal(await card.locator('.arca-approve').innerText(), 'Approve');
   });
 
   await t.test('a hanging approval returns to waiting after the timeout', async () => {
