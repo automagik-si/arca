@@ -165,18 +165,42 @@ fn choice(reason: &str, local: bool, provisional: bool) -> HostModeChoice {
     }
 }
 
-/// The `environment.server_name` of a server document, when it is a name that identifies a daemon. Empty, `localhost` and
-/// `localhost.localdomain` name no machine, so they leave the choice to the socket-path fallback.
+/// Host names a stock image or a distribution's installer sets by default. Two machines can carry the same one, so a match
+/// on one identifies no machine; it leaves the choice to the socket-path fallback, as an empty or loopback name does.
+const DEFAULT_HOST_NAMES: &[&str] = &[
+    "localhost",
+    "localhost.localdomain",
+    "localhost4",
+    "localhost6",
+    "ip6-localhost",
+    "ip6-loopback",
+    "ubuntu",
+    "debian",
+    "fedora",
+    "centos",
+    "rhel",
+    "almalinux",
+    "rockylinux",
+    "alpine",
+    "archlinux",
+    "opensuse",
+    "sles",
+    "linux",
+];
+
+/// The `environment.server_name` of a server document, when it is a name that identifies a daemon. An empty name, a
+/// loopback name or a shared image default names no machine, so it leaves the choice to the socket-path fallback.
 fn server_name(document: &Value) -> Option<String> {
     usable_name(document.pointer("/environment/server_name")?.as_str()?)
 }
 
-/// A host name that can identify a machine, without case. Empty, `localhost` and `localhost.localdomain` are unknown.
+/// A host name that can identify a machine, without case. Empty, loopback and shared image default names are unknown.
 fn usable_name(name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty()
-        && !name.eq_ignore_ascii_case("localhost")
-        && !name.eq_ignore_ascii_case("localhost.localdomain"))
+        && !DEFAULT_HOST_NAMES
+            .iter()
+            .any(|default| name.eq_ignore_ascii_case(default)))
     .then(|| name.to_string())
 }
 
@@ -414,5 +438,58 @@ mod tests {
             );
             assert!(choice.provisional, "{name:?}");
         }
+    }
+
+    #[test]
+    fn shared_default_host_names_are_unknown_and_leave_the_path_fallback() {
+        // A server name that is an image default says nothing about which machine it is, even when it differs from the
+        // local host name.
+        for name in [
+            "ubuntu",
+            "Ubuntu",
+            "debian",
+            "fedora",
+            "centos",
+            "archlinux",
+        ] {
+            let scratch = Scratch::new("default-server");
+            scratch.hostname("node1");
+            let incus = Server::naming(name);
+            let choice = choose_host_mode(&incus, None, false, scratch.path());
+            assert_eq!(choice.mode, HostMode::Remote, "{name:?}");
+            assert_eq!(
+                choice.reason,
+                "the Incus server did not name itself; the socket path is not a standard local Incus socket",
+                "{name:?}"
+            );
+            assert!(choice.provisional, "{name:?}");
+        }
+
+        // The same holds for the local host name: a stock default is not this machine's own name.
+        for name in ["ubuntu", "debian", "linux", "ip6-localhost"] {
+            let scratch = Scratch::new("default-host");
+            scratch.hostname(name);
+            let incus = Server::naming("node1");
+            let choice = choose_host_mode(&incus, None, true, scratch.path());
+            assert_eq!(choice.mode, HostMode::Local, "{name:?}");
+            assert_eq!(
+                choice.reason,
+                "the local host name could not be read; the socket path is a standard local Incus socket",
+                "{name:?}"
+            );
+            assert!(choice.provisional, "{name:?}");
+        }
+
+        // Two machines from the same image both carry "ubuntu": a match on it must not read as this machine.
+        let scratch = Scratch::new("both-default");
+        scratch.hostname("ubuntu");
+        let incus = Server::naming("ubuntu");
+        let choice = choose_host_mode(&incus, None, false, scratch.path());
+        assert_eq!(choice.mode, HostMode::Remote);
+        assert_eq!(
+            choice.reason,
+            "the Incus server did not name itself; the socket path is not a standard local Incus socket"
+        );
+        assert!(choice.provisional);
     }
 }

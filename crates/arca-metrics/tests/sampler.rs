@@ -2584,4 +2584,80 @@ mod host_totals {
             .count();
         assert_eq!(probes_before, probes_after, "no further mode probe");
     }
+
+    /// An Incus whose `/1.0` is unreadable until `up` is set, then names `hostname`; its resources read always answers
+    /// `totals`.
+    #[derive(Clone)]
+    struct LateTotals {
+        up: Arc<AtomicBool>,
+        hostname: String,
+        totals: Value,
+    }
+
+    impl IncusRead for LateTotals {
+        fn get(&self, path: &str) -> Result<Value, IncusError> {
+            match path {
+                "/1.0" => {
+                    if self.up.load(Ordering::SeqCst) {
+                        Ok(json!({ "environment": { "server_name": self.hostname } }))
+                    } else {
+                        Err(IncusError::Timeout)
+                    }
+                }
+                RESOURCES => Ok(self.totals.clone()),
+                _ => Err(IncusError::Status {
+                    code: 404,
+                    message: "not found".to_string(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn a_mode_switch_clears_the_ring_so_the_mean_covers_only_the_new_mode() {
+        let scratch = Scratch::new("switch-clears-ring");
+        write_first_tree(scratch.path());
+        write(scratch.path(), "proc/sys/kernel/hostname", "node1\n");
+        let up = Arc::new(AtomicBool::new(false));
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            LateTotals {
+                up: Arc::clone(&up),
+                hostname: "node1".to_string(),
+                totals: resources(16, 32_000_000_000, 8_000_000_000),
+            },
+        );
+
+        // The first sample is the provisional remote reading: 16 threads and 32 GB from Incus.
+        let remote = sampler.sample(1_000).clone();
+        assert_eq!(remote.cpu.cores, 16);
+        assert_eq!(remote.memory.total_bytes, Some(32_000_000_000));
+        let before = mean(&sampler.history(1)).expect("the remote sample has a mean");
+        assert_eq!(before.memory.total_bytes, Some(32_000_000_000));
+
+        // The retry then names this host: the mode switches local, and only the post-switch sample is in the window.
+        up.store(true, Ordering::SeqCst);
+        sampler.sample(6_000);
+        assert!(!sampler.mode_provisional(), "the retry settled the mode");
+        let window = sampler.history(1);
+        assert_eq!(window.len(), 1, "the remote samples were cleared");
+        assert_eq!(window[0].at, 6_000);
+
+        // The mean is the local machine's alone: 4 threads and 16.384 GB, never an average with the remote 32 GB.
+        let averaged = mean(&window).expect("the post-switch sample has a mean");
+        assert_eq!(averaged.cpu.cores, 4);
+        assert_eq!(averaged.memory.total_bytes, Some(16_384_000_000));
+        assert_eq!(averaged.load.one, Some(0.52));
+    }
 }

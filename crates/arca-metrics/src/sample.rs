@@ -391,7 +391,8 @@ impl<R: IncusRead> Sampler<R> {
 
     /// Retries a provisional mode's `/1.0` name check, under [`MODE_PROBE_TIMEOUT`]. Once the server names itself and the
     /// name comparison succeeds, the answer is kept and no later sample probes again. A mode from `incus.local` or from a
-    /// real name comparison is never provisional, so this does nothing for it.
+    /// real name comparison is never provisional, so this does nothing for it. A switch between the local and remote modes
+    /// clears the ring and the rate counters, so a mean never mixes the two sources and no rate spans them.
     fn retry_mode(&mut self) {
         let Some(retry) = self.mode_retry.clone() else {
             return;
@@ -406,8 +407,13 @@ impl<R: IncusRead> Sampler<R> {
         if choice.provisional {
             return;
         }
+        let was_local = self.cfg.incus_local;
         self.cfg.incus_local = choice.is_local();
         self.mode_retry = None;
+        if was_local != self.cfg.incus_local {
+            self.ring.clear();
+            self.previous = None;
+        }
         if let Some(shared) = &self.mode_choice {
             *shared.lock().unwrap_or_else(PoisonError::into_inner) = choice.clone();
         }
@@ -508,6 +514,13 @@ impl<R: IncusRead> Sampler<R> {
     /// The most recent sample, or `None` before the first one.
     pub fn latest(&self) -> Option<&HostSample> {
         self.ring.back()
+    }
+
+    /// Whether the host mode is still the provisional socket-path fallback, which each sample retries. While it is
+    /// provisional, a remote-shaped sample does not establish that this machine can never provide its own PSI or CPU
+    /// temperature: the mode may still resolve local.
+    pub fn mode_provisional(&self) -> bool {
+        self.mode_retry.is_some()
     }
 
     /// What Incus and the NICs answered at the latest sample. Before the first sample every field is `None`.
