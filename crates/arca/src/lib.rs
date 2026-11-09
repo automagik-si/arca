@@ -26,6 +26,7 @@ pub mod handlers;
 pub mod kernel;
 pub mod linked;
 mod passkey_change;
+pub mod peer_sync;
 pub mod service;
 pub mod service_exec;
 

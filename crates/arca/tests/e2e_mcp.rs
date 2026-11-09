@@ -767,3 +767,83 @@ fn action_approve_is_served_only_to_a_node_that_trusts_another_kernels_passkeys(
     );
     assert_eq!(serve.terminate().code(), Some(0));
 }
+
+/// Whether a doctor sees `peer_keys_sync` listed on `socket`, and the reply to a call of it.
+fn doctor_sees_peer_keys_sync(socket: &Path, doctor: &str) -> (bool, Value) {
+    let (status, text) = post(socket, &[bearer(doctor)], &rpc(1, "tools/list", json!({})));
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_str(&text).expect("JSON");
+    let listed = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .any(|t| t["name"] == json!("peer_keys_sync"));
+    let (status, text) = post(
+        socket,
+        &[bearer(doctor)],
+        &call(2, "peer_keys_sync", json!({ "lines": [] })),
+    );
+    assert_eq!(status, 200);
+    (listed, serde_json::from_str(&text).expect("JSON"))
+}
+
+#[test]
+fn peer_keys_sync_is_served_only_to_a_node_that_keeps_another_machines_passkeys() {
+    // No peerKeys: the verb is neither listed nor answered.
+    let scratch = Scratch::new("peer-off");
+    let off = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, off.shim.socket(), &hash_dir);
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (listed, reply) = doctor_sees_peer_keys_sync(&socket, doctor);
+    assert!(!listed, "peer_keys_sync is not listed");
+    assert_eq!(reply["error"]["message"], json!("not_found"), "{reply}");
+    assert_eq!(serve.terminate().code(), Some(0));
+
+    // peerKeys alone: peer_keys_sync and action_approve are served, and arca_status names the page host with no path.
+    let scratch = Scratch::new("peer-on");
+    let on = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, on.shim.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["approval"] = json!({
+        "peerKeys": { "from": "alpha", "origins": ["https://alpha.example.com:8443"] }
+    });
+    fs::write(&config, cfg.to_string()).expect("write the config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (listed, reply) = doctor_sees_peer_keys_sync(&socket, doctor);
+    assert!(listed, "peer_keys_sync is listed");
+    assert_eq!(
+        reply["error"]["data"]["refusal"],
+        json!("Untrusted"),
+        "an empty list is refused by the handler: {reply}"
+    );
+    let (approve_listed, _) = doctor_sees_action_approve(&socket, doctor);
+    assert!(
+        approve_listed,
+        "action_approve is served to a peerKeys node"
+    );
+    let (_, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(3, "arca_status", json!({})),
+    );
+    let status = tool_result(&text);
+    conforming("arca_status", &status);
+    assert_eq!(
+        status["approval"]["peerKeys"],
+        json!({ "from": "alpha", "keys": 0, "since": null, "reason": "no passkey has been synced from alpha yet" })
+    );
+    assert!(
+        !text.contains(&*scratch.0.display().to_string()),
+        "no path reaches a status reader"
+    );
+    assert_eq!(serve.terminate().code(), Some(0));
+}

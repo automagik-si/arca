@@ -401,7 +401,7 @@ impl Kernel {
         // A parsed WebAuthn proof is mandatory before OwnerKeys' dispatch; no other proof can change trust.
         let assertion = parse_proof(proof)?;
         // Only this kernel's own passkeys (the root file and its state file) may change its owner trust. A passkey trusted
-        // read-only from another kernel's file approves actions only: it is refused here with a plain reason, and any other
+        // read-only from another kernel's file, or kept in sync from another machine's page host, approves actions only: it is refused here with a plain reason, and any other
         // unknown passkey with the own-keys check's own refusal, before any nonce or count is spent or anything is written.
         // The verifier puts own lines before trusted ones, so the check below verifies against the own line found here.
         if !self
@@ -410,11 +410,13 @@ impl Kernel {
             .any(|own| own.credential_id == assertion.credential_id)
         {
             let owner = self.verifier.verifier();
+            let peer = owner.peer().map(|peer| peer.load().0).unwrap_or_default();
             if owner
                 .foreign()
                 .load()
                 .0
                 .iter()
+                .chain(peer.iter())
                 .any(|line| line.credential_id == assertion.credential_id)
             {
                 return Err(ApprovalRefusal::Untrusted(
@@ -497,6 +499,77 @@ impl Kernel {
         change::write_state_bytes(state_dir, body.as_bytes()).map_err(|_| change::storage())?;
         self.replace_owner_passkeys(next);
         Ok(())
+    }
+
+    /// `peer_keys_sync`: keeps the owner passkeys of the page host `approval.peerKeys.from` names in the peer passkeys file.
+    ///
+    /// `lines` is the page host's whole set. While the file holds no line, the first sync is kept as is (trust on first use:
+    /// the operator enabled it by turning `peerKeys` on). A set equal to the kept one changes nothing. Any other set is kept
+    /// only with `statement` and `proof`: a passkey approval of a statement naming this host, the action `peer_keys_set` and
+    /// the new set's digest, signed by a passkey already kept in the file, checked and spent by this kernel's own verifier
+    /// (nonce, window, sign count). Without them the answer is the statement to sign, and nothing is written. An empty set is
+    /// refused: the last key cannot be removed. The caller holds the kernel lock across the check and the write.
+    pub fn peer_keys_sync(
+        &mut self,
+        lines: &[String],
+        signed: Option<(&str, &[u8])>,
+        now_ms: u64,
+    ) -> Result<PeerSync, ApprovalRefusal> {
+        use arca_approval::{normalize_set, parse_proof, parse_statement, peer_target, set_digest};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        let Some(peer) = self.verifier.verifier().peer().cloned() else {
+            return Err(ApprovalRefusal::Untrusted(
+                "this machine does not keep another machine's passkeys".into(),
+            ));
+        };
+        let next = normalize_set(lines)?;
+        if next.is_empty() {
+            return Err(ApprovalRefusal::Untrusted(
+                "the last trusted passkey cannot be removed".into(),
+            ));
+        }
+        let kept = peer.current()?;
+        let keys = next.len();
+        if kept.lines.is_empty() {
+            peer.write(&next, now_ms, None)
+                .map_err(|_| peer_storage())?;
+            peer.load();
+            return Ok(PeerSync::Trusted { keys });
+        }
+        if kept.lines == next {
+            return Ok(PeerSync::Unchanged { keys });
+        }
+        let digest = set_digest(&next);
+        let target = peer_target(&digest);
+        let args = json!({ "sha256": digest });
+        let Some((statement, proof)) = signed else {
+            return Ok(PeerSync::NeedsApproval {
+                keys,
+                statement: peer_statement(&self.host, &target, &args, now_ms)?,
+            });
+        };
+        let parsed = parse_statement(statement.as_bytes())?;
+        if parsed.action != ArcaAction::PeerKeysSet {
+            return Err(ApprovalRefusal::WrongAction);
+        }
+        // Only a passkey already kept from the page host may change the set: this kernel's own passkeys and other kernels'
+        // files cannot, and an SSH signature is not a passkey proof.
+        let assertion = parse_proof(proof)?;
+        let (trusted, _) = peer.load();
+        if !trusted
+            .iter()
+            .any(|line| line.credential_id == assertion.credential_id)
+        {
+            return Err(ApprovalRefusal::BadSignature);
+        }
+        let approval = format!("{}.{}", STANDARD.encode(statement), STANDARD.encode(proof));
+        self.verifier
+            .check(ArcaAction::PeerKeysSet, &target, &args, &approval, now_ms)?;
+        peer.write(&next, kept.since.unwrap_or(now_ms), Some(now_ms))
+            .map_err(|_| peer_storage())?;
+        peer.load();
+        Ok(PeerSync::Changed { keys })
     }
 
     /// Verifies a WebAuthn assertion over `statement` against the owner's passkeys, advancing the shared sign count. The
@@ -740,4 +813,45 @@ fn fresh_grant() -> Option<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).ok()?;
     Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// What `peer_keys_sync` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerSync {
+    /// The file held no passkey, so this first set is kept as is.
+    Trusted { keys: usize },
+    /// The set is the one already kept; nothing was written.
+    Unchanged { keys: usize },
+    /// The set differs and carried no approval: nothing was written, and `statement` is what the owner signs to keep it.
+    NeedsApproval { keys: usize, statement: String },
+    /// The set differs and its approval held: it is kept now.
+    Changed { keys: usize },
+}
+
+fn peer_storage() -> ApprovalRefusal {
+    ApprovalRefusal::Storage("the peer passkeys file could not be saved".into())
+}
+
+/// A fresh `peer_keys_set` statement naming `host`, the set's `target` and its digest `args`, valid for ten minutes.
+fn peer_statement(
+    host: &str,
+    target: &str,
+    args: &Value,
+    now: u64,
+) -> Result<String, ApprovalRefusal> {
+    use arca_kernel::canon::{canonical_json, params_digest};
+    let malformed = || ApprovalRefusal::Malformed("the peer passkey statement is invalid".into());
+    let nonce = crate::handlers::fresh_nonce().map_err(|_| peer_storage())?;
+    let text = canonical_json(&json!({
+        "action": ArcaAction::PeerKeysSet.as_str(),
+        "host": host,
+        "target": target,
+        "paramsDigest": params_digest(args).map_err(|_| malformed())?,
+        "issuedAt": crate::handlers::iso_utc(now),
+        "expiresAt": crate::handlers::iso_utc(now.saturating_add(600_000)),
+        "nonce": nonce,
+    }))
+    .map_err(|_| malformed())?;
+    arca_approval::parse_statement(text.as_bytes())?;
+    Ok(text)
 }

@@ -297,8 +297,9 @@ nine actions (`service_create`, `service_remove`, `service_publish`,
 proposed. `arca_propose` may
 target `pageHost`, the host whose kernel serves this canvas and its approval
 page, and any configured reader whose name the page host's `arca_status` lists in
-`approval.linkedHosts` (another kernel on the same machine whose approvals the
-page host relays). Any other host is refused before a proposal is recorded, with
+`approval.linkedHosts` (another kernel whose approvals the page host relays, on
+the same machine or on another machine whose socket is forwarded to the page
+host; both are treated alike). Any other host is refused before a proposal is recorded, with
 the plain reason "this machine is not linked for approvals yet"; a page host
 whose status cannot be read links nothing. The proposal is recorded by the
 target host's own kernel, which later verifies the owner's passkey itself. The tools are

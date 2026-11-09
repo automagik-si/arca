@@ -38,7 +38,9 @@ use crate::action_proposal::{
 };
 use crate::config::NodeConfig;
 use crate::gpu::{GpuBackend, GpuDeviceState, GpuInstance, GpuRefusal, card_for};
-use crate::kernel::{ActionApprovalError, AppliedSeq, ApprovedAction, JOURNAL_FILE, Kernel};
+use crate::kernel::{
+    ActionApprovalError, AppliedSeq, ApprovedAction, JOURNAL_FILE, Kernel, PeerSync,
+};
 
 /// Answers from the public ontology embedded in the binary, without reading node state.
 pub struct OntologyQuery;
@@ -457,6 +459,8 @@ pub const STATUS_TRUST_WINDOW: std::time::Duration = std::time::Duration::from_s
 pub struct ApprovalStatus {
     pub linked_hosts: Vec<String>,
     pub foreign: arca_approval::ForeignPasskeys,
+    /// The passkeys another machine's page host keeps in sync here, when `approval.peerKeys` is set: the verifier's own value.
+    pub peer: Option<arca_approval::PeerPasskeys>,
 }
 
 impl ApprovalStatus {
@@ -480,8 +484,35 @@ impl ApprovalStatus {
                 })
             })
             .collect();
-        json!({ "linkedHosts": self.linked_hosts, "trustedKeyFiles": files })
+        let mut status = json!({ "linkedHosts": self.linked_hosts, "trustedKeyFiles": files });
+        if let Some(peer) = &self.peer {
+            status["peerKeys"] = peer_status(peer);
+        }
+        status
     }
+}
+
+/// `arca_status`'s `peerKeys`: the page host, how many of its passkeys are trusted, since when, and a plain sentence. No key,
+/// credential, line or path.
+fn peer_status(peer: &arca_approval::PeerPasskeys) -> Value {
+    let state = peer.recent_state(STATUS_TRUST_WINDOW);
+    let from = peer.from();
+    let since = state.since.map(iso_utc);
+    let reason = match (&state.reason, &since) {
+        (Some(why), _) => why.clone(),
+        (None, Some(since)) => {
+            let mut text = format!("trusting {from}'s passkeys since {since} (first sync)");
+            if let Some(changed) = state.changed {
+                text.push_str(&format!(
+                    "; the list last changed with a passkey approval at {}",
+                    iso_utc(changed)
+                ));
+            }
+            text
+        }
+        (None, None) => format!("no passkey has been synced from {from} yet"),
+    };
+    json!({ "from": from, "keys": state.keys, "since": since, "reason": reason })
 }
 
 impl ToolHandler for StatusHandler {
@@ -973,12 +1004,60 @@ pub fn plan_handlers_with(
         (
             "action_approve",
             Arc::new(ActionApprove {
-                kernel,
-                clock,
+                kernel: Arc::clone(&kernel),
+                clock: Arc::clone(&clock),
                 actions,
             }) as Arc<dyn ToolHandler>,
         ),
+        (
+            "peer_keys_sync",
+            Arc::new(PeerKeysSync { kernel, clock }) as Arc<dyn ToolHandler>,
+        ),
     ]
+}
+
+/// `peer_keys_sync`: keeps the page host's owner passkeys in this kernel's peer passkeys file (see
+/// [`Kernel::peer_keys_sync`]). `statement` and `approval` (the owner's passkey proof over it, as its JSON) come together or
+/// not at all. No line is echoed or logged.
+struct PeerKeysSync {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+}
+
+impl ToolHandler for PeerKeysSync {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let lines: Vec<String> = args
+            .get("lines")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CallError::Invalid("lines is required".to_string()))?
+            .iter()
+            .map(|line| line.as_str().map(str::to_string))
+            .collect::<Option<_>>()
+            .ok_or_else(|| CallError::Invalid("each line is a string".to_string()))?;
+        let statement = args.get("statement").and_then(Value::as_str);
+        let approval = args.get("approval").and_then(Value::as_str);
+        let signed = match (statement, approval) {
+            (Some(statement), Some(proof)) => Some((statement, proof.as_bytes())),
+            (None, None) => None,
+            _ => {
+                return Err(CallError::Invalid(
+                    "statement and approval come together".to_string(),
+                ));
+            }
+        };
+        let now = (self.clock)();
+        let outcome = lock(&self.kernel)?
+            .peer_keys_sync(&lines, signed, now)
+            .map_err(refusal_failure)?;
+        Ok(match outcome {
+            PeerSync::Trusted { keys } => json!({ "status": "trusted", "keys": keys }),
+            PeerSync::Unchanged { keys } => json!({ "status": "unchanged", "keys": keys }),
+            PeerSync::Changed { keys } => json!({ "status": "changed", "keys": keys }),
+            PeerSync::NeedsApproval { keys, statement } => {
+                json!({ "status": "needs_approval", "keys": keys, "statement": statement })
+            }
+        })
+    }
 }
 
 /// `plan_list`: each waiting delete plan and action proposal that has not lapsed. A delete plan carries the statement the

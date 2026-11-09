@@ -623,6 +623,55 @@ function actionCard(plan) {
   return card;
 }
 
+// A card for a passkey list another machine keeps in sync from this page: the owner approves it with a passkey that
+// machine already trusts, and this page relays the signed statement with the list. No passkey line is shown.
+function peerKeysCard(card) {
+  const node = el("article", "card plan action");
+  const meta = el("div", "plan-meta");
+  meta.append(el("span", "badge", "Passkeys"));
+  if (card.expiresAt) {
+    const at = Date.parse(card.expiresAt);
+    const expiry = el("time", "expiry");
+    expiry.dateTime = card.expiresAt;
+    expiry.append(icon("clock"), expiryText(at));
+    meta.append(expiry);
+  }
+  const heading = el("h3", "", card.title);
+  const text = el("p", "notice-text", card.linkedHost + " will trust " + card.keys + " passkey" + (card.keys === 1 ? "" : "s") + " from this page for approvals. Confirm with a passkey it already trusts.");
+  const button = el("button", "btn btn-primary btn-big approve");
+  button.type = "button";
+  button.setAttribute("aria-label", card.title);
+  button.append(icon("key"), "Approve");
+  button.addEventListener("click", () => trustPeerKeys(card, button));
+  node.append(meta, heading, text, button);
+  return node;
+}
+
+async function trustPeerKeys(card, button) {
+  button.disabled = true;
+  status("Confirm with your passkey…", "wait");
+  try {
+    const proof = await trustedProof(card.statement);
+    const answer = await fetch("/approve/peer-keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ host: card.linkedHost, statement: card.statement, proof }),
+    });
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok) {
+      if (body.refusal === "Expired") await fetch("/approve/peer-keys/sync", { method: "POST" }).catch(() => {});
+      const refused = new Error(body.message || body.refusal || ("the approval answered " + answer.status));
+      refused.refusal = body.refusal;
+      throw refused;
+    }
+    status(card.linkedHost + " now trusts your passkey list.", "ok");
+    await loadPlans();
+  } catch (error) {
+    fail(error);
+    button.disabled = false;
+  }
+}
+
 function showTrusted(count) {
   document.getElementById("trusted").textContent = String(count);
   document.body.dataset.trusted = count > 0 ? "yes" : "no";
@@ -640,10 +689,12 @@ async function loadPlans() {
     const body = await response.json();
     showTrusted(body.passkeysTrusted || 0);
     target.replaceChildren();
-    if (!body.plans.length) {
+    const peerKeys = Array.isArray(body.peerKeys) ? body.peerKeys : [];
+    if (!body.plans.length && !peerKeys.length) {
       target.append(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
       return;
     }
+    for (const card of peerKeys) target.append(peerKeysCard(card));
     for (const plan of body.plans) target.append(plan.kind === "action" ? actionCard(plan) : planCard(plan));
   } catch (error) {
     const card = notice("problem", "Couldn't load what's waiting", "Your plans are safe. Nothing changes until you approve it.");
@@ -854,7 +905,7 @@ async function approve(plan, button) {
     const answer = await fetch("/approve/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan: id, approval }),
+      body: JSON.stringify(plan.linkedHost ? { plan: id, approval, host: plan.linkedHost } : { plan: id, approval }),
     });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) {
@@ -904,6 +955,11 @@ document.getElementById("get-code").addEventListener("click", getCode);
 document.getElementById("register").addEventListener("click", register);
 loadPlans();
 loadPasskeys().catch(fail);
+// Opening the page syncs this host's passkey list with the machines that keep it, so a changed list shows its card now.
+fetch("/approve/peer-keys/sync", { method: "POST" })
+  .then((answer) => (answer.ok ? answer.json() : null))
+  .then((body) => { if (body && Array.isArray(body.peerKeys) && body.peerKeys.length) loadPlans(); })
+  .catch(() => {});
 </script>
 </body>
 </html>

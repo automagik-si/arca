@@ -304,7 +304,7 @@ record is refused.
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
-`action_propose`, `plan_decline`, `approval_submit`, `action_approve`, the Postgres and ontology verbs, `service_create`, `service_list` and
+`action_propose`, `plan_decline`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
 `service_status`, and `gpu_attach` and `gpu_detach`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
@@ -347,8 +347,13 @@ its request is read.
   with this kernel's own verifier, nonce store and sign counts, and when it holds runs the action once, exactly as the
   approval page does, answering `{plan, id, action, result}`. It is a doctor verb that writes. Another kernel's approval
   page on the same machine relays a linked host's approvals here; see "Approving on another kernel of this machine". It is
-  served only by a kernel whose `approval` key names at least one `trustOwnerKeysFrom` file; any other kernel neither lists
-  it nor answers it (`not_found`).
+  served only by a kernel whose `approval` key names at least one `trustOwnerKeysFrom` file or sets `peerKeys`; any other
+  kernel neither lists it nor answers it (`not_found`).
+- `peer_keys_sync` takes `{lines, statement?, approval?}`: the page host's whole owner passkey list, and, for a changed
+  list, the statement this kernel issued with the owner's passkey proof over it (its JSON) in `approval`. It answers
+  `{status, keys, statement?}` with `status` `trusted` (first sync), `unchanged`, `needs_approval` (with the statement to
+  sign; nothing written) or `changed`. No line is echoed. It is a doctor verb that writes, served only by a kernel whose
+  `approval.peerKeys` is set; see "Approving on another machine".
 
 `serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
@@ -688,6 +693,8 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
   credential for a delete plan; that decline stays with the doctor-scope `plan_decline`.
 - With `approval.linkedHosts` set, `GET /approve/plans` also lists each linked kernel's waiting action proposals, and
   `POST /approve/approve` and `POST /approve/decline` take an optional `"host"`. See the next section.
+- With linked hosts that keep this host's passkeys, `GET /approve/plans` adds `peerKeys` cards, `POST /approve/peer-keys`
+  approves one and `POST /approve/peer-keys/sync` syncs now. See [Approving on another machine](#approving-on-another-machine).
 - `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }`,
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.
@@ -728,8 +735,8 @@ without a cut event. `GET /approve/canvas/chat/history` is the same bounded thre
 One canvas can approve changes on every Arca kernel that runs on the same machine as the page host, with the same passkey.
 The page host never approves for another kernel: each kernel records its own proposals, and each verifies the owner's
 signed statement with its own verifier, nonce store and sign counts. The page host only lists the other kernel's waiting
-proposals and carries the signed bytes to it. Kernels on another machine are not covered yet; they come with key pinning
-at pairing.
+proposals and carries the signed bytes to it. A kernel on another machine is linked the same way, with its socket forwarded
+to this machine and the owner's passkeys kept in sync there; see [Approving on another machine](#approving-on-another-machine).
 
 On the page host (here `alpha`, page origin `https://alpha.example.com`), list each linked kernel with its MCP socket and
 the file holding a token for it:
@@ -792,6 +799,87 @@ In the canvas, the Doctor proposes on the page host and on any machine the page 
 `approval.linkedHosts`; any other machine is refused with "this machine is not linked for approvals yet" before a proposal
 is recorded. Every card shows the host its statement names, and a linked machine's card approves and declines through the
 page host with that machine's name.
+
+#### Approving on another machine
+
+A kernel on another machine (here `gamma`) is approved from the same canvas. The page host (`alpha`) reaches gamma's MCP
+socket through a unix socket forwarded to a path on alpha, for example an SSH local forward kept up by a service:
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -o StreamLocalBindUnlink=yes \
+  -L /run/arca-alpha/gamma.sock:/run/arca-gamma/arca.sock arca@gamma.example.com
+```
+
+On alpha, gamma is a linked host like any other; its `socket` is the forwarded path:
+
+```json
+"approval": {
+  "linkedHosts": [
+    { "name": "gamma", "socket": "/run/arca-alpha/gamma.sock", "tokenFile": "/etc/arca/alpha/gamma-relay.secret" }
+  ]
+}
+```
+
+The token is minted on gamma with scope `doctor`, limited to the verbs the page uses there:
+
+```sh
+arca token mint --scope doctor --id relay-alpha \
+  --tools arca_status,plan_list,action_approve,plan_decline,peer_keys_sync \
+  --out gamma-relay.secret --config /etc/arca/gamma.json
+```
+
+What a second machine cannot do is read alpha's passkeys file. Instead gamma keeps a copy alpha sends it, and trusts it
+only because the operator said so. On gamma, name the page host and its page origin:
+
+```json
+"approval": {
+  "peerKeys": { "from": "alpha", "origins": ["https://alpha.example.com"] }
+}
+```
+
+`from` is the page host's approval host (its `approvalHost`, or its system host name). Turning `peerKeys` on is the one
+step that enables trust: gamma then serves `peer_keys_sync` (scope `doctor`) and `action_approve`; without `peerKeys`
+neither is served unless `trustOwnerKeysFrom` names a file.
+
+- **First sync.** Alpha syncs on start, every 10 minutes, and each time the owner opens the approval page. It reads
+  gamma's `arca_status`; when `approval.peerKeys.from` names alpha, it sends its own owner passkey lines (its root file
+  and its state file, as its verifier holds them, without comments, labels or dates) with `peer_keys_sync`. While gamma's
+  `<stateDir>/peer-passkeys` is missing or empty, the first set is kept as is (trust on first use), and gamma's
+  `arca_status` says `trusting alpha's passkeys since <time> (first sync)`.
+- **No change.** An identical set changes nothing and needs no signature.
+- **A changed set.** When the owner adds or removes a passkey on alpha, gamma does not keep the new set on alpha's word.
+  It answers with a statement naming gamma's host, action `peer_keys_set`, target `peer-keys-<sha256>` and the digest of
+  `{ "sha256": "<sha256>" }`, where `<sha256>` is the SHA-256 of the new set's lines, sorted, each followed by a newline.
+  Alpha's approval page shows the card **Trust your new passkey list on gamma**. The owner approves it with a passkey gamma
+  already keeps; alpha relays the signed statement with the set, and gamma checks it with its own verifier (host, action,
+  digest, window, nonce, sign count). A passkey not already in gamma's copy, gamma's own passkeys and SSH keys cannot
+  approve it; a replay is refused. A statement lasts ten minutes; an expired card is refreshed by the next sync.
+- **The last key.** An empty set is refused: the last kept key cannot be removed this way.
+- **Another page host.** A file whose header names another page host than `from` adds no key, and the next sync from the
+  configured page host is a first sync: changing `from` is the same owner-enabled step as turning `peerKeys` on.
+
+Gamma trusts the kept passkeys exactly as `trustOwnerKeysFrom` keys: for action approvals only, only for the listed
+`origins`, never for gamma's own sign-in and never to add or remove one of gamma's own passkeys. The file is gamma's own:
+written whole and atomically at mode 0600 without following a link, and read under the `trustOwnerKeysFrom` rule (no link,
+a regular file owned by root or gamma's user, no group or other write bit, parsed whole). A file that cannot be trusted adds
+no key and is never overwritten by a first sync; `arca_status` reports `approval.peerKeys` as
+`{ "from", "keys", "since", "reason" }`, with no key, credential, line or path. Alpha never logs or stores the lines it
+sends; its log names only the host, the outcome and a count, and only when something changed or failed. A link whose token
+may not call `arca_status` is taken as one that does not ask for the list.
+
+The page routes:
+
+- `GET /approve/plans` adds `peerKeys: [{ "linkedHost", "title", "keys", "statement", "expiresAt" }]`, one card per linked
+  host whose set waits for the owner.
+- `POST /approve/peer-keys` takes `{ "host", "statement", "proof" }`, reads alpha's lines again, and relays them with the
+  statement and the proof to that host's `peer_keys_sync`. The answer is the host's own (`status` `changed`, or its exact
+  refusal); an unlisted host is refused `NotLinked`.
+- `POST /approve/peer-keys/sync` syncs with every linked host now (at most once per 30 seconds; a request inside that
+  window answers from the last sync) and answers `{ "hosts": [{ "name", "status" }],
+  "peerKeys": [...] }`.
+
+In the canvas, a linked machine is treated alike whether it runs on the page host's machine or another: the Doctor proposes
+on it when the page host lists it in `approval.linkedHosts`, and its cards approve through the page host.
 
 To use it:
 
