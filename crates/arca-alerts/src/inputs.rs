@@ -82,7 +82,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use arca_incus::{IncusError, IncusRead};
-    use arca_metrics::{ModeRetry, Sampler, SamplerConfig};
+    use arca_metrics::{ModeRetry, PROVISIONAL_WINDOW_MS, Sampler, SamplerConfig};
     use serde_json::{Value, json};
 
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -554,5 +554,106 @@ mod tests {
             );
         }
         assert_eq!(eval.firing().len(), 1);
+    }
+
+    #[test]
+    fn a_provisional_mode_settles_after_the_window_and_a_firing_alert_then_resolves_no_data() {
+        const T0: u64 = 3_000_000;
+        let host = Host::new("provisional-window-alert");
+        host.write("proc/sys/kernel/hostname", "node1\n");
+        host.write(
+            "proc/pressure/memory",
+            "some avg10=30.00 avg60=0.00 avg300=0.00 total=1\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        );
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: host.proc_root().join("proc"),
+                sys_root: host.proc_root().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            SlowName {
+                up: Arc::new(AtomicBool::new(false)),
+                hostname: "node1".to_string(),
+            },
+        );
+        let rules = Rules::default();
+        let mut eval = Evaluator::default();
+
+        // The pressure alert is already firing when the sampler's provisional samples begin.
+        for t in (0..=60_000).step_by(5_000) {
+            let inputs = Inputs {
+                at: T0 + t,
+                memory_some_avg10: Some(Timed {
+                    at: T0 + t,
+                    value: 30.0,
+                }),
+                ..Inputs::default()
+            };
+            eval.step(&rules, &inputs, T0 + t);
+        }
+        assert_eq!(eval.firing().len(), 1);
+
+        // The server never names itself, so the first sample starts the provisional window. The alert stays firing
+        // with a data gap, not a no-data resolve.
+        let started = 65_000;
+        sampler.sample(T0 + started);
+        assert!(sampler.mode_provisional());
+        let inputs = from_sampler(&sampler);
+        assert!(inputs.unavailable.is_empty());
+        assert!(eval.step(&rules, &inputs, T0 + started).is_empty());
+        assert_eq!(eval.firing().len(), 1);
+        assert!(eval.unknown().iter().any(|alert| {
+            alert.rule == RuleId::MemPsiHigh.as_str() && alert.reason == UnknownReason::Missing
+        }));
+
+        // One tick before the bound the mode is still provisional.
+        sampler.sample(T0 + started + PROVISIONAL_WINDOW_MS - 5_000);
+        assert!(sampler.mode_provisional());
+        assert!(
+            eval.step(
+                &rules,
+                &from_sampler(&sampler),
+                T0 + started + PROVISIONAL_WINDOW_MS - 5_000
+            )
+            .is_empty()
+        );
+
+        // At the bound it settles on the fallback: the reading is now permanently unavailable, and the no-data clock
+        // starts.
+        let settled = started + PROVISIONAL_WINDOW_MS;
+        sampler.sample(T0 + settled);
+        assert!(!sampler.mode_provisional(), "the window ended");
+        let inputs = from_sampler(&sampler);
+        assert!(inputs.unavailable.contains(&RuleId::MemPsiHigh));
+        assert!(eval.step(&rules, &inputs, T0 + settled).is_empty());
+        assert_eq!(eval.firing().len(), 1);
+        assert!(eval.unknown().iter().any(|alert| {
+            alert.rule == RuleId::MemPsiHigh.as_str() && alert.reason == UnknownReason::Unavailable
+        }));
+
+        // The clear window runs from the settlement; then the restored alert resolves no data exactly once.
+        for t in (settled + 5_000..settled + 120_000).step_by(5_000) {
+            sampler.sample(T0 + t);
+            assert!(
+                eval.step(&rules, &from_sampler(&sampler), T0 + t)
+                    .is_empty(),
+                "no event at {t} ms"
+            );
+            assert_eq!(eval.firing().len(), 1);
+        }
+        let resolved_at = settled + 120_000;
+        sampler.sample(T0 + resolved_at);
+        let resolved = eval.step(&rules, &from_sampler(&sampler), T0 + resolved_at);
+        assert_eq!(resolved.len(), 1, "exactly one no-data resolve");
+        assert_eq!(resolved[0].state, EventState::Resolved);
+        assert_eq!(resolved[0].reason, Some(ResolveReason::NoData));
+        assert!(eval.firing().is_empty());
     }
 }

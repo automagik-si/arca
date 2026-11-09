@@ -339,21 +339,26 @@ on when the two differ. The mode is chosen at startup, in this order:
 
 1. An explicit `incus.local` wins: `true` means the local daemon, `false` a remote one.
 2. Otherwise the node reads the Incus server document, `GET /1.0`, and compares `environment.server_name` with the local
-   host name, without case. A match is local; a mismatch is remote. A name that identifies no one machine is treated as
-   unknown: an empty name, a loopback name such as `localhost` or `localhost.localdomain`, and a default a stock image or
-   distribution sets, such as `ubuntu`, `debian` or `linux`.
+   host name, without case. A match is local; a mismatch is remote. A name of `localhost`, `localhost.localdomain` or an
+   empty name identifies no machine and is treated as unknown.
 3. If `/1.0` cannot be read, or it does not carry a usable server name, or the local host name cannot be read, the socket
    path decides: the standard local daemon sockets (`/var/lib/incus/unix.socket` and `/var/lib/incus/unix.socket.user`) are
    local and every other path is remote. This choice is provisional: each later sample retries the `/1.0` check, under the
-   same 2 s cap and with no added startup delay, until the server names itself, then keeps that answer.
+   same 2 s cap and with no added startup delay, until the server names itself, then keeps that answer. The provisional
+   choice stands for at most 10 minutes after the first provisional sample; then the sampler settles on the socket-path
+   fallback and stops probing.
 
-The chosen mode and a value-free reason are logged at startup, and again if a provisional choice is replaced, and returned
-by `arca_status` as `metricsSource` (`local` or `remote`) and `metricsSourceReason`. The reason never carries a host name. A proxy whose upstream is the local
-daemon, such as the recording shim, therefore needs no `"local": true`: its server name matches the local host name. A
-container that mounts the host's Incus socket at the standard path is still remote when its own host name differs from the
-Incus server name, so the sampler never reports the container's `/proc` as the managed host's. When a provisional choice
-resolves to the other mode, the sampler clears its sample ring and its rate counters, so the window mean and the next
-rate cover only samples from the new mode.
+The name comparison cannot tell two machines apart when both keep the same default name, such as two stock images still
+named `ubuntu`: a match reads as local. The sampler has no way to resolve that ambiguity from names alone. Set
+`incus.local` in `node.json` on that node; an explicit `true` or `false` always wins and ends the question.
+
+The chosen mode and a value-free reason are logged at startup, and again if a provisional choice is replaced or settles on
+the fallback, and returned by `arca_status` as `metricsSource` (`local` or `remote`) and `metricsSourceReason`. The reason
+never carries a host name. A proxy whose upstream is the local daemon, such as the recording shim, therefore needs no
+`"local": true`: its server name matches the local host name. A container that mounts the host's Incus socket at the
+standard path is still remote when its own host name differs from the Incus server name, so the sampler never reports the
+container's `/proc` as the managed host's. When a provisional choice resolves to the other mode, the sampler clears its
+sample ring and its rate counters, so the window mean and the next rate cover only samples from the new mode.
 
 - **Local daemon.** The sample is this machine's: `cpu.cores` and `cpu.usedPct`, the `load` averages,
   `memory.totalBytes`, `memory.availableBytes` and `memory.usedBytes`, PSI, CPU temperature, GPU busy, swap and NIC rates come
@@ -366,8 +371,9 @@ rate cover only samples from the new mode.
   reported to the alert evaluator as readings this node can never provide, so a firing `mem-psi-high` or `cpu-hot` resolves
   with `no data` after its clear window instead of staying unknown forever. While the choice is still provisional they are
   not reported that way: the mode may yet resolve local, and a `no data` resolve would only fire the alert again after the
-  switch. The pools, instance counts, incus-osd reading and SMART state still come from the same Incus, so they describe the
-  remote machine too.
+  switch. The provisional window is at most 10 minutes, so a fallback that never resolves local settles and the normal
+  no-data handling starts then. The pools, instance counts, incus-osd reading and SMART state still come from the same
+  Incus, so they describe the remote machine too.
 - **The resources read fails.** On a remote node the totals are `null` and `cpu.coresKnown` is `false`; `cpu.cores` stays an
   integer in the schema, so its `0` is a placeholder a consumer must not show as a count. `cpu.reason` and `memory.reason`
   say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong

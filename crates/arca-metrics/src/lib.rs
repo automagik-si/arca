@@ -20,8 +20,8 @@ pub use mode::{
 pub use osd::OsdReading;
 pub use probe::ProbeTarget;
 pub use sample::{
-    Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, Memory, Network, NicCounters, Pool,
-    ProjectCount, Psi, REMOTE_HOST_REASON, RESOURCES_REASON, Readings, Sampler, SamplerConfig,
-    mean, node_metrics,
+    Cpu, DEFAULT_MINUTES, HostSample, LatencyReading, Load, Memory, Network, NicCounters,
+    PROVISIONAL_WINDOW_MS, Pool, ProjectCount, Psi, REMOTE_HOST_REASON, RESOURCES_REASON, Readings,
+    Sampler, SamplerConfig, mean, node_metrics,
 };
 pub use smart::{DriveReading, DrivesReading};

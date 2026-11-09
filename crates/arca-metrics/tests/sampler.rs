@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arca_api::{conforms, verb};
 use arca_incus::{FakeIncus, FakeState, UnixIncus};
 use arca_metrics::{
-    Cpu, HostSample, Load, Memory, Network, Pool, ProjectCount, Psi, Sampler, SamplerConfig, mean,
-    node_metrics,
+    Cpu, HostSample, Load, Memory, Network, PROVISIONAL_WINDOW_MS, Pool, ProjectCount, Psi,
+    Sampler, SamplerConfig, mean, node_metrics,
 };
 use serde_json::{Value, json};
 
@@ -2659,5 +2659,63 @@ mod host_totals {
         assert_eq!(averaged.cpu.cores, 4);
         assert_eq!(averaged.memory.total_bytes, Some(16_384_000_000));
         assert_eq!(averaged.load.one, Some(0.52));
+    }
+
+    #[test]
+    fn a_provisional_mode_settles_on_the_socket_path_fallback_after_the_window() {
+        let scratch = Scratch::new("provisional-window");
+        write_first_tree(scratch.path());
+        write(scratch.path(), "proc/sys/kernel/hostname", "node1\n");
+        let incus = LateName {
+            up: Arc::new(AtomicBool::new(false)),
+            hostname: "node1".to_string(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            incus.clone(),
+        );
+
+        // The first sample starts the provisional window on the remote path fallback.
+        let first = sampler.sample(1_000).clone();
+        assert!(sampler.mode_provisional());
+        assert_eq!(first.load.reason.as_deref(), Some(REMOTE_REASON));
+        assert!(!first.cpu.cores_known);
+
+        // One tick before the window ends it is still provisional and still probes.
+        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS - 5_000);
+        assert!(sampler.mode_provisional());
+
+        // At the bound it settles on the fallback, and no later sample probes `/1.0`.
+        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS);
+        assert!(!sampler.mode_provisional(), "the window ended");
+        let probes_at_settle = incus
+            .reads
+            .lock()
+            .expect("the reads are not poisoned")
+            .iter()
+            .filter(|path| path.as_str() == "/1.0")
+            .count();
+        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS + 5_000);
+        assert!(!sampler.mode_provisional(), "it stays settled");
+        let probes_after = incus
+            .reads
+            .lock()
+            .expect("the reads are not poisoned")
+            .iter()
+            .filter(|path| path.as_str() == "/1.0")
+            .count();
+        assert_eq!(probes_after, probes_at_settle, "no probe after the window");
     }
 }

@@ -29,6 +29,11 @@ pub const REMOTE_HOST_REASON: &str = "not available for a remote host";
 /// The reason the host totals are absent: the node's Incus did not answer `GET /1.0/resources`.
 pub const RESOURCES_REASON: &str = "the Incus resources read failed";
 
+/// How long the socket-path fallback stands as provisional, in milliseconds: 10 minutes after the first provisional
+/// sample. Past it the sampler settles on the fallback, so a remote reading is treated as never available and its alerts
+/// can resolve with no data.
+pub const PROVISIONAL_WINDOW_MS: u64 = 600_000;
+
 /// The window `starts_10m` counts, in milliseconds: a start counts while it is less than this old.
 const START_WINDOW_MS: u64 = 600_000;
 
@@ -255,10 +260,13 @@ pub struct Sampler<R: IncusRead> {
     osd_memory: UpdateMemory,
     /// When the incus-osd storage document was last read for SMART, in epoch milliseconds. `None` until the first read.
     smart_read_at: Option<u64>,
-    /// How to retry a provisional mode. Cleared once a server-name answer decides it.
+    /// How to retry a provisional mode. Cleared once a server-name answer decides it, or once the provisional window ends.
     mode_retry: Option<ModeRetry>,
+    /// When the first provisional sample retried the mode, in epoch milliseconds. `None` while the mode is settled and
+    /// before the first provisional sample.
+    provisional_since: Option<u64>,
     /// The choice `arca_status` reads, when the server shares it. A provisional choice is replaced here when a retry
-    /// succeeds. `None` for a sampler a test builds directly.
+    /// succeeds or the window ends. `None` for a sampler a test builds directly.
     mode_choice: Option<Arc<Mutex<HostModeChoice>>>,
 }
 
@@ -281,6 +289,7 @@ impl<R: IncusRead> Sampler<R> {
             osd_memory: UpdateMemory::default(),
             smart_read_at: None,
             mode_retry,
+            provisional_since: None,
             mode_choice: None,
         }
     }
@@ -308,7 +317,7 @@ impl<R: IncusRead> Sampler<R> {
     /// A remote host's totals are read from its Incus every tick; a failed read is null with [`RESOURCES_REASON`], never the
     /// local machine's numbers. A local host keeps reading its own procfs and sysfs.
     pub fn sample(&mut self, now_ms: u64) -> &HostSample {
-        self.retry_mode();
+        self.retry_mode(now_ms);
         let previous = self.previous;
         let host = read_host(&self.cfg, &self.incus, previous, now_ms);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
@@ -392,8 +401,9 @@ impl<R: IncusRead> Sampler<R> {
     /// Retries a provisional mode's `/1.0` name check, under [`MODE_PROBE_TIMEOUT`]. Once the server names itself and the
     /// name comparison succeeds, the answer is kept and no later sample probes again. A mode from `incus.local` or from a
     /// real name comparison is never provisional, so this does nothing for it. A switch between the local and remote modes
-    /// clears the ring and the rate counters, so a mean never mixes the two sources and no rate spans them.
-    fn retry_mode(&mut self) {
+    /// clears the ring and the rate counters, so a mean never mixes the two sources and no rate spans them. The fallback
+    /// stands for at most [`PROVISIONAL_WINDOW_MS`]; after that the sampler settles on it instead of retrying forever.
+    fn retry_mode(&mut self, now_ms: u64) {
         let Some(retry) = self.mode_retry.clone() else {
             return;
         };
@@ -405,22 +415,44 @@ impl<R: IncusRead> Sampler<R> {
             MODE_PROBE_TIMEOUT,
         );
         if choice.provisional {
+            let since = *self.provisional_since.get_or_insert(now_ms);
+            if now_ms.abs_diff(since) >= PROVISIONAL_WINDOW_MS {
+                self.settle_provisional(&choice);
+            }
             return;
         }
+        let mode = choice.mode;
+        let reason = choice.reason.clone();
+        self.settle_mode(choice);
+        eprintln!("arca: metrics source {}: {reason}", mode.as_str());
+    }
+
+    /// Keeps a real mode answer or a settled fallback, clears the retry, and drops samples from the mode it replaced.
+    fn settle_mode(&mut self, choice: HostModeChoice) {
+        self.provisional_since = None;
+        self.mode_retry = None;
         let was_local = self.cfg.incus_local;
         self.cfg.incus_local = choice.is_local();
-        self.mode_retry = None;
         if was_local != self.cfg.incus_local {
             self.ring.clear();
             self.previous = None;
         }
         if let Some(shared) = &self.mode_choice {
-            *shared.lock().unwrap_or_else(PoisonError::into_inner) = choice.clone();
+            *shared.lock().unwrap_or_else(PoisonError::into_inner) = choice;
         }
+    }
+
+    /// Settles a choice that stayed provisional past [`PROVISIONAL_WINDOW_MS`] on the socket-path fallback it already
+    /// carries. The mode does not change; only the retry ends, so a remote reading now counts as never available.
+    fn settle_provisional(&mut self, choice: &HostModeChoice) {
+        let mut settled = choice.clone();
+        settled.provisional = false;
+        let mode = settled.mode;
+        let reason = settled.reason.clone();
+        self.settle_mode(settled);
         eprintln!(
-            "arca: metrics source {}: {}",
-            choice.mode.as_str(),
-            choice.reason
+            "arca: metrics source {}: {reason}; the provisional window ended",
+            mode.as_str()
         );
     }
 
@@ -516,9 +548,10 @@ impl<R: IncusRead> Sampler<R> {
         self.ring.back()
     }
 
-    /// Whether the host mode is still the provisional socket-path fallback, which each sample retries. While it is
-    /// provisional, a remote-shaped sample does not establish that this machine can never provide its own PSI or CPU
-    /// temperature: the mode may still resolve local.
+    /// Whether the host mode is still the provisional socket-path fallback, which each sample retries for at most
+    /// [`PROVISIONAL_WINDOW_MS`]. While it is provisional, a remote-shaped sample does not establish that this machine can
+    /// never provide its own PSI or CPU temperature: the mode may still resolve local. Once the window ends, this is false
+    /// and a remote reading is treated as never available.
     pub fn mode_provisional(&self) -> bool {
         self.mode_retry.is_some()
     }
