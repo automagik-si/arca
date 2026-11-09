@@ -514,12 +514,15 @@ impl NvidiaSmi {
         }
     }
 
-    /// The same reader over another program path.
+    /// The same reader over another program path. An alternate program is not the host's real tool, so it gets its own
+    /// gate: a reader of another program never refuses the real tool as busy, and independent readers of other programs
+    /// never refuse each other. Only [`NvidiaSmi::new`] takes the process-wide gate the sampler and the approval path
+    /// share.
     pub fn at(program: impl Into<std::path::PathBuf>) -> NvidiaSmi {
         NvidiaSmi {
             program: program.into(),
             timeout: NVIDIA_TIMEOUT,
-            gate: global_gate(),
+            gate: std::sync::Arc::new(NvidiaGate::default()),
         }
     }
 
@@ -1157,12 +1160,22 @@ mod tests {
     }
 
     #[test]
-    fn every_reader_in_the_process_shares_one_gate() {
+    fn the_real_tool_shares_one_gate_and_an_alternate_program_is_isolated() {
         let first = NvidiaSmi::new();
-        let second = NvidiaSmi::at("nvidia-smi");
+        let second = NvidiaSmi::new();
         assert!(
             std::sync::Arc::ptr_eq(&first.gate, &second.gate),
             "the sampler and the approval path's in-use read share the guard"
+        );
+        let alternate = NvidiaSmi::at("nvidia-smi");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first.gate, &alternate.gate),
+            "an alternate program gets its own gate"
+        );
+        let another = NvidiaSmi::at("nvidia-smi");
+        assert!(
+            !std::sync::Arc::ptr_eq(&alternate.gate, &another.gate),
+            "two alternate program readers never refuse each other"
         );
     }
 

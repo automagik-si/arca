@@ -609,6 +609,47 @@ fn an_oversize_nvidia_smi_answer_is_refused_at_the_cap() {
 }
 
 #[test]
+fn separate_programs_do_not_refuse_each_other_as_busy() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("separate-gates");
+    let started = scratch.path().join("started");
+    let script = scratch.path().join("slow.sh");
+    // The program marks its start, holds its reader for a second, then answers one card.
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nsleep 1\nprintf '%s\\n' '00000000:01:00.0, GPU-11111111-1111-1111-1111-111111111111, 0, 0, 16376, 0, 0, 0, 0, 0x0'\n",
+            started.display()
+        ),
+    )
+    .expect("the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+
+    let slow = NvidiaSmi::at(script).with_timeout(Duration::from_secs(5));
+    let slow = std::thread::spawn(move || slow.readings());
+    // The marker proves the slow program started, so its reader holds its own gate for the check below.
+    let until = Instant::now() + Duration::from_secs(5);
+    while !started.exists() {
+        assert!(Instant::now() < until, "the slow program started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let missing = NvidiaSmi::at(scratch.path().join("no-such-nvidia-smi"));
+    assert_eq!(
+        missing.readings().expect_err("the program is missing"),
+        arca_metrics::gpu::NvidiaError::Missing,
+        "another program's in-flight read never refuses this one as busy"
+    );
+    let readings = slow
+        .join()
+        .expect("the slow reader thread")
+        .expect("the slow program answers, not Busy");
+    assert_eq!(readings.len(), 1);
+}
+
+#[test]
 fn attribution_checks_the_first_lxc_segment_and_strict_docker_ids() {
     let scratch = Scratch::new("spoof");
     let docker = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
