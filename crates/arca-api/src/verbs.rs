@@ -164,7 +164,7 @@ static VERBS: [Verb; 28] = [
     },
     Verb {
         name: "action_propose",
-        summary: "Records an inert service or database action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+        summary: "Records an inert service, database or GPU assignment action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -840,6 +840,7 @@ fn host_sample() -> Value {
 fn gpu_section() -> Value {
     result(vec![
         ("reason", true, nullable(string())),
+        ("skipped", true, nullable(string())),
         (
             "cards",
             true,
@@ -893,6 +894,7 @@ fn gpu_owner() -> Value {
         ("kind", true, one_of(&["instance", "container", "host"])),
         ("project", false, string()),
         ("name", false, string()),
+        ("container", false, string()),
     ])
 }
 
@@ -1433,10 +1435,11 @@ pub fn summary_gpu(v: &Value) -> String {
         "detached"
     };
     format!(
-        "GPU {} {} on the instance {}",
+        "GPU {} {} on the instance {} in project {}",
         v["pci"].as_str().unwrap_or("?"),
         state,
-        v["instance"].as_str().unwrap_or("?")
+        v["instance"].as_str().unwrap_or("?"),
+        v["project"].as_str().unwrap_or("?")
     )
 }
 
@@ -1451,46 +1454,54 @@ fn instance_name_schema() -> Value {
     })
 }
 
-/// A PCI address in Incus's spelling: four lowercase domain hex digits, two bus, two slot and one function.
+/// A PCI address in Incus's spelling: an optional four lowercase domain hex digits, two bus, two slot and one function.
+/// The kernel normalizes it before the proposal is recorded.
 fn pci_schema() -> Value {
     json!({
-        "description": "The card's PCI address, such as 0000:01:00.0. It is the card's identity.",
-        "pattern": "^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+        "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+        "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
         "type": "string"
     })
 }
 
 fn approval_schema() -> Value {
     json!({
-        "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+        "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
         "maxLength": 16384,
         "minLength": 1,
         "type": "string"
     })
 }
 
-fn gpu_attach_params() -> Value {
+/// A GPU action's params. `project`, `kind` and `uuid` are resolved by the kernel when the proposal is made and are part
+/// of the approved arguments; a direct caller names only the instance and the card.
+fn gpu_params() -> Value {
     params(vec![
         ("instance", true, instance_name_schema()),
         ("pci", true, pci_schema()),
+        ("project", false, instance_name_schema()),
+        ("kind", false, one_of(&["container", "virtual-machine"])),
+        ("uuid", false, nullable(string())),
         ("approval", true, approval_schema()),
     ])
 }
 
+fn gpu_attach_params() -> Value {
+    gpu_params()
+}
+
 fn gpu_detach_params() -> Value {
-    params(vec![
-        ("instance", true, instance_name_schema()),
-        ("pci", true, pci_schema()),
-        ("approval", true, approval_schema()),
-    ])
+    gpu_params()
 }
 
 fn gpu_change_result() -> Value {
     result(vec![
         ("instance", true, string()),
+        ("project", true, string()),
         ("pci", true, string()),
         ("device", true, string()),
         ("attached", true, boolean()),
+        ("changed", true, boolean()),
     ])
 }
 

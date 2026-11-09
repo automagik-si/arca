@@ -166,6 +166,9 @@
                               "properties": {
                                 "owner": {
                                   "properties": {
+                                    "container": {
+                                      "type": "string"
+                                    },
                                     "kind": {
                                       "enum": [
                                         "instance",
@@ -332,10 +335,17 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "skipped": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "reason",
+                    "skipped",
                     "cards"
                   ],
                   "type": "object"
@@ -626,6 +636,9 @@
                               "properties": {
                                 "owner": {
                                   "properties": {
+                                    "container": {
+                                      "type": "string"
+                                    },
                                     "kind": {
                                       "enum": [
                                         "instance",
@@ -792,10 +805,17 @@
                         "string",
                         "null"
                       ]
+                    },
+                    "skipped": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
                     }
                   },
                   "required": [
                     "reason",
+                    "skipped",
                     "cards"
                   ],
                   "type": "object"
@@ -1673,7 +1693,7 @@
           "type": "object"
         }
       },
-      "summary": "Records an inert service or database action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+      "summary": "Records an inert service, database or GPU assignment action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
@@ -3445,7 +3465,7 @@
           "name": "approval",
           "required": true,
           "schema": {
-            "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
             "maxLength": 16384,
             "minLength": 1,
             "type": "string"
@@ -3466,9 +3486,41 @@
           "name": "pci",
           "required": true,
           "schema": {
-            "description": "The card's PCI address, such as 0000:01:00.0. It is the card's identity.",
-            "pattern": "^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+            "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+            "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
             "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "enum": [
+              "container",
+              "virtual-machine"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "uuid",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       ],
@@ -3479,6 +3531,9 @@
             "attached": {
               "type": "boolean"
             },
+            "changed": {
+              "type": "boolean"
+            },
             "device": {
               "type": "string"
             },
@@ -3487,13 +3542,18 @@
             },
             "pci": {
               "type": "string"
+            },
+            "project": {
+              "type": "string"
             }
           },
           "required": [
             "instance",
+            "project",
             "pci",
             "device",
-            "attached"
+            "attached",
+            "changed"
           ],
           "type": "object"
         }
@@ -3511,7 +3571,7 @@
           "name": "approval",
           "required": true,
           "schema": {
-            "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
             "maxLength": 16384,
             "minLength": 1,
             "type": "string"
@@ -3532,9 +3592,41 @@
           "name": "pci",
           "required": true,
           "schema": {
-            "description": "The card's PCI address, such as 0000:01:00.0. It is the card's identity.",
-            "pattern": "^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+            "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+            "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
             "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "enum": [
+              "container",
+              "virtual-machine"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "uuid",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       ],
@@ -3545,6 +3637,9 @@
             "attached": {
               "type": "boolean"
             },
+            "changed": {
+              "type": "boolean"
+            },
             "device": {
               "type": "string"
             },
@@ -3553,13 +3648,18 @@
             },
             "pci": {
               "type": "string"
+            },
+            "project": {
+              "type": "string"
             }
           },
           "required": [
             "instance",
+            "project",
             "pci",
             "device",
-            "attached"
+            "attached",
+            "changed"
           ],
           "type": "object"
         }

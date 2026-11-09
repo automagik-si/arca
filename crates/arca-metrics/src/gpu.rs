@@ -39,6 +39,15 @@ pub const NVIDIA_MISSING: &str = "nvidia-smi is not installed";
 /// Why a card has no telemetry: `nvidia-smi` ran, but the read failed.
 pub const NVIDIA_FAILED: &str = "the nvidia-smi read failed";
 
+/// Why a card has no telemetry: `nvidia-smi` did not answer by its deadline and was killed.
+pub const NVIDIA_TIMEOUT_REASON: &str = "the nvidia-smi read timed out";
+
+/// How long one `nvidia-smi` query may run before it is killed.
+pub const NVIDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The most bytes of `nvidia-smi` output the sampler reads.
+pub const NVIDIA_MAX_OUTPUT: usize = 1024 * 1024;
+
 /// How a GPU is currently used. It is derived from the card's kernel driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -110,6 +119,8 @@ impl GpuCard {
 pub enum NvidiaError {
     /// The `nvidia-smi` program is not installed.
     Missing,
+    /// The program did not answer by its deadline and was killed.
+    TimedOut,
     /// The program ran, but it failed or its output could not be read. The text is a short reason, never a raw value.
     Failed(String),
 }
@@ -118,6 +129,7 @@ impl fmt::Display for NvidiaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Missing => f.write_str(NVIDIA_MISSING),
+            Self::TimedOut => f.write_str(NVIDIA_TIMEOUT_REASON),
             Self::Failed(why) => write!(f, "{NVIDIA_FAILED}: {why}"),
         }
     }
@@ -166,8 +178,14 @@ pub struct NvidiaProcess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum GpuOwner {
-    /// An Incus instance. The name is the instance name, and the project is the instance's project.
-    Instance { project: String, name: String },
+    /// An Incus instance. The name is the instance name, and the project is the instance's project. A Docker container
+    /// inside the instance is extra detail, never a second owner.
+    Instance {
+        project: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        container: Option<String>,
+    },
     /// A Docker container, named by the id in its `docker-<id>.scope` cgroup.
     Container { name: String },
     /// A process on the host, or one whose cgroup does not name an instance or a container.
@@ -236,6 +254,8 @@ impl From<GpuCard> for GpuCardSample {
 pub struct GpuSection {
     /// Why the inventory is absent. `None` when the cards list was read, even when it is empty.
     pub reason: Option<String>,
+    /// Why some cards were left out of a read inventory, such as one with no PCI address. The rest still list.
+    pub skipped: Option<String>,
     pub cards: Vec<GpuCardSample>,
 }
 
@@ -251,12 +271,40 @@ impl GpuSection {
     }
 }
 
+/// The cards of one successful inventory, and why a card may have been left out. A skipped card is not a failed read: the
+/// cards beside it still list, and the reason says one was dropped rather than that the host has no cards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GpuInventory {
+    pub cards: Vec<GpuCard>,
+    pub skipped: Option<String>,
+}
+
 /// Reads the GPU cards of a `/1.0/resources` document. `None` when the document does not carry a usable `gpu.cards` list:
 /// an absent or malformed list is unknown, never a shorter list that could read as known-empty. A host with no GPU answers
-/// `gpu.total` 0 and `gpu.cards` `[]`, which is a known-empty list.
-pub fn cards_of(document: &Value) -> Option<Vec<GpuCard>> {
+/// `gpu.total` 0 and `gpu.cards` `[]`, which is a known-empty list. A card without a PCI address is skipped, with a reason,
+/// and the other cards still list.
+pub fn cards_of(document: &Value) -> Option<GpuInventory> {
     let cards = document.pointer("/gpu/cards")?.as_array()?;
-    cards.iter().map(card_of).collect()
+    let mut inventory = GpuInventory::default();
+    let mut skipped = 0u64;
+    for card in cards {
+        match card_of(card) {
+            Some(card) => inventory.cards.push(card),
+            None => skipped = skipped.saturating_add(1),
+        }
+    }
+    inventory.skipped = skipped_reason(skipped);
+    Some(inventory)
+}
+
+fn skipped_reason(skipped: u64) -> Option<String> {
+    match skipped {
+        0 => None,
+        1 => Some("1 card without a readable PCI address was skipped".to_string()),
+        count => Some(format!(
+            "{count} cards without a readable PCI address were skipped"
+        )),
+    }
 }
 
 fn card_of(card: &Value) -> Option<GpuCard> {
@@ -322,16 +370,16 @@ fn vram_total(nvidia: &Value) -> Option<u64> {
 /// Reads the inventory through `incus`. A read that fails, or a document without a usable `gpu.cards` list, is `None`.
 /// A 404 is treated as a known-empty list: an Incus without the resources endpoint reports no cards, and the sampler does
 /// not invent an inventory failure for it.
-pub fn read_inventory<R: IncusRead>(incus: &R) -> Option<Vec<GpuCard>> {
+pub fn read_inventory<R: IncusRead>(incus: &R) -> Option<GpuInventory> {
     match incus.get(RESOURCES_PATH) {
         Ok(document) => match cards_of(&document) {
-            Some(cards) => Some(cards),
+            Some(inventory) => Some(inventory),
             // A resources document with no `gpu` object at all is a host without the extension; a present but malformed
             // list is unknown.
-            None if document.get("gpu").is_none() => Some(Vec::new()),
+            None if document.get("gpu").is_none() => Some(GpuInventory::default()),
             None => None,
         },
-        Err(arca_incus::IncusError::Status { code: 404, .. }) => Some(Vec::new()),
+        Err(arca_incus::IncusError::Status { code: 404, .. }) => Some(GpuInventory::default()),
         Err(_) => None,
     }
 }
@@ -341,15 +389,24 @@ pub fn read_inventory<R: IncusRead>(incus: &R) -> Option<Vec<GpuCard>> {
 /// it is still compared exactly rather than being guessed into another form.
 pub fn normalize_pci(text: &str) -> String {
     let text = text.trim().to_ascii_lowercase();
-    let Some((domain, rest)) = text.split_once(':') else {
-        return text;
-    };
-    if domain.is_empty() || !domain.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return text;
+    let parts: Vec<&str> = text.split(':').collect();
+    match parts.as_slice() {
+        // bus:slot.function, with no domain.
+        [bus, rest] if bus.len() == 2 && bus.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            format!("0000:{bus}:{rest}")
+        }
+        // domain:bus:slot.function, with a domain of up to eight hex digits.
+        [domain, bus, rest]
+            if !domain.is_empty()
+                && domain.len() <= 8
+                && domain.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            let trimmed = domain.trim_start_matches('0');
+            let domain = if trimmed.is_empty() { "0" } else { trimmed };
+            format!("{domain:0>4}:{bus}:{rest}")
+        }
+        _ => text,
     }
-    let trimmed = domain.trim_start_matches('0');
-    let domain = if trimmed.is_empty() { "0" } else { trimmed };
-    format!("{domain:0>4}:{rest}")
 }
 
 /// Reads the cards from `nvidia-smi`. It is a trait so a test can give a fake and a node without the tool is a plain
@@ -363,6 +420,7 @@ pub trait Nvidia: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct NvidiaSmi {
     program: std::path::PathBuf,
+    timeout: std::time::Duration,
 }
 
 impl Default for NvidiaSmi {
@@ -375,6 +433,7 @@ impl NvidiaSmi {
     pub fn new() -> NvidiaSmi {
         NvidiaSmi {
             program: std::path::PathBuf::from("nvidia-smi"),
+            timeout: NVIDIA_TIMEOUT,
         }
     }
 
@@ -382,20 +441,78 @@ impl NvidiaSmi {
     pub fn at(program: impl Into<std::path::PathBuf>) -> NvidiaSmi {
         NvidiaSmi {
             program: program.into(),
+            timeout: NVIDIA_TIMEOUT,
         }
     }
 
+    /// The same reader with another deadline, so a test can prove the kill without waiting five seconds.
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> NvidiaSmi {
+        self.timeout = timeout;
+        self
+    }
+
     fn run(&self, args: &[&str]) -> Result<String, NvidiaError> {
-        match Command::new(&self.program).args(args).output() {
-            Ok(output) if output.status.success() => {
-                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        use std::io::Read as _;
+
+        let mut child = Command::new(&self.program)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::NotFound => NvidiaError::Missing,
+                kind => NvidiaError::Failed(kind.to_string()),
+            })?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(NvidiaError::Failed(
+                "the command has no output pipe".to_string(),
+            ));
+        };
+        // Read beside the child so a full pipe never blocks it. One byte past the cap proves the cap was crossed.
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout
+                .take(NVIDIA_MAX_OUTPUT.saturating_add(1) as u64)
+                .read_to_end(&mut bytes);
+            bytes
+        });
+        let deadline = std::time::Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // Do not join the reader: a grandchild may still hold the pipe. The thread ends when the pipe
+                    // closes, and the caller must not wait for it here.
+                    drop(reader);
+                    return Err(NvidiaError::TimedOut);
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(reader);
+                    return Err(NvidiaError::Failed(error.kind().to_string()));
+                }
             }
-            Ok(_) => Err(NvidiaError::Failed(
-                "the command answered an error".to_string(),
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(NvidiaError::Missing),
-            Err(error) => Err(NvidiaError::Failed(error.kind().to_string())),
+        };
+        let bytes = reader
+            .join()
+            .map_err(|_| NvidiaError::Failed("the output reader stopped".to_string()))?;
+        if bytes.len() > NVIDIA_MAX_OUTPUT {
+            return Err(NvidiaError::Failed(
+                "the answer is over the 1 MiB cap".to_string(),
+            ));
         }
+        if !status.success() {
+            return Err(NvidiaError::Failed(
+                "the command answered an error".to_string(),
+            ));
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
 
@@ -509,28 +626,54 @@ fn mib(text: &str) -> Option<u64> {
     whole(text).map(|mib| mib.saturating_mul(1024 * 1024))
 }
 
-/// Reads `/proc/<pid>/cgroup` under `proc_root`: the path of the process's cgroup, from its last `:` field.
+/// Reads `/proc/<pid>/cgroup` under `proc_root`: the cgroup v2 `0::` path when there is one, else the first v1 path that
+/// is not `/`. A v1 `devices` line names the container's payload; the v2 unified line names it too.
 pub fn read_cgroup(proc_root: &Path, pid: u32) -> Option<String> {
     let text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup")).ok()?;
-    text.lines()
-        .filter_map(|line| line.splitn(3, ':').nth(2))
-        .map(str::trim)
-        .find(|path| !path.is_empty())
-        .map(str::to_string)
+    let mut fallback = None;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let Some(hierarchy) = parts.next() else {
+            continue;
+        };
+        let Some(controllers) = parts.next() else {
+            continue;
+        };
+        let Some(path) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        if hierarchy == "0" && controllers.is_empty() {
+            return Some(path.to_string());
+        }
+        if fallback.is_none() && path != "/" {
+            fallback = Some(path.to_string());
+        }
+    }
+    fallback
+}
+
+/// The first path segment of a cgroup path, which is the only place an Incus payload may appear.
+fn first_segment(path: &str) -> &str {
+    path.trim_start_matches('/').split('/').next().unwrap_or("")
 }
 
 /// The instance name from an `lxc.payload.` path, project-aware. Incus names a default-project container's payload
 /// `lxc.payload.<instance>` and another project's `lxc.payload.<project>_<instance>`. The known instance list is consulted
 /// first, so an instance whose own name holds an `_` is matched whole; without that list the first `_` separates the
-/// project from the name, and a name without one is in the default project.
+/// project from the name, and a name without one is in the default project. The literal `lxc.payload.` is matched only as
+/// the first path segment: a name deeper in the path cannot claim to be an instance.
 pub fn incus_instance(path: &str, instances: &[InstanceKey]) -> Option<(String, String)> {
-    let suffix = path
-        .split('/')
-        .find_map(|segment| segment.strip_prefix("lxc.payload."))?;
-    if suffix.is_empty() {
+    let suffix = first_segment(path).strip_prefix("lxc.payload.")?;
+    if !printable(suffix, 128) {
         return None;
     }
     for instance in instances {
+        if !printable(&instance.project, 128) || !printable(&instance.name, 128) {
+            continue;
+        }
         if instance.project == "default" && instance.name == suffix {
             return Some((instance.project.clone(), instance.name.clone()));
         }
@@ -538,23 +681,30 @@ pub fn incus_instance(path: &str, instances: &[InstanceKey]) -> Option<(String, 
             return Some((instance.project.clone(), instance.name.clone()));
         }
     }
-    match suffix.split_once('_') {
-        Some((project, name)) if !project.is_empty() && !name.is_empty() => {
-            Some((project.to_string(), name.to_string()))
-        }
-        _ => Some(("default".to_string(), suffix.to_string())),
-    }
+    let split = suffix.split_once('_');
+    let (project, name) = match split {
+        Some((project, name)) if printable(project, 128) && printable(name, 128) => (project, name),
+        _ => ("default", suffix),
+    };
+    (printable(project, 128) && printable(name, 128))
+        .then(|| (project.to_string(), name.to_string()))
 }
 
-/// The Docker container id from a `docker-<id>.scope` cgroup segment.
+/// The Docker container id from a `docker-<id>.scope` cgroup segment. The id is exactly 64 ASCII hex characters; a segment
+/// that only looks like a Docker scope is ignored, never attributed.
 pub fn docker_container(path: &str) -> Option<String> {
     path.split('/').find_map(|segment| {
-        segment
+        let id = segment
             .strip_prefix("docker-")
-            .and_then(|rest| rest.strip_suffix(".scope"))
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
+            .and_then(|rest| rest.strip_suffix(".scope"))?;
+        (id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| id.to_ascii_lowercase())
     })
+}
+
+/// Whether a name is printable ASCII and within its length cap. A name that is not is never shown.
+fn printable(text: &str, max: usize) -> bool {
+    !text.is_empty() && text.len() <= max && text.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
 /// One instance the attribution knows: its project and name.
@@ -589,11 +739,21 @@ pub fn attribute(
 }
 
 fn owner_of(path: &str, instances: &[InstanceKey]) -> GpuOwner {
-    if let Some(container) = docker_container(path) {
-        return GpuOwner::Container { name: container };
+    // The first segment is checked before any Docker scope, so a Docker cgroup inside an Incus instance belongs to the
+    // instance. A first segment that names `lxc.payload.` but resolves no instance is not retried as Docker: it is host
+    // attribution, never a second guess at a spoofed path.
+    if first_segment(path).starts_with("lxc.payload.") {
+        return match incus_instance(path, instances) {
+            Some((project, name)) => GpuOwner::Instance {
+                project,
+                name,
+                container: docker_container(path),
+            },
+            None => GpuOwner::Host,
+        };
     }
-    match incus_instance(path, instances) {
-        Some((project, name)) => GpuOwner::Instance { project, name },
+    match docker_container(path) {
+        Some(name) => GpuOwner::Container { name },
         None => GpuOwner::Host,
     }
 }
@@ -761,6 +921,7 @@ pub fn mean_gpu(samples: &[&GpuSection], last: &GpuSection) -> GpuSection {
     }
     GpuSection {
         reason: None,
+        skipped: last.skipped.clone(),
         cards,
     }
 }

@@ -24,7 +24,7 @@ use arca_approval::{
     TEST_PASSKEYS_ENV, load_passkeys, load_signers, load_state_passkeys, passkeys_trust,
     signers_trust,
 };
-use arca_incus::UnixIncus;
+use arca_incus::{ProjectFamily, UnixIncus};
 use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
@@ -206,7 +206,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 applied_seq,
                 started,
                 socket: cfg.incus.socket.clone(),
-                metrics_source,
+                metrics_source: Arc::clone(&metrics_source),
             }),
         )
         .handle(
@@ -246,8 +246,28 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
-    let gpu: Arc<dyn crate::gpu::GpuBackend> =
-        Arc::new(crate::gpu::IncusGpu::new(cfg.incus.socket.clone()));
+    // A watch-only node has no device writer. A kernel-mode node writes GPU devices only in its own project family, and
+    // only reads local telemetry for the VM-in-use check when the metrics source is a settled local daemon.
+    let gpu: Option<Arc<dyn crate::gpu::GpuBackend>> = if kernel_mode {
+        let family = ProjectFamily::new(
+            cfg.kernel.projects.iter().map(String::as_str),
+            cfg.kernel.droidd_projects.iter().map(String::as_str),
+        )
+        .map_err(Failure::Config)?;
+        let local = {
+            let choice = metrics_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            choice.is_local() && !choice.provisional
+        };
+        Some(Arc::new(crate::gpu::IncusGpu::new(
+            cfg.incus.socket.clone(),
+            family,
+            local,
+        )))
+    } else {
+        None
+    };
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers(
         Arc::clone(&kernel),
         clock.clone(),

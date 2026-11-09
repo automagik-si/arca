@@ -1,7 +1,7 @@
 //! The tick's [`Inputs`], built from the sampler's newest sample and its [`Readings`].
 
 use arca_incus::IncusRead;
-use arca_metrics::{REMOTE_HOST_REASON, Sampler};
+use arca_metrics::{NOT_MEASURABLE, NVIDIA_MISSING, REMOTE_HOST_REASON, Sampler};
 
 use crate::eval::{
     DriveUse, GpuGone, GpuUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse,
@@ -23,13 +23,19 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
         unavailable.insert(RuleId::CpuHot);
     }
     // The inventory is the same read for a local and a remote host. Telemetry and attribution are local only, so a remote
-    // host (or one without nvidia-smi) has every card present with no telemetry. That is a reading this node can never
-    // provide, not a gap: a firing VRAM alert resolves with `no data` after its clear window instead of hanging forever.
+    // host (or one without nvidia-smi) has every card present with no telemetry. Only that permanently unmeasurable case is
+    // `unavailable`: a failed or timed-out read, or one the tool has not answered yet, is an ordinary unknown and keeps a
+    // firing alert. A provisional mode is not marked either; it may still resolve local.
     let gpu_known = sample.gpu.reason.is_none();
-    if gpu_known
-        && !sample.gpu.cards.is_empty()
-        && sample.gpu.cards.iter().all(|card| card.telemetry.is_none())
-    {
+    let not_measurable = !sample.gpu.cards.is_empty()
+        && sample.gpu.cards.iter().all(|card| {
+            card.telemetry.is_none()
+                && matches!(
+                    card.reason.as_deref(),
+                    Some(NOT_MEASURABLE) | Some(NVIDIA_MISSING)
+                )
+        });
+    if gpu_known && not_measurable && !sampler.mode_provisional() {
         unavailable.insert(RuleId::GpuVramHigh);
     }
     let gpus = gpu_known.then(|| Timed {

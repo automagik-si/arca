@@ -13,7 +13,7 @@ use arca_metrics::gpu::{
     NvidiaReading, NvidiaSmi, normalize_pci, parse_processes, parse_readings, read_cgroup,
     read_inventory,
 };
-use arca_metrics::{FakeNvidia, Sampler, SamplerConfig, mean};
+use arca_metrics::{FakeNvidia, Nvidia, Sampler, SamplerConfig, mean};
 use serde_json::{Value, json};
 
 const FIRST: &str = "0000:01:00.0";
@@ -235,7 +235,8 @@ fn two_identical_cards_are_two_rows_keyed_by_pci() {
         first.processes[0].owner,
         GpuOwner::Instance {
             project: "default".to_string(),
-            name: "alpha".to_string()
+            name: "alpha".to_string(),
+            container: None,
         }
     );
     assert_eq!(
@@ -252,7 +253,8 @@ fn two_identical_cards_are_two_rows_keyed_by_pci() {
         first.processes[3].owner,
         GpuOwner::Instance {
             project: "default".to_string(),
-            name: "alpha".to_string()
+            name: "alpha".to_string(),
+            container: None,
         },
         "a cgroup v1 line resolves the same instance"
     );
@@ -260,7 +262,8 @@ fn two_identical_cards_are_two_rows_keyed_by_pci() {
         second.processes[0].owner,
         GpuOwner::Instance {
             project: "svc".to_string(),
-            name: "beta".to_string()
+            name: "beta".to_string(),
+            container: None,
         },
         "the project is part of the instance's cgroup name"
     );
@@ -421,7 +424,9 @@ fn the_incus_gpu_cards_document_is_parsed_per_card() {
         card(FIRST, "GPU-11111111-1111-1111-1111-111111111111"),
         card(SECOND, "GPU-22222222-2222-2222-2222-222222222222"),
     ]);
-    let cards = arca_metrics::gpu::cards_of(&document).expect("the cards parse");
+    let cards = arca_metrics::gpu::cards_of(&document)
+        .expect("the cards parse")
+        .cards;
     assert_eq!(cards.len(), 2);
     assert_eq!(cards[0].pci, FIRST);
     assert_eq!(cards[1].pci, SECOND);
@@ -436,7 +441,9 @@ fn a_vfio_card_has_its_own_use_and_a_missing_gpu_list_is_empty_not_unknown() {
     let mut bound = card(SECOND, "GPU-22222222-2222-2222-2222-222222222222");
     bound["driver"] = json!("vfio-pci");
     bound["nvidia"] = json!({});
-    let cards = arca_metrics::gpu::cards_of(&resources(vec![bound])).expect("the cards parse");
+    let cards = arca_metrics::gpu::cards_of(&resources(vec![bound]))
+        .expect("the cards parse")
+        .cards;
     assert_eq!(cards[0].usage, arca_metrics::GpuUse::VfioPci);
     assert_eq!(cards[0].uuid, None);
 
@@ -454,7 +461,7 @@ fn a_vfio_card_has_its_own_use_and_a_missing_gpu_list_is_empty_not_unknown() {
     }
     assert_eq!(
         read_inventory(&NoGpu(no_gpu)),
-        Some(Vec::new()),
+        Some(arca_metrics::gpu::GpuInventory::default()),
         "a resources document without a GPU block is a known-empty inventory"
     );
     let malformed = json!({ "gpu": { "cards": "not a list" } });
@@ -537,4 +544,184 @@ fn a_failed_resources_read_is_a_reason_not_an_empty_inventory() {
         }
     }
     assert_eq!(read_inventory(&Offline), None);
+}
+
+#[test]
+fn one_card_without_a_pci_address_is_skipped_with_a_reason() {
+    let mut without = card(SECOND, "GPU-22222222-2222-2222-2222-222222222222");
+    without
+        .as_object_mut()
+        .expect("a card object")
+        .remove("pci_address");
+    let inventory = arca_metrics::gpu::cards_of(&resources(vec![
+        card(FIRST, "GPU-11111111-1111-1111-1111-111111111111"),
+        without,
+    ]))
+    .expect("the list is read");
+    assert_eq!(inventory.cards.len(), 1, "the valid card still lists");
+    assert_eq!(inventory.cards[0].pci, FIRST);
+    assert!(
+        inventory
+            .skipped
+            .as_deref()
+            .is_some_and(|reason| reason.contains("1 card without a readable PCI address")),
+        "{:?}",
+        inventory.skipped
+    );
+}
+
+#[test]
+fn a_hanging_nvidia_smi_is_killed_at_its_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("hang");
+    let script = scratch.path().join("hang.sh");
+    fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+    let reader = NvidiaSmi::at(script).with_timeout(Duration::from_millis(150));
+
+    let started = Instant::now();
+    let error = reader.readings().expect_err("the hang times out");
+    assert_eq!(error, arca_metrics::gpu::NvidiaError::TimedOut);
+    assert_eq!(error.to_string(), "the nvidia-smi read timed out");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the child was killed at the deadline"
+    );
+}
+
+#[test]
+fn an_oversize_nvidia_smi_answer_is_refused_at_the_cap() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    let scratch = Scratch::new("cap");
+    let script = scratch.path().join("large.sh");
+    // One byte over the 1 MiB cap, without needing a big fixture file.
+    fs::write(
+        &script,
+        "#!/bin/sh\nhead -c 1048577 /dev/zero | tr '\\0' x\n",
+    )
+    .expect("the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+    let reader = NvidiaSmi::at(script).with_timeout(Duration::from_secs(5));
+    let error = reader.readings().expect_err("the answer is too large");
+    assert_eq!(
+        error,
+        arca_metrics::gpu::NvidiaError::Failed("the answer is over the 1 MiB cap".to_string())
+    );
+}
+
+#[test]
+fn attribution_checks_the_first_lxc_segment_and_strict_docker_ids() {
+    let scratch = Scratch::new("spoof");
+    let docker = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let instances = vec![
+        InstanceKey {
+            project: "default".to_string(),
+            name: "alpha".to_string(),
+        },
+        InstanceKey {
+            project: "svc".to_string(),
+            name: "beta".to_string(),
+        },
+    ];
+    let cgroups = [
+        (
+            1010,
+            format!("0::/lxc.payload.alpha/docker-{docker}.scope\n"),
+        ),
+        (
+            1011,
+            "0::/lxc.payload.alpha/docker-not-a-real-id.scope\n".to_string(),
+        ),
+        (
+            1012,
+            "0::/user.slice/lxc.payload.alpha\n".to_string(),
+        ),
+        (
+            1013,
+            "12:devices:/lxc.payload.svc_beta\n".to_string(),
+        ),
+        (
+            1014,
+            format!("0::/system.slice/docker-{docker}.scope\n"),
+        ),
+        (
+            1015,
+            "0::/lxc.payload.unknown/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope\n".to_string(),
+        ),
+    ];
+    for (pid, text) in &cgroups {
+        write(scratch.path(), &format!("proc/{pid}/cgroup"), text);
+    }
+    let processes: Vec<NvidiaProcess> = cgroups
+        .iter()
+        .map(|(pid, _)| NvidiaProcess {
+            pci: FIRST.to_string(),
+            pid: *pid,
+            vram_bytes: Some(1 << 20),
+        })
+        .collect();
+    let owners = arca_metrics::gpu::attribute(&scratch.path().join("proc"), &processes, &instances);
+    assert_eq!(
+        owners[0].owner,
+        GpuOwner::Instance {
+            project: "default".to_string(),
+            name: "alpha".to_string(),
+            container: Some(docker.to_string()),
+        },
+        "Docker inside an Incus instance belongs to the instance, with the id as detail"
+    );
+    assert_eq!(
+        owners[1].owner,
+        GpuOwner::Instance {
+            project: "default".to_string(),
+            name: "alpha".to_string(),
+            container: None,
+        },
+        "a faked docker-<text>.scope is ignored"
+    );
+    assert_eq!(
+        owners[2].owner,
+        GpuOwner::Host,
+        "lxc.payload. is only recognized as the first segment"
+    );
+    assert_eq!(
+        owners[3].owner,
+        GpuOwner::Instance {
+            project: "svc".to_string(),
+            name: "beta".to_string(),
+            container: None,
+        },
+        "the v1 devices line resolves the instance"
+    );
+    assert_eq!(
+        owners[4].owner,
+        GpuOwner::Container {
+            name: docker.to_string()
+        }
+    );
+    assert_eq!(
+        owners[5].owner,
+        GpuOwner::Instance {
+            project: "default".to_string(),
+            name: "unknown".to_string(),
+            container: Some(docker.to_string()),
+        },
+        "a first-segment lxc.payload. is an instance; its Docker scope is extra detail"
+    );
+    assert_eq!(
+        arca_metrics::gpu::docker_container(&format!("/system.slice/docker-{docker}.scope")),
+        Some(docker.to_string())
+    );
+    assert_eq!(
+        arca_metrics::gpu::docker_container("/system.slice/docker-abc.scope"),
+        None
+    );
+    assert_eq!(
+        arca_metrics::gpu::incus_instance("/user.slice/lxc.payload.alpha", &instances),
+        None
+    );
 }

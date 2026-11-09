@@ -155,7 +155,7 @@ impl Default for Rules {
                 id: R::GpuGone,
                 enabled: true,
                 threshold: 0.0,
-                for_s: 0,
+                for_s: 15,
                 clear_for_s: 120,
                 clear_margin: 0.0,
                 severity: Critical,

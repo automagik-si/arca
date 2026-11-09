@@ -704,7 +704,7 @@ fn a_host_sample_with_nulls_conforms_to_the_result_schema() {
         "psi": { "memorySomeAvg10": 0.0, "memoryFullAvg10": null, "cpuSomeAvg10": 1.5 },
         "cpuTempC": null,
         "gpuBusyPct": null,
-        "gpu": { "reason": null, "cards": [] },
+        "gpu": { "reason": null, "skipped": null, "cards": [] },
         "pools": [{ "name": "p", "usedBytes": null, "totalBytes": 9, "freeBytes": null }],
         "network": null,
         "projects": [{ "project": "p", "total": 2, "running": 1 }]
@@ -794,6 +794,7 @@ fn gpu_section() -> Value {
             "kind": { "type": "string", "enum": ["instance", "container", "host"] },
             "project": { "type": "string" },
             "name": { "type": "string" },
+            "container": { "type": "string" },
         }),
         &["kind"],
     );
@@ -843,9 +844,10 @@ fn gpu_section() -> Value {
     open(
         json!({
             "reason": { "type": ["string", "null"] },
+            "skipped": { "type": ["string", "null"] },
             "cards": { "type": "array", "items": card },
         }),
-        &["reason", "cards"],
+        &["reason", "skipped", "cards"],
     )
 }
 

@@ -483,12 +483,14 @@ impl<R: IncusRead> Sampler<R> {
     /// wrong machine. A local host without the tool reports [`gpu::NVIDIA_MISSING`], and a failed read [`gpu::NVIDIA_FAILED`];
     /// a card the tool does not list reads [`NO_READING_YET`]. None of them is a zero.
     fn read_gpu(&mut self, instances: Option<&[InstanceReading]>) -> GpuSection {
-        let Some(cards) = gpu::read_inventory(&self.incus) else {
+        let Some(inventory) = gpu::read_inventory(&self.incus) else {
             return GpuSection {
                 reason: Some(INVENTORY_REASON.to_string()),
+                skipped: None,
                 cards: Vec::new(),
             };
         };
+        let cards = inventory.cards;
         let current: BTreeMap<String, GpuCard> = cards
             .iter()
             .cloned()
@@ -578,6 +580,7 @@ impl<R: IncusRead> Sampler<R> {
             .collect();
         GpuSection {
             reason: None,
+            skipped: inventory.skipped,
             cards,
         }
     }
@@ -901,6 +904,7 @@ fn read_host<R: IncusRead>(
 fn nvidia_reason(error: &gpu::NvidiaError) -> String {
     match error {
         gpu::NvidiaError::Missing => gpu::NVIDIA_MISSING.to_string(),
+        gpu::NvidiaError::TimedOut => gpu::NVIDIA_TIMEOUT_REASON.to_string(),
         gpu::NvidiaError::Failed(_) => gpu::NVIDIA_FAILED.to_string(),
     }
 }

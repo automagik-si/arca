@@ -2110,16 +2110,12 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
     let statement =
         arca::handlers::plan_statement("node1", &plan.to_hex(), NOW, &"b".repeat(64)).unwrap();
     let proof = common::approve_statement(&key, &statement);
-    let handler = arca::handlers::plan_handlers(
-        Arc::clone(&rig.kernel),
-        Arc::new(|| NOW),
-        None,
-        Arc::new(arca::gpu::FakeGpu::default()),
-    )
-    .into_iter()
-    .find(|(name, _)| *name == "approval_submit")
-    .unwrap()
-    .1;
+    let handler =
+        arca::handlers::plan_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW), None, None)
+            .into_iter()
+            .find(|(name, _)| *name == "approval_submit")
+            .unwrap()
+            .1;
     let (started, waiting) = mpsc::channel();
     let (finished, done) = mpsc::channel();
     let approve = std::thread::spawn(move || {

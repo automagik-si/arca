@@ -447,13 +447,13 @@ impl FakeIncus {
         lock(&self.shared.writes).clone()
     }
 
-    /// Sets the host's own interfaces: each name with the addresses it holds. The fake answers the listing of
-    /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
     /// Serves `document` at `/1.0/resources`. Until a test sets one, the fake answers 404, as an Incus without the endpoint.
     pub fn set_resources(&self, document: Value) {
         *lock(&self.shared.resources) = Some(document);
     }
 
+    /// Sets the host's own interfaces: each name with the addresses it holds. The fake answers the listing of
+    /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
     pub fn set_host_interfaces(&self, interfaces: Vec<(String, Vec<IpAddr>)>) {
         *lock(&self.shared.host_interfaces) = interfaces;
     }

@@ -14,8 +14,9 @@ mod sample;
 mod smart;
 
 pub use gpu::{
-    FakeNvidia, GpuCard, GpuCardSample, GpuOwner, GpuProcess, GpuSection, GpuTelemetry, GpuUse,
-    INVENTORY_REASON, InstanceKey, NO_READING_YET, NOT_MEASURABLE, NVIDIA_FAILED, NVIDIA_MISSING,
+    FakeNvidia, GpuCard, GpuCardSample, GpuInventory, GpuOwner, GpuProcess, GpuSection,
+    GpuTelemetry, GpuUse, INVENTORY_REASON, InstanceKey, NO_READING_YET, NOT_MEASURABLE,
+    NVIDIA_FAILED, NVIDIA_MAX_OUTPUT, NVIDIA_MISSING, NVIDIA_TIMEOUT, NVIDIA_TIMEOUT_REASON,
     Nvidia, NvidiaError, NvidiaProcess, NvidiaReading, NvidiaSmi, attribute, cards_of, mean_gpu,
     normalize_pci, parse_processes, parse_readings, read_inventory,
 };

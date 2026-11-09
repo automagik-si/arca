@@ -2099,13 +2099,27 @@ mod gpu_alerts {
     fn a_card_gone_from_the_inventory_fires_and_its_return_resolves_with_subject_gone() {
         let rules = Rules::default();
         let mut eval = Evaluator::default();
-        let fired = eval.step(&rules, &reading_of(RuleId::GpuGone, 1.0, T0), T0);
+        // The disappearance holds for 15 s before it fires.
+        for t in [0, 5_000, 10_000] {
+            assert!(
+                eval.step(&rules, &reading_of(RuleId::GpuGone, 1.0, T0 + t), T0 + t)
+                    .is_empty()
+            );
+        }
+        let fired = eval.step(
+            &rules,
+            &reading_of(RuleId::GpuGone, 1.0, T0 + 15_000),
+            T0 + 15_000,
+        );
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].rule, "gpu-gone");
         assert_eq!(fired[0].labels["gpu"], "0000:01:00.0");
 
         // A failed inventory read is unknown, never an empty one: the alert is held, still firing, and marked unknown.
-        assert!(eval.step(&rules, &Inputs::default(), T0 + 5_000).is_empty());
+        assert!(
+            eval.step(&rules, &Inputs::default(), T0 + 20_000)
+                .is_empty()
+        );
         assert_eq!(eval.firing().len(), 1);
         assert!(eval.firing()[0].unknown);
         assert_eq!(
@@ -2116,8 +2130,8 @@ mod gpu_alerts {
         // The card is back: the fresh reading no longer holds its label set, so the alert resolves once as subject-gone.
         let resolved = eval.step(
             &rules,
-            &reading_of(RuleId::GpuGone, 0.0, T0 + 10_000),
-            T0 + 10_000,
+            &reading_of(RuleId::GpuGone, 0.0, T0 + 25_000),
+            T0 + 25_000,
         );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].state, EventState::Resolved);
@@ -2146,5 +2160,172 @@ mod gpu_alerts {
             Some(UnknownReason::Missing),
             "a card the tool cannot measure is unknown, never a zero that never fires"
         );
+    }
+}
+
+mod gpu_inputs {
+    use super::*;
+    use arca_metrics::gpu::{FakeNvidia, GpuSection, NOT_MEASURABLE, NVIDIA_MISSING, NvidiaSmi};
+    use arca_metrics::{ModeRetry, Sampler, SamplerConfig};
+    use std::sync::Arc;
+
+    fn fake(tag: &str) -> (Scratch, FakeIncus) {
+        let scratch = Scratch::new(tag);
+        let fake = FakeIncus::start(
+            scratch.path(),
+            FakeState {
+                server: json!({ "api_version": "1.0" }),
+                projects: Vec::new(),
+                instances: Vec::new(),
+                pools: Vec::new(),
+                networks: Vec::new(),
+            },
+        )
+        .expect("the fake serves");
+        fake.set_resources(json!({
+            "cpu": { "total": 4 },
+            "memory": { "total": 8_589_934_592u64, "used": 1_073_741_824u64 },
+            "gpu": {
+                "total": 1,
+                "cards": [{
+                    "pci_address": "0000:01:00.0",
+                    "vendor": "NVIDIA Corporation",
+                    "product": "NVIDIA GeForce RTX 4060 Ti",
+                    "driver": "nvidia",
+                    "numa_node": 0
+                }]
+            }
+        }));
+        (scratch, fake)
+    }
+
+    fn sampler(
+        scratch: &Scratch,
+        fake: &FakeIncus,
+        local: bool,
+        retry: Option<ModeRetry>,
+        nvidia: impl arca_metrics::Nvidia + 'static,
+    ) -> Sampler<UnixIncus> {
+        Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: local,
+                mode_retry: retry,
+            },
+            UnixIncus::new(fake.socket().to_path_buf()),
+        )
+        .with_nvidia(Arc::new(nvidia))
+    }
+
+    #[test]
+    fn not_measurable_and_missing_tool_are_unavailable_but_a_failed_or_pending_read_is_not() {
+        let (remote_scratch, remote_fake) = fake("gpu-remote");
+        let mut remote = sampler(
+            &remote_scratch,
+            &remote_fake,
+            false,
+            None,
+            FakeNvidia::missing(),
+        );
+        remote.sample(T0);
+        let inputs = inputs::from_sampler(&remote);
+        assert!(inputs.unavailable.contains(&RuleId::GpuVramHigh));
+        assert_eq!(
+            remote.latest().expect("a sample").gpu.cards[0]
+                .reason
+                .as_deref(),
+            Some(NOT_MEASURABLE)
+        );
+
+        let (missing_scratch, missing_fake) = fake("gpu-missing");
+        let mut missing = sampler(
+            &missing_scratch,
+            &missing_fake,
+            true,
+            None,
+            FakeNvidia::missing(),
+        );
+        missing.sample(T0);
+        let inputs = inputs::from_sampler(&missing);
+        assert!(inputs.unavailable.contains(&RuleId::GpuVramHigh));
+        assert_eq!(
+            missing.latest().expect("a sample").gpu.cards[0]
+                .reason
+                .as_deref(),
+            Some(NVIDIA_MISSING)
+        );
+
+        let (failed_scratch, failed_fake) = fake("gpu-failed");
+        let mut failed = sampler(
+            &failed_scratch,
+            &failed_fake,
+            true,
+            None,
+            FakeNvidia::failing(),
+        );
+        failed.sample(T0);
+        let inputs = inputs::from_sampler(&failed);
+        assert!(
+            !inputs.unavailable.contains(&RuleId::GpuVramHigh),
+            "a failed read is an ordinary unknown, not a permanent one"
+        );
+        assert!(inputs.gpus.is_some(), "the card still has an unknown value");
+
+        let (empty_scratch, empty_fake) = fake("gpu-empty");
+        let mut empty = sampler(&empty_scratch, &empty_fake, true, None, FakeNvidia::empty());
+        empty.sample(T0);
+        let inputs = inputs::from_sampler(&empty);
+        assert!(
+            !inputs.unavailable.contains(&RuleId::GpuVramHigh),
+            "no reading yet is unknown, never permanently unavailable"
+        );
+        assert_eq!(
+            empty.latest().expect("a sample").gpu.cards[0]
+                .reason
+                .as_deref(),
+            Some(arca_metrics::NO_READING_YET)
+        );
+    }
+
+    #[test]
+    fn a_provisional_mode_is_not_unavailable_even_when_the_card_cannot_be_measured() {
+        let (scratch, fake) = fake("gpu-provisional");
+        let retry = ModeRetry {
+            explicit: None,
+            path_is_local: true,
+        };
+        let mut sampler = sampler(&scratch, &fake, true, Some(retry), FakeNvidia::missing());
+        sampler.sample(T0);
+        assert!(
+            sampler.mode_provisional(),
+            "the socket-path choice is provisional"
+        );
+        let inputs = inputs::from_sampler(&sampler);
+        assert!(
+            !inputs.unavailable.contains(&RuleId::GpuVramHigh),
+            "a provisional mode may still resolve local"
+        );
+    }
+
+    #[test]
+    fn the_metric_read_does_not_wait_for_a_hanging_tool_on_the_tick() {
+        // The tool itself is covered by the metrics tests; here the sampler must retain the card and a plain reason.
+        let (scratch, fake) = fake("gpu-reason");
+        let mut sampler = sampler(
+            &scratch,
+            &fake,
+            true,
+            None,
+            NvidiaSmi::at(scratch.path().join("missing-nvidia-smi")),
+        );
+        sampler.sample(T0);
+        let section: GpuSection = sampler.latest().expect("a sample").gpu.clone();
+        assert_eq!(section.cards.len(), 1);
+        assert!(section.cards[0].telemetry.is_none());
+        assert_eq!(section.cards[0].reason.as_deref(), Some(NVIDIA_MISSING));
     }
 }

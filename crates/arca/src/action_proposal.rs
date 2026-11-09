@@ -1,4 +1,4 @@
-//! Inert action proposals: a viewer may ask the owner to approve one of a closed set of service or database actions.
+//! Inert action proposals: a viewer may ask the owner to approve one of a closed set of service, database or GPU actions.
 //!
 //! A proposal changes nothing. It carries the action's own arguments, a digest over the canonical `{action, args}`, the
 //! exact arguments the owner is shown as `details`, and a plain-language summary built here from the validated arguments.
@@ -144,7 +144,25 @@ impl ActionKind {
                     return Err("args/name: expected a database name".to_string());
                 }
             }
-            Self::GpuAttach | Self::GpuDetach => {}
+            Self::GpuAttach | Self::GpuDetach => {
+                for key in ["project", "kind", "uuid"] {
+                    if args.get(key).is_none() {
+                        return Err(format!(
+                            "args/{key}: the kernel resolves it when the proposal is made"
+                        ));
+                    }
+                }
+                let kind = args["kind"].as_str().unwrap_or_default();
+                if !matches!(kind, "container" | "virtual-machine") {
+                    return Err("args/kind: expected container or virtual-machine".to_string());
+                }
+                let pci = args["pci"].as_str().unwrap_or_default();
+                let normalized = arca_metrics::normalize_pci(pci);
+                let Some(object) = args.as_object_mut() else {
+                    return Err("args: expected an object".to_string());
+                };
+                object.insert("pci".to_string(), Value::String(normalized));
+            }
             _ => {}
         }
         Ok(args)
@@ -179,21 +197,35 @@ impl ActionKind {
             }
             Self::GpuAttach | Self::GpuDetach => {
                 let instance = text("instance");
+                let project = text("project");
+                let kind = text("kind");
                 let pci = text("pci");
                 let gpu = match gpu_product.filter(|product| !product.is_empty()) {
                     Some(product) => format!("{product} ({pci})"),
                     None => format!("GPU at {pci}"),
                 };
-                let effect = match self {
-                    Self::GpuAttach => format!(
-                        "Adds the card to {instance} as a physical GPU device. Its memory is shared with every other consumer of the card, not isolated."
+                let shown_instance = if kind.is_empty() {
+                    instance.to_string()
+                } else {
+                    format!("{instance} ({kind})")
+                };
+                let effect = match (self, kind) {
+                    (Self::GpuAttach, "virtual-machine") => format!(
+                        "{instance} takes the whole card while it runs; the host and every container lose it until {instance} stops."
+                    ),
+                    (Self::GpuAttach, _) => format!(
+                        "Adds the card to {instance} as a physical GPU device. Its memory is shared with every other user of the card, not isolated."
+                    ),
+                    (_, "virtual-machine") => format!(
+                        "Removes the card from {instance}; the VM no longer takes the whole card when it runs."
                     ),
                     _ => format!(
-                        "Removes the card from {instance}. The device is taken out of the instance's configuration."
+                        "Removes the card from {instance}; the container no longer sees it."
                     ),
                 };
                 vec![
-                    row("Instance", instance),
+                    row("Project", project),
+                    row("Instance", &shown_instance),
                     row("GPU", &gpu),
                     row("Effect", &effect),
                 ]
@@ -238,10 +270,22 @@ impl ActionKind {
                 text("name"),
                 image("image")
             ),
+            Self::GpuAttach if !text("project").is_empty() => format!(
+                "Attach the GPU at {} to instance {} in project {}",
+                text("pci"),
+                text("instance"),
+                text("project")
+            ),
             Self::GpuAttach => format!(
                 "Attach the GPU at {} to instance {}",
                 text("pci"),
                 text("instance")
+            ),
+            Self::GpuDetach if !text("project").is_empty() => format!(
+                "Detach the GPU at {} from instance {} in project {}",
+                text("pci"),
+                text("instance"),
+                text("project")
             ),
             Self::GpuDetach => format!(
                 "Detach the GPU at {} from instance {}",
@@ -307,13 +351,16 @@ fn loaded_words(
         return (action.summary(args), action.details(args));
     }
     let instance = args["instance"].as_str().unwrap_or_default();
+    let project = args["project"].as_str().unwrap_or_default();
     let pci = args["pci"].as_str().unwrap_or_default();
-    let rows_fit = stored_details.len() == 3
-        && stored_details[0].label == "Instance"
-        && stored_details[0].value == instance
-        && stored_details[1].label == "GPU"
-        && stored_details[1].value.contains(pci)
-        && stored_details[2].label == "Effect";
+    let rows_fit = stored_details.len() == 4
+        && stored_details[0].label == "Project"
+        && stored_details[0].value == project
+        && stored_details[1].label == "Instance"
+        && stored_details[1].value.starts_with(instance)
+        && stored_details[2].label == "GPU"
+        && stored_details[2].value.contains(pci)
+        && stored_details[3].label == "Effect";
     if rows_fit && stored_summary.contains(pci) && stored_summary.contains(instance) {
         (stored_summary.to_string(), stored_details.to_vec())
     } else {
@@ -759,13 +806,16 @@ mod tests {
         let proposed = store
             .propose(
                 ActionKind::GpuAttach,
-                json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+                json!({
+                    "project": "arcak-gpu", "instance": "alpha", "kind": "container",
+                    "uuid": "00000000-0000-4000-8000-0000000000a1", "pci": "0000:02:00.0"
+                }),
                 1_000,
                 Some("NVIDIA GeForce RTX 4060 Ti"),
             )
             .expect("a GPU proposal");
         assert_eq!(
-            proposed.details[1],
+            proposed.details[2],
             ActionDetail {
                 label: "GPU".to_string(),
                 value: "NVIDIA GeForce RTX 4060 Ti (0000:02:00.0)".to_string(),
@@ -778,7 +828,7 @@ mod tests {
         assert_eq!(store.waiting().len(), 1);
         assert_eq!(store.waiting()[0].details, proposed.details);
         assert_eq!(store.waiting()[0].summary, proposed.summary);
-        assert!(store.waiting()[0].details[2].value.contains("shared"));
+        assert!(store.waiting()[0].details[3].value.contains("shared"));
     }
 
     #[test]

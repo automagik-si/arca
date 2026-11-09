@@ -3067,12 +3067,7 @@ fn canvas_cookie_cannot_approve_or_reach_mcp() {
     assert!(!String::from_utf8_lossy(&body).contains("approved"));
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     let clock: Clock = Arc::new(|| NOW);
-    let handlers = plan_handlers(
-        Arc::clone(&rig.kernel),
-        clock,
-        None,
-        Arc::new(arca::gpu::FakeGpu::default()),
-    );
+    let handlers = plan_handlers(Arc::clone(&rig.kernel), clock, None, None);
     let submit = handlers
         .iter()
         .find(|(name, _)| *name == "approval_submit")
