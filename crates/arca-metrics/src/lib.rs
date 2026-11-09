@@ -4,6 +4,7 @@
 //! answered at the latest sample, with a `None` for each read that failed, the newest latency probe round, and the incus-osd
 //! update and Secure Boot reading.
 
+pub mod gpu;
 mod incus;
 mod mode;
 mod osd;
@@ -12,6 +13,13 @@ mod procfs;
 mod sample;
 mod smart;
 
+pub use gpu::{
+    FakeNvidia, GpuCard, GpuCardSample, GpuInventory, GpuOwner, GpuProcess, GpuSection,
+    GpuTelemetry, GpuUse, INVENTORY_REASON, InstanceKey, NO_READING_YET, NOT_MEASURABLE,
+    NVIDIA_BUSY_REASON, NVIDIA_FAILED, NVIDIA_MAX_OUTPUT, NVIDIA_MISSING, NVIDIA_TIMEOUT,
+    NVIDIA_TIMEOUT_REASON, Nvidia, NvidiaError, NvidiaProcess, NvidiaReading, NvidiaSmi, attribute,
+    cards_of, mean_gpu, normalize_pci, parse_processes, parse_readings, read_inventory,
+};
 pub use incus::{InstanceKind, InstanceReading};
 pub use mode::{
     HostMode, HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode,

@@ -805,6 +805,27 @@ are refused explicitly; their ownership classifier is unchanged.
 Source: `ExecCommand` and `ServiceFile` in `crates/arca-incus/src/exec.rs`; `ServiceExec::{run, check, sweep}` in
 `crates/arca/src/service_exec.rs`; the service wiring and removal tests in `crates/arca/tests/services/wiring.rs`.
 
+**Rule 51.** A GPU assignment writes only when the node is in kernel mode, and only to an instance in the kernel's project
+family (Rules 5 and 8). `serve` builds no device writer in watch-only mode, and the GPU handler refuses there. The
+instance's own config must classify as a kernel object: a foreign, droidd, contested or retained instance is refused even
+inside the family. When the proposal is made, the kernel resolves the instance's project, type and `volatile.uuid` and puts
+them in the proposal's arguments, so the owner's digest binds them; execution re-reads the instance under that project and
+refuses one that moved, changed type or was recreated with another uuid. The writer itself holds the same `ProjectFamily` and refuses a project
+outside it before any request, a read included. It changes only the instance's own `devices` map: it adds exactly
+`gpu-<normalized pci>` with `{"type":"gpu","gputype":"physical","pci":"<normalized pci>"}`, under the read's `If-Match`, and
+detaches only that exact device; any other GPU device is refused as not Arca's, and a second device for the same card is
+never a false failed removal. The PCI spelling is normalized on both sides. The project, type and uuid checks use the same
+identity rule Rule 50 uses for exec, and the project rule is Rule 45's: a separate, narrow path, never a widening of
+`ProjectFamily`.
+Source: `GpuBackend`, `IncusGpu`, `GpuRefusal` and `GpuActionHandler` in `crates/arca/src/gpu.rs` and
+`crates/arca/src/handlers.rs`; `DeviceAssigner::{attach_gpu, detach_gpu}` and `normalize_pci` in
+`crates/arca-incus/src/assign.rs`; tests `two_identical_gpus_stay_apart_in_proposals_and_only_an_approval_runs_one`,
+`a_gpu_proposal_binds_identity_and_execution_refuses_a_recreated_instance`,
+`an_instance_outside_the_kernel_family_is_refused`, `a_watch_only_node_has_no_gpu_writer`,
+`a_stale_etag_is_412_and_changes_nothing`, `a_gpu_device_that_arca_did_not_add_is_refused_and_left_alone`,
+`two_devices_for_one_card_do_not_leave_a_false_unconfirmed_removal`, `the_writer_itself_refuses_a_project_outside_its_family`
+and `the_backend_refuses_a_foreign_or_retained_instance_and_reads_the_mode_each_call`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is

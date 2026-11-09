@@ -1,9 +1,11 @@
 //! The tick's [`Inputs`], built from the sampler's newest sample and its [`Readings`].
 
 use arca_incus::IncusRead;
-use arca_metrics::{REMOTE_HOST_REASON, Sampler};
+use arca_metrics::{NOT_MEASURABLE, NVIDIA_MISSING, REMOTE_HOST_REASON, Sampler};
 
-use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse};
+use crate::eval::{
+    DriveUse, GpuGone, GpuUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse,
+};
 
 /// The inputs of the sampler's newest sample, stamped with its time. A read that failed in the sampler is `None` here, so
 /// the rule reads it as unknown. Before the first sample every source is unknown.
@@ -20,9 +22,54 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
         unavailable.insert(RuleId::MemPsiHigh);
         unavailable.insert(RuleId::CpuHot);
     }
+    // The inventory is the same read for a local and a remote host. Telemetry and attribution are local only, so a remote
+    // host (or one without nvidia-smi) has every card present with no telemetry. Only that permanently unmeasurable case is
+    // `unavailable`: a failed or timed-out read, or one the tool has not answered yet, is an ordinary unknown and keeps a
+    // firing alert. A provisional mode is not marked either; it may still resolve local.
+    let gpu_known = sample.gpu.reason.is_none();
+    let not_measurable = !sample.gpu.cards.is_empty()
+        && sample.gpu.cards.iter().all(|card| {
+            card.telemetry.is_none()
+                && matches!(
+                    card.reason.as_deref(),
+                    Some(NOT_MEASURABLE) | Some(NVIDIA_MISSING)
+                )
+        });
+    if gpu_known && not_measurable && !sampler.mode_provisional() {
+        unavailable.insert(RuleId::GpuVramHigh);
+    }
+    let gpus = gpu_known.then(|| Timed {
+        at,
+        value: sample
+            .gpu
+            .cards
+            .iter()
+            .map(|card| GpuUse {
+                pci: card.pci.clone(),
+                vram_used_pct: card.telemetry.as_ref().and_then(|telemetry| {
+                    let used = telemetry.memory_used_bytes?;
+                    let total = telemetry.memory_total_bytes?;
+                    (total > 0).then(|| used as f64 / total as f64 * 100.0)
+                }),
+            })
+            .collect(),
+    });
+    let gpus_gone = gpu_known.then(|| Timed {
+        at,
+        value: sampler
+            .readings()
+            .gpus_gone
+            .iter()
+            .map(|card| GpuGone {
+                pci: card.pci.clone(),
+            })
+            .collect(),
+    });
     Inputs {
         at,
         unavailable,
+        gpus,
+        gpus_gone,
         pools: sampler.readings().pools.as_ref().map(|pools| Timed {
             at,
             value: pools

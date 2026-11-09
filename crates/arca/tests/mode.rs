@@ -90,8 +90,8 @@ fn a_shim_style_socket_to_the_local_daemon_is_local_and_keeps_proc_readings() {
     assert!(sample.load.one.is_some(), "the local load is still read");
     assert_eq!(
         resource_reads(&fake),
-        0,
-        "a local node never asks Incus for host totals"
+        1,
+        "a local node asks Incus once, for the GPU inventory, and never for host totals"
     );
 }
 
@@ -114,7 +114,11 @@ fn a_proxy_to_another_host_is_remote_and_reports_no_local_reading() {
         Some("the Incus resources read failed")
     );
     assert_eq!(sample.load.one, None);
-    assert_eq!(resource_reads(&fake), 1);
+    assert_eq!(
+        resource_reads(&fake),
+        2,
+        "one resources read for the remote host totals and one for the GPU inventory"
+    );
 }
 
 #[test]

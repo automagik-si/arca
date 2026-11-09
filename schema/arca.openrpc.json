@@ -132,6 +132,224 @@
                     "null"
                   ]
                 },
+                "gpu": {
+                  "properties": {
+                    "cards": {
+                      "items": {
+                        "properties": {
+                          "driver": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "driverVersion": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "numaNode": {
+                            "type": "integer"
+                          },
+                          "pci": {
+                            "type": "string"
+                          },
+                          "processReason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "processes": {
+                            "items": {
+                              "properties": {
+                                "owner": {
+                                  "properties": {
+                                    "container": {
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "enum": [
+                                        "instance",
+                                        "container",
+                                        "host"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "name": {
+                                      "type": "string"
+                                    },
+                                    "project": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "type": "object"
+                                },
+                                "pci": {
+                                  "type": "string"
+                                },
+                                "pid": {
+                                  "type": "integer"
+                                },
+                                "vramBytes": {
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "pci",
+                                "pid",
+                                "vramBytes",
+                                "owner"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "product": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "telemetry": {
+                            "properties": {
+                              "eventReasons": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "memoryTotalBytes": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "memoryUsedBytes": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "powerDrawW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "powerLimitW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "smClockMhz": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "temperatureC": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "utilizationPct": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "utilizationPct",
+                              "memoryUsedBytes",
+                              "memoryTotalBytes",
+                              "powerDrawW",
+                              "powerLimitW",
+                              "temperatureC",
+                              "smClockMhz",
+                              "eventReasons"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "use": {
+                            "enum": [
+                              "driver-bound",
+                              "vfio-pci",
+                              "no-driver"
+                            ],
+                            "type": "string"
+                          },
+                          "uuid": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "vendor": {
+                            "type": "string"
+                          },
+                          "vramTotalBytes": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "pci",
+                          "uuid",
+                          "vendor",
+                          "product",
+                          "driver",
+                          "driverVersion",
+                          "numaNode",
+                          "vramTotalBytes",
+                          "use",
+                          "telemetry",
+                          "reason",
+                          "processes",
+                          "processReason"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "skipped": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "reason",
+                    "skipped",
+                    "cards"
+                  ],
+                  "type": "object"
+                },
                 "gpuBusyPct": {
                   "type": [
                     "number",
@@ -334,6 +552,7 @@
                 "psi",
                 "cpuTempC",
                 "gpuBusyPct",
+                "gpu",
                 "pools",
                 "network",
                 "projects"
@@ -383,6 +602,224 @@
                     "null"
                   ]
                 },
+                "gpu": {
+                  "properties": {
+                    "cards": {
+                      "items": {
+                        "properties": {
+                          "driver": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "driverVersion": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "numaNode": {
+                            "type": "integer"
+                          },
+                          "pci": {
+                            "type": "string"
+                          },
+                          "processReason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "processes": {
+                            "items": {
+                              "properties": {
+                                "owner": {
+                                  "properties": {
+                                    "container": {
+                                      "type": "string"
+                                    },
+                                    "kind": {
+                                      "enum": [
+                                        "instance",
+                                        "container",
+                                        "host"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "name": {
+                                      "type": "string"
+                                    },
+                                    "project": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "kind"
+                                  ],
+                                  "type": "object"
+                                },
+                                "pci": {
+                                  "type": "string"
+                                },
+                                "pid": {
+                                  "type": "integer"
+                                },
+                                "vramBytes": {
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                }
+                              },
+                              "required": [
+                                "pci",
+                                "pid",
+                                "vramBytes",
+                                "owner"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "product": {
+                            "type": "string"
+                          },
+                          "reason": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "telemetry": {
+                            "properties": {
+                              "eventReasons": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "memoryTotalBytes": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "memoryUsedBytes": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "powerDrawW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "powerLimitW": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "smClockMhz": {
+                                "type": [
+                                  "integer",
+                                  "null"
+                                ]
+                              },
+                              "temperatureC": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              },
+                              "utilizationPct": {
+                                "type": [
+                                  "number",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "utilizationPct",
+                              "memoryUsedBytes",
+                              "memoryTotalBytes",
+                              "powerDrawW",
+                              "powerLimitW",
+                              "temperatureC",
+                              "smClockMhz",
+                              "eventReasons"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "use": {
+                            "enum": [
+                              "driver-bound",
+                              "vfio-pci",
+                              "no-driver"
+                            ],
+                            "type": "string"
+                          },
+                          "uuid": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "vendor": {
+                            "type": "string"
+                          },
+                          "vramTotalBytes": {
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "pci",
+                          "uuid",
+                          "vendor",
+                          "product",
+                          "driver",
+                          "driverVersion",
+                          "numaNode",
+                          "vramTotalBytes",
+                          "use",
+                          "telemetry",
+                          "reason",
+                          "processes",
+                          "processReason"
+                        ],
+                        "type": "object"
+                      },
+                      "type": "array"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "skipped": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "reason",
+                    "skipped",
+                    "cards"
+                  ],
+                  "type": "object"
+                },
                 "gpuBusyPct": {
                   "type": [
                     "number",
@@ -585,6 +1022,7 @@
                 "psi",
                 "cpuTempC",
                 "gpuBusyPct",
+                "gpu",
                 "pools",
                 "network",
                 "projects"
@@ -1060,7 +1498,9 @@
                           "service_unpublish",
                           "service_connect",
                           "service_disconnect",
-                          "postgres_create"
+                          "postgres_create",
+                          "gpu_attach",
+                          "gpu_detach"
                         ],
                         "type": "string"
                       },
@@ -1157,7 +1597,9 @@
               "service_unpublish",
               "service_connect",
               "service_disconnect",
-              "postgres_create"
+              "postgres_create",
+              "gpu_attach",
+              "gpu_detach"
             ],
             "type": "string"
           }
@@ -1182,7 +1624,9 @@
                 "service_unpublish",
                 "service_connect",
                 "service_disconnect",
-                "postgres_create"
+                "postgres_create",
+                "gpu_attach",
+                "gpu_detach"
               ],
               "type": "string"
             },
@@ -1249,7 +1693,7 @@
           "type": "object"
         }
       },
-      "summary": "Records an inert service or database action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+      "summary": "Records an inert service, database or GPU assignment action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
@@ -3009,6 +3453,218 @@
         }
       },
       "summary": "Take a service's dash off the tailnet: it stops serving 8443, its node logs out and leaves the tailnet, and tailscaled stops. Runs whether or not a publish finished.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "gpu_attach",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "pci",
+          "required": true,
+          "schema": {
+            "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+            "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "enum": [
+              "container",
+              "virtual-machine"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "uuid",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "attached": {
+              "type": "boolean"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "device": {
+              "type": "string"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "pci": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "instance",
+            "project",
+            "pci",
+            "device",
+            "attached",
+            "changed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Attach a physical GPU card to an Incus instance, by PCI address, with the owner's signed approval. A card bound to vfio-pci is refused for a container.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "gpu_detach",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "pci",
+          "required": true,
+          "schema": {
+            "description": "The card's PCI address, such as 0000:01:00.0 or 01:00.0. It is the card's identity.",
+            "pattern": "^(?:[0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "enum": [
+              "container",
+              "virtual-machine"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "uuid",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "attached": {
+              "type": "boolean"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "device": {
+              "type": "string"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "pci": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "instance",
+            "project",
+            "pci",
+            "device",
+            "attached",
+            "changed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "doctor",

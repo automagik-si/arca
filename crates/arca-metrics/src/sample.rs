@@ -12,6 +12,10 @@ use arca_incus::IncusRead;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::gpu::{
+    self, GpuCard, GpuCardSample, GpuSection, INVENTORY_REASON, InstanceKey, NO_READING_YET,
+    NOT_MEASURABLE, Nvidia, NvidiaReading, NvidiaSmi, mean_gpu,
+};
 use crate::incus::{self, InstanceReading};
 use crate::mode::{HostModeChoice, MODE_PROBE_TIMEOUT, ModeRetry, choose_host_mode_within};
 use crate::osd::{self, OsdReading, UpdateMemory};
@@ -112,6 +116,9 @@ pub struct HostSample {
     pub psi: Psi,
     pub cpu_temp_c: Option<f64>,
     pub gpu_busy_pct: Option<f64>,
+    /// The GPU inventory and telemetry, keyed by PCI address. A remote host reads the inventory and leaves the telemetry
+    /// absent with a reason.
+    pub gpu: GpuSection,
     pub pools: Vec<Pool>,
     /// Bytes per second over the physical NICs since the previous sample. `None` on the first sample.
     pub network: Option<Network>,
@@ -245,6 +252,10 @@ pub struct Readings {
     /// The SMART state of the drives with SMART enabled, taken every 10 min. `None` when the storage document cannot be read, as
     /// on a plain Incus that answers 404, and before the first read.
     pub drives: Option<DrivesReading>,
+    /// The cards that were in a successful inventory and are gone from the newest one, keyed by PCI address. Empty when the
+    /// newest inventory still holds every card. It is not cleared by a failed inventory read: the alert source is unknown
+    /// then, so a firing disappearance alert is held, never resolved by an outage.
+    pub gpus_gone: Vec<GpuCard>,
 }
 
 /// What the sampler keeps of one instance between ticks: its `last_used_at` on the previous listing, its starts since the
@@ -302,6 +313,13 @@ pub struct Sampler<R: IncusRead> {
     /// The choice `arca_status` reads, when the server shares it. A provisional choice is replaced here when a retry
     /// succeeds or the window ends. `None` for a sampler a test builds directly.
     mode_choice: Option<Arc<Mutex<HostModeChoice>>>,
+    /// The tool the GPU telemetry and attribution read. The real `nvidia-smi` unless a test supplies a fake.
+    nvidia: Arc<dyn Nvidia>,
+    /// Every card a successful inventory has held, by PCI address. A card that disappears stays here, so the disappearance
+    /// is reported; two identical cards are told apart by this address alone.
+    gpu_known: BTreeMap<String, GpuCard>,
+    /// The cards gone from the newest successful inventory, by PCI address.
+    gpu_gone: Vec<GpuCard>,
 }
 
 impl<R: IncusRead> Sampler<R> {
@@ -328,12 +346,22 @@ impl<R: IncusRead> Sampler<R> {
             last_mode_probe: None,
             clock: Arc::new(SystemClock::new()),
             mode_choice: None,
+            nvidia: Arc::new(NvidiaSmi::new()),
+            gpu_known: BTreeMap::new(),
+            gpu_gone: Vec::new(),
         }
     }
 
     /// Shares the startup mode choice with `arca_status`, so a retry that succeeds replaces the provisional answer there too.
     pub fn with_mode_choice(mut self, choice: Arc<Mutex<HostModeChoice>>) -> Self {
         self.mode_choice = Some(choice);
+        self
+    }
+
+    /// Uses `nvidia` for the local GPU telemetry and attribution, instead of the host's `nvidia-smi`. A test supplies a
+    /// fake; a build never needs to.
+    pub fn with_nvidia(mut self, nvidia: Arc<dyn Nvidia>) -> Self {
+        self.nvidia = nvidia;
         self
     }
 
@@ -367,6 +395,7 @@ impl<R: IncusRead> Sampler<R> {
         let instances =
             incus::read_instances(&self.incus).map(|listed| self.count_starts(listed, now_ms));
         let projects = instances.as_deref().map(incus::project_counts);
+        let gpu = self.read_gpu(instances.as_deref());
         let latency = if self.probe_due(now_ms) {
             Some(self.probe_round(now_ms))
         } else {
@@ -411,6 +440,7 @@ impl<R: IncusRead> Sampler<R> {
             psi: host.psi,
             cpu_temp_c: host.cpu_temp_c,
             gpu_busy_pct: host.gpu_busy_pct,
+            gpu,
             pools: rows,
             network: host.network,
             projects: projects.clone().unwrap_or_default(),
@@ -426,6 +456,7 @@ impl<R: IncusRead> Sampler<R> {
             latency,
             osd,
             drives,
+            gpus_gone: self.gpu_gone.clone(),
         };
         self.previous = Some(Previous {
             at: now_ms,
@@ -439,6 +470,119 @@ impl<R: IncusRead> Sampler<R> {
         self.ring
             .back()
             .expect("the sample just pushed is in the ring")
+    }
+
+    /// Reads the GPU inventory through Incus and, on a local host only, the newest telemetry and process attribution.
+    ///
+    /// The inventory is read every tick, for a local and a remote host alike, and is keyed by the PCI address. A card that
+    /// was in an earlier successful inventory and is gone from this one is kept in `gpu_gone` until it returns, so the
+    /// disappearance is a reading rather than a gap. A failed inventory read leaves the known cards alone and reports the
+    /// reason; a card is never invented and a missing read is never an empty inventory.
+    ///
+    /// A remote host's telemetry and attribution are absent with [`NOT_MEASURABLE`]: a local `nvidia-smi` would describe the
+    /// wrong machine. A local host without the tool reports [`gpu::NVIDIA_MISSING`], and a failed read [`gpu::NVIDIA_FAILED`];
+    /// a card the tool does not list reads [`NO_READING_YET`]. None of them is a zero.
+    fn read_gpu(&mut self, instances: Option<&[InstanceReading]>) -> GpuSection {
+        let Some(inventory) = gpu::read_inventory(&self.incus) else {
+            return GpuSection {
+                reason: Some(INVENTORY_REASON.to_string()),
+                skipped: None,
+                cards: Vec::new(),
+            };
+        };
+        let cards = inventory.cards;
+        let current: BTreeMap<String, GpuCard> = cards
+            .iter()
+            .cloned()
+            .map(|card| (card.pci.clone(), card))
+            .collect();
+        for card in current.values() {
+            self.gpu_known.insert(card.pci.clone(), card.clone());
+        }
+        self.gpu_gone = self
+            .gpu_known
+            .values()
+            .filter(|card| !current.contains_key(&card.pci))
+            .cloned()
+            .collect();
+        let (readings, reading_reason) = if self.cfg.incus_local {
+            match self.nvidia.readings() {
+                Ok(readings) => (Some(readings), None),
+                Err(error) => (None, Some(nvidia_reason(&error))),
+            }
+        } else {
+            (None, Some(NOT_MEASURABLE.to_string()))
+        };
+        let readings: Option<BTreeMap<String, NvidiaReading>> = readings.map(|readings| {
+            readings
+                .into_iter()
+                .map(|reading| (reading.pci.clone(), reading))
+                .collect()
+        });
+        let (processes, process_reason) = if self.cfg.incus_local {
+            match self.nvidia.processes() {
+                Ok(processes) => {
+                    let keys: Vec<InstanceKey> = instances
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|instance| InstanceKey {
+                            project: instance.project.clone(),
+                            name: instance.name.clone(),
+                        })
+                        .collect();
+                    (
+                        Some(gpu::attribute(&self.cfg.proc_root, &processes, &keys)),
+                        None,
+                    )
+                }
+                Err(error) => (None, Some(nvidia_reason(&error))),
+            }
+        } else {
+            (None, Some(NOT_MEASURABLE.to_string()))
+        };
+        let cards = current
+            .values()
+            .map(|card| {
+                let mut sample: GpuCardSample = card.clone().into();
+                match (
+                    &reading_reason,
+                    readings.as_ref().and_then(|map| map.get(&card.pci)),
+                ) {
+                    (Some(reason), _) => sample.reason = Some(reason.clone()),
+                    (None, Some(reading)) => {
+                        sample.reason = None;
+                        sample.uuid = sample.uuid.clone().or_else(|| reading.uuid.clone());
+                        sample.vram_total_bytes = sample
+                            .vram_total_bytes
+                            .or(reading.telemetry.memory_total_bytes);
+                        sample.telemetry = Some(reading.telemetry.clone());
+                    }
+                    (None, None) => sample.reason = Some(NO_READING_YET.to_string()),
+                }
+                match &process_reason {
+                    Some(reason) => sample.process_reason = Some(reason.clone()),
+                    None => {
+                        sample.process_reason = None;
+                        sample.processes = processes
+                            .as_ref()
+                            .map(|processes| {
+                                processes
+                                    .iter()
+                                    .filter(|process| process.pci == card.pci)
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    }
+                }
+                sample
+            })
+            .collect();
+        GpuSection {
+            reason: None,
+            skipped: inventory.skipped,
+            cards,
+        }
     }
 
     /// Retries a provisional mode's `/1.0` name check, under [`MODE_PROBE_TIMEOUT`]. Before [`PROVISIONAL_WINDOW_MS`] the
@@ -756,6 +900,16 @@ fn read_host<R: IncusRead>(
     }
 }
 
+/// Why a local `nvidia-smi` read is absent, in the plain words a card carries.
+fn nvidia_reason(error: &gpu::NvidiaError) -> String {
+    match error {
+        gpu::NvidiaError::Missing => gpu::NVIDIA_MISSING.to_string(),
+        gpu::NvidiaError::TimedOut => gpu::NVIDIA_TIMEOUT_REASON.to_string(),
+        gpu::NvidiaError::Busy => gpu::NVIDIA_BUSY_REASON.to_string(),
+        gpu::NvidiaError::Failed(_) => gpu::NVIDIA_FAILED.to_string(),
+    }
+}
+
 /// The `node_metrics` result row: the sample time, the window in minutes, the latest sample and the mean over the window.
 /// Without minutes the window is [`DEFAULT_MINUTES`].
 pub fn node_metrics(s: &Sampler<impl IncusRead>, minutes: Option<u32>, now_ms: u64) -> Value {
@@ -828,6 +982,10 @@ pub fn mean(samples: &[HostSample]) -> Option<HostSample> {
         },
         cpu_temp_c: average(samples.iter().filter_map(|s| s.cpu_temp_c)),
         gpu_busy_pct: average(samples.iter().filter_map(|s| s.gpu_busy_pct)),
+        gpu: mean_gpu(
+            &samples.iter().map(|sample| &sample.gpu).collect::<Vec<_>>(),
+            &last.gpu,
+        ),
         pools: mean_pools(samples),
         network: mean_network(samples),
         projects: mean_projects(samples),

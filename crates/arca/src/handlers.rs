@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 
 use crate::action_proposal::{ActionKind, ActionProposal, ProposalRateLimiter, ProposeError};
 use crate::config::NodeConfig;
+use crate::gpu::{GpuBackend, GpuDeviceState, GpuInstance, GpuRefusal, card_for};
 use crate::kernel::{ActionApprovalError, AppliedSeq, ApprovedAction, JOURNAL_FILE, Kernel};
 
 /// Answers from the public ontology embedded in the binary, without reading node state.
@@ -857,11 +858,12 @@ impl ToolHandler for TokenListHandler {
     }
 }
 
-/// The handlers of the four plan verbs, keyed by verb name, over one kernel and one clock.
+/// The plan, proposal and GPU action handlers, keyed by verb name, over one kernel and one clock.
 pub fn plan_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     postgres_image: Option<String>,
+    gpu: Option<Arc<dyn GpuBackend>>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let rate = Arc::new(ProposalRateLimiter::default());
     vec![
@@ -879,6 +881,23 @@ pub fn plan_handlers(
                 clock: Arc::clone(&clock),
                 postgres_image,
                 rate,
+                gpu: gpu.clone(),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "gpu_attach",
+            Arc::new(GpuActionHandler {
+                action: ActionKind::GpuAttach,
+                kernel: Arc::clone(&kernel),
+                gpu: gpu.clone(),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "gpu_detach",
+            Arc::new(GpuActionHandler {
+                action: ActionKind::GpuDetach,
+                kernel: Arc::clone(&kernel),
+                gpu,
             }) as Arc<dyn ToolHandler>,
         ),
         (
@@ -968,13 +987,14 @@ fn action_json(
     Ok(value)
 }
 
-/// `action_propose`: validates one allowed action's arguments and records an inert proposal. A disallowed action is an
-/// invalid call and leaves no record.
+/// `action_propose`: validates one allowed action's arguments, resolves a GPU action's project, type and identity, and
+/// records an inert proposal. A disallowed action is an invalid call and leaves no record.
 struct ActionPropose {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     postgres_image: Option<String>,
     rate: Arc<ProposalRateLimiter>,
+    gpu: Option<Arc<dyn GpuBackend>>,
 }
 
 impl ToolHandler for ActionPropose {
@@ -989,9 +1009,33 @@ impl ToolHandler for ActionPropose {
             .get("args")
             .cloned()
             .ok_or_else(|| CallError::Invalid("args is required".to_string()))?;
+        let is_gpu = matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach);
+        let payload = if is_gpu {
+            let Some(gpu) = &self.gpu else {
+                return Err(gpu_refusal(GpuRefusal::Disabled));
+            };
+            enrich_gpu(gpu.as_ref(), &payload)?
+        } else {
+            payload
+        };
         let payload = action
             .prepare(&payload, self.postgres_image.as_deref())
             .map_err(CallError::Invalid)?;
+        let gpu_product = match action {
+            ActionKind::GpuAttach => prepare_attach(
+                self.gpu.as_deref().expect("a GPU action has a backend"),
+                &payload,
+            )?
+            .card
+            .map(|card| card.product),
+            ActionKind::GpuDetach => prepare_detach(
+                self.gpu.as_deref().expect("a GPU action has a backend"),
+                &payload,
+            )?
+            .card
+            .map(|card| card.product),
+            _ => None,
+        };
         let now = (self.clock)();
         if !self.rate.allow(&caller.token_id, now) {
             return Err(CallError::Refused {
@@ -1001,7 +1045,7 @@ impl ToolHandler for ActionPropose {
         }
         let mut kernel = lock(&self.kernel)?;
         let proposal = kernel
-            .propose_action(action, payload, now)
+            .propose_action(action, payload, now, gpu_product.as_deref())
             .map_err(propose_failure)?;
         Ok(json!({
             "kind": "action",
@@ -1013,6 +1057,185 @@ impl ToolHandler for ActionPropose {
             "argsDigest": proposal.args_digest,
             "createdAt": proposal.created_ms,
             "expiresAt": proposal.expires_at,
+        }))
+    }
+}
+
+/// A resolved GPU target: the instance the project-bound action names, and the card when the inventory knows it.
+struct GpuTarget {
+    instance: GpuInstance,
+    card: Option<arca_metrics::GpuCard>,
+}
+
+/// Adds the resolved project, type and UUID to a GPU proposal's arguments before validation, so the argsDigest binds
+/// them. The caller's `instance` and `pci` are kept; anything the caller sent for the resolved fields is replaced.
+fn enrich_gpu(gpu: &dyn GpuBackend, args: &Value) -> Result<Value, CallError> {
+    let name = args["instance"]
+        .as_str()
+        .ok_or_else(|| CallError::Invalid("args/instance is required".to_string()))?;
+    let instance = gpu.resolve(name).map_err(gpu_refusal)?;
+    let Some(mut object) = args.as_object().cloned() else {
+        return Err(CallError::Invalid("args: expected an object".to_string()));
+    };
+    object.insert("project".to_string(), json!(instance.project));
+    object.insert("kind".to_string(), json!(instance.kind));
+    object.insert("uuid".to_string(), json!(instance.uuid));
+    Ok(Value::Object(object))
+}
+
+/// Reads the instance the arguments bind and refuses a moved or recreated one.
+fn bound_instance(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuInstance, CallError> {
+    let project = args["project"].as_str().unwrap_or_default();
+    let name = args["instance"].as_str().unwrap_or_default();
+    let instance = gpu.instance(project, name).map_err(gpu_refusal)?;
+    let kind = args["kind"].as_str().unwrap_or_default();
+    let uuid = args["uuid"].as_str();
+    if instance.kind != kind || instance.uuid.as_deref() != uuid {
+        return Err(gpu_refusal(GpuRefusal::Identity(
+            "the instance moved, changed type or was recreated".to_string(),
+        )));
+    }
+    Ok(instance)
+}
+
+/// Checks an attach proposal against the inventory and the project-bound instance. The card must be in the inventory; a
+/// container may not take a vfio-pci card; a virtual machine may not take a driver-bound card another consumer uses.
+fn prepare_attach(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuTarget, CallError> {
+    let pci = args["pci"].as_str().unwrap_or_default();
+    let cards = gpu.inventory().map_err(gpu_refusal)?;
+    let card = card_for(&cards, pci).map_err(gpu_refusal)?;
+    let instance = bound_instance(gpu, args)?;
+    if !gpu.is_kernel_object(&instance).map_err(gpu_refusal)? {
+        return Err(gpu_refusal(GpuRefusal::NotKernelObject(instance.name)));
+    }
+    if card.usage == arca_metrics::GpuUse::VfioPci && instance.is_container() {
+        return Err(gpu_refusal(GpuRefusal::Bound(vec![card.pci.clone()])));
+    }
+    if instance.is_vm()
+        && card.driver.as_deref() == Some("nvidia")
+        && gpu.in_use(&card.pci).map_err(gpu_refusal)? == Some(true)
+    {
+        return Err(gpu_refusal(GpuRefusal::InUse(card.pci.clone())));
+    }
+    Ok(GpuTarget {
+        instance,
+        card: Some(card),
+    })
+}
+
+/// Checks a detach's project-bound instance and that it holds Arca's own device for the card. A card that has left the
+/// inventory can still be detached by its address; the device is the part that must still be Arca's.
+fn prepare_detach(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuTarget, CallError> {
+    let pci = args["pci"].as_str().unwrap_or_default();
+    let instance = bound_instance(gpu, args)?;
+    if !gpu.is_kernel_object(&instance).map_err(gpu_refusal)? {
+        return Err(gpu_refusal(GpuRefusal::NotKernelObject(instance.name)));
+    }
+    let state = gpu.device_state(&instance, pci).map_err(gpu_refusal)?;
+    match state {
+        GpuDeviceState::Arca => {}
+        GpuDeviceState::Absent => {
+            return Err(gpu_refusal(GpuRefusal::DeviceAbsent(pci.to_string())));
+        }
+        GpuDeviceState::Foreign => {
+            return Err(gpu_refusal(GpuRefusal::ForeignDevice(pci.to_string())));
+        }
+    }
+    let card = gpu
+        .inventory()
+        .ok()
+        .and_then(|cards| card_for(&cards, pci).ok());
+    Ok(GpuTarget { instance, card })
+}
+
+fn gpu_refusal(refusal: GpuRefusal) -> CallError {
+    let code = match &refusal {
+        GpuRefusal::Disabled => "GpuDisabled",
+        GpuRefusal::Inventory(_) => "GpuInventoryUnavailable",
+        GpuRefusal::NotInInventory(_) => "GpuNotInInventory",
+        GpuRefusal::Bound(_) => "GpuBoundToVfio",
+        GpuRefusal::InUse(_) => "GpuInUse",
+        GpuRefusal::Project(_) => "GpuProjectRefused",
+        GpuRefusal::Instance(_) => "GpuInstanceUnknown",
+        GpuRefusal::Identity(_) => "GpuInstanceChanged",
+        GpuRefusal::DeviceAbsent(_) => "GpuDeviceAbsent",
+        GpuRefusal::ForeignDevice(_) => "GpuDeviceNotArca",
+        GpuRefusal::NotKernelObject(_) => "GpuInstanceNotKernel",
+    };
+    CallError::Refused {
+        code: code.to_string(),
+        message: refusal.to_string(),
+    }
+}
+
+/// `gpu_attach` and `gpu_detach`: the gated verbs an approved action proposal runs. The random one-shot grant is passed in
+/// `approval`; the handler consumes it before doing any work, so a direct call with no grant is refused and an approval is
+/// spent once. The project, instance identity and card are checked again here, because any of them may have changed.
+struct GpuActionHandler {
+    action: ActionKind,
+    kernel: Arc<Mutex<Kernel>>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+}
+
+impl ToolHandler for GpuActionHandler {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let Some(gpu) = &self.gpu else {
+            return Err(gpu_refusal(GpuRefusal::Disabled));
+        };
+        let mut bare = args;
+        let grant = bare
+            .as_object_mut()
+            .and_then(|object| object.remove("approval"))
+            .and_then(|value| value.as_str().map(str::to_string))
+            .ok_or_else(|| CallError::Invalid("approval is required".to_string()))?;
+        let args = self
+            .action
+            .prepare(&bare, None)
+            .map_err(CallError::Invalid)?;
+        {
+            let mut kernel = lock(&self.kernel)?;
+            if !kernel.consume_action_grant(self.action.as_str(), &args, &grant) {
+                return Err(CallError::Refused {
+                    code: "NotApproved".to_string(),
+                    message: "this action runs only from an approved proposal".to_string(),
+                });
+            }
+        }
+        let pci = args["pci"].as_str().unwrap_or_default().to_string();
+        let target = match self.action {
+            ActionKind::GpuAttach => prepare_attach(gpu.as_ref(), &args)?,
+            _ => prepare_detach(gpu.as_ref(), &args)?,
+        };
+        let change = match self.action {
+            ActionKind::GpuAttach => {
+                gpu.attach(&target.instance, &pci)
+                    .map_err(|message| CallError::Refused {
+                        code: "GpuWriteFailed".to_string(),
+                        message,
+                    })?
+            }
+            _ => gpu
+                .detach(&target.instance, &pci)
+                .map_err(|message| CallError::Refused {
+                    code: "GpuWriteFailed".to_string(),
+                    message,
+                })?,
+        };
+        if self.action == ActionKind::GpuDetach && !change.changed {
+            return Err(CallError::Refused {
+                code: "NothingToRemove".to_string(),
+                message:
+                    "nothing to remove: the instance no longer holds Arca's device for this card"
+                        .to_string(),
+            });
+        }
+        Ok(json!({
+            "instance": target.instance.name,
+            "project": target.instance.project,
+            "pci": pci,
+            "device": change.device,
+            "attached": self.action == ActionKind::GpuAttach,
+            "changed": change.changed,
         }))
     }
 }
@@ -1157,7 +1380,10 @@ impl ActionExecutor {
                 CallError::Internal("the approved action has no handler".to_string())
             })?;
         let mut call = args.clone();
-        if matches!(action, "service_remove" | "service_publish") {
+        if matches!(
+            action,
+            "service_remove" | "service_publish" | "gpu_attach" | "gpu_detach"
+        ) {
             call["approval"] = json!(grant);
         }
         handler.call(

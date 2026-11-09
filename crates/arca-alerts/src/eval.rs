@@ -40,10 +40,12 @@ pub enum RuleId {
     UpdateFailed,
     CrashLoop,
     SmartWarning,
+    GpuVramHigh,
+    GpuGone,
 }
 
 impl RuleId {
-    pub const ALL: [RuleId; 8] = [
+    pub const ALL: [RuleId; 10] = [
         Self::DiskPoolFull,
         Self::MemPsiHigh,
         Self::CpuHot,
@@ -52,6 +54,8 @@ impl RuleId {
         Self::UpdateFailed,
         Self::CrashLoop,
         Self::SmartWarning,
+        Self::GpuVramHigh,
+        Self::GpuGone,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -64,6 +68,8 @@ impl RuleId {
             Self::UpdateFailed => "update-failed",
             Self::CrashLoop => "crash-loop",
             Self::SmartWarning => "smart-warning",
+            Self::GpuVramHigh => "gpu-vram-high",
+            Self::GpuGone => "gpu-gone",
         }
     }
 
@@ -120,7 +126,7 @@ impl Rule {
 pub struct Rules(pub Vec<Rule>);
 
 impl Default for Rules {
-    /// The eight defaults. Disk is percent used, `mem-psi-high` the memory `some` avg10, `cpu-hot` °C. The yes-or-no rules
+    /// The ten defaults. Disk is percent used, `mem-psi-high` the memory `some` avg10, `cpu-hot` °C. The yes-or-no rules
     /// read 1 when bad, `drift` a count, and `crash-loop` the starts of the last 10 minutes.
     fn default() -> Rules {
         use RuleId as R;
@@ -134,6 +140,26 @@ impl Default for Rules {
             Rule::default_of(R::UpdateFailed, 0.0, 0.0, Warning),
             Rule::default_of(R::CrashLoop, 2.0, 2.0, Critical),
             Rule::default_of(R::SmartWarning, 0.0, 0.0, Critical),
+            // The owner's rule: a card above 95 percent VRAM for five minutes. A card that disappears from the inventory
+            // fires at once and clears when it returns.
+            Rule {
+                id: R::GpuVramHigh,
+                enabled: true,
+                threshold: 95.0,
+                for_s: 300,
+                clear_for_s: 120,
+                clear_margin: 5.0,
+                severity: Warning,
+            },
+            Rule {
+                id: R::GpuGone,
+                enabled: true,
+                threshold: 0.0,
+                for_s: 15,
+                clear_for_s: 120,
+                clear_margin: 0.0,
+                severity: Critical,
+            },
         ])
     }
 }
@@ -168,6 +194,12 @@ pub struct Inputs {
     pub instances: Option<Timed<Vec<InstanceUse>>>,
     pub update: Option<Timed<UpdateUse>>,
     pub drives: Option<Timed<Vec<DriveUse>>>,
+    /// Each card in the inventory, with its VRAM use in percent. A card without telemetry is present with `None`, so its
+    /// alert is unknown rather than resolved; the whole source is `None` when the inventory read failed.
+    pub gpus: Option<Timed<Vec<GpuUse>>>,
+    /// The cards that were in the inventory and are gone from it now. `None` when the inventory read failed, so an outage
+    /// never resolves a disappearance alert.
+    pub gpus_gone: Option<Timed<Vec<GpuGone>>>,
     /// The rules whose reading this node can never provide, such as PSI and CPU temperature on a remote metrics source.
     /// A firing alert of one resolves with `no data` after its clear window; a transient outage never does.
     pub unavailable: BTreeSet<RuleId>,
@@ -221,6 +253,20 @@ pub struct InstanceUse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateUse {
     pub failed: bool,
+}
+
+/// One GPU card's VRAM use. The PCI address is the card's identity, so two identical cards have two rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuUse {
+    pub pci: String,
+    /// The share of the card's VRAM in use, in percent. `None` when the card has no telemetry yet.
+    pub vram_used_pct: Option<f64>,
+}
+
+/// One card that was in the inventory and is gone from it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuGone {
+    pub pci: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -517,6 +563,16 @@ fn source_of(id: RuleId, inputs: &Inputs, now: u64) -> Source {
                         drive.passed.map(|passed| bad_as(!passed)),
                     )
                 })
+                .collect()
+        }),
+        RuleId::GpuVramHigh => read(&inputs.gpus, SAMPLE_MAX_AGE_MS, now, |gpus| {
+            gpus.iter()
+                .map(|gpu| (labels_of([("gpu", gpu.pci.as_str())]), gpu.vram_used_pct))
+                .collect()
+        }),
+        RuleId::GpuGone => read(&inputs.gpus_gone, SAMPLE_MAX_AGE_MS, now, |gone| {
+            gone.iter()
+                .map(|gpu| (labels_of([("gpu", gpu.pci.as_str())]), Some(1.0)))
                 .collect()
         }),
     }

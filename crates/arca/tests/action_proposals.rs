@@ -45,6 +45,7 @@ struct Rig {
     handlers: std::collections::HashMap<&'static str, Arc<dyn ToolHandler>>,
     runs: Arc<AtomicU64>,
     executor: ActionExecutor,
+    gpu: Arc<arca::gpu::FakeGpu>,
 }
 
 impl Rig {
@@ -60,23 +61,54 @@ impl Rig {
             kernel(&scratch, &fake, verifier, NOW).expect("the kernel opens"),
         ));
         let clock = Arc::new(AtomicU64::new(NOW));
-        let handlers = plan_handlers(
-            Arc::clone(&kernel),
-            {
-                let clock = Arc::clone(&clock);
-                Arc::new(move || clock.load(Ordering::SeqCst))
-            },
-            postgres_image.map(str::to_string),
-        )
-        .into_iter()
-        .collect();
+        let gpu = Arc::new(
+            arca::gpu::FakeGpu::new(
+                gpu_cards(),
+                vec![
+                    gpu_instance("alpha", "arcak-gpu", "container"),
+                    gpu_instance("beta", "arcak-gpu", "container"),
+                    gpu_instance("foreign", "droidd", "container"),
+                    gpu_instance("benchy", "bench", "container"),
+                    arca::gpu::GpuInstance {
+                        project: "arcak-gpu".to_string(),
+                        name: "unowned".to_string(),
+                        kind: "container".to_string(),
+                        uuid: Some("00000000-0000-4000-8000-0000000unowned".to_string()),
+                        own_config: std::collections::BTreeMap::new(),
+                    },
+                ],
+            )
+            .with_family(["arcak-gpu".to_string()]),
+        );
+        let handlers: std::collections::HashMap<&'static str, Arc<dyn ToolHandler>> =
+            plan_handlers(
+                Arc::clone(&kernel),
+                {
+                    let clock = Arc::clone(&clock);
+                    Arc::new(move || clock.load(Ordering::SeqCst))
+                },
+                postgres_image.map(str::to_string),
+                Some(Arc::clone(&gpu) as Arc<dyn arca::gpu::GpuBackend>),
+            )
+            .into_iter()
+            .collect();
         let runs = Arc::new(AtomicU64::new(0));
-        let executor = ActionExecutor::new([(
-            "service_create",
-            Arc::new(Counting {
-                runs: Arc::clone(&runs),
-            }) as Arc<dyn ToolHandler>,
-        )]);
+        let executor = ActionExecutor::new([
+            (
+                "service_create",
+                Arc::new(Counting {
+                    runs: Arc::clone(&runs),
+                }) as Arc<dyn ToolHandler>,
+            ),
+            (
+                "gpu_attach",
+                Arc::clone(&handlers["gpu_attach"]) as Arc<dyn ToolHandler>,
+            ),
+            (
+                "gpu_detach",
+                Arc::clone(&handlers["gpu_detach"]) as Arc<dyn ToolHandler>,
+            ),
+        ]);
         Rig {
             _scratch: scratch,
             _fake: fake,
@@ -85,6 +117,7 @@ impl Rig {
             handlers,
             runs,
             executor,
+            gpu,
         }
     }
 
@@ -121,6 +154,30 @@ impl Rig {
 
 fn create_args(name: &str) -> Value {
     json!({ "name": name, "template": "nats" })
+}
+
+/// Two identical cards, as the second RTX 4060 Ti will be: the same product string, two PCI addresses.
+fn gpu_cards() -> Vec<arca_metrics::GpuCard> {
+    let mut first = arca_metrics::GpuCard::new("0000:01:00.0", "NVIDIA GeForce RTX 4060 Ti");
+    first.uuid = Some("GPU-11111111-1111-1111-1111-111111111111".to_string());
+    first.vram_total_bytes = Some(17_179_869_184);
+    let mut second = arca_metrics::GpuCard::new("0000:02:00.0", "NVIDIA GeForce RTX 4060 Ti");
+    second.uuid = Some("GPU-22222222-2222-2222-2222-222222222222".to_string());
+    second.vram_total_bytes = Some(17_179_869_184);
+    vec![first, second]
+}
+
+fn gpu_instance(name: &str, project: &str, kind: &str) -> arca::gpu::GpuInstance {
+    arca::gpu::GpuInstance {
+        project: project.to_string(),
+        name: name.to_string(),
+        kind: kind.to_string(),
+        uuid: Some(format!("00000000-0000-4000-8000-{name:0>12}")),
+        own_config: std::collections::BTreeMap::from([(
+            "user.arcakernel.entry".to_string(),
+            "gpu-alpha".to_string(),
+        )]),
+    }
 }
 
 fn statement(host: &str, id: &str, action: &str, digest: &str, nonce: &str) -> String {
@@ -225,6 +282,13 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 json!({ "from": "api", "to": "nats" })
             }
             ActionKind::PostgresCreate => json!({ "name": "orders" }),
+            ActionKind::GpuAttach | ActionKind::GpuDetach => json!({
+                "project": "arcak-gpu",
+                "instance": "alpha",
+                "kind": "container",
+                "uuid": "00000000-0000-4000-8000-0000000000a1",
+                "pci": "0000:01:00.0",
+            }),
         }
     }
 
@@ -233,6 +297,22 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             .prepare(&sample(action), Some(TEST_PG_IMAGE))
             .expect("the sample is valid");
         let details = action.details(&prepared);
+        if matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach) {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Project", "Instance", "GPU", "Effect"]);
+            assert_eq!(details[0].value, "arcak-gpu");
+            assert_eq!(details[1].value, "alpha (container)");
+            assert!(details[2].value.contains("0000:01:00.0"));
+            assert!(
+                details[3].value.contains("shared with every other user")
+                    || details[3].value.contains("Removes")
+            );
+            assert_eq!(
+                prepared["pci"], "0000:01:00.0",
+                "the address is normalized before the digest"
+            );
+            continue;
+        }
         let schema = action.params_schema();
         let fields = schema["properties"].as_object().expect("properties");
         let mut seen = 0;
@@ -660,4 +740,417 @@ fn a_statement_with_an_unlisted_action_does_not_parse() {
         parse_statement(text.as_bytes()),
         Err(ApprovalRefusal::Malformed(_))
     ));
+}
+
+/// Marks `pci` attached in the fake backend, as an earlier approved action would have.
+fn mark_attached(rig: &Rig, name: &str, pci: &str) {
+    let instance = gpu_instance(name, "arcak-gpu", "container");
+    arca::gpu::GpuBackend::attach(&*rig.gpu, &instance, pci)
+        .expect("the fake marks the device attached");
+}
+
+#[test]
+fn two_identical_gpus_stay_apart_in_proposals_and_only_an_approval_runs_one() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu", &key);
+    let second = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect("the second card is in the inventory");
+    assert_eq!(second["action"], json!("gpu_attach"));
+    assert_eq!(second["args"]["project"], json!("arcak-gpu"));
+    assert_eq!(second["args"]["kind"], json!("container"));
+    assert!(
+        second["args"]["uuid"].is_string(),
+        "the instance identity is bound into the digest"
+    );
+    assert_eq!(
+        second["details"],
+        json!([
+            { "label": "Project", "value": "arcak-gpu" },
+            { "label": "Instance", "value": "alpha (container)" },
+            {
+                "label": "GPU",
+                "value": "NVIDIA GeForce RTX 4060 Ti (0000:02:00.0)"
+            },
+            {
+                "label": "Effect",
+                "value": "Adds the card to alpha as a physical GPU device. Its memory is shared with every other user of the card, not isolated."
+            }
+        ])
+    );
+    assert!(
+        second["details"][3]["value"]
+            .as_str()
+            .is_some_and(
+                |effect| effect.contains("not isolated") && !effect.contains("isolated VRAM")
+            ),
+        "two users of one card are never described as isolated VRAM"
+    );
+    assert!(
+        second["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("arcak-gpu")),
+        "the summary names the bound project"
+    );
+    let first = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:01:00.0" }),
+        )
+        .expect("the first card is in the inventory");
+    assert_ne!(second["id"], first["id"], "the cards are two proposals");
+    assert!(
+        first["details"][2]["value"]
+            .as_str()
+            .is_some_and(|gpu| gpu.ends_with("(0000:01:00.0)"))
+    );
+
+    // A direct call without the one-shot grant changes nothing and is refused, even with the resolved fields.
+    let direct = call_verb(
+        &rig.handlers,
+        "gpu_attach",
+        json!({
+            "project": "arcak-gpu", "instance": "alpha", "kind": "container",
+            "uuid": second["args"]["uuid"], "pci": "0000:02:00.0", "approval": "not-a-grant"
+        }),
+    )
+    .expect_err("a direct call has no owner approval");
+    assert!(matches!(
+        direct,
+        CallError::Refused { ref code, .. } if code == "NotApproved"
+    ));
+    assert!(rig.gpu.calls().is_empty(), "nothing was attached");
+
+    // The owner's approval runs exactly the card the proposal names, once.
+    let id = second["id"].as_str().expect("an id");
+    let digest = second["argsDigest"].as_str().expect("a digest");
+    let statement = statement(HOST, id, "gpu_attach", digest, &"a".repeat(32));
+    let approval = approve_statement(&key, &statement);
+    let approved = rig
+        .approve(id, &approval, NOW)
+        .expect("the approval verifies");
+    let result = rig
+        .executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect("the approved attach runs");
+    assert_eq!(result["instance"], json!("alpha"));
+    assert_eq!(result["project"], json!("arcak-gpu"));
+    assert_eq!(result["pci"], json!("0000:02:00.0"));
+    assert_eq!(result["attached"], json!(true));
+    assert_eq!(
+        rig.gpu.calls(),
+        vec![arca::gpu::GpuCall::Attach {
+            project: "arcak-gpu".to_string(),
+            instance: "alpha".to_string(),
+            pci: "0000:02:00.0".to_string(),
+        }],
+        "the first card was never confused with the second"
+    );
+    let replay = rig
+        .executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect_err("the grant was consumed");
+    assert!(matches!(
+        replay,
+        CallError::Refused { ref code, .. } if code == "NotApproved"
+    ));
+    assert_eq!(rig.gpu.calls().len(), 1, "the replay attached nothing");
+}
+
+#[test]
+fn a_gpu_proposal_binds_identity_and_execution_refuses_a_recreated_instance() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-identity", &key);
+    let proposed = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect("a proposal");
+    let uuid = proposed["args"]["uuid"].as_str().expect("a uuid");
+    assert_eq!(proposed["details"][0]["value"], json!("arcak-gpu"));
+
+    // The same name in the same project, but a recreated instance: its volatile.uuid changed.
+    let mut recreated = gpu_instance("alpha", "arcak-gpu", "container");
+    recreated.uuid = Some("00000000-0000-4000-8000-00000000ffff".to_string());
+    rig.gpu.set_instances(vec![recreated]);
+    let id = proposed["id"].as_str().expect("an id");
+    let digest = proposed["argsDigest"].as_str().expect("a digest");
+    let approval = approve_statement(
+        &key,
+        &statement(HOST, id, "gpu_attach", digest, &"c".repeat(32)),
+    );
+    let approved = rig.approve(id, &approval, NOW).expect("the approval");
+    let refused = rig
+        .executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect_err("the recreated instance is refused");
+    assert!(
+        matches!(refused, CallError::Refused { ref code, .. } if code == "GpuInstanceChanged"),
+        "{refused:?}"
+    );
+    assert!(rig.gpu.calls().is_empty(), "nothing was attached");
+    assert_eq!(
+        approved.args["uuid"],
+        json!(uuid),
+        "the old uuid is still bound"
+    );
+}
+
+#[test]
+fn an_instance_outside_the_kernel_family_is_refused() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-family", &key);
+    for name in ["foreign", "benchy"] {
+        let refused = rig
+            .propose(
+                "gpu_attach",
+                json!({ "instance": name, "pci": "0000:02:00.0" }),
+            )
+            .expect_err("an instance outside the family is refused");
+        assert!(
+            matches!(refused, CallError::Refused { ref code, .. } if code == "GpuProjectRefused"),
+            "{refused:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_or_vfio_card_is_refused_for_attach() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-refuse", &key);
+    let unknown = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:03:00.0" }),
+        )
+        .expect_err("the card is not in the inventory");
+    assert!(matches!(
+        unknown,
+        CallError::Refused { ref code, .. } if code == "GpuNotInInventory"
+    ));
+
+    let mut bound = arca_metrics::GpuCard::new("0000:02:00.0", "NVIDIA GeForce RTX 4060 Ti");
+    bound.usage = arca_metrics::GpuUse::VfioPci;
+    bound.driver = Some("vfio-pci".to_string());
+    rig.gpu.set_cards(vec![bound]);
+    let container = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("a container cannot take a vfio-pci card");
+    assert!(matches!(
+        container,
+        CallError::Refused { ref code, .. } if code == "GpuBoundToVfio"
+    ));
+
+    // A virtual machine is exactly the case vfio-pci exists for, so the same card is allowed there.
+    rig.gpu
+        .set_instances(vec![gpu_instance("alpha", "arcak-gpu", "virtual-machine")]);
+    rig.propose(
+        "gpu_attach",
+        json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+    )
+    .expect("a VM may take a vfio-pci card");
+}
+
+#[test]
+fn a_vm_attach_refuses_an_in_use_nvidia_card_and_states_the_whole_card_effect() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-vm", &key);
+    rig.gpu
+        .set_instances(vec![gpu_instance("alpha", "arcak-gpu", "virtual-machine")]);
+    rig.gpu.set_in_use("0000:02:00.0", Some(true));
+    let in_use = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("a VM may not take an in-use nvidia card");
+    assert!(matches!(
+        in_use,
+        CallError::Refused { ref code, .. } if code == "GpuInUse"
+    ));
+
+    rig.gpu.set_in_use("0000:02:00.0", Some(false));
+    let proposed = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect("a free card is proposed for the VM");
+    assert_eq!(
+        proposed["details"][1],
+        json!({"label":"Instance","value":"alpha (virtual-machine)"})
+    );
+    assert_eq!(
+        proposed["details"][3]["value"],
+        json!(
+            "alpha takes the whole card while it runs; the host and every container lose it until alpha stops."
+        )
+    );
+}
+
+#[test]
+fn a_detach_refuses_an_absent_or_foreign_device_at_proposal_time() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-device", &key);
+    let absent = rig
+        .propose(
+            "gpu_detach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("there is no device to remove");
+    assert!(matches!(
+        absent,
+        CallError::Refused { ref code, .. } if code == "GpuDeviceAbsent"
+    ));
+
+    rig.gpu.set_foreign_device(
+        &gpu_instance("alpha", "arcak-gpu", "container"),
+        "0000:02:00.0",
+    );
+    let foreign = rig
+        .propose(
+            "gpu_detach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("the device is not Arca's");
+    assert!(matches!(
+        foreign,
+        CallError::Refused { ref code, .. } if code == "GpuDeviceNotArca"
+    ));
+}
+
+#[test]
+fn a_detach_is_proposed_for_the_card_by_its_pci_address_even_after_it_left_the_inventory() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-detach", &key);
+    mark_attached(&rig, "alpha", "0000:02:00.0");
+    let proposed = rig
+        .propose(
+            "gpu_detach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect("a detach proposal");
+    assert_eq!(proposed["action"], json!("gpu_detach"));
+    assert_eq!(
+        proposed["details"][0],
+        json!({"label":"Project","value":"arcak-gpu"})
+    );
+    assert_eq!(
+        proposed["details"][2],
+        json!({ "label": "GPU", "value": "NVIDIA GeForce RTX 4060 Ti (0000:02:00.0)" })
+    );
+    assert!(
+        proposed["details"][3]["value"]
+            .as_str()
+            .is_some_and(|effect| effect.contains("Removes"))
+    );
+
+    // The card can leave the inventory between the proposal and the run; the detach still names it by address.
+    rig.gpu.set_cards(vec![arca_metrics::GpuCard::new(
+        "0000:01:00.0",
+        "NVIDIA GeForce RTX 4060 Ti",
+    )]);
+    let id = proposed["id"].as_str().expect("an id");
+    let digest = proposed["argsDigest"].as_str().expect("a digest");
+    let statement = statement(HOST, id, "gpu_detach", digest, &"b".repeat(32));
+    let approval = approve_statement(&key, &statement);
+    let approved = rig
+        .approve(id, &approval, NOW)
+        .expect("the approval verifies");
+    let result = rig
+        .executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect("the approved detach runs");
+    assert_eq!(result["attached"], json!(false));
+    assert_eq!(result["changed"], json!(true));
+    assert_eq!(result["pci"], json!("0000:02:00.0"));
+    assert_eq!(
+        rig.gpu.calls(),
+        vec![
+            arca::gpu::GpuCall::Attach {
+                project: "arcak-gpu".to_string(),
+                instance: "alpha".to_string(),
+                pci: "0000:02:00.0".to_string(),
+            },
+            arca::gpu::GpuCall::Detach {
+                project: "arcak-gpu".to_string(),
+                instance: "alpha".to_string(),
+                pci: "0000:02:00.0".to_string(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_watch_only_node_has_no_gpu_writer() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-disabled", &key);
+    let clock = Arc::clone(&rig.clock);
+    let handlers: std::collections::HashMap<&'static str, Arc<dyn ToolHandler>> = plan_handlers(
+        Arc::clone(&rig.kernel),
+        Arc::new(move || clock.load(Ordering::SeqCst)),
+        None,
+        None,
+    )
+    .into_iter()
+    .collect();
+    let refused = call_verb(
+        &handlers,
+        "action_propose",
+        json!({
+            "action": "gpu_attach",
+            "args": { "instance": "alpha", "pci": "0000:02:00.0" }
+        }),
+    )
+    .expect_err("a watch-only node refuses a GPU proposal");
+    assert!(matches!(
+        refused,
+        CallError::Refused { ref code, .. } if code == "GpuDisabled"
+    ));
+    let direct = call_verb(
+        &handlers,
+        "gpu_attach",
+        json!({ "instance": "alpha", "pci": "0000:02:00.0", "approval": "x" }),
+    )
+    .expect_err("a watch-only node has no GPU handler writer");
+    assert!(matches!(
+        direct,
+        CallError::Refused { ref code, .. } if code == "GpuDisabled"
+    ));
+}
+
+#[test]
+fn a_foreign_or_retained_instance_is_refused_even_in_the_family() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-owner", &key);
+    let unowned = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "unowned", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("an instance without the kernel mark is refused");
+    assert!(
+        matches!(unowned, CallError::Refused { ref code, .. } if code == "GpuInstanceNotKernel"),
+        "{unowned:?}"
+    );
+
+    // The same alpha is a retained object when its entry's plan was declined.
+    rig.gpu.retain("gpu-alpha");
+    let retained = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("a retained instance is refused");
+    assert!(
+        matches!(retained, CallError::Refused { ref code, .. } if code == "GpuInstanceNotKernel"),
+        "{retained:?}"
+    );
 }

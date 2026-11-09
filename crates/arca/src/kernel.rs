@@ -230,8 +230,10 @@ impl Kernel {
         action: ActionKind,
         args: Value,
         now_ms: u64,
+        gpu_product: Option<&str>,
     ) -> Result<ActionProposal, ProposeError> {
-        self.action_proposals.propose(action, args, now_ms)
+        self.action_proposals
+            .propose(action, args, now_ms, gpu_product)
     }
 
     /// Declines one waiting action proposal, whatever its age. Returns whether one waited under `id`.
