@@ -38,6 +38,7 @@ function fakeDsh({
   const followed = [];
   const cancels = [];
   const executed = [];
+  const presented = [];
   let title = null;
   let callCounter = 1;
   let turnCounter = 0;
@@ -145,14 +146,16 @@ function fakeDsh({
       const value = await registered.definition.execute(args, {
         callId, agent, signal: new AbortController().signal,
       });
+      // DSH hands the model the render() payload, never the raw tool value. This fake records exactly that
+      // payload so a test can assert what the model would read.
+      const content = registered.definition.output.render(args, value);
+      presented.push({ name, args, value, content });
       executed.push({ name, args });
       events.emit('session/event', agent.session, {
         type: 'tool/result',
         data: {
           turn: currentTurn,
-          message: {
-            role: 'tool', toolCallId: callId, content: [{ type: 'text', text: JSON.stringify(value) }], isError: false,
-          },
+          message: { role: 'tool', toolCallId: callId, content, isError: false },
         },
       });
       return value;
@@ -219,7 +222,7 @@ function fakeDsh({
     },
   };
   return {
-    dsh, api, created, resumed, followed, cancels, executed, globals, guards,
+    dsh, api, created, resumed, followed, cancels, executed, presented, globals, guards,
     restrictions, sections, releaseCreate: () => releaseCreate?.(),
     title: () => title, events,
   };
@@ -430,6 +433,113 @@ test('write intent is a presentation hint and the prompt pins the read-only cont
   assert.doesNotMatch(prompt, /postgres_link|service_remove/);
   assert.match(stateFilePath({ DSH_HOME: '/tmp/example-home' }), /^\/tmp\/example-home\/storages\/arca-canvas-chat\.json$/);
   assert.equal(stateFilePath({ DSH_HOME: '/tmp/example-home' }, '/tmp/other.json'), '/tmp/other.json');
+});
+
+test('the Doctor prompt is a snapshot for a plain-language owner conversation', () => {
+  const prompt = doctorPrompt({
+    hosts: [{ name: 'alpha' }, { name: 'beta' }],
+    approvalUrl: 'https://example.com/approve',
+    now: Date.parse('2026-11-08T12:00:00Z'),
+  });
+  const snapshot = [
+    'You are the Arca Doctor, a friendly read-only helper in the Arca canvas.',
+    'You talk to the owner in plain language, not to an engineer.',
+    'You can read live Arca data from these hosts: alpha, beta.',
+    'Today is 2026-11-08.',
+    '',
+    'Rules:',
+    '- Answer only from data returned by your tools in this conversation. Never invent, estimate or make up a',
+    '  number, status, name, port or address. Rounding for display is fine; the figure behind it must be real.',
+    '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
+    '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
+    '  code fences.',
+    '- Sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total. Never show',
+    '  raw bytes.',
+    '- Percentages are whole numbers, for example 70%, not 70.29%.',
+    '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
+    '  explicitly asks for it.',
+    '- If a figure cannot be read, say "not measurable from here". Never repeat an internal reason or error',
+    '  string.',
+    '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
+    '  approve, mint or change anything. Never claim that you did.',
+    "- If asked to change something, answer in two short parts: what the change would do (using the real names",
+    "  and data you can read), and that it needs the owner's passkey on the approval page. Do not attempt an",
+    '  inline approval and do not ask for a passkey in the chat.',
+    '- The approval page is at https://example.com/approve.',
+  ].join('\n');
+  assert.equal(prompt, snapshot);
+  assert.doesNotMatch(prompt, /\bIncus\b|kernel mode|uptime/i);
+  assert.match(doctorPrompt({ hosts: [{ name: 'alpha' }], now: Date.parse('2026-11-08T12:00:00Z') }),
+    /No approval page is configured on this canvas/);
+});
+
+test('a node_metrics result reaches the fake model as plain GB, rounded percentages and no internal reason', async (t) => {
+  const internalReason = 'not available for a remote host';
+  const metrics = {
+    at: 1_700_000_000_000,
+    minutes: 5,
+    latest: {
+      at: 1_700_000_000_000,
+      cpu: { usedPct: 70.29, cores: 8, coresKnown: true, reason: null },
+      load: { one: 1.25, five: null, fifteen: 0.8, reason: internalReason },
+      memory: {
+        totalBytes: 96_300_000_000,
+        availableBytes: 79_300_000_000,
+        usedBytes: 17_000_000_000,
+        swapTotalBytes: 8_000_000_000,
+        swapFreeBytes: null,
+        reason: null,
+      },
+      psi: { memorySomeAvg10: 0, memoryFullAvg10: 0, cpuSomeAvg10: 1.49 },
+      cpuTempC: 54.2,
+      gpuBusyPct: 29.6,
+      pools: [{ name: 'data', usedBytes: 3_400_000_000, totalBytes: 96_300_000_000, freeBytes: 92_900_000_000 }],
+      network: { rxBytesPerSec: 1_200_000_000, txBytesPerSec: 800_000_000 },
+      projects: [{ project: 'default', total: 3, running: 2 }],
+    },
+    mean: {
+      at: 1_700_000_000_000,
+      cpu: { usedPct: 64.8, cores: 8, coresKnown: true, reason: null },
+      load: { one: 1.0, five: 1.0, fifteen: 1.0, reason: null },
+      memory: {
+        totalBytes: 96_300_000_000,
+        availableBytes: null,
+        usedBytes: null,
+        swapTotalBytes: 8_000_000_000,
+        swapFreeBytes: null,
+        reason: internalReason,
+      },
+      psi: { memorySomeAvg10: null, memoryFullAvg10: null, cpuSomeAvg10: null },
+      cpuTempC: null,
+      gpuBusyPct: null,
+      pools: [],
+      network: null,
+      projects: [],
+    },
+  };
+  const { fake, port } = await harness(t, {
+    clientFor: () => ({ async call() { return metrics; } }),
+    script: async (api) => {
+      await api.call('node_metrics', {});
+      api.text('checked');
+      api.end();
+    },
+  });
+  await post(port, { message: 'how is alpha doing?' });
+  const seen = fake.presented.find((entry) => entry.name === 'node_metrics');
+  assert.ok(seen, 'the tool was presented to the fake model');
+  assert.equal(seen.content[0].type, 'text');
+  const text = seen.content.map((block) => block.text).join('\n');
+  assert.match(text, /17\.0 GB used of 96\.3 GB, 79\.3 GB available/);
+  assert.match(text, /70% used across 8 cores/);
+  assert.match(text, /65% used across 8 cores/);
+  assert.match(text, /3\.4 GB used, 96\.3 GB total/);
+  assert.match(text, /not measurable from here/);
+  assert.doesNotMatch(text, /not available for a remote host/);
+  assert.doesNotMatch(text, /70\.29|64\.8/);
+  for (const raw of ['17000000000', '96300000000', '79300000000', '3400000000', '8000000000']) {
+    assert.equal(text.includes(raw), false, `${raw} is never shown to the model`);
+  }
 });
 
 test('a turn streams assistant text, one card per real call, and persists the transcript', async (t) => {

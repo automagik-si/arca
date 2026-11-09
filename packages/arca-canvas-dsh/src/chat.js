@@ -294,39 +294,223 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
   const names = hosts.map((host) => text(host?.name)).filter(Boolean);
   const hostLine = names.length ? names.join(', ') : 'the configured host';
   const approval = safeApprovalUrl(approvalUrl);
-  const link = approval ? `the approval page at ${approval}` : 'the approval page (not configured on this canvas)';
+  const approvalLine = approval
+    ? `- The approval page is at ${approval}.`
+    : '- No approval page is configured on this canvas; say so instead of linking.';
   return [
-    'You are the Arca Doctor, a read-only operations assistant embedded in the Arca canvas.',
+    'You are the Arca Doctor, a friendly read-only helper in the Arca canvas.',
+    'You talk to the owner in plain language, not to an engineer.',
     `You can read live Arca data from these hosts: ${hostLine}.`,
     `Today is ${new Date(now).toISOString().slice(0, 10)}.`,
     '',
     'Rules:',
-    '- Answer only from data returned by your tools in this conversation. Never invent, estimate or round a',
-    '  number, status, name, port or address. If a read fails or a host did not answer, say that plainly.',
+    '- Answer only from data returned by your tools in this conversation. Never invent, estimate or make up a',
+    '  number, status, name, port or address. Rounding for display is fine; the figure behind it must be real.',
     '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
+    '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
+    '  code fences.',
+    '- Sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total. Never show',
+    '  raw bytes.',
+    '- Percentages are whole numbers, for example 70%, not 70.29%.',
+    '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
+    '  explicitly asks for it.',
+    '- If a figure cannot be read, say "not measurable from here". Never repeat an internal reason or error',
+    '  string.',
     '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
     '  approve, mint or change anything. Never claim that you did.',
-    `- If asked to change something, answer in two short parts: what the change would do (using the real names`,
-    `  and data you can read), and that it needs the owner's passkey on ${link}. Do not attempt an inline`,
-    '  approval and do not ask for a passkey in the chat.',
-    '- Write plain text only. No markdown tables, no headings, no code fences unless quoting a real value.',
-    '- Keep answers short and concrete: a sentence or a few bullets at most.',
-    approval ? `- The approval link is ${approval}` : '- No approval URL is configured; say so instead of linking.',
+    "- If asked to change something, answer in two short parts: what the change would do (using the real names",
+    "  and data you can read), and that it needs the owner's passkey on the approval page. Do not attempt an",
+    '  inline approval and do not ask for a passkey in the chat.',
+    approvalLine,
   ].join('\n');
+}
+
+const NOT_MEASURABLE = 'not measurable from here';
+const GIGABYTE = 1_000_000_000;
+
+function measured(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+export function formatGigabytes(bytes) {
+  const value = measured(bytes);
+  return value === null || value < 0 ? '' : `${(value / GIGABYTE).toFixed(1)} GB`;
+}
+
+function formatGigabytesPerSecond(bytes) {
+  const value = measured(bytes);
+  return value === null || value < 0 ? '' : `${(value / GIGABYTE).toFixed(1)} GB/s`;
+}
+
+function formatPercent(value) {
+  const number = measured(value);
+  return number === null ? '' : `${Math.round(number)}%`;
+}
+
+function cpuLine(cpu) {
+  if (!cpu || cpu.reason) return `CPU: ${NOT_MEASURABLE}.`;
+  const cores = measured(cpu.cores);
+  const coresKnown = cores !== null && cores > 0 && cpu.coresKnown !== false;
+  const percent = formatPercent(cpu.usedPct);
+  if (!percent) {
+    return coresKnown ? `CPU: ${cores} cores; load ${NOT_MEASURABLE}.` : `CPU: ${NOT_MEASURABLE}.`;
+  }
+  return `CPU: ${percent} used${coresKnown ? ` across ${cores} cores` : ''}.`;
+}
+
+function memoryLine(memory) {
+  if (!memory || memory.reason) return `Memory: ${NOT_MEASURABLE}.`;
+  const total = measured(memory.totalBytes);
+  const available = measured(memory.availableBytes);
+  const reportedUsed = measured(memory.usedBytes);
+  const used = reportedUsed ?? (total !== null && available !== null ? Math.max(0, total - available) : null);
+  const totalText = formatGigabytes(total);
+  if (!totalText) return `Memory: ${NOT_MEASURABLE}.`;
+  const usedText = formatGigabytes(used);
+  const availableText = formatGigabytes(available);
+  if (usedText && availableText) return `Memory: ${usedText} used of ${totalText}, ${availableText} available.`;
+  if (usedText) return `Memory: ${usedText} used of ${totalText}.`;
+  if (availableText) return `Memory: ${availableText} available of ${totalText}.`;
+  return `Memory: ${totalText} total.`;
+}
+
+function loadLine(load) {
+  if (!load || load.reason) return `Load: ${NOT_MEASURABLE}.`;
+  const values = [
+    ['one', '1 minute'], ['five', '5 minutes'], ['fifteen', '15 minutes'],
+  ].flatMap(([key, label]) => {
+    const number = measured(load[key]);
+    return number === null ? [] : [`${number.toFixed(1)} (${label})`];
+  });
+  return values.length ? `Load: ${values.join(', ')}.` : `Load: ${NOT_MEASURABLE}.`;
+}
+
+function pressureLines(psi) {
+  if (!psi) return [];
+  const lines = [];
+  const memory = [];
+  const memorySome = formatPercent(psi.memorySomeAvg10);
+  const memoryFull = formatPercent(psi.memoryFullAvg10);
+  if (memorySome) memory.push(`${memorySome} some`);
+  if (memoryFull) memory.push(`${memoryFull} full`);
+  if (memory.length) lines.push(`Memory pressure: ${memory.join(', ')}.`);
+  const cpuSome = formatPercent(psi.cpuSomeAvg10);
+  if (cpuSome) lines.push(`CPU pressure: ${cpuSome}.`);
+  return lines;
+}
+
+function poolLines(pools) {
+  if (!Array.isArray(pools)) return [];
+  return pools.map((pool) => {
+    const name = text(pool?.name).trim();
+    const parts = [];
+    const used = formatGigabytes(pool?.usedBytes);
+    const total = formatGigabytes(pool?.totalBytes);
+    const free = formatGigabytes(pool?.freeBytes);
+    if (used) parts.push(`${used} used`);
+    if (total) parts.push(`${total} total`);
+    if (free) parts.push(`${free} free`);
+    return `${name ? `Disk pool ${name}` : 'Disk pool'}: ${parts.length ? `${parts.join(', ')}.` : `${NOT_MEASURABLE}.`}`;
+  });
+}
+
+function networkLine(network) {
+  if (!network) return '';
+  const received = formatGigabytesPerSecond(network.rxBytesPerSec);
+  const sent = formatGigabytesPerSecond(network.txBytesPerSec);
+  const parts = [];
+  if (received) parts.push(`${received} received`);
+  if (sent) parts.push(`${sent} sent`);
+  return parts.length ? `Network: ${parts.join(', ')}.` : `Network: ${NOT_MEASURABLE}.`;
+}
+
+function projectLine(projects) {
+  if (!Array.isArray(projects) || !projects.length) return '';
+  const rows = projects.map((project) => {
+    const name = text(project?.project).trim() || 'unnamed';
+    const total = measured(project?.total);
+    const running = measured(project?.running);
+    const counts = [];
+    if (total !== null) counts.push(`${total} total`);
+    if (running !== null) counts.push(`${running} running`);
+    return `${name}${counts.length ? ` (${counts.join(', ')})` : ''}`;
+  });
+  return `Projects: ${rows.join('; ')}.`;
+}
+
+function sampleLines(sample) {
+  const lines = [
+    cpuLine(sample.cpu),
+    memoryLine(sample.memory),
+    loadLine(sample.load),
+  ];
+  const temperature = measured(sample.cpuTempC);
+  if (temperature !== null) lines.push(`CPU temperature: ${temperature.toFixed(1)} C.`);
+  const gpu = formatPercent(sample.gpuBusyPct);
+  if (gpu) lines.push(`GPU: ${gpu} busy.`);
+  lines.push(...poolLines(sample.pools));
+  const network = networkLine(sample.network);
+  if (network) lines.push(network);
+  lines.push(...pressureLines(sample.psi));
+  const projects = projectLine(sample.projects);
+  if (projects) lines.push(projects);
+  return lines;
+}
+
+function formatNodeMetrics(value) {
+  const data = value && typeof value === 'object' ? value : {};
+  const host = text(data.host).trim() || 'the host';
+  const minutes = measured(data.minutes);
+  const lines = [`Host ${host}.`];
+  if (data.latest) {
+    lines.push(minutes !== null ? `Latest reading for the last ${minutes} minutes:` : 'Latest reading:');
+    lines.push(...sampleLines(data.latest));
+  } else {
+    lines.push(`Latest reading: ${NOT_MEASURABLE}.`);
+  }
+  if (data.mean) {
+    lines.push(minutes !== null ? `Average over ${minutes} minutes:` : 'Average:');
+    lines.push(...sampleLines(data.mean));
+  }
+  return lines.join('\n');
+}
+
+// The model must never see a raw byte count or an internal host reason it could repeat to the owner. Metrics
+// get a short plain-language summary with GB sizes and whole percentages; every other result keeps its shape
+// but has byte, rate and percentage fields replaced by the same display strings.
+export function formatToolResult(name, value) {
+  if (name === 'node_metrics') return formatNodeMetrics(value);
+  return JSON.stringify(presentToolValues(value));
+}
+
+function presentToolValues(value) {
+  if (Array.isArray(value)) return value.map(presentToolValues);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === 'number' && /BytesPerSec$/.test(key)) out[key] = formatGigabytesPerSecond(item);
+    else if (typeof item === 'number' && /Bytes$/.test(key)) out[key] = formatGigabytes(item);
+    else if (typeof item === 'number' && /Pct$/.test(key)) out[key] = formatPercent(item);
+    else if (key === 'reason' && typeof item === 'string' && item) out[key] = NOT_MEASURABLE;
+    else out[key] = presentToolValues(item);
+  }
+  return out;
 }
 
 function toolClient(clientFor, hosts, name, onCall) {
   return {
     name,
     description: {
-      arca_status: 'Read the Arca node status (version, mode, uptime, Incus reachability, applied sequence).',
-      watch_report: 'Read the live instances grouped by Incus project.',
-      postgres_list: 'List the PostgreSQL databases Arca knows about.',
-      node_metrics: 'Read the latest CPU and memory metrics for the host.',
-      alerts_list: 'List firing, unknown and recently resolved alerts.',
-      plan_list: 'List pending Arca plans waiting for approval.',
-      journal_list: 'Read the Arca activity journal, oldest first. Optional after cursor and limit (max 500).',
-      service_list: 'List the managed services with name, state, ipv4, ports, template, links and published.',
+      arca_status: 'Check whether this machine is up, its version and how recently Arca last applied an update.',
+      watch_report: 'List the apps and machines running on this host, grouped by project.',
+      postgres_list: 'List the databases Arca knows about.',
+      node_metrics: 'Read how busy the CPU is and how much memory and disk the host is using.',
+      alerts_list: 'List current warnings and recently resolved ones.',
+      plan_list: 'List changes waiting for the owner\'s approval.',
+      journal_list: 'Read recent Arca activity, oldest first. Optional after cursor and limit (max 500).',
+      service_list: 'List the managed services with name, state, address, ports and links.',
     }[name],
     parameters: {
       type: 'object',
@@ -346,7 +530,7 @@ function toolClient(clientFor, hosts, name, onCall) {
     output: {
       schema: {},
       render(args, value) {
-        return [{ type: 'text', text: bound(JSON.stringify(value), DEFAULTS.resultChars) }];
+        return [{ type: 'text', text: bound(formatToolResult(name, value), DEFAULTS.resultChars) }];
       },
     },
     timeoutMs: 10_000,
@@ -515,7 +699,7 @@ export function createDoctorChat(options = {}) {
         agentCtx.systemPrompt.section({
           name: 'deployment:persona-prefix',
           order: 0,
-          text: 'You are the Arca Doctor, a read-only operations assistant in the Arca canvas.',
+          text: 'You are the Arca Doctor, a friendly read-only helper in the Arca canvas.',
         });
         agentCtx.systemPrompt.section({
           name: 'arca-doctor',
