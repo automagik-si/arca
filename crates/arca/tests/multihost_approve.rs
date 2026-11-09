@@ -26,9 +26,10 @@ use arca::handlers::{
 use arca::kernel::{AppliedSeq, Kernel};
 use arca_api::Scope;
 use arca_approval::{
-    ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys, PasskeyVerifier,
-    SshSigVerifier, parse_passkeys,
+    ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys,
+    PasskeyVerifier, STATE_PASSKEYS_FILE, SshSigVerifier, parse_passkeys,
 };
+use arca_kernel::canon::{Digest, canonical_json, params_digest};
 use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_tools, serve_unix};
 use arca_metrics::{HostMode, HostModeChoice};
 use common::*;
@@ -84,7 +85,17 @@ struct Pair {
     beta_runs: Arc<AtomicU64>,
     token_file: PathBuf,
     foreign: ForeignPasskeys,
+    /// Beta's state directory, where its state-file passkeys live.
+    beta_state: PathBuf,
     _runtime: Runtime,
+}
+
+/// A passkey of beta's own, answering only beta's page origin.
+fn beta_key(seed: u8) -> SoftPasskey {
+    let mut key = SoftPasskey::from_seed(seed);
+    key.rp_id = "beta.example.com".to_string();
+    key.origin = BETA_ORIGIN.to_string();
+    key
 }
 
 fn executor(runs: &Arc<AtomicU64>) -> ActionExecutor {
@@ -133,9 +144,7 @@ impl Pair {
         ));
 
         // Beta: its own passkey answers only beta's page; alpha's file is trusted only as the config says.
-        let mut beta_own = SoftPasskey::from_seed(2);
-        beta_own.rp_id = "beta.example.com".to_string();
-        beta_own.origin = BETA_ORIGIN.to_string();
+        let beta_own = beta_key(2);
         let foreign = match trust {
             BetaTrust::AlphaFile => {
                 ForeignPasskeys::new(vec![alpha_passkeys.clone()], vec![ORIGIN.to_string()])
@@ -198,6 +207,8 @@ impl Pair {
         }
         let _ = slot.set(executor(&beta_runs));
         let beta_socket = beta_scratch.path("beta.sock");
+        let beta_state = beta_scratch.path("state");
+        private_dir(&beta_state);
 
         // Alpha's page, linked to beta.
         let alpha_state = alpha_scratch.path("state");
@@ -255,6 +266,7 @@ impl Pair {
             beta_runs,
             token_file,
             foreign,
+            beta_state,
             _runtime: runtime,
         };
         (pair, owner)
@@ -335,6 +347,20 @@ impl Pair {
             .iter()
             .any(|proposal| proposal.id == id)
     }
+}
+
+/// A passkey change statement for beta: `action` is `passkey_add` or `passkey_remove`, over `line`.
+fn passkey_change(action: &str, line: &str, nonce: &str) -> String {
+    canonical_json(&json!({
+        "action": action,
+        "host": BETA_HOST,
+        "target": format!("passkey-{}", Digest::of(line.as_bytes()).to_hex()),
+        "paramsDigest": params_digest(&json!({ "line": line })).expect("the digest"),
+        "issuedAt": arca::handlers::iso_utc(NOW),
+        "expiresAt": arca::handlers::iso_utc(NOW + 600_000),
+        "nonce": nonce,
+    }))
+    .expect("the statement")
 }
 
 fn approval(key: &SoftPasskey, statement: &str) -> String {
@@ -503,11 +529,20 @@ fn an_unreadable_trust_file_adds_no_key_and_arca_status_says_why() {
     }
     .call(json!({}), &caller(Scope::Viewer))
     .expect("arca_status answers");
-    let files = &status["approval"]["trustedKeyFiles"];
-    assert_eq!(files[0]["keys"], json!(0));
+    // The approval check just read the file: the status reports that read, by index and file name, never the path.
     assert_eq!(
-        files[0]["reason"],
-        json!("the file cannot be read by this kernel")
+        status["approval"]["trustedKeyFiles"],
+        json!([{
+            "index": 0,
+            "name": "owner-passkeys",
+            "keys": 0,
+            "reason": "the file cannot be read by this kernel",
+        }])
+    );
+    assert!(
+        !status
+            .to_string()
+            .contains(&*pair._alpha_scratch.dir.display().to_string())
     );
     assert!(
         arca_api::check::conforms(
@@ -611,4 +646,139 @@ fn a_token_the_linked_host_refuses_relays_nothing() {
     assert_eq!(answer["refusal"], json!("LinkToken"));
     assert_eq!(pair.beta_runs.load(Ordering::SeqCst), 0);
     assert!(Pair::waiting(&pair.beta, &id));
+}
+
+#[test]
+fn a_passkey_trusted_from_another_kernel_cannot_add_or_remove_the_targets_own_passkeys() {
+    let (pair, owner) = Pair::new("mh-passkeys", BetaTrust::AlphaFile);
+    let beta_own = beta_key(2);
+    let state = pair.beta_state.join(STATE_PASSKEYS_FILE);
+    let change = |action: &str, line: &str, key: &SoftPasskey, nonce: &str| {
+        let statement = passkey_change(action, line, nonce);
+        let proof = key.assert(&Assert::over(NAMESPACE, statement.as_bytes()));
+        pair.beta
+            .lock()
+            .expect("the kernel lock")
+            .approve_passkey_change(&pair.beta_state, line, &statement, &proof, NOW)
+    };
+    let count = || {
+        pair.beta
+            .lock()
+            .expect("the kernel lock")
+            .owner_passkey_count()
+    };
+    let foreign_refused = |result: Result<(), ApprovalRefusal>| match result {
+        Err(ApprovalRefusal::Untrusted(why)) => {
+            assert!(why.contains("another kernel"), "a plain reason: {why}")
+        }
+        other => panic!("the foreign passkey is refused, not {other:?}"),
+    };
+
+    // Alpha's passkey is trusted on beta for actions, but adding a key to beta with it is refused and writes nothing.
+    let added = beta_key(3).line(NAMESPACE);
+    foreign_refused(change(
+        "passkey_add",
+        &added,
+        &owner,
+        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    ));
+    assert!(!state.exists(), "nothing is written");
+    assert_eq!(count(), 1);
+
+    // Beta's own passkey still adds it.
+    change(
+        "passkey_add",
+        &added,
+        &beta_own,
+        "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+    )
+    .expect("beta's own passkey adds a key");
+    let before = fs::read(&state).expect("the state file");
+    assert_eq!(count(), 2);
+
+    // Alpha's passkey cannot remove it; beta's own passkey can.
+    foreign_refused(change(
+        "passkey_remove",
+        &added,
+        &owner,
+        "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+    ));
+    assert_eq!(
+        fs::read(&state).expect("the state file"),
+        before,
+        "nothing is written"
+    );
+    assert_eq!(count(), 2);
+    change(
+        "passkey_remove",
+        &added,
+        &beta_own,
+        "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+    )
+    .expect("beta's own passkey removes the key");
+    assert_eq!(count(), 1);
+
+    // The same alpha passkey still approves beta's actions: the trust is for approvals only.
+    let id = Pair::propose(&pair.beta);
+    let statement = pair.row(&id, Some("beta")).expect("beta's row")["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": id, "approval": approval(&owner, &statement), "host": "beta" })),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(pair.beta_runs.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_token_file_that_is_a_link_or_open_to_others_is_never_read() {
+    let (pair, owner) = Pair::new("mh-token-file", BetaTrust::AlphaFile);
+    let id = Pair::propose(&pair.beta);
+    let statement = pair.row(&id, Some("beta")).expect("beta's row")["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let secret = fs::read_to_string(&pair.token_file).expect("the token file");
+    let real = pair.token_file.with_extension("real");
+    write_mode(&real, &secret, 0o600);
+    let refused = |why: &str| {
+        assert_eq!(
+            pair.plans()["linkedHosts"],
+            json!([{ "name": "beta", "read": false }]),
+            "{why}"
+        );
+        let (status, answer) = pair.request(
+            "POST",
+            "/approve/approve",
+            Some(json!({ "plan": id, "approval": approval(&owner, &statement), "host": "beta" })),
+        );
+        assert_eq!(status, 502, "{why}: {answer}");
+        assert_eq!(answer["refusal"], json!("LinkToken"), "{why}");
+        assert_eq!(pair.beta_runs.load(Ordering::SeqCst), 0, "{why}");
+    };
+
+    // A link to a good token file is not followed.
+    fs::remove_file(&pair.token_file).expect("the token file is removed");
+    std::os::unix::fs::symlink(&real, &pair.token_file).expect("a link");
+    refused("a link");
+
+    // The right token in a file group or others may write is not read.
+    fs::remove_file(&pair.token_file).expect("the link is removed");
+    write_mode(&pair.token_file, &secret, 0o664);
+    refused("a group-writable file");
+    fs::set_permissions(&pair.token_file, fs::Permissions::from_mode(0o640)).expect("mode 0640");
+    refused("a group-readable file");
+
+    // The same token at mode 0600 relays.
+    fs::set_permissions(&pair.token_file, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+    let (status, answer) = pair.request(
+        "POST",
+        "/approve/approve",
+        Some(json!({ "plan": id, "approval": approval(&owner, &statement), "host": "beta" })),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(pair.beta_runs.load(Ordering::SeqCst), 1);
 }

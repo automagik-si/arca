@@ -399,7 +399,40 @@ impl Kernel {
             return Err(ApprovalRefusal::WrongAction);
         }
         // A parsed WebAuthn proof is mandatory before OwnerKeys' dispatch; no other proof can change trust.
-        parse_proof(proof)?;
+        let assertion = parse_proof(proof)?;
+        // Only this kernel's own passkeys (the root file and its state file) may change its owner trust. A passkey trusted
+        // read-only from another kernel's file approves actions only: it is refused here with a plain reason, and any other
+        // unknown passkey with the own-keys check's own refusal, before any nonce or count is spent or anything is written.
+        // The verifier puts own lines before trusted ones, so the check below verifies against the own line found here.
+        if !self
+            .owner_passkey_lines()
+            .iter()
+            .any(|own| own.credential_id == assertion.credential_id)
+        {
+            let owner = self.verifier.verifier();
+            if owner
+                .foreign()
+                .load()
+                .0
+                .iter()
+                .any(|line| line.credential_id == assertion.credential_id)
+            {
+                return Err(ApprovalRefusal::Untrusted(
+                    "only this machine's own passkeys can change its passkeys; a passkey trusted from another kernel cannot"
+                        .into(),
+                ));
+            }
+            return Err(
+                match owner.verify_passkey(
+                    arca_approval::ARCA_NAMESPACE,
+                    statement.as_bytes(),
+                    proof,
+                ) {
+                    Err(refusal) => refusal,
+                    Ok(_) => ApprovalRefusal::BadSignature,
+                },
+            );
+        }
         let approval = format!("{}.{}", STANDARD.encode(statement), STANDARD.encode(proof));
         self.verifier.check(
             parsed.action,

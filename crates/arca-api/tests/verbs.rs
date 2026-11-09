@@ -364,11 +364,12 @@ fn arca_status_schemas_equal_its_table_row() {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "path": { "type": "string" },
+                                    "index": { "type": "integer", "minimum": 0 },
+                                    "name": { "type": "string" },
                                     "keys": { "type": "integer", "minimum": 0 },
                                     "reason": { "type": ["string", "null"] },
                                 },
-                                "required": ["path", "keys", "reason"],
+                                "required": ["index", "name", "keys", "reason"],
                             },
                         },
                     },

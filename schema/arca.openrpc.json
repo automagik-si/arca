@@ -31,11 +31,15 @@
                 "trustedKeyFiles": {
                   "items": {
                     "properties": {
+                      "index": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
                       "keys": {
                         "minimum": 0,
                         "type": "integer"
                       },
-                      "path": {
+                      "name": {
                         "type": "string"
                       },
                       "reason": {
@@ -46,7 +50,8 @@
                       }
                     },
                     "required": [
-                      "path",
+                      "index",
+                      "name",
                       "keys",
                       "reason"
                     ],

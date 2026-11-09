@@ -447,8 +447,12 @@ pub struct StatusHandler {
     pub approval: Option<ApprovalStatus>,
 }
 
-/// What `arca_status` reports of a node's multi-host approvals. Each trusted file is read again at every status call, so
-/// its key count and reason are what an approval checked now would see.
+/// How old the trusted files' last read may be for `arca_status` to report it rather than read the files again.
+pub const STATUS_TRUST_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What `arca_status` reports of a node's multi-host approvals. `foreign` is the verifier's own value (a clone shares its
+/// last read), so a status call reports what the last approval check saw, and reads the files itself only when that read is
+/// older than [`STATUS_TRUST_WINDOW`]. A file is named by its index and file name, never its path.
 #[derive(Clone, Default)]
 pub struct ApprovalStatus {
     pub linked_hosts: Vec<String>,
@@ -457,12 +461,20 @@ pub struct ApprovalStatus {
 
 impl ApprovalStatus {
     fn json(&self) -> Value {
-        let (_, states) = self.foreign.load();
-        let files: Vec<Value> = states
+        // A file is named by its place in `approval.trustOwnerKeysFrom` and its file name, never its full path.
+        let files: Vec<Value> = self
+            .foreign
+            .recent_states(STATUS_TRUST_WINDOW)
             .iter()
-            .map(|state| {
+            .enumerate()
+            .map(|(index, state)| {
                 json!({
-                    "path": state.path.display().to_string(),
+                    "index": index,
+                    "name": state
+                        .path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     "keys": state.keys,
                     "reason": state.reason,
                 })

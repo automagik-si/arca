@@ -3,7 +3,11 @@
 //! A node config may name passkeys files that belong to another kernel on the same machine (`approval.trustOwnerKeysFrom`)
 //! and the page origins it accepts from them (`approval.origins`). Each file is opened read-only, without following a link,
 //! every time an approval is checked, so a passkey the owner enrols on the other kernel is trusted here without a restart,
-//! and one the owner removes there stops verifying here. Nothing here writes, copies or caches a file.
+//! and one the owner removes there stops verifying here. Nothing here writes or copies a file, and no key is cached.
+//!
+//! Each read keeps only the files' states (a count and a reason, never a key). `arca_status` reports those through
+//! [`ForeignPasskeys::recent_states`], which re-reads the files only when the last read is older than its window, so status
+//! calls never read the files more often than that.
 //!
 //! A file is read only when it is a regular file owned by root or by this process's uid, with no group or other write bit,
 //! and parses as a whole under [`parse_passkeys`]. A line is kept only when its origin is one of the listed origins. A file
@@ -14,6 +18,8 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::ApprovalRefusal;
 use crate::passkey::{PasskeyLine, parse_passkeys};
@@ -27,12 +33,17 @@ const NOFOLLOW: i32 = 0;
 /// The largest trusted passkeys file read, in bytes.
 const MAX_BYTES: u64 = 1024 * 1024;
 
-/// The passkeys files of other kernels this kernel also trusts, and the page origins it accepts from them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The passkeys files of other kernels this kernel also trusts, and the page origins it accepts from them. A clone shares
+/// the last read's states with the original, so the approval check and `arca_status` see one record.
+#[derive(Debug, Clone, Default)]
 pub struct ForeignPasskeys {
     sources: Vec<PathBuf>,
     origins: Vec<String>,
+    last: Arc<Mutex<Option<LastRead>>>,
 }
+
+/// When the files were last read, and each file's state then.
+type LastRead = (Instant, Vec<SourceState>);
 
 /// What one trusted file gave at its last read: how many passkeys it added, or why it added none.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +59,11 @@ impl ForeignPasskeys {
     /// Trust the passkeys files `sources` for the page origins `origins`. The config check has already refused an origin
     /// that is not an approval origin, and a source list without an origin.
     pub fn new(sources: Vec<PathBuf>, origins: Vec<String>) -> Self {
-        Self { sources, origins }
+        Self {
+            sources,
+            origins,
+            last: Arc::default(),
+        }
     }
 
     /// Whether no file is named, so this trusts nothing more than the kernel's own passkeys.
@@ -98,7 +113,23 @@ impl ForeignPasskeys {
                 }),
             }
         }
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some((Instant::now(), states.clone()));
         (lines, states)
+    }
+
+    /// Each file's state from the last read, by this value or a clone of it, when that read is younger than `window`;
+    /// otherwise the files are read now. An approval check is such a read, so a status call right after one reports what
+    /// that check saw.
+    pub fn recent_states(&self, window: Duration) -> Vec<SourceState> {
+        let recent = self
+            .last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < window)
+            .map(|(_, states)| states.clone());
+        recent.unwrap_or_else(|| self.load().1)
     }
 }
 

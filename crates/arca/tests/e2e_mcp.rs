@@ -674,3 +674,96 @@ fn conforming(verb_name: &str, value: &Value) {
         panic!("{verb_name} does not conform: {why}\n{value}");
     }
 }
+
+/// The tool names a doctor lists on `socket`, and the reply to its `action_approve` call.
+fn doctor_sees_action_approve(socket: &Path, doctor: &str) -> (bool, Value) {
+    let (status, text) = post(socket, &[bearer(doctor)], &rpc(1, "tools/list", json!({})));
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_str(&text).expect("JSON");
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("a name"))
+        .collect();
+    assert!(
+        names.contains(&"plan_list"),
+        "the doctor lists the other verbs"
+    );
+    let (status, text) = post(
+        socket,
+        &[bearer(doctor)],
+        &call(
+            2,
+            "action_approve",
+            json!({ "plan": "act-000000000000", "approval": "a.b" }),
+        ),
+    );
+    assert_eq!(status, 200);
+    (
+        names.contains(&"action_approve"),
+        serde_json::from_str(&text).expect("JSON"),
+    )
+}
+
+#[test]
+fn action_approve_is_served_only_to_a_node_that_trusts_another_kernels_passkeys() {
+    // No approval key: the verb is neither listed nor answered, as before it existed.
+    let scratch = Scratch::new("relay-off");
+    let off = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, off.shim.socket(), &hash_dir);
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (listed, reply) = doctor_sees_action_approve(&socket, doctor);
+    assert!(!listed, "action_approve is not listed");
+    assert_eq!(reply["error"]["message"], json!("not_found"), "{reply}");
+    let (_, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(3, "arca_status", json!({})),
+    );
+    assert!(tool_result(&text).get("approval").is_none());
+    assert_eq!(serve.terminate().code(), Some(0));
+
+    // An approval key that trusts another kernel's passkeys file: the verb is listed and reaches its handler, and
+    // arca_status names the file by its index and file name only.
+    let scratch = Scratch::new("relay-on");
+    let on = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, on.shim.socket(), &hash_dir);
+    let trusted = scratch.at("other-kernel").join("owner-passkeys");
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["approval"] = json!({
+        "trustOwnerKeysFrom": [trusted.display().to_string()],
+        "origins": ["https://alpha.example.com:8443"],
+        "linkedHosts": []
+    });
+    fs::write(&config, cfg.to_string()).expect("write the config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (listed, reply) = doctor_sees_action_approve(&socket, doctor);
+    assert!(listed, "action_approve is listed");
+    assert_ne!(reply["error"]["message"], json!("not_found"), "{reply}");
+    let (_, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(3, "arca_status", json!({})),
+    );
+    let status = tool_result(&text);
+    conforming("arca_status", &status);
+    assert_eq!(
+        status["approval"]["trustedKeyFiles"],
+        json!([{ "index": 0, "name": "owner-passkeys", "keys": 0, "reason": "the file is missing" }])
+    );
+    assert!(
+        !text.contains("other-kernel"),
+        "no path reaches a status reader"
+    );
+    assert_eq!(serve.terminate().code(), Some(0));
+}

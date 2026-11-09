@@ -773,7 +773,8 @@ fn arca_status_result() -> Value {
                     "trustedKeyFiles",
                     true,
                     array(result(vec![
-                        ("path", true, string()),
+                        ("index", true, at_least(0)),
+                        ("name", true, string()),
                         ("keys", true, at_least(0)),
                         ("reason", true, nullable(string())),
                     ])),

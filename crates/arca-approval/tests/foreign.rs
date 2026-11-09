@@ -208,3 +208,34 @@ fn a_verifier_whose_own_file_was_refused_refuses_trusted_keys_too() {
         Err(refusal)
     );
 }
+
+#[test]
+fn the_status_reuses_the_last_read_within_its_window_and_reads_again_after() {
+    let scratch = Scratch::new("foreign-recent");
+    let owner = SoftPasskey::from_seed(1);
+    let path = scratch.path("owner-passkeys");
+    write_mode(
+        &path,
+        format!("{}\n", owner.line(ARCA_NAMESPACE)).as_bytes(),
+        0o600,
+    );
+    let trust = foreign(vec![path.clone()]);
+    // A clone (the status's copy) shares the read the original (the verifier's) made.
+    let status = trust.clone();
+    assert_eq!(trust.load().1[0].keys, 1);
+    fs::remove_file(&path).expect("the file is removed");
+    let window = std::time::Duration::from_secs(60);
+    assert_eq!(
+        status.recent_states(window)[0].keys,
+        1,
+        "the last read is reused, the file is not read again"
+    );
+    let states = status.recent_states(std::time::Duration::ZERO);
+    assert_eq!(states[0].keys, 0, "an old read is replaced by a new one");
+    assert_eq!(states[0].reason.as_deref(), Some("the file is missing"));
+    assert_eq!(
+        trust.recent_states(window)[0].reason.as_deref(),
+        Some("the file is missing"),
+        "the new read is shared back"
+    );
+}

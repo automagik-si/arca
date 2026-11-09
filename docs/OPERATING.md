@@ -78,7 +78,7 @@ refused without the value being echoed back.
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
-| `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts for approvals, read-only. See "Approving on another kernel of this machine". |
+| `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts, read-only, for action approvals only (never to change its own passkeys). See "Approving on another kernel of this machine". |
 | `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
 | `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. |
 
@@ -314,8 +314,10 @@ its request is read.
   whether Incus answers, `appliedSeq`: the applied desired-state document's sequence, or `null` before any document applies,
   and `metricsSource` (`local` or `remote`) with the reason it was chosen. See "Host metrics". A node with an `approval`
   key also reports `approval`: its `linkedHosts` by name, and one `trustedKeyFiles` entry per trusted passkeys file with its
-  `path`, the `keys` it adds now and, when it adds none, the plain `reason` (for example `the file is missing` or `the file
-  cannot be read by this kernel`). Each file is read again at every call.
+  `index` in `trustOwnerKeysFrom` and its file `name` (never its full path), the `keys` it adds and, when it adds none, the
+  plain `reason` (for example `the file is missing` or `the file cannot be read by this kernel`). It reports the files' last
+  read, by an approval check or an earlier status call, and reads them again only when that read is more than 10 seconds
+  old.
 - `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
   `mean` are `null`. See "Host metrics" for where its readings come from.
@@ -344,7 +346,9 @@ its request is read.
 - `action_approve` takes `{plan: "<act-id>", approval}`, checks the owner's passkey approval for a waiting action proposal
   with this kernel's own verifier, nonce store and sign counts, and when it holds runs the action once, exactly as the
   approval page does, answering `{plan, id, action, result}`. It is a doctor verb that writes. Another kernel's approval
-  page on the same machine relays a linked host's approvals here; see "Approving on another kernel of this machine".
+  page on the same machine relays a linked host's approvals here; see "Approving on another kernel of this machine". It is
+  served only by a kernel whose `approval` key names at least one `trustOwnerKeysFrom` file; any other kernel neither lists
+  it nor answers it (`not_found`).
 
 `serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
@@ -746,8 +750,9 @@ arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve
   --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
 ```
 
-It is read from its file at each call, so it can be rotated without a restart; it must be a regular file with no group or
-other permission bit.
+It is read from its file at each call, so it can be rotated without a restart. It is opened without following a link, and
+must be a regular file owned by root or by the page host's user, with no group or other permission bit; any other token
+file relays nothing (502 `LinkToken`).
 
 On the linked kernel (`beta`), trust the page host's passkeys file read-only, for the page host's origin only:
 
@@ -762,8 +767,11 @@ The file is opened read-only, without following a link, at every approval check,
 the page host is trusted or dropped here without a restart. It is never written, copied or cached. It is read only when it is
 a regular file owned by root or by this kernel's user, with no group or other write bit, and parses whole; only its lines
 whose `origin` is listed are trusted. A file that is missing, unreadable or refused adds no key, and `arca_status` names the
-reason. The sign-in route of beta's own canvas never uses these keys. With no `approval` key, a kernel trusts only its own
-owner keys, as before.
+reason. The sign-in route of beta's own canvas never uses these keys, and neither does a passkey change: only beta's own
+passkeys (its root file and its state file) can add or remove one of beta's passkeys, and a passkey trusted from another
+kernel's file is refused with "only this machine's own passkeys can change its passkeys". The trusted keys approve action
+proposals only. With no `approval` key, a kernel trusts only its own owner keys and does not serve `action_approve`, as
+before.
 
 Then:
 

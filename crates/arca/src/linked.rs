@@ -4,11 +4,12 @@
 //! linked kernel's approval: the target verifies it with its own verifier, nonce store and sign counts, and its answer is
 //! returned as it came.
 //!
-//! The token is read from its file at every call, and sent only in the bearer header. It is never logged or returned.
+//! The token is read from its file at every call, without following a link, and sent only in the bearer header. It is
+//! never logged or returned.
 
-use std::fs;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -88,13 +89,36 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
         .ok_or(RelayError::Unreachable)
 }
 
-/// The token in the host's token file: a regular file with no group or other permission bit, trimmed of its newline.
+/// `O_NOFOLLOW` on Linux: the open fails on a symbolic link instead of following it.
+#[cfg(target_os = "linux")]
+const NOFOLLOW: i32 = 0o400_000;
+#[cfg(not(target_os = "linux"))]
+const NOFOLLOW: i32 = 0;
+/// The largest token file read, in bytes. A token is far shorter.
+const TOKEN_MAX: u64 = 4096;
+
+/// The token in the host's token file, trimmed of its newline. The file is opened read-only without following a link, and
+/// its type, owner and mode are checked on the open handle, so the bytes read are the bytes checked: a regular file owned
+/// by root or this kernel's user, with no group or other permission bit (it is a secret, so not even a read bit).
 fn read_token(host: &LinkedHost) -> Result<String, RelayError> {
-    let meta = fs::symlink_metadata(&host.token_file).map_err(|_| RelayError::Token)?;
-    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW)
+        .open(&host.token_file)
+        .map_err(|_| RelayError::Token)?;
+    let meta = file.metadata().map_err(|_| RelayError::Token)?;
+    let uid = arca_approval::effective_uid().map_err(|_| RelayError::Token)?;
+    if !meta.is_file()
+        || (meta.uid() != 0 && meta.uid() != uid)
+        || meta.mode() & 0o077 != 0
+        || meta.len() > TOKEN_MAX
+    {
         return Err(RelayError::Token);
     }
-    let text = fs::read_to_string(&host.token_file).map_err(|_| RelayError::Token)?;
+    let mut text = String::new();
+    file.take(TOKEN_MAX)
+        .read_to_string(&mut text)
+        .map_err(|_| RelayError::Token)?;
     let token = text.trim_end();
     let shaped = token.starts_with("arca_")
         && token.len() > "arca_".len()
