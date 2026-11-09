@@ -2,14 +2,22 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile as readStateFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { cpuCoresKnown } from './model.js';
+import { cpuCoresKnown, proposalId } from './model.js';
+import { snapshotError } from './arca-client.js';
 
-// The Doctor chat is read-only by construction: only these verbs are registered with DSH. Every write verb
+// The Doctor chat cannot change anything by itself: only these verbs are registered with DSH. Every write verb
 // (postgres_link/unlink/delete, service_*, plan/approve/apply, token_*, adopt, ...) is absent from this list and
-// cannot be reached from a model request.
+// cannot be reached from a model request. `arca_propose` is the one non-read tool: it records an inert proposal
+// for the owner to approve with the passkey, and changes nothing.
 export const READ_TOOLS = Object.freeze([
   'arca_status', 'watch_report', 'postgres_list', 'node_metrics',
   'alerts_list', 'plan_list', 'journal_list', 'service_list',
+]);
+export const PROPOSE_TOOL = 'arca_propose';
+export const DOCTOR_TOOLS = Object.freeze([...READ_TOOLS, PROPOSE_TOOL]);
+export const PROPOSE_ACTIONS = Object.freeze([
+  'service_create', 'service_remove', 'service_publish', 'service_unpublish',
+  'service_connect', 'service_disconnect', 'postgres_create',
 ]);
 
 export const DEFAULTS = Object.freeze({
@@ -29,22 +37,11 @@ export const DEFAULTS = Object.freeze({
 
 const SESSION_NAME = 'Doctor';
 const MODEL = Object.freeze({ provider: 'deepseek-official', model: 'deepseek-flash' });
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-// A write-intent hint is presentation only: it can add an approval card, never an action. The model is told to answer
-// "what it would do" and link /approve; the card makes that link reachable in the panel.
-const WRITE_INTENT = new RegExp(
-  '\\b(?:delete|remove|drop|unlink|link|start|stop|restart|recreate|apply|approve|adopt|mint|rotate|publish|'
-  + 'unpublish|deploy|scale|rename|create|add|set|update|change|move|pair|connect|disconnect)\\b', 'i');
 
 function capMessage(reason, limit) {
   return reason === 'tool-calls'
     ? `This answer stopped at the ${limit}-tool-call limit for one turn.`
     : `This answer stopped at the ${limit.toLocaleString('en-US')}-output-token limit for one turn.`;
-}
-
-export function writeIntent(message) {
-  return WRITE_INTENT.test(String(message ?? ''));
 }
 
 export function safeApprovalUrl(value) {
@@ -120,10 +117,11 @@ function normalizeState(raw, ms) {
         ...(Array.isArray(message.tools) ? {
           tools: message.tools.filter((tool) => tool && typeof tool === 'object').slice(0, 64).map((tool) => ({
             callId: text(tool.callId),
-            name: READ_TOOLS.includes(tool.name) ? tool.name : 'tool',
+            name: DOCTOR_TOOLS.includes(tool.name) ? tool.name : 'tool',
             state: ['running', 'done', 'error'].includes(tool.state) ? tool.state : 'done',
             ...(typeof tool.host === 'string' && tool.host ? { host: text(tool.host) } : {}),
             ...(typeof tool.summary === 'string' && tool.summary ? { summary: bound(tool.summary, 240) } : {}),
+            ...(proposalId(tool.proposal) ? { proposal: { id: proposalId(tool.proposal) } } : {}),
           })),
         } : {}),
       }))
@@ -307,15 +305,16 @@ export function createSse(response, { heartbeatMs = DEFAULTS.heartbeatMs, onClos
   };
 }
 
-export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } = {}) {
+export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', now = Date.now() } = {}) {
   const names = hosts.map((host) => text(host?.name)).filter(Boolean);
   const hostLine = names.length ? names.join(', ') : 'the configured host';
+  const proposeHost = text(proposalHost).trim() || names[0] || 'the configured host';
   const approval = safeApprovalUrl(approvalUrl);
   const approvalLine = approval
-    ? `- The approval page is at ${approval}.`
-    : '- No approval page is configured on this canvas; say so instead of linking.';
+    ? `- The approval page is at ${approval}. The canvas card uses the same passkey.`
+    : '- No approval page is configured on this canvas; say so instead of proposing a change.';
   return [
-    'You are the Arca Doctor, a friendly read-only helper in the Arca canvas.',
+    'You are the Arca Doctor, a friendly helper in the Arca canvas.',
     'You talk to the owner in plain language, not to an engineer.',
     `You can read live Arca data from these hosts: ${hostLine}.`,
     `Today is ${new Date(now).toISOString().slice(0, 10)}.`,
@@ -334,11 +333,15 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
     '- If a read fails or a host did not answer, say "could not be read just now". Only a reading the host can',
     '  never give, such as remote CPU load, is "not measurable from here". Never repeat an internal reason or',
     '  error string.',
-    '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
-    '  approve, mint or change anything. Never claim that you did.',
-    "- If asked to change something, answer in two short parts: what the change would do (using the real names",
-    "  and data you can read), and that it needs the owner's passkey on the approval page. Do not attempt an",
-    '  inline approval and do not ask for a passkey in the chat.',
+    '- You cannot link, unlink, delete, start, stop, restart, create, adopt, apply, approve, mint or change',
+    '  anything by yourself. arca_propose is the only way to ask for a change: it records a request for the',
+    '  owner and changes nothing.',
+    '- For a change request, call arca_propose with the action and its arguments, then tell the owner in one',
+    '  plain sentence what will happen and to tap Approve on the card. Never claim the change is done before',
+    '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
+    `- You can propose changes only on ${proposeHost} from here for now. Another host is refused because its`,
+    '  approval page is not this one.',
+    '- Do not propose a change the owner did not ask for, and never propose a database delete.',
     approvalLine,
   ].join('\n');
 }
@@ -651,6 +654,93 @@ export function createReadTools({ hosts = [], clientFor, onCall } = {}) {
   return READ_TOOLS.map((name) => toolClient(clientFor, hosts, name, onCall));
 }
 
+const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name}; '
+  + 'service_publish {name, reach: "tailnet"}; service_unpublish {name}; '
+  + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}.';
+
+// The one non-read tool: it records an inert proposal for the owner and changes nothing. The kernel checks the
+// action name and its arguments again, so this list is an explicit fence rather than the only validation.
+export function createProposeTool({ hosts = [], clientFor, onCall, onProposal, proposalHost = '' } = {}) {
+  const pageHost = hosts.find((host) => host.name === proposalHost)?.name ?? hosts[0]?.name ?? '';
+  return {
+    name: PROPOSE_TOOL,
+    description: `Ask the owner to approve one change. It records a proposal and changes nothing. Actions: ${PROPOSE_ARGUMENTS} You can propose only on ${pageHost || 'the configured host'} from here for now.`,
+    parameters: {
+      type: 'object',
+      properties: {
+        host: {
+          type: 'string',
+          description: `Host to propose on. One of: ${hosts.map((host) => host.name).join(', ')}. Defaults to ${hosts[0]?.name ?? 'the first host'}. Only ${pageHost || 'the first host'} can be proposed from this page; another host is refused.`,
+          ...(hosts.length ? { enum: hosts.map((host) => host.name) } : {}),
+        },
+        action: {
+          type: 'string',
+          enum: [...PROPOSE_ACTIONS],
+          description: 'The change to ask for.',
+        },
+        args: {
+          type: 'object',
+          description: `The action's arguments. ${PROPOSE_ARGUMENTS}`,
+        },
+      },
+      required: ['action', 'args'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {},
+      render(args, value) {
+        const id = proposalId(value);
+        const summary = text(value?.summary).trim() || 'A change';
+        return [{
+          type: 'text',
+          text: bound(`${id ? `${id}: ` : ''}${summary}. It waits for the owner's approval.`, DEFAULTS.resultChars),
+        }];
+      },
+    },
+    timeoutMs: 10_000,
+    isConcurrencySafe() {
+      return false;
+    },
+    async execute(args = {}, exec = {}) {
+      const requested = text(args?.host).trim();
+      if (requested && !hosts.some((candidate) => candidate.name === requested)) {
+        throw new Error(`Unknown host "${requested}". Valid hosts: ${hosts.map((candidate) => candidate.name).join(', ') || '(none)'}.`);
+      }
+      const host = hosts.find((candidate) => candidate.name === requested) ?? hosts[0];
+      if (!host) throw new Error('No Arca host is configured.');
+      if (pageHost && host.name !== pageHost) {
+        throw new Error(`I can only propose changes on ${pageHost} from here for now.`);
+      }
+      const client = clientFor(host.name);
+      if (!client) throw new Error(`No Arca reader is available for host "${host.name}".`);
+      const action = text(args?.action).trim();
+      if (!PROPOSE_ACTIONS.includes(action)) throw new Error('That action cannot be proposed.');
+      let payload = args?.args;
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        throw new Error('The action needs an arguments object.');
+      }
+      if (action === 'postgres_create') {
+        // The kernel owns the database image; a proposal can never choose one.
+        const { image: _ignored, ...rest } = payload;
+        payload = rest;
+      }
+      await onCall?.({
+        name: PROPOSE_TOOL, host: host.name, input: { action, args: payload }, callId: exec.callId,
+      });
+      let value;
+      try {
+        value = await client.call('action_propose', { action, args: payload }, exec.signal);
+      } catch (error) {
+        throw new Error(snapshotError(error));
+      }
+      const id = proposalId(value);
+      if (!id) throw new Error('Arca did not return a waiting proposal.');
+      onProposal?.({ callId: exec.callId, host: host.name, value, id });
+      return { ...value, host: host.name };
+    },
+  };
+}
+
 class TurnCap extends Error {
   constructor(reason) {
     super(`Doctor turn cap reached: ${reason}`);
@@ -666,6 +756,7 @@ function sseError(message) {
 export function createDoctorChat(options = {}) {
   const {
     hosts = [],
+    proposalHost = '',
     approvalUrl = '',
     resolveDsh = () => null,
     clientFor = () => null,
@@ -708,6 +799,7 @@ export function createDoctorChat(options = {}) {
   const sessionAttempts = new Map();
 
   const primaryApproval = safeApprovalUrl(approvalUrl);
+  const primaryProposalHost = text(proposalHost).trim() || text(hosts[0]?.name).trim();
 
   function beginSessionAttempt(sessionId) {
     const entry = { sessionId, promise: null, resolve: null };
@@ -740,14 +832,14 @@ export function createDoctorChat(options = {}) {
   }
 
   // The allow-list is the primary fence: every global tool, including one registered after setup, is hidden from
-  // the Doctor unless its name is in READ_TOOLS. The tools are registered globally with a `when` condition for this
+  // the Doctor unless its name is in DOCTOR_TOOLS. The tools are registered globally with a `when` condition for this
   // Doctor session only; the restriction is applied in the agent scope. A registry that cannot do that fails setup.
   function installTools(dsh) {
     if (toolsInstalled) return;
     const registry = dsh?.tools;
     if (!registry || typeof registry.register !== 'function'
       || typeof registry.restrict !== 'function' || typeof registry.definitions !== 'function') {
-      throw new Error('The DSH tool registry cannot enforce a read-only set.');
+      throw new Error("The DSH tool registry cannot enforce the Doctor's tool set.");
     }
     const registered = [];
     try {
@@ -757,7 +849,7 @@ export function createDoctorChat(options = {}) {
         }));
       }
       const known = new Set((registry.definitions(undefined) ?? []).map((definition) => definition.name));
-      const missing = READ_TOOLS.filter((name) => !known.has(name));
+      const missing = DOCTOR_TOOLS.filter((name) => !known.has(name));
       if (missing.length) throw new Error(`The DSH tool registry is missing ${missing.join(', ')}.`);
       toolDisposers = registered;
       toolsInstalled = true;
@@ -797,30 +889,30 @@ export function createDoctorChat(options = {}) {
         || typeof agentCtx.tools.guard !== 'function') {
         throw new Error('The DSH tool restriction is unavailable.');
       }
-      agentCtx.tools.restrict({ allow: [...READ_TOOLS] });
+      agentCtx.tools.restrict({ allow: [...DOCTOR_TOOLS] });
       // A late registration is hidden by the allow-list; this dispatch guard is the second fence and also denies
       // the reserved `run_code` transport, which a restriction cannot name.
       agentCtx.on('tools/pre-execute', (exec, next) => {
-        if (!exec || !READ_TOOLS.includes(exec.name)) {
-          return Promise.resolve({ kind: 'deny', reason: 'The Doctor is read-only: that tool is not available.' });
+        if (!exec || !DOCTOR_TOOLS.includes(exec.name)) {
+          return Promise.resolve({ kind: 'deny', reason: 'The Doctor may only read or propose: that tool is not available.' });
         }
         return next();
       });
       // The guard runs after an allow decision, so a later policy cannot open the door this check closes.
       // It is required exactly like the restriction: a setup that cannot install both fences fails closed.
-      agentCtx.tools.guard((exec) => (READ_TOOLS.includes(exec?.name)
+      agentCtx.tools.guard((exec) => (DOCTOR_TOOLS.includes(exec?.name)
         ? undefined
-        : 'The Doctor is read-only: that tool is not available.'));
+        : 'The Doctor may only read or propose: that tool is not available.'));
       if (agentCtx.systemPrompt?.section) {
         agentCtx.systemPrompt.section({
           name: 'deployment:persona-prefix',
           order: 0,
-          text: 'You are the Arca Doctor, a friendly read-only helper in the Arca canvas.',
+          text: 'You are the Arca Doctor, a friendly helper in the Arca canvas.',
         });
         agentCtx.systemPrompt.section({
           name: 'arca-doctor',
           order: 100,
-          text: doctorPrompt({ hosts, approvalUrl: primaryApproval, now: now() }),
+          text: doctorPrompt({ hosts, approvalUrl: primaryApproval, proposalHost: primaryProposalHost, now: now() }),
         });
       }
     };
@@ -908,6 +1000,7 @@ export function createDoctorChat(options = {}) {
       ...(card.input && Object.keys(card.input).length ? { input: card.input } : {}),
       ...(card.summary ? { summary: card.summary } : {}),
       ...(card.host ? { host: card.host } : {}),
+      ...(proposalId(card.proposal) ? { proposal: { id: proposalId(card.proposal) } } : {}),
     };
   }
 
@@ -938,7 +1031,18 @@ export function createDoctorChat(options = {}) {
     if (!sse.closed) sse.send('tool', toolPayload(card));
   }
 
-  const tools = createReadTools({ hosts, clientFor, onCall: onToolCall });
+  function onProposal({ callId, id }) {
+    if (!turn) return;
+    const card = turn.tools.find((tool) => tool.callId === callId);
+    if (!card) return;
+    card.proposal = { id };
+    if (!sse.closed) sse.send('tool', toolPayload(card));
+  }
+
+  const tools = [
+    ...createReadTools({ hosts, clientFor, onCall: onToolCall }),
+    createProposeTool({ hosts, clientFor, onCall: onToolCall, onProposal, proposalHost: primaryProposalHost }),
+  ];
 
   function usageTotal(usage) {
     if (!usage) return 0;
@@ -1012,14 +1116,6 @@ export function createDoctorChat(options = {}) {
     turn = run;
     const doctorAgent = agent;
     const done = new Promise((resolve) => { run.resolve = resolve; });
-    const started = primaryApproval && writeIntent(message) ? primaryApproval : '';
-    if (started) {
-      sse.send('approval', {
-        url: started,
-        title: 'Approval needed',
-        detail: 'This chat is read-only. Open the Arca approval page to review the change and approve it with your passkey.',
-      });
-    }
     await chatStore.patch((state) => ({
       ...state,
       messages: [...state.messages, { role: 'user', text: message, at: new Date(now()).toISOString() }]
@@ -1155,10 +1251,11 @@ export function createDoctorChat(options = {}) {
           role: 'assistant',
           text: run.text,
           at: new Date(now()).toISOString(),
-          tools: run.tools.map(({ callId, name, state, host, summary }) => ({
+          tools: run.tools.map(({ callId, name, state, host, summary, proposal }) => ({
             callId, name, state,
             ...(host ? { host } : {}),
             ...(summary ? { summary: bound(summary, 240) } : {}),
+            ...(proposalId(proposal) ? { proposal: { id: proposalId(proposal) } } : {}),
           })),
         }].slice(-DEFAULTS.historyMessages),
       })).catch((error) => noteStoreFailure('transcript', error));
@@ -1314,7 +1411,7 @@ export function createDoctorChat(options = {}) {
     history,
     close,
     ensureAgent: async () => ensureAgent(resolveDsh()),
-    doctorPrompt: () => doctorPrompt({ hosts, approvalUrl: primaryApproval, now: now() }),
+    doctorPrompt: () => doctorPrompt({ hosts, approvalUrl: primaryApproval, proposalHost: primaryProposalHost, now: now() }),
     get sessionId() {
       return agent?.session?.id ?? null;
     },

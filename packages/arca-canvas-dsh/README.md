@@ -1,16 +1,18 @@
 # Arca canvas for DSH
 
-A read-only host plugin for stock DSH and an embedding DSH host. It polls Arca
-through a Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
+A host plugin for stock DSH and an embedding DSH host. It polls Arca through a
+Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
 `GET /arca-canvas` draws a workspace from the snapshot: a top bar with the project
 picker, local clock and fleet summary; a machines strip with CPU and memory bars;
 the selected project's cards on a dotted canvas with curved SVG edges; and a
 Doctor panel with Chat and Steps tabs, recent Arca activity and waiting approvals.
-The Doctor composer is a working read-only chat backed by a persisted DSH session named
-`Doctor` (model `deepseek-flash`). It works without a sidebar.
+The Doctor composer is a working chat backed by a persisted DSH session named
+`Doctor` (model `deepseek-flash`). It works without a sidebar. The Doctor reads
+Arca and can record one inert action proposal; it cannot change anything. The
+owner approves a proposal with the passkey on a card inside the kernel-served
+canvas.
 When the sidebar is installed, an Arca canvas tab embeds this same page, sharing
-its renderer, polling and styles. The canvas is read only; waiting plans link to
-the configured approval page.
+its renderer, polling and styles.
 
 ## Install
 
@@ -62,7 +64,7 @@ config:
 | `chatEnabled` | Enable the Doctor chat routes. Default true; when false the chat routes answer 503 and no model is called. |
 | `chatStatePath` | Optional absolute path of the persisted chat state (DSH session id, daily token counter and the panel transcript). Defaults to `$DSH_HOME/storages/arca-canvas-chat.json`. |
 | `dailyTokenBudget` | Positive integer total-token budget per UTC day, default 1000000. When reached the Doctor answers with the daily-budget card and spends no model call. |
-| `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Waiting plans link there only when configured; otherwise the badge is plain text. |
+| `approvalUrl` | Optional absolute HTTP(S) URL of this deployment’s Arca `/approve` page, empty by default. URLs with credentials are refused. Delete plans link there; the proposal cards use the same-origin `/approve/plans` route on the kernel-served canvas. Without it the cards are unavailable and the badge is plain text. |
 | `devicesUrl` | Optional absolute device service HTTP(S) MCP URL without credentials or fragments, empty by default. HTTPS permits any host. HTTP requires a literal loopback, RFC1918, CGNAT (100.64/10), or fd00::/8 address; hostnames and public addresses are refused. |
 | `devicesTokenPath` | Optional absolute device reader token file path; requires a regular file with mode exactly `0400`, with symlinks refused. Empty by default. |
 | `projects` | Optional owner project groups. Each entry has a unique non-empty `name`, an optional `domain`, and a non-empty `members` array of `{ host, incusProject, instance }`. Every member must name a configured host, and one instance can belong to only one project. |
@@ -151,8 +153,10 @@ readers.
 ## Snapshot
 
 The JSON object has `at` (ISO timestamp), `approvalUrl` (empty or the configured
-approval URL), `projects` (the configured owner groups, each with `name`,
-`domain` and `members`), `defaultProject`, and `hosts` in configured order. Each
+approval URL), `pageHost` (the first configured host, whose kernel serves the
+canvas and its approval origin), `projects` (the configured owner groups, each
+with `name`, `domain` and `members`), `defaultProject`, and `hosts` in configured
+order. Each
 host entry has `name`, `address` (the configured LAN address or empty), `at`,
 `error` (null or safe error text), `nodeName`
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
@@ -248,24 +252,36 @@ Cards carry only real snapshot data: status, kind, owner class, the instance's
 own absolute URL when present, and database address, port and link count when
 present. A domain card appears only when the project config sets `domain`.
 
-The right-hand Doctor panel has Chat and Steps tabs. Chat is a real read-only
+The right-hand Doctor panel has Chat and Steps tabs. Chat is a real
 conversation; Steps renders the newest `journal_list` records across every
-machine. A waiting-plan card links to the configured `approvalUrl`. When
-`journal_list` is unavailable Steps says so without fabricating activity. The
-chat's waiting-plan card appears under the conversation too.
+machine. A waiting action proposal is an approval card in Steps, and also under
+the Doctor message that proposed it. A delete plan keeps the count-and-link card
+to the configured `approvalUrl`. When `journal_list` is unavailable Steps says so
+without fabricating activity.
 
-The Doctor answers only from the eight read-only Arca tools (`arca_status`,
-`watch_report`, `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`,
-`journal_list`, `service_list`). They are registered globally with a per-session
-`when` condition, the Doctor's scope is restricted with
-`restrict({ allow: READ_TOOLS })`, and scoped `tools/pre-execute` and
-`tools.guard` checks deny every other name (including the reserved `run_code`) at
-dispatch. A setup that cannot install the restriction and guard, or enumerate
-its tools, fails after the `start` event, so the chat sends a fixed "The Doctor
-could not answer." SSE error event and makes no model call. Write verbs are never
-registered. A request to change something is answered with what the change would
-do and the configured `/approve` link; the panel adds the approval card. Inline
-passkey approval is phase 3. The page never receives a model credential.
+The Doctor has the eight read-only Arca tools (`arca_status`, `watch_report`,
+`postgres_list`, `node_metrics`, `alerts_list`, `plan_list`, `journal_list`,
+`service_list`) plus one non-read tool, `arca_propose`. `arca_propose` calls the
+kernel's `action_propose` viewer verb and records an inert proposal for one of
+seven actions (`service_create`, `service_remove`, `service_publish`,
+`service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`);
+it changes nothing and a database delete cannot be proposed. `arca_propose` may
+target only `pageHost`, the host whose kernel serves this canvas and its approval
+page; a proposal for any other configured reader is refused in plain words
+because that host's approval page is not this one. The tools are
+registered globally with a per-session `when` condition, the Doctor's scope is
+restricted with `restrict({ allow: DOCTOR_TOOLS })` (the eight reads plus
+`arca_propose`), and scoped `tools/pre-execute` and `tools.guard` checks deny every
+other name (including the reserved `run_code`) at dispatch. A setup that cannot
+install the restriction and guard, or enumerate its tools, fails after the
+`start` event, so the chat sends a fixed "The Doctor could not answer." SSE error
+event and makes no model call. Every write verb is still never registered. The
+page never receives a model credential.
+
+For a change request the model calls `arca_propose`, then tells the owner in one
+plain sentence what will happen and to tap Approve on the card. It must never
+claim the change is done before the result arrives. `postgres_create` never
+carries a container image: the kernel picks its default.
 
 The Doctor speaks to a non-technical owner: short plain sentences, no markdown
 tables, headings or code fences, sizes in GB with one decimal and percentages as
@@ -284,8 +300,74 @@ missing fragment selects `defaultProject`, else the first configured project,
 then the first service project, then the first other Incus project, and replaces
 the fragment. The page never pans, zooms or drags. Polls rebuild a region only
 when its data changed, so selection, focus and scroll survive unchanged polls.
-There are no write actions and no routes beyond the existing `/arca-canvas`
-assets and snapshot.
+No write verb is exposed. The only non-read tool records an inert proposal, and
+the package adds no routes beyond the existing `/arca-canvas` assets and
+snapshot.
+
+## Approval cards
+
+The canvas page at `/approve/canvas` is this package's DSH page relayed by the
+kernel from the DSH listener. The card uses the page's own origin: it reads
+`GET /approve/plans` and posts to `POST /approve/approve` and
+`POST /approve/decline`, which are kernel routes on the approval origin and are
+never proxied through DSH. A page opened directly from the DSH listener has no
+`/approve/plans`, so it keeps the waiting count and the configured approval link
+instead of an action card.
+
+The trust claim is precise: the card protects against model text and chat data.
+Those cannot choose its summary, details, host, action, digest or target, and
+cannot make the owner sign a different kernel statement. It is **not** a defence
+against a compromised DSH: a DSH that can rewrite this page's JavaScript can
+mislead the owner. The passkey still binds the approval to the kernel's
+`statement`, so such a page cannot change the action the kernel verifies without
+the owner signing that statement.
+
+An approval card shows, from the kernel's `/approve/plans` row matched by id:
+
+- the **host from the signed statement**, so two hosts with the same action and
+  arguments (the id hashes only those) are never confused;
+- the kernel-built `summary`, as text;
+- every `details` row (`label` and `value`) in kernel order, as text;
+- the action, the target id and the first 12 hex characters of `argsDigest`;
+- a live expiry countdown and Approve / Decline buttons.
+
+All text is assigned with `textContent`; no kernel field is parsed as markup. A
+row without a string `label` and `value` fails the whole proposal closed, so a
+card is never shown with a missing behaviour-changing argument. A proposal whose
+action is not one of the seven allowed actions (for example an older
+`postgres_delete`) is not rendered. The card parses the `statement` and drops the
+proposal unless `statement.target` is the entry id, `statement.action` is the
+entry action and `statement.paramsDigest` is the entry `argsDigest`.
+
+A proposal id reaches the panel only from a real `arca_propose` tool result, and
+it only selects which kernel row to draw. A chat card is attached only when the
+tool ran on `pageHost` and the page kernel listed that id. An id the kernel did
+not list draws no card; the panel says "The proposal is not waiting any more."
+A foreign host's tool event never attaches this page's row. Model text never
+supplies a card field: a contradicting or hostile answer cannot change what the
+owner signs. The kernel row must carry a `statement`; the card signs exactly that
+string.
+
+Approve reads the trusted credential ids from `GET /approve` and calls
+`navigator.credentials.get` exactly like the approval page: `rpId` is
+`location.hostname`, `userVerification` is `required`, and the challenge is
+`SHA-256("arca-kernel-approval/v1\narca-kernel-approve\n" + statement)`.
+The proof is the page's WebAuthn proof object. The POST body is exactly
+`{"plan":"act-<12 hex>","approval":"<base64 statement>.<base64 proof>"}`.
+Decline posts exactly `{"plan":"act-<12 hex>"}`. Only `act-*` ids can be declined
+from a card.
+
+States are `waiting`, `approving` (the passkey prompt), `done` (the verb's result
+in plain words), `declined`, `expired` and `failed` (a plain reason). A cancelled
+passkey prompt returns the card to `waiting`. A failed approval whose entry is
+still listed becomes `waiting` again with a Retry button; a new waiting entry
+with the same id after a decline is waiting again. An approve POST that gets no
+answer after 30 seconds returns to `waiting` with "No answer from Arca, try
+again." A `NoSuchPlan` answer says the proposal may have been approved or
+declined elsewhere and points at Steps, never "Nothing changed". An approval the
+kernel accepted but whose action handler refused shows the action's own plain
+error. While a card is open, the page refreshes `/approve/plans` with the
+snapshot poll; an expired card disables its buttons and says nothing changed.
 
 ## Doctor chat contract
 
@@ -327,8 +409,7 @@ SSE events, in order. Every `data` is one JSON object.
 | --- | --- | --- |
 | `start` | `{ "session": "Doctor", "sessionId"?: "<dsh-session-id>" }` | Always first, sent before agent or model work so the kernel's idle timer never starts on a silent socket. `sessionId` is present when a persisted session is already known. |
 | `text` | `{ "text": "<delta>" }` | One assistant text delta; concatenate in arrival order. |
-| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the eight reads. |
-| `approval` | `{ "url", "title", "detail" }` | Advisory card when the message looks like a write request and an approval URL is configured. `url` is the configured `/approve` URL. Presentation only. |
+| `tool` | `{ "callId", "name", "state", "input"?, "summary"?, "host"?, "proposal"? }` | One card per real tool dispatch. `state` is `running`, then `done` or `error`; `name` is one of the eight reads or `arca_propose`. `proposal` is `{ "id": "act-<12 hex>" }` when the kernel accepted an action proposal. |
 | `usage` | `{ "turnToolCalls", "turnOutputTokens", "dailyTokens", "dailyBudget", "day" }` | Token accounting from the model's own usage; `dailyTokens` counts input plus output for the UTC day. |
 | `budget` | `{ "scope": "daily", "used", "budget", "message" }` | Daily budget reached; the message is `Daily budget reached, try tomorrow.`. The turn then ends. |
 | `cap` | `{ "reason", "limit", "message" }` | Per-turn cap reached: `reason` is `tool-calls` (40) or `output-tokens` (64000). |
@@ -355,7 +436,8 @@ model call:
     { "role": "user", "text": "...", "at": "<ISO time>" },
     { "role": "assistant", "text": "...", "at": "<ISO time>",
       "tools": [{ "callId": "...", "name": "arca_status", "state": "done",
-                 "host": "alpha", "summary": "..." }] }
+                 "host": "alpha", "summary": "...",
+                 "proposal"?: { "id": "act-<12 hex>" } }] }
   ],
   "usage": { "day": "YYYY-MM-DD", "dailyTokens": 0, "dailyBudget": 1000000,
              "budgetExhausted": false },
@@ -363,7 +445,7 @@ model call:
 }
 ```
 
-`tools[].host` and `tools[].summary` are optional. `session` is `null` before the first turn.
+`tools[].host`, `tools[].summary` and `tools[].proposal` are optional. A `proposal` is kept in the panel replay so the same kernel card returns after a reload. `session` is `null` before the first turn.
 The transcript is capped at the newest
 200 messages and the body is kept under 1.5 MiB (oldest replay rows are dropped)
 so it fits the kernel's 2 MiB forward cap. The model transcript itself is the
@@ -395,17 +477,24 @@ The tests assert light/dark colors, layout regions and literal rendering of
 untrusted strings in a real browser. They also rebuild every browser artifact
 into a temporary directory and compare SHA-256 hashes. Chat tests use a fake
 DSH agent/stream and the synthetic Arca socket fixtures: they cover streamed
-text, one card per real call, the approval card and read-only refusal, the tool
-and token caps, the daily budget, the persisted `Doctor` session, and the
-absence of the model key from the page.
+text, one card per real call, the inert proposal tool and the full allow-list,
+the approval card's kernel-only text, exact approve and decline bodies, the
+host row and statement integrity, a foreign host and an unknown id, expiry,
+action refusal, retry, NoSuchPlan, a hanging approval timeout, passkey
+cancellation, the tool and token caps, the daily budget, the persisted `Doctor`
+session, and the absence of the model key from the page.
 
 `npm run build` regenerates the browser module and standalone page assets using
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.
 Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test’s
-1440×900 light/dark screenshots (`canvas-v28-light.png`, `canvas-v28-dark.png`)
+1440×900 light/dark screenshots (`canvas-v28-light.png`, `canvas-v28-dark.png`,
+`approval-card-waiting-light.png`, `approval-card-waiting-dark.png`,
+`approval-card-done-light.png`, `approval-card-done-dark.png`)
 and `rectangles.json` outside the repository. The standard browser fixture has
 two hosts, two owner projects, one service project, one fallback project,
-real-shaped journal rows and one waiting plan.
+real-shaped journal rows, one waiting delete plan and eight waiting action proposals
+(including a hostile row, a mismatched statement, a foreign-host candidate and an old
+database-delete row the card must not draw).
 
 The client contract is pinned to the sidebar’s 0.24.1 API: package metadata uses
 `dsh.client.inject: ["dsh-better-sidebar"]` (package IDs), while the client exports

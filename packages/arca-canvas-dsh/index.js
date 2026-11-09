@@ -135,6 +135,7 @@ export function apply(ctx, config) {
   }));
   const chat = config.chatEnabled ? createDoctorChat({
     hosts: readers.map(({ name, address }) => ({ name, address })),
+    proposalHost: readers[0]?.name ?? '',
     approvalUrl: approvalUrl(config.approvalUrl),
     clientFor(name) {
       return readers.find((reader) => reader.name === name)?.client ?? null;
@@ -196,6 +197,7 @@ export function apply(ctx, config) {
         res.end(JSON.stringify({
           at: new Date().toISOString(),
           approvalUrl: approvalUrl(config.approvalUrl),
+          pageHost: (readers[0]?.name ?? '').trim(),
           projects: (config.projects ?? []).map(({ name, domain, members }) => ({
             name,
             domain: domain ?? '',

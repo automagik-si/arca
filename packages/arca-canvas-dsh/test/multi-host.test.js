@@ -145,6 +145,7 @@ test('two Unix hosts keep projects, machines, journal and failures isolated', as
   const ready = await until(read, (snapshot) => snapshot.hosts.every((host) => host.instancesKnown)
     && snapshot.hosts[0].devices === 'ok' && snapshot.hosts.every((host) => host.journalKnown));
   assert.deepEqual(ready.hosts.map((host) => host.name), ['alpha', 'beta']);
+  assert.equal(ready.pageHost, 'alpha', 'the snapshot names the primary host whose kernel serves the page');
   assert.equal(ready.hosts[1].devices, 'off');
   assert.deepEqual(ready.hosts[1].phones, []);
   assert.ok(ready.hosts.every((host) => Number.isFinite(Date.parse(host.at)) && host.error === null));

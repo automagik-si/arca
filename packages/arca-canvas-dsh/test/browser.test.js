@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
@@ -11,6 +12,116 @@ const pageJs = await readFile(join(here, '../page.js'));
 const pageCss = await readFile(join(here, '../page.css'));
 const fixture = JSON.parse(await readFile(join(here, 'dashboard-fixtures.json'), 'utf8'));
 const html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="arca-canvas/page.css"></head><body><main id="arca-root" data-arca-base="/arca-canvas" data-poll-ms="50"></main><script src="arca-canvas/page.js" defer></script></body></html>';
+
+const CHAT_ID = 'act-0123456789ab';
+const EXTERNAL_ID = 'act-89abcdef0123';
+const EXPIRING_ID = 'act-111111111111';
+const FAILED_ID = 'act-222222222222';
+const HOSTILE_ID = 'act-333333333333';
+const DISALLOWED_ID = 'act-444444444444';
+const MISMATCH_ID = 'act-555555555555';
+const RETRY_ID = 'act-666666666666';
+const GONE_ID = 'act-777777777777';
+const HANG_ID = 'act-888888888888';
+const UNKNOWN_ID = 'act-999999999999';
+const DELETE_ID = 'd'.repeat(64);
+
+function digestFor(id) {
+  return `${id.slice(4)}${'0'.repeat(52)}`;
+}
+
+const b64 = (value) => Buffer.from(value).toString('base64');
+const b64url = (value) => b64(value).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+function approvalStatement(plan) {
+  return JSON.stringify({
+    action: plan.action,
+    expiresAt: new Date(plan.expiresAt).toISOString(),
+    host: 'alpha.example',
+    issuedAt: new Date(plan.createdAt).toISOString(),
+    nonce: '0123456789abcdef0123456789abcdef',
+    paramsDigest: plan.argsDigest,
+    target: plan.id,
+  });
+}
+
+function actionPlan({ id, action, summary, args, details }) {
+  const now = Date.now();
+  const plan = {
+    kind: 'action', id, action, summary, args,
+    argsDigest: digestFor(id), createdAt: now, expiresAt: now + 15 * 60 * 1000, details,
+  };
+  plan.statement = approvalStatement(plan);
+  return plan;
+}
+
+function approvalFixture() {
+  return [
+    actionPlan({
+      id: CHAT_ID, action: 'service_create', summary: 'Create the service nats',
+      args: { name: 'nats', template: 'nats' },
+      details: [{ label: 'Name', value: 'nats' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: EXTERNAL_ID, action: 'service_create', summary: 'Create the service billing',
+      args: { name: 'billing', template: 'postgres' },
+      details: [{ label: 'Name', value: 'billing' }, { label: 'Template', value: 'postgres' }],
+    }),
+    actionPlan({
+      id: EXPIRING_ID, action: 'service_create', summary: 'Create the service ephemeral',
+      args: { name: 'ephemeral', template: 'nats' },
+      details: [{ label: 'Name', value: 'ephemeral' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: FAILED_ID, action: 'service_connect', summary: 'Connect the service web1 to nats',
+      args: { from: 'web1', to: 'nats' },
+      details: [{ label: 'From', value: 'web1' }, { label: 'To', value: 'nats' }],
+    }),
+    actionPlan({
+      id: RETRY_ID, action: 'service_create', summary: 'Create the service retry',
+      args: { name: 'retry', template: 'nats' },
+      details: [{ label: 'Name', value: 'retry' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: GONE_ID, action: 'service_create', summary: 'Create the service gone',
+      args: { name: 'gone', template: 'nats' },
+      details: [{ label: 'Name', value: 'gone' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: HANG_ID, action: 'service_create', summary: 'Create the service hang',
+      args: { name: 'hang', template: 'nats' },
+      details: [{ label: 'Name', value: 'hang' }, { label: 'Template', value: 'nats' }],
+    }),
+    actionPlan({
+      id: DISALLOWED_ID, action: 'postgres_delete', summary: 'Delete the database legacy',
+      args: { name: 'legacy' }, details: [{ label: 'Name', value: 'legacy' }],
+    }),
+    (() => {
+      const plan = actionPlan({
+        id: MISMATCH_ID, action: 'service_create', summary: 'Create the service mismatch',
+        args: { name: 'mismatch', template: 'nats' },
+        details: [{ label: 'Name', value: 'mismatch' }, { label: 'Template', value: 'nats' }],
+      });
+      const statement = JSON.parse(plan.statement);
+      statement.target = CHAT_ID;
+      plan.statement = JSON.stringify(statement);
+      return plan;
+    })(),
+    actionPlan({
+      id: HOSTILE_ID, action: 'service_connect',
+      summary: 'Connect <img src=x onerror="window.__arcaXss=1"> to nats',
+      args: { from: '<img src=x onerror="window.__arcaXss=1">', to: 'nats' },
+      details: [
+        { label: 'From', value: '<img src=x onerror="window.__arcaXss=1">' },
+        { label: 'To', value: 'nats' },
+      ],
+    }),
+    {
+      plan: DELETE_ID, kind: 'delete', createdAt: Date.now(), expiresAt: Date.now() + 15 * 60 * 1000,
+      entry: { kind: 'database', name: 'old-db' }, objects: [], paramsDigest: 'e'.repeat(64), statement: '{}',
+    },
+  ];
+}
 
 function luminance(rgb) {
   const channels = rgb.match(/\d+/g).slice(0, 3).map((value) => {
@@ -48,13 +159,70 @@ function chatEvents(message) {
       ],
     };
   }
-  if (message.includes('delete')) {
+  if (message.includes('create nats')) {
     return {
       status: 200,
       events: [
         ['start', { session: 'Doctor' }],
-        ['approval', { url: 'https://example.com/approve', detail: 'This chat is read-only. Review the change and approve it with your passkey.' }],
-        ['text', { text: 'That would delete the app database from the arcak-svc project. Approve it at https://example.com/approve.' }],
+        ['text', { text: 'I can create the nats service. ' }],
+        ['tool', {
+          callId: 'call-propose-1', name: 'arca_propose', state: 'running', host: 'alpha',
+          input: { action: 'service_create', args: { name: 'nats', template: 'nats' } },
+        }],
+        ['tool', {
+          callId: 'call-propose-1', name: 'arca_propose', state: 'done', host: 'alpha',
+          proposal: { id: CHAT_ID }, summary: 'Proposed: Create the service nats',
+        }],
+        ['text', { text: 'Tap Approve on the card to allow it.' }],
+        ['done', { reason: 'complete' }],
+      ],
+    };
+  }
+  if (message.includes('foreign proposal')) {
+    return {
+      status: 200,
+      events: [
+        ['start', { session: 'Doctor' }],
+        ['text', { text: 'That change belongs to beta. ' }],
+        ['tool', {
+          callId: 'call-propose-3', name: 'arca_propose', state: 'done', host: 'beta',
+          proposal: { id: EXTERNAL_ID }, summary: 'Proposed: Create the service billing',
+        }],
+        ['text', { text: 'Nothing is waiting for you on this canvas.' }],
+        ['done', { reason: 'complete' }],
+      ],
+    };
+  }
+  if (message.includes('unknown proposal')) {
+    return {
+      status: 200,
+      events: [
+        ['start', { session: 'Doctor' }],
+        ['text', { text: 'The change was proposed. ' }],
+        ['tool', {
+          callId: 'call-propose-4', name: 'arca_propose', state: 'done', host: 'alpha',
+          proposal: { id: UNKNOWN_ID }, summary: 'Proposed: Create the service unknown',
+        }],
+        ['text', { text: 'Check the card. ' }],
+        ['done', { reason: 'complete' }],
+      ],
+    };
+  }
+  if (message.includes('mismatch')) {
+    return {
+      status: 200,
+      events: [
+        ['start', { session: 'Doctor' }],
+        ['text', { text: 'I will delete the app database and stop every host. ' }],
+        ['tool', {
+          callId: 'call-propose-2', name: 'arca_propose', state: 'running', host: 'alpha',
+          input: { action: 'service_connect', args: { from: 'web1', to: 'nats' } },
+        }],
+        ['tool', {
+          callId: 'call-propose-2', name: 'arca_propose', state: 'done', host: 'alpha',
+          proposal: { id: HOSTILE_ID }, summary: 'Proposed: Connect the service to nats',
+        }],
+        ['text', { text: 'Approve the card when you are ready.' }],
         ['done', { reason: 'complete' }],
       ],
     };
@@ -90,9 +258,13 @@ async function body(req) {
   return raw;
 }
 
-test('v28 layout binds both hosts, the Doctor chat and the activity steps', async (t) => {
+test('v28 layout binds both hosts, the Doctor chat, the approval cards and the activity steps', async (t) => {
   let data = fixture;
+  let approvalPlans = approvalFixture();
   const requests = [];
+  const approvalRequests = [];
+  const declines = [];
+  let retryAttempts = 0;
   const server = createServer(async (req, res) => {
     const path = new URL(req.url, 'http://local').pathname;
     requests.push({ method: req.method, path });
@@ -116,6 +288,84 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
       writeSse(res, reply.events);
       return;
     }
+    if (path === '/approve') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end('<!doctype html><html><body data-credential-ids=\'["AQID"]\'></body></html>');
+      return;
+    }
+    if (path === '/approve/plans') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ plans: approvalPlans, passkeysTrusted: 1 }));
+      return;
+    }
+    if (path === '/test/expire') {
+      const plan = approvalPlans.find((row) => row.id === EXPIRING_ID);
+      plan.expiresAt = Date.now() - 1000;
+      plan.statement = approvalStatement(plan);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+    if (path === '/test/repropose') {
+      if (!approvalPlans.some((row) => row.id === EXTERNAL_ID)) {
+        approvalPlans = [...approvalPlans, actionPlan({
+          id: EXTERNAL_ID, action: 'service_create', summary: 'Create the service billing',
+          args: { name: 'billing', template: 'postgres' },
+          details: [{ label: 'Name', value: 'billing' }, { label: 'Template', value: 'postgres' }],
+        })];
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+    if (path === '/approve/approve' && req.method === 'POST') {
+      const raw = await body(req);
+      approvalRequests.push({ raw, body: JSON.parse(raw) });
+      const payload = JSON.parse(raw);
+      if (payload.plan === RETRY_ID) {
+        retryAttempts += 1;
+        if (retryAttempts === 1) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ refusal: 'BadSignature', message: 'the passkey answer did not check' }));
+          return;
+        }
+      }
+      if (payload.plan === FAILED_ID) {
+        approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ refusal: 'service_not_found', message: 'The service nats: not found' }));
+        return;
+      }
+      if (payload.plan === GONE_ID) {
+        approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ refusal: 'NoSuchPlan', message: 'the proposal is no longer waiting' }));
+        return;
+      }
+      if (payload.plan === HANG_ID) return; // never answer; the page's 250 ms test timeout applies
+      const plan = approvalPlans.find((row) => row.id === payload.plan);
+      approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        plan: payload.plan,
+        id: payload.plan,
+        action: plan?.action ?? 'service_create',
+        result: {
+          name: plan?.args?.name ?? 'nats', template: plan?.args?.template ?? 'nats',
+          state: 'running', ipv4: '10.99.0.10', ports: [4222], links: [], published: null, lanPort: null,
+        },
+      }));
+      return;
+    }
+    if (path === '/approve/decline' && req.method === 'POST') {
+      const raw = await body(req);
+      declines.push({ raw, body: JSON.parse(raw) });
+      const payload = JSON.parse(raw);
+      approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ plan: payload.plan, retained: [] }));
+      return;
+    }
     res.writeHead(404).end();
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -131,6 +381,43 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
       get: descriptor.get,
       set() { throw new Error('innerHTML is forbidden'); },
     });
+  });
+
+  await page.addInitScript(() => {
+    const b64url = (bytes) => {
+      let text = '';
+      for (const byte of bytes) text += String.fromCharCode(byte);
+      return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    };
+    window.__arcaPasskey = { calls: [] };
+    Object.defineProperty(navigator, 'credentials', {
+      configurable: true,
+      value: {
+        async get(options) {
+          if (window.__arcaPasskey.cancelNext) {
+            window.__arcaPasskey.cancelNext = false;
+            throw new DOMException('The operation was cancelled.', 'NotAllowedError');
+          }
+          window.__arcaPasskey.calls.push({
+            challenge: Array.from(new Uint8Array(options.publicKey.challenge)),
+            rpId: options.publicKey.rpId,
+            userVerification: options.publicKey.userVerification,
+            allowCredentials: options.publicKey.allowCredentials.map((entry) => ({
+              type: entry.type, id: Array.from(entry.id),
+            })),
+          });
+          return {
+            rawId: Uint8Array.from([1, 2, 3]),
+            response: {
+              authenticatorData: Uint8Array.from([4, 5]),
+              clientDataJSON: new TextEncoder().encode('{"type":"webauthn.get"}'),
+              signature: Uint8Array.from([6, 7]),
+            },
+          };
+        },
+      },
+    });
+    window.__arcaPasskey.b64url = b64url;
   });
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
@@ -216,7 +503,7 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     assert.equal(await page.locator('[role="tab"]').nth(1).innerText(), 'Steps');
     assert.equal(await page.locator('[role="tab"]').first().getAttribute('aria-selected'), 'true');
     assert.match(await page.locator('.arca-chat-view').innerText(), /Ask the Doctor/);
-    assert.match(await page.locator('.arca-chat-banner').innerText(), /Read only .* changes need your passkey/);
+    assert.match(await page.locator('.arca-chat-banner').innerText(), /Read only .* approve with your passkey/);
     const dom = await page.evaluate(() => `${document.documentElement.textContent}\n${document.documentElement.outerHTML}`);
     assert.doesNotMatch(dom, /arcak-svc/i, 'the internal project id never reaches the DOM');
     assert.doesNotMatch(dom, /DEEPSEEK_API_KEY|sk-[A-Za-z0-9]/);
@@ -233,7 +520,11 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     assert.equal(await page.locator('.arca-panel-sub').innerText(), 'Recent activity · all machines');
     assert.equal(await page.locator('.arca-step').count(), 4);
     assert.match(await page.locator('.arca-step').first().innerText(), /rotate-token[\s\S]*beta[\s\S]*Applied/);
-    const approval = page.locator('.arca-steps-view .arca-approval a');
+    await page.waitForFunction((id) => Boolean(document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)), CHAT_ID);
+    assert.equal(await page.locator('.arca-steps-view .arca-proposal').count(), 8, 'the seven-action contract, less the removed delete action');
+    assert.equal(await page.locator(`.arca-steps-view .arca-proposal[data-proposal="${DISALLOWED_ID}"]`).count(), 0, 'a database delete proposal is not rendered');
+    assert.equal(await page.locator(`.arca-steps-view .arca-proposal[data-proposal="${MISMATCH_ID}"]`).count(), 0, 'a statement that does not match its entry is dropped');
+    const approval = page.locator('.arca-steps-view .arca-approval-delete a');
     assert.equal(await approval.getAttribute('href'), fixture.approvalUrl);
     assert.match(await approval.innerText(), /Review approvals/);
     await goChat();
@@ -262,16 +553,205 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     }
   });
 
-  await t.test('a write request answers what it would do and links the passkey page', async () => {
-    await send('delete the app database');
-    await page.waitForFunction(() => [...document.querySelectorAll('.arca-msg-assistant .arca-msg-text')].some((node) => node.textContent.includes('would delete')));
-    const approval = page.locator('.arca-msg-assistant .arca-approval a');
-    assert.equal(await approval.getAttribute('href'), 'https://example.com/approve');
-    assert.match(await page.locator('.arca-msg-assistant .arca-approval').innerText(), /read-only/i);
-    assert.match(await page.locator('.arca-msg-assistant').last().innerText(), /Approve it at https:\/\/example\.com\/approve/);
-    const dom = await page.evaluate(() => document.documentElement.textContent);
-    assert.doesNotMatch(dom, /arcak-svc/i, 'the model cannot leak the internal project id into the DOM');
-    assert.match(await page.locator('.arca-msg-assistant').last().innerText(), /Arca service project/);
+  await t.test('a proposal card renders the kernel summary and every details row', async () => {
+    await send('create nats');
+    const card = page.locator(`.arca-chat-view .arca-proposal[data-proposal="${CHAT_ID}"]`);
+    await card.waitFor();
+    assert.equal(await card.getAttribute('data-state'), 'waiting');
+    assert.equal(await card.locator('.arca-approval-summary').innerText(), 'Create the service nats');
+    assert.equal(await card.locator('.arca-approval-fact[data-detail="host"] dd').innerText(), 'alpha.example');
+    const rows = await card.locator('.arca-approval-fact[data-detail="true"]').evaluateAll((nodes) => nodes.map((node) => [
+      node.querySelector('dt').textContent, node.querySelector('dd').textContent,
+    ]));
+    assert.deepEqual(rows, [['Name', 'nats'], ['Template', 'nats']]);
+    assert.equal(await card.locator('[data-technical="action"] dd').innerText(), 'service_create');
+    assert.equal(await card.locator('[data-technical="target"] dd').innerText(), CHAT_ID);
+    assert.equal(await card.locator('[data-technical="digest"] dd').innerText(), digestFor(CHAT_ID).slice(0, 12));
+    assert.match(await card.locator('.arca-approval-expiry').innerText(), /^Expires in \d+:\d{2}$/);
+    assert.match(await page.locator('.arca-msg-assistant').last().innerText(), /I can create the nats service/);
+    assert.doesNotMatch(await card.innerText(), /delete the app database/);
+    const polls = requests.filter((entry) => entry.method === 'GET' && entry.path === '/approve/plans').length;
+    let refreshed = false;
+    for (let attempt = 0; attempt < 20 && !refreshed; attempt++) {
+      await page.waitForTimeout(50);
+      refreshed = requests.filter((entry) => entry.method === 'GET' && entry.path === '/approve/plans').length > polls;
+    }
+    assert.ok(refreshed, 'an open card is refreshed with the snapshot poll');
+
+    if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
+      await mkdir(process.env.ARCA_CANVAS_EVIDENCE_DIR, { recursive: true });
+      for (const theme of ['light', 'dark']) {
+        await page.emulateMedia({ colorScheme: theme });
+        await card.scrollIntoViewIfNeeded();
+        await page.waitForTimeout(250);
+        await page.screenshot({ path: join(process.env.ARCA_CANVAS_EVIDENCE_DIR, `approval-card-waiting-${theme}.png`) });
+      }
+      await page.emulateMedia({ colorScheme: 'light' });
+    }
+  });
+
+  await t.test('approving posts the exact statement and proof and shows the result', async () => {
+    const plan = approvalPlans.find((row) => row.id === CHAT_ID);
+    assert.ok(plan?.statement, 'the fake kernel sent a statement');
+    const challenge = createHash('sha256')
+      .update(`arca-kernel-approval/v1\narca-kernel-approve\n${plan.statement}`)
+      .digest();
+    const proof = {
+      alg: 'ES256',
+      authenticatorData: b64url(Buffer.from([4, 5])),
+      clientDataJSON: b64url(Buffer.from('{"type":"webauthn.get"}')),
+      credentialId: b64url(Buffer.from([1, 2, 3])),
+      kind: 'webauthn',
+      signature: b64url(Buffer.from([6, 7])),
+      v: 1,
+    };
+    const approval = `${b64(plan.statement)}.${b64(JSON.stringify(proof))}`;
+    const card = page.locator(`.arca-chat-view .arca-proposal[data-proposal="${CHAT_ID}"]`);
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-chat-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'done', CHAT_ID);
+    assert.equal(approvalRequests.length, 1);
+    assert.equal(approvalRequests[0].raw, JSON.stringify({ plan: CHAT_ID, approval }));
+    const passkey = await page.evaluate(() => window.__arcaPasskey.calls.at(-1));
+    assert.deepEqual(passkey.challenge, Array.from(challenge));
+    assert.equal(passkey.rpId, '127.0.0.1');
+    assert.equal(passkey.userVerification, 'required');
+    assert.deepEqual(passkey.allowCredentials, [{ type: 'public-key', id: [1, 2, 3] }]);
+    assert.match(await card.locator('.arca-approval-status').innerText(), /The service nats was created and is running/);
+
+    if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
+      await mkdir(process.env.ARCA_CANVAS_EVIDENCE_DIR, { recursive: true });
+      for (const theme of ['light', 'dark']) {
+        await page.emulateMedia({ colorScheme: theme });
+        await card.scrollIntoViewIfNeeded();
+        await page.waitForTimeout(250);
+        await page.screenshot({ path: join(process.env.ARCA_CANVAS_EVIDENCE_DIR, `approval-card-done-${theme}.png`) });
+      }
+      await page.emulateMedia({ colorScheme: 'light' });
+    }
+  });
+
+  await t.test('a contradicting model answer never changes what the card shows', async () => {
+    await send('mismatch check');
+    const card = page.locator(`.arca-chat-view .arca-proposal[data-proposal="${HOSTILE_ID}"]`);
+    await card.waitFor();
+    const summary = 'Connect <img src=x onerror="window.__arcaXss=1"> to nats';
+    assert.equal(await card.locator('.arca-approval-summary').textContent(), summary);
+    assert.equal(await card.locator('.arca-approval-fact[data-detail="host"] dd').innerText(), 'alpha.example');
+    const rows = await card.locator('.arca-approval-fact[data-detail="true"]').evaluateAll((nodes) => nodes.map((node) => [
+      node.querySelector('dt').textContent, node.querySelector('dd').textContent,
+    ]));
+    assert.deepEqual(rows, [
+      ['From', '<img src=x onerror="window.__arcaXss=1">'],
+      ['To', 'nats'],
+    ]);
+    assert.match(await page.locator('.arca-msg-assistant').last().innerText(), /delete the app database and stop every host/);
+    assert.doesNotMatch(await card.innerText(), /delete the app database/);
+    assert.equal(await card.locator('img').count(), 0, 'hostile kernel markup is text, never an element');
+    assert.equal(await page.evaluate(() => window.__arcaXss), undefined);
+  });
+
+  await t.test('declining posts the exact proposal id and leaves nothing changed', async () => {
+    await goSteps();
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${EXTERNAL_ID}"]`);
+    await card.waitFor();
+    await card.locator('.arca-decline').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'declined', EXTERNAL_ID);
+    assert.equal(declines.length, 1);
+    assert.equal(declines[0].raw, JSON.stringify({ plan: EXTERNAL_ID }));
+    assert.match(await card.locator('.arca-approval-status').innerText(), /Declined. Nothing changed/);
+    assert.equal(await page.locator('.arca-canvas-title').innerText(), 'Studio');
+
+    // A new waiting row with the same id after the decline is waiting again, not stuck on Declined.
+    await fetch(`${origin}/test/repropose`);
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'waiting', EXTERNAL_ID, { timeout: 10000 });
+    assert.equal(await card.locator('.arca-approve').innerText(), 'Approve');
+    assert.equal(await card.locator('.arca-approval-status').count(), 0);
+  });
+
+  await t.test('the host row and the statement decide which cards exist', async () => {
+    await goSteps();
+    // A waiting row whose statement does not name its own target is dropped by the card parser.
+    assert.equal(await page.locator(`.arca-steps-view .arca-proposal[data-proposal="${MISMATCH_ID}"]`).count(), 0);
+    // A foreign host's tool event never attaches this page kernel's row.
+    await goChat();
+    await send('foreign proposal');
+    const foreign = page.locator('.arca-msg-assistant').last();
+    assert.equal(await foreign.locator('.arca-proposal').count(), 0);
+    assert.equal(await foreign.locator('.arca-approval-missing').count(), 0);
+    // An id the kernel did not list draws no card, only the explicit note.
+    await send('unknown proposal');
+    const unknown = page.locator('.arca-msg-assistant').last();
+    assert.equal(await unknown.locator('.arca-proposal').count(), 0);
+    assert.match(await unknown.locator('.arca-approval-missing').innerText(), /The proposal is not waiting any more\./);
+  });
+
+  await t.test('a proposal expires with no buttons', async () => {
+    await goSteps();
+    const expiring = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${EXPIRING_ID}"]`);
+    await expiring.waitFor();
+    await fetch(`${origin}/test/expire`);
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'expired', EXPIRING_ID, { timeout: 10000 });
+    assert.match(await expiring.locator('.arca-approval-status').innerText(), /Expired. Nothing changed/);
+    assert.equal(await expiring.locator('button').count(), 0);
+  });
+
+  await t.test('an accepted approval whose action refuses shows the action error', async () => {
+    const failed = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${FAILED_ID}"]`);
+    await failed.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', FAILED_ID);
+    const text = await failed.innerText();
+    assert.match(text, /The service nats: not found/);
+    assert.doesNotMatch(text, /did not accept this approval|Nothing changed/);
+  });
+
+  await t.test('a failed approval whose entry still waits becomes waiting with Retry', async () => {
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${RETRY_ID}"]`);
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'waiting', RETRY_ID);
+    assert.match(await card.locator('.arca-card-note').innerText(), /Arca could not check the passkey's answer/);
+    const retry = card.locator('.arca-approve');
+    assert.equal(await retry.innerText(), 'Retry');
+    await retry.click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'done', RETRY_ID);
+    assert.match(await card.locator('.arca-approval-status').innerText(), /The service retry was created and is running/);
+  });
+
+  await t.test('NoSuchPlan says it may have been handled elsewhere, never Nothing changed', async () => {
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${GONE_ID}"]`);
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', GONE_ID);
+    const text = await card.innerText();
+    assert.match(text, /This proposal is no longer waiting\. It may have been approved or declined elsewhere\. Check Steps\./);
+    assert.doesNotMatch(text, /Nothing changed/);
+  });
+
+  await t.test('a hanging approval returns to waiting after the timeout', async () => {
+    await page.evaluate(() => {
+      const timeout = AbortSignal.timeout.bind(AbortSignal);
+      Object.defineProperty(AbortSignal, 'timeout', {
+        configurable: true,
+        value: (ms) => timeout(ms === 30000 ? 250 : ms),
+      });
+    });
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${HANG_ID}"]`);
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'waiting', HANG_ID, { timeout: 5000 });
+    assert.match(await card.locator('.arca-card-note').innerText(), /No answer from Arca, try again/);
+    assert.equal(await card.locator('.arca-approve').innerText(), 'Retry');
+  });
+
+  await t.test('a cancelled passkey prompt returns the card to waiting', async () => {
+    await goChat();
+    const card = page.locator(`.arca-chat-view .arca-proposal[data-proposal="${HOSTILE_ID}"]`);
+    await card.waitFor();
+    assert.equal(await card.getAttribute('data-state'), 'waiting');
+    const before = approvalRequests.length;
+    await page.evaluate(() => { window.__arcaPasskey.cancelNext = true; });
+    await card.locator('.arca-approve').click();
+    await page.waitForFunction((id) => document.querySelector(`.arca-chat-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'waiting', HOSTILE_ID);
+    assert.equal(approvalRequests.length, before, 'a cancelled prompt posts nothing');
+    assert.match(await card.locator('.arca-card-note').innerText(), /Passkey cancelled/);
+    assert.equal(await card.locator('.arca-approve').isEnabled(), true);
   });
 
   await t.test('model markup renders as text and never as an element', async () => {
@@ -452,7 +932,6 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     };
     await goSteps();
     await page.waitForFunction(() => document.querySelector('.arca-steps-view')?.textContent?.includes('Activity journal unavailable'));
-    assert.equal(await page.locator('.arca-steps-view .arca-approval').count(), 0);
     assert.equal(await page.locator('.arca-step').count(), 0);
     await goChat();
     assert.equal(await page.locator('.arca-machine').first().innerText().then((value) => value.includes('No metrics')), true);
@@ -627,7 +1106,7 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     assert.ok(requests.length > 0);
     const writes = requests.filter((entry) => entry.method !== 'GET');
     assert.ok(writes.length > 0);
-    assert.ok(writes.every((entry) => entry.method === 'POST' && entry.path === '/arca-canvas/chat'));
+    assert.ok(writes.every((entry) => entry.method === 'POST' && ['/arca-canvas/chat', '/approve/approve', '/approve/decline'].includes(entry.path)));
     assert.doesNotMatch(pageJs.toString(), /\.innerHTML\b/);
     assert.ok(pageJs.length < 2 * 1024 * 1024);
     assert.equal(pageJs.toString().includes('DEEPSEEK_API_KEY'), false);
