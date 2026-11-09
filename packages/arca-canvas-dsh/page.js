@@ -69,13 +69,14 @@
   function hostCpu(host = {}) {
     const cpu = host.metrics?.latest?.cpu;
     const cores = finite(cpu?.cores);
+    const coresKnown = cores !== null && cores > 0 && (typeof cpu?.coresKnown === "boolean" ? cpu.coresKnown : true);
     const usedPct = finite(cpu?.usedPct);
     const reason = typeof cpu?.reason === "string" ? cpu.reason.trim() : "";
     if (cores === null && usedPct === null && !reason) return null;
-    const known = !reason && cores !== null && cores > 0;
-    const percent = known && usedPct !== null ? clampPercent(usedPct) : null;
+    const percent = coresKnown && usedPct !== null ? clampPercent(usedPct) : null;
     return {
       cores,
+      coresKnown,
       usedPct: percent,
       usedCores: percent !== null && cores !== null ? percent / 100 * cores : null,
       reason
@@ -100,11 +101,14 @@
   }
   function cpuLabel(cpu) {
     if (!cpu) return "";
-    if (cpu.reason || cpu.cores === 0) return "cores n/a";
-    if (cpu.usedPct === null) return "n/a";
-    if (cpu.usedCores !== null && cpu.cores !== null) return `${formatNumber(cpu.usedCores)} / ${count(cpu.cores, "core")}`;
-    if (cpu.cores !== null) return count(cpu.cores, "core");
-    return `${formatNumber(cpu.usedPct)}% used`;
+    const cores = finite(cpu.cores);
+    const coresKnown = cores !== null && cores > 0 && (typeof cpu.coresKnown === "boolean" ? cpu.coresKnown : true);
+    if (!coresKnown) return "cores n/a";
+    const usedPct = finite(cpu.usedPct);
+    if (usedPct === null) return `n/a / ${count(cores, "core")}`;
+    const usedCores = finite(cpu.usedCores);
+    if (usedCores !== null) return `${formatNumber(usedCores)} / ${count(cores, "core")}`;
+    return `${formatNumber(usedPct)}% used`;
   }
   function memoryLabel(memory) {
     if (!memory) return "";
@@ -115,7 +119,10 @@
   function fleetSummary(hosts = []) {
     const rows = list(hosts);
     const parts = [count(rows.length, "machine")];
-    const cores = rows.reduce((sum, host) => sum + (hostCpu(host)?.cores ?? 0), 0);
+    const cores = rows.reduce((sum, host) => {
+      const cpu = hostCpu(host);
+      return sum + (cpu?.coresKnown ? cpu.cores : 0);
+    }, 0);
     if (cores > 0) parts.push(count(cores, "core"));
     const bytes = rows.reduce((sum, host) => sum + (hostMemory(host)?.totalBytes ?? 0), 0);
     if (bytes > 0) parts.push(`${formatGb(bytes)} GB`);
@@ -192,7 +199,8 @@
       tone: online ? "ok" : "bad",
       cpu,
       cpuLabel: cpuLabel(cpu),
-      cpuReason: cpu?.reason ?? "",
+      // The reason is the CPU n/a tooltip: it only applies while no load is shown.
+      cpuReason: cpu?.usedPct === null ? cpu?.reason ?? "" : "",
       memory,
       memoryLabel: memoryLabel(memory),
       memoryReason: memory?.reason ?? "",

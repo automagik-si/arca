@@ -383,7 +383,7 @@ test('only a service with a real lan port gets an Open link', () => {
 
 test('a remote host with unknown totals reports cores n/a and memory n/a with reasons', () => {
   const host = structuredClone(fixture.hosts[0]);
-  host.metrics.latest.cpu = { cores: 0, usedPct: null, reason: 'the Incus resources read failed' };
+  host.metrics.latest.cpu = { cores: 0, coresKnown: false, usedPct: null, reason: 'the Incus resources read failed' };
   host.metrics.latest.memory = {
     totalBytes: null, availableBytes: null, usedBytes: 2_000_000_000,
     reason: 'the Incus resources read failed',
@@ -400,12 +400,54 @@ test('a remote host with unknown totals reports cores n/a and memory n/a with re
   const nullLoad = structuredClone(fixture.hosts[0]);
   nullLoad.metrics.latest.cpu = { cores: 8, usedPct: null, reason: null };
   const nullMachine = buildDashboard({ ...fixture, hosts: [nullLoad] }).hosts[0];
-  assert.equal(nullMachine.cpuLabel, 'n/a', 'null load with known cores is CPU n/a');
+  assert.equal(nullMachine.cpuLabel, 'n/a / 8 cores', 'null load with known cores keeps the real capacity');
   assert.equal(nullMachine.cpu.usedPct, null);
-  assert.equal(cpuLabel(hostCpu(nullLoad)), 'n/a');
+  assert.equal(nullMachine.cpuReason, '');
+  assert.equal(cpuLabel(hostCpu(nullLoad)), 'n/a / 8 cores');
   // Real readings are unchanged.
   assert.equal(cpuLabel(hostCpu(fixture.hosts[0])), '2 / 8 cores');
   assert.equal(memoryLabel(hostMemory(fixture.hosts[0])), '4 / 16 GB');
+});
+
+test('a reason for the absent load never hides a known core count', () => {
+  const remote = structuredClone(fixture.hosts[0]);
+  remote.metrics.latest.cpu = {
+    cores: 16, coresKnown: true, usedPct: null, reason: 'not available for a remote host',
+  };
+  const remoteMachine = buildDashboard({ ...fixture, hosts: [remote] }).hosts[0];
+  assert.equal(remoteMachine.cpu.cores, 16);
+  assert.equal(remoteMachine.cpu.coresKnown, true);
+  assert.equal(remoteMachine.cpuLabel, 'n/a / 16 cores', 'the core count stays visible while the load is n/a');
+  assert.equal(remoteMachine.cpu.usedPct, null);
+  assert.equal(remoteMachine.cpu.usedCores, null);
+  assert.equal(remoteMachine.cpuReason, 'not available for a remote host', 'the reason is the CPU n/a tooltip');
+  assert.equal(buildDashboard({ ...fixture, hosts: [remote] }).summary, '1 machine · 16 cores · 16 GB');
+
+  const failed = structuredClone(fixture.hosts[0]);
+  failed.metrics.latest.cpu = {
+    cores: 0, coresKnown: false, usedPct: null, reason: 'the Incus resources read failed',
+  };
+  const failedMachine = buildDashboard({ ...fixture, hosts: [failed] }).hosts[0];
+  assert.equal(failedMachine.cpu.coresKnown, false);
+  assert.equal(failedMachine.cpuLabel, 'cores n/a');
+  assert.equal(failedMachine.cpuReason, 'the Incus resources read failed');
+  assert.equal(buildDashboard({ ...fixture, hosts: [failed] }).summary, '1 machine · 16 GB');
+
+  // Older snapshots carry no flag: zero is the placeholder, a positive count is real.
+  const legacyZero = structuredClone(fixture.hosts[0]);
+  legacyZero.metrics.latest.cpu = { cores: 0, usedPct: null, reason: 'the Incus resources read failed' };
+  assert.equal(buildDashboard({ ...fixture, hosts: [legacyZero] }).hosts[0].cpuLabel, 'cores n/a');
+  assert.equal(hostCpu(legacyZero).coresKnown, false);
+  assert.equal(cpuLabel(hostCpu(fixture.hosts[0])), '2 / 8 cores');
+  assert.equal(hostCpu(fixture.hosts[0]).coresKnown, true);
+
+  // A real load still yields the used share of the real capacity.
+  const loaded = structuredClone(fixture.hosts[0]);
+  loaded.metrics.latest.cpu = { cores: 16, coresKnown: true, usedPct: 25, reason: null };
+  const loadedMachine = buildDashboard({ ...fixture, hosts: [loaded] }).hosts[0];
+  assert.equal(loadedMachine.cpuLabel, '4 / 16 cores');
+  assert.equal(loadedMachine.cpu.usedPct, 25);
+  assert.equal(loadedMachine.cpuReason, '');
 });
 
 test('the host usedBytes figure wins over the total-available derivation', () => {

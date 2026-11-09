@@ -306,7 +306,7 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
     assert.match(await page.locator('.arca-error').innerText(), /not available right now/);
   });
 
-  await t.test('a null CPU load renders n/a with no bar and never zero', async () => {
+  await t.test('a null CPU load keeps the core count and draws no bar or zero', async () => {
     data = {
       ...fixture,
       hosts: fixture.hosts.map((host, index) => index !== 0 ? host : {
@@ -314,10 +314,36 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
         metrics: { ...host.metrics, latest: { ...host.metrics.latest, cpu: { cores: 8, usedPct: null } } },
       }),
     };
-    await page.waitForFunction(() => document.querySelector('.arca-machine .arca-meter-value')?.textContent === 'n/a');
+    await page.waitForFunction(() => document.querySelector('.arca-machine .arca-meter-value')?.textContent === 'n/a / 8 cores');
     const card = page.locator('.arca-machine:not(.arca-placeholder)').first();
-    assert.equal(await card.locator('.arca-meter-value').first().innerText(), 'n/a');
+    assert.equal(await card.locator('.arca-meter-value').first().innerText(), 'n/a / 8 cores');
     assert.equal(await card.locator('.arca-meter').first().innerText().then((value) => value.includes('0%')), false);
+    assert.equal(await card.locator('.arca-meter').first().locator('.arca-meter-fill').count(), 0);
+    assert.equal(await card.locator('.arca-meter-fill').count(), 1, 'the real memory bar is unchanged');
+    data = fixture;
+    await page.waitForFunction(() => document.querySelector('.arca-machine .arca-meter-value')?.textContent === '2 / 8 cores');
+  });
+
+  await t.test('a remote host reason leaves the known core count visible', async () => {
+    data = {
+      ...fixture,
+      hosts: fixture.hosts.map((host, index) => index !== 0 ? host : {
+        ...host,
+        metrics: {
+          ...host.metrics,
+          latest: {
+            ...host.metrics.latest,
+            cpu: { cores: 16, coresKnown: true, usedPct: null, reason: 'not available for a remote host' },
+          },
+        },
+      }),
+    };
+    await page.waitForFunction(() => document.querySelector('.arca-machine .arca-meter-value')?.textContent === 'n/a / 16 cores');
+    const card = page.locator('.arca-machine:not(.arca-placeholder)').first();
+    assert.equal(await card.locator('.arca-meter-value').first().innerText(), 'n/a / 16 cores');
+    assert.match(await card.innerText(), /16 cores/);
+    assert.doesNotMatch(await card.innerText(), /cores n\/a/);
+    assert.equal(await card.locator('.arca-meter').first().getAttribute('title'), 'not available for a remote host');
     assert.equal(await card.locator('.arca-meter').first().locator('.arca-meter-fill').count(), 0);
     assert.equal(await card.locator('.arca-meter-fill').count(), 1, 'the real memory bar is unchanged');
     data = fixture;
@@ -333,7 +359,7 @@ test('v28 layout binds both hosts, the Doctor chat and the activity steps', asyn
           ...host.metrics,
           latest: {
             ...host.metrics.latest,
-            cpu: { cores: 0, usedPct: null, reason: 'the Incus resources read failed' },
+            cpu: { cores: 0, coresKnown: false, usedPct: null, reason: 'the Incus resources read failed' },
             memory: { totalBytes: null, availableBytes: null, usedBytes: 2_000_000_000, reason: 'the Incus resources read failed' },
           },
         },
