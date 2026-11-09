@@ -60,12 +60,166 @@
     if (!Number.isFinite(value)) return "";
     return `${Math.round(value * 10 ** digits) / 10 ** digits}`;
   }
-  function formatGb(bytes) {
+  var MEMORY_GIGABYTE = 1024 ** 3;
+  function formatGigabyteValue(bytes, base) {
     const value = Number(bytes);
     if (!Number.isFinite(value) || value < 0) return "";
-    const gb = value / 1e9;
+    const gb = value / base;
     if (gb >= 10) return String(Math.round(gb));
     return String(Math.round(gb * 10) / 10);
+  }
+  function formatGb(bytes) {
+    return formatGigabyteValue(bytes, MEMORY_GIGABYTE);
+  }
+  var WATCH_ONLY_SERVICES = "Arca watches this machine; it doesn't run services here yet";
+  function formatWatts(value) {
+    const number = finite(value);
+    return number === null || number < 0 ? "" : `${formatNumber(number, 1)} W`;
+  }
+  function formatCelsius(value) {
+    const number = finite(value);
+    return number === null ? "" : `${formatNumber(number, 1)} \xB0C`;
+  }
+  function formatMhz(value) {
+    const number = finite(value);
+    return number === null || number < 0 ? "" : `${Math.round(number)} MHz`;
+  }
+  function gpuPowerCapped(value) {
+    if (value === null || value === void 0 || value === "") return false;
+    let mask;
+    try {
+      if (typeof value === "number") {
+        if (!Number.isFinite(value) || value < 0) return false;
+        mask = BigInt(Math.trunc(value));
+      } else {
+        const raw = String(value).trim().toLowerCase();
+        if (!/^(?:0x[0-9a-f]+|[0-9]+)$/.test(raw)) return false;
+        mask = BigInt(raw);
+      }
+    } catch {
+      return false;
+    }
+    return (mask & 4n) === 4n;
+  }
+  function gpuProductName(product) {
+    let value = text(product).trim();
+    const bracket = value.match(/\[([^\]]+)\]/);
+    if (bracket) value = bracket[1];
+    value = value.replace(/\b(?:NVIDIA|AMD|ATI|Intel|Corporation)\b/gi, " ").replace(/\b(?:GeForce|Radeon|Graphics)\b/gi, " ").replace(/\b(?:RTX|GTX|RX|Arc)\b/gi, " ").replace(/\b\d+\s*GB\b/gi, " ").replace(/\s+/g, " ").trim();
+    value = value.split(/\s*\/\s*/)[0].trim();
+    return value;
+  }
+  function gpuCardReason(card, gpu) {
+    return text(card?.reason).trim() || text(gpu?.reason).trim();
+  }
+  function containerLabel(value) {
+    const id = text(value).trim();
+    if (!id) return "";
+    return /^[0-9a-f]{64}$/i.test(id) ? id.slice(0, 12) : id;
+  }
+  function gpuOwnerRows(processes) {
+    const groups = /* @__PURE__ */ new Map();
+    for (const process of list(processes)) {
+      if (!process || typeof process !== "object") continue;
+      const owner = process.owner && typeof process.owner === "object" ? process.owner : {};
+      const project = text(owner.project).trim();
+      const name = text(owner.name).trim();
+      const container = text(owner.container).trim();
+      const kind = text(owner.kind).trim().toLowerCase();
+      let row;
+      if (project || name) {
+        const where = [project ? projectLabel(project) : "", name].filter(Boolean).join(" / ");
+        row = {
+          kind: "instance",
+          project,
+          name,
+          container,
+          label: where || "an instance",
+          detail: container ? `Docker ${containerLabel(container)}` : ""
+        };
+      } else if (container || kind === "docker" || kind === "container") {
+        row = {
+          kind: "docker",
+          project: "",
+          name: "",
+          container,
+          label: container ? `Docker container ${containerLabel(container)}` : "a Docker container",
+          detail: ""
+        };
+      } else {
+        row = { kind: "host", project: "", name: "", container: "", label: "on the host", detail: "" };
+      }
+      const key = `${row.kind}|${project}|${name}|${container}`;
+      let group = groups.get(key);
+      if (!group) {
+        group = { ...row, key, vramBytes: null, processes: 0 };
+        groups.set(key, group);
+      }
+      group.processes += 1;
+      const bytes = finite(process.vramBytes);
+      if (bytes !== null && bytes >= 0) group.vramBytes = (group.vramBytes ?? 0) + bytes;
+    }
+    return [...groups.values()].sort((a, b) => {
+      if (a.vramBytes === null && b.vramBytes !== null) return 1;
+      if (a.vramBytes !== null && b.vramBytes === null) return -1;
+      if (a.vramBytes !== b.vramBytes) return (b.vramBytes ?? 0) - (a.vramBytes ?? 0);
+      return byName(a.label, b.label);
+    }).map((owner) => ({ ...owner, vramText: owner.vramBytes === null ? "" : `${formatGb(owner.vramBytes)} GB` }));
+  }
+  function gpuCards(gpu) {
+    const cards = list(gpu?.cards).filter((card) => card && typeof card === "object" && text(card.pci).trim()).slice().sort((a, b) => text(a.pci).trim().localeCompare(text(b.pci).trim(), "en"));
+    return cards.map((card, index) => {
+      const pci = text(card.pci).trim();
+      const product = text(card.product).trim();
+      const shortName = gpuProductName(product);
+      const slot = index + 1;
+      const label = `GPU ${slot}${shortName ? ` \xB7 ${shortName}` : ""}`;
+      const telemetry = card.telemetry && typeof card.telemetry === "object" ? card.telemetry : null;
+      const utilizationPct = finite(telemetry?.utilizationPct);
+      const usedBytes = finite(telemetry?.memoryUsedBytes);
+      const totalBytes = finite(telemetry?.memoryTotalBytes) ?? finite(card.vramTotalBytes);
+      const vramPercent = usedBytes !== null && totalBytes !== null && totalBytes > 0 ? Math.max(0, Math.min(100, usedBytes / totalBytes * 100)) : null;
+      let vramText = "";
+      if (usedBytes !== null && totalBytes !== null) vramText = `${formatGb(usedBytes)} / ${formatGb(totalBytes)} GB`;
+      else if (usedBytes !== null) vramText = `${formatGb(usedBytes)} GB used`;
+      else if (totalBytes !== null) vramText = `${formatGb(totalBytes)} GB`;
+      const hasReading = Boolean(telemetry) && (utilizationPct !== null || usedBytes !== null || totalBytes !== null);
+      const reason = gpuCardReason(card, gpu);
+      return {
+        pci,
+        slot,
+        slotLabel: `GPU ${slot}`,
+        shortName,
+        label,
+        product,
+        vendor: text(card.vendor).trim(),
+        uuid: text(card.uuid).trim(),
+        driver: text(card.driver).trim(),
+        driverVersion: text(card.driverVersion).trim(),
+        use: text(card.use).trim(),
+        numaNode: finite(card.numaNode),
+        telemetry,
+        hasReading,
+        utilizationPct: utilizationPct === null ? null : Math.max(0, Math.min(100, utilizationPct)),
+        utilizationText: utilizationPct === null ? "" : `${Math.round(Math.max(0, Math.min(100, utilizationPct)))}%`,
+        usedBytes,
+        totalBytes,
+        vramText,
+        vramPercent,
+        reason,
+        // With no usable telemetry the plain kernel reason is the whole reading, never a zero.
+        statusText: hasReading ? "" : reason || "No reading yet",
+        powerDrawW: finite(telemetry?.powerDrawW),
+        powerLimitW: finite(telemetry?.powerLimitW),
+        temperatureC: finite(telemetry?.temperatureC),
+        smClockMhz: finite(telemetry?.smClockMhz),
+        eventReasons: telemetry?.eventReasons ?? null,
+        powerCapped: gpuPowerCapped(telemetry?.eventReasons),
+        processReason: text(card.processReason).trim(),
+        owners: gpuOwnerRows(card.processes),
+        title: product ? `${product} \xB7 ${pci}` : pci
+      };
+    });
   }
   function isHostOnline(host = {}) {
     return Boolean(host.machine) && host.machine.incusReachable !== false;
@@ -193,10 +347,22 @@
     if (unknown) parts.push(`${unknown} unknown`);
     return { tone, text: parts.join(" \xB7 ") || "Live" };
   }
+  function readErrorTools(error) {
+    const value = text(error).trim();
+    if (!value) return [];
+    const pattern = /(?:^|\s)(arca_status|watch_report|postgres_list|node_metrics|alerts_list|plan_list|service_list|journal_list):\s/g;
+    const tools = [];
+    let match;
+    while ((match = pattern.exec(value)) !== null) tools.push(match[1]);
+    return [...new Set(tools)];
+  }
   function buildMachine(host) {
     const cpu = hostCpu(host);
     const memory = hostMemory(host);
     const online = isHostOnline(host);
+    const mode = text(host.machine?.mode).trim();
+    const gpu = host.metrics?.latest?.gpu;
+    const errorTools = readErrorTools(host.error);
     return {
       name: text(host.name, text(host.nodeName, "Machine")),
       label: text(host.name, text(host.nodeName, "Machine")),
@@ -204,6 +370,10 @@
       online,
       status: online ? "Online" : "Offline",
       tone: online ? "ok" : "bad",
+      mode,
+      // The kernel says watch-only when it has no project it may write in. It is a mode of the machine,
+      // not an error, and the services area keys off this value rather than any service refusal text.
+      watchOnly: mode.toLowerCase() === "watch-only",
       cpu,
       cpuLabel: cpuLabel(cpu),
       // The reason is the CPU n/a tooltip: it only applies while no load is shown.
@@ -211,6 +381,18 @@
       memory,
       memoryLabel: memoryLabel(memory),
       memoryReason: memory?.reason ?? "",
+      gpus: gpuCards(gpu),
+      gpuReason: text(gpu?.reason).trim(),
+      gpuSkipped: text(gpu?.skipped).trim(),
+      services: list(host.services).map((service) => ({
+        name: text(service?.name).trim(),
+        state: text(service?.state).trim(),
+        lanPort: finite(service?.lanPort)
+      })).filter((service) => service.name),
+      // Older snapshots have no flag: treat their empty list as known-empty, as before.
+      servicesKnown: host.servicesKnown !== false,
+      errorTools,
+      servicesOnlyError: errorTools.length > 0 && errorTools.every((tool) => tool === "service_list"),
       instanceCount: host.instancesKnown === false ? null : list(host.instances).length,
       instancesKnown: host.instancesKnown !== false,
       error: host.error ?? null,
@@ -476,8 +658,15 @@
     "service_unpublish",
     "service_connect",
     "service_disconnect",
-    "postgres_create"
+    "postgres_create",
+    "gpu_attach",
+    "gpu_detach"
   ]);
+  var GPU_ACTIONS = /* @__PURE__ */ new Set(["gpu_attach", "gpu_detach"]);
+  function normalizePci(value) {
+    const match = String(value ?? "").trim().toLowerCase().match(/^(?:([0-9a-f]{4}):)?([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$/);
+    return match ? `${match[1] ?? "0000"}:${match[2]}` : "";
+  }
   var APPROVAL_TIMEOUT_MS = 3e4;
   var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
   var MISSING_PROPOSAL = "The proposal is not waiting any more.";
@@ -756,6 +945,45 @@
     row.append(valueNode);
     return row;
   }
+  function gpuLine(doc, gpu) {
+    const row = el(doc, "div", "arca-gpu");
+    row.dataset.gpu = gpu.pci;
+    row.title = gpu.title;
+    const head = el(doc, "div", "arca-gpu-head");
+    head.append(el(doc, "span", "arca-gpu-label", gpu.label));
+    row.append(head);
+    if (gpu.hasReading) {
+      head.append(el(doc, "span", "arca-gpu-util mono", gpu.utilizationText || "n/a"));
+      const body = el(doc, "div", "arca-gpu-body");
+      if (gpu.vramPercent !== null) {
+        body.append(svgEl(doc, "svg", {
+          class: "arca-gpu-bar",
+          viewBox: "0 0 100 6",
+          preserveAspectRatio: "none",
+          "aria-hidden": "true"
+        }, [
+          svgEl(doc, "rect", { class: "arca-meter-track", width: 100, height: 6, rx: 3 }),
+          svgEl(doc, "rect", { class: "arca-meter-fill", width: Math.max(0, Math.min(100, gpu.vramPercent)), height: 6, rx: 3 })
+        ]));
+      } else {
+        body.append(el(doc, "span", "arca-gpu-bar-empty"));
+      }
+      body.append(el(doc, "span", "arca-gpu-vram mono", gpu.vramText || "VRAM n/a"));
+      row.append(body);
+      if (gpu.powerCapped) row.append(el(doc, "span", "arca-gpu-note", "held back by its power limit"));
+    } else {
+      row.append(el(doc, "span", "arca-gpu-reason", gpu.statusText));
+    }
+    return row;
+  }
+  function gpuFailureLine(doc, reason) {
+    const row = el(doc, "div", "arca-gpu");
+    row.title = reason;
+    const head = el(doc, "div", "arca-gpu-head");
+    head.append(el(doc, "span", "arca-gpu-label", "GPU"));
+    row.append(head, el(doc, "span", "arca-gpu-reason", reason));
+    return row;
+  }
   function machineCard(doc, machine) {
     const card = el(doc, "article", "arca-machine");
     card.dataset.host = machine.name;
@@ -769,6 +997,15 @@
       meter(doc, "Mem", machine.memoryLabel, machine.memory?.usedPct, "No metrics", machine.memoryReason)
     );
     card.append(meters);
+    if (machine.gpus.length) {
+      const gpus = el(doc, "div", "arca-gpus");
+      for (const gpu of machine.gpus) gpus.append(gpuLine(doc, gpu));
+      card.append(gpus);
+    } else if (machine.gpuReason) {
+      const gpus = el(doc, "div", "arca-gpus");
+      gpus.append(gpuFailureLine(doc, machine.gpuReason));
+      card.append(gpus);
+    }
     const foot = el(doc, "div", "arca-machine-foot");
     foot.append(el(
       doc,
@@ -776,7 +1013,16 @@
       "arca-machine-instances",
       machine.instanceCount === null ? "Instances unknown" : count2(machine.instanceCount, "instance")
     ));
-    if (machine.error && !machine.metricsAt) foot.append(el(doc, "span", "arca-machine-warn", "Partial data"));
+    const right = el(doc, "span", "arca-machine-foot-right");
+    if (machine.error && !machine.metricsAt && (!machine.watchOnly || !machine.servicesOnlyError)) {
+      right.append(el(doc, "span", "arca-machine-warn", "Partial data"));
+    }
+    const more = el(doc, "button", "arca-machine-more", "Details");
+    more.type = "button";
+    more.dataset.machineDetail = machine.name;
+    more.setAttribute("aria-label", `Details for ${machine.name}`);
+    right.append(more);
+    foot.append(right);
     card.append(foot);
     return card;
   }
@@ -1161,7 +1407,26 @@
     composer.append(composerBox, composerNote);
     panel.append(panelHead, chatScroll, stepsScroll, composer);
     main.append(left, panel);
-    shell.append(topbar, main);
+    const detailBackdrop = el(doc, "div", "arca-detail-backdrop");
+    detailBackdrop.hidden = true;
+    const detailPanel = el(doc, "section", "arca-detail-panel");
+    detailPanel.setAttribute("role", "dialog");
+    detailPanel.setAttribute("aria-modal", "true");
+    detailPanel.setAttribute("aria-labelledby", "arca-detail-title");
+    const detailHead = el(doc, "header", "arca-detail-head");
+    const detailHeading = el(doc, "div", "arca-detail-heading");
+    const detailTitle = el(doc, "h2", "arca-detail-title");
+    detailTitle.id = "arca-detail-title";
+    const detailSub = el(doc, "p", "arca-detail-sub");
+    detailHeading.append(detailTitle, detailSub);
+    const detailClose = el(doc, "button", "arca-detail-close", "Close");
+    detailClose.type = "button";
+    detailClose.setAttribute("aria-label", "Close machine details");
+    detailHead.append(detailHeading, detailClose);
+    const detailBody = el(doc, "div", "arca-detail-body");
+    detailPanel.append(detailHead, detailBody);
+    detailBackdrop.append(detailPanel);
+    shell.append(topbar, main, detailBackdrop);
     root2.replaceChildren(shell);
     const state = {
       envelope: {},
@@ -1170,6 +1435,7 @@
       tab: "chat",
       plans: 0,
       approvalUrl: "",
+      detailHost: "",
       signatures: { machines: "", canvas: "", panel: "", picker: "" }
     };
     const chat = {
@@ -1250,9 +1516,142 @@
       const online = (state.dashboard?.hosts ?? []).filter((machine) => machine.online).length;
       machinesMeta.textContent = `${online} online`;
     };
+    const gpuUseLabel = (use) => ({
+      "driver-bound": "Driver bound",
+      "vfio-pci": "Reserved for passthrough",
+      "no-driver": "No driver"
+    })[use] ?? (use || "Unknown");
+    const detailPair = (label, value) => {
+      if (!value) return null;
+      const row = el(doc, "div", "arca-detail-fact");
+      row.append(el(doc, "dt", "", label), el(doc, "dd", "", value));
+      return row;
+    };
+    function closeMachineDetail() {
+      state.detailHost = "";
+      detailBackdrop.hidden = true;
+    }
+    function renderMachineDetail() {
+      const machine = state.dashboard?.hosts?.find((host) => host.name === state.detailHost);
+      if (!machine) {
+        closeMachineDetail();
+        return;
+      }
+      detailTitle.textContent = machine.name;
+      detailSub.textContent = [
+        machine.watchOnly ? "Watching this machine" : machine.status,
+        `CPU ${machine.cpuLabel || "unknown"}`,
+        `Mem ${machine.memoryLabel || "unknown"}`
+      ].join(" \xB7 ");
+      detailBody.replaceChildren();
+      const gpuSection = el(doc, "section", "arca-detail-section");
+      gpuSection.append(el(doc, "h3", "arca-detail-heading", "GPUs"));
+      if (!machine.gpus.length) {
+        gpuSection.append(el(
+          doc,
+          "p",
+          "arca-detail-note",
+          machine.gpuReason || "No GPU on this machine."
+        ));
+      }
+      for (const gpu of machine.gpus) {
+        const card = el(doc, "article", "arca-detail-gpu");
+        card.dataset.gpu = gpu.pci;
+        const cardHead = el(doc, "div", "arca-detail-gpu-head");
+        cardHead.append(
+          el(doc, "strong", "arca-detail-gpu-name", gpu.label),
+          el(doc, "span", "arca-detail-gpu-util mono", gpu.utilizationText || (gpu.hasReading ? "n/a" : "No reading"))
+        );
+        card.append(cardHead);
+        const facts = el(doc, "dl", "arca-detail-facts");
+        for (const pair of [
+          detailPair("Card", gpu.product || gpu.label),
+          detailPair("PCI address", gpu.pci),
+          detailPair("State", gpuUseLabel(gpu.use)),
+          detailPair("Driver", [gpu.driver, gpu.driverVersion].filter(Boolean).join(" ")),
+          detailPair("VRAM", gpu.totalBytes === null ? "" : `${formatGb(gpu.totalBytes)} GB`),
+          detailPair("Memory in use", gpu.hasReading ? gpu.vramText || "n/a" : gpu.statusText),
+          detailPair("Power", [
+            formatWatts(gpu.powerDrawW),
+            gpu.powerLimitW === null ? "" : `of ${formatWatts(gpu.powerLimitW)}`
+          ].filter(Boolean).join(" ")),
+          detailPair("Temperature", formatCelsius(gpu.temperatureC)),
+          detailPair("Clock", formatMhz(gpu.smClockMhz)),
+          detailPair("NUMA node", gpu.numaNode === null ? "" : String(gpu.numaNode))
+        ]) if (pair) facts.append(pair);
+        card.append(facts);
+        if (gpu.powerCapped) {
+          card.append(el(doc, "p", "arca-detail-note arca-detail-power", "This card is held back by its power limit."));
+        }
+        const users = el(doc, "div", "arca-detail-users");
+        users.append(el(doc, "h4", "arca-detail-users-title", "Who is using it"));
+        if (gpu.owners.length) {
+          const rows = el(doc, "ul", "arca-detail-owners");
+          for (const owner of gpu.owners) {
+            const item = el(doc, "li", "arca-detail-owner");
+            item.dataset.owner = owner.kind;
+            if (owner.project) item.dataset.ownerProject = owner.project;
+            if (owner.name) item.dataset.ownerInstance = owner.name;
+            if (owner.container) item.dataset.ownerContainer = owner.container;
+            if (owner.container) item.title = `Docker ${owner.container}`;
+            else if (owner.project) item.title = `${owner.project} / ${owner.name}`;
+            const where = el(doc, "span", "arca-detail-owner-where");
+            where.append(el(doc, "span", "", owner.label));
+            if (owner.detail) where.append(el(doc, "span", "arca-detail-owner-detail", owner.detail));
+            item.append(where, el(doc, "span", "arca-detail-owner-vram mono", owner.vramText || "VRAM unknown"));
+            rows.append(item);
+          }
+          users.append(rows);
+        } else if (gpu.processReason) {
+          users.append(el(doc, "p", "arca-detail-note", `Processes: ${gpu.processReason}.`));
+        } else {
+          users.append(el(doc, "p", "arca-detail-note", "No process is using this card."));
+        }
+        card.append(users);
+        gpuSection.append(card);
+      }
+      detailBody.append(gpuSection);
+      const services = el(doc, "section", "arca-detail-section");
+      services.append(el(doc, "h3", "arca-detail-heading", "Services"));
+      if (machine.watchOnly) {
+        services.append(el(doc, "p", "arca-detail-note arca-detail-watch", WATCH_ONLY_SERVICES));
+      } else if (!machine.servicesKnown) {
+        services.append(el(doc, "p", "arca-detail-note", "Services could not be read just now."));
+      } else if (machine.services.length) {
+        const rows = el(doc, "ul", "arca-detail-services-list");
+        for (const service of machine.services) {
+          const item = el(doc, "li", "arca-detail-service");
+          item.append(el(doc, "span", "", service.name), el(doc, "span", "arca-detail-service-state", service.state || "Unknown"));
+          if (service.lanPort !== null) item.append(el(doc, "span", "arca-detail-service-port mono", `port ${service.lanPort}`));
+          rows.append(item);
+        }
+        services.append(rows);
+      } else {
+        services.append(el(doc, "p", "arca-detail-note", "No services are running from here."));
+      }
+      detailBody.append(services);
+    }
+    function openMachineDetail(name) {
+      state.detailHost = name;
+      renderMachineDetail();
+      if (!state.detailHost) return;
+      detailBackdrop.hidden = false;
+      detailClose.focus();
+    }
+    detailClose.addEventListener("click", closeMachineDetail);
+    detailBackdrop.addEventListener("click", (event) => {
+      if (event.target === detailBackdrop) closeMachineDetail();
+    });
+    machinesRow.addEventListener("click", (event) => {
+      const button = event.target?.closest?.("[data-machine-detail]");
+      if (button) openMachineDetail(button.dataset.machineDetail);
+    });
+    doc.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !detailBackdrop.hidden) closeMachineDetail();
+    });
     const updateMachines = () => {
       const hosts = state.dashboard?.hosts ?? [];
-      const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpu, memory }) => ({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct })));
+      const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpu, memory, gpus, gpuReason, watchOnly, mode, services, servicesKnown, servicesOnlyError }) => ({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct, gpus, gpuReason, watchOnly, mode, services, servicesKnown, servicesOnlyError })));
       if (signature === state.signatures.machines) return;
       state.signatures.machines = signature;
       const nodes = hosts.map((machine) => machineCard(doc, machine));
@@ -1261,6 +1660,7 @@
         placeholderCard(doc, "Phones", "Room for paired phones and desktops.")
       );
       machinesRow.replaceChildren(...nodes);
+      if (state.detailHost && !detailBackdrop.hidden) renderMachineDetail();
     };
     const updateCanvas = () => {
       const project = state.project;
@@ -1405,6 +1805,7 @@
           if (statement.target !== id || statement.action !== row.action || statement.paramsDigest !== digest) continue;
           const host = typeof statement.host === "string" ? statement.host.trim() : "";
           if (!host) continue;
+          const pci = GPU_ACTIONS.has(row.action) && row.args && typeof row.args === "object" ? normalizePci(row.args.pci) : "";
           plans.set(id, {
             kind: "action",
             id,
@@ -1414,7 +1815,8 @@
             details,
             expiresAt,
             host,
-            statement: row.statement
+            statement: row.statement,
+            pci
           });
         } else if (typeof row.plan === "string" && /^[0-9a-f]{64}$/.test(row.plan)) {
           deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
@@ -1527,6 +1929,15 @@
       note.dataset.proposal = id;
       return note;
     }
+    function planGpuSlot(plan) {
+      if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
+      const pageHost = text2(state.envelope.pageHost).trim();
+      if (!pageHost) return null;
+      const host = (state.dashboard?.hosts ?? []).find((candidate) => candidate.name.toLowerCase() === pageHost.toLowerCase());
+      if (!host) return null;
+      const gpu = host.gpus?.find((candidate) => candidate.pci === plan.pci);
+      return gpu ? { slot: gpu.slotLabel, host: host.name, pci: gpu.pci } : null;
+    }
     function proposalCard(doc2, id) {
       const key = proposalId({ id });
       const card = approvalCardFor(key);
@@ -1555,6 +1966,14 @@
       hostRow.dataset.detail = "host";
       hostRow.append(el(doc2, "dt", "", "Host"), el(doc2, "dd", "", plan.host));
       facts.append(hostRow);
+      const slot = planGpuSlot(plan);
+      if (slot) {
+        const slotRow = el(doc2, "div", "arca-approval-fact arca-approval-slot");
+        slotRow.dataset.slot = "true";
+        slotRow.dataset.pageBuilt = "slot";
+        slotRow.append(el(doc2, "dt", "", "Slot"), el(doc2, "dd", "", `${slot.slot} on ${slot.host} (${slot.pci})`));
+        facts.append(slotRow);
+      }
       for (const row of plan.details) {
         const line = el(doc2, "div", "arca-approval-fact");
         line.dataset.detail = "true";
@@ -1794,6 +2213,7 @@ ${statement}`)
           plan.argsDigest,
           plan.expiresAt,
           plan.host,
+          plan.pci,
           plan.details
         ]),
         deletes: approvals.deletes.map((plan) => plan.id),

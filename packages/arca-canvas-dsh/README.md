@@ -3,10 +3,12 @@
 A host plugin for stock DSH and an embedding DSH host. It polls Arca through a
 Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
 `GET /arca-canvas` draws a workspace from the snapshot: a top bar with the project
-picker, local clock and fleet summary; a machines strip with CPU and memory bars;
-the selected project's cards on a dotted canvas with curved SVG edges; and a
-Doctor panel with Chat and Steps tabs, recent Arca activity and waiting approvals.
-The Doctor composer is a working chat backed by a persisted DSH session named
+picker, local clock and fleet summary; a machines strip with CPU, memory and one
+line per GPU card; the selected project's cards on a dotted canvas with curved
+SVG edges; and a Doctor panel with Chat and Steps tabs, recent Arca activity and
+waiting approvals. A machine's Details dialog names who is using each GPU and
+shows its services area. The Doctor composer is a working chat backed by a
+persisted DSH session named
 `Doctor` (model `deepseek-flash`). It works without a sidebar. The Doctor reads
 Arca and can record one inert action proposal; it cannot change anything. The
 owner approves a proposal with the passkey on a card inside the kernel-served
@@ -161,7 +163,8 @@ host entry has `name`, `address` (the configured LAN address or empty), `at`,
 `error` (null or safe error text), `nodeName`
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
 `watch_report` failed), `projects` (the Incus project ids from `watch_report`),
-`databases`, `services`, `metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
+`databases`, `services`, `servicesKnown` (false when `service_list` failed),
+`metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
 `journal_list` failed), `journalPending` (true while a deep journal read finishes
 in the background), `devices`, `devicesAt` (ISO time of the last good device
 list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable`,
@@ -252,6 +255,31 @@ Cards carry only real snapshot data: status, kind, owner class, the instance's
 own absolute URL when present, and database address, port and link count when
 present. A domain card appears only when the project config sets `domain`.
 
+A machine card draws one line per `node_metrics.latest.gpu.cards[]` entry under
+CPU and Mem. Cards are sorted by PCI and every card gets its own slot number, so
+a unique card reads `GPU 1 · 4060 Ti` and two identical cards read
+`GPU 1 · 4060 Ti` / `GPU 2 · 4060 Ti`; every line's tooltip names the exact PCI
+address. The line shows utilization as a whole percentage, a VRAM bar and
+used/total GB from telemetry. Memory and VRAM use 1024-based GB, so a 16 GiB
+card reads `16 GB`; disks keep decimal GB to match their labels. A card with no
+telemetry shows its card name and the kernel's plain `reason` instead, never an
+invented 0%. A card is marked "held back by its power limit" only when
+`telemetry.eventReasons` has the SW power cap bit (0x4). A host whose
+`gpu.cards` is empty draws no GPU line, unless `gpu.reason` says the inventory
+read failed: then one GPU line carries that reason.
+
+The machine Details dialog repeats every card with its PCI address, driver,
+VRAM, power (W), temperature (°C) and clock, then lists who is using it: the
+Incus project and instance (with a Docker container id when the process runs in
+one), a host Docker container, or "on the host", each with its own VRAM in GB.
+Its services area lists the machine's services. A failed `service_list` on a
+normal host says "Services could not be read just now", never "No services".
+When `arca_status.mode` is `watch-only` it instead says "Arca watches this
+machine; it doesn't run services here yet" and shows no service error, because
+the kernel refuses service reads by design in that mode. That expected refusal
+is also the only read hidden from the strip's "Partial data" warning; another
+failed read on a watch-only machine still shows it.
+
 The right-hand Doctor panel has Chat and Steps tabs. Chat is a real
 conversation; Steps renders the newest `journal_list` records across every
 machine. A waiting action proposal is an approval card in Steps, and also under
@@ -263,9 +291,10 @@ The Doctor has the eight read-only Arca tools (`arca_status`, `watch_report`,
 `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`, `journal_list`,
 `service_list`) plus one non-read tool, `arca_propose`. `arca_propose` calls the
 kernel's `action_propose` viewer verb and records an inert proposal for one of
-seven actions (`service_create`, `service_remove`, `service_publish`,
-`service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`);
-it changes nothing and a database delete cannot be proposed. `arca_propose` may
+nine actions (`service_create`, `service_remove`, `service_publish`,
+`service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`,
+`gpu_attach`, `gpu_detach`); it changes nothing and a database delete cannot be
+proposed. `arca_propose` may
 target only `pageHost`, the host whose kernel serves this canvas and its approval
 page; a proposal for any other configured reader is refused in plain words
 because that host's approval page is not this one. The tools are
@@ -285,11 +314,17 @@ carries a container image: the kernel picks its default.
 
 The Doctor speaks to a non-technical owner: short plain sentences, no markdown
 tables, headings or code fences, sizes in GB with one decimal and percentages as
-whole numbers. Tool results reach the model in that same form. Metrics arrive as
-a short plain-text summary (memory used, available and total in GB, rounded CPU
-percentages, plain labels), and a figure the host cannot report is shown as
-`not measurable from here` rather than an internal reason. Byte fields in every
-other read result become GB, network rates pick KB/s, MB/s or GB/s, and
+whole numbers. Memory and VRAM use 1024-based GB (a 16 GiB card reads 16 GB);
+disks keep decimal GB to match their labels. Tool results reach the model in
+that same form. Metrics arrive as a short plain-text summary (memory used,
+available and total in GB, rounded CPU percentages, plain labels), and a figure
+the host cannot report is shown as `not measurable from here` rather than an
+internal reason. GPU cards reach the model with their slot and exact PCI address
+(`GPU 2 (4060 Ti, PCI 0000:02:00.0): ...`), utilization, VRAM, power and
+temperature, plus who is using each card by project/instance, Docker container
+or "on the host" and that user's VRAM in GB, so the Doctor can answer "who is
+using the GPU" and name the right identical card. Byte fields in every other
+read result are disk-like decimal GB, network rates pick KB/s, MB/s or GB/s, and
 percentages become whole numbers, so the model never sees a raw byte count it
 could repeat. Alert reasons are translated to plain words; a resolved alert
 keeps its own resolution instead of reading like a different one.
@@ -327,6 +362,13 @@ An approval card shows, from the kernel's `/approve/plans` row matched by id:
 - the **host from the signed statement**, so two hosts with the same action and
   arguments (the id hashes only those) are never confused; the card signature
   includes it, so a changed host re-renders the card;
+- for `gpu_attach` / `gpu_detach`, a page-built **Slot** row next to Host, which
+  maps the proposal's PCI address through the page host's dashboard inventory
+  (for example `GPU 2 on alpha (0000:02:00.0)`) so two identical cards are
+  unmistakable. The signed statement's host name (`alpha.example`) is not
+  compared with the dashboard name (`alpha`); a plan from `/approve/plans` is
+  always the page kernel's own plan, and a PCI absent from that inventory draws
+  no Slot row;
 - the kernel-built `summary`, as text;
 - every `details` row (`label` and `value`) in kernel order, as text;
 - the action, the target id and the first 12 hex characters of `argsDigest`;
@@ -335,10 +377,13 @@ An approval card shows, from the kernel's `/approve/plans` row matched by id:
 All text is assigned with `textContent`; no kernel field is parsed as markup. A
 row without a string `label` and `value` fails the whole proposal closed, so a
 card is never shown with a missing behaviour-changing argument. A proposal whose
-action is not one of the seven allowed actions (for example an older
+action is not one of the nine allowed actions (for example an older
 `postgres_delete`) is not rendered. The card parses the `statement` and drops the
 proposal unless `statement.target` is the entry id, `statement.action` is the
-entry action and `statement.paramsDigest` is the entry `argsDigest`.
+entry action and `statement.paramsDigest` is the entry `argsDigest`. A GPU
+proposal's rows are the kernel's `Project`, `Instance` (with its type), `GPU`
+(product and exact PCI address) and `Effect`; the Effect sentence is the safety
+text and is shown exactly as sent, never shortened.
 
 A proposal id reaches the panel only from a real `arca_propose` tool result, and
 it only selects which kernel row to draw. A chat card is attached only when the
@@ -490,7 +535,13 @@ the approval card's kernel-only text, exact approve and decline bodies, the
 host row and statement integrity, a foreign host and an unknown id, expiry,
 action refusal, retry, NoSuchPlan, a hanging approval timeout, passkey
 cancellation, the tool and token caps, the daily budget, the persisted `Doctor`
-session, and the absence of the model key from the page.
+session, and the absence of the model key from the page. GPU tests cover
+PCI-sorted slots for identical cards, the Doctor's slot+PCI card identity, a
+remote host with inventory only, no GPU, a failed GPU inventory read, telemetry
+with a reason, process owners of every kind, binary 16 GB VRAM, a watch-only
+services area and its partial-data rule, a failed service read on a normal host,
+the power-cap bit, the page-built Slot row, and the whole GPU approval-card rows
+including the Effect sentence.
 
 `npm run build` regenerates the browser module and standalone page assets using
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.
@@ -498,7 +549,10 @@ Set `ARCA_CANVAS_EVIDENCE_DIR` to an existing directory to save the browser test
 1440×900 light/dark screenshots (`canvas-v28-light.png`, `canvas-v28-dark.png`,
 `approval-card-waiting-light.png`, `approval-card-waiting-dark.png`,
 `approval-card-done-light.png`, `approval-card-done-dark.png`)
-and `rectangles.json` outside the repository. The standard browser fixture has
+and `rectangles.json` outside the repository. The GPU browser test saves the
+two-card machine strip as `canvas-gpu-strip-light.png` and
+`canvas-gpu-strip-dark.png`, plus detail and GPU approval shots. The standard
+browser fixture has
 two hosts, two owner projects, one service project, one fallback project,
 real-shaped journal rows, one waiting delete plan and eight waiting action proposals
 (including a hostile row, a mismatched statement, a foreign-host candidate and an old

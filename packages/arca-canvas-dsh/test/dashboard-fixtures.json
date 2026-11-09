@@ -111,7 +111,7 @@
         "latest": {
           "at": 1794160000000,
           "cpu": { "cores": 8, "usedPct": 25 },
-          "memory": { "totalBytes": 16000000000, "availableBytes": 12000000000 },
+          "memory": { "totalBytes": 17179869184, "availableBytes": 12884901888 },
           "load": { "one": 1.2, "five": 1.1, "fifteen": 1.0 }
         }
       },
@@ -191,7 +191,7 @@
         "latest": {
           "at": 1794160000000,
           "cpu": { "cores": 4, "usedPct": 50 },
-          "memory": { "totalBytes": 8000000000, "availableBytes": 2000000000 },
+          "memory": { "totalBytes": 8589934592, "availableBytes": 2147483648 },
           "load": { "one": 2.2, "five": 2.0, "fifteen": 1.8 }
         }
       },

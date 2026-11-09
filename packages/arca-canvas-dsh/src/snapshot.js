@@ -23,6 +23,7 @@ export function emptySnapshot(config = {}) {
     projects: [],
     databases: [],
     services: [],
+    servicesKnown: false,
     metrics: null,
     alerts: [],
     plans: [],
@@ -189,7 +190,11 @@ export async function collectSnapshot(client, config = {}, state = {}) {
     read('metrics', 'node_metrics', () => client.call('node_metrics')),
     read('alerts', 'alerts_list', () => client.call('alerts_list')),
     read('plans', 'plan_list', async () => rows((await client.call('plan_list')).plans)),
-    read('services', 'service_list', async () => rows((await client.call('service_list')).services)),
+    read('services', 'service_list', async () => {
+      const services = rows((await client.call('service_list')).services);
+      snapshot.servicesKnown = true;
+      return services;
+    }),
     read('journal', 'journal_list', async () => {
       const records = await collectJournal(client, journalState);
       snapshot.journalKnown = true;

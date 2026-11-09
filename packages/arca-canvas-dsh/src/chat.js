@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile as readStateFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { cpuCoresKnown, proposalId } from './model.js';
+import { cpuCoresKnown, formatCelsius, formatWatts, gpuCards, proposalId, projectLabel } from './model.js';
 import { snapshotError } from './arca-client.js';
 
 // The Doctor chat cannot change anything by itself: only these verbs are registered with DSH. Every write verb
@@ -17,7 +17,7 @@ export const PROPOSE_TOOL = 'arca_propose';
 export const DOCTOR_TOOLS = Object.freeze([...READ_TOOLS, PROPOSE_TOOL]);
 export const PROPOSE_ACTIONS = Object.freeze([
   'service_create', 'service_remove', 'service_publish', 'service_unpublish',
-  'service_connect', 'service_disconnect', 'postgres_create',
+  'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
 ]);
 
 export const DEFAULTS = Object.freeze({
@@ -325,9 +325,15 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
     '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
     '  code fences.',
-    '- Storage sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total.',
+    '- Sizes are always in GB with one decimal. Memory and GPU memory use 1024-based GB, so a 16 GB card',
+    '  reads 16 GB; disks use decimal GB (17.0 GB) to match the drive labels. Power is W and temperature is',
+    '  °C with one decimal.',
     '- Network rates keep the unit the tool gives: KB/s, MB/s or GB/s, with one decimal. Never show raw bytes.',
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
+    '- When the owner asks about a GPU, name each card and say how busy it is. Say who is using it by',
+    '  project and instance, by Docker container, or "on the host", with that user\'s memory in GB. A card',
+    '  with no reading is "not measurable from here" or "could not be read just now"; never say 0% without',
+    '  a reading. Say a card is held back by its power limit only when the reading says so.',
     '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
     '  explicitly asks for it.',
     '- If a read fails or a host did not answer, say "could not be read just now". Only a reading the host can',
@@ -339,6 +345,8 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '- For a change request, call arca_propose with the action and its arguments, then tell the owner in one',
     '  plain sentence what will happen and to tap Approve on the card. Never claim the change is done before',
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
+    '- For a GPU attach or detach, propose gpu_attach or gpu_detach with the instance and the card\'s exact',
+    '  PCI address. The approval card shows the project, instance, card and safety effect; never shorten it.',
     `- You can propose changes only on ${proposeHost} from here for now. Another host is refused because its`,
     '  approval page is not this one.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -353,6 +361,9 @@ const REMOTE_HOST_REASON = 'not available for a remote host';
 const KILOBYTE = 1_000;
 const MEGABYTE = 1_000_000;
 const GIGABYTE = 1_000_000_000;
+// Memory and VRAM are binary (a 16 GiB card is 16 GB); disks and rates keep decimal units so they
+// match drive labels and the units the kernel reports. Both visible units stay "GB".
+const MEMORY_GIBIBYTE = 1024 ** 3;
 
 // The kernel explains a missing sample with one of two reasons (crates/arca-metrics/src/sample.rs): a remote
 // host can never give the reading, or a read failed. A local reading with no reason simply is not there yet.
@@ -383,6 +394,11 @@ function measured(value) {
 }
 
 export function formatGigabytes(bytes) {
+  const value = measured(bytes);
+  return value === null || value < 0 ? '' : `${(value / MEMORY_GIBIBYTE).toFixed(1)} GB`;
+}
+
+export function formatDiskGigabytes(bytes) {
   const value = measured(bytes);
   return value === null || value < 0 ? '' : `${(value / GIGABYTE).toFixed(1)} GB`;
 }
@@ -464,9 +480,9 @@ function poolLines(pools) {
   return pools.map((pool) => {
     const name = text(pool?.name).trim();
     const parts = [];
-    const used = formatGigabytes(pool?.usedBytes);
-    const total = formatGigabytes(pool?.totalBytes);
-    const free = formatGigabytes(pool?.freeBytes);
+    const used = formatDiskGigabytes(pool?.usedBytes);
+    const total = formatDiskGigabytes(pool?.totalBytes);
+    const free = formatDiskGigabytes(pool?.freeBytes);
     if (used) parts.push(`${used} used`);
     if (total) parts.push(`${total} total`);
     if (free) parts.push(`${free} free`);
@@ -498,6 +514,77 @@ function projectLine(projects) {
   return `Projects: ${rows.join('; ')}.`;
 }
 
+function gpuReasonLabel(reason) {
+  const value = text(reason).trim();
+  if (!value) return NO_READING;
+  if (value === REMOTE_HOST_REASON || value === 'not measurable from here') return NOT_MEASURABLE;
+  if (value === NO_READING) return NO_READING;
+  return COULD_NOT_READ;
+}
+
+function gpuOwnerText(owner) {
+  if (owner.kind === 'instance') {
+    const where = [
+      owner.project ? `project ${projectLabel(owner.project)}` : '',
+      owner.name ? `instance ${owner.name}` : '',
+    ].filter(Boolean).join(', ');
+    return `${where || 'an instance'}${owner.detail ? ` (${owner.detail})` : ''}`;
+  }
+  if (owner.kind === 'docker') return owner.label;
+  return 'on the host';
+}
+
+// Two identical cards need more than a product name: the slot and PCI address tell the model exactly
+// which physical card the owner means, and match the Slot row on the approval card.
+function gpuLineLabel(card) {
+  const model = card.shortName ? `${card.shortName}, ` : '';
+  return `GPU ${card.slot} (${model}PCI ${card.pci})`;
+}
+
+// The Doctor must be able to answer "who is using the GPU" from the tool text alone. One plain line per
+// card carries the reading, who holds its memory, and the power-limit sentence only when bit 0x4 says so.
+function gpuLines(gpu) {
+  if (!gpu || typeof gpu !== 'object') return [];
+  const cards = gpuCards(gpu);
+  if (!cards.length) {
+    const reason = text(gpu.reason).trim();
+    return reason ? [`GPU: ${gpuReasonLabel(reason)}.`] : [];
+  }
+  const lines = [];
+  for (const card of cards) {
+    const label = gpuLineLabel(card);
+    const facts = [];
+    if (card.hasReading) {
+      if (card.utilizationText) facts.push(`${card.utilizationText} busy`);
+      if (card.usedBytes !== null && card.totalBytes !== null) {
+        facts.push(`${formatGigabytes(card.usedBytes)} used of ${formatGigabytes(card.totalBytes)}`);
+      } else if (card.totalBytes !== null) {
+        facts.push(`${formatGigabytes(card.totalBytes)} total`);
+      }
+      const draw = formatWatts(card.powerDrawW);
+      if (draw) facts.push(card.powerLimitW === null ? draw : `${draw} of ${formatWatts(card.powerLimitW)}`);
+      const temperature = formatCelsius(card.temperatureC);
+      if (temperature) facts.push(temperature);
+    } else {
+      facts.push(gpuReasonLabel(card.reason));
+    }
+    lines.push(`${label}: ${facts.join(', ')}.`);
+    if (card.powerCapped) lines.push(`${label} is held back by its power limit.`);
+    if (card.owners.length) {
+      const users = card.owners.map((owner) => {
+        const vram = owner.vramBytes === null ? '' : ` (${formatGigabytes(owner.vramBytes)})`;
+        return `${gpuOwnerText(owner)}${vram}`;
+      });
+      lines.push(`Who is using ${label}: ${users.join('; ')}.`);
+    } else if (card.processReason) {
+      lines.push(`Who is using ${label}: ${gpuReasonLabel(card.processReason)}.`);
+    } else {
+      lines.push(`No process is using ${label}.`);
+    }
+  }
+  return lines;
+}
+
 function sampleLines(sample) {
   const lines = [
     cpuLine(sample.cpu),
@@ -506,8 +593,12 @@ function sampleLines(sample) {
   ];
   const temperature = measured(sample.cpuTempC);
   if (temperature !== null) lines.push(`CPU temperature: ${temperature.toFixed(1)} C.`);
-  const gpu = formatPercent(sample.gpuBusyPct);
-  if (gpu) lines.push(`GPU: ${gpu} busy.`);
+  if (sample.gpu && typeof sample.gpu === 'object') {
+    lines.push(...gpuLines(sample.gpu));
+  } else {
+    const gpu = formatPercent(sample.gpuBusyPct);
+    if (gpu) lines.push(`GPU: ${gpu} busy.`);
+  }
   lines.push(...poolLines(sample.pools));
   const network = networkLine(sample.network);
   if (network) lines.push(network);
@@ -570,7 +661,9 @@ function presentToolValues(value) {
   const out = {};
   for (const [key, item] of Object.entries(value)) {
     if (typeof item === 'number' && /BytesPerSec$/.test(key)) out[key] = formatRate(item);
-    else if (typeof item === 'number' && /Bytes$/.test(key)) out[key] = formatGigabytes(item);
+    // Read results other than node_metrics carry store/device sizes, which are disk-like: keep the
+    // decimal GB the kernel's disk labels use. Memory and VRAM alone go through the binary helper.
+    else if (typeof item === 'number' && /Bytes$/.test(key)) out[key] = formatDiskGigabytes(item);
     else if (typeof item === 'number' && /Pct$/.test(key)) out[key] = formatPercent(item);
     else out[key] = presentToolValues(item);
   }
@@ -584,7 +677,7 @@ function toolClient(clientFor, hosts, name, onCall) {
       arca_status: 'Check whether this machine is up, its version and its last applied update.',
       watch_report: 'List the instances on this host and their state, grouped by project.',
       postgres_list: 'List the databases Arca knows about.',
-      node_metrics: 'Read how busy the CPU is and how much memory and disk the host is using.',
+      node_metrics: 'Read CPU, memory, disk, GPU and network readings for the host, including who is using each GPU.',
       alerts_list: 'List current warnings and recently resolved ones.',
       plan_list: 'List changes waiting for the owner\'s approval.',
       journal_list: 'Read recent Arca activity, oldest first. Optional after cursor and limit (max 500).',
@@ -656,7 +749,8 @@ export function createReadTools({ hosts = [], clientFor, onCall } = {}) {
 
 const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name}; '
   + 'service_publish {name, reach: "tailnet"}; service_unpublish {name}; '
-  + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}.';
+  + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}; '
+  + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}.';
 
 // The one non-read tool: it records an inert proposal for the owner and changes nothing. The kernel checks the
 // action name and its arguments again, so this list is an explicit fence rather than the only validation.
