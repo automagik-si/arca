@@ -1016,7 +1016,7 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The eight verbs an action proposal may name. The list is closed here and checked by the handler again.
+/// The nine verbs an action proposal may name. The list is closed here and checked by the handler again.
 const ACTION_NAMES: [&str; 9] = [
     "service_create",
     "service_remove",

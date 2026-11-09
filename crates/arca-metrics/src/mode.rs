@@ -255,6 +255,14 @@ mod tests {
     }
 
     impl IncusRead for Server {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             self.1
                 .lock()

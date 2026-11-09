@@ -230,6 +230,14 @@ mod tests {
     fn a_pool_entry_without_a_name_makes_the_whole_listing_unknown() {
         struct Listing(Value);
         impl IncusRead for Listing {
+            fn get_within(
+                &self,
+                path: &str,
+                _timeout: std::time::Duration,
+            ) -> Result<Value, arca_incus::IncusError> {
+                self.get(path)
+            }
+
             fn get(&self, path: &str) -> Result<Value, arca_incus::IncusError> {
                 if path == POOLS_PATH {
                     return Ok(self.0.clone());

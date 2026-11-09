@@ -75,6 +75,10 @@ impl Canned {
 }
 
 impl IncusRead for Canned {
+    fn get_within(&self, path: &str, _timeout: std::time::Duration) -> Result<Value, IncusError> {
+        self.get(path)
+    }
+
     fn get(&self, path: &str) -> Result<Value, IncusError> {
         self.asked.lock().expect("the log").push(path.to_string());
         self.answer.clone()

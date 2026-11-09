@@ -98,12 +98,10 @@ impl std::error::Error for IncusError {}
 pub trait IncusRead: Send + Sync {
     fn get(&self, path: &str) -> Result<Value, IncusError>;
 
-    /// Reads one path under a shorter deadline than the client's own. The default keeps `get`'s deadline, so a fake or a
-    /// client without a configurable deadline needs no override. The startup host-mode probe uses it so a hung Incus costs
-    /// at most its own short deadline.
-    fn get_within(&self, path: &str, _timeout: Duration) -> Result<Value, IncusError> {
-        self.get(path)
-    }
+    /// Reads one path under a shorter deadline than the client's own. A socket client applies it; an in-memory reader
+    /// answers without waiting, so it cannot outlast any deadline. The startup host-mode probe uses it, so a hung Incus
+    /// costs at most its own short deadline.
+    fn get_within(&self, path: &str, timeout: Duration) -> Result<Value, IncusError>;
 }
 
 /// A GET-only client for Incus's unix socket.
@@ -1342,5 +1340,38 @@ mod tests {
                 message: "d".repeat(512)
             }
         );
+    }
+
+    #[test]
+    fn get_within_applies_its_shorter_deadline() {
+        use std::os::unix::net::UnixListener;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "arca-incus-read-{}-{nanos}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&path).expect("a listener");
+        // The server accepts and then says nothing, as a hung Incus does.
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("the client connects");
+            std::thread::sleep(Duration::from_millis(600));
+        });
+
+        let client = UnixIncus::new(path.clone()).with_timeout(Duration::from_secs(10));
+        let started = std::time::Instant::now();
+        let answer = client.get_within("/1.0", Duration::from_millis(40));
+        assert_eq!(answer, Err(IncusError::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "the read ended at the shorter deadline, not the client's ten seconds"
+        );
+
+        server.join().expect("the server thread");
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -455,6 +455,14 @@ fn a_vfio_card_has_its_own_use_and_a_missing_gpu_list_is_empty_not_unknown() {
     );
     struct NoGpu(Value);
     impl arca_incus::IncusRead for NoGpu {
+        fn get_within(
+            &self,
+            _path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, arca_incus::IncusError> {
+            Ok(self.0.clone())
+        }
+
         fn get(&self, _path: &str) -> Result<Value, arca_incus::IncusError> {
             Ok(self.0.clone())
         }
@@ -536,6 +544,14 @@ fn cgroups_resolve_incus_projects_and_docker_containers() {
 fn a_failed_resources_read_is_a_reason_not_an_empty_inventory() {
     struct Offline;
     impl arca_incus::IncusRead for Offline {
+        fn get_within(
+            &self,
+            _path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, arca_incus::IncusError> {
+            self.get(_path)
+        }
+
         fn get(&self, _path: &str) -> Result<Value, arca_incus::IncusError> {
             Err(arca_incus::IncusError::Status {
                 code: 503,
@@ -590,6 +606,47 @@ fn an_oversize_nvidia_smi_answer_is_refused_at_the_cap() {
         error,
         arca_metrics::gpu::NvidiaError::Failed("the answer is over the 1 MiB cap".to_string())
     );
+}
+
+#[test]
+fn separate_programs_do_not_refuse_each_other_as_busy() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let scratch = Scratch::new("separate-gates");
+    let started = scratch.path().join("started");
+    let script = scratch.path().join("slow.sh");
+    // The program marks its start, holds its reader for a second, then answers one card.
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nsleep 1\nprintf '%s\\n' '00000000:01:00.0, GPU-11111111-1111-1111-1111-111111111111, 0, 0, 16376, 0, 0, 0, 0, 0x0'\n",
+            started.display()
+        ),
+    )
+    .expect("the script");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
+
+    let slow = NvidiaSmi::at(script).with_timeout(Duration::from_secs(5));
+    let slow = std::thread::spawn(move || slow.readings());
+    // The marker proves the slow program started, so its reader holds its own gate for the check below.
+    let until = Instant::now() + Duration::from_secs(5);
+    while !started.exists() {
+        assert!(Instant::now() < until, "the slow program started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let missing = NvidiaSmi::at(scratch.path().join("no-such-nvidia-smi"));
+    assert_eq!(
+        missing.readings().expect_err("the program is missing"),
+        arca_metrics::gpu::NvidiaError::Missing,
+        "another program's in-flight read never refuses this one as busy"
+    );
+    let readings = slow
+        .join()
+        .expect("the slow reader thread")
+        .expect("the slow program answers, not Busy");
+    assert_eq!(readings.len(), 1);
 }
 
 #[test]

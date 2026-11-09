@@ -58,7 +58,8 @@ impl Rig {
         let fake = start_fake(&scratch);
         let verifier = verifier_for(&scratch, &[key], tag);
         let kernel = Arc::new(Mutex::new(
-            kernel(&scratch, &fake, verifier, NOW).expect("the kernel opens"),
+            kernel_with_image(&scratch, &fake, verifier, NOW, postgres_image)
+                .expect("the kernel opens"),
         ));
         let clock = Arc::new(AtomicU64::new(NOW));
         let gpu = Arc::new(
@@ -494,6 +495,88 @@ fn the_per_token_proposal_rate_holds_across_propose_and_decline() {
     let error = rig
         .propose("service_create", create_args("rate-extra"))
         .expect_err("the token's window is full");
+    assert!(matches!(
+        error,
+        CallError::Refused { ref code, .. } if code == "RateLimited"
+    ));
+}
+
+#[test]
+fn a_deduplicated_proposal_does_not_consume_the_token_window() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-rate-dedupe", &key);
+    let first = rig
+        .propose("service_create", create_args("nats"))
+        .expect("the first new proposal");
+    for _ in 0..PROPOSAL_RATE_MAX * 2 {
+        assert_eq!(
+            rig.propose("service_create", create_args("nats"))
+                .expect("the duplicate still answers"),
+            first,
+            "a deduplicated proposal returns the waiting record"
+        );
+    }
+    // The duplicates counted nothing: one new proposal plus twenty-nine more still fit the window.
+    for index in 0..PROPOSAL_RATE_MAX - 1 {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("new{index}")))
+            .expect("a new proposal inside the window");
+        let id = proposed["id"].as_str().expect("an id");
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    let error = rig
+        .propose("service_create", create_args("new-extra"))
+        .expect_err("the thirty accepted proposals fill the window");
+    assert!(matches!(
+        error,
+        CallError::Refused { ref code, .. } if code == "RateLimited"
+    ));
+    assert_eq!(
+        rig.propose("service_create", create_args("nats"))
+            .expect("a duplicate answers even with a full window"),
+        first,
+        "a duplicate records nothing, so the full window does not refuse it"
+    );
+}
+
+#[test]
+fn a_refused_proposal_does_not_consume_the_token_window() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-rate-refused", &key);
+    let mut waiting = Vec::new();
+    for index in 0..MAX_WAITING {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("busy{index}")))
+            .expect("a proposal inside the window");
+        waiting.push(proposed["id"].as_str().expect("an id").to_string());
+    }
+    // Forty refusals for a full waiting set. If they counted, this loop would turn into RateLimited well before its end.
+    for index in 0..40 {
+        let error = rig
+            .propose("service_create", create_args(&format!("overflow{index}")))
+            .expect_err("a ninth proposal waits for room");
+        assert!(
+            matches!(error, CallError::Refused { ref code, .. } if code == "TooManyProposals"),
+            "a refusal, not a rate limit: {error:?}"
+        );
+    }
+    for id in &waiting {
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    // Eight accepted proposals are already counted, so twenty-two more fill the window exactly.
+    for index in 0..PROPOSAL_RATE_MAX - MAX_WAITING {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("spent{index}")))
+            .expect("a new proposal inside the window");
+        let id = proposed["id"].as_str().expect("an id");
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    let error = rig
+        .propose("service_create", create_args("spent-extra"))
+        .expect_err("the refusals counted nothing, so thirty new proposals fill the window");
     assert!(matches!(
         error,
         CallError::Refused { ref code, .. } if code == "RateLimited"
@@ -993,6 +1076,75 @@ fn a_vm_attach_refuses_an_in_use_nvidia_card_and_states_the_whole_card_effect() 
             "alpha takes the whole card while it runs; the host and every container lose it until alpha stops."
         )
     );
+}
+
+#[test]
+fn a_vm_attach_refuses_an_unknown_in_use_card_at_proposal_time() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-unknown", &key);
+    rig.gpu
+        .set_instances(vec![gpu_instance("alpha", "arcak-gpu", "virtual-machine")]);
+    // The local consumer list cannot be read: unknown is never treated as a free card.
+    rig.gpu.set_in_use("0000:02:00.0", None);
+    let refused = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("an unknown in-use state refuses a VM attach");
+    match refused {
+        CallError::Refused { code, message } => {
+            assert_eq!(code, "GpuInUseUnknown");
+            assert_eq!(
+                message,
+                "Arca could not check whether the card is in use; try again"
+            );
+        }
+        other => panic!("a refusal was expected, got {other:?}"),
+    }
+    assert_eq!(rig.list()["plans"], json!([]), "nothing was recorded");
+}
+
+#[test]
+fn a_vm_attach_refuses_an_unknown_in_use_card_again_when_it_runs() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-unknown-run", &key);
+    rig.gpu
+        .set_instances(vec![gpu_instance("alpha", "arcak-gpu", "virtual-machine")]);
+    rig.gpu.set_in_use("0000:02:00.0", Some(false));
+    let proposed = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect("a free card is proposed");
+    let id = proposed["id"].as_str().expect("an id");
+    let digest = proposed["argsDigest"].as_str().expect("a digest");
+    let approval = approve_statement(
+        &key,
+        &statement(HOST, id, "gpu_attach", digest, &"d".repeat(32)),
+    );
+    let approved = rig
+        .approve(id, &approval, NOW)
+        .expect("the approval verifies");
+
+    // The consumer list becomes unreadable after the proposal: execution re-reads it and refuses, never attaches.
+    rig.gpu.set_in_use("0000:02:00.0", None);
+    let refused = rig
+        .executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect_err("execution re-reads the in-use state");
+    match refused {
+        CallError::Refused { code, message } => {
+            assert_eq!(code, "GpuInUseUnknown");
+            assert_eq!(
+                message,
+                "Arca could not check whether the card is in use; try again"
+            );
+        }
+        other => panic!("a refusal was expected, got {other:?}"),
+    }
+    assert!(rig.gpu.calls().is_empty(), "nothing was attached");
 }
 
 #[test]
