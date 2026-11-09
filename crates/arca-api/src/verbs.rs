@@ -69,6 +69,14 @@ pub struct Verb {
     pub cut: fn(&Value) -> Option<Value>,
 }
 
+impl Verb {
+    /// Whether the MCP door advertises `readOnlyHint`. A verb that records a durable proposal is not read-only even
+    /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
+    pub fn read_only_hint(&self) -> bool {
+        !self.writes && self.name != "action_propose"
+    }
+}
+
 static VERBS: [Verb; 26] = [
     Verb {
         name: "arca_status",
@@ -917,7 +925,7 @@ fn plan_list_result() -> Value {
 }
 
 /// The eight verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 8] = [
+const ACTION_NAMES: [&str; 7] = [
     "service_create",
     "service_remove",
     "service_publish",
@@ -925,7 +933,6 @@ const ACTION_NAMES: [&str; 8] = [
     "service_connect",
     "service_disconnect",
     "postgres_create",
-    "postgres_delete",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -965,12 +972,18 @@ fn action_proposal() -> Value {
         ),
         ("action", true, one_of(&ACTION_NAMES)),
         ("summary", true, string()),
+        ("details", true, array(detail())),
         ("args", true, json!({ "type": "object" })),
         ("argsDigest", true, hex64()),
         ("createdAt", true, int()),
         ("expiresAt", true, int()),
         ("statement", false, string()),
     ])
+}
+
+/// One argument the owner is shown for an action proposal.
+fn detail() -> Value {
+    result(vec![("label", true, string()), ("value", true, string())])
 }
 
 /// A delete plan: its digest, its entry, its times, the objects it deletes, the digest of its arguments and the exact

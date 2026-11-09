@@ -62,10 +62,9 @@ pub const CHAT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const CHAT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// A chat response relays at most two MiB, so a broken upstream cannot stream without bound.
 pub const CHAT_STREAM_MAX: usize = 2 * 1024 * 1024;
-/// The data chunks the relay may buffer for a slow client. One further slot is kept empty so the final cut event always
-/// has room, however full the data queue is.
+/// The data chunks the relay may buffer for a slow client. One of the channel's permits is reserved at spawn for the
+/// final cut event, so data sends keep normal backpressure and the cut never waits for room.
 const RELAY_CHANNEL: usize = 16;
-const RELAY_QUEUE: usize = RELAY_CHANNEL + 1;
 /// At most two chat streams hold a listener connection; a third gets 429 before any upstream connect.
 pub const CHAT_CONCURRENCY: usize = 2;
 /// The sign-in statement's kind. The approval parser refuses it structurally, as this parser refuses an approval statement.
@@ -540,16 +539,15 @@ fn cut_event(sse: bool, reason: &str) -> Vec<u8> {
     }
 }
 
-/// Whether one more data chunk fits without consuming the slot the cut event needs.
-fn data_fits(sender: &mpsc::Sender<Result<Vec<u8>, io::Error>>) -> bool {
-    sender.capacity() > 1
-}
+/// The channel item the relay carries: one body chunk or its final cut event.
+type RelayChunk = Result<Vec<u8>, io::Error>;
 
-/// Emits the cut event before the body closes. Delivery gets its own short bound, never the already-expired total deadline,
-/// so a total cut can still be reported; a client that has gone away simply drops it. The relay never fills the last
-/// channel slot with data, so this send waits for the client, not for room.
-async fn cut(sender: &mpsc::Sender<Result<Vec<u8>, io::Error>>, sse: bool, reason: &str) {
-    let _ = timeout(DSH_TIMEOUT, sender.send(Ok(cut_event(sse, reason)))).await;
+/// Emits the cut event over the permit reserved at spawn, so it is delivered even when every other permit is queued
+/// behind a slow client. No send has to wait for room, and the body closes straight after it.
+fn cut(permit: &mut Option<mpsc::OwnedPermit<RelayChunk>>, sse: bool, reason: &str) {
+    if let Some(permit) = permit.take() {
+        let _ = permit.send(Ok(cut_event(sse, reason)));
+    }
 }
 
 /// Relays the DSH body as it arrives: each chunk is sent over the channel immediately, so nothing is buffered whole. One
@@ -564,8 +562,15 @@ fn spawn_chat_relay(
     idle: Duration,
     sse: bool,
 ) -> mpsc::Receiver<Result<Vec<u8>, io::Error>> {
-    let (sender, receiver) = mpsc::channel(RELAY_QUEUE);
+    let (sender, receiver) = mpsc::channel(RELAY_CHANNEL);
     tokio::spawn(async move {
+        let cut_sender = sender.clone();
+        let mut cut_permit = Some(
+            cut_sender
+                .reserve_owned()
+                .await
+                .expect("a fresh relay channel has room for the cut permit"),
+        );
         let mut pending = initial;
         let mut decoder = chunked.then(ChunkedBody::new);
         let mut relayed = 0usize;
@@ -578,7 +583,7 @@ fn spawn_chat_relay(
                 Some(decoder) => match decoder.push(&data) {
                     Ok(pieces) => pieces,
                     Err(()) => {
-                        cut(&sender, sse, "upstream").await;
+                        cut(&mut cut_permit, sse, "upstream");
                         return;
                     }
                 },
@@ -590,13 +595,7 @@ fn spawn_chat_relay(
                     continue;
                 }
                 if relayed.saturating_add(piece.len()) > CHAT_STREAM_MAX {
-                    cut(&sender, sse, "cap").await;
-                    return;
-                }
-                if !data_fits(&sender) {
-                    // The queue is full. Cut now, while the reserved slot still exists, rather than letting the cut
-                    // time out behind a client that is not reading.
-                    cut(&sender, sse, "full").await;
+                    cut(&mut cut_permit, sse, "cap");
                     return;
                 }
                 relayed = relayed.saturating_add(piece.len());
@@ -604,7 +603,14 @@ fn spawn_chat_relay(
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => return,
                     Err(_) => {
-                        cut(&sender, sse, "total").await;
+                        // A full queue at the total deadline is the one "full" cut. Until then a slow client applies
+                        // normal backpressure, and no briefly full queue ends the answer.
+                        let reason = if sender.capacity() == 0 {
+                            "full"
+                        } else {
+                            "total"
+                        };
+                        cut(&mut cut_permit, sse, reason);
                         return;
                     }
                 }
@@ -614,7 +620,7 @@ fn spawn_chat_relay(
             }
             let now = Instant::now();
             if now >= deadline {
-                cut(&sender, sse, "total").await;
+                cut(&mut cut_permit, sse, "total");
                 return;
             }
             let wait = deadline.saturating_duration_since(now).min(idle);
@@ -629,12 +635,12 @@ fn spawn_chat_relay(
                         None => content_length.is_some_and(|length| received < length),
                     };
                     if early {
-                        cut(&sender, sse, "upstream").await;
+                        cut(&mut cut_permit, sse, "upstream");
                     }
                     return;
                 }
                 Ok(Err(_)) => {
-                    cut(&sender, sse, "upstream").await;
+                    cut(&mut cut_permit, sse, "upstream");
                     return;
                 }
                 Err(_) => {
@@ -643,7 +649,7 @@ fn spawn_chat_relay(
                     } else {
                         "idle"
                     };
-                    cut(&sender, sse, reason).await;
+                    cut(&mut cut_permit, sse, reason);
                     return;
                 }
                 Ok(Ok(read)) => pending.extend_from_slice(&buffer[..read]),
@@ -946,30 +952,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_relay_queue_keeps_room_for_the_cut() {
-        let (sender, mut receiver) = mpsc::channel(RELAY_QUEUE);
-        for index in 0..RELAY_CHANNEL {
-            sender
-                .send(Ok(format!("data: {index}\n\n").into_bytes()))
-                .await
-                .expect("the queue takes its data chunks");
-        }
-        assert_eq!(sender.capacity(), 1, "the cut slot is still empty");
-        assert!(
-            !data_fits(&sender),
-            "no further data may consume the cut slot"
+    async fn a_full_relay_queue_delivers_the_cut_through_its_reserved_permit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let addr = listener.local_addr().expect("the listener address");
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let mut client = client.expect("the client connects");
+        let (server, _) = accepted.expect("the server accepts");
+        let mut receiver = spawn_chat_relay(
+            server,
+            Vec::new(),
+            false,
+            None,
+            Instant::now() + Duration::from_millis(300),
+            Duration::from_secs(5),
+            true,
         );
-        cut(&sender, true, "full").await;
-        drop(sender);
+        let writer = tokio::spawn(async move {
+            let event = [b'x'; 4096];
+            for _ in 0..64 {
+                if client.write_all(&event).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        writer.abort();
         let mut body = Vec::new();
         while let Some(chunk) = receiver.recv().await {
             body.extend(chunk.expect("a relayed chunk"));
         }
         let text = String::from_utf8(body).expect("UTF-8");
         let events = sse_events(&text);
-        assert_eq!(events.len(), RELAY_CHANNEL + 1);
-        let (event, data) = events.last().expect("the cut event");
-        assert_eq!(event, "arca-cut");
+        let (event, data) = events.last().expect("the final event");
+        assert_eq!(event, "arca-cut", "the cut survived a full relay queue");
         assert_eq!(
             serde_json::from_str::<Value>(data).expect("cut JSON"),
             json!({ "reason": "full" })

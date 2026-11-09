@@ -789,6 +789,18 @@ async fn decline(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
     let Ok(args) = serde_json::from_slice::<Value>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let action = args
+        .get("plan")
+        .or_else(|| args.get("id"))
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("act-"));
+    if !action {
+        return call_error_response(CallError::Refused {
+            code: "DoctorRequired".to_string(),
+            message: "the page declines only action proposals; a delete plan needs the doctor-scope plan_decline"
+                .to_string(),
+        });
+    }
     let mut kernel = match state.kernel.lock() {
         Ok(kernel) => kernel,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),

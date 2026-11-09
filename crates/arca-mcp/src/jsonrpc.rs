@@ -113,7 +113,7 @@ fn tools_for(server: &Server, caller: &Caller) -> Vec<Value> {
                 "description": v.summary,
                 "inputSchema": (v.params)(),
                 "outputSchema": mcp_output_schema(v),
-                "annotations": { "readOnlyHint": !v.writes, "destructiveHint": v.destructive }
+                "annotations": { "readOnlyHint": v.read_only_hint(), "destructiveHint": v.destructive }
             })
         })
         .collect()

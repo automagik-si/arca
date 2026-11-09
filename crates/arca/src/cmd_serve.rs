@@ -246,20 +246,23 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
-    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
-        plan_handlers(Arc::clone(&kernel), clock.clone())
-            .into_iter()
-            .chain(crate::handlers::postgres_handlers(
-                kernel.clone(),
-                clock.clone(),
-                Arc::new(cfg.clone()),
-            ))
-            .chain(crate::handlers::service_handlers(
-                kernel.clone(),
-                clock.clone(),
-                Arc::new(cfg.clone()),
-            ))
-            .collect();
+    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers(
+        Arc::clone(&kernel),
+        clock.clone(),
+        cfg.kernel.postgres_image.clone(),
+    )
+    .into_iter()
+    .chain(crate::handlers::postgres_handlers(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+    ))
+    .chain(crate::handlers::service_handlers(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+    ))
+    .collect();
     for (verb, handler) in &action_handlers {
         server = server.handle(verb, Arc::clone(handler));
     }

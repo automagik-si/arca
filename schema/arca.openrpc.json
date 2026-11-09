@@ -1060,8 +1060,7 @@
                           "service_unpublish",
                           "service_connect",
                           "service_disconnect",
-                          "postgres_create",
-                          "postgres_delete"
+                          "postgres_create"
                         ],
                         "type": "string"
                       },
@@ -1075,6 +1074,24 @@
                       },
                       "createdAt": {
                         "type": "integer"
+                      },
+                      "details": {
+                        "items": {
+                          "properties": {
+                            "label": {
+                              "type": "string"
+                            },
+                            "value": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "label",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "array"
                       },
                       "expiresAt": {
                         "type": "integer"
@@ -1101,6 +1118,7 @@
                       "id",
                       "action",
                       "summary",
+                      "details",
                       "args",
                       "argsDigest",
                       "createdAt",
@@ -1139,8 +1157,7 @@
               "service_unpublish",
               "service_connect",
               "service_disconnect",
-              "postgres_create",
-              "postgres_delete"
+              "postgres_create"
             ],
             "type": "string"
           }
@@ -1165,8 +1182,7 @@
                 "service_unpublish",
                 "service_connect",
                 "service_disconnect",
-                "postgres_create",
-                "postgres_delete"
+                "postgres_create"
               ],
               "type": "string"
             },
@@ -1180,6 +1196,24 @@
             },
             "createdAt": {
               "type": "integer"
+            },
+            "details": {
+              "items": {
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "label",
+                  "value"
+                ],
+                "type": "object"
+              },
+              "type": "array"
             },
             "expiresAt": {
               "type": "integer"
@@ -1206,6 +1240,7 @@
             "id",
             "action",
             "summary",
+            "details",
             "args",
             "argsDigest",
             "createdAt",

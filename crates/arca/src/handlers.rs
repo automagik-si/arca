@@ -33,7 +33,7 @@ use arca_watch::{WatchConfig, watch_once};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::action_proposal::{ActionKind, ActionProposal, ProposeError};
+use crate::action_proposal::{ActionKind, ActionProposal, ProposalRateLimiter, ProposeError};
 use crate::config::NodeConfig;
 use crate::kernel::{ActionApprovalError, AppliedSeq, ApprovedAction, JOURNAL_FILE, Kernel};
 
@@ -861,7 +861,9 @@ impl ToolHandler for TokenListHandler {
 pub fn plan_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
+    postgres_image: Option<String>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    let rate = Arc::new(ProposalRateLimiter::default());
     vec![
         (
             "plan_list",
@@ -875,6 +877,8 @@ pub fn plan_handlers(
             Arc::new(ActionPropose {
                 kernel: Arc::clone(&kernel),
                 clock: Arc::clone(&clock),
+                postgres_image,
+                rate,
             }) as Arc<dyn ToolHandler>,
         ),
         (
@@ -945,6 +949,7 @@ fn action_json(
         "id": proposal.id,
         "action": proposal.action,
         "summary": proposal.summary,
+        "details": proposal.details,
         "args": proposal.args,
         "argsDigest": proposal.args_digest,
         "createdAt": proposal.created_ms,
@@ -968,10 +973,12 @@ fn action_json(
 struct ActionPropose {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
+    postgres_image: Option<String>,
+    rate: Arc<ProposalRateLimiter>,
 }
 
 impl ToolHandler for ActionPropose {
-    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+    fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         let name = args["action"]
             .as_str()
             .ok_or_else(|| CallError::Invalid("action is required".to_string()))?;
@@ -982,16 +989,26 @@ impl ToolHandler for ActionPropose {
             .get("args")
             .cloned()
             .ok_or_else(|| CallError::Invalid("args is required".to_string()))?;
-        action.validate(&payload).map_err(CallError::Invalid)?;
+        let payload = action
+            .prepare(&payload, self.postgres_image.as_deref())
+            .map_err(CallError::Invalid)?;
         let now = (self.clock)();
+        if !self.rate.allow(&caller.token_id, now) {
+            return Err(CallError::Refused {
+                code: "RateLimited".to_string(),
+                message: "too many proposals from this token; try again in ten minutes".to_string(),
+            });
+        }
         let mut kernel = lock(&self.kernel)?;
         let proposal = kernel
             .propose_action(action, payload, now)
             .map_err(propose_failure)?;
         Ok(json!({
+            "kind": "action",
             "id": proposal.id,
             "action": proposal.action,
             "summary": proposal.summary,
+            "details": proposal.details,
             "args": proposal.args,
             "argsDigest": proposal.args_digest,
             "createdAt": proposal.created_ms,

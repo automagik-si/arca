@@ -1092,10 +1092,20 @@ fn action_proposals_are_listed_next_to_delete_plans_and_decline_removes_one() {
     let action = rig.action_from_page();
     assert_eq!(action["kind"], json!("action"));
     assert_eq!(action["action"], json!("service_create"));
-    assert_eq!(action["summary"], json!("Create the service nats"));
+    assert_eq!(
+        action["summary"],
+        json!("Create the service nats from template nats")
+    );
     assert_eq!(
         action["args"],
         json!({ "name": "nats", "template": "nats" })
+    );
+    assert_eq!(
+        action["details"],
+        json!([
+            { "label": "Name", "value": "nats" },
+            { "label": "Template", "value": "nats" }
+        ])
     );
     let id = action["id"].as_str().expect("an id");
     assert!(id.starts_with("act-"));
@@ -1116,13 +1126,32 @@ fn action_proposals_are_listed_next_to_delete_plans_and_decline_removes_one() {
     assert_eq!(status, 200);
     let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
     assert_eq!(listed["plans"].as_array().map(Vec::len), Some(2));
+    let delete_id = listed["plans"]
+        .as_array()
+        .expect("plans")
+        .iter()
+        .find_map(|plan| plan["plan"].as_str())
+        .expect("the delete plan is still listed");
+    let (status, body) = rig.post(
+        "/approve/decline",
+        Some(ORIGIN),
+        json!({ "plan": delete_id }),
+    );
     assert!(
-        listed["plans"]
-            .as_array()
-            .expect("plans")
-            .iter()
-            .any(|plan| plan["plan"].is_string()),
-        "the delete plan is still listed"
+        refusal(status),
+        "the open page cannot decline a delete plan"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("DoctorRequired"),
+        "the refusal names the doctor door"
+    );
+    let (status, body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
+    assert_eq!(
+        listed["plans"].as_array().map(Vec::len),
+        Some(2),
+        "the refused decline left the delete plan waiting"
     );
 
     let (status, body) = rig.post("/approve/decline", Some(ORIGIN), json!({ "plan": id }));
@@ -3037,7 +3066,7 @@ fn canvas_cookie_cannot_approve_or_reach_mcp() {
     assert!(!String::from_utf8_lossy(&body).contains("approved"));
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     let clock: Clock = Arc::new(|| NOW);
-    let handlers = plan_handlers(Arc::clone(&rig.kernel), clock);
+    let handlers = plan_handlers(Arc::clone(&rig.kernel), clock, None);
     let submit = handlers
         .iter()
         .find(|(name, _)| *name == "approval_submit")
@@ -3172,6 +3201,21 @@ fn zero_keys_pages_serve_empty_ids_and_skip_webauthn() {
         assert!(!source.contains("__ARCA_CREDENTIAL_IDS__"), "{path}");
         assert!(source.contains("if (!allowCredentials.length)"), "{path}");
     }
+}
+
+#[test]
+fn action_cards_render_every_kernel_detail_row_as_text() {
+    let html = include_str!("../src/approve_page.html");
+    assert!(
+        html.contains("const details = Array.isArray(plan.details) ? plan.details : [];")
+            && html
+                .contains("for (const detail of details) fact(detail.label, detail.value, false);"),
+        "the action card renders every details row"
+    );
+    assert!(
+        !html.contains("innerHTML"),
+        "the page builds rows with textContent, never innerHTML"
+    );
 }
 
 #[test]

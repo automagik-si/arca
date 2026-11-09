@@ -190,7 +190,6 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "service_connect",
         "service_disconnect",
         "postgres_create",
-        "postgres_delete",
     ];
     let action_proposal = open(
         json!({
@@ -203,6 +202,17 @@ fn plan_verb_schemas_equal_their_table_rows() {
             },
             "action": { "type": "string", "enum": action_names },
             "summary": { "type": "string" },
+            "details": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string" },
+                        "value": { "type": "string" },
+                    },
+                    "required": ["label", "value"],
+                },
+            },
             "args": { "type": "object" },
             "argsDigest": hex64(),
             "createdAt": { "type": "integer" },
@@ -214,6 +224,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
             "id",
             "action",
             "summary",
+            "details",
             "args",
             "argsDigest",
             "createdAt",

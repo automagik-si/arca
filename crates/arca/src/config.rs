@@ -128,6 +128,10 @@ pub struct KernelConfig {
     pub reserved_cidrs: Vec<String>,
     #[serde(default)]
     pub service_cidr: Option<String>,
+    /// The digest-pinned database image a proposed `postgres_create` uses. A proposal cannot choose another image; when
+    /// this is absent, a proposed database create is refused.
+    #[serde(default)]
+    pub postgres_image: Option<String>,
     /// The containers `arca adopt` may take from the default project, each with its adoption project. A config that lists any
     /// is for `arca adopt` alone: `serve` refuses it.
     #[serde(default)]
@@ -167,6 +171,8 @@ pub enum ConfigError {
     /// The link config contains an invalid name or route.
     Link(String),
     ServiceCidr,
+    /// The configured postgres image is not digest-pinned.
+    PostgresImage,
     /// The adoption allowlist or its attach networks break a rule. The text names the rule, never a value.
     Adopt(&'static str),
 }
@@ -194,6 +200,10 @@ impl fmt::Display for ConfigError {
             Self::ServiceCidr => write!(
                 f,
                 "kernel.serviceCidr must be an IPv4 /24 outside kernel.reservedCidrs"
+            ),
+            Self::PostgresImage => write!(
+                f,
+                "kernel.postgresImage must be a digest-pinned image reference (name@sha256:<64 hex>)"
             ),
             Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
             Self::ApprovalHost => write!(
@@ -254,6 +264,11 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     if let Some(cidr) = &kernel.service_cidr {
         arca_netproject::check_cidr(cidr, &kernel.reserved_cidrs)
             .map_err(|_| ConfigError::ServiceCidr)?;
+    }
+    if let Some(image) = &kernel.postgres_image
+        && arca_postgres::fingerprint(image).is_err()
+    {
+        return Err(ConfigError::PostgresImage);
     }
     check_adopt(kernel)?;
     if kernel.scratch {
@@ -428,6 +443,18 @@ mod tests {
             value["approvalHost"] = serde_json::json!(host);
         }
         serde_json::from_value(value).expect("the fixture config parses")
+    }
+
+    #[test]
+    fn a_configured_postgres_image_must_be_digest_pinned() {
+        let mut config = config_with(None);
+        config.kernel.postgres_image = Some("docker.io/library/postgres:18".to_string());
+        assert_eq!(check(&config), Err(ConfigError::PostgresImage));
+        config.kernel.postgres_image = Some(format!(
+            "docker.io/library/postgres@sha256:{}",
+            "a".repeat(64)
+        ));
+        assert_eq!(check(&config), Ok(()));
     }
 
     #[test]

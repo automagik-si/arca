@@ -70,6 +70,7 @@ refused without the value being echoed back.
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
 | `kernel.droiddProjects` | yes | droidd's projects. Required, and it must not be empty while `kernel.projects` is not. |
 | `kernel.serviceCidr` | no | Service bridge `<ipv4-network>/24`, outside every `kernel.reservedCidrs` range. Required for Postgres creation and probe consumer add; no default. |
+| `kernel.postgresImage` | no | A digest-pinned image (`name@sha256:<64 hex>`). A proposed `postgres_create` uses exactly this image and may not choose another; without it, a proposed database create is refused. |
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
@@ -287,6 +288,8 @@ record is refused.
 
 `tools/list` shows a caller only the verbs it may call.
 
+`action_propose` records a durable proposal, so its MCP annotation advertises `readOnlyHint: false` even though it changes no desired state.
+
 `tools/list` advertises each verb's MCP `outputSchema`: the natural result schema, wrapped under its `output.key` when the result is not an object, with `truncated` and (for an untrusted verb) `untrusted` added and every object level open. The OpenRPC document keeps the natural schemas.
 
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
@@ -320,9 +323,10 @@ its request is read.
   24 hours and the store's health. It reads the newest published tick and never waits on Incus. See "Alerts".
 - `token_list` lists each live token's id, scope and optional tool list. It never lists a secret or a digest.
 - `plan_list` lists each waiting delete plan and action proposal. A delete plan carries the statement its owner signs; an
-  action proposal carries its action, arguments and kernel-built summary. See the next section.
-- `action_propose` takes `{action, args}` and records an inert action proposal. It is a viewer verb: it changes no desired
-  state and applies nothing. The owner approves it on the approval page with a passkey.
+  action proposal carries its action, arguments, details and kernel-built summary. See the next section.
+- `action_propose` takes `{action, args}` and records an inert action proposal, returning `kind`, `summary`, `details` and
+  the record. It is a viewer verb: it changes no desired state and applies nothing, so MCP does not advertise it as
+  read-only. The owner approves it on the approval page with a passkey.
 - `plan_decline` retains a waiting delete plan's objects, or declines a waiting action proposal. A decline is final and
   survives a restart.
 - `approval_submit` checks an owner's approval for a waiting delete plan and, when it holds, deletes the plan's objects once.
@@ -419,7 +423,7 @@ A call sends `initialize` and then `tools/call`, each on its own connection. Its
 | `desired.json` | the current signed desired-state document, with the entries that converged and the plans that were declined. Mode 0600 |
 | `desired.lock` | the lock held while `serve` runs. A second process over the same directory is refused |
 | `journal.jsonl` | the journal of every effect the reconciler sent, as intents and outcomes |
-| `action-proposals.jsonl` | the action proposals and their `proposed`, `approved`, `declined` and `result` events |
+| `action-proposals.jsonl` | the action proposals and their `proposed`, `approved`, `declined` and `result` events. Opening compacts it to the waiting, unexpired proposals; an unreadable or oversized file is renamed `*.bad-<ts>` and the kernel starts empty |
 | `approval-nonces.jsonl` | the approval nonces that were spent |
 | `passkey-counts.jsonl` | the last sign count kept for each passkey. Mode 0600 |
 | `secrets/` | the secret files the writer reads, if any |
@@ -446,24 +450,30 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of eight gated verbs:
-`service_create`, `service_remove`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect`,
-`postgres_create` or `postgres_delete`. `action_propose` takes `{action, args}`; `args` is checked against that verb's own
-parameter schema, with the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid
-call and leaves no record. The record is:
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of seven gated verbs:
+`service_create`, `service_remove`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect` or
+`postgres_create`. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
+record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
+differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains.
+
+The record carries `details`, a kernel-built array of `{label,value}` rows that lists every argument the owner is approving;
+the approval page renders every row as text. The record is:
 
 ```json
-{"id":"act-<12 hex>","action":"service_create","args":{"name":"nats","template":"nats"},"argsDigest":"<sha256 of canonical {action,args}>","createdAt":<ms>,"expiresAt":<createdAt+15 min>,"summary":"Create the service nats"}
+{"id":"act-<12 hex>","action":"service_create","summary":"Create the service nats from template nats","details":[{"label":"Name","value":"nats"},{"label":"Template","value":"nats"}],"args":{"name":"nats","template":"nats"},"argsDigest":"<sha256 of canonical {action,args}>","createdAt":<ms>,"expiresAt":<createdAt+15 min>}
 ```
 
-The `summary` is built in the kernel from the checked fields; a caller cannot supply one. At most eight unexpired proposals
-wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same `argsDigest` returns the
-record that already waits instead of adding another. A proposal lapses fifteen minutes after it was made. The journal writes
+The `summary` and `details` are built in the kernel from the checked fields; a caller cannot supply either. At most eight
+unexpired proposals wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same
+`argsDigest` returns the record that already waits instead of adding another. One token may have thirty accepted proposals in
+ten minutes; beyond that it gets `RateLimited`. A proposal lapses fifteen minutes after it was made. The journal writes
 `proposed` when the record is made, `approved` when its proof verifies, `declined` on a decline, and `result` after the one
-run. A restart replays the journal, so an unexpired waiting proposal survives it.
+run. On start the journal is compacted to the waiting, unexpired proposals; an unreadable or larger-than-16-MiB file is
+quarantined as `action-proposals.jsonl.bad-<ts>` and the kernel starts empty, so this file never stops a start.
 
 `plan_list` carries an action proposal as
-`{"kind":"action","id":"act-…","action":"…","summary":"…","args":{…},"argsDigest":"…","createdAt":<ms>,"expiresAt":<ms>}`.
+`{"kind":"action","id":"act-…","action":"…","summary":"…","details":[…],"args":{…},"argsDigest":"…","createdAt":<ms>,"expiresAt":<ms>}`.
 `GET /approve/plans` carries the same item plus `statement`, the exact text the owner signs:
 
 ```
@@ -566,7 +576,8 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
 - `POST /approve/setup-code` issues a one-time 8-digit setup code to the machine's own screen while no passkey is trusted.
 - `POST /approve/approve` takes `{ "plan": "<digest or act-id>", "approval": "<string>" }`. A delete plan keeps the
   `approval_submit` path; an `act-…` id verifies the passkey against the proposal's statement and runs its action once.
-- `POST /approve/decline` takes `{ "plan": "<digest or act-id>" }` and declines that delete plan or action proposal.
+- `POST /approve/decline` takes `{ "plan": "<act-id>" }` and declines only an action proposal. The open page has no
+  credential for a delete plan; that decline stays with the doctor-scope `plan_decline`.
 - `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }`,
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.
@@ -596,7 +607,7 @@ any upstream connect. The kernel forwards the JSON to `POST /arca-canvas/chat` o
 write capability. The answer is relayed as a stream with the upstream's `Content-Type` (`text/event-stream`,
 `application/x-ndjson` or `application/json`) as each chunk arrives: nothing is buffered whole, one ten-minute total covers
 the connect, request write, response head and relay, and an idle gap of 60 seconds or a 2 MiB relay cap also ends the stream.
-A cut answer ends with a final `event: arca-cut` whose data names `idle`, `total`, `cap` or `upstream`
+A cut answer ends with a final `event: arca-cut` whose data names `idle`, `total`, `full`, `cap` or `upstream`
 (`{"arcaCut":{"reason":"..."}}` line for the NDJSON/JSON media types); a client disconnect closes the upstream connection
 without a cut event. `GET /approve/canvas/chat/history` is the same bounded three-second forward to
 `/arca-canvas/chat/history`. Every canvas route carries the CSP with `frame-ancestors 'none'`, `nosniff`, `no-referrer`, and

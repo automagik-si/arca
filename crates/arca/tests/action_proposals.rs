@@ -4,18 +4,26 @@
 
 mod common;
 
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use arca::action_proposal::{ACTION_PROPOSALS_FILE, MAX_WAITING};
+use arca::action_proposal::{ACTION_PROPOSALS_FILE, ActionKind, MAX_WAITING, PROPOSAL_RATE_MAX};
 use arca::handlers::{ActionExecutor, plan_handlers};
 use arca::kernel::Kernel;
 use arca_api::{Scope, verb};
 use arca_approval::{ApprovalRefusal, ArcaAction, parse_statement};
-use arca_mcp::{CallError, Caller, ToolHandler};
+use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint, serve_unix};
 use arca_reconcile::PLAN_TTL_MS;
 use common::*;
 use serde_json::{Value, json};
+use tokio::runtime::Runtime;
+
+/// A digest-pinned image the test kernel configures as its postgres default.
+const TEST_PG_IMAGE: &str = "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 /// A handler that counts its runs. It stands in for the gated verb, so the test can prove the page ran it once.
 struct Counting {
@@ -41,6 +49,10 @@ struct Rig {
 
 impl Rig {
     fn new(tag: &str, key: &SkKey) -> Rig {
+        Self::with_image(tag, key, Some(TEST_PG_IMAGE))
+    }
+
+    fn with_image(tag: &str, key: &SkKey, postgres_image: Option<&str>) -> Rig {
         let scratch = Scratch::new(tag);
         let fake = start_fake(&scratch);
         let verifier = verifier_for(&scratch, &[key], tag);
@@ -48,10 +60,14 @@ impl Rig {
             kernel(&scratch, &fake, verifier, NOW).expect("the kernel opens"),
         ));
         let clock = Arc::new(AtomicU64::new(NOW));
-        let handlers = plan_handlers(Arc::clone(&kernel), {
-            let clock = Arc::clone(&clock);
-            Arc::new(move || clock.load(Ordering::SeqCst))
-        })
+        let handlers = plan_handlers(
+            Arc::clone(&kernel),
+            {
+                let clock = Arc::clone(&clock);
+                Arc::new(move || clock.load(Ordering::SeqCst))
+            },
+            postgres_image.map(str::to_string),
+        )
         .into_iter()
         .collect();
         let runs = Arc::new(AtomicU64::new(0));
@@ -128,13 +144,18 @@ fn a_viewer_may_propose_and_nothing_changes() {
             &viewer,
         )
         .expect("a viewer may propose");
-    assert_eq!(
-        proposed["kind"],
-        json!(null),
-        "the record has no listing kind"
+    assert_eq!(proposed["kind"], json!("action"));
+    assert!(
+        proposed["details"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2),
+        "the owner sees every argument"
     );
     assert_eq!(proposed["action"], json!("service_create"));
-    assert_eq!(proposed["summary"], json!("Create the service nats"));
+    assert_eq!(
+        proposed["summary"],
+        json!("Create the service nats from template nats")
+    );
     assert!(
         proposed["id"]
             .as_str()
@@ -163,7 +184,6 @@ fn a_viewer_may_propose_and_nothing_changes() {
         "service_connect",
         "service_disconnect",
         "postgres_create",
-        "postgres_delete",
     ] {
         assert!(
             !arca_api::may_call(Scope::Viewer, verb(name).expect("present")),
@@ -195,10 +215,222 @@ fn the_summary_is_built_by_the_kernel_and_an_extra_field_is_refused() {
 }
 
 #[test]
+fn every_argument_of_every_allowed_verb_is_in_details() {
+    fn sample(action: ActionKind) -> Value {
+        match action {
+            ActionKind::ServiceCreate => json!({ "name": "nats", "template": "nats" }),
+            ActionKind::ServiceRemove | ActionKind::ServiceUnpublish => json!({ "name": "nats" }),
+            ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
+            ActionKind::ServiceConnect | ActionKind::ServiceDisconnect => {
+                json!({ "from": "api", "to": "nats" })
+            }
+            ActionKind::PostgresCreate => json!({ "name": "orders" }),
+        }
+    }
+
+    for action in ActionKind::ALL {
+        let prepared = action
+            .prepare(&sample(action), Some(TEST_PG_IMAGE))
+            .expect("the sample is valid");
+        let details = action.details(&prepared);
+        let schema = action.params_schema();
+        let fields = schema["properties"].as_object().expect("properties");
+        let mut seen = 0;
+        for field in fields.keys() {
+            let label = match (action, field.as_str()) {
+                (ActionKind::PostgresCreate, "name") => "Database",
+                (_, "name") => "Name",
+                (_, "template") => "Template",
+                (_, "reach") => "Reach",
+                (_, "from") => "Service",
+                (_, "to") => "To",
+                (_, "image") => "Image",
+                _ => panic!("{action:?} field {field} has no owner label"),
+            };
+            let row = details
+                .iter()
+                .find(|row| row.label == label)
+                .unwrap_or_else(|| panic!("{action:?} details lack {label}"));
+            assert_eq!(
+                row.value,
+                prepared[field.as_str()].as_str().expect("a string field"),
+                "{action:?} {label}"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, details.len(), "{action:?} has an extra detail row");
+    }
+    let traversal = ActionKind::ServiceCreate
+        .prepare(&json!({ "name": "nats", "template": "../outside" }), None);
+    assert!(
+        traversal.is_err(),
+        "the template field is constrained to the catalog's name grammar"
+    );
+}
+
+#[test]
+fn a_proposed_postgres_create_uses_only_the_configured_pinned_image() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-postgres", &key);
+    let proposed = rig
+        .propose("postgres_create", json!({ "name": "orders" }))
+        .expect("the default image is filled in");
+    assert_eq!(proposed["args"]["image"], json!(TEST_PG_IMAGE));
+    assert_eq!(
+        proposed["details"],
+        json!([
+            { "label": "Database", "value": "orders" },
+            { "label": "Image", "value": TEST_PG_IMAGE }
+        ])
+    );
+    let foreign = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let error = rig
+        .propose(
+            "postgres_create",
+            json!({ "name": "other", "image": foreign }),
+        )
+        .expect_err("a proposal cannot choose an image");
+    assert!(matches!(error, CallError::Invalid(_)));
+    assert_eq!(
+        rig.list()["plans"].as_array().map(Vec::len),
+        Some(1),
+        "the refused image recorded nothing"
+    );
+
+    let no_default = Rig::with_image("proposal-postgres-none", &key, None);
+    let error = no_default
+        .propose("postgres_create", json!({ "name": "orders" }))
+        .expect_err("no configured image");
+    assert!(matches!(error, CallError::Invalid(_)));
+
+    let unpinned = Rig::with_image(
+        "proposal-postgres-unpinned",
+        &key,
+        Some("docker.io/library/postgres:18"),
+    );
+    let error = unpinned
+        .propose("postgres_create", json!({ "name": "orders" }))
+        .expect_err("an unpinned default is refused");
+    assert!(matches!(error, CallError::Invalid(_)));
+}
+
+#[test]
+fn action_propose_succeeds_through_the_mcp_door() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-mcp", &key);
+    let tokens_dir = rig._scratch.path("mcp-tokens");
+    std::fs::create_dir(&tokens_dir).expect("the token directory");
+    std::fs::set_permissions(&tokens_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("mode 0700");
+    let (secret, hash) = mint(Scope::Viewer);
+    let hash_path = tokens_dir.join("viewer.hash");
+    std::fs::write(&hash_path, hash).expect("the hash file");
+    std::fs::set_permissions(&hash_path, std::fs::Permissions::from_mode(0o400))
+        .expect("mode 0400");
+    let tokens = TokenStore::load(&tokens_dir).expect("the token store loads");
+    let server = Server::new(arca_api::verbs(), tokens).handle(
+        "action_propose",
+        Arc::clone(&rig.handlers["action_propose"]),
+    );
+    let socket = rig._scratch.path("mcp.sock");
+    let runtime = Runtime::new().expect("a runtime");
+    let served = socket.clone();
+    runtime.spawn(async move {
+        let _ = serve_unix(server.router(), &served).await;
+    });
+    let until = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < until, "the MCP socket started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "action_propose",
+            "arguments": {
+                "action": "service_create",
+                "args": { "name": "nats", "template": "nats" }
+            }
+        }
+    });
+    let body = serde_json::to_vec(&call).expect("the call");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = UnixStream::connect(&socket).expect("connect to MCP");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("read timeout");
+    stream.write_all(request.as_bytes()).expect("the head");
+    stream.write_all(&body).expect("the body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("the answer");
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("a response head");
+    assert!(
+        String::from_utf8_lossy(&raw[..split]).starts_with("HTTP/1.1 200"),
+        "the MCP door answers 200"
+    );
+    let reply: Value = serde_json::from_slice(&raw[split + 4..]).expect("JSON-RPC");
+    assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
+    let proposal = &reply["result"]["structuredContent"];
+    assert_eq!(proposal["kind"], json!("action"));
+    assert_eq!(proposal["action"], json!("service_create"));
+    assert_eq!(
+        proposal["summary"],
+        json!("Create the service nats from template nats")
+    );
+    assert_eq!(proposal["args"]["template"], json!("nats"));
+    assert!(
+        proposal["details"]
+            .as_array()
+            .is_some_and(|rows| rows.len() == 2),
+        "the owner sees both arguments"
+    );
+    assert!(
+        proposal["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("act-") && id.len() == 16)
+    );
+}
+
+#[test]
+fn the_per_token_proposal_rate_holds_across_propose_and_decline() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-rate", &key);
+    for index in 0..PROPOSAL_RATE_MAX {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("rate{index}")))
+            .expect("a proposal inside the window");
+        let id = proposed["id"].as_str().expect("an id");
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    let error = rig
+        .propose("service_create", create_args("rate-extra"))
+        .expect_err("the token's window is full");
+    assert!(matches!(
+        error,
+        CallError::Refused { ref code, .. } if code == "RateLimited"
+    ));
+}
+
+#[test]
 fn a_disallowed_action_is_refused_and_records_nothing() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("proposal-disallowed", &key);
-    for action in ["service_secret_set", "reboot", "install", ""] {
+    for action in [
+        "service_secret_set",
+        "reboot",
+        "install",
+        "postgres_delete",
+        "",
+    ] {
         let error = rig
             .propose(action, json!({ "name": "nats" }))
             .expect_err("not on the list");

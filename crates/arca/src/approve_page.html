@@ -601,6 +601,8 @@ function actionCard(plan) {
     row.append(detail);
     facts.append(row);
   };
+  const details = Array.isArray(plan.details) ? plan.details : [];
+  for (const detail of details) fact(detail.label, detail.value, false);
   fact("Action", plan.action, true);
   fact("Target", plan.id, true);
   const digest = plan.argsDigest || "";

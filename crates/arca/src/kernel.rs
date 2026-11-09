@@ -125,11 +125,7 @@ impl Kernel {
         now_ms: u64,
     ) -> Result<Self, KernelError> {
         let mut store = DesiredStore::open(state_dir, key)?;
-        let action_proposals =
-            ActionProposalStore::open(state_dir).map_err(|error| KernelError::Io {
-                path: ACTION_PROPOSALS_FILE.to_string(),
-                why: error.to_string(),
-            })?;
+        let action_proposals = ActionProposalStore::open(state_dir, now_ms);
         let retained = RetainedSet::new(store.retained().clone());
         let provider = provider(retained.clone())?;
         let journal = Journal::open(FileJournal::open(&state_dir.join(JOURNAL_FILE))?)?;
