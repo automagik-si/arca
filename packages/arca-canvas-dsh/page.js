@@ -481,29 +481,58 @@
   var APPROVAL_TIMEOUT_MS = 3e4;
   var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
   var MISSING_PROPOSAL = "The proposal is not waiting any more.";
-  var APPROVAL_REFUSALS = /* @__PURE__ */ new Set([
-    "Expired",
-    "Replayed",
-    "NoSuchPlan",
-    "Untrusted",
+  var NEUTRAL_REFUSAL = "Arca did not accept this approval. Try again from the card.";
+  var APPROVAL_REFUSAL_CODES = Object.freeze([
+    "Malformed",
+    "NotCanonical",
+    "NoVerifier",
     "BadSignature",
+    "NotHardwareKey",
     "NoUserPresence",
     "NoUserVerification",
     "WrongOrigin",
     "WrongRp",
-    "WrongHost"
+    "SignCountRegressed",
+    "WrongNamespace",
+    "WrongHost",
+    "WrongAction",
+    "WrongTarget",
+    "WrongParams",
+    "IssuedAhead",
+    "Expired",
+    "TtlTooLong",
+    "Replayed",
+    "Untrusted",
+    "Storage",
+    "Unresolved",
+    "NoSuchPlan"
   ]);
+  var APPROVAL_REFUSALS = new Set(APPROVAL_REFUSAL_CODES);
+  var FINISHED_STATES = /* @__PURE__ */ new Set(["done", "declined", "failed", "expired"]);
   var REFUSALS = Object.freeze({
-    Expired: "This proposal ran out of time. Nothing changed.",
+    Malformed: "Arca could not read this approval. Try again from the card.",
+    NotCanonical: "Arca could not read this approval as signed. Try again from the card.",
+    NoVerifier: "Arca has no trusted passkey verifier for this approval.",
+    BadSignature: "Arca could not check the passkey's answer. Try again from the card.",
+    NotHardwareKey: "Arca needs a hardware-backed passkey for this approval.",
+    NoUserPresence: "The passkey did not confirm that you were present. Try again from the card.",
+    NoUserVerification: "The passkey did not confirm that it was you. Try again from the card.",
+    WrongOrigin: "This approval came from a page address Arca does not allow.",
+    WrongRp: "This approval came from the wrong passkey relying party.",
+    SignCountRegressed: "The passkey's signature counter went backwards, so Arca refused this approval.",
+    WrongNamespace: "This approval was signed for a different Arca operation.",
+    WrongHost: "This approval was made for a different Arca host.",
+    WrongAction: "This approval does not match the proposed action.",
+    WrongTarget: "This approval does not match the proposed target.",
+    WrongParams: "This approval does not match the proposed arguments.",
+    IssuedAhead: "This approval is dated in the future. Check this machine's clock and try again.",
+    Expired: "This proposal has expired. Nothing changed.",
+    TtlTooLong: "This approval was valid for longer than Arca allows.",
     Replayed: "This approval was already used. Reload the page to see what is still waiting.",
-    NoSuchPlan: NO_SUCH_PLAN,
     Untrusted: "Arca does not trust this passkey. Use the passkey you set up for Arca.",
-    BadSignature: "Arca could not check the passkey's answer. Try again.",
-    NoUserPresence: "Your device did not confirm it was you. Try again.",
-    NoUserVerification: "Your device did not confirm it was you. Try again.",
-    WrongOrigin: "This page's address does not match Arca's settings.",
-    WrongRp: "This page's address does not match Arca's settings.",
-    WrongHost: "This approval was made for a different Arca."
+    Storage: "Arca could not record this approval. Try again from the card.",
+    Unresolved: "Arca could not match this approval to a waiting proposal.",
+    NoSuchPlan: NO_SUCH_PLAN
   });
   var text2 = (value, fallback = "") => value == null ? fallback : String(value);
   var list2 = (value) => Array.isArray(value) ? value : [];
@@ -529,18 +558,21 @@
     const minutes = Math.floor(seconds / 60);
     return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
   }
-  function plainRefusal(refusal, status) {
-    if (typeof refusal === "string" && REFUSALS[refusal]) return REFUSALS[refusal];
-    if (status === 401 || status === 403) return "Arca did not accept this approval.";
-    if (status === 404) return "This proposal is no longer waiting in Arca.";
-    if (status === 429) return "Arca is busy. Try again shortly.";
-    return "Arca could not complete this just now. Try again in a moment.";
+  function approvalRefusalText(refusal) {
+    if (typeof refusal === "string" && APPROVAL_REFUSALS.has(refusal)) return REFUSALS[refusal];
+    return NEUTRAL_REFUSAL;
   }
   function plainActionError(body) {
     const message = typeof body?.message === "string" ? body.message.trim() : "";
-    if (!message) return "The change was approved, but Arca could not run it just now. Try again.";
+    if (!message) return NEUTRAL_REFUSAL;
     const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
     return /[.!?]$/.test(sentence) ? `The change was approved, but Arca could not run it: ${sentence}` : `The change was approved, but Arca could not run it: ${sentence}.`;
+  }
+  function approvalErrorText(body) {
+    const refusal = body?.refusal;
+    if (typeof refusal === "string" && refusal) return approvalRefusalText(refusal);
+    if (refusal != null) return NEUTRAL_REFUSAL;
+    return plainActionError(body);
   }
   function plainError(error) {
     if (!error) return "Something went wrong. Try again.";
@@ -1327,11 +1359,15 @@
       let card = approvals.cards.get(key);
       if (!card) {
         if (!approvals.plans.has(key)) return null;
-        card = { plan: null, state: "waiting", reason: "", note: "", result: "", busy: "" };
+        card = { plan: null, state: "waiting", reason: "", note: "", result: "", busy: "", settledAt: 0 };
         approvals.cards.set(key, card);
       }
       if (!card.plan && approvals.plans.has(key)) card.plan = approvals.plans.get(key);
       return card;
+    }
+    function setCardState(card, state2, now = Date.now()) {
+      card.state = state2;
+      card.settledAt = FINISHED_STATES.has(state2) ? now : 0;
     }
     function approvalDetails(value) {
       if (!Array.isArray(value) || !value.length) return null;
@@ -1403,7 +1439,8 @@
       }
       approvals.fetching = true;
       approvalInflight = (async () => {
-        approvals.fetchStartedAt = Date.now();
+        const startedAt = Date.now();
+        approvals.fetchStartedAt = startedAt;
         try {
           const next = await readApprovalPlans();
           const now = Date.now();
@@ -1411,10 +1448,11 @@
             const card = approvals.cards.get(id);
             if (!card) continue;
             card.plan = plan;
-            if (!["done", "declined", "failed", "expired"].includes(card.state)) continue;
+            if (!FINISHED_STATES.has(card.state)) continue;
+            if (startedAt <= card.settledAt) continue;
             if (card.state === "expired" && plan.expiresAt <= now) continue;
             const failedReason = card.state === "failed" ? card.reason || card.note : "";
-            card.state = "waiting";
+            setCardState(card, "waiting", now);
             card.result = "";
             card.reason = "";
             card.busy = "";
@@ -1428,9 +1466,9 @@
           }
           for (const [id, card] of approvals.cards) {
             if (next.plans.has(id) || card.state !== "waiting") continue;
-            if (card.plan && now >= card.plan.expiresAt) card.state = "expired";
+            if (card.plan && now >= card.plan.expiresAt) setCardState(card, "expired", now);
             else {
-              card.state = "failed";
+              setCardState(card, "failed", now);
               card.reason = NO_SUCH_PLAN;
               card.retry = false;
             }
@@ -1460,7 +1498,7 @@
       let changed = false;
       for (const card of approvals.cards.values()) {
         if (card.state === "waiting" && card.plan && now >= card.plan.expiresAt) {
-          card.state = "expired";
+          setCardState(card, "expired", now);
           card.busy = "";
           changed = true;
         }
@@ -1629,17 +1667,17 @@ ${statement}`)
       const plan = card?.plan;
       if (!card || card.state !== "waiting" || !plan) return;
       if (!plan.statement) {
-        card.state = "failed";
+        setCardState(card, "failed");
         card.reason = "Arca did not send the approval statement. Reload the page.";
         updatePanel();
         return;
       }
       if (Date.now() >= plan.expiresAt) {
-        card.state = "expired";
+        setCardState(card, "expired");
         updatePanel();
         return;
       }
-      card.state = "approving";
+      setCardState(card, "approving");
       card.busy = "";
       card.reason = "";
       card.note = "";
@@ -1661,33 +1699,30 @@ ${statement}`)
           const refusal = body?.refusal;
           card.retry = false;
           if (refusal === "NoSuchPlan") {
-            card.state = "failed";
+            setCardState(card, "failed");
             card.reason = NO_SUCH_PLAN;
           } else if (refusal === "Expired") {
-            card.state = "expired";
-          } else if (APPROVAL_REFUSALS.has(refusal)) {
-            card.state = "failed";
-            card.reason = plainRefusal(refusal, response.status);
+            setCardState(card, "expired");
           } else {
-            card.state = "failed";
-            card.reason = plainActionError(body);
+            setCardState(card, "failed");
+            card.reason = approvalErrorText(body);
           }
           return;
         }
-        card.state = "done";
+        setCardState(card, "done");
         card.result = plainResult(plan.action, body?.result);
         approvals.plans.delete(id);
       } catch (error) {
         if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-          card.state = "waiting";
+          setCardState(card, "waiting");
           card.note = "No answer from Arca, try again.";
           card.retry = true;
         } else if (error?.name === "NotAllowedError") {
-          card.state = "waiting";
+          setCardState(card, "waiting");
           card.note = "Passkey cancelled.";
           card.retry = false;
         } else {
-          card.state = "failed";
+          setCardState(card, "failed");
           card.reason = plainError(error);
           card.retry = false;
         }
@@ -1714,20 +1749,20 @@ ${statement}`)
           card.busy = "";
           card.retry = false;
           if (body?.refusal === "NoSuchPlan") {
-            card.state = "failed";
+            setCardState(card, "failed");
             card.reason = NO_SUCH_PLAN;
           } else if (body?.refusal === "Expired") {
-            card.state = "expired";
+            setCardState(card, "expired");
           } else {
-            card.state = "failed";
-            card.reason = plainRefusal(body?.refusal, response.status);
+            setCardState(card, "failed");
+            card.reason = approvalRefusalText(body?.refusal);
           }
           return;
         }
-        card.state = "declined";
+        setCardState(card, "declined");
         approvals.plans.delete(id);
       } catch (error) {
-        card.state = "failed";
+        setCardState(card, "failed");
         card.reason = plainError(error);
       } finally {
         card.busy = "";
@@ -1749,7 +1784,15 @@ ${statement}`)
     }
     function approvalSignature() {
       return JSON.stringify({
-        plans: [...approvals.plans.values()].map((plan) => [plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.details]),
+        plans: [...approvals.plans.values()].map((plan) => [
+          plan.id,
+          plan.summary,
+          plan.action,
+          plan.argsDigest,
+          plan.expiresAt,
+          plan.host,
+          plan.details
+        ]),
         deletes: approvals.deletes.map((plan) => plan.id),
         cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),
         passkeysTrusted: approvals.passkeysTrusted,
