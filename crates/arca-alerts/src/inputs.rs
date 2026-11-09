@@ -3,7 +3,9 @@
 use arca_incus::IncusRead;
 use arca_metrics::{REMOTE_HOST_REASON, Sampler};
 
-use crate::eval::{DriveUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse};
+use crate::eval::{
+    DriveUse, GpuGone, GpuUse, Inputs, InstanceUse, PoolUse, RuleId, Timed, UpdateUse,
+};
 
 /// The inputs of the sampler's newest sample, stamped with its time. A read that failed in the sampler is `None` here, so
 /// the rule reads it as unknown. Before the first sample every source is unknown.
@@ -20,9 +22,48 @@ pub fn from_sampler<R: IncusRead>(sampler: &Sampler<R>) -> Inputs {
         unavailable.insert(RuleId::MemPsiHigh);
         unavailable.insert(RuleId::CpuHot);
     }
+    // The inventory is the same read for a local and a remote host. Telemetry and attribution are local only, so a remote
+    // host (or one without nvidia-smi) has every card present with no telemetry. That is a reading this node can never
+    // provide, not a gap: a firing VRAM alert resolves with `no data` after its clear window instead of hanging forever.
+    let gpu_known = sample.gpu.reason.is_none();
+    if gpu_known
+        && !sample.gpu.cards.is_empty()
+        && sample.gpu.cards.iter().all(|card| card.telemetry.is_none())
+    {
+        unavailable.insert(RuleId::GpuVramHigh);
+    }
+    let gpus = gpu_known.then(|| Timed {
+        at,
+        value: sample
+            .gpu
+            .cards
+            .iter()
+            .map(|card| GpuUse {
+                pci: card.pci.clone(),
+                vram_used_pct: card.telemetry.as_ref().and_then(|telemetry| {
+                    let used = telemetry.memory_used_bytes?;
+                    let total = telemetry.memory_total_bytes?;
+                    (total > 0).then(|| used as f64 / total as f64 * 100.0)
+                }),
+            })
+            .collect(),
+    });
+    let gpus_gone = gpu_known.then(|| Timed {
+        at,
+        value: sampler
+            .readings()
+            .gpus_gone
+            .iter()
+            .map(|card| GpuGone {
+                pci: card.pci.clone(),
+            })
+            .collect(),
+    });
     Inputs {
         at,
         unavailable,
+        gpus,
+        gpus_gone,
         pools: sampler.readings().pools.as_ref().map(|pools| Timed {
             at,
             value: pools

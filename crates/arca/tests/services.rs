@@ -1836,6 +1836,7 @@ fn an_approved_action_proposal_runs_the_real_service_remove_handler_once() {
             arca::action_proposal::ActionKind::ServiceRemove,
             json!({ "name": "pg" }),
             NOW,
+            None,
         )
         .expect("the proposal is inert");
     let statement = arca::handlers::action_statement(
@@ -2109,11 +2110,16 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
     let statement =
         arca::handlers::plan_statement("node1", &plan.to_hex(), NOW, &"b".repeat(64)).unwrap();
     let proof = common::approve_statement(&key, &statement);
-    let handler = arca::handlers::plan_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW), None)
-        .into_iter()
-        .find(|(name, _)| *name == "approval_submit")
-        .unwrap()
-        .1;
+    let handler = arca::handlers::plan_handlers(
+        Arc::clone(&rig.kernel),
+        Arc::new(|| NOW),
+        None,
+        Arc::new(arca::gpu::FakeGpu::default()),
+    )
+    .into_iter()
+    .find(|(name, _)| *name == "approval_submit")
+    .unwrap()
+    .1;
     let (started, waiting) = mpsc::channel();
     let (finished, done) = mpsc::channel();
     let approve = std::thread::spawn(move || {

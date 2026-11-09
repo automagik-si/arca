@@ -46,11 +46,13 @@ pub enum ActionKind {
     ServiceConnect,
     ServiceDisconnect,
     PostgresCreate,
+    GpuAttach,
+    GpuDetach,
 }
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 7] = [
+    pub const ALL: [ActionKind; 9] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServicePublish,
@@ -58,6 +60,8 @@ impl ActionKind {
         Self::ServiceConnect,
         Self::ServiceDisconnect,
         Self::PostgresCreate,
+        Self::GpuAttach,
+        Self::GpuDetach,
     ];
 
     /// The verb name this action runs.
@@ -70,6 +74,8 @@ impl ActionKind {
             Self::ServiceConnect => "service_connect",
             Self::ServiceDisconnect => "service_disconnect",
             Self::PostgresCreate => "postgres_create",
+            Self::GpuAttach => "gpu_attach",
+            Self::GpuDetach => "gpu_detach",
         }
     }
 
@@ -138,13 +144,22 @@ impl ActionKind {
                     return Err("args/name: expected a database name".to_string());
                 }
             }
+            Self::GpuAttach | Self::GpuDetach => {}
             _ => {}
         }
         Ok(args)
     }
 
-    /// The arguments the owner is shown, in plain words. Every field of the verb's params schema has a row.
+    /// The arguments the owner is shown, in plain words. Every field of the verb's params schema has a row. A GPU action
+    /// also names the card's product when the inventory knows it; [`Self::details`] leaves that out.
     pub fn details(self, args: &Value) -> Vec<ActionDetail> {
+        self.details_with_gpu(args, None)
+    }
+
+    /// The same rows, with the card's product filled in for an attach or detach when the inventory knows it. The GPU row
+    /// always carries the PCI address, so two identical cards are never confused, and the effect row never claims that a
+    /// card shared by more than one container has isolated VRAM.
+    pub fn details_with_gpu(self, args: &Value, gpu_product: Option<&str>) -> Vec<ActionDetail> {
         let text = |key: &str| args[key].as_str().unwrap_or_default();
         let row = |label: &str, value: &str| ActionDetail {
             label: label.to_string(),
@@ -161,6 +176,27 @@ impl ActionKind {
             }
             Self::PostgresCreate => {
                 vec![row("Database", text("name")), row("Image", text("image"))]
+            }
+            Self::GpuAttach | Self::GpuDetach => {
+                let instance = text("instance");
+                let pci = text("pci");
+                let gpu = match gpu_product.filter(|product| !product.is_empty()) {
+                    Some(product) => format!("{product} ({pci})"),
+                    None => format!("GPU at {pci}"),
+                };
+                let effect = match self {
+                    Self::GpuAttach => format!(
+                        "Adds the card to {instance} as a physical GPU device. Its memory is shared with every other consumer of the card, not isolated."
+                    ),
+                    _ => format!(
+                        "Removes the card from {instance}. The device is taken out of the instance's configuration."
+                    ),
+                };
+                vec![
+                    row("Instance", instance),
+                    row("GPU", &gpu),
+                    row("Effect", &effect),
+                ]
             }
         }
     }
@@ -201,6 +237,16 @@ impl ActionKind {
                 "Create the database {} from {}",
                 text("name"),
                 image("image")
+            ),
+            Self::GpuAttach => format!(
+                "Attach the GPU at {} to instance {}",
+                text("pci"),
+                text("instance")
+            ),
+            Self::GpuDetach => format!(
+                "Detach the GPU at {} from instance {}",
+                text("pci"),
+                text("instance")
             ),
         }
     }
@@ -244,6 +290,34 @@ impl ActionProposal {
     /// Whether the proposal's fifteen minutes have run.
     pub fn expired(&self, now: u64) -> bool {
         now > self.expires_at
+    }
+}
+
+/// The summary and details to show for a proposal read from the journal. A GPU proposal's product is not in its arguments:
+/// the inventory that named it at proposal time may be gone when the kernel next opens. The journal is the kernel's own
+/// private file, so its words are kept for a GPU action when they still carry the proposal's instance and PCI address;
+/// otherwise the rows are rebuilt without a product. Every other action is rebuilt from its arguments, as before.
+fn loaded_words(
+    action: ActionKind,
+    args: &Value,
+    stored_summary: &str,
+    stored_details: &[ActionDetail],
+) -> (String, Vec<ActionDetail>) {
+    if !matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach) {
+        return (action.summary(args), action.details(args));
+    }
+    let instance = args["instance"].as_str().unwrap_or_default();
+    let pci = args["pci"].as_str().unwrap_or_default();
+    let rows_fit = stored_details.len() == 3
+        && stored_details[0].label == "Instance"
+        && stored_details[0].value == instance
+        && stored_details[1].label == "GPU"
+        && stored_details[1].value.contains(pci)
+        && stored_details[2].label == "Effect";
+    if rows_fit && stored_summary.contains(pci) && stored_summary.contains(instance) {
+        (stored_summary.to_string(), stored_details.to_vec())
+    } else {
+        (action.summary(args), action.details(args))
     }
 }
 
@@ -313,6 +387,7 @@ impl ActionProposalStore {
         action: ActionKind,
         args: Value,
         now: u64,
+        gpu_product: Option<&str>,
     ) -> Result<ActionProposal, ProposeError> {
         self.waiting.retain(|proposal| !proposal.expired(now));
         let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
@@ -336,7 +411,7 @@ impl ActionProposalStore {
             id,
             action: action.as_str().to_string(),
             summary: action.summary(&args),
-            details: action.details(&args),
+            details: action.details_with_gpu(&args, gpu_product),
             args,
             args_digest: digest,
             created_ms: now,
@@ -426,11 +501,13 @@ impl ActionProposalStore {
                     if proposal.id != action_id(&digest) || proposal.args_digest != digest {
                         return Err("a proposed event does not match its arguments".to_string());
                     }
+                    let (summary, details) =
+                        loaded_words(action, &proposal.args, &proposal.summary, &proposal.details);
                     waiting.push(ActionProposal {
                         id: proposal.id,
                         action: proposal.action,
-                        summary: action.summary(&proposal.args),
-                        details: action.details(&proposal.args),
+                        summary,
+                        details,
                         args: proposal.args,
                         args_digest: digest,
                         created_ms: proposal.created_ms,
@@ -642,10 +719,15 @@ mod tests {
         let dir = Temp::new("compact");
         let mut store = ActionProposalStore::open(&dir.0, 1_000);
         let first = store
-            .propose(ActionKind::ServiceCreate, create_args("first"), 1_000)
+            .propose(ActionKind::ServiceCreate, create_args("first"), 1_000, None)
             .expect("the first proposal");
         let second = store
-            .propose(ActionKind::ServiceCreate, create_args("second"), 1_000)
+            .propose(
+                ActionKind::ServiceCreate,
+                create_args("second"),
+                1_000,
+                None,
+            )
             .expect("the second proposal");
         store.approve(&first.id).expect("the approval event");
         drop(store);
@@ -668,6 +750,35 @@ mod tests {
             fs::read_to_string(dir.0.join(ACTION_PROPOSALS_FILE)).expect("the compacted journal"),
             ""
         );
+    }
+
+    #[test]
+    fn a_gpu_product_survives_a_restart_without_the_inventory() {
+        let dir = Temp::new("gpu-product");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000);
+        let proposed = store
+            .propose(
+                ActionKind::GpuAttach,
+                json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+                1_000,
+                Some("NVIDIA GeForce RTX 4060 Ti"),
+            )
+            .expect("a GPU proposal");
+        assert_eq!(
+            proposed.details[1],
+            ActionDetail {
+                label: "GPU".to_string(),
+                value: "NVIDIA GeForce RTX 4060 Ti (0000:02:00.0)".to_string(),
+            }
+        );
+        drop(store);
+
+        // A restart without an inventory still shows the product the owner approved; the journal is the kernel's own.
+        let store = ActionProposalStore::open(&dir.0, 2_000);
+        assert_eq!(store.waiting().len(), 1);
+        assert_eq!(store.waiting()[0].details, proposed.details);
+        assert_eq!(store.waiting()[0].summary, proposed.summary);
+        assert!(store.waiting()[0].details[2].value.contains("shared"));
     }
 
     #[test]

@@ -298,8 +298,8 @@ record is refused.
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
-`action_propose`, `plan_decline`, `approval_submit`, the Postgres and ontology verbs, and `service_create`, `service_list` and
-`service_status`.
+`action_propose`, `plan_decline`, `approval_submit`, the Postgres and ontology verbs, `service_create`, `service_list` and
+`service_status`, and `gpu_attach` and `gpu_detach`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -392,6 +392,38 @@ sample ring and its rate counters, so the window mean and the next rate cover on
   say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong
   machine. `load.reason` still says `not available for a remote host`.
 
+### GPUs
+
+Every sample carries a `gpu` object: the cards the node's Incus reports in `GET /1.0/resources`, `gpu.cards[]`. The PCI
+address is the key. The NVIDIA UUID is extra identity when the card reports one, never the key, so two identical RTX 4060
+Ti cards are two rows from the first sample and are never merged by product or UUID. The card fields are:
+
+| Field | Meaning |
+|-------|---------|
+| `pci` | the PCI address, normalized to four lowercase domain hex digits, such as `0000:01:00.0` |
+| `uuid` | the NVIDIA UUID when the card reports one, else `null` |
+| `vendor`, `product` | the PCI database names |
+| `driver`, `driverVersion` | the bound kernel driver and its version, `null` when no driver is bound |
+| `numaNode` | the card's NUMA node |
+| `vramTotalBytes` | the card's total VRAM when that is known; Incus's own document does not carry it, so it is filled from local `nvidia-smi` telemetry and is `null` on a remote host |
+| `use` | `driver-bound` (a driver is bound), `vfio-pci` (reserved for passthrough) or `no-driver` |
+
+The inventory is read for a remote host as well as the local one: it describes the machine the node's Incus serves. A
+failed resources read is `gpu.reason: "the Incus resources read failed"` with no cards, never the last list and never an
+empty "no GPUs" answer.
+
+Telemetry is local only, like the CPU readings. Every tick, a local node runs `nvidia-smi
+--query-gpu=pci.bus_id,uuid,utilization.gpu,memory.used,memory.total,power.draw,power.limit,temperature.gpu,clocks.sm,clocks_event_reasons.active`
+for each card's numbers and `nvidia-smi --query-compute-apps=gpu_bus_id,pid,used_memory` for the processes. Each card carries
+`telemetry` and a `reason` when it has none: `not measurable from here` on a remote host, `nvidia-smi is not installed`,
+`the nvidia-smi read failed`, or `no reading yet` when the tool ran but did not list the card. A missing number is `null`,
+never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and an `owner`: an Incus `instance` with its
+`project` and `name`, a Docker `container` named by the id in its `docker-<id>.scope` cgroup, or `host`. Attribution reads
+`/proc/<pid>/cgroup` by the host's PID, so a process in another PID namespace resolves the same way.
+
+`node_metrics`' `mean` averages each card's numbers over the window, keyed by PCI address, and carries the newest process
+list. A card whose telemetry was never measurable has a `null` telemetry and a reason, not a zero.
+
 A mean over a window that holds both successful and failed reads averages the successful ones and takes its reason from the
 newest successful read, so a late failure does not label averaged figures. A window with no successful read is `null` with
 the failure reason. The failure and provenance fields are additions: `cpu.coresKnown`, `memory.usedBytes`, `cpu.reason`,
@@ -463,12 +495,17 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of seven gated verbs:
-`service_create`, `service_remove`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect` or
-`postgres_create`. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of nine gated verbs:
+`service_create`, `service_remove`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect`,
+`postgres_create`, `gpu_attach` or `gpu_detach`. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
 differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains.
+A GPU proposal names an existing Incus instance and the card's PCI address. `gpu_attach` refuses an address that is not in
+the inventory, and a card bound to `vfio-pci` when the target is a container; a virtual machine may take a `vfio-pci` card.
+`gpu_detach` still names a card that has left the inventory by the address in the instance's device. The GPU rows are
+`Instance`, `GPU` (the product and the exact PCI address), and `Effect`; the effect says that a card shared by more than one
+consumer has shared memory, never isolated VRAM.
 
 The record carries `details`, a kernel-built array of `{label,value}` rows that lists every argument the owner is approving;
 the approval page renders every row as text. The record is:
@@ -477,7 +514,16 @@ the approval page renders every row as text. The record is:
 {"id":"act-<12 hex>","action":"service_create","summary":"Create the service nats from template nats","details":[{"label":"Name","value":"nats"},{"label":"Template","value":"nats"}],"args":{"name":"nats","template":"nats"},"argsDigest":"<sha256 of canonical {action,args}>","createdAt":<ms>,"expiresAt":<createdAt+15 min>}
 ```
 
-The `summary` and `details` are built in the kernel from the checked fields; a caller cannot supply either. At most eight
+A GPU proposal's rows name the exact card:
+
+```json
+{"id":"act-<12 hex>","action":"gpu_attach","summary":"Attach the GPU at 0000:02:00.0 to instance alpha","details":[{"label":"Instance","value":"alpha"},{"label":"GPU","value":"NVIDIA GeForce RTX 4060 Ti (0000:02:00.0)"},{"label":"Effect","value":"Adds the card to alpha as a physical GPU device. Its memory is shared with every other consumer of the card, not isolated."}],"args":{"instance":"alpha","pci":"0000:02:00.0"},"argsDigest":"<sha256 of canonical {action,args}>","createdAt":<ms>,"expiresAt":<createdAt+15 min>}
+```
+
+The `summary` and `details` are built in the kernel from the checked fields; a caller cannot supply either. The product
+in a GPU row comes from the inventory at proposal time; it is kept in the kernel's private proposals journal, so a
+restart still shows it after the card is gone. A direct `gpu_attach` or `gpu_detach` call carries no usable approval: the
+handler accepts only the one-shot grant an approved proposal arms, and consumes it before the change. At most eight
 unexpired proposals wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same
 `argsDigest` returns the record that already waits instead of adding another. One token may have thirty accepted proposals in
 ten minutes; beyond that it gets `RateLimited`. A proposal lapses fifteen minutes after it was made. The journal writes
@@ -976,7 +1022,7 @@ lock, a failed step (the record names it) or a failed verify.
 
 ## Alerts
 
-On every 5-second tick, `serve` reads the node, evaluates eight rules and writes the points and any alert events to
+On every 5-second tick, `serve` reads the node, evaluates ten rules and writes the points and any alert events to
 `arca.db` (see "The store"). The thresholds come from `alerts.json` in the state directory. Alerts never write anything to
 Incus or to the desired state.
 
@@ -1023,9 +1069,17 @@ value stays at or below `threshold - clearMargin` for `clearForS` seconds. Every
 | `update-failed` | the incus-osd update status: a failed check, no completed check for 14 days, or a node up 24 hours with no completed check and no usable check time | 0 | 0 | warning |
 | `crash-loop` | the starts of one instance in the last 600 seconds | 2 | 2 | critical |
 | `smart-warning` | a drive's SMART health check, failed when it reports false | 0 | 0 | critical |
+| `gpu-vram-high` | each card's used VRAM, in percent of its total, keyed by PCI address | 95 | 5 | warning |
+| `gpu-gone` | 1 for each card that was in the inventory and is gone from it now | 0 | 0 | critical |
 
 A yes-or-no rule reads 1 when it is bad and 0 when it is fine, so its threshold of 0 fires on 1. The thresholds are a
 starting point. Tune them after a week of data.
+
+`gpu-vram-high` fires only above 95 percent held for five minutes, so exactly 95 is not above it. `gpu-gone` fires as soon
+as a card that a successful inventory held is missing from a later successful inventory; it clears when the card returns.
+A failed inventory read is unknown, so it never resolves either alert. A remote node, or a local node without
+`nvidia-smi`, marks `gpu-vram-high` unavailable: a firing alert resolves with `no data` after its clear window rather than
+hanging forever. The GPU labels are the card's PCI address, so two identical cards have two alert rows.
 
 The pools that `disk-pool-full` reads come from Incus's own pool list on every tick. The `incus.pools` key of the config
 file filters that list (see the config table), so a pool that is left out is never evaluated.

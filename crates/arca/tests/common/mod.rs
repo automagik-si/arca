@@ -334,7 +334,14 @@ pub fn plan_verbs(
     now: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> std::collections::HashMap<&'static str, std::sync::Arc<dyn ToolHandler>> {
     let clock: Clock = std::sync::Arc::new(move || now.load(Ordering::SeqCst));
-    plan_handlers(kernel, clock, None).into_iter().collect()
+    plan_handlers(
+        kernel,
+        clock,
+        None,
+        std::sync::Arc::new(arca::gpu::FakeGpu::default()),
+    )
+    .into_iter()
+    .collect()
 }
 
 /// A caller of scope `scope`, for direct calls to a handler.

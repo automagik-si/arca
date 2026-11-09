@@ -77,7 +77,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 26] = [
+static VERBS: [Verb; 28] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -442,6 +442,34 @@ static VERBS: [Verb; 26] = [
         params: service_unpublish_params,
         result: service_unpublish_result,
     },
+    Verb {
+        name: "gpu_attach",
+        summary: "Attach a physical GPU card to an Incus instance, by PCI address, with the owner's signed approval. A card bound to vfio-pci is refused for a container.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_gpu,
+        cut: no_cut,
+        params: gpu_attach_params,
+        result: gpu_change_result,
+    },
+    Verb {
+        name: "gpu_detach",
+        summary: "Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_gpu,
+        cut: no_cut,
+        params: gpu_detach_params,
+        result: gpu_change_result,
+    },
 ];
 
 /// Every verb of the table, in table order.
@@ -776,6 +804,7 @@ fn host_sample() -> Value {
         ),
         ("cpuTempC", true, nullable(num())),
         ("gpuBusyPct", true, nullable(num())),
+        ("gpu", true, gpu_section()),
         (
             "pools",
             true,
@@ -803,6 +832,67 @@ fn host_sample() -> Value {
                 ("running", true, int()),
             ])),
         ),
+    ])
+}
+
+/// The GPU part of a host sample: the inventory, per-card telemetry and the attributed compute processes, all keyed by the
+/// PCI address. A card that is in the inventory but has no telemetry carries a reason, never a zero.
+fn gpu_section() -> Value {
+    result(vec![
+        ("reason", true, nullable(string())),
+        (
+            "cards",
+            true,
+            array(result(vec![
+                ("pci", true, string()),
+                ("uuid", true, nullable(string())),
+                ("vendor", true, string()),
+                ("product", true, string()),
+                ("driver", true, nullable(string())),
+                ("driverVersion", true, nullable(string())),
+                ("numaNode", true, int()),
+                ("vramTotalBytes", true, nullable(int())),
+                (
+                    "use",
+                    true,
+                    one_of(&["driver-bound", "vfio-pci", "no-driver"]),
+                ),
+                ("telemetry", true, nullable(gpu_telemetry())),
+                ("reason", true, nullable(string())),
+                (
+                    "processes",
+                    true,
+                    array(result(vec![
+                        ("pci", true, string()),
+                        ("pid", true, int()),
+                        ("vramBytes", true, nullable(int())),
+                        ("owner", true, gpu_owner()),
+                    ])),
+                ),
+                ("processReason", true, nullable(string())),
+            ])),
+        ),
+    ])
+}
+
+fn gpu_telemetry() -> Value {
+    result(vec![
+        ("utilizationPct", true, nullable(num())),
+        ("memoryUsedBytes", true, nullable(int())),
+        ("memoryTotalBytes", true, nullable(int())),
+        ("powerDrawW", true, nullable(num())),
+        ("powerLimitW", true, nullable(num())),
+        ("temperatureC", true, nullable(num())),
+        ("smClockMhz", true, nullable(int())),
+        ("eventReasons", true, nullable(string())),
+    ])
+}
+
+fn gpu_owner() -> Value {
+    result(vec![
+        ("kind", true, one_of(&["instance", "container", "host"])),
+        ("project", false, string()),
+        ("name", false, string()),
     ])
 }
 
@@ -925,7 +1015,7 @@ fn plan_list_result() -> Value {
 }
 
 /// The eight verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 7] = [
+const ACTION_NAMES: [&str; 9] = [
     "service_create",
     "service_remove",
     "service_publish",
@@ -933,6 +1023,8 @@ const ACTION_NAMES: [&str; 7] = [
     "service_connect",
     "service_disconnect",
     "postgres_create",
+    "gpu_attach",
+    "gpu_detach",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -1331,6 +1423,75 @@ pub fn service_view_schema() -> Value {
         "required": ["name", "template", "state", "ipv4", "ports", "links", "published", "lanPort"],
         "type": "object"
     })
+}
+
+/// A short line for a successful `gpu_attach` or `gpu_detach`.
+pub fn summary_gpu(v: &Value) -> String {
+    let state = if v["attached"].as_bool() == Some(true) {
+        "attached"
+    } else {
+        "detached"
+    };
+    format!(
+        "GPU {} {} on the instance {}",
+        v["pci"].as_str().unwrap_or("?"),
+        state,
+        v["instance"].as_str().unwrap_or("?")
+    )
+}
+
+/// An Incus instance name, as Incus accepts one: a hostname.
+fn instance_name_schema() -> Value {
+    json!({
+        "description": "The Incus instance name.",
+        "maxLength": 63,
+        "minLength": 1,
+        "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+        "type": "string"
+    })
+}
+
+/// A PCI address in Incus's spelling: four lowercase domain hex digits, two bus, two slot and one function.
+fn pci_schema() -> Value {
+    json!({
+        "description": "The card's PCI address, such as 0000:01:00.0. It is the card's identity.",
+        "pattern": "^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-7]$",
+        "type": "string"
+    })
+}
+
+fn approval_schema() -> Value {
+    json!({
+        "description": "The owner's approval: <base64 statement>.<base64 signature>.",
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+    })
+}
+
+fn gpu_attach_params() -> Value {
+    params(vec![
+        ("instance", true, instance_name_schema()),
+        ("pci", true, pci_schema()),
+        ("approval", true, approval_schema()),
+    ])
+}
+
+fn gpu_detach_params() -> Value {
+    params(vec![
+        ("instance", true, instance_name_schema()),
+        ("pci", true, pci_schema()),
+        ("approval", true, approval_schema()),
+    ])
+}
+
+fn gpu_change_result() -> Value {
+    result(vec![
+        ("instance", true, string()),
+        ("pci", true, string()),
+        ("device", true, string()),
+        ("attached", true, boolean()),
+    ])
 }
 
 fn service_name_schema(description: &'static str) -> Value {

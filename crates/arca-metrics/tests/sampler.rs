@@ -178,6 +178,7 @@ fn bare(at: u64) -> HostSample {
         },
         cpu_temp_c: None,
         gpu_busy_pct: None,
+        gpu: arca_metrics::GpuSection::default(),
         pools: Vec::new(),
         network: None,
         projects: Vec::new(),
@@ -398,8 +399,8 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
     let requests = fake.requests();
     assert_eq!(
         requests.len(),
-        6,
-        "the pool list, the instance list, one resources read for the admitted pool and the three incus-osd documents"
+        7,
+        "the pool list, the instance list, the GPU inventory, one resources read for the admitted pool and the three incus-osd documents"
     );
     assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
     let mut paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
@@ -408,6 +409,7 @@ fn the_fake_incus_records_only_get_the_pool_list_the_instance_list_and_one_read_
         paths,
         vec![
             INSTANCES,
+            "/1.0/resources",
             "/1.0/storage-pools/default/resources",
             POOLS,
             OSD_SECURITY,
@@ -448,12 +450,13 @@ fn a_pool_name_that_is_not_plain_is_never_sent_to_incus() {
         paths,
         vec![
             INSTANCES.to_string(),
+            "/1.0/resources".to_string(),
             POOLS.to_string(),
             OSD_SECURITY.to_string(),
             OSD_STORAGE.to_string(),
             OSD_UPDATE.to_string(),
         ],
-        "the pool list and the instance list were sent, and no resources read"
+        "the pool list, the instance list and the GPU inventory were sent, and no pool resources read"
     );
     assert_eq!(sample.pools.len(), 3, "every listed name keeps its row");
     assert!(
@@ -818,6 +821,7 @@ mod pools_from_incus {
             sorted_paths(&fake),
             vec![
                 INSTANCES.to_string(),
+                "/1.0/resources".to_string(),
                 "/1.0/storage-pools/default/resources".to_string(),
                 "/1.0/storage-pools/pool1/resources".to_string(),
                 POOLS.to_string(),
@@ -851,6 +855,7 @@ mod pools_from_incus {
             sorted_paths(&fake),
             vec![
                 INSTANCES.to_string(),
+                "/1.0/resources".to_string(),
                 "/1.0/storage-pools/pool1/resources".to_string(),
                 POOLS.to_string(),
                 OSD_SECURITY.to_string(),
@@ -887,12 +892,13 @@ mod pools_from_incus {
             sorted_paths(&fake),
             vec![
                 INSTANCES.to_string(),
+                "/1.0/resources".to_string(),
                 POOLS.to_string(),
                 OSD_SECURITY.to_string(),
                 OSD_STORAGE.to_string(),
                 OSD_UPDATE.to_string(),
             ],
-            "no resources read for a name Incus does not list"
+            "no pool resources read for a name Incus does not list"
         );
     }
 
@@ -2359,7 +2365,11 @@ mod host_totals {
         assert_eq!(sample.cpu_temp_c, None);
         assert_eq!(sample.gpu_busy_pct, None);
         assert_eq!(sample.network, None);
-        assert_eq!(incus.resources_reads(), 1, "the totals came from Incus");
+        assert_eq!(
+            incus.resources_reads(),
+            2,
+            "one resources read for the totals and one for the GPU inventory"
+        );
 
         let value = node_metrics(&sampler, Some(1), 1_000);
         let schema = (verb("node_metrics")
@@ -2405,8 +2415,8 @@ mod host_totals {
         assert_eq!(second.cpu.used_pct, Some(25.0));
         assert_eq!(
             incus.resources_reads(),
-            0,
-            "a local host keeps its own /proc totals and asks Incus for none"
+            2,
+            "a local host keeps its own /proc totals; the resources reads are the GPU inventory"
         );
     }
 
@@ -2433,7 +2443,11 @@ mod host_totals {
         assert_eq!(sample.cpu_temp_c, None);
         assert_eq!(sample.gpu_busy_pct, None);
         assert_eq!(sample.network, None);
-        assert_eq!(incus.resources_reads(), 1);
+        assert_eq!(
+            incus.resources_reads(),
+            2,
+            "one resources read for the failed totals and one for the GPU inventory"
+        );
     }
 
     #[test]

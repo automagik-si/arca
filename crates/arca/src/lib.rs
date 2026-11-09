@@ -21,6 +21,7 @@ pub mod cmd_token;
 pub mod cmd_watch;
 pub mod config;
 pub mod desired_store;
+pub mod gpu;
 pub mod handlers;
 pub mod kernel;
 mod passkey_change;

@@ -176,6 +176,7 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
         },
         cpu_temp_c: Some(90.0),
         gpu_busy_pct: Some(10.0),
+        gpu: arca_metrics::GpuSection::default(),
         pools: vec![Pool {
             name: "default".to_string(),
             used_bytes: Some(pool_used),
@@ -213,6 +214,7 @@ fn sample_at(at: u64, pool_used: u64) -> (HostSample, Readings) {
             last_check_ms: Some(at - 60_000),
             last_success_ms: Some(at - 60_000),
         }),
+        gpus_gone: Vec::new(),
         drives: Some(DrivesReading {
             at,
             drives: vec![
@@ -504,10 +506,11 @@ fn the_scenario_health_line_shows_its_unknown_rules_as_a_count() {
     let scratch = Scratch::new("scenario-line");
     let state = state_dir(&scratch);
     let snapshot = run(&state);
-    // The two rules with no input (update-failed, smart-warning) stay unknown, and the line counts them.
+    // The four rules with no input (update-failed, smart-warning, gpu-vram-high, gpu-gone) stay unknown, and the
+    // line counts them. This scenario builds its inputs by hand; a live node's sampler supplies the GPU sources.
     assert_eq!(
         alerts_line(&snapshot, NOW + 185_000),
-        "alerts 2 firing: cpu-hot, drift · 2 unknown"
+        "alerts 2 firing: cpu-hot, drift · 4 unknown"
     );
 }
 
@@ -948,7 +951,7 @@ fn watch_report_ages_from_its_sweep_and_alerts_list_conforms_over_the_server() {
     );
     assert_eq!(
         list["unknown"].as_array().map(Vec::len),
-        Some(2),
-        "two rules have no input"
+        Some(4),
+        "four rules have no input in this hand-built scenario"
     );
 }

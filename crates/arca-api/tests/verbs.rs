@@ -58,6 +58,8 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_secret_set",
             "service_publish",
             "service_unpublish",
+            "gpu_attach",
+            "gpu_detach",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -86,6 +88,8 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("service_status", VerbClass::L, Scope::Viewer, false, false),
         ("service_logs", VerbClass::L, Scope::Viewer, false, false),
         ("service_remove", VerbClass::L, Scope::Doctor, true, true),
+        ("gpu_attach", VerbClass::L, Scope::Doctor, true, false),
+        ("gpu_detach", VerbClass::L, Scope::Doctor, true, true),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -190,6 +194,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "service_connect",
         "service_disconnect",
         "postgres_create",
+        "gpu_attach",
+        "gpu_detach",
     ];
     let action_proposal = open(
         json!({
@@ -698,6 +704,7 @@ fn a_host_sample_with_nulls_conforms_to_the_result_schema() {
         "psi": { "memorySomeAvg10": 0.0, "memoryFullAvg10": null, "cpuSomeAvg10": 1.5 },
         "cpuTempC": null,
         "gpuBusyPct": null,
+        "gpu": { "reason": null, "cards": [] },
         "pools": [{ "name": "p", "usedBytes": null, "totalBytes": 9, "freeBytes": null }],
         "network": null,
         "projects": [{ "project": "p", "total": 2, "running": 1 }]
@@ -755,6 +762,93 @@ fn nullable_object(mut schema: Value) -> Value {
     schema
 }
 
+fn gpu_section() -> Value {
+    let telemetry = {
+        let mut schema = open(
+            json!({
+                "utilizationPct": { "type": ["number", "null"] },
+                "memoryUsedBytes": { "type": ["integer", "null"] },
+                "memoryTotalBytes": { "type": ["integer", "null"] },
+                "powerDrawW": { "type": ["number", "null"] },
+                "powerLimitW": { "type": ["number", "null"] },
+                "temperatureC": { "type": ["number", "null"] },
+                "smClockMhz": { "type": ["integer", "null"] },
+                "eventReasons": { "type": ["string", "null"] },
+            }),
+            &[
+                "utilizationPct",
+                "memoryUsedBytes",
+                "memoryTotalBytes",
+                "powerDrawW",
+                "powerLimitW",
+                "temperatureC",
+                "smClockMhz",
+                "eventReasons",
+            ],
+        );
+        schema["type"] = json!(["object", "null"]);
+        schema
+    };
+    let owner = open(
+        json!({
+            "kind": { "type": "string", "enum": ["instance", "container", "host"] },
+            "project": { "type": "string" },
+            "name": { "type": "string" },
+        }),
+        &["kind"],
+    );
+    let card = open(
+        json!({
+            "pci": { "type": "string" },
+            "uuid": { "type": ["string", "null"] },
+            "vendor": { "type": "string" },
+            "product": { "type": "string" },
+            "driver": { "type": ["string", "null"] },
+            "driverVersion": { "type": ["string", "null"] },
+            "numaNode": { "type": "integer" },
+            "vramTotalBytes": { "type": ["integer", "null"] },
+            "use": { "type": "string", "enum": ["driver-bound", "vfio-pci", "no-driver"] },
+            "telemetry": telemetry,
+            "reason": { "type": ["string", "null"] },
+            "processes": {
+                "type": "array",
+                "items": open(
+                    json!({
+                        "pci": { "type": "string" },
+                        "pid": { "type": "integer" },
+                        "vramBytes": { "type": ["integer", "null"] },
+                        "owner": owner,
+                    }),
+                    &["pci", "pid", "vramBytes", "owner"],
+                ),
+            },
+            "processReason": { "type": ["string", "null"] },
+        }),
+        &[
+            "pci",
+            "uuid",
+            "vendor",
+            "product",
+            "driver",
+            "driverVersion",
+            "numaNode",
+            "vramTotalBytes",
+            "use",
+            "telemetry",
+            "reason",
+            "processes",
+            "processReason",
+        ],
+    );
+    open(
+        json!({
+            "reason": { "type": ["string", "null"] },
+            "cards": { "type": "array", "items": card },
+        }),
+        &["reason", "cards"],
+    )
+}
+
 fn host_sample() -> Value {
     json!({
         "type": "object",
@@ -799,6 +893,7 @@ fn host_sample() -> Value {
             ),
             "cpuTempC": { "type": ["number", "null"] },
             "gpuBusyPct": { "type": ["number", "null"] },
+            "gpu": gpu_section(),
             "pools": {
                 "type": "array",
                 "items": open(
@@ -832,7 +927,7 @@ fn host_sample() -> Value {
             }
         },
         "required": [
-            "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "pools", "network", "projects"
+            "at", "cpu", "load", "memory", "psi", "cpuTempC", "gpuBusyPct", "gpu", "pools", "network", "projects"
         ]
     })
 }

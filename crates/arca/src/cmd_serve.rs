@@ -246,10 +246,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
+    let gpu: Arc<dyn crate::gpu::GpuBackend> =
+        Arc::new(crate::gpu::IncusGpu::new(cfg.incus.socket.clone()));
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers(
         Arc::clone(&kernel),
         clock.clone(),
         cfg.kernel.postgres_image.clone(),
+        gpu,
     )
     .into_iter()
     .chain(crate::handlers::postgres_handlers(

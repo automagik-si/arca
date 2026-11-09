@@ -210,6 +210,8 @@ struct Shared {
     waits_ended: Mutex<Vec<String>>,
     console: Mutex<BTreeMap<(String, String), String>>,
     counter: AtomicU64,
+    /// The `/1.0/resources` document the fake serves, when a test sets one.
+    resources: Mutex<Option<Value>>,
 }
 
 /// The served state: the server document, the pools, every object and every operation.
@@ -284,6 +286,7 @@ struct Address {
 
 enum Route {
     Server,
+    Resources,
     ListProjects,
     ListImages(String),
     ListInstances,
@@ -391,6 +394,7 @@ impl Shared {
             waits_ended: Mutex::new(Vec::new()),
             console: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
+            resources: Mutex::new(None),
         }
     }
 
@@ -445,6 +449,11 @@ impl FakeIncus {
 
     /// Sets the host's own interfaces: each name with the addresses it holds. The fake answers the listing of
     /// `/1.0/networks?recursion=1` and each `/1.0/networks/<name>/state` from them, and nothing else reads them.
+    /// Serves `document` at `/1.0/resources`. Until a test sets one, the fake answers 404, as an Incus without the endpoint.
+    pub fn set_resources(&self, document: Value) {
+        *lock(&self.shared.resources) = Some(document);
+    }
+
     pub fn set_host_interfaces(&self, interfaces: Vec<(String, Vec<IpAddr>)>) {
         *lock(&self.shared.host_interfaces) = interfaces;
     }
@@ -1023,6 +1032,7 @@ fn parse(target: &str) -> Option<Route> {
     };
     let route = match segments.as_slice() {
         [] if query.is_empty() => Route::Server,
+        ["resources"] if query.is_empty() => Route::Resources,
         ["projects"] if query == "recursion=1" => Route::ListProjects,
         ["projects"] => Route::Collection(Address {
             kind: "project",
@@ -1106,6 +1116,10 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
     };
     match (request.method.as_str(), route) {
         ("GET", Route::Server) => sync(store.server.clone()),
+        ("GET", Route::Resources) => match lock(&shared.resources).clone() {
+            Some(document) => sync(document),
+            None => (404, String::new(), error_envelope(404, "not found")),
+        },
         ("GET", Route::ListProjects) => sync(Value::Array(store.bodies("project"))),
         ("GET", Route::ListImages(project)) => match store.image_store(&project) {
             Some(home) => sync(Value::Array(
