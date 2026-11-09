@@ -236,9 +236,10 @@ state from `arca_status.incusReachable`, a CPU bar from `latest.cpu.usedPct`
 availableBytes`), and the instance count. The card trusts `cpu.coresKnown`: a
 known count is always shown, even when `cpu.reason` explains why the load is
 absent. A null CPU load renders `CPU n/a` as `n/a / N cores` with no bar, never
-zero. Only an unknown core count, from `coresKnown: false` or an older snapshot
-whose `cores` is zero, says `cores n/a` and carries the reason as the meter's
-tooltip. A memory `reason` renders `Mem n/a` with the same tooltip and no bar.
+zero. An unknown core count, from `coresKnown: false` or an older snapshot
+whose `cores` is zero, says `cores n/a`. Whenever the card has no CPU load, the
+host's `reason` is the meter's tooltip, so a known count can keep the tooltip
+too. A memory `reason` renders `Mem n/a` with the same tooltip and no bar.
 A real reading is never replaced by an invented one.
 Two dashed placeholder cards leave room for storage and phones. The project
 canvas draws the selected project's instances and matched databases as cards
@@ -259,9 +260,9 @@ The Doctor answers only from the eight read-only Arca tools (`arca_status`,
 `when` condition, the Doctor's scope is restricted with
 `restrict({ allow: READ_TOOLS })`, and scoped `tools/pre-execute` and
 `tools.guard` checks deny every other name (including the reserved `run_code`) at
-dispatch. A registry that cannot restrict or enumerate fails setup after the
-`start` event, so the chat sends a fixed "Doctor unavailable" SSE error and makes
-no model call. Write verbs are never
+dispatch. A setup that cannot install the restriction and guard, or enumerate
+its tools, fails after the `start` event, so the chat sends a fixed "The Doctor
+could not answer." SSE error event and makes no model call. Write verbs are never
 registered. A request to change something is answered with what the change would
 do and the configured `/approve` link; the panel adds the approval card. Inline
 passkey approval is phase 3. The page never receives a model credential.

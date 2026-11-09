@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import {
-  buildDashboard, cpuLabel, fleetSummary, hostCpu, hostMemory, instanceKindLabel, journalFeed,
-  memoryLabel, ownerLabel, parseProjectHash, projectHash, projectLabel, selectProject, statusTone,
+  buildDashboard, cpuCoreCount, cpuCoresKnown, cpuLabel, fleetSummary, hostCpu, hostMemory, instanceKindLabel,
+  journalFeed, memoryLabel, ownerLabel, parseProjectHash, projectHash, projectLabel, selectProject, statusTone,
 } from '../src/model.js';
 
 const fixture = JSON.parse(await readFile(new URL('./dashboard-fixtures.json', import.meta.url), 'utf8'));
@@ -213,6 +213,33 @@ test('fleet summary sums real cores and memory and omits absent parts', () => {
   const oneMetric = fixture.hosts.map((host, index) => index === 0 ? host : { ...host, metrics: null });
   assert.equal(fleetSummary(oneMetric), '2 machines · 8 cores · 16 GB');
   assert.equal(fleetSummary([{ name: 'alpha' }]), '1 machine');
+});
+
+test('an old kernel without coresKnown keeps its cores on the card and in the total', () => {
+  // An old kernel sends no flag. Its positive count is real and must reach both the card and the fleet total.
+  const legacy = structuredClone(fixture.hosts[0]);
+  legacy.metrics.latest.cpu = { cores: 8, usedPct: 50, reason: null };
+  assert.equal(cpuCoresKnown(legacy.metrics.latest.cpu), true);
+  assert.equal(cpuCoreCount(legacy.metrics.latest.cpu), 8);
+  const legacyDashboard = buildDashboard({ ...fixture, hosts: [legacy] });
+  assert.equal(legacyDashboard.hosts[0].cpuLabel, '4 / 8 cores');
+  assert.equal(legacyDashboard.summary, '1 machine · 8 cores · 16 GB');
+});
+
+test('a mixed fleet total counts only cores the helper calls known', () => {
+  // The failed read's coresKnown:false placeholder is not capacity, so it must not reach the sum.
+  const legacy = structuredClone(fixture.hosts[0]);
+  legacy.metrics.latest.cpu = { cores: 8, usedPct: 50, reason: null };
+  const failed = structuredClone(fixture.hosts[1]);
+  failed.metrics.latest.cpu = {
+    cores: 12, coresKnown: false, usedPct: 30, reason: 'the Incus resources read failed',
+  };
+  const mixed = buildDashboard({ ...fixture, hosts: [legacy, failed] });
+  assert.equal(mixed.summary, '2 machines · 8 cores · 24 GB');
+  assert.equal(mixed.hosts[1].cpuLabel, 'cores n/a');
+  assert.equal(mixed.hosts[1].cpu.coresKnown, false);
+  assert.equal(cpuLabel(hostCpu(legacy)), '4 / 8 cores');
+  assert.equal(cpuLabel(hostCpu(failed)), 'cores n/a');
 });
 
 test('machines expose online state, capacity and unknown instance counts', () => {
@@ -457,4 +484,12 @@ test('the host usedBytes figure wins over the total-available derivation', () =>
   assert.equal(machine.memory.usedBytes, 5_000_000_000);
   assert.equal(machine.memory.usedPct, 31.25);
   assert.equal(machine.memoryLabel, '5 / 16 GB');
+});
+
+test('README matches the fixed Doctor SSE error and the card tooltip rule', async () => {
+  const readme = (await readFile(new URL('../README.md', import.meta.url), 'utf8')).replace(/\s+/g, ' ');
+  assert.match(readme, /fixed "The Doctor could not answer\." SSE error event/);
+  assert.doesNotMatch(readme, /fixed "Doctor unavailable"/);
+  assert.match(readme, /Whenever the card has no CPU load, the host's `reason` is the meter's tooltip/);
+  assert.match(readme, /A memory `reason` renders `Mem n\/a` with the same tooltip and no bar/);
 });
