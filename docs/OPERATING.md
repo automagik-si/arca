@@ -484,33 +484,41 @@ and total space. Loop, optical and zram devices are not listed. Each disk gets o
 | Role | When | Offered as |
 |---|---|---|
 | `system` | something on it is mounted at `/`, `/boot` or as swap, holds swap, is a RAID, LVM, LUKS, ZFS or bcache member, or the disk holds an Incus pool (by device, UUID, label, or a pool folder on its file system) | never |
+| `snapshots` | the disk holds a snapshot pool of this machine, or a file system labelled `arca-snapshots-<name>` (a whole disk another machine made snapshot storage) | never: it is not erased |
 | `in use` | something on it is mounted elsewhere | `folder`: a pool in a folder on it |
 | `free` | nothing on it is mounted or a member of anything | `whole disk`: Incus erases and formats it |
 
 Each disk carries a `reason` in plain words, and an `in use` disk lists its `folders` (its mount points). A pool has
-`snapshots: true` when it was added by `storage_add`.
+`snapshots: true` when its config carries `user.arcasnapshot.storage=<its own name>`, which `storage_add` sets when it
+creates the pool. The pool's description (`Arca snapshot storage`) is only for people; anyone can edit it, so it is not the
+marker.
 
 ### Adding storage: `storage_add`
 
 `storage_add` is gated like every action proposal: the Doctor (or any viewer) proposes it, the owner approves it with the
 passkey, and it runs once. The arguments are `{name, device}` or `{name, path}`:
 
-- `{name, device}` (a `free` disk, such as `sdb`) creates an Incus `btrfs` pool on the whole device, mounted with
-  `compress=zstd`. Incus formats the disk; the kernel process never formats, mounts or writes a disk.
+- `{name, device}` (a `free` disk, such as `sdb`) creates an Incus `btrfs` pool named `arca-snapshots-<name>` on the
+  whole device, mounted with `compress=zstd`. The request sets `source.wipe=true`: Incus wipes the old partition table and
+  file system signatures (a backup GPT at the end of the disk included) and then formats the disk, since `mkfs.btrfs`
+  refuses a disk that still has a partition table. Incus labels the new file system with the pool's name, so the disk
+  shows as `snapshots` on any machine. The kernel process never formats, mounts or writes a disk.
 - `{name, path}` (a folder on an `in use` disk) creates an Incus `dir` pool at `<path>/arca-pool`. Incus creates the
-  folder; nothing else on the disk changes.
+  folder; nothing else on the disk changes. The folder is judged by where it really is: every link in its path is
+  followed when the proposal is made, the resolved path is what the owner approves, and a folder that leads onto a system
+  disk is refused. A folder that leads elsewhere by the time it runs is `DiskChanged`.
 
 When the proposal is made the kernel reads the disk again and binds its device name, model, serial, transport, size and
 current contents (and the folder's mount point) into the arguments, so the owner's digest covers them. The approval card says
-in plain words the disk model, size and transport, what is on it now (each partition with its file system and label), the
-pool name, and for a whole disk: **"Everything on this disk will be erased."** The run reads the disk again and refuses
+in plain words the disk model, size and transport, what is on it now (each partition with its file system and label, for
+a folder target too), the pool name, and for a whole disk: **"Everything on this disk will be erased."** The run reads the disk again and refuses
 anything that changed (`DiskChanged`), so a different disk plugged in under the same name is never formatted.
 
-Refusals: a system disk, a member disk or a disk holding a pool (`SystemDisk`); a mounted disk as a whole-disk target
+Refusals: a system disk, a member disk or a disk holding a pool (`SystemDisk`); a disk that holds snapshots, as a whole
+disk or as a folder (`SnapshotDisk`); a mounted disk as a whole-disk target
 (`DiskMounted`); a partition instead of the whole disk (`NotWholeDisk`); a device or folder not in `storage_list`
 (`DiskNotListed`); a pool name or folder already in use (`PoolExists`); and every storage action on a watch-only node
-(`StorageDisabled`). A pool added this way carries the description `Arca snapshot storage`; snapshots are written only to
-such a pool.
+(`StorageDisabled`). Snapshots are written only to a pool that carries the `user.arcasnapshot.storage` marker.
 
 ### Taking snapshots: `snapshot_create`
 
@@ -522,11 +530,20 @@ when needed so the name fits 63 characters). The kernel creates `arcak-snapshots
 - An instance is copied stateless and alone (`instance_only`, not its own snapshots), with `boot.autostart=false`, and is
   never started: the request carries no `start` and the writer has no way to start anything. The copy uses no profile:
   the source's expanded config and its root disk (moved to the snapshot pool) and NICs are written into the copy itself.
+  Incus fills every key and device a copy request leaves unset from the source's own (`createFromCopy`), so leaving
+  something out does not drop it. The create request masks each of the source's own keys it drops with an empty value
+  (Incus does not store one) and each of its own devices it drops with a `none` device; once Incus has made the copy, one
+  `PUT` of the copy writes its clean config and devices (keeping the volatile keys Incus gave it), and the copy is read
+  back. A copy that still runs, may start, uses a profile, carries a live ownership mark, any device of its source, a mask
+  or a root disk off the snapshot pool is deleted, and the snapshot is `StorageWriteFailed`. A copy Incus is still making
+  when the verb answers is finished the same way in the background once Incus is done; until then it already carries no
+  live mark and only `none` devices.
   Devices that would tie the copy to the source project or to this host (custom volumes, host folders, GPUs, proxies, USB
   and the like, and a NIC on a network the source project owns) are left out and named in
   `user.arcasnapshot.dropped-devices`. NICs lose their fixed MAC and IP addresses, so the copy never claims its source's.
 - A custom volume is copied alone (`volume_only`) into `arcak-snapshots` on the snapshot pool, keeping its config except
-  the source pool's driver keys.
+  the source pool's driver keys. It is read back too: a volume copy that carries a live ownership mark is deleted and
+  refused.
 
 Sources are only read: they are never stopped, changed or deleted, a running app keeps running, and no write ever names the
 source's project. Every copy records its source in `user.arcasnapshot.source-project`, `source-name`, `source-kind`,
@@ -545,8 +562,9 @@ source pool), pool, size, when it was made, `ready` or `copying`, and the device
 deleted.
 
 The snapshot writer (`arca_incus::SnapshotWriter`) sends only these writes, and refuses anything else before the socket is
-touched: `POST /1.0/storage-pools`, `POST /1.0/projects` (for `arcak-snapshots` only), and `POST` and `DELETE` of an
-instance or a custom volume with `?project=arcak-snapshots`. No `PUT`, no `PATCH`, and no instance state change.
+touched: `POST /1.0/storage-pools`, `POST /1.0/projects` (for `arcak-snapshots` only), `POST` and `DELETE` of an
+instance or a custom volume with `?project=arcak-snapshots`, and the one clean-up `PUT` of a new instance copy there. No
+`PATCH`, no other `PUT`, and no instance state change.
 
 ### Restoring from the disk alone
 
@@ -555,8 +573,8 @@ After the machine is reinstalled (Arca OS), plug the snapshot disk in and:
 1. Initialize Incus as usual, with the default bridge (`incusbr0`) the copies' NICs name.
 2. Create the snapshot project with the same features, so the recovery finds it:
    `incus project create arcak-snapshots -c features.networks=false -c features.profiles=true -c features.images=true -c features.storage.volumes=true`.
-3. Run `incus admin recover`. Name the pool as it was (`storage_list` on the old machine showed it), its driver (`btrfs`
-   for a whole disk, `dir` for a folder) and its source (the disk's device, such as `/dev/sdb`, or the folder
+3. Run `incus admin recover`. Name the pool as it was (for a whole disk, the file system label `arca-snapshots-<name>`
+   that `lsblk -o NAME,LABEL` shows), its driver (`btrfs` for a whole disk, `dir` for a folder) and its source (the disk's device, such as `/dev/sdb`, or the folder
    `<path>/arca-pool`). Incus scans the pool and lists the copies and volumes in `arcak-snapshots`; confirm to import them.
 4. Copy each app back into its project and onto the machine's own pool, then start it:
    `incus copy <snapshot> <name> --project arcak-snapshots --target-project <project> --storage default`, then

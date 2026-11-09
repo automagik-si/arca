@@ -701,7 +701,7 @@ function toolClient(clientFor, hosts, name, onCall) {
       plan_list: 'List changes waiting for the owner\'s approval.',
       journal_list: 'Read recent Arca activity, oldest first. Optional after cursor and limit (max 500).',
       service_list: 'List the managed services with name, state, address, ports and links.',
-      storage_list: 'List the disks with their role (system, in use or free), what each can be offered as for snapshots, and the storage pools with used and total space.',
+      storage_list: 'List the disks with their role (system, snapshots, in use or free), what each can be offered as for snapshots, and the storage pools with used and total space.',
       snapshot_list: 'List the snapshot copies of apps and data volumes, with their source, storage, size and when they were made.',
     }[name],
     parameters: {

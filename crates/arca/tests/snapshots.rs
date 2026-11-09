@@ -18,7 +18,8 @@ use arca::storage::{
 };
 use arca_incus::fake_storage::FakeStorageIncus;
 use arca_incus::snapshot::{
-    SNAPSHOT_POOL_DESCRIPTION, SNAPSHOT_PROJECT, source_dependencies, write_allowed,
+    SNAPSHOT_POOL_DESCRIPTION, SNAPSHOT_PROJECT, SNAPSHOT_STORAGE_KEY, source_dependencies,
+    write_allowed,
 };
 use arca_mcp::{CallError, ToolHandler};
 use common::*;
@@ -56,7 +57,8 @@ fn node(
 }
 
 /// The host's disks: a system NVMe, a free USB disk, a mounted USB stick, a RAID member, an LVM member, a disk holding an
-/// Incus pool, a disk holding swap, and a loop device that is never listed.
+/// Incus pool, a disk holding swap, a disk another machine made snapshot storage (its btrfs label says so), a disk holding
+/// this machine's snapshot pool, and a loop device that is never listed.
 fn host_disks() -> Value {
     json!({ "blockdevices": [
         disk("nvme0n1", "Fakedisk NVMe 512G", "nvme", false, 512 * GB, json!({ "children": [
@@ -82,6 +84,12 @@ fn host_disks() -> Value {
         disk("sdg", "Acme Portable 500G", "usb", true, 500 * GB, json!({ "children": [
             node("sdg1", "part", Some("swap"), None, &["[SWAP]"], 8 * GB),
         ]})),
+        disk("sdh", "Acme Portable 2T", "usb", true, 2000 * GB, json!({
+            "fstype": "btrfs", "label": "arca-snapshots-office", "uuid": "uuid-office",
+        })),
+        disk("sdi", "Acme Portable 4T", "usb", true, 4000 * GB, json!({
+            "fstype": "btrfs", "uuid": "uuid-vault",
+        })),
         { "name": "loop0", "path": "/dev/loop0", "size": GB, "type": "loop", "mountpoints": ["/snap/core"] },
     ]})
 }
@@ -129,17 +137,39 @@ impl Rig {
         incus.add_instance(json!({
             "name": "web", "project": "shop", "type": "container", "status": "Running",
             "profiles": ["default"],
-            "config": { "volatile.uuid": "00000000-0000-4000-8000-0000000000a1", "boot.autostart": "true" },
+            // The app's own (local) config and devices: live marks, a data volume, a proxy and a host folder. Incus carries
+            // every one of them into a copy whose request leaves them unset.
+            "config": {
+                "volatile.uuid": "00000000-0000-4000-8000-0000000000a1",
+                "volatile.idmap.base": "0",
+                "boot.autostart": "true",
+                "user.arca.app": "web",
+                "user.arcakernel.entry": "service-web",
+                "user.droid.slot": "7",
+                "user.tactu.owner": "shop"
+            },
+            "devices": {
+                "photos": { "type": "disk", "path": "/srv/photos", "pool": "fast", "source": "photos" },
+                "http": { "type": "proxy", "listen": "tcp:0.0.0.0:8080", "connect": "tcp:127.0.0.1:80" },
+                "share": { "type": "disk", "path": "/srv/share", "source": "/srv/share" }
+            },
             "expanded_config": {
                 "volatile.uuid": "00000000-0000-4000-8000-0000000000a1",
+                "volatile.idmap.base": "0",
                 "volatile.eth0.hwaddr": "00:16:3e:00:00:01",
                 "boot.autostart": "true",
-                "limits.memory": "2GiB"
+                "limits.memory": "2GiB",
+                "user.arca.app": "web",
+                "user.arcakernel.entry": "service-web",
+                "user.droid.slot": "7",
+                "user.tactu.owner": "shop"
             },
             "expanded_devices": {
                 "root": { "type": "disk", "path": "/", "pool": "fast" },
                 "eth0": { "type": "nic", "network": "incusbr0", "name": "eth0", "ipv4.address": "192.0.2.10" },
-                "photos": { "type": "disk", "path": "/srv/photos", "pool": "fast", "source": "photos" }
+                "photos": { "type": "disk", "path": "/srv/photos", "pool": "fast", "source": "photos" },
+                "http": { "type": "proxy", "listen": "tcp:0.0.0.0:8080", "connect": "tcp:127.0.0.1:80" },
+                "share": { "type": "disk", "path": "/srv/share", "source": "/srv/share" }
             },
         }));
         incus.add_volume(
@@ -242,7 +272,7 @@ impl Rig {
             name,
             "btrfs",
             SNAPSHOT_POOL_DESCRIPTION,
-            json!({ "source": format!("uuid-{name}") }),
+            json!({ "source": format!("uuid-{name}"), SNAPSHOT_STORAGE_KEY: name }),
             0,
             1000 * GB,
         );
@@ -276,7 +306,7 @@ fn disk_view<'a>(list: &'a Value, name: &str) -> &'a Value {
 }
 
 /// Every request a write path sent that was not a GET must be in the snapshot family: a pool or the snapshot project
-/// created, or an instance or volume created or deleted in the snapshot project.
+/// created, an instance or volume created or deleted in the snapshot project, or a new copy rewritten there once.
 fn assert_write_family(incus: &FakeStorageIncus) {
     for write in incus.writes() {
         assert!(
@@ -310,6 +340,16 @@ fn assert_write_family(incus: &FakeStorageIncus) {
 fn every_disk_gets_its_plain_role() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("storage-roles", &key);
+    rig.add_snapshot_pool("vault");
+    // A pool that only says "Arca snapshot storage" in its editable description is not snapshot storage.
+    rig.incus.add_pool(
+        "lookalike",
+        "btrfs",
+        SNAPSHOT_POOL_DESCRIPTION,
+        json!({ "source": "uuid-sdd-none" }),
+        0,
+        GB,
+    );
     let list = rig.storage_list();
     let roles: Vec<(String, String)> = list["disks"]
         .as_array()
@@ -330,6 +370,8 @@ fn every_disk_gets_its_plain_role() {
         ("sde", "system"),
         ("sdf", "system"),
         ("sdg", "system"),
+        ("sdh", "snapshots"),
+        ("sdi", "snapshots"),
     ];
     assert_eq!(
         roles,
@@ -393,6 +435,30 @@ fn every_disk_gets_its_plain_role() {
     assert_eq!(fast["used"], json!(300 * GB));
     assert_eq!(fast["total"], json!(1000 * GB));
     assert_eq!(fast["snapshots"], json!(false));
+    for name in ["sdh", "sdi"] {
+        assert_eq!(disk_view(&list, name)["offer"], Value::Null, "{name}");
+    }
+    assert!(
+        disk_view(&list, "sdh")["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("label arca-snapshots-office")
+    );
+    assert!(
+        disk_view(&list, "sdi")["reason"]
+            .as_str()
+            .unwrap_or("")
+            .contains("snapshot storage vault")
+    );
+    let pools = list["pools"].as_array().expect("pools");
+    let snapshots_of = |name: &str| {
+        pools
+            .iter()
+            .find(|pool| pool["name"] == json!(name))
+            .map(|pool| pool["snapshots"].clone())
+    };
+    assert_eq!(snapshots_of("vault"), Some(json!(true)));
+    assert_eq!(snapshots_of("lookalike"), Some(json!(false)));
     assert!(rig.incus.writes().is_empty(), "a listing writes nothing");
 }
 
@@ -407,6 +473,12 @@ fn a_whole_disk_plan_says_everything_will_be_erased_and_incus_formats_it() {
     assert_eq!(row(details, "Disk"), "Acme Portable 1T (1000.0 GB, USB)");
     assert_eq!(row(details, "Device"), "/dev/sdb");
     assert_eq!(row(details, "On it now"), "sdb1 ext4 \"PHOTOS\" 1000.0 GB");
+    assert_eq!(
+        row(details, "Storage name"),
+        "arca-snapshots-usb1",
+        "the disk's label will say it holds snapshots"
+    );
+    assert_eq!(proposed["args"]["name"], json!("arca-snapshots-usb1"));
     assert!(row(details, "Effect").starts_with(ERASE_SENTENCE));
     assert_eq!(ERASE_SENTENCE, "Everything on this disk will be erased.");
     assert!(
@@ -426,11 +498,23 @@ fn a_whole_disk_plan_says_everything_will_be_erased_and_incus_formats_it() {
         .expect("the approved add runs");
     assert_eq!(
         result,
-        json!({ "pool": "usb1", "driver": "btrfs", "source": "/dev/sdb" })
+        json!({ "pool": "arca-snapshots-usb1", "driver": "btrfs", "source": "/dev/sdb" })
     );
-    let pool = rig.incus.pool("usb1").expect("Incus created the pool");
+    let pool = rig
+        .incus
+        .pool("arca-snapshots-usb1")
+        .expect("Incus created the pool");
     assert_eq!(pool["driver"], json!("btrfs"));
     assert_eq!(pool["description"], json!(SNAPSHOT_POOL_DESCRIPTION));
+    assert_eq!(
+        pool["config"][SNAPSHOT_STORAGE_KEY],
+        json!("arca-snapshots-usb1")
+    );
+    assert_eq!(
+        pool["config"]["source.wipe"],
+        json!("true"),
+        "Incus wipes the old partition table before it formats"
+    );
     assert!(
         pool["config"]["btrfs.mount_options"]
             .as_str()
@@ -457,6 +541,7 @@ fn a_folder_plan_keeps_the_rest_of_the_disk() {
         .expect("a folder on a mounted disk may be proposed");
     let details = &proposed["details"];
     assert_eq!(row(details, "Disk"), "Acme Stick 64G (64.0 GB, USB)");
+    assert_eq!(row(details, "On it now"), "sdc1 exfat \"BACKUP\" 64.0 GB");
     assert_eq!(row(details, "Folder"), "/media/owner/BACKUP/arca-pool");
     assert_eq!(row(details, "Mounted at"), "/media/owner/BACKUP");
     assert!(
@@ -472,7 +557,67 @@ fn a_folder_plan_keeps_the_rest_of_the_disk() {
         pool["config"]["source"],
         json!("/media/owner/BACKUP/arca-pool")
     );
+    assert_eq!(pool["config"][SNAPSHOT_STORAGE_KEY], json!("stick"));
+    assert!(pool["config"].get("source.wipe").is_none());
     assert_write_family(&rig.incus);
+}
+
+#[test]
+fn a_folder_is_judged_by_where_its_links_lead() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-add-link", &key);
+    // A real folder stands in for the stick's mount point, so links in it are followed for real.
+    let mount = std::fs::canonicalize({
+        let path = rig._scratch.path("stick");
+        std::fs::create_dir(&path).expect("the mount folder");
+        path
+    })
+    .expect("a real path");
+    let mount = mount.to_str().expect("utf-8").to_string();
+    std::fs::create_dir(format!("{mount}/photos")).expect("a folder on the stick");
+    std::os::unix::fs::symlink("/etc", format!("{mount}/escape")).expect("a link");
+    let mut disks = host_disks();
+    disks["blockdevices"][2]["children"][0]["mountpoints"] = json!([mount]);
+    rig.devices.set(Ok(disks));
+
+    assert_eq!(
+        refused_code(rig.propose(
+            "storage_add",
+            json!({ "name": "stick", "path": format!("{mount}/escape") })
+        )),
+        "SystemDisk",
+        "a folder that leads onto the system disk is refused"
+    );
+    let proposed = rig
+        .propose(
+            "storage_add",
+            json!({ "name": "stick", "path": format!("{mount}/photos") }),
+        )
+        .expect("a real folder on the stick");
+    assert_eq!(proposed["args"]["path"], json!(format!("{mount}/photos")));
+    // The folder is swapped for a link to the system disk after the proposal.
+    std::fs::remove_dir(format!("{mount}/photos")).expect("remove");
+    std::os::unix::fs::symlink("/etc", format!("{mount}/photos")).expect("a link");
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &proposed)),
+        "DiskChanged"
+    );
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn a_disk_that_holds_snapshots_is_never_erased() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-add-snapshot-disk", &key);
+    rig.add_snapshot_pool("vault");
+    for device in ["sdh", "sdi"] {
+        assert_eq!(
+            refused_code(rig.propose("storage_add", json!({ "name": "again", "device": device }))),
+            "SnapshotDisk",
+            "{device}"
+        );
+    }
+    assert!(rig.incus.writes().is_empty());
 }
 
 #[test]
@@ -491,7 +636,11 @@ fn system_member_mounted_and_unlisted_disks_are_refused() {
         (json!({ "name": "x", "device": "loop0" }), "DiskNotListed"),
         (json!({ "name": "x", "path": "/home/owner" }), "SystemDisk"),
         (json!({ "name": "x", "path": "/srv/data" }), "SystemDisk"),
-        (json!({ "name": "fast", "device": "sdb" }), "PoolExists"),
+        (
+            json!({ "name": "fast", "path": "/media/owner/BACKUP" }),
+            "PoolExists",
+        ),
+        (json!({ "name": "x", "device": "sdh" }), "SnapshotDisk"),
     ];
     for (args, code) in cases {
         assert_eq!(
@@ -505,6 +654,7 @@ fn system_member_mounted_and_unlisted_disks_are_refused() {
         json!({ "name": "x" }),
         json!({ "name": "x", "path": "/media/owner/../owner" }),
         json!({ "name": "Bad Name", "device": "sdb" }),
+        json!({ "name": "a-name-too-long-for-it", "device": "sdb" }),
     ] {
         let refused = rig
             .propose("storage_add", args.clone())
@@ -564,7 +714,7 @@ fn a_watch_only_node_lists_but_never_writes() {
     let rig = Rig::with_writes("storage-watch-only", &key, false);
     assert_eq!(
         rig.storage_list()["disks"].as_array().map(Vec::len),
-        Some(7)
+        Some(9)
     );
     assert_eq!(
         refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
@@ -631,9 +781,41 @@ fn an_app_snapshot_is_a_stopped_self_contained_copy_and_the_source_is_only_read(
     assert_eq!(copy["config"]["boot.autostart"], json!("false"));
     assert_eq!(copy["profiles"], json!([]));
     assert_eq!(copy["devices"]["root"]["pool"], json!("usb1"));
-    assert!(
-        copy["devices"].get("photos").is_none(),
-        "the source project's volume is left out"
+    for device in ["photos", "http", "share"] {
+        for field in ["devices", "expanded_devices"] {
+            assert!(
+                copy[field].get(device).is_none(),
+                "the source's {device} is left out of {field}: {copy}"
+            );
+        }
+    }
+    assert_eq!(
+        copy["devices"].as_object().map(|devices| devices.len()),
+        Some(2),
+        "only the root disk and the NIC: {copy}"
+    );
+    for field in ["config", "expanded_config"] {
+        for key in copy[field].as_object().expect("config").keys() {
+            assert!(
+                !arca_incus::snapshot::ownership_key(key),
+                "the copy carries the live mark {key}"
+            );
+        }
+    }
+    for key in [
+        "user.arca.app",
+        "user.arcakernel.entry",
+        "user.droid.slot",
+        "user.tactu.owner",
+    ] {
+        assert!(
+            copy["config"][format!("{}{key}", arca_incus::snapshot::MARK_PREFIX)].is_string(),
+            "{key} is kept as a mark"
+        );
+    }
+    assert_eq!(
+        copy["config"]["user.arcasnapshot.dropped-devices"],
+        json!("http,photos,share")
     );
     assert!(
         copy["devices"]["eth0"].get("ipv4.address").is_none(),
@@ -661,12 +843,22 @@ fn an_app_snapshot_is_a_stopped_self_contained_copy_and_the_source_is_only_read(
                 "POST".to_string(),
                 format!("/1.0/instances?project={SNAPSHOT_PROJECT}")
             ),
+            (
+                "PUT".to_string(),
+                format!("/1.0/instances/{name}?project={SNAPSHOT_PROJECT}")
+            ),
         ]
     );
     assert!(
         writes[1].body.get("start").is_none(),
         "the create never asks to start"
     );
+    assert_eq!(
+        writes[1].body["devices"]["photos"],
+        json!({ "type": "none" }),
+        "the create masks the source's volume, which the snapshot project does not have"
+    );
+    assert_eq!(writes[1].body["config"]["user.arca.app"], json!(""));
     assert!(
         !rig.incus
             .requests()
@@ -795,6 +987,72 @@ fn a_failed_or_slow_copy_is_reported_plainly() {
         .approve_and_run(&key, &proposed)
         .expect("a long copy keeps going");
     assert_eq!(result["state"], json!("copying"));
+    let name = snapshot_name("shop", "web", NOW).expect("a name");
+    let copying = rig
+        .incus
+        .instance(SNAPSHOT_PROJECT, &name)
+        .expect("the copy being made");
+    for key in copying["config"].as_object().expect("config").keys() {
+        assert!(
+            !arca_incus::snapshot::ownership_key(key),
+            "even while copying, no live mark: {key}"
+        );
+    }
+    assert_eq!(copying["devices"]["http"], json!({ "type": "none" }));
+    // Once Incus finishes, the copy is rewritten clean in the background.
+    rig.incus.release_operations();
+    let clean = (0..200).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(25));
+        rig.incus
+            .instance(SNAPSHOT_PROJECT, &name)
+            .filter(|copy| copy["devices"].get("http").is_none())
+    });
+    let clean = clean.expect("the copy is cleaned once it is made");
+    assert_eq!(
+        clean["devices"].as_object().map(|devices| devices.len()),
+        Some(2)
+    );
+    assert_write_family(&rig.incus);
+}
+
+#[test]
+fn a_copy_that_stays_tied_to_its_source_is_deleted_and_refused() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("snapshot-not-clean", &key);
+    rig.add_snapshot_pool("usb1");
+    rig.incus.ignore_puts();
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "project": "shop", "instance": "web", "pool": "usb1" }),
+        )
+        .expect("a proposal");
+    match rig.approve_and_run(&key, &proposed) {
+        Err(CallError::Refused { code, message }) => {
+            assert_eq!(code, "StorageWriteFailed");
+            assert!(message.contains("device http"), "{message}");
+            assert!(message.contains("the copy was deleted"), "{message}");
+        }
+        other => panic!("expected a refused copy, got {other:?}"),
+    }
+    let name = snapshot_name("shop", "web", NOW).expect("a name");
+    assert!(
+        rig.incus.instance(SNAPSHOT_PROJECT, &name).is_none(),
+        "the half-made copy is gone"
+    );
+    let last = rig.incus.writes().pop().expect("a write");
+    assert_eq!(
+        (last.method.as_str(), last.target),
+        (
+            "DELETE",
+            format!("/1.0/instances/{name}?project={SNAPSHOT_PROJECT}")
+        )
+    );
+    assert!(
+        rig.incus.instance("shop", "web").is_some(),
+        "the source stays"
+    );
+    assert_write_family(&rig.incus);
 }
 
 #[test]
@@ -827,7 +1085,7 @@ fn snapshot_list_and_delete_stay_inside_the_snapshot_project() {
     assert_eq!(app["pool"], json!("usb1"));
     assert_eq!(app["size"], json!(3 * GB));
     assert_eq!(app["created"], json!("2026-10-30T12:00:00.000Z"));
-    assert_eq!(app["droppedDevices"], json!(["photos"]));
+    assert_eq!(app["droppedDevices"], json!(["http", "photos", "share"]));
     assert_eq!(snapshots[1]["kind"], json!("volume"));
     assert_eq!(snapshots[1]["sourcePool"], json!("fast"));
 

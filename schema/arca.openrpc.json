@@ -4011,6 +4011,7 @@
                   "role": {
                     "enum": [
                       "system",
+                      "snapshots",
                       "in use",
                       "free"
                     ],
@@ -4095,7 +4096,7 @@
           "type": "object"
         }
       },
-      "summary": "The host's disks, each with a plain role (system, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
+      "summary": "The host's disks, each with a plain role (system, snapshots, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
@@ -4135,7 +4136,7 @@
           "name": "device",
           "required": false,
           "schema": {
-            "description": "A whole free disk, such as sdb or /dev/sdb. Incus erases and formats it as btrfs.",
+            "description": "A whole free disk, such as sdb or /dev/sdb. Incus wipes and formats it as btrfs; the pool is named arca-snapshots-<name> (at most 32 characters).",
             "pattern": "^(?:/dev/)?[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$",
             "type": "string"
           }
@@ -4225,7 +4226,7 @@
           "type": "object"
         }
       },
-      "summary": "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus erases and formats. A system disk, a member disk and a mounted disk are refused as a whole-disk target.",
+      "summary": "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus wipes and formats as the pool arca-snapshots-<name>. A system disk, a member disk, a disk that holds snapshots and a mounted disk are refused as a whole-disk target.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "doctor",

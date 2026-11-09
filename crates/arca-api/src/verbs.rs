@@ -500,7 +500,7 @@ static VERBS: [Verb; 35] = [
     },
     Verb {
         name: "storage_list",
-        summary: "The host's disks, each with a plain role (system, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
+        summary: "The host's disks, each with a plain role (system, snapshots, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -514,7 +514,7 @@ static VERBS: [Verb; 35] = [
     },
     Verb {
         name: "storage_add",
-        summary: "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus erases and formats. A system disk, a member disk and a mounted disk are refused as a whole-disk target.",
+        summary: "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus wipes and formats as the pool arca-snapshots-<name>. A system disk, a member disk, a disk that holds snapshots and a mounted disk are refused as a whole-disk target.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -2026,7 +2026,7 @@ fn storage_add_params() -> Value {
             "device",
             false,
             json!({
-                "description": "A whole free disk, such as sdb or /dev/sdb. Incus erases and formats it as btrfs.",
+                "description": "A whole free disk, such as sdb or /dev/sdb. Incus wipes and formats it as btrfs; the pool is named arca-snapshots-<name> (at most 32 characters).",
                 "pattern": "^(?:/dev/)?[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$",
                 "type": "string"
             }),
@@ -2132,7 +2132,11 @@ fn storage_list_result() -> Value {
         ("label", true, nullable(string())),
         ("mountpoints", true, array(string())),
         ("children", true, array(partition)),
-        ("role", true, one_of(&["system", "in use", "free"])),
+        (
+            "role",
+            true,
+            one_of(&["system", "snapshots", "in use", "free"]),
+        ),
         ("reason", true, string()),
         ("offer", true, nullable_enum(&["folder", "whole disk"])),
         ("folders", true, array(string())),

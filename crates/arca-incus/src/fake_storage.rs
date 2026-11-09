@@ -5,10 +5,17 @@
 //! `/1.0/instances/<n>?project=<p>`, `/1.0/instances?project=<p>&recursion=1`, `/1.0/instances/<n>/state?project=<p>`,
 //! `/1.0/storage-pools/<p>/volumes/custom?project=<p>&recursion=1`, `/1.0/storage-pools/<p>/volumes/custom/<n>?project=<p>`,
 //! its `/state`, and `/1.0/operations/<id>/wait`. Writes: `POST /1.0/storage-pools`, `POST /1.0/projects`, `POST` of an
-//! instance or a volume with a `copy` source, and `DELETE` of either. An instance or volume create or delete is answered with
-//! an operation that has already ended, unless the test holds operations ([`FakeStorageIncus::hold_operations`]) or fails the
-//! next copy ([`FakeStorageIncus::fail_next_copy`]). A created instance is `Stopped` unless its body says `start: true`. Any
-//! other request is 404 for a GET and 405 otherwise. Nothing here touches a disk.
+//! instance or a volume with a `copy` source, `PUT` of an instance, and `DELETE` of either. An instance or volume create or
+//! delete is answered with an operation that has already ended, unless the test holds operations
+//! ([`FakeStorageIncus::hold_operations`]) or fails the next copy ([`FakeStorageIncus::fail_next_copy`]). A created instance
+//! is `Stopped` unless its body says `start: true`. Any other request is 404 for a GET and 405 otherwise. Nothing here touches
+//! a disk.
+//!
+//! An instance copy behaves as Incus's own does (`createFromCopy`): every local config key and local device of the source
+//! that the request leaves unset is carried into the copy (volatile keys aside), an empty config value is not stored, the
+//! source's profiles are used when the request names none, and a disk device on a custom volume the target project does not
+//! have fails the create. A `PUT` replaces the config, devices and profiles, and refuses one that drops a volatile idmap
+//! key, as Incus does. A volume copy takes the source's config only when the request has none.
 
 use std::collections::BTreeMap;
 use std::io::{self, Read};
@@ -44,6 +51,7 @@ struct State {
     counter: u64,
     hold: bool,
     fail_next: Option<String>,
+    ignore_puts: bool,
 }
 
 /// The running fake. Dropping it stops it.
@@ -156,6 +164,22 @@ impl FakeStorageIncus {
     /// Keeps every new operation running, so a wait answers that it is still running.
     pub fn hold_operations(&self) {
         lock(&self.state).hold = true;
+    }
+
+    /// Ends every held operation successfully, and stops holding new ones.
+    pub fn release_operations(&self) {
+        let mut state = lock(&self.state);
+        state.hold = false;
+        for operation in state.operations.values_mut() {
+            if operation["status_code"] == json!(103) {
+                operation["status_code"] = json!(200);
+            }
+        }
+    }
+
+    /// Answers every instance `PUT` as done without applying it, as a rewrite that did not take would.
+    pub fn ignore_puts(&self) {
+        lock(&self.state).ignore_puts = true;
     }
 
     /// Fails the next instance or volume copy with Incus's message.
@@ -317,6 +341,39 @@ fn operation(state: &mut State, failure: Option<String>) -> (u16, Value) {
     )
 }
 
+/// The config, devices and profiles of an instance copy, as Incus's `createFromCopy` makes them: the request's own, with
+/// every local key and device of the source the request leaves unset carried in (volatile keys aside, except the two Incus
+/// keeps), and without empty values. A new copy gets its own volatile keys.
+fn merged_copy(body: &Value, source: &Value) -> (Value, Value, Value) {
+    let mut config = body["config"].as_object().cloned().unwrap_or_default();
+    for (key, value) in source["config"].as_object().into_iter().flatten() {
+        let kept = !key.starts_with("volatile.")
+            || key == "volatile.base_image"
+            || key == "volatile.last_state.idmap";
+        if kept && !config.contains_key(key) {
+            config.insert(key.clone(), value.clone());
+        }
+    }
+    config.retain(|_, value| value.as_str().is_some_and(|text| !text.is_empty()));
+    config.insert(
+        "volatile.uuid".to_string(),
+        json!("00000000-0000-4000-8000-00000000c0b1"),
+    );
+    config.insert("volatile.idmap.base".to_string(), json!("0"));
+    let mut devices = body["devices"].as_object().cloned().unwrap_or_default();
+    for (name, device) in source["devices"].as_object().into_iter().flatten() {
+        devices
+            .entry(name.clone())
+            .or_insert_with(|| device.clone());
+    }
+    let profiles = if body["profiles"].is_null() {
+        source["profiles"].clone()
+    } else {
+        body["profiles"].clone()
+    };
+    (Value::Object(config), Value::Object(devices), profiles)
+}
+
 fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, Value) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let params: BTreeMap<&str, &str> = query
@@ -416,24 +473,77 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
                 .as_str()
                 .unwrap_or_default()
                 .to_string();
-            if body["source"]["type"] != json!("copy")
-                || !state.instances.contains_key(&(from_project, from))
-            {
+            let Some(source) = (body["source"]["type"] == json!("copy"))
+                .then(|| state.instances.get(&(from_project, from)))
+                .flatten()
+                .cloned()
+            else {
                 return error(404, "Source instance not found");
+            };
+            let (config, devices, profiles) = merged_copy(body, &source);
+            for (device_name, device) in devices.as_object().into_iter().flatten() {
+                let on_volume = device["type"] == json!("disk")
+                    && device.get("path") != Some(&json!("/"))
+                    && device["source"]
+                        .as_str()
+                        .is_some_and(|source| !source.starts_with('/'));
+                if on_volume {
+                    let key = (
+                        device["pool"].as_str().unwrap_or_default().to_string(),
+                        project.clone(),
+                        device["source"].as_str().unwrap_or_default().to_string(),
+                    );
+                    if !state.volumes.contains_key(&key) {
+                        return error(
+                            400,
+                            &format!(
+                                "Failed add validation for device \"{device_name}\": Failed loading custom volume: Storage volume not found"
+                            ),
+                        );
+                    }
+                }
             }
             if let Some(message) = state.fail_next.take() {
                 return operation(state, Some(message));
             }
             let running = body["start"] == json!(true);
             let row = json!({
-                "name": name, "project": project, "type": body["type"],
-                "description": body["description"], "profiles": body["profiles"],
-                "config": body["config"], "devices": body["devices"],
-                "expanded_config": body["config"], "expanded_devices": body["devices"],
+                "name": name, "project": project, "type": body["type"], "architecture": "x86_64",
+                "description": body["description"], "profiles": profiles,
+                "config": config, "devices": devices,
+                "expanded_config": config, "expanded_devices": devices,
                 "status": if running { "Running" } else { "Stopped" },
                 "created_at": "2026-11-09T14:05:00Z",
             });
             state.instances.insert((project, name), row);
+            operation(state, None)
+        }
+        ("PUT", ["instances", name]) => {
+            let key = (project.clone(), (*name).to_string());
+            let Some(found) = state.instances.get(&key).cloned() else {
+                return error(404, "Instance not found");
+            };
+            let dropped_idmap =
+                found["config"]
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .any(|(key, _)| {
+                        key.starts_with("volatile.idmap.") && body["config"].get(key).is_none()
+                    });
+            if dropped_idmap {
+                return error(400, "Volatile idmap keys can't be deleted by the user");
+            }
+            if state.ignore_puts {
+                return operation(state, None);
+            }
+            let mut row = found;
+            for field in ["config", "devices", "profiles", "description"] {
+                row[field] = body[field].clone();
+            }
+            row["expanded_config"] = body["config"].clone();
+            row["expanded_devices"] = body["devices"].clone();
+            state.instances.insert(key, row);
             operation(state, None)
         }
         ("DELETE", ["instances", name]) => {
@@ -505,10 +615,15 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             if let Some(message) = state.fail_next.take() {
                 return operation(state, Some(message));
             }
+            let config = if body["config"].is_null() {
+                state.volumes[&source]["config"].clone()
+            } else {
+                body["config"].clone()
+            };
             let row = json!({
                 "name": name, "project": project, "pool": pool, "type": "custom",
                 "content_type": body["content_type"], "description": body["description"],
-                "config": body["config"], "created_at": "2026-11-09T14:05:00Z",
+                "config": config, "created_at": "2026-11-09T14:05:00Z",
             });
             state.volumes.insert(key, row);
             operation(state, None)

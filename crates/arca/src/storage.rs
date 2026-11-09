@@ -23,12 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arca_incus::snapshot::{
-    CREATED_KEY, DROPPED_KEY, SOURCE_KIND_KEY, SOURCE_NAME_KEY, SOURCE_POOL_KEY,
-    SOURCE_PROJECT_KEY, folder_pool_path, instance_copy_body, plain_name, volume_copy_body,
+    CREATED_KEY, DROPPED_KEY, SNAPSHOT_LABEL_PREFIX, SOURCE_KIND_KEY, SOURCE_NAME_KEY,
+    SOURCE_POOL_KEY, SOURCE_PROJECT_KEY, folder_pool_path, instance_copy_body, plain_name,
+    volume_copy_body,
 };
 use arca_incus::{
-    IncusError, IncusRead, PoolSource, Progress, SNAPSHOT_POOL_DESCRIPTION, SNAPSHOT_PROJECT,
-    SnapshotWriter, UnixIncus,
+    IncusError, IncusRead, PoolSource, Progress, SNAPSHOT_PROJECT, SnapshotWriter, UnixIncus,
 };
 use arca_mcp::{CallError, Caller, ToolHandler};
 use serde_json::{Value, json};
@@ -258,6 +258,9 @@ impl PoolView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiskRole {
     System,
+    /// Holds Arca snapshots: a snapshot pool of this machine, or a disk labelled as snapshot storage by another one. It is
+    /// never offered, so it is never erased.
+    Snapshots,
     InUse,
     Free,
 }
@@ -266,6 +269,7 @@ impl DiskRole {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
+            Self::Snapshots => "snapshots",
             Self::InUse => "in use",
             Self::Free => "free",
         }
@@ -326,7 +330,7 @@ impl DiskView {
             "role": self.role.as_str(),
             "reason": self.reason,
             "offer": match self.role {
-                DiskRole::System => Value::Null,
+                DiskRole::System | DiskRole::Snapshots => Value::Null,
                 DiskRole::InUse => json!("folder"),
                 DiskRole::Free => json!("whole disk"),
             },
@@ -380,7 +384,7 @@ fn resolved_device(source: &str) -> String {
 /// Gives every disk its role. A pool is matched by the device it names, by a UUID or label, or, for a folder pool, by the
 /// file system its folder is on.
 pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
-    let mut pool_disks: Vec<Option<String>> = vec![None; disks.len()];
+    let mut pool_disks: Vec<Option<&PoolView>> = vec![None; disks.len()];
     for pool in pools {
         for source in &pool.sources {
             if source.starts_with("/dev/") {
@@ -391,12 +395,12 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
                         .iter()
                         .any(|node| node.path == device || node.path == *source)
                     {
-                        pool_disks[index].get_or_insert_with(|| pool.name.clone());
+                        pool_disks[index].get_or_insert(pool);
                     }
                 }
             } else if source.starts_with('/') {
                 if let Some((index, _)) = mount_owner(disks, source) {
-                    pool_disks[index].get_or_insert_with(|| pool.name.clone());
+                    pool_disks[index].get_or_insert(pool);
                 }
             } else {
                 for (index, disk) in disks.iter().enumerate() {
@@ -404,7 +408,7 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
                         node.uuid.as_deref() == Some(source)
                             || node.label.as_deref() == Some(source)
                     }) {
-                        pool_disks[index].get_or_insert_with(|| pool.name.clone());
+                        pool_disks[index].get_or_insert(pool);
                     }
                 }
             }
@@ -414,7 +418,7 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
         .iter()
         .zip(pool_disks)
         .map(|(disk, pool)| {
-            let (role, reason) = role_of(disk, pool.as_deref());
+            let (role, reason) = role_of(disk, pool);
             DiskView {
                 disk: disk.clone(),
                 role,
@@ -424,7 +428,7 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
         .collect()
 }
 
-fn role_of(disk: &BlockDevice, pool: Option<&str>) -> (DiskRole, String) {
+fn role_of(disk: &BlockDevice, pool: Option<&PoolView>) -> (DiskRole, String) {
     let nodes = disk.walk();
     for node in &nodes {
         for mount in &node.mountpoints {
@@ -462,10 +466,35 @@ fn role_of(disk: &BlockDevice, pool: Option<&str>) -> (DiskRole, String) {
             );
         }
     }
+    if let Some(pool) = pool.filter(|pool| pool.snapshots) {
+        return (
+            DiskRole::Snapshots,
+            format!(
+                "holds the snapshot storage {}; it is never offered or erased",
+                pool.name
+            ),
+        );
+    }
     if let Some(pool) = pool {
         return (
             DiskRole::System,
-            format!("holds the Incus storage pool {pool}; it is never offered"),
+            format!(
+                "holds the Incus storage pool {}; it is never offered",
+                pool.name
+            ),
+        );
+    }
+    if let Some(node) = nodes.iter().find(|node| {
+        node.label
+            .as_deref()
+            .is_some_and(|label| label.starts_with(SNAPSHOT_LABEL_PREFIX))
+    }) {
+        return (
+            DiskRole::Snapshots,
+            format!(
+                "holds Arca snapshots (file system label {}); it is never offered or erased",
+                node.label.as_deref().unwrap_or_default()
+            ),
         );
     }
     let mounts: BTreeSet<&str> = nodes
@@ -662,8 +691,7 @@ impl Storage {
                 sources,
                 used: space_of("used"),
                 total: space_of("total"),
-                snapshots: row.get("description").and_then(Value::as_str)
-                    == Some(SNAPSHOT_POOL_DESCRIPTION),
+                snapshots: arca_incus::snapshot::is_snapshot_pool(row),
             });
         }
         Ok(pools)
@@ -1039,8 +1067,10 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
                 if text(&args, "disk") != name {
                     return Err("args/disk: it must name the device".to_string());
                 }
+                let pool = whole_disk_pool_name(text(&args, "name"))?;
                 if let Some(object) = args.as_object_mut() {
                     object.insert("device".to_string(), json!(format!("/dev/{name}")));
+                    object.insert("name".to_string(), json!(pool));
                 }
             }
         },
@@ -1078,6 +1108,48 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
         _ => {}
     }
     Ok(args)
+}
+
+/// The pool name of a whole-disk snapshot storage: `arca-snapshots-<name>`. Incus labels the btrfs file system it makes
+/// with the pool's name, so the label says the disk holds snapshots on any machine it is plugged into.
+fn whole_disk_pool_name(name: &str) -> Result<String, String> {
+    let pool = if name.starts_with(SNAPSHOT_LABEL_PREFIX) {
+        name.to_string()
+    } else {
+        format!("{SNAPSHOT_LABEL_PREFIX}{name}")
+    };
+    if pool.len() > 32 || pool.len() == SNAPSHOT_LABEL_PREFIX.len() {
+        return Err(format!(
+            "args/name: a whole disk's storage is named {SNAPSHOT_LABEL_PREFIX}<name>, at most 32 characters"
+        ));
+    }
+    Ok(pool)
+}
+
+/// A folder as the host resolves it: every link in the part of the path that exists is followed, and the rest is kept as
+/// written. A folder that does not exist yet stays on the disk its nearest existing parent is on.
+pub fn resolved_folder(path: &str) -> String {
+    let mut existing = std::path::PathBuf::from(path);
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&existing) {
+            let mut real = real;
+            for part in rest.iter().rev() {
+                real.push(part);
+            }
+            return real
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| path.to_string());
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_string(),
+        }
+    }
 }
 
 /// A folder target's path, checked: absolute, without `.` or `..` parts, doubled or trailing slashes, or control
@@ -1118,7 +1190,7 @@ pub fn details(action: ActionKind, args: &Value) -> Vec<ActionDetail> {
                 row(
                     "Effect",
                     format!(
-                        "{ERASE_SENTENCE} Incus formats the whole disk as snapshot storage {} (btrfs, compressed). Apps and data are copied onto it only when you approve each snapshot.",
+                        "{ERASE_SENTENCE} Incus wipes and formats the whole disk as snapshot storage {} (btrfs, compressed); the disk is labelled with that name. Apps and data are copied onto it only when you approve each snapshot.",
                         text(args, "name")
                     ),
                 ),
@@ -1126,6 +1198,7 @@ pub fn details(action: ActionKind, args: &Value) -> Vec<ActionDetail> {
         }
         ActionKind::StorageAdd => vec![
             row("Disk", disk_words(args)),
+            row("On it now", text(args, "contents").to_string()),
             row("Mounted at", text(args, "mount").to_string()),
             row("Folder", folder_pool_path(text(args, "path"))),
             row("Storage name", text(args, "name").to_string()),
@@ -1348,7 +1421,10 @@ pub fn enrich(
                 (find_whole_disk(&survey, device)?, None)
             } else if let Some(path) = object.get("path").and_then(Value::as_str) {
                 let path = clean_folder(path).map_err(CallError::Invalid)?;
+                // The disk is decided by where the folder really is, after its links are followed.
+                let path = resolved_folder(&path);
                 let (view, mount) = find_folder_disk(&survey, &path)?;
+                object.insert("path".to_string(), json!(path));
                 (view, Some(mount))
             } else {
                 return Err(CallError::Invalid(
@@ -1445,6 +1521,10 @@ fn find_whole_disk<'a>(survey: &'a Survey, device: &str) -> Result<&'a DiskView,
     if let Some(view) = survey.disks.iter().find(|view| view.disk.name == name) {
         return match view.role {
             DiskRole::Free => Ok(view),
+            DiskRole::Snapshots => Err(StorageRefusal::new(
+                "SnapshotDisk",
+                format!("{name} already {}", view.reason),
+            )),
             DiskRole::System => Err(StorageRefusal::new(
                 "SystemDisk",
                 format!("{name} is a system disk: it {}", view.reason),
@@ -1493,6 +1573,15 @@ fn find_folder_disk<'a>(
     let view = &survey.disks[index];
     match view.role {
         DiskRole::InUse => {}
+        DiskRole::Snapshots => {
+            return Err(StorageRefusal::new(
+                "SnapshotDisk",
+                format!(
+                    "{path} is on the disk {}, which {}",
+                    view.disk.name, view.reason
+                ),
+            ));
+        }
         DiskRole::System => {
             return Err(StorageRefusal::new(
                 "SystemDisk",
@@ -1562,6 +1651,13 @@ fn check(
                 (view, None, PoolSource::Device(view.disk.path.clone()))
             } else {
                 let path = text(args, "path");
+                if resolved_folder(path) != path {
+                    return Err(StorageRefusal::new(
+                        "DiskChanged",
+                        "the folder now leads somewhere else through a link; propose it again",
+                    )
+                    .into());
+                }
                 let (view, mount) = find_folder_disk(&survey, path)?;
                 (view, Some(mount), PoolSource::Folder(path.to_string()))
             };
