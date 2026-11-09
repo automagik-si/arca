@@ -399,7 +399,11 @@ fn service_list_reports_a_lan_port_only_when_the_template_has_a_lan_proxy() {
     let nats = rig
         .call("service_create", json!({"name":"nats","template":"nats"}))
         .expect("nats create");
-    assert_eq!(nats["lanPort"], Value::Null, "a container port is not a host listener");
+    assert_eq!(
+        nats["lanPort"],
+        Value::Null,
+        "a container port is not a host listener"
+    );
 
     let mut lan = nats_template();
     lan["name"] = json!("automagik");
@@ -407,7 +411,10 @@ fn service_list_reports_a_lan_port_only_when_the_template_has_a_lan_proxy() {
     lan["lan"] = json!({"port": 3081});
     rig.template("automagik", lan);
     let automagik = rig
-        .call("service_create", json!({"name":"automagik","template":"automagik"}))
+        .call(
+            "service_create",
+            json!({"name":"automagik","template":"automagik"}),
+        )
         .expect("automagik create");
     assert_eq!(automagik["lanPort"], json!(3081));
 
@@ -1799,6 +1806,88 @@ fn stopped_service_template() -> Value {
 }
 
 #[test]
+fn an_approved_action_proposal_runs_the_real_service_remove_handler_once() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .expect("create");
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_some()
+    );
+
+    let proposal = rig
+        .kernel
+        .lock()
+        .expect("kernel")
+        .propose_action(
+            arca::action_proposal::ActionKind::ServiceRemove,
+            json!({ "name": "pg" }),
+            NOW,
+        )
+        .expect("the proposal is inert");
+    let statement = arca::handlers::action_statement(
+        "node1",
+        &proposal.id,
+        "service_remove",
+        &proposal.args_digest,
+        NOW,
+        &"7".repeat(32),
+    )
+    .expect("the statement");
+    let approval = common::approve_statement(&key, &statement);
+    let approved = {
+        let mut kernel = rig.kernel.lock().expect("kernel");
+        arca::handlers::approve_action(
+            &mut kernel,
+            &json!({ "plan": proposal.id, "approval": approval }),
+            NOW,
+        )
+        .expect("the owner's approval verifies")
+    };
+    let executor = arca::handlers::ActionExecutor::new(
+        rig.handlers
+            .iter()
+            .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+    );
+    let result = executor
+        .run(&approved.action, &approved.args, &approved.grant)
+        .expect("the real service_remove handler runs");
+    assert_eq!(result, json!({"removed": true}));
+    assert!(
+        rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
+            .is_none(),
+        "the approved action removed the instance"
+    );
+    assert!(
+        rig.entries().iter().all(|entry| entry.id.0 != "service-pg"),
+        "the desired entry is gone"
+    );
+
+    let replay = rig
+        .kernel
+        .lock()
+        .expect("kernel")
+        .approve_action(&proposal.id, &approval, NOW);
+    assert!(matches!(
+        replay,
+        Err(arca::kernel::ActionApprovalError::NoSuch)
+    ));
+}
+
+#[test]
 fn service_remove_is_refused_without_a_valid_approval_and_removes_with_one() {
     let key = common::SkKey::from_seed(9);
     let rig = Rig::with_key(
@@ -2020,7 +2109,7 @@ fn service_remove_holds_the_kernel_lock_until_its_plan_is_run_once() {
     let statement =
         arca::handlers::plan_statement("node1", &plan.to_hex(), NOW, &"b".repeat(64)).unwrap();
     let proof = common::approve_statement(&key, &statement);
-    let handler = arca::handlers::plan_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW))
+    let handler = arca::handlers::plan_handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW), None)
         .into_iter()
         .find(|(name, _)| *name == "approval_submit")
         .unwrap()

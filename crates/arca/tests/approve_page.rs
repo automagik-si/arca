@@ -21,15 +21,16 @@ use arca::canvas::{
     CHAT_BODY_MAX, CHAT_CONCURRENCY, CHAT_HISTORY_PATH, CHAT_PATH, CHAT_STREAM_MAX, Canvas,
 };
 use arca::desired_store::EntryChange;
-use arca::handlers::{Clock, plan_handlers};
+use arca::handlers::{ActionExecutor, Clock, plan_handlers};
 use arca::kernel::Kernel;
 use arca_api::Scope;
 use arca_approval::{
-    PASSKEY_COUNTS_FILE, STATE_PASSKEYS_FILE, load_state_passkeys, parse_passkeys,
+    ArcaAction, PASSKEY_COUNTS_FILE, STATE_PASSKEYS_FILE, load_state_passkeys, parse_passkeys,
+    parse_statement,
 };
 use arca_kernel::canon::canonical_json;
 use arca_kernel::desired::EntryId;
-use arca_mcp::{CallError, Caller, Server, TokenStore, serve_unix};
+use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, serve_unix};
 use common::*;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
@@ -369,7 +370,20 @@ struct Rig {
     display: Arc<FakeDisplay>,
     canvas: Canvas,
     upstream: Arc<TestUpstream>,
+    action_runs: Arc<AtomicU64>,
     _runtime: Runtime,
+}
+
+/// The action executor's stand-in for `service_create`: it counts the runs, so the page test can prove exactly one.
+struct CountingAction {
+    runs: Arc<AtomicU64>,
+}
+
+impl ToolHandler for CountingAction {
+    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "created": true }))
+    }
 }
 
 const TEST_CHAT_IDLE: Duration = Duration::from_millis(600);
@@ -460,6 +474,13 @@ impl Rig {
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
         let clock = Arc::new(AtomicU64::new(NOW));
         let display = Arc::new(FakeDisplay::default());
+        let action_runs = Arc::new(AtomicU64::new(0));
+        let actions = ActionExecutor::new([(
+            "service_create",
+            Arc::new(CountingAction {
+                runs: Arc::clone(&action_runs),
+            }) as Arc<dyn ToolHandler>,
+        )]);
         let page_clock = Arc::clone(&clock);
         let clock_fn: Clock = Arc::new(move || page_clock.load(Ordering::SeqCst));
         let logs = Arc::new(Mutex::new(Vec::new()));
@@ -473,6 +494,7 @@ impl Rig {
         )
         .with_canvas_origin(&format!("http://{}", upstream.addr))
         .with_chat_timeouts(chat_idle, chat_total)
+        .with_actions(actions)
         .with_log(Arc::new(move |line| {
             captured_logs
                 .lock()
@@ -518,6 +540,7 @@ impl Rig {
             display,
             canvas,
             upstream,
+            action_runs,
             _runtime: runtime,
         };
         (rig, key)
@@ -557,6 +580,32 @@ impl Rig {
             plan["plan"].as_str().expect("a digest").to_string(),
             plan["statement"].as_str().expect("a statement").to_string(),
         )
+    }
+
+    fn waiting_action(&self) -> Value {
+        let now = self.clock.load(Ordering::SeqCst);
+        let mut kernel = self.kernel.lock().expect("the kernel lock");
+        let proposal = kernel
+            .propose_action(
+                arca::action_proposal::ActionKind::ServiceCreate,
+                json!({ "name": "nats", "template": "nats" }),
+                now,
+            )
+            .expect("an action proposal");
+        serde_json::to_value(proposal).expect("the proposal serializes")
+    }
+
+    fn action_from_page(&self) -> Value {
+        let (status, body) = self.get("/approve/plans", None);
+        assert_eq!(status, 200);
+        let body: Value = serde_json::from_slice(&body).expect("plans JSON");
+        body["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .find(|plan| plan["kind"] == json!("action"))
+            .cloned()
+            .expect("the action proposal")
     }
 
     fn request(
@@ -859,13 +908,38 @@ fn chat_json() -> Vec<u8> {
     serde_json::to_vec(&json!({ "message": "hello" })).expect("chat JSON")
 }
 
-fn assert_cut(body: &[u8], reason: &str) {
+fn sse_events(body: &[u8]) -> Vec<(String, String)> {
     let text = String::from_utf8_lossy(body);
-    assert!(text.contains("event: arca-cut"), "a cut event is present");
-    assert!(
-        text.contains(&format!("data: {{\"reason\":\"{reason}\"}}")),
-        "the cut event names {reason}"
-    );
+    let mut events = Vec::new();
+    for block in text.split("\n\n") {
+        let mut event = "message".to_string();
+        let mut data = Vec::new();
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("event: ") {
+                event = value.to_string();
+            } else if let Some(value) = line.strip_prefix("data: ") {
+                data.push(value.to_string());
+            }
+        }
+        if !data.is_empty() {
+            events.push((event, data.join("\n")));
+        }
+    }
+    events
+}
+
+fn cut_reason(body: &[u8]) -> String {
+    let events = sse_events(body);
+    let (event, data) = events.last().expect("a final event");
+    assert_eq!(event, "arca-cut", "the final event is the cut");
+    serde_json::from_str::<Value>(data).expect("cut JSON")["reason"]
+        .as_str()
+        .expect("a cut reason")
+        .to_string()
+}
+
+fn assert_cut(body: &[u8], reason: &str) {
+    assert_eq!(cut_reason(body), reason, "the cut event names {reason}");
 }
 
 /// Reads until the stream body contains `needle`; a read timeout or an early end fails with the deadline and phrase.
@@ -1008,6 +1082,185 @@ fn a_valid_approval_runs_the_plan_once_and_every_bad_post_deletes_nothing() {
         "the replay is refused"
     );
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 1, "still one DELETE");
+}
+
+#[test]
+fn action_proposals_are_listed_next_to_delete_plans_and_decline_removes_one() {
+    let (rig, _key) = Rig::new("page-action-list", true);
+    rig.waiting_plan();
+    rig.waiting_action();
+    let action = rig.action_from_page();
+    assert_eq!(action["kind"], json!("action"));
+    assert_eq!(action["action"], json!("service_create"));
+    assert_eq!(
+        action["summary"],
+        json!("Create the service nats from template nats")
+    );
+    assert_eq!(
+        action["args"],
+        json!({ "name": "nats", "template": "nats" })
+    );
+    assert_eq!(
+        action["details"],
+        json!([
+            { "label": "Name", "value": "nats" },
+            { "label": "Template", "value": "nats" }
+        ])
+    );
+    let id = action["id"].as_str().expect("an id");
+    assert!(id.starts_with("act-"));
+    assert_eq!(id.len(), 16);
+    let digest = action["argsDigest"].as_str().expect("a digest");
+    assert_eq!(digest.len(), 64);
+    let statement = action["statement"].as_str().expect("a statement");
+    let parsed = parse_statement(statement.as_bytes()).expect("the kernel parser reads it");
+    assert_eq!(parsed.action, ArcaAction::ServiceCreate);
+    assert_eq!(parsed.target, id);
+    assert_eq!(parsed.params_digest, digest);
+    assert_eq!(
+        action["expiresAt"].as_u64(),
+        action["createdAt"].as_u64().map(|at| at + 15 * 60 * 1000)
+    );
+
+    let (status, body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
+    assert_eq!(listed["plans"].as_array().map(Vec::len), Some(2));
+    let delete_id = listed["plans"]
+        .as_array()
+        .expect("plans")
+        .iter()
+        .find_map(|plan| plan["plan"].as_str())
+        .expect("the delete plan is still listed");
+    let (status, body) = rig.post(
+        "/approve/decline",
+        Some(ORIGIN),
+        json!({ "plan": delete_id }),
+    );
+    assert!(
+        refusal(status),
+        "the open page cannot decline a delete plan"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("DoctorRequired"),
+        "the refusal names the doctor door"
+    );
+    let (status, body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
+    assert_eq!(
+        listed["plans"].as_array().map(Vec::len),
+        Some(2),
+        "the refused decline left the delete plan waiting"
+    );
+
+    let (status, body) = rig.post("/approve/decline", Some(ORIGIN), json!({ "plan": id }));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let declined: Value = serde_json::from_slice(&body).expect("decline JSON");
+    assert_eq!(declined["plan"], json!(id));
+    assert_eq!(declined["retained"], json!([]));
+    let (status, body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
+    assert_eq!(
+        listed["plans"].as_array().map(Vec::len),
+        Some(1),
+        "only the delete plan remains"
+    );
+    assert!(
+        listed["plans"]
+            .as_array()
+            .expect("plans")
+            .iter()
+            .all(|plan| plan["kind"] != json!("action"))
+    );
+    assert!(
+        refusal(
+            rig.post("/approve/decline", Some(ORIGIN), json!({ "plan": id }))
+                .0
+        ),
+        "a second decline finds nothing"
+    );
+}
+
+#[test]
+fn a_passkey_approval_runs_an_action_proposal_exactly_once() {
+    let (rig, key) = Rig::new("page-action-approve", true);
+    rig.waiting_action();
+    let action = rig.action_from_page();
+    let id = action["id"].as_str().expect("an id").to_string();
+    let statement = action["statement"].as_str().expect("a statement");
+    let body = json!({ "plan": id, "approval": approval(&key, statement) });
+
+    let (status, answer) = rig.post("/approve/approve", Some(ORIGIN), body.clone());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let answer: Value = serde_json::from_slice(&answer).expect("approval JSON");
+    assert_eq!(answer["plan"], json!(id));
+    assert_eq!(answer["action"], json!("service_create"));
+    assert_eq!(answer["result"], json!({ "created": true }));
+    assert_eq!(rig.action_runs.load(Ordering::SeqCst), 1);
+    let (status, listed_body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&listed_body).expect("plans JSON");
+    assert_eq!(listed["plans"], json!([]), "the action proposal is retired");
+
+    assert!(
+        refusal(rig.post("/approve/approve", Some(ORIGIN), body).0),
+        "the replay is refused"
+    );
+    assert_eq!(
+        rig.action_runs.load(Ordering::SeqCst),
+        1,
+        "the action did not run again"
+    );
+}
+
+#[test]
+fn an_expired_action_or_a_statement_for_another_id_is_refused() {
+    let (rig, key) = Rig::new("page-action-refusals", true);
+    rig.waiting_action();
+    let action = rig.action_from_page();
+    let id = action["id"].as_str().expect("an id").to_string();
+    let statement = action["statement"].as_str().expect("a statement");
+    let expired = approval(&key, statement);
+    rig.advance(15 * 60 * 1000 + 1);
+    assert!(
+        refusal(
+            rig.post(
+                "/approve/approve",
+                Some(ORIGIN),
+                json!({ "plan": id, "approval": expired })
+            )
+            .0
+        ),
+        "the proposal lapsed"
+    );
+    assert_eq!(rig.action_runs.load(Ordering::SeqCst), 0);
+
+    rig.waiting_action();
+    let action = rig.action_from_page();
+    let id = action["id"].as_str().expect("an id").to_string();
+    let digest = action["argsDigest"].as_str().expect("a digest");
+    let wrong_target = arca::handlers::action_statement(
+        HOST,
+        "act-000000000000",
+        "service_create",
+        digest,
+        NOW + 15 * 60 * 1000 + 1,
+        &"9".repeat(32),
+    )
+    .expect("a statement");
+    let (status, body) = rig.post(
+        "/approve/approve",
+        Some(ORIGIN),
+        json!({ "plan": id, "approval": approval(&key, &wrong_target) }),
+    );
+    assert!(refusal(status));
+    assert!(
+        String::from_utf8_lossy(&body).contains("WrongTarget"),
+        "the target differs"
+    );
+    assert_eq!(rig.action_runs.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -1937,6 +2190,7 @@ fn canvas_headers_and_csp_cover_approval_and_canvas_urls() {
         assert!(csp.contains("script-src 'self'"), "{path}");
         assert!(csp.contains("sha256-"), "{path}");
         assert!(csp.contains("style-src 'self'"), "{path}");
+        assert!(csp.contains("connect-src 'self'"), "{path}");
         assert!(!csp.contains("unsafe-inline"), "{path}");
         assert!(csp.contains("frame-ancestors 'none'"), "{path}");
         assert_eq!(
@@ -1946,6 +2200,11 @@ fn canvas_headers_and_csp_cover_approval_and_canvas_urls() {
         assert_eq!(
             header_value(&head, "referrer-policy").as_deref(),
             Some("no-referrer")
+        );
+        assert_eq!(
+            header_value(&head, "permissions-policy").as_deref(),
+            Some("publickey-credentials-get=(self)"),
+            "{path}: WebAuthn get() is allowed for this origin"
         );
     }
     let (status, head, _) = rig.get_full("/approve/canvas", Some("https://elsewhere.example"));
@@ -2229,10 +2488,17 @@ fn canvas_chat_relays_the_stream_chunk_by_chunk() {
     let mut rest = body_so_far;
     stream.read_to_end(&mut rest).expect("the streamed body");
     let text = String::from_utf8_lossy(&rest);
-    assert!(text.contains("data: first"));
-    assert!(text.contains("data: second"));
+    let events = sse_events(&rest);
+    assert_eq!(
+        events,
+        vec![
+            ("message".to_string(), "first".to_string()),
+            ("message".to_string(), "second".to_string()),
+        ],
+        "{text}"
+    );
     assert!(
-        !text.contains("event: arca-cut"),
+        events.iter().all(|(event, _)| event != "arca-cut"),
         "a complete stream carries no cut event"
     );
     assert!(
@@ -2441,10 +2707,14 @@ fn canvas_chat_stream_cap_is_cut() {
     assert_eq!(status, 200);
     let mut body = initial;
     stream.read_to_end(&mut body).expect("the streamed body");
-    assert_cut(&body, "cap");
+    let reason = cut_reason(&body);
+    assert!(
+        matches!(reason.as_str(), "cap" | "full"),
+        "a flood is cut by the byte cap or by the full relay queue, not {reason}"
+    );
     assert!(
         body.len() < CHAT_STREAM_MAX + 64 * 1024,
-        "the cap stopped the upstream stream"
+        "the cut stopped the upstream stream before its cap"
     );
 }
 
@@ -2796,7 +3066,7 @@ fn canvas_cookie_cannot_approve_or_reach_mcp() {
     assert!(!String::from_utf8_lossy(&body).contains("approved"));
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
     let clock: Clock = Arc::new(|| NOW);
-    let handlers = plan_handlers(Arc::clone(&rig.kernel), clock);
+    let handlers = plan_handlers(Arc::clone(&rig.kernel), clock, None);
     let submit = handlers
         .iter()
         .find(|(name, _)| *name == "approval_submit")
@@ -2931,6 +3201,21 @@ fn zero_keys_pages_serve_empty_ids_and_skip_webauthn() {
         assert!(!source.contains("__ARCA_CREDENTIAL_IDS__"), "{path}");
         assert!(source.contains("if (!allowCredentials.length)"), "{path}");
     }
+}
+
+#[test]
+fn action_cards_render_every_kernel_detail_row_as_text() {
+    let html = include_str!("../src/approve_page.html");
+    assert!(
+        html.contains("const details = Array.isArray(plan.details) ? plan.details : [];")
+            && html
+                .contains("for (const detail of details) fact(detail.label, detail.value, false);"),
+        "the action card renders every details row"
+    );
+    assert!(
+        !html.contains("innerHTML"),
+        "the page builds rows with textContent, never innerHTML"
+    );
 }
 
 #[test]

@@ -416,6 +416,7 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "watch_report",
             "journal_list",
             "plan_list",
+            "action_propose",
             "alerts_list",
             "postgres_list",
             "ontology_query",
@@ -500,6 +501,17 @@ fn a_listed_tool_carries_its_schemas_and_annotations() {
         .expect("write_probe")
         .clone();
     assert_eq!(probe["annotations"]["readOnlyHint"], false);
+    let propose = tools
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|t| t["name"] == "action_propose")
+        .expect("action_propose")
+        .clone();
+    assert_eq!(
+        propose["annotations"]["readOnlyHint"], false,
+        "a proposal records a durable event, so it is not read-only"
+    );
     for tool in tools.as_array().expect("tools") {
         assert_eq!(
             tool["outputSchema"]["properties"]["truncated"]["const"], true,

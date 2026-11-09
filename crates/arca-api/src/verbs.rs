@@ -69,7 +69,15 @@ pub struct Verb {
     pub cut: fn(&Value) -> Option<Value>,
 }
 
-static VERBS: [Verb; 25] = [
+impl Verb {
+    /// Whether the MCP door advertises `readOnlyHint`. A verb that records a durable proposal is not read-only even
+    /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
+    pub fn read_only_hint(&self) -> bool {
+        !self.writes && self.name != "action_propose"
+    }
+}
+
+static VERBS: [Verb; 26] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -142,7 +150,7 @@ static VERBS: [Verb; 25] = [
     },
     Verb {
         name: "plan_list",
-        summary: "The delete plans waiting for an owner's approval, each with the exact statement the owner signs.",
+        summary: "The delete plans and action proposals waiting for an owner's approval. Delete plans carry the exact statement the owner signs; action proposals carry their action, arguments and kernel-built summary.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -153,6 +161,20 @@ static VERBS: [Verb; 25] = [
         cut: no_cut,
         params: plan_list_params,
         result: plan_list_result,
+    },
+    Verb {
+        name: "action_propose",
+        summary: "Records an inert service or database action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_action_propose,
+        cut: no_cut,
+        params: action_propose_params,
+        result: action_propose_result,
     },
     Verb {
         name: "plan_decline",
@@ -475,6 +497,15 @@ pub fn summary_plans(v: &Value) -> String {
     format!(
         "{} waiting plan(s)",
         v["plans"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `action_propose`.
+pub fn summary_action_propose(v: &Value) -> String {
+    format!(
+        "{} proposed: {}",
+        v["id"].as_str().unwrap_or("?"),
+        v["summary"].as_str().unwrap_or("?")
     )
 }
 
@@ -886,7 +917,73 @@ fn plan_list_params() -> Value {
 }
 
 fn plan_list_result() -> Value {
-    result(vec![("plans", true, array(plan()))])
+    result(vec![(
+        "plans",
+        true,
+        json!({ "type": "array", "items": json!({ "anyOf": [plan(), action_proposal()] }) }),
+    )])
+}
+
+/// The eight verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 7] = [
+    "service_create",
+    "service_remove",
+    "service_publish",
+    "service_unpublish",
+    "service_connect",
+    "service_disconnect",
+    "postgres_create",
+];
+
+/// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
+fn plan_ref() -> Value {
+    json!({
+        "maxLength": 68,
+        "minLength": 16,
+        "pattern": "^(?:[0-9a-f]{64}|act-[0-9a-f]{12})$",
+        "type": "string"
+    })
+}
+
+fn action_propose_params() -> Value {
+    params(vec![
+        ("action", true, one_of(&ACTION_NAMES)),
+        ("args", true, json!({ "type": "object" })),
+    ])
+}
+
+fn action_propose_result() -> Value {
+    action_proposal()
+}
+
+/// An action proposal. `statement` is optional because `plan_list` omits it; the open approval page adds it.
+fn action_proposal() -> Value {
+    result(vec![
+        ("kind", true, json!({ "const": "action", "type": "string" })),
+        (
+            "id",
+            true,
+            json!({
+                "maxLength": 16,
+                "minLength": 16,
+                "pattern": "^act-[0-9a-f]{12}$",
+                "type": "string"
+            }),
+        ),
+        ("action", true, one_of(&ACTION_NAMES)),
+        ("summary", true, string()),
+        ("details", true, array(detail())),
+        ("args", true, json!({ "type": "object" })),
+        ("argsDigest", true, hex64()),
+        ("createdAt", true, int()),
+        ("expiresAt", true, int()),
+        ("statement", false, string()),
+    ])
+}
+
+/// One argument the owner is shown for an action proposal.
+fn detail() -> Value {
+    result(vec![("label", true, string()), ("value", true, string())])
 }
 
 /// A delete plan: its digest, its entry, its times, the objects it deletes, the digest of its arguments and the exact
@@ -921,12 +1018,12 @@ fn object_ref() -> Value {
 }
 
 fn plan_decline_params() -> Value {
-    params(vec![("plan", true, hex64())])
+    params(vec![("plan", true, plan_ref())])
 }
 
 fn plan_decline_result() -> Value {
     result(vec![
-        ("plan", true, hex64()),
+        ("plan", true, plan_ref()),
         ("retained", true, array(object_ref())),
     ])
 }

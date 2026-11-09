@@ -257,6 +257,7 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "watch_report",
             "journal_list",
             "plan_list",
+            "action_propose",
             "alerts_list",
             "postgres_list",
             "ontology_query",

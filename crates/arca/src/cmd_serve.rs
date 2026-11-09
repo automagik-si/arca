@@ -40,9 +40,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    AlertsExport, AlertsHandler, AlertsPublished, Clock, JournalListHandler, MetricsExport,
-    MetricsHandler, OntologyQuery, Published, SAMPLE_INTERVAL, StatusHandler, Ticker,
-    TokenListHandler, WatchHandler, new_sampler, now_ms, plan_handlers, spawn_watcher,
+    ActionExecutor, AlertsExport, AlertsHandler, AlertsPublished, Clock, JournalListHandler,
+    MetricsExport, MetricsHandler, OntologyQuery, Published, SAMPLE_INTERVAL, StatusHandler,
+    Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms, plan_handlers, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -246,21 +246,27 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         )
         .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
-    for (verb, handler) in plan_handlers(Arc::clone(&kernel), clock.clone())
-        .into_iter()
-        .chain(crate::handlers::postgres_handlers(
-            kernel.clone(),
-            clock.clone(),
-            Arc::new(cfg.clone()),
-        ))
-        .chain(crate::handlers::service_handlers(
-            kernel.clone(),
-            clock.clone(),
-            Arc::new(cfg.clone()),
-        ))
-    {
-        server = server.handle(verb, handler);
+    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers(
+        Arc::clone(&kernel),
+        clock.clone(),
+        cfg.kernel.postgres_image.clone(),
+    )
+    .into_iter()
+    .chain(crate::handlers::postgres_handlers(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+    ))
+    .chain(crate::handlers::service_handlers(
+        kernel.clone(),
+        clock.clone(),
+        Arc::new(cfg.clone()),
+    ))
+    .collect();
+    for (verb, handler) in &action_handlers {
+        server = server.handle(verb, Arc::clone(handler));
     }
+    let actions = ActionExecutor::new(action_handlers);
     let router = server.router();
     let page = cfg.approval_origin.clone().map(|origin| {
         crate::approve_page::Page::new(
@@ -271,6 +277,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(crate::approve_page::DesktopDisplay),
         )
         .with_canvas_origin(&cfg.canvas_origin)
+        .with_actions(actions)
     });
     let proxy_router = match &page {
         Some(page) => router.clone().merge(page.router(true)),

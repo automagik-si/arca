@@ -228,6 +228,17 @@
     border-radius: var(--arca-r-sm); background: var(--arca-fill);
     font: var(--arca-text-sm)/1.6 var(--arca-mono); overflow-wrap: anywhere; user-select: all;
   }
+  .action-facts { display: grid; gap: 0; margin: 0 0 var(--arca-space-4); }
+  .action-fact {
+    display: flex; align-items: baseline; gap: var(--arca-space-3);
+    padding: var(--arca-space-2) 0; border-top: 1px solid var(--arca-line);
+  }
+  .action-fact:last-child { border-bottom: 1px solid var(--arca-line); }
+  .action-fact dt { flex: none; width: 6.5rem; color: var(--arca-muted); font-size: var(--arca-text-sm); }
+  .action-fact dd { min-width: 0; margin: 0; font-weight: 550; overflow-wrap: anywhere; }
+  .action-fact code { font-size: var(--arca-text-sm); }
+  .actions { display: flex; gap: var(--arca-space-2); }
+  .actions .approve { flex: 1; }
 
   /* buttons */
   .btn {
@@ -570,6 +581,48 @@ function planCard(plan) {
   return card;
 }
 
+function actionCard(plan) {
+  const card = el("article", "card plan action");
+  const meta = el("div", "plan-meta");
+  const expiry = el("time", "expiry");
+  expiry.dateTime = new Date(plan.expiresAt).toISOString();
+  expiry.title = new Date(plan.expiresAt).toLocaleString();
+  if (plan.expiresAt - Date.now() < 5 * 60000) expiry.classList.add("soon");
+  expiry.append(icon("clock"), expiryText(plan.expiresAt));
+  meta.append(el("span", "badge", "Action"), expiry);
+
+  const heading = el("h3", "", plan.summary);
+  const facts = el("dl", "action-facts");
+  const fact = (label, value, code) => {
+    const row = el("div", "action-fact");
+    row.append(el("dt", "", label));
+    const detail = el("dd");
+    detail.append(code ? el("code", "", value) : document.createTextNode(value));
+    row.append(detail);
+    facts.append(row);
+  };
+  const details = Array.isArray(plan.details) ? plan.details : [];
+  for (const detail of details) fact(detail.label, detail.value, false);
+  fact("Action", plan.action, true);
+  fact("Target", plan.id, true);
+  const digest = plan.argsDigest || "";
+  fact("Fingerprint", digest.slice(0, 8) + "…" + digest.slice(-4), true);
+
+  const buttons = el("div", "actions");
+  const approveButton = el("button", "btn btn-primary btn-big approve");
+  approveButton.type = "button";
+  approveButton.setAttribute("aria-label", "Approve: " + plan.summary);
+  approveButton.append(icon("key"), "Approve");
+  approveButton.addEventListener("click", () => approve(plan, approveButton));
+  const declineButton = el("button", "btn btn-secondary", "Decline");
+  declineButton.type = "button";
+  declineButton.addEventListener("click", () => decline(plan, declineButton));
+  buttons.append(approveButton, declineButton);
+
+  card.append(meta, heading, facts, buttons);
+  return card;
+}
+
 function showTrusted(count) {
   document.getElementById("trusted").textContent = String(count);
   document.body.dataset.trusted = count > 0 ? "yes" : "no";
@@ -588,10 +641,10 @@ async function loadPlans() {
     showTrusted(body.passkeysTrusted || 0);
     target.replaceChildren();
     if (!body.plans.length) {
-      target.append(notice("empty", "Nothing to approve", "When Arca wants to delete something, it will wait here for your OK."));
+      target.append(notice("empty", "Nothing to approve", "When Arca wants to change or delete something, it will wait here for your OK."));
       return;
     }
-    for (const plan of body.plans) target.append(planCard(plan));
+    for (const plan of body.plans) target.append(plan.kind === "action" ? actionCard(plan) : planCard(plan));
   } catch (error) {
     const card = notice("problem", "Couldn't load what's waiting", "Your plans are safe. Nothing changes until you approve it.");
     const retry = el("button", "btn btn-secondary", "Try again");
@@ -797,10 +850,11 @@ async function approve(plan, button) {
   try {
     const proof = await trustedProof(plan.statement);
     const approval = b64(enc.encode(plan.statement)) + "." + b64(enc.encode(JSON.stringify(proof)));
+    const id = plan.id || plan.plan;
     const answer = await fetch("/approve/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ plan: plan.plan, approval }),
+      body: JSON.stringify({ plan: id, approval }),
     });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) {
@@ -808,10 +862,38 @@ async function approve(plan, button) {
       refused.refusal = body.refusal;
       throw refused;
     }
-    const deleted = (body.deleted || []).length;
-    status("Approved. " + deleted + " item" + (deleted === 1 ? "" : "s") + " deleted.", "ok");
+    if (plan.kind === "action") {
+      status("Approved. " + plan.action + " ran.", "ok");
+    } else {
+      const deleted = (body.deleted || []).length;
+      status("Approved. " + deleted + " item" + (deleted === 1 ? "" : "s") + " deleted.", "ok");
+    }
     await loadPlans();
     await loadPasskeys();
+  } catch (error) {
+    fail(error);
+    button.disabled = false;
+  }
+}
+
+async function decline(plan, button) {
+  button.disabled = true;
+  status("Declining…", "wait");
+  try {
+    const id = plan.id || plan.plan;
+    const answer = await fetch("/approve/decline", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan: id }),
+    });
+    const body = await answer.json().catch(() => ({}));
+    if (!answer.ok) {
+      const refused = new Error(body.refusal || ("the decline answered " + answer.status));
+      refused.refusal = body.refusal;
+      throw refused;
+    }
+    status("Declined. Nothing changed.", "ok");
+    await loadPlans();
   } catch (error) {
     fail(error);
     button.disabled = false;
