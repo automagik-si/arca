@@ -363,8 +363,12 @@ An approval card shows, from the kernel's `/approve/plans` row matched by id:
   arguments (the id hashes only those) are never confused; the card signature
   includes it, so a changed host re-renders the card;
 - for `gpu_attach` / `gpu_detach`, a page-built **Slot** row next to Host, which
-  maps the proposal's PCI address through that host's inventory (for example
-  `GPU 2 on alpha`) so two identical cards are unmistakable;
+  maps the proposal's PCI address through the page host's dashboard inventory
+  (for example `GPU 2 on alpha (0000:02:00.0)`) so two identical cards are
+  unmistakable. The signed statement's host name (`alpha.example`) is not
+  compared with the dashboard name (`alpha`); a plan from `/approve/plans` is
+  always the page kernel's own plan, and a PCI absent from that inventory draws
+  no Slot row;
 - the kernel-built `summary`, as text;
 - every `details` row (`label` and `value`) in kernel order, as text;
 - the action, the target id and the first 12 hex characters of `argsDigest`;

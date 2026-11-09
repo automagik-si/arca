@@ -1340,18 +1340,20 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     return note;
   }
 
-  // The Slot row is page-built: it maps the kernel proposal's PCI back to the host inventory so the
-  // owner can see which physical card a "GPU 2" suggestion means. Kernel details rows are untouched.
+  // The Slot row is page-built: every plan from /approve/plans is the page kernel's own plan, so map its
+  // PCI through pageHost's dashboard inventory. Plan.host is the approval hostname from the signed
+  // statement ("alpha.example") while pageHost is the dashboard name ("alpha"); comparing them would
+  // never match. There is no other host or single-host fallback: no match in this inventory, no row.
+  // Kernel details rows are untouched.
   function planGpuSlot(plan) {
     if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
-    const hosts = state.dashboard?.hosts ?? [];
-    const wanted = text(plan.host).trim().toLowerCase();
     const pageHost = text(state.envelope.pageHost).trim();
-    let host = hosts.find((candidate) => candidate.name.toLowerCase() === wanted);
-    if (!host && pageHost) host = hosts.find((candidate) => candidate.name === pageHost);
-    if (!host && hosts.length === 1) host = hosts[0];
-    const gpu = host?.gpus?.find((candidate) => candidate.pci === plan.pci);
-    return gpu && host ? { slot: gpu.slotLabel, host: host.name } : null;
+    if (!pageHost) return null;
+    const host = (state.dashboard?.hosts ?? [])
+      .find((candidate) => candidate.name.toLowerCase() === pageHost.toLowerCase());
+    if (!host) return null;
+    const gpu = host.gpus?.find((candidate) => candidate.pci === plan.pci);
+    return gpu ? { slot: gpu.slotLabel, host: host.name, pci: gpu.pci } : null;
   }
 
   function proposalCard(doc, id) {
@@ -1389,7 +1391,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       const slotRow = el(doc, 'div', 'arca-approval-fact arca-approval-slot');
       slotRow.dataset.slot = 'true';
       slotRow.dataset.pageBuilt = 'slot';
-      slotRow.append(el(doc, 'dt', '', 'Slot'), el(doc, 'dd', '', `${slot.slot} on ${slot.host}`));
+      slotRow.append(el(doc, 'dt', '', 'Slot'), el(doc, 'dd', '', `${slot.slot} on ${slot.host} (${slot.pci})`));
       facts.append(slotRow);
     }
     for (const row of plan.details) {
@@ -1628,7 +1630,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   function approvalSignature() {
     return JSON.stringify({
       plans: [...approvals.plans.values()].map((plan) => [
-        plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.host, plan.details,
+        plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.host, plan.pci, plan.details,
       ]),
       deletes: approvals.deletes.map((plan) => plan.id),
       cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),

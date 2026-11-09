@@ -1931,14 +1931,12 @@
     }
     function planGpuSlot(plan) {
       if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
-      const hosts = state.dashboard?.hosts ?? [];
-      const wanted = text2(plan.host).trim().toLowerCase();
       const pageHost = text2(state.envelope.pageHost).trim();
-      let host = hosts.find((candidate) => candidate.name.toLowerCase() === wanted);
-      if (!host && pageHost) host = hosts.find((candidate) => candidate.name === pageHost);
-      if (!host && hosts.length === 1) host = hosts[0];
-      const gpu = host?.gpus?.find((candidate) => candidate.pci === plan.pci);
-      return gpu && host ? { slot: gpu.slotLabel, host: host.name } : null;
+      if (!pageHost) return null;
+      const host = (state.dashboard?.hosts ?? []).find((candidate) => candidate.name.toLowerCase() === pageHost.toLowerCase());
+      if (!host) return null;
+      const gpu = host.gpus?.find((candidate) => candidate.pci === plan.pci);
+      return gpu ? { slot: gpu.slotLabel, host: host.name, pci: gpu.pci } : null;
     }
     function proposalCard(doc2, id) {
       const key = proposalId({ id });
@@ -1973,7 +1971,7 @@
         const slotRow = el(doc2, "div", "arca-approval-fact arca-approval-slot");
         slotRow.dataset.slot = "true";
         slotRow.dataset.pageBuilt = "slot";
-        slotRow.append(el(doc2, "dt", "", "Slot"), el(doc2, "dd", "", `${slot.slot} on ${slot.host}`));
+        slotRow.append(el(doc2, "dt", "", "Slot"), el(doc2, "dd", "", `${slot.slot} on ${slot.host} (${slot.pci})`));
         facts.append(slotRow);
       }
       for (const row of plan.details) {
@@ -2215,6 +2213,7 @@ ${statement}`)
           plan.argsDigest,
           plan.expiresAt,
           plan.host,
+          plan.pci,
           plan.details
         ]),
         deletes: approvals.deletes.map((plan) => plan.id),

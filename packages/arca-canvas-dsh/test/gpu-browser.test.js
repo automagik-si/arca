@@ -199,6 +199,18 @@ test('GPU cards render per machine, name their users, and keep the approval safe
       res.end(JSON.stringify({ plans: [plan], passkeysTrusted: 1 }));
       return;
     }
+    if (path === '/test/gpu-plan-pci-missing') {
+      plan.args.pci = '0000:09:00.0';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
+    if (path === '/test/gpu-plan-pci-restore') {
+      plan.args.pci = '0000:02:00.0';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+      return;
+    }
     if (path === '/approve') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end('<!doctype html><html><body data-credential-ids=\'["AQID"]\'></body></html>');
@@ -312,10 +324,21 @@ test('GPU cards render per machine, name their users, and keep the approval safe
     node.querySelector('dt').textContent, node.querySelector('dd').textContent,
   ]));
   assert.deepEqual(rows, plan.details.map((row) => [row.label, row.value]));
-  assert.equal(await card.locator('.arca-approval-slot dd').innerText(), 'GPU 2 on alpha');
+  // The statement host is the approval hostname while the dashboard host is alpha: the Slot row maps
+  // the PCI through pageHost's inventory and must still draw.
+  assert.equal(await card.locator('.arca-approval-fact[data-detail="host"] dd').innerText(), 'alpha.example');
+  assert.equal(await card.locator('.arca-approval-slot dd').innerText(), 'GPU 2 on alpha (0000:02:00.0)');
   assert.equal(rows[3][0], 'Effect');
   assert.equal(rows[3][1], EFFECT, 'the Effect safety sentence is never shortened');
   assert.equal(await card.locator('[data-technical="action"] dd').innerText(), 'gpu_attach');
+
+  // A PCI that is not in pageHost's inventory draws no Slot row.
+  await page.evaluate(() => fetch('/test/gpu-plan-pci-missing'));
+  await page.waitForFunction((id) => !document.querySelector(`.arca-chat-view .arca-proposal[data-proposal="${id}"] .arca-approval-slot`), GPU_ID);
+  assert.equal(await card.locator('.arca-approval-slot').count(), 0);
+  await page.evaluate(() => fetch('/test/gpu-plan-pci-restore'));
+  await page.waitForFunction((id) => Boolean(document.querySelector(`.arca-chat-view .arca-proposal[data-proposal="${id}"] .arca-approval-slot`)), GPU_ID);
+  assert.equal(await card.locator('.arca-approval-slot dd').innerText(), 'GPU 2 on alpha (0000:02:00.0)');
 
   if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
     await mkdir(process.env.ARCA_CANVAS_EVIDENCE_DIR, { recursive: true });
