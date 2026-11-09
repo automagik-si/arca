@@ -24,6 +24,7 @@ pub mod desired_store;
 pub mod gpu;
 pub mod handlers;
 pub mod kernel;
+pub mod linked;
 mod passkey_change;
 pub mod service;
 pub mod service_exec;

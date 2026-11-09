@@ -320,6 +320,18 @@ pub fn kernel_with_image(
     now: u64,
     postgres_image: Option<&str>,
 ) -> Result<Kernel, arca_kernel::KernelError> {
+    kernel_on_host(scratch, fake, verifier, now, postgres_image, HOST)
+}
+
+/// The same kernel, whose approval statements name `host`.
+pub fn kernel_on_host(
+    scratch: &Scratch,
+    fake: &FakeIncus,
+    verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
+    now: u64,
+    postgres_image: Option<&str>,
+    host: &str,
+) -> Result<Kernel, arca_kernel::KernelError> {
     let mut plugins = PluginSet::new();
     plugins.add::<Toy>().expect("the toy plugin is valid");
     let socket = fake.socket().to_path_buf();
@@ -329,7 +341,7 @@ pub fn kernel_with_image(
         node_key_at(&scratch.dir),
         plugins,
         verifier,
-        HOST.to_string(),
+        host.to_string(),
         postgres_image,
         move |retained| {
             let provider = IncusProvider::new(socket, family(), secrets, retained)

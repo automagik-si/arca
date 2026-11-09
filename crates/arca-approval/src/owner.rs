@@ -36,15 +36,21 @@ impl OwnerKeys {
         self.passkeys.replace_lines(lines);
     }
 
-    /// Verifies a passkey assertion over `statement`, sharing the approval verifier's sign-count store. SSH proofs are not
-    /// accepted here; the sign-in route only asks this for a WebAuthn proof.
+    /// Verifies a passkey assertion over `statement` against this kernel's own passkeys, sharing the approval verifier's
+    /// sign-count store. SSH proofs and other kernels' passkeys are not accepted here; the sign-in route only asks this for a
+    /// WebAuthn proof by a passkey this kernel holds.
     pub fn verify_passkey(
         &self,
         namespace: &str,
         statement: &[u8],
         signature: &[u8],
     ) -> Result<String, ApprovalRefusal> {
-        self.passkeys.verify(namespace, statement, signature)
+        self.passkeys.verify_own(namespace, statement, signature)
+    }
+
+    /// The other kernels' passkeys files trusted for approvals.
+    pub fn foreign(&self) -> &crate::foreign::ForeignPasskeys {
+        self.passkeys.foreign()
     }
 }
 

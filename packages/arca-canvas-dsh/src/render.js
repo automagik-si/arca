@@ -34,6 +34,20 @@ export const APPROVAL_REFUSAL_CODES = Object.freeze([
   'Expired', 'TtlTooLong', 'Replayed', 'Untrusted', 'Storage', 'Unresolved', 'NoSuchPlan',
 ]);
 const APPROVAL_REFUSALS = new Set(APPROVAL_REFUSAL_CODES);
+// The page host answers these itself when it relays an approval to a linked machine. None of them is the
+// action's own refusal: NotLinked, LinkToken and Unreachable mean the linked machine was never asked.
+const RELAY_REFUSALS = Object.freeze({
+  NotLinked: 'This machine is not linked for approvals yet. Nothing changed.',
+  LinkToken: 'This page is not allowed to approve on that machine yet. Nothing changed.',
+  Unreachable: 'That machine could not be reached just now. Reload the page to see whether the change still waits.',
+  Failed: 'That machine could not finish this approval. Check Steps to see whether it ran.',
+});
+
+// A card is keyed by its proposal id on the page host, and by machine and id on a linked machine: two
+// machines record the same id for the same change, and each must keep its own card.
+export function approvalKey(host, id) {
+  return host ? `${host}|${id}` : id;
+}
 const FINISHED_STATES = new Set(['done', 'declined', 'failed', 'expired']);
 const REFUSALS = Object.freeze({
   Malformed: 'Arca could not read this approval. Try again from the card.',
@@ -92,6 +106,7 @@ function expiryText(expiresAt, now = Date.now()) {
 // A refusal code the kernel named as an approval refusal gets its plain sentence. This is also the
 // decline path, where any unrecognized refusal stays neutral.
 export function approvalRefusalText(refusal) {
+  if (typeof refusal === 'string' && Object.hasOwn(RELAY_REFUSALS, refusal)) return RELAY_REFUSALS[refusal];
   if (typeof refusal === 'string' && APPROVAL_REFUSALS.has(refusal)) return REFUSALS[refusal];
   return NEUTRAL_REFUSAL;
 }
@@ -112,6 +127,7 @@ function plainActionError(body) {
 export function approvalErrorText(body) {
   const refusal = body?.refusal;
   if (typeof refusal === 'string' && refusal) {
+    if (Object.hasOwn(RELAY_REFUSALS, refusal)) return RELAY_REFUSALS[refusal];
     return APPROVAL_REFUSALS.has(refusal) ? REFUSALS[refusal] : plainActionError(body);
   }
   if (typeof body?.message === 'string' && body.message.trim()) return plainActionError(body);
@@ -838,7 +854,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   // response. The model's text never enters a card: a proposal id from a real arca_propose call only selects
   // which kernel row to draw.
   const approvals = {
-    plans: new Map(), deletes: [], cards: new Map(), passkeysTrusted: 0,
+    plans: new Map(), deletes: [], cards: new Map(), passkeysTrusted: 0, linkedHosts: new Set(),
     loaded: false, error: '', fetching: false, credentialIds: null, announced: new Map(), fetchStartedAt: 0,
   };
   let approvalInflight = null;
@@ -1121,21 +1137,20 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         for (const tool of message.tools) tools.append(chatToolCard(doc, tool));
         node.append(tools);
       }
-      const pageHost = text(state.envelope.pageHost).trim();
       const proposed = new Set();
       for (const tool of message.tools) {
-        const id = proposalId(tool.proposal);
-        if (!id || proposed.has(id)) continue;
-        // Only the kernel that serves this page may attach a card. A tool event for another host, or one
-        // whose host is not known, never draws the page kernel's row.
-        if (!pageHost || tool.host !== pageHost) continue;
-        proposed.add(id);
-        const card = proposalCard(doc, id);
+        // A card is drawn only from the row of the kernel the tool named: the page host's own row, or the
+        // row a linked machine listed through the page host. A tool event for any other host, or one
+        // whose host is not known, never draws a row.
+        const key = toolCardKey(tool);
+        if (!key || proposed.has(key)) continue;
+        proposed.add(key);
+        const card = proposalCard(doc, key);
         if (card) node.append(card);
         else if (approvals.loaded && !approvals.error
-          && approvals.announced.has(id)
-          && approvals.fetchStartedAt >= (approvals.announced.get(id) ?? 0)) {
-          node.append(missingProposalNote(doc, id));
+          && approvals.announced.has(key)
+          && approvals.fetchStartedAt >= (approvals.announced.get(key) ?? 0)) {
+          node.append(missingProposalNote(doc, key));
         }
       }
       for (const note of message.notes ?? []) node.append(chatNotice(doc, note.kind, note.title, note.body));
@@ -1154,9 +1169,24 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   const approvalConfigured = () => Boolean(approvalUrl(state.envelope.approvalUrl));
 
-  function approvalCardFor(id) {
-    const key = proposalId({ id });
-    if (!key) return null;
+  // The card key of a proposal tool event: the id on the page host, machine and id on a linked machine,
+  // or '' for a host this page does not serve.
+  function toolCardKey(tool) {
+    const id = proposalId(tool?.proposal);
+    const pageHost = text(state.envelope.pageHost).trim();
+    if (!id || !pageHost || typeof tool?.host !== 'string') return '';
+    if (tool.host === pageHost) return id;
+    return approvals.linkedHosts.has(tool.host) ? approvalKey(tool.host, id) : '';
+  }
+
+  // The proposal id a card key names, or '' when the key is not one.
+  function keyId(key) {
+    const id = typeof key === 'string' ? key.slice(key.lastIndexOf('|') + 1) : '';
+    return proposalId({ id });
+  }
+
+  function approvalCardFor(key) {
+    if (!keyId(key)) return null;
     let card = approvals.cards.get(key);
     if (!card) {
       // A tool may name an id whose kernel row is not here yet. Do not create a card from the tool alone:
@@ -1193,6 +1223,11 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   function parseApprovalPlans(body) {
     const plans = new Map();
     const deletes = [];
+    const linked = new Set();
+    for (const entry of Array.isArray(body?.linkedHosts) ? body.linkedHosts : []) {
+      const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
+      if (name) linked.add(name);
+    }
     for (const row of Array.isArray(body?.plans) ? body.plans : []) {
       if (!row || typeof row !== 'object') continue;
       if (row.kind === 'action') {
@@ -1214,16 +1249,22 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         if (!host) continue;
         const pci = GPU_ACTIONS.has(row.action) && row.args && typeof row.args === 'object'
           ? normalizePci(row.args.pci) : '';
-        plans.set(id, {
+        // A row a linked machine listed names that machine; its card posts the machine back so the page
+        // host relays the approval there. A linked row the page host did not list as linked is dropped.
+        const linkedHost = typeof row.linkedHost === 'string' ? row.linkedHost.trim() : '';
+        if (row.linkedHost !== undefined && (!linkedHost || !linked.has(linkedHost))) continue;
+        plans.set(approvalKey(linkedHost, id), {
           kind: 'action', id, action: row.action, summary, argsDigest: digest, details, expiresAt,
-          host, statement: row.statement, pci,
+          host, statement: row.statement, pci, linkedHost,
         });
-      } else if (typeof row.plan === 'string' && /^[0-9a-f]{64}$/.test(row.plan)) {
+      } else if (row.linkedHost === undefined && typeof row.plan === 'string' && /^[0-9a-f]{64}$/.test(row.plan)) {
         deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
       }
     }
     const trusted = Number(body?.passkeysTrusted);
-    return { plans, deletes, passkeysTrusted: Number.isInteger(trusted) && trusted > 0 ? trusted : 0 };
+    return {
+      plans, deletes, linked, passkeysTrusted: Number.isInteger(trusted) && trusted > 0 ? trusted : 0,
+    };
   }
 
   async function readApprovalPlans() {
@@ -1285,6 +1326,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         }
         approvals.plans = next.plans;
         approvals.deletes = next.deletes;
+        approvals.linkedHosts = next.linked;
         approvals.passkeysTrusted = next.passkeysTrusted;
         approvals.error = '';
       } catch (error) {
@@ -1347,17 +1389,17 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   // Kernel details rows are untouched.
   function planGpuSlot(plan) {
     if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
-    const pageHost = text(state.envelope.pageHost).trim();
-    if (!pageHost) return null;
+    // A linked machine's row maps through that machine's inventory, never the page host's.
+    const owner = plan.linkedHost || text(state.envelope.pageHost).trim();
+    if (!owner) return null;
     const host = (state.dashboard?.hosts ?? [])
-      .find((candidate) => candidate.name.toLowerCase() === pageHost.toLowerCase());
+      .find((candidate) => candidate.name.toLowerCase() === owner.toLowerCase());
     if (!host) return null;
     const gpu = host.gpus?.find((candidate) => candidate.pci === plan.pci);
     return gpu ? { slot: gpu.slotLabel, host: host.name, pci: gpu.pci } : null;
   }
 
-  function proposalCard(doc, id) {
-    const key = proposalId({ id });
+  function proposalCard(doc, key) {
     const card = approvalCardFor(key);
     if (!card || !card.plan) return null;
     const plan = card.plan;
@@ -1385,6 +1427,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     const hostRow = el(doc, 'div', 'arca-approval-fact');
     hostRow.dataset.detail = 'host';
     hostRow.append(el(doc, 'dt', '', 'Host'), el(doc, 'dd', '', plan.host));
+    if (plan.linkedHost) hostRow.dataset.linkedHost = plan.linkedHost;
     facts.append(hostRow);
     const slot = planGpuSlot(plan);
     if (slot) {
@@ -1498,8 +1541,8 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     };
   }
 
-  async function approveProposal(id) {
-    const card = approvals.cards.get(id);
+  async function approveProposal(key) {
+    const card = approvals.cards.get(key);
     const plan = card?.plan;
     if (!card || card.state !== 'waiting' || !plan) return;
     if (!plan.statement) {
@@ -1527,7 +1570,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ plan: id, approval }),
+        body: JSON.stringify(plan.linkedHost
+          ? { plan: plan.id, approval, host: plan.linkedHost }
+          : { plan: plan.id, approval }),
         signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
       });
       const body = await response.json().catch(() => ({}));
@@ -1549,7 +1594,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       }
       setCardState(card, 'done');
       card.result = plainResult(plan.action, body?.result);
-      approvals.plans.delete(id);
+      approvals.plans.delete(key);
     } catch (error) {
       if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
         setCardState(card, 'waiting');
@@ -1570,11 +1615,13 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     }
   }
 
-  async function declineProposal(id) {
-    const card = approvals.cards.get(id);
+  async function declineProposal(key) {
+    const card = approvals.cards.get(key);
     if (!card || card.state !== 'waiting') return;
     // The page accepts only action proposal ids on this path. A delete plan keeps its own approval page flow.
-    if (!proposalId({ id })) return;
+    const id = keyId(key);
+    if (!id) return;
+    const linkedHost = card.plan?.linkedHost ?? '';
     card.busy = 'declining';
     updatePanel();
     try {
@@ -1582,7 +1629,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ plan: id }),
+        body: JSON.stringify(linkedHost ? { plan: id, host: linkedHost } : { plan: id }),
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {
@@ -1601,7 +1648,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         return;
       }
       setCardState(card, 'declined');
-      approvals.plans.delete(id);
+      approvals.plans.delete(key);
     } catch (error) {
       setCardState(card, 'failed');
       card.reason = plainError(error);
@@ -1631,9 +1678,11 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     return JSON.stringify({
       plans: [...approvals.plans.values()].map((plan) => [
         plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.host, plan.pci, plan.details,
+        plan.linkedHost,
       ]),
       deletes: approvals.deletes.map((plan) => plan.id),
       cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),
+      linked: [...approvals.linkedHosts],
       passkeysTrusted: approvals.passkeysTrusted,
       loaded: approvals.loaded,
       missing: announcedMissing(),
@@ -1664,7 +1713,12 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       if (card) Object.assign(card, data);
       else message.tools.push({ ...data });
       const proposedId = proposalId(data?.proposal);
-      if (proposedId && data?.host === text(state.envelope.pageHost).trim()) void confirmProposal(proposedId);
+      const pageHost = text(state.envelope.pageHost).trim();
+      // A proposal on a linked machine is confirmed by the page host's next listing, which also says
+      // whether that machine is linked; the card is drawn only if it is.
+      if (proposedId && pageHost && typeof data?.host === 'string' && data.host) {
+        void confirmProposal(data.host === pageHost ? proposedId : approvalKey(data.host, proposedId));
+      }
     } else if (event === 'budget') {
       const message = activeAssistant();
       const body = String(data?.message ?? 'Daily budget reached, try tomorrow.');
@@ -1784,18 +1838,16 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   });
   updateSend();
 
-  // Replay keeps the proposal id and the tool's host. Announce only proposals made on this page's kernel;
-  // an old or foreign host never attaches a card here.
+  // Replay keeps the proposal id and the tool's host. Announce proposals made on this page's kernel, and on a
+  // machine the page host lists as linked; an old or foreign host never attaches a card here.
   function announceHistoryProposals() {
-    const pageHost = text(state.envelope.pageHost).trim();
-    if (!pageHost) return [];
     const added = [];
     for (const message of chat.messages) {
       for (const tool of message.tools ?? []) {
-        const id = proposalId(tool.proposal);
-        if (!id || tool.host !== pageHost || approvals.announced.has(id)) continue;
-        approvals.announced.set(id, Date.now());
-        added.push(id);
+        const key = toolCardKey(tool);
+        if (!key || approvals.announced.has(key)) continue;
+        approvals.announced.set(key, Date.now());
+        added.push(key);
       }
     }
     return added;

@@ -61,6 +61,37 @@ pub struct NodeConfig {
     /// The node link endpoint and opaque ALPN routes.
     #[serde(default)]
     pub link: Option<arca_link::Config>,
+    /// Multi-host approvals on one machine: the other kernels' passkeys files this kernel also trusts, and the linked hosts
+    /// whose proposals this kernel's approval page lists and relays. Absent, a kernel trusts only its own owner keys and its
+    /// page serves only its own proposals.
+    #[serde(default)]
+    pub approval: Option<ApprovalConfig>,
+}
+
+/// The `approval` key. Every list may be empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovalConfig {
+    /// Other kernels' owner passkeys files, read read-only at each approval check. A file that is missing or cannot be trusted
+    /// adds no key.
+    #[serde(default)]
+    pub trust_owner_keys_from: Vec<PathBuf>,
+    /// The page origins a passkey from those files may answer from. Required when `trustOwnerKeysFrom` names a file.
+    #[serde(default)]
+    pub origins: Vec<String>,
+    /// The kernels on this machine whose waiting proposals this kernel's approval page lists and relays approvals to.
+    #[serde(default)]
+    pub linked_hosts: Vec<LinkedHost>,
+}
+
+/// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token the page relays
+/// with (scope `doctor`, and ideally limited to `plan_list`, `action_approve` and `plan_decline`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LinkedHost {
+    pub name: String,
+    pub socket: PathBuf,
+    pub token_file: PathBuf,
 }
 
 /// Where Incus listens, and which storage pools the sampler reports. The pools come from Incus's own pool list. `pools` is an
@@ -175,6 +206,8 @@ pub enum ConfigError {
     PostgresImage,
     /// The adoption allowlist or its attach networks break a rule. The text names the rule, never a value.
     Adopt(&'static str),
+    /// The `approval` key breaks a rule. The text names the rule, never a value.
+    Approval(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -206,6 +239,7 @@ impl fmt::Display for ConfigError {
                 "kernel.postgresImage must be a digest-pinned image reference (name@sha256:<64 hex>)"
             ),
             Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
+            Self::Approval(why) => write!(f, "approval is refused: {why}"),
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
@@ -290,6 +324,51 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     }
     if canvas_origin_addr(&config.canvas_origin).is_none() {
         return Err(ConfigError::CanvasOrigin);
+    }
+    if let Some(approval) = &config.approval {
+        check_approval(approval)?;
+    }
+    Ok(())
+}
+
+/// The `approval` rules: absolute trusted file paths with at least one origin, each origin an approval origin, and linked
+/// hosts with unique plain names and absolute socket and token paths.
+fn check_approval(approval: &ApprovalConfig) -> Result<(), ConfigError> {
+    if !approval
+        .trust_owner_keys_from
+        .iter()
+        .all(|path| path.is_absolute())
+    {
+        return Err(ConfigError::Approval(
+            "each trustOwnerKeysFrom file must be an absolute path",
+        ));
+    }
+    if !approval.trust_owner_keys_from.is_empty() && approval.origins.is_empty() {
+        return Err(ConfigError::Approval(
+            "origins must list the page origins the trusted files' passkeys answer from",
+        ));
+    }
+    if !approval
+        .origins
+        .iter()
+        .all(|origin| approval_origin_ok(origin))
+    {
+        return Err(ConfigError::Approval(
+            "each origin must be https://, a lowercase host name, and at most a non-443 port, with no path",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for host in &approval.linked_hosts {
+        if !host_name_ok(&host.name) || !names.insert(host.name.as_str()) {
+            return Err(ConfigError::Approval(
+                "each linked host needs a unique name of letters, digits, dots and hyphens",
+            ));
+        }
+        if !host.socket.is_absolute() || !host.token_file.is_absolute() {
+            return Err(ConfigError::Approval(
+                "each linked host's socket and tokenFile must be absolute paths",
+            ));
+        }
     }
     Ok(())
 }
@@ -479,6 +558,64 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(check(&config), Ok(()));
+    }
+
+    #[test]
+    fn the_approval_key_is_optional_and_its_rules_name_no_value() {
+        let mut config = config_with(None);
+        assert_eq!(
+            config.approval, None,
+            "absent, nothing more is trusted or linked"
+        );
+        let parse = |value: serde_json::Value| -> ApprovalConfig {
+            serde_json::from_value(value).expect("the approval key parses")
+        };
+        config.approval = Some(parse(serde_json::json!({
+            "trustOwnerKeysFrom": ["/var/lib/arca-alpha/owner-passkeys"],
+            "origins": ["https://alpha.example.com:8443"],
+            "linkedHosts": [
+                { "name": "beta", "socket": "/run/arca-beta/arca.sock", "tokenFile": "/etc/arca/beta-relay.secret" }
+            ]
+        })));
+        assert_eq!(check(&config), Ok(()));
+
+        for (bad, rule) in [
+            (
+                serde_json::json!({ "trustOwnerKeysFrom": ["/var/lib/arca-alpha/owner-passkeys"] }),
+                "origins must list",
+            ),
+            (
+                serde_json::json!({ "trustOwnerKeysFrom": ["relative/owner-passkeys"], "origins": ["https://alpha.example.com"] }),
+                "absolute path",
+            ),
+            (
+                serde_json::json!({ "origins": ["http://alpha.example.com"] }),
+                "each origin must be https://",
+            ),
+            (
+                serde_json::json!({ "linkedHosts": [
+                    { "name": "beta", "socket": "/run/b.sock", "tokenFile": "/etc/b" },
+                    { "name": "beta", "socket": "/run/c.sock", "tokenFile": "/etc/c" }
+                ] }),
+                "unique name",
+            ),
+            (
+                serde_json::json!({ "linkedHosts": [{ "name": "beta", "socket": "b.sock", "tokenFile": "/etc/b" }] }),
+                "absolute paths",
+            ),
+        ] {
+            config.approval = Some(parse(bad));
+            let refused = check(&config).expect_err("the approval key is refused");
+            assert!(matches!(refused, ConfigError::Approval(_)));
+            assert!(refused.to_string().contains(rule), "{refused}");
+            assert!(
+                !refused.to_string().contains("alpha.example"),
+                "no value is echoed"
+            );
+        }
+        let unknown: Result<ApprovalConfig, _> =
+            serde_json::from_value(serde_json::json!({ "trustOwnerKeys": [] }));
+        assert!(unknown.is_err(), "an unknown key is refused");
     }
 
     #[test]

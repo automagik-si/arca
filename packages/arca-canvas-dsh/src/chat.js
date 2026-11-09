@@ -347,8 +347,8 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
     '- For a GPU attach or detach, propose gpu_attach or gpu_detach with the instance and the card\'s exact',
     '  PCI address. The approval card shows the project, instance, card and safety effect; never shorten it.',
-    `- You can propose changes only on ${proposeHost} from here for now. Another host is refused because its`,
-    '  approval page is not this one.',
+    `- You can propose changes on ${proposeHost} and on any machine linked to it for approvals. Another machine is`,
+    '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
     approvalLine,
   ].join('\n');
@@ -752,19 +752,37 @@ const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name
   + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}; '
   + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}.';
 
+export const NOT_LINKED = 'this machine is not linked for approvals yet';
+
+// The page host's kernel names the machines it relays approvals to in arca_status (approval.linkedHosts). A read that
+// fails links nothing, so a proposal is never recorded where the owner could not approve it.
+async function linkedHostsOf(client, signal) {
+  if (!client) return [];
+  try {
+    const status = await client.call('arca_status', {}, signal);
+    const names = status?.approval?.linkedHosts;
+    return Array.isArray(names) ? names.filter((name) => typeof name === 'string' && name) : [];
+  } catch {
+    return [];
+  }
+}
+
 // The one non-read tool: it records an inert proposal for the owner and changes nothing. The kernel checks the
 // action name and its arguments again, so this list is an explicit fence rather than the only validation.
+// A proposal goes to the page host, or to a host the page host's kernel lists as linked for approvals; the
+// target kernel records it and later verifies the owner's passkey itself. Any other host is refused.
 export function createProposeTool({ hosts = [], clientFor, onCall, onProposal, proposalHost = '' } = {}) {
   const pageHost = hosts.find((host) => host.name === proposalHost)?.name ?? hosts[0]?.name ?? '';
+  const where = pageHost || 'the configured host';
   return {
     name: PROPOSE_TOOL,
-    description: `Ask the owner to approve one change. It records a proposal and changes nothing. Actions: ${PROPOSE_ARGUMENTS} You can propose only on ${pageHost || 'the configured host'} from here for now.`,
+    description: `Ask the owner to approve one change. It records a proposal and changes nothing. Actions: ${PROPOSE_ARGUMENTS} You can propose on ${where} and on machines linked to it for approvals; another machine is refused.`,
     parameters: {
       type: 'object',
       properties: {
         host: {
           type: 'string',
-          description: `Host to propose on. One of: ${hosts.map((host) => host.name).join(', ')}. Defaults to ${hosts[0]?.name ?? 'the first host'}. Only ${pageHost || 'the first host'} can be proposed from this page; another host is refused.`,
+          description: `Host to propose on. One of: ${hosts.map((host) => host.name).join(', ')}. Defaults to ${hosts[0]?.name ?? 'the first host'}. ${pageHost || 'The first host'} and the machines linked to it for approvals can be proposed on from this page; another host is refused.`,
           ...(hosts.length ? { enum: hosts.map((host) => host.name) } : {}),
         },
         action: {
@@ -802,17 +820,18 @@ export function createProposeTool({ hosts = [], clientFor, onCall, onProposal, p
       }
       const host = hosts.find((candidate) => candidate.name === requested) ?? hosts[0];
       if (!host) throw new Error('No Arca host is configured.');
-      if (pageHost && host.name !== pageHost) {
-        throw new Error(`I can only propose changes on ${pageHost} from here for now.`);
-      }
-      const client = clientFor(host.name);
-      if (!client) throw new Error(`No Arca reader is available for host "${host.name}".`);
       const action = text(args?.action).trim();
       if (!PROPOSE_ACTIONS.includes(action)) throw new Error('That action cannot be proposed.');
       let payload = args?.args;
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
         throw new Error('The action needs an arguments object.');
       }
+      if (pageHost && host.name !== pageHost) {
+        const linked = await linkedHostsOf(clientFor(pageHost), exec.signal);
+        if (!linked.includes(host.name)) throw new Error(`${host.name}: ${NOT_LINKED}.`);
+      }
+      const client = clientFor(host.name);
+      if (!client) throw new Error(`No Arca reader is available for host "${host.name}".`);
       if (action === 'postgres_create') {
         // The kernel owns the database image; a proposal can never choose one.
         const { image: _ignored, ...rest } = payload;

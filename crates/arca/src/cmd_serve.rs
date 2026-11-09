@@ -19,10 +19,10 @@ use arca_alerts::checks::CheckTargets;
 use arca_alerts::rules::{self, Probes, RulesError};
 use arca_api::verbs;
 use arca_approval::{
-    ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, OwnerKeys, PASSKEY_COUNTS_FILE,
-    PasskeyLine, PasskeyVerifier, STATE_PASSKEYS_FILE, SignerLine, SshSigVerifier,
-    TEST_PASSKEYS_ENV, load_passkeys, load_signers, load_state_passkeys, passkeys_trust,
-    signers_trust,
+    ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys,
+    PASSKEY_COUNTS_FILE, PasskeyLine, PasskeyVerifier, STATE_PASSKEYS_FILE, SignerLine,
+    SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys, load_signers, load_state_passkeys,
+    passkeys_trust, signers_trust,
 };
 use arca_incus::{ProjectFamily, UnixIncus};
 use arca_kernel::KernelError;
@@ -40,9 +40,10 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::adoptions::AdoptionRecord;
 use crate::config::{self, NodeConfig};
 use crate::handlers::{
-    ActionExecutor, AlertsExport, AlertsHandler, AlertsPublished, Clock, JournalListHandler,
-    MetricsExport, MetricsHandler, OntologyQuery, Published, SAMPLE_INTERVAL, StatusHandler,
-    Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms, plan_handlers, spawn_watcher,
+    ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
+    Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, Published,
+    SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
+    plan_handlers_with, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -128,7 +129,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // The kernel opens before anything listens, so a state directory that is held, or whose document is not this node's, stops
     // the start with nothing served.
     let host = approval_host(&cfg)?;
-    let trusted = owner_keys(&cfg)?;
+    // One value for the other kernels' passkeys files: the verifier reads them at each check, and arca_status reports that
+    // read (its clone shares the last one).
+    let foreign = foreign_passkeys(&cfg);
+    let trusted = owner_keys(&cfg, foreign.clone())?;
     let (signing_keys, passkeys) = trusted.key_counts();
     eprintln!("arca: {signing_keys} owner signing key(s), {passkeys} passkey(s) kept");
     let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
@@ -198,7 +202,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
 
     let reader = Arc::new(Mutex::new(reader));
     let mode = if kernel_mode { "kernel" } else { "watch-only" };
-    let mut server = Server::new(verbs(), tokens.clone())
+    // action_approve is served only to a kernel set up to accept relayed approvals: an `approval` key that trusts another
+    // kernel's passkeys file. Without one it is not in the served table, so tools/list never lists it and a call answers
+    // not_found, exactly as before the verb existed.
+    let relayed = accepts_relayed_approvals(&cfg);
+    let mut server = Server::new(served_verbs(relayed), tokens.clone())
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
@@ -208,6 +216,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 started,
                 socket: cfg.incus.socket.clone(),
                 metrics_source: Arc::clone(&metrics_source),
+                approval: cfg.approval.as_ref().map(|approval| ApprovalStatus {
+                    linked_hosts: approval
+                        .linked_hosts
+                        .iter()
+                        .map(|host| host.name.clone())
+                        .collect(),
+                    foreign: foreign.clone(),
+                }),
             }),
         )
         .handle(
@@ -279,11 +295,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         None
     };
-    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers(
+    let action_slot = ActionSlot::default();
+    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers_with(
         Arc::clone(&kernel),
         clock.clone(),
         cfg.kernel.postgres_image.clone(),
         gpu,
+        Arc::clone(&action_slot),
     )
     .into_iter()
     .chain(crate::handlers::postgres_handlers(
@@ -298,9 +316,13 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     ))
     .collect();
     for (verb, handler) in &action_handlers {
+        if *verb == "action_approve" && !relayed {
+            continue;
+        }
         server = server.handle(verb, Arc::clone(handler));
     }
     let actions = ActionExecutor::new(action_handlers);
+    let _ = action_slot.set(actions.clone());
     let router = server.router();
     let page = cfg.approval_origin.clone().map(|origin| {
         crate::approve_page::Page::new(
@@ -312,6 +334,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .with_canvas_origin(&cfg.canvas_origin)
         .with_actions(actions)
+        .with_linked_hosts(
+            cfg.approval
+                .as_ref()
+                .map(|approval| approval.linked_hosts.clone())
+                .unwrap_or_default(),
+        )
     });
     let proxy_router = match &page {
         Some(page) => router.clone().merge(page.router(true)),
@@ -515,7 +543,7 @@ fn check_state_dir_owned_by(dir: &Path, uid: u32) -> Result<(), Failure> {
 /// the start. A passkeys file that cannot be trusted or read refuses every passkey approval, and the SSH keys still verify.
 /// Its refusal names the file, the rule and at most a line number, never a key. A test passkeys file named outside a scratch
 /// kernel stops the start.
-fn owner_keys(cfg: &NodeConfig) -> Result<OwnerKeys, Failure> {
+fn owner_keys(cfg: &NodeConfig, foreign: ForeignPasskeys) -> Result<OwnerKeys, Failure> {
     let ssh = SshSigVerifier::new(owner_signers(cfg)?);
     let test: Option<PathBuf> = std::env::var_os(TEST_PASSKEYS_ENV).map(PathBuf::from);
     let (path, trust) =
@@ -539,13 +567,62 @@ fn owner_keys(cfg: &NodeConfig) -> Result<OwnerKeys, Failure> {
         Ok(lines)
     })();
     let passkeys = match loaded {
-        Ok(lines) => PasskeyVerifier::new(lines, counts),
+        Ok(lines) => PasskeyVerifier::new(lines, counts).with_foreign(foreign),
         Err(refusal) => {
             eprintln!("arca: every passkey approval is refused: {refusal}");
             PasskeyVerifier::refusing(refusal)
         }
     };
     Ok(OwnerKeys::new(ssh, passkeys))
+}
+
+/// The other kernels' passkeys files this kernel also trusts for approvals, from `approval.trustOwnerKeysFrom`, for the
+/// origins `approval.origins` lists. No `approval` key trusts none. Each file's state at start is logged by path and count
+/// only; `arca_status` reports the latest read by index and file name.
+fn foreign_passkeys(cfg: &NodeConfig) -> ForeignPasskeys {
+    let Some(approval) = &cfg.approval else {
+        return ForeignPasskeys::default();
+    };
+    let foreign = ForeignPasskeys::new(
+        approval.trust_owner_keys_from.clone(),
+        approval.origins.clone(),
+    );
+    for state in foreign.load().1 {
+        match &state.reason {
+            None => eprintln!(
+                "arca: {} owner passkey(s) trusted from {}",
+                state.keys,
+                state.path.display()
+            ),
+            Some(reason) => eprintln!(
+                "arca: no owner passkey is trusted from {}: {reason}",
+                state.path.display()
+            ),
+        }
+    }
+    foreign
+}
+
+/// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at
+/// least one passkeys file to trust. Only then is `action_approve` served.
+fn accepts_relayed_approvals(cfg: &NodeConfig) -> bool {
+    cfg.approval
+        .as_ref()
+        .is_some_and(|approval| !approval.trust_owner_keys_from.is_empty())
+}
+
+/// The verbs this kernel serves: the whole table when it accepts relayed approvals, else the table without
+/// `action_approve`. The smaller table is built once at start and lives as long as the process.
+fn served_verbs(relayed: bool) -> &'static [arca_api::Verb] {
+    if relayed {
+        return verbs();
+    }
+    let table: Vec<arca_api::Verb> = verbs()
+        .iter()
+        .filter(|verb| verb.name != "action_approve")
+        .copied()
+        .collect();
+    Box::leak(table.into_boxed_slice())
 }
 
 /// The owner signing keys this kernel trusts for the approval namespace. A signers file that is not there is no key at all, so

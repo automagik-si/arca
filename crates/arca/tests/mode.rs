@@ -147,6 +147,7 @@ fn the_status_exposes_the_chosen_mode_and_reason() {
         started: Instant::now(),
         socket: fake.socket().to_path_buf(),
         metrics_source: choice,
+        approval: None,
     };
     let caller = Caller {
         token_id: "viewer".to_string(),

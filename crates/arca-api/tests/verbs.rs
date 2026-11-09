@@ -41,6 +41,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "action_propose",
             "plan_decline",
             "approval_submit",
+            "action_approve",
             "alerts_list",
             "postgres_create",
             "postgres_list",
@@ -76,6 +77,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("action_propose", VerbClass::L, Scope::Viewer, false, false),
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
+        ("action_approve", VerbClass::L, Scope::Doctor, true, true),
         ("alerts_list", VerbClass::L, Scope::Viewer, false, false),
         ("postgres_create", VerbClass::L, Scope::Doctor, true, false),
         ("postgres_list", VerbClass::L, Scope::Viewer, false, false),
@@ -224,6 +226,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
             "createdAt": { "type": "integer" },
             "expiresAt": { "type": "integer" },
             "statement": { "type": "string" },
+            "host": { "type": "string" },
         }),
         &[
             "kind",
@@ -309,6 +312,34 @@ fn plan_verb_schemas_equal_their_table_rows() {
 }
 
 #[test]
+fn action_approve_takes_an_action_id_and_an_approval_and_names_what_ran() {
+    let v = verb("action_approve").expect("present");
+    let id = json!({ "type": "string", "minLength": 16, "maxLength": 16, "pattern": "^act-[0-9a-f]{12}$" });
+    assert_eq!(
+        (v.params)(),
+        closed_with(
+            json!({
+                "plan": id.clone(),
+                "approval": { "type": "string", "maxLength": 16384 },
+            }),
+            &["plan", "approval"]
+        )
+    );
+    let result = (v.result)();
+    assert_eq!(
+        result["required"],
+        json!(["plan", "id", "action", "result"])
+    );
+    assert_eq!(result["properties"]["plan"], id);
+    assert_eq!(result["properties"]["result"], json!({ "type": "object" }));
+    assert!(arca_api::conforms(
+        &result,
+        &json!({ "plan": "act-0123456789ab", "id": "act-0123456789ab", "action": "service_create", "result": {} })
+    )
+    .is_ok());
+}
+
+#[test]
 fn arca_status_schemas_equal_its_table_row() {
     let v = verb("arca_status").expect("present");
     assert_eq!((v.params)(), closed(json!({})));
@@ -323,7 +354,27 @@ fn arca_status_schemas_equal_its_table_row() {
                 "incusReachable": { "type": "boolean" },
                 "appliedSeq": { "type": ["integer", "null"] },
                 "metricsSource": { "type": "string", "enum": ["local", "remote"] },
-                "metricsSourceReason": { "type": "string" }
+                "metricsSourceReason": { "type": "string" },
+                "approval": {
+                    "type": "object",
+                    "properties": {
+                        "linkedHosts": { "type": "array", "items": { "type": "string" } },
+                        "trustedKeyFiles": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": { "type": "integer", "minimum": 0 },
+                                    "name": { "type": "string" },
+                                    "keys": { "type": "integer", "minimum": 0 },
+                                    "reason": { "type": ["string", "null"] },
+                                },
+                                "required": ["index", "name", "keys", "reason"],
+                            },
+                        },
+                    },
+                    "required": ["linkedHosts", "trustedKeyFiles"],
+                }
             }),
             &[
                 "version",
