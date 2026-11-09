@@ -27,9 +27,9 @@ use crate::signers::effective_uid;
 
 /// `O_NOFOLLOW` on Linux: the open fails on a symbolic link instead of following it.
 #[cfg(target_os = "linux")]
-const NOFOLLOW: i32 = 0o400_000;
+pub(crate) const NOFOLLOW: i32 = 0o400_000;
 #[cfg(not(target_os = "linux"))]
-const NOFOLLOW: i32 = 0;
+pub(crate) const NOFOLLOW: i32 = 0;
 /// The largest trusted passkeys file read, in bytes.
 const MAX_BYTES: u64 = 1024 * 1024;
 
@@ -136,6 +136,17 @@ impl ForeignPasskeys {
 /// The lines of one trusted file, or the plain reason it is not read. It is opened read-only without following a link,
 /// and its owner and mode are checked on the open file, so the bytes read are the bytes checked.
 fn read_source(path: &Path) -> Result<Vec<PasskeyLine>, String> {
+    let bytes = read_trusted_bytes(path)?;
+    parse_passkeys(&bytes).map_err(|refusal| match refusal {
+        ApprovalRefusal::Untrusted(why) => why,
+        other => other.to_string(),
+    })
+}
+
+/// The bytes of a passkeys file read under this module's rule: opened read-only without following a link, a regular file
+/// owned by root or this process's uid, with no group or other write bit, and at most 1 MiB. The checks run on the open
+/// handle, so the bytes read are the bytes checked. The error is a plain reason that names no path.
+pub(crate) fn read_trusted_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let mut file = match OpenOptions::new()
         .read(true)
         .custom_flags(NOFOLLOW)
@@ -174,8 +185,5 @@ fn read_source(path: &Path) -> Result<Vec<PasskeyLine>, String> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err("the file is larger than a passkeys file can be".to_string());
     }
-    parse_passkeys(&bytes).map_err(|refusal| match refusal {
-        ApprovalRefusal::Untrusted(why) => why,
-        other => other.to_string(),
-    })
+    Ok(bytes)
 }

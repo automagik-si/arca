@@ -48,6 +48,7 @@ use crate::handlers::{
 use crate::kernel::Kernel;
 use crate::linked::{self, RelayError};
 use crate::passkey_change::{self, write_state_bytes};
+use crate::peer_sync::PeerSyncer;
 
 /// The page's own body cap. `arca-mcp`'s 64 KiB layer is private and does not reach merged routes.
 const PAGE_BODY_BYTES: usize = 64 * 1024;
@@ -120,6 +121,7 @@ struct PageState {
     chat_slots: Arc<Semaphore>,
     actions: ActionExecutor,
     linked: Arc<Vec<LinkedHost>>,
+    peer_sync: Option<PeerSyncer>,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -277,6 +279,7 @@ impl Page {
                 chat_slots: Arc::new(Semaphore::new(canvas::CHAT_CONCURRENCY)),
                 actions: ActionExecutor::default(),
                 linked: Arc::new(Vec::new()),
+                peer_sync: None,
             },
         }
     }
@@ -292,6 +295,13 @@ impl Page {
     /// approvals and declines. The page never approves for another host: the linked kernel checks every approval itself.
     pub fn with_linked_hosts(mut self, hosts: Vec<LinkedHost>) -> Self {
         self.state.linked = Arc::new(hosts);
+        self
+    }
+
+    /// Keeps this host's passkey list in sync on the linked hosts that ask for it, and shows a list that changed as a card
+    /// the owner approves (see `crate::peer_sync`).
+    pub fn with_peer_sync(mut self, syncer: PeerSyncer) -> Self {
+        self.state.peer_sync = Some(syncer);
         self
     }
 
@@ -338,6 +348,8 @@ impl Page {
             .route("/approve/plans", get(plans))
             .route("/approve/approve", post(approve))
             .route("/approve/decline", post(decline))
+            .route("/approve/peer-keys", post(peer_keys_trust))
+            .route("/approve/peer-keys/sync", post(peer_keys_sync))
             .route("/approve/setup-code", post(setup_code))
             .route("/approve/setup-code/verify", post(verify_setup_code))
             .route("/approve/register", post(register))
@@ -748,6 +760,9 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     };
+    if let Some(syncer) = &state.peer_sync {
+        body["peerKeys"] = peer_cards(syncer);
+    }
     if state.linked.is_empty() {
         return Json(body).into_response();
     }
@@ -761,6 +776,103 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
     }
     body["linkedHosts"] = json!(hosts);
     Json(body).into_response()
+}
+
+/// The changed passkey lists waiting for the owner, one card per linked host: the host, the statement it issued, how many
+/// passkeys the new list holds, and the card's words. No line is listed.
+fn peer_cards(syncer: &PeerSyncer) -> Value {
+    let cards: Vec<Value> = syncer
+        .pending()
+        .into_iter()
+        .map(|(host, pending)| {
+            let expires = serde_json::from_str::<Value>(&pending.statement)
+                .ok()
+                .and_then(|statement| statement["expiresAt"].as_str().map(str::to_string));
+            json!({
+                "linkedHost": host,
+                "title": format!("Trust your new passkey list on {host}"),
+                "keys": pending.keys,
+                "statement": pending.statement,
+                "expiresAt": expires,
+            })
+        })
+        .collect();
+    json!(cards)
+}
+
+/// `POST /approve/peer-keys/sync`: syncs this host's passkey list with every linked host now (at most once per thirty
+/// seconds), and answers with the cards still waiting.
+async fn peer_keys_sync(State(state): State<Arc<PageState>>) -> Response {
+    let Some(syncer) = state.peer_sync.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(outcomes) = tokio::task::spawn_blocking(move || {
+        let outcomes = syncer.sync_on_demand();
+        (outcomes, peer_cards(&syncer))
+    })
+    .await
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let (outcomes, cards) = outcomes;
+    let hosts: Vec<Value> = outcomes
+        .into_iter()
+        .map(|(name, outcome)| match outcome {
+            crate::peer_sync::SyncOutcome::NotAsked => {
+                json!({ "name": name, "status": "not_asked" })
+            }
+            crate::peer_sync::SyncOutcome::Synced(status) => {
+                json!({ "name": name, "status": status })
+            }
+            crate::peer_sync::SyncOutcome::Failed(why) => {
+                json!({ "name": name, "status": "failed", "reason": why })
+            }
+        })
+        .collect();
+    Json(json!({ "hosts": hosts, "peerKeys": cards })).into_response()
+}
+
+/// `POST /approve/peer-keys` `{host, statement, proof}`: relays this host's passkey list to `host` with the owner's passkey
+/// proof over the statement that host issued, and answers with what the host said. The page never checks the proof itself.
+async fn peer_keys_trust(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    let Some(syncer) = state.peer_sync.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(args) = serde_json::from_slice::<Value>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let host = match linked_host(&state, &args) {
+        Ok(Some(host)) => host,
+        Ok(None) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(refusal) => return refusal.into_response(),
+    };
+    let (Some(statement), Some(proof)) = (
+        args.get("statement")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        args.get("proof"),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let proof = match proof {
+        Value::String(text) => text.clone(),
+        Value::Object(_) => match canonical_json(proof) {
+            Ok(text) => text,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let name = host.name.clone();
+    let outcome =
+        tokio::task::spawn_blocking(move || syncer.submit(&host, &statement, &proof)).await;
+    match outcome {
+        Ok(Ok(mut value)) => {
+            value["host"] = json!(name);
+            Json(value).into_response()
+        }
+        Ok(Err(error)) => relay_error_response(&name, error),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// The waiting action proposals of every linked kernel, each with `linkedHost` naming it and a fresh statement that names
@@ -848,13 +960,22 @@ async fn relay(host: LinkedHost, verb: &'static str, arguments: Value) -> Respon
             value["host"] = json!(name);
             Json(value).into_response()
         }
-        Ok(Err(RelayError::Refused { code, message })) => refused(&code, &message),
-        Ok(Err(RelayError::Failed(message))) => (
+        Ok(Err(error)) => relay_error_response(&name, error),
+        Err(_) => relay_error_response(&name, RelayError::Unreachable),
+    }
+}
+
+/// A relayed call's failure as the page answers it: the linked kernel's exact refusal, or a plain reason when it could not
+/// be asked.
+fn relay_error_response(name: &str, error: RelayError) -> Response {
+    match error {
+        RelayError::Refused { code, message } => refused(&code, &message),
+        RelayError::Failed(message) => (
             StatusCode::BAD_GATEWAY,
             Json(json!({ "refusal": "Failed", "message": message })),
         )
             .into_response(),
-        Ok(Err(RelayError::Token)) => (
+        RelayError::Token => (
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "refusal": "LinkToken",
@@ -862,7 +983,7 @@ async fn relay(host: LinkedHost, verb: &'static str, arguments: Value) -> Respon
             })),
         )
             .into_response(),
-        Ok(Err(RelayError::Unreachable)) | Err(_) => (
+        RelayError::Unreachable => (
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "refusal": "Unreachable",

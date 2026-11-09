@@ -544,6 +544,40 @@ test('a host the page host lists as linked is proposed on its own kernel', async
   assert.deepEqual(proposals.map(({ host, id }) => [host, id]), [['beta', PROPOSAL.id]]);
 });
 
+test('a linked host on another machine is proposed on exactly like one on the page host machine', async () => {
+  // gamma runs on another machine: its own status says its readings are remote, and it keeps alpha's passkeys. Only the
+  // page host's linkedHosts decides; where gamma runs does not.
+  const calls = [];
+  const tool = createProposeTool({
+    hosts: [{ name: 'alpha' }, { name: 'gamma', socketPath: '/run/arca-alpha/gamma.sock' }],
+    proposalHost: 'alpha',
+    clientFor(name) {
+      return {
+        async call(verb, args) {
+          calls.push({ host: name, verb, args });
+          if (verb === 'arca_status' && name === 'alpha') {
+            return { mode: 'kernel', metricsSource: 'local', approval: { linkedHosts: ['gamma'], trustedKeyFiles: [] } };
+          }
+          if (verb === 'arca_status') {
+            return {
+              mode: 'kernel',
+              metricsSource: 'remote',
+              approval: { linkedHosts: [], trustedKeyFiles: [], peerKeys: { from: 'alpha', keys: 1, since: null, reason: '' } },
+            };
+          }
+          return { ...structuredClone(PROPOSAL), host: name };
+        },
+      };
+    },
+  });
+  const accepted = await tool.execute(
+    { host: 'gamma', action: 'service_create', args: { name: 'nats', template: 'nats' } },
+    { callId: 'call-gamma', signal: new AbortController().signal },
+  );
+  assert.equal(accepted.host, 'gamma');
+  assert.deepEqual(calls.map((call) => [call.host, call.verb]), [['alpha', 'arca_status'], ['gamma', 'action_propose']]);
+});
+
 test('a page host whose status cannot be read links nothing', async () => {
   const calls = [];
   const tool = createProposeTool({

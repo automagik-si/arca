@@ -1,4 +1,5 @@
-//! The approval page's relay to the linked kernels on this machine (`approval.linkedHosts`). The page lists a linked
+//! The approval page's relay to the linked kernels (`approval.linkedHosts`): on this machine, or on another machine whose
+//! MCP socket is forwarded to a path on this one (an SSH-forwarded unix socket, say). The page lists a linked
 //! kernel's waiting proposals with `plan_list` and hands the owner's signed approval to that kernel's `action_approve`, or
 //! a decline to its `plan_decline`, over the kernel's own MCP unix socket. The page never checks, spends or stores a
 //! linked kernel's approval: the target verifies it with its own verifier, nonce store and sign counts, and its answer is
@@ -20,7 +21,8 @@ use crate::config::LinkedHost;
 /// The longest a relayed approval or decline may take, in either direction: the linked kernel runs the action before it
 /// answers.
 const TIMEOUT: Duration = Duration::from_secs(30);
-/// The longest a listing may take. The canvas polls it, so a linked kernel that hangs must not hold the page's own list.
+/// The longest a listing or a status read may take. The canvas polls the list, so a linked kernel that hangs must not hold
+/// the page's own list.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
 /// The largest reply read from a linked kernel.
 const REPLY_MAX: u64 = 4 * 1024 * 1024;
@@ -49,7 +51,7 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
         "method": "tools/call",
         "params": { "name": verb, "arguments": arguments },
     });
-    let timeout = if verb == "plan_list" {
+    let timeout = if verb == "plan_list" || verb == "arca_status" {
         LIST_TIMEOUT
     } else {
         TIMEOUT

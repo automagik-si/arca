@@ -20,9 +20,9 @@ use arca_alerts::rules::{self, Probes, RulesError};
 use arca_api::verbs;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys,
-    PASSKEY_COUNTS_FILE, PasskeyLine, PasskeyVerifier, STATE_PASSKEYS_FILE, SignerLine,
-    SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys, load_signers, load_state_passkeys,
-    passkeys_trust, signers_trust,
+    PASSKEY_COUNTS_FILE, PEER_PASSKEYS_FILE, PasskeyLine, PasskeyVerifier, PeerPasskeys,
+    STATE_PASSKEYS_FILE, SignerLine, SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys,
+    load_signers, load_state_passkeys, passkeys_trust, signers_trust,
 };
 use arca_incus::{ProjectFamily, UnixIncus};
 use arca_kernel::KernelError;
@@ -132,7 +132,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // One value for the other kernels' passkeys files: the verifier reads them at each check, and arca_status reports that
     // read (its clone shares the last one).
     let foreign = foreign_passkeys(&cfg);
-    let trusted = owner_keys(&cfg, foreign.clone())?;
+    // The passkeys another machine's page host keeps in sync here, when `approval.peerKeys` is set: one value shared by the
+    // verifier, `peer_keys_sync` and arca_status.
+    let peer = peer_passkeys(&cfg);
+    let trusted = owner_keys(&cfg, foreign.clone(), peer.clone())?;
     let (signing_keys, passkeys) = trusted.key_counts();
     eprintln!("arca: {signing_keys} owner signing key(s), {passkeys} passkey(s) kept");
     let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
@@ -206,7 +209,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // kernel's passkeys file. Without one it is not in the served table, so tools/list never lists it and a call answers
     // not_found, exactly as before the verb existed.
     let relayed = accepts_relayed_approvals(&cfg);
-    let mut server = Server::new(served_verbs(relayed), tokens.clone())
+    // peer_keys_sync is served only to a kernel whose config keeps another machine's page host's passkeys.
+    let keeps_peer_keys = peer.is_some();
+    let mut server = Server::new(served_verbs(relayed, keeps_peer_keys), tokens.clone())
         .handle(
             "arca_status",
             Arc::new(StatusHandler {
@@ -223,6 +228,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                         .map(|host| host.name.clone())
                         .collect(),
                     foreign: foreign.clone(),
+                    peer: peer.clone(),
                 }),
             }),
         )
@@ -337,7 +343,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     ))
     .collect();
     for (verb, handler) in &action_handlers {
-        if *verb == "action_approve" && !relayed {
+        if (*verb == "action_approve" && !relayed)
+            || (*verb == "peer_keys_sync" && !keeps_peer_keys)
+        {
             continue;
         }
         server = server.handle(verb, Arc::clone(handler));
@@ -345,8 +353,23 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let actions = ActionExecutor::new(action_handlers);
     let _ = action_slot.set(actions.clone());
     let router = server.router();
+    let linked_hosts = cfg
+        .approval
+        .as_ref()
+        .map(|approval| approval.linked_hosts.clone())
+        .unwrap_or_default();
+    // The page host keeps its own passkey list in sync on each linked host that asks for it: now, every ten minutes, and
+    // when the approval page asks.
+    let peer_sync = (cfg.approval_origin.is_some() && !linked_hosts.is_empty())
+        .then(|| crate::peer_sync::PeerSyncer::new(Arc::clone(&kernel), linked_hosts.clone()));
+    if let Some(syncer) = &peer_sync {
+        syncer
+            .clone()
+            .spawn()
+            .map_err(|e| Failure::Runtime(e.to_string()))?;
+    }
     let page = cfg.approval_origin.clone().map(|origin| {
-        crate::approve_page::Page::new(
+        let page = crate::approve_page::Page::new(
             origin,
             Arc::clone(&kernel),
             clock.clone(),
@@ -355,12 +378,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .with_canvas_origin(&cfg.canvas_origin)
         .with_actions(actions)
-        .with_linked_hosts(
-            cfg.approval
-                .as_ref()
-                .map(|approval| approval.linked_hosts.clone())
-                .unwrap_or_default(),
-        )
+        .with_linked_hosts(linked_hosts.clone());
+        match &peer_sync {
+            Some(syncer) => page.with_peer_sync(syncer.clone()),
+            None => page,
+        }
     });
     let proxy_router = match &page {
         Some(page) => router.clone().merge(page.router(true)),
@@ -564,7 +586,11 @@ fn check_state_dir_owned_by(dir: &Path, uid: u32) -> Result<(), Failure> {
 /// the start. A passkeys file that cannot be trusted or read refuses every passkey approval, and the SSH keys still verify.
 /// Its refusal names the file, the rule and at most a line number, never a key. A test passkeys file named outside a scratch
 /// kernel stops the start.
-fn owner_keys(cfg: &NodeConfig, foreign: ForeignPasskeys) -> Result<OwnerKeys, Failure> {
+fn owner_keys(
+    cfg: &NodeConfig,
+    foreign: ForeignPasskeys,
+    peer: Option<PeerPasskeys>,
+) -> Result<OwnerKeys, Failure> {
     let ssh = SshSigVerifier::new(owner_signers(cfg)?);
     let test: Option<PathBuf> = std::env::var_os(TEST_PASSKEYS_ENV).map(PathBuf::from);
     let (path, trust) =
@@ -593,6 +619,10 @@ fn owner_keys(cfg: &NodeConfig, foreign: ForeignPasskeys) -> Result<OwnerKeys, F
             eprintln!("arca: every passkey approval is refused: {refusal}");
             PasskeyVerifier::refusing(refusal)
         }
+    };
+    let passkeys = match peer {
+        Some(peer) => passkeys.with_peer(peer),
+        None => passkeys,
     };
     Ok(OwnerKeys::new(ssh, passkeys))
 }
@@ -624,23 +654,44 @@ fn foreign_passkeys(cfg: &NodeConfig) -> ForeignPasskeys {
     foreign
 }
 
-/// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at
-/// least one passkeys file to trust. Only then is `action_approve` served.
-fn accepts_relayed_approvals(cfg: &NodeConfig) -> bool {
-    cfg.approval
-        .as_ref()
-        .is_some_and(|approval| !approval.trust_owner_keys_from.is_empty())
+/// The passkeys another machine's page host keeps in sync here, from `approval.peerKeys`, in the state directory's
+/// `peer-passkeys` file. No `peerKeys` keeps none. The file's state at start is logged by count only, never a line or a key.
+fn peer_passkeys(cfg: &NodeConfig) -> Option<PeerPasskeys> {
+    let config = cfg.approval.as_ref()?.peer_keys.as_ref()?;
+    let peer = PeerPasskeys::new(
+        cfg.state_dir.join(PEER_PASSKEYS_FILE),
+        config.from.clone(),
+        config.origins.clone(),
+    );
+    let state = peer.load().1;
+    match state.reason {
+        None => eprintln!(
+            "arca: {} passkey(s) of {} trusted for approvals",
+            state.keys, config.from
+        ),
+        Some(reason) => eprintln!("arca: no passkey of {} is trusted: {reason}", config.from),
+    }
+    Some(peer)
 }
 
-/// The verbs this kernel serves: the whole table when it accepts relayed approvals, else the table without
-/// `action_approve`. The smaller table is built once at start and lives as long as the process.
-fn served_verbs(relayed: bool) -> &'static [arca_api::Verb] {
-    if relayed {
+/// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at
+/// least one passkeys file to trust, or keeps another machine's page host's passkeys. Only then is `action_approve` served.
+fn accepts_relayed_approvals(cfg: &NodeConfig) -> bool {
+    cfg.approval.as_ref().is_some_and(|approval| {
+        !approval.trust_owner_keys_from.is_empty() || approval.peer_keys.is_some()
+    })
+}
+
+/// The verbs this kernel serves: the whole table, less `action_approve` when it accepts no relayed approval and less
+/// `peer_keys_sync` when it keeps no peer passkeys. A smaller table is built once at start and lives as long as the process.
+fn served_verbs(relayed: bool, peer_keys: bool) -> &'static [arca_api::Verb] {
+    if relayed && peer_keys {
         return verbs();
     }
     let table: Vec<arca_api::Verb> = verbs()
         .iter()
-        .filter(|verb| verb.name != "action_approve")
+        .filter(|verb| relayed || verb.name != "action_approve")
+        .filter(|verb| peer_keys || verb.name != "peer_keys_sync")
         .copied()
         .collect();
     Box::leak(table.into_boxed_slice())

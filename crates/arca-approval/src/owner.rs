@@ -52,6 +52,11 @@ impl OwnerKeys {
     pub fn foreign(&self) -> &crate::foreign::ForeignPasskeys {
         self.passkeys.foreign()
     }
+
+    /// The passkeys another machine's page host keeps in sync here, when the config keeps them.
+    pub fn peer(&self) -> Option<&crate::peer::PeerPasskeys> {
+        self.passkeys.peer()
+    }
 }
 
 impl SignatureVerifier for OwnerKeys {
