@@ -9,6 +9,10 @@
 //!
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
 //! host stays `approval_host(&cfg)`.
+//!
+//! With `approval.linkedHosts`, the page also lists the waiting action proposals of other kernels on this machine and relays
+//! the owner's signed approval or decline for one of them to that kernel over its own socket (see `crate::linked`). The page
+//! never checks or spends another kernel's approval, and never asks its own kernel about another kernel's id.
 
 use std::collections::HashMap;
 use std::fs;
@@ -36,14 +40,19 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::canvas::{self, Canvas};
+use crate::config::LinkedHost;
 use crate::handlers::{
-    ActionExecutor, Clock, approve_action, approve_plan, decline_plan, list_plans,
+    ActionExecutor, Clock, action_statement, approve_plan, decline_plan, fresh_nonce, list_plans,
+    run_approved_action,
 };
 use crate::kernel::Kernel;
+use crate::linked::{self, RelayError};
 use crate::passkey_change::{self, write_state_bytes};
 
 /// The page's own body cap. `arca-mcp`'s 64 KiB layer is private and does not reach merged routes.
 const PAGE_BODY_BYTES: usize = 64 * 1024;
+/// The refusal a linked-host name the page does not list gets, in the owner's words.
+const NOT_LINKED: &str = "this machine is not linked for approvals yet";
 /// A setup code lives for ten minutes.
 const CODE_TTL_MS: u64 = 10 * 60 * 1000;
 /// A setup-code request is spaced by sixty seconds.
@@ -110,6 +119,7 @@ struct PageState {
     canvas: Arc<Canvas>,
     chat_slots: Arc<Semaphore>,
     actions: ActionExecutor,
+    linked: Arc<Vec<LinkedHost>>,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -266,6 +276,7 @@ impl Page {
                 ),
                 chat_slots: Arc::new(Semaphore::new(canvas::CHAT_CONCURRENCY)),
                 actions: ActionExecutor::default(),
+                linked: Arc::new(Vec::new()),
             },
         }
     }
@@ -274,6 +285,13 @@ impl Page {
     /// tests may pass a fake. Without them an action proposal can still be listed and declined, but not approved.
     pub fn with_actions(mut self, actions: ActionExecutor) -> Self {
         self.state.actions = actions;
+        self
+    }
+
+    /// The linked kernels on this machine whose waiting proposals the page lists, and to which it relays the owner's signed
+    /// approvals and declines. The page never approves for another host: the linked kernel checks every approval itself.
+    pub fn with_linked_hosts(mut self, hosts: Vec<LinkedHost>) -> Self {
+        self.state.linked = Arc::new(hosts);
         self
     }
 
@@ -717,17 +735,157 @@ fn canvas_error() -> Response {
 
 async fn plans(State(state): State<Arc<PageState>>) -> Response {
     let now = (state.clock)();
-    let kernel = match state.kernel.lock() {
-        Ok(kernel) => kernel,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    match list_plans(&kernel, now, true) {
-        Ok(mut body) => {
-            body["passkeysTrusted"] = json!(kernel.owner_passkey_count());
-            Json(body).into_response()
+    let mut body = {
+        let kernel = match state.kernel.lock() {
+            Ok(kernel) => kernel,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match list_plans(&kernel, now, true) {
+            Ok(mut body) => {
+                body["passkeysTrusted"] = json!(kernel.owner_passkey_count());
+                body
+            }
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if state.linked.is_empty() {
+        return Json(body).into_response();
     }
+    let linked = Arc::clone(&state.linked);
+    let Ok(listed) = tokio::task::spawn_blocking(move || linked_plans(&linked, now)).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let (rows, hosts) = listed;
+    if let Some(plans) = body["plans"].as_array_mut() {
+        plans.extend(rows);
+    }
+    body["linkedHosts"] = json!(hosts);
+    Json(body).into_response()
+}
+
+/// The waiting action proposals of every linked kernel, each with `linkedHost` naming it and a fresh statement that names
+/// the host the linked kernel says its statements carry, and one `{name, read}` per linked kernel. A kernel that does not
+/// answer adds no row. A linked kernel's delete plans are not listed: the page relays only action proposals.
+fn linked_plans(linked: &[LinkedHost], now: u64) -> (Vec<Value>, Vec<Value>) {
+    let mut rows = Vec::new();
+    let mut hosts = Vec::new();
+    for host in linked {
+        let listed = linked::call(host, "plan_list", json!({}));
+        hosts.push(json!({ "name": host.name, "read": listed.is_ok() }));
+        let Ok(listed) = listed else {
+            continue;
+        };
+        for row in listed["plans"].as_array().into_iter().flatten() {
+            if row["kind"] != json!("action") {
+                continue;
+            }
+            let (Some(target), Some(id), Some(action), Some(digest)) = (
+                row["host"].as_str(),
+                row["id"].as_str(),
+                row["action"].as_str(),
+                row["argsDigest"].as_str(),
+            ) else {
+                continue;
+            };
+            let Ok(nonce) = fresh_nonce() else {
+                continue;
+            };
+            let Ok(statement) = action_statement(target, id, action, digest, now, &nonce) else {
+                continue;
+            };
+            let mut row = row.clone();
+            row["linkedHost"] = json!(host.name);
+            row["statement"] = json!(statement);
+            rows.push(row);
+        }
+    }
+    (rows, hosts)
+}
+
+/// The linked host a request names, when it names one. `Ok(None)` is this page's own kernel; a name the page does not
+/// list is refused with [`NOT_LINKED`].
+fn linked_host(state: &PageState, args: &Value) -> Result<Option<LinkedHost>, HostRefusal> {
+    match args.get("host") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => state
+            .linked
+            .iter()
+            .find(|host| host.name == *name)
+            .cloned()
+            .map(Some)
+            .ok_or(HostRefusal::NotLinked),
+        Some(_) => Err(HostRefusal::NotAName),
+    }
+}
+
+/// Why a page POST's `host` is refused before anything is relayed.
+enum HostRefusal {
+    /// The page does not list this host.
+    NotLinked,
+    /// `host` is not a string.
+    NotAName,
+}
+
+impl IntoResponse for HostRefusal {
+    fn into_response(self) -> Response {
+        match self {
+            Self::NotLinked => refused("NotLinked", NOT_LINKED),
+            Self::NotAName => StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+}
+
+/// Relays one call to a linked kernel and answers with what it said: its result with `host` added, its exact refusal, or
+/// a plain reason when it could not be asked.
+async fn relay(host: LinkedHost, verb: &'static str, arguments: Value) -> Response {
+    let name = host.name.clone();
+    let outcome = tokio::task::spawn_blocking(move || linked::call(&host, verb, arguments)).await;
+    match outcome {
+        Ok(Ok(mut value)) => {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("truncated");
+            }
+            value["host"] = json!(name);
+            Json(value).into_response()
+        }
+        Ok(Err(RelayError::Refused { code, message })) => refused(&code, &message),
+        Ok(Err(RelayError::Failed(message))) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "refusal": "Failed", "message": message })),
+        )
+            .into_response(),
+        Ok(Err(RelayError::Token)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "refusal": "LinkToken",
+                "message": format!("{name} does not accept this page's token"),
+            })),
+        )
+            .into_response(),
+        Ok(Err(RelayError::Unreachable)) | Err(_) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "refusal": "Unreachable",
+                "message": format!("{name} could not be reached just now"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn refused(code: &str, message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "refusal": code, "message": message })),
+    )
+        .into_response()
+}
+
+/// The plan or proposal id a page POST names.
+fn plan_id(args: &Value) -> Option<&str> {
+    args.get("plan")
+        .or_else(|| args.get("id"))
+        .and_then(Value::as_str)
 }
 
 async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
@@ -735,44 +893,36 @@ async fn approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     };
     let now = (state.clock)();
-    let action = args
-        .get("plan")
-        .or_else(|| args.get("id"))
-        .and_then(Value::as_str)
-        .is_some_and(|id| id.starts_with("act-"));
-    if action {
-        let approved = {
-            let mut kernel = match state.kernel.lock() {
-                Ok(kernel) => kernel,
-                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let action = plan_id(&args).is_some_and(|id| id.starts_with("act-"));
+    match linked_host(&state, &args) {
+        Err(refusal) => return refusal.into_response(),
+        Ok(Some(host)) => {
+            // Another host's approval is never checked here: its bytes go to that kernel's own verifier.
+            let (Some(id), Some(approval)) = (
+                plan_id(&args).filter(|_| action),
+                args.get("approval").and_then(Value::as_str),
+            ) else {
+                return StatusCode::BAD_REQUEST.into_response();
             };
-            match approve_action(&mut kernel, &args, now) {
-                Ok(approved) => approved,
-                Err(error) => return call_error_response(error),
-            }
-        };
-        let outcome = state
-            .actions
-            .run(&approved.action, &approved.args, &approved.grant);
-        let code = match &outcome {
-            Ok(_) => None,
-            Err(CallError::Refused { code, .. }) => Some(code.as_str()),
-            Err(CallError::Invalid(_)) => Some("Invalid"),
-            Err(_) => Some("Internal"),
-        };
-        if let Ok(mut kernel) = state.kernel.lock() {
-            kernel.revoke_action_grant(&approved.grant);
-            kernel.journal_action_result(&approved, outcome.is_ok(), code);
+            return relay(
+                host,
+                "action_approve",
+                json!({ "plan": id, "approval": approval }),
+            )
+            .await;
         }
+        Ok(None) => {}
+    }
+    if action {
+        let kernel = Arc::clone(&state.kernel);
+        let actions = state.actions.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || run_approved_action(&kernel, &actions, &args, now))
+                .await;
         return match outcome {
-            Ok(result) => Json(json!({
-                "plan": approved.id,
-                "id": approved.id,
-                "action": approved.action,
-                "result": result,
-            }))
-            .into_response(),
-            Err(error) => call_error_response(error),
+            Ok(Ok(result)) => Json(result).into_response(),
+            Ok(Err(error)) => call_error_response(error),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
     }
     let mut kernel = match state.kernel.lock() {
@@ -789,17 +939,21 @@ async fn decline(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
     let Ok(args) = serde_json::from_slice::<Value>(&body) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let action = args
-        .get("plan")
-        .or_else(|| args.get("id"))
-        .and_then(Value::as_str)
-        .is_some_and(|id| id.starts_with("act-"));
+    let action = plan_id(&args).is_some_and(|id| id.starts_with("act-"));
     if !action {
         return call_error_response(CallError::Refused {
             code: "DoctorRequired".to_string(),
             message: "the page declines only action proposals; a delete plan needs the doctor-scope plan_decline"
                 .to_string(),
         });
+    }
+    match linked_host(&state, &args) {
+        Err(refusal) => return refusal.into_response(),
+        Ok(Some(host)) => {
+            let id = plan_id(&args).unwrap_or_default().to_string();
+            return relay(host, "plan_decline", json!({ "plan": id })).await;
+        }
+        Ok(None) => {}
     }
     let mut kernel = match state.kernel.lock() {
         Ok(kernel) => kernel,

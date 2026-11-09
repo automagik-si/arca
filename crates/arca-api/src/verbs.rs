@@ -77,7 +77,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 28] = [
+static VERBS: [Verb; 29] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -203,6 +203,20 @@ static VERBS: [Verb; 28] = [
         cut: no_cut,
         params: approval_submit_params,
         result: approval_submit_result,
+    },
+    Verb {
+        name: "action_approve",
+        summary: "Submits an owner's passkey approval for a waiting action proposal, which runs its action once. The approval is checked by this kernel's own verifier and never echoed; an approval page on the same machine relays a linked host's approvals here.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_action_approve,
+        cut: no_cut,
+        params: action_approve_params,
+        result: action_approve_result,
     },
     Verb {
         name: "alerts_list",
@@ -557,6 +571,15 @@ pub fn summary_approval(v: &Value) -> String {
     )
 }
 
+/// A short line for a successful `action_approve`.
+pub fn summary_action_approve(v: &Value) -> String {
+    format!(
+        "action proposal {} approved; {} ran",
+        v["plan"].as_str().unwrap_or("?"),
+        v["action"].as_str().unwrap_or("?")
+    )
+}
+
 /// A short line for a successful `alerts_list`.
 pub fn summary_alerts(v: &Value) -> String {
     format!(
@@ -741,6 +764,22 @@ fn arca_status_result() -> Value {
         ("appliedSeq", true, nullable(int())),
         ("metricsSource", true, one_of(&["local", "remote"])),
         ("metricsSourceReason", true, string()),
+        (
+            "approval",
+            false,
+            result(vec![
+                ("linkedHosts", true, array(string())),
+                (
+                    "trustedKeyFiles",
+                    true,
+                    array(result(vec![
+                        ("path", true, string()),
+                        ("keys", true, at_least(0)),
+                        ("reason", true, nullable(string())),
+                    ])),
+                ),
+            ]),
+        ),
     ])
 }
 
@@ -1072,6 +1111,7 @@ fn action_proposal() -> Value {
         ("createdAt", true, int()),
         ("expiresAt", true, int()),
         ("statement", false, string()),
+        ("host", false, string()),
     ])
 }
 
@@ -1136,6 +1176,32 @@ fn approval_submit_result() -> Value {
         ("drift", true, array(object_ref())),
         ("partial", true, boolean()),
     ])
+}
+
+fn action_approve_params() -> Value {
+    params(vec![
+        ("plan", true, action_id()),
+        ("approval", true, string_max(16_384)),
+    ])
+}
+
+fn action_approve_result() -> Value {
+    result(vec![
+        ("plan", true, action_id()),
+        ("id", true, action_id()),
+        ("action", true, one_of(&ACTION_NAMES)),
+        ("result", true, json!({ "type": "object" })),
+    ])
+}
+
+/// An action proposal id: `act-` and twelve lowercase hex digits.
+fn action_id() -> Value {
+    json!({
+        "maxLength": 16,
+        "minLength": 16,
+        "pattern": "^act-[0-9a-f]{12}$",
+        "type": "string"
+    })
 }
 
 fn alerts_list_params() -> Value {

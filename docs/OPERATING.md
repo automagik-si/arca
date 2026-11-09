@@ -78,6 +78,9 @@ refused without the value being echoed back.
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
 | `canvasOrigin` | no | The loopback DSH origin the remote canvas proxies: an `http://` literal loopback IP and port, with no path. Default `http://127.0.0.1:3081`; any other origin refuses the config before `serve` listens. |
+| `approval.trustOwnerKeysFrom` | no | Absolute paths of other kernels' owner passkeys files on this machine, which this kernel also trusts for approvals, read-only. See "Approving on another kernel of this machine". |
+| `approval.origins` | with `trustOwnerKeysFrom` | The page origins (`approvalOrigin` form) a passkey from those files may answer from. A line for any other origin is not trusted. |
+| `approval.linkedHosts` | no | `[{ "name": "<host>", "socket": "<path>", "tokenFile": "<path>" }]`: the kernels on this machine whose proposals this kernel's approval page lists and relays approvals to. |
 
 The config is refused, with exit 2, when:
 
@@ -92,6 +95,9 @@ The config is refused, with exit 2, when:
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
 - `kernel.projects` is not empty and `kernel.droiddProjects` is empty;
 - `kernel.scratch` is `true` and a kernel project does not start with `arcak-scratch-`.
+- `approval.trustOwnerKeysFrom` names a relative path, or names a file while `approval.origins` is empty; an
+  `approval.origins` entry is not an `approvalOrigin`; or a linked host's name is not a host name or is listed twice, or its
+  `socket` or `tokenFile` is a relative path.
 - an adopted instance is not a plain name (`^[a-z][a-z0-9-]{0,56}$`), its `to` does not start with `arcak-adopt-` or is
   not in `kernel.projects`, an instance or a `to` is listed twice, an attach network is not a plain name, or
   `kernel.scratch` is `true` while `kernel.adopt` is set.
@@ -298,7 +304,7 @@ record is refused.
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
-`action_propose`, `plan_decline`, `approval_submit`, the Postgres and ontology verbs, `service_create`, `service_list` and
+`action_propose`, `plan_decline`, `approval_submit`, `action_approve`, the Postgres and ontology verbs, `service_create`, `service_list` and
 `service_status`, and `gpu_attach` and `gpu_detach`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
@@ -306,7 +312,10 @@ its request is read.
 
 - `arca_status` reports the node id, mode (`kernel` when kernel projects are configured, `watch-only` otherwise), uptime,
   whether Incus answers, `appliedSeq`: the applied desired-state document's sequence, or `null` before any document applies,
-  and `metricsSource` (`local` or `remote`) with the reason it was chosen. See "Host metrics".
+  and `metricsSource` (`local` or `remote`) with the reason it was chosen. See "Host metrics". A node with an `approval`
+  key also reports `approval`: its `linkedHosts` by name, and one `trustedKeyFiles` entry per trusted passkeys file with its
+  `path`, the `keys` it adds now and, when it adds none, the plain `reason` (for example `the file is missing` or `the file
+  cannot be read by this kernel`). Each file is read again at every call.
 - `node_metrics` takes `minutes` from 1 to 60. The server samples the host every 5 seconds into an hour-long ring, on its own
   thread. A call reads the last samples published and never waits on Incus. Until the first sample is taken, `latest` and
   `mean` are `null`. See "Host metrics" for where its readings come from.
@@ -323,7 +332,8 @@ its request is read.
   24 hours and the store's health. It reads the newest published tick and never waits on Incus. See "Alerts".
 - `token_list` lists each live token's id, scope and optional tool list. It never lists a secret or a digest.
 - `plan_list` lists each waiting delete plan and action proposal. A delete plan carries the statement its owner signs; an
-  action proposal carries its action, arguments, details and kernel-built summary. See the next section.
+  action proposal carries its action, arguments, details, kernel-built summary and `host`, the host its statements name.
+  See the next section.
 - `action_propose` takes `{action, args}` and records an inert action proposal, returning `kind`, `summary`, `details` and
   the record. It is a viewer verb: it changes no desired state and applies nothing, so MCP does not advertise it as
   read-only. The owner approves it on the approval page with a passkey.
@@ -331,6 +341,10 @@ its request is read.
   survives a restart.
 - `approval_submit` checks an owner's approval for a waiting delete plan and, when it holds, deletes the plan's objects once.
   Action proposals are approved and run by the approval page, which can reach the gated verb's handler.
+- `action_approve` takes `{plan: "<act-id>", approval}`, checks the owner's passkey approval for a waiting action proposal
+  with this kernel's own verifier, nonce store and sign counts, and when it holds runs the action once, exactly as the
+  approval page does, answering `{plan, id, action, result}`. It is a doctor verb that writes. Another kernel's approval
+  page on the same machine relays a linked host's approvals here; see "Approving on another kernel of this machine".
 
 `serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
@@ -668,6 +682,8 @@ With `approvalOrigin` set, `serve` serves an approval page and mounts its routes
   `approval_submit` path; an `act-…` id verifies the passkey against the proposal's statement and runs its action once.
 - `POST /approve/decline` takes `{ "plan": "<act-id>" }` and declines only an action proposal. The open page has no
   credential for a delete plan; that decline stays with the doctor-scope `plan_decline`.
+- With `approval.linkedHosts` set, `GET /approve/plans` also lists each linked kernel's waiting action proposals, and
+  `POST /approve/approve` and `POST /approve/decline` take an optional `"host"`. See the next section.
 - `POST /approve/register` takes `{ "credentialId": "<base64url>", "publicKey": "<base64>", "publicKeyAlgorithm": -7 }`,
   plus `"setupCode"` while no passkey is trusted, and returns `{ "trusted": true, "line": "<line>" }`; without `setupCode`
   it returns `{ "line": "<line>" }` as the developer answer.
@@ -702,6 +718,72 @@ A cut answer ends with a final `event: arca-cut` whose data names `idle`, `total
 without a cut event. `GET /approve/canvas/chat/history` is the same bounded three-second forward to
 `/arca-canvas/chat/history`. Every canvas route carries the CSP with `frame-ancestors 'none'`, `nosniff`, `no-referrer`, and
 `Cache-Control: no-store` on every canvas body, including refusals.
+
+#### Approving on another kernel of this machine
+
+One canvas can approve changes on every Arca kernel that runs on the same machine as the page host, with the same passkey.
+The page host never approves for another kernel: each kernel records its own proposals, and each verifies the owner's
+signed statement with its own verifier, nonce store and sign counts. The page host only lists the other kernel's waiting
+proposals and carries the signed bytes to it. Kernels on another machine are not covered yet; they come with key pinning
+at pairing.
+
+On the page host (here `alpha`, page origin `https://alpha.example.com`), list each linked kernel with its MCP socket and
+the file holding a token for it:
+
+```json
+"approval": {
+  "linkedHosts": [
+    { "name": "beta", "socket": "/run/arca-beta/arca.sock", "tokenFile": "/etc/arca/alpha/beta-relay.secret" }
+  ]
+}
+```
+
+`name` is the name the canvas knows that machine by (its `hosts[].name` in the canvas config). The token is minted on the
+linked kernel with scope `doctor`, limited to the three verbs the page relays:
+
+```sh
+arca token mint --scope doctor --id relay-alpha --tools plan_list,action_approve,plan_decline \
+  --out /etc/arca/alpha/beta-relay.secret --config /etc/arca/beta.json
+```
+
+It is read from its file at each call, so it can be rotated without a restart; it must be a regular file with no group or
+other permission bit.
+
+On the linked kernel (`beta`), trust the page host's passkeys file read-only, for the page host's origin only:
+
+```json
+"approval": {
+  "trustOwnerKeysFrom": ["/var/lib/arca-alpha/owner-passkeys"],
+  "origins": ["https://alpha.example.com"]
+}
+```
+
+The file is opened read-only, without following a link, at every approval check, so a passkey the owner adds or removes on
+the page host is trusted or dropped here without a restart. It is never written, copied or cached. It is read only when it is
+a regular file owned by root or by this kernel's user, with no group or other write bit, and parses whole; only its lines
+whose `origin` is listed are trusted. A file that is missing, unreadable or refused adds no key, and `arca_status` names the
+reason. The sign-in route of beta's own canvas never uses these keys. With no `approval` key, a kernel trusts only its own
+owner keys, as before.
+
+Then:
+
+- `GET /approve/plans` adds each linked kernel's waiting action proposals. Each row carries `linkedHost` (the linked
+  name), `host` (the host that kernel's statements name) and a fresh `statement` that names that host. The answer adds
+  `linkedHosts: [{ "name", "read" }]`; a kernel that does not answer (`read: false`) adds no row. A linked kernel's delete
+  plans are not listed.
+- `POST /approve/approve` with `"host": "<linked name>"` relays `{plan, approval}` to that kernel's `action_approve` and
+  answers what it said: its result with `host` added, or its exact refusal (403 `{refusal, message}`, for example
+  `WrongHost`, `BadSignature` or `Replayed`). `POST /approve/decline` with a `host` relays to `plan_decline` the same way.
+- A `host` the page does not list is refused 403 `{ "refusal": "NotLinked", "message": "this machine is not linked for
+  approvals yet" }`. A linked kernel that refuses the token answers 502 `LinkToken`; one that does not answer, 502
+  `Unreachable`. Nothing is relayed in either case.
+- Without a `host`, the page approves only on its own kernel, as before. It never calls its own kernel for another
+  kernel's id.
+
+In the canvas, the Doctor proposes on the page host and on any machine the page host's `arca_status` lists in
+`approval.linkedHosts`; any other machine is refused with "this machine is not linked for approvals yet" before a proposal
+is recorded. Every card shows the host its statement names, and a linked machine's card approves and declines through the
+page host with that machine's name.
 
 To use it:
 

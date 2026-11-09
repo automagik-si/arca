@@ -20,6 +20,47 @@
                 "null"
               ]
             },
+            "approval": {
+              "properties": {
+                "linkedHosts": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "trustedKeyFiles": {
+                  "items": {
+                    "properties": {
+                      "keys": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "path": {
+                        "type": "string"
+                      },
+                      "reason": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "path",
+                      "keys",
+                      "reason"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "linkedHosts",
+                "trustedKeyFiles"
+              ],
+              "type": "object"
+            },
             "incusReachable": {
               "type": "boolean"
             },
@@ -1536,6 +1577,9 @@
                       "expiresAt": {
                         "type": "integer"
                       },
+                      "host": {
+                        "type": "string"
+                      },
                       "id": {
                         "maxLength": 16,
                         "minLength": 16,
@@ -1661,6 +1705,9 @@
             },
             "expiresAt": {
               "type": "integer"
+            },
+            "host": {
+              "type": "string"
             },
             "id": {
               "maxLength": 16,
@@ -1901,6 +1948,77 @@
         }
       },
       "summary": "Submits an owner's approval for a waiting delete plan, which deletes the plan's objects once. The approval is never echoed.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "action_approve",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "maxLength": 16384,
+            "type": "string"
+          }
+        },
+        {
+          "name": "plan",
+          "required": true,
+          "schema": {
+            "maxLength": 16,
+            "minLength": 16,
+            "pattern": "^act-[0-9a-f]{12}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "action": {
+              "enum": [
+                "service_create",
+                "service_remove",
+                "service_publish",
+                "service_unpublish",
+                "service_connect",
+                "service_disconnect",
+                "postgres_create",
+                "gpu_attach",
+                "gpu_detach"
+              ],
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 16,
+              "minLength": 16,
+              "pattern": "^act-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "plan": {
+              "maxLength": 16,
+              "minLength": 16,
+              "pattern": "^act-[0-9a-f]{12}$",
+              "type": "string"
+            },
+            "result": {
+              "type": "object"
+            }
+          },
+          "required": [
+            "plan",
+            "id",
+            "action",
+            "result"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Submits an owner's passkey approval for a waiting action proposal, which runs its action once. The approval is checked by this kernel's own verifier and never echoed; an approval page on the same machine relays a linked host's approvals here.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "doctor",

@@ -295,9 +295,13 @@ nine actions (`service_create`, `service_remove`, `service_publish`,
 `service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`,
 `gpu_attach`, `gpu_detach`); it changes nothing and a database delete cannot be
 proposed. `arca_propose` may
-target only `pageHost`, the host whose kernel serves this canvas and its approval
-page; a proposal for any other configured reader is refused in plain words
-because that host's approval page is not this one. The tools are
+target `pageHost`, the host whose kernel serves this canvas and its approval
+page, and any configured reader whose name the page host's `arca_status` lists in
+`approval.linkedHosts` (another kernel on the same machine whose approvals the
+page host relays). Any other host is refused before a proposal is recorded, with
+the plain reason "this machine is not linked for approvals yet"; a page host
+whose status cannot be read links nothing. The proposal is recorded by the
+target host's own kernel, which later verifies the owner's passkey itself. The tools are
 registered globally with a per-session `when` condition, the Doctor's scope is
 restricted with `restrict({ allow: DOCTOR_TOOLS })` (the eight reads plus
 `arca_propose`), and scoped `tools/pre-execute` and `tools.guard` checks deny every
@@ -387,7 +391,13 @@ text and is shown exactly as sent, never shortened.
 
 A proposal id reaches the panel only from a real `arca_propose` tool result, and
 it only selects which kernel row to draw. A chat card is attached only when the
-tool ran on `pageHost` and the page kernel listed that id. An id the kernel did
+tool ran on `pageHost` and the page kernel listed that id, or when the tool ran
+on a host that `/approve/plans` lists in `linkedHosts` and the page kernel
+listed a row with that `linkedHost` and id. The same change on two machines has
+the same id, so a linked machine's card is keyed `<host>|<id>` and keeps its own
+state; its Host row shows the host its statement names, and Approve and Decline
+send `host` so the page host relays them to that machine. A row naming a
+`linkedHost` the answer does not list is dropped. An id the kernel did
 not list draws no card; the panel says "The proposal is not waiting any more."
 A foreign host's tool event never attaches this page's row. Model text never
 supplies a card field: a contradicting or hostile answer cannot change what the

@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  ChatStore, DEFAULTS, DOCTOR_TOOLS, PROPOSE_ACTIONS, PROPOSE_TOOL, READ_TOOLS, createDoctorChat, createProposeTool,
+  ChatStore, DEFAULTS, DOCTOR_TOOLS, NOT_LINKED, PROPOSE_ACTIONS, PROPOSE_TOOL, READ_TOOLS, createDoctorChat, createProposeTool,
   dayOf, doctorPrompt, formatToolResult, sseFrame, stateFilePath,
 } from '../src/chat.js';
 
@@ -476,8 +476,8 @@ test('the proposal tool offers exactly the nine allowed actions, never a databas
   assert.equal(PROPOSE_ACTIONS.includes('gpu_delete'), false);
   const tool = createProposeTool({ hosts: [{ name: 'alpha' }], proposalHost: 'alpha' });
   assert.equal(tool.name, PROPOSE_TOOL);
-  assert.match(tool.description, /only on alpha from here for now/);
-  assert.match(tool.parameters.properties.host.description, /Only alpha can be proposed/);
+  assert.match(tool.description, /propose on alpha and on machines linked to it for approvals; another machine is refused/);
+  assert.match(tool.parameters.properties.host.description, /alpha and the machines linked to it for approvals can be proposed on/);
   assert.deepEqual(tool.parameters.properties.action.enum, [...PROPOSE_ACTIONS]);
   assert.equal(tool.parameters.properties.action.enum.includes('postgres_delete'), false);
   assert.equal(tool.parameters.required.includes('action'), true);
@@ -486,30 +486,83 @@ test('the proposal tool offers exactly the nine allowed actions, never a databas
   assert.doesNotMatch(tool.description, /postgres_delete|image/);
 });
 
-test('the same proposal on two hosts: only the page host is offered, the other is refused', async () => {
+// A fake reader per host. The page host's arca_status names the hosts its kernel relays approvals to.
+function linkedClients(calls, linkedHosts) {
+  return (name) => ({
+    async call(verb, args) {
+      calls.push({ host: name, verb, args });
+      if (verb === 'arca_status') {
+        return linkedHosts === null ? { mode: 'kernel' } : { mode: 'kernel', approval: { linkedHosts, trustedKeyFiles: [] } };
+      }
+      return { ...structuredClone(PROPOSAL), host: name };
+    },
+  });
+}
+
+test('a host the page host does not list as linked is refused before Arca records anything', async () => {
+  for (const linked of [null, [], ['gamma']]) {
+    const calls = [];
+    const tool = createProposeTool({
+      hosts: [{ name: 'alpha' }, { name: 'beta' }],
+      proposalHost: 'alpha',
+      clientFor: linkedClients(calls, linked),
+    });
+    const exec = { callId: 'call-alpha', signal: new AbortController().signal };
+    const accepted = await tool.execute({ action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec);
+    assert.equal(accepted.id, PROPOSAL.id);
+    assert.equal(accepted.host, 'alpha');
+    await assert.rejects(
+      tool.execute({ host: 'beta', action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec),
+      (error) => error.message === `beta: ${NOT_LINKED}.`,
+    );
+    assert.deepEqual(
+      calls.map((call) => [call.host, call.verb]),
+      [['alpha', 'action_propose'], ['alpha', 'arca_status']],
+      'the unlinked host never reaches Arca',
+    );
+    assert.deepEqual(calls[0].args, { action: 'service_create', args: { name: 'nats', template: 'nats' } });
+  }
+  assert.equal(NOT_LINKED, 'this machine is not linked for approvals yet');
+});
+
+test('a host the page host lists as linked is proposed on its own kernel', async () => {
+  const calls = [];
+  const proposals = [];
+  const tool = createProposeTool({
+    hosts: [{ name: 'alpha' }, { name: 'beta' }],
+    proposalHost: 'alpha',
+    clientFor: linkedClients(calls, ['beta']),
+    onProposal: (proposal) => proposals.push(proposal),
+  });
+  const exec = { callId: 'call-beta', signal: new AbortController().signal };
+  const accepted = await tool.execute({ host: 'beta', action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec);
+  assert.equal(accepted.id, PROPOSAL.id);
+  assert.equal(accepted.host, 'beta');
+  assert.deepEqual(calls.map((call) => [call.host, call.verb]), [['alpha', 'arca_status'], ['beta', 'action_propose']]);
+  assert.deepEqual(calls[1].args, { action: 'service_create', args: { name: 'nats', template: 'nats' } });
+  assert.deepEqual(proposals.map(({ host, id }) => [host, id]), [['beta', PROPOSAL.id]]);
+});
+
+test('a page host whose status cannot be read links nothing', async () => {
   const calls = [];
   const tool = createProposeTool({
     hosts: [{ name: 'alpha' }, { name: 'beta' }],
     proposalHost: 'alpha',
     clientFor(name) {
       return {
-        async call(verb, args) {
-          calls.push({ host: name, verb, args });
-          return { ...structuredClone(PROPOSAL), host: name };
+        async call(verb) {
+          calls.push([name, verb]);
+          if (verb === 'arca_status') throw new Error('socket closed');
+          return structuredClone(PROPOSAL);
         },
       };
     },
   });
-  const exec = { callId: 'call-alpha', signal: new AbortController().signal };
-  const accepted = await tool.execute({ action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec);
-  assert.equal(accepted.id, PROPOSAL.id);
-  assert.equal(accepted.host, 'alpha');
   await assert.rejects(
-    tool.execute({ host: 'beta', action: 'service_create', args: { name: 'nats', template: 'nats' } }, exec),
-    /I can only propose changes on alpha from here for now\./,
+    tool.execute({ host: 'beta', action: 'service_create', args: { name: 'nats', template: 'nats' } }, { callId: 'c' }),
+    (error) => error.message === `beta: ${NOT_LINKED}.`,
   );
-  assert.deepEqual(calls.map((call) => [call.host, call.verb]), [['alpha', 'action_propose']], 'the refused host never reaches Arca');
-  assert.deepEqual(calls[0].args, { action: 'service_create', args: { name: 'nats', template: 'nats' } });
+  assert.deepEqual(calls, [['alpha', 'arca_status']]);
 });
 
 test('the prompt pins the propose-and-approve contract', () => {
@@ -517,7 +570,8 @@ test('the prompt pins the propose-and-approve contract', () => {
   assert.match(prompt, /arca_propose/);
   assert.match(prompt, /tap Approve on the card/);
   assert.match(prompt, /Never claim the change is done/);
-  assert.match(prompt, /only on alpha from here for now/);
+  assert.match(prompt, /propose changes on alpha and on any machine linked to it for approvals/);
+  assert.match(prompt, /this machine is not linked for approvals yet/);
   assert.match(prompt, /never propose a database delete/);
   assert.match(prompt, /https:\/\/example\.com\/approve/);
   assert.match(prompt, /Never invent/i);
@@ -566,8 +620,8 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
     '- For a GPU attach or detach, propose gpu_attach or gpu_detach with the instance and the card\'s exact',
     '  PCI address. The approval card shows the project, instance, card and safety effect; never shorten it.',
-    '- You can propose changes only on alpha from here for now. Another host is refused because its',
-    '  approval page is not this one.',
+    '- You can propose changes on alpha and on any machine linked to it for approvals. Another machine is',
+    '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
     '- The approval page is at https://example.com/approve. The canvas card uses the same passkey.',
   ].join('\n');

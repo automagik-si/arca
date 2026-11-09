@@ -443,6 +443,33 @@ pub struct StatusHandler {
     /// The host-reading mode chosen at startup, and why. A provisional choice is replaced by the sampler when a later
     /// server-name probe succeeds.
     pub metrics_source: Arc<Mutex<HostModeChoice>>,
+    /// The `approval` config, when the node has one: its linked hosts and the other kernels' passkeys files it trusts.
+    pub approval: Option<ApprovalStatus>,
+}
+
+/// What `arca_status` reports of a node's multi-host approvals. Each trusted file is read again at every status call, so
+/// its key count and reason are what an approval checked now would see.
+#[derive(Clone, Default)]
+pub struct ApprovalStatus {
+    pub linked_hosts: Vec<String>,
+    pub foreign: arca_approval::ForeignPasskeys,
+}
+
+impl ApprovalStatus {
+    fn json(&self) -> Value {
+        let (_, states) = self.foreign.load();
+        let files: Vec<Value> = states
+            .iter()
+            .map(|state| {
+                json!({
+                    "path": state.path.display().to_string(),
+                    "keys": state.keys,
+                    "reason": state.reason,
+                })
+            })
+            .collect();
+        json!({ "linkedHosts": self.linked_hosts, "trustedKeyFiles": files })
+    }
 }
 
 impl ToolHandler for StatusHandler {
@@ -454,7 +481,7 @@ impl ToolHandler for StatusHandler {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
-        Ok(json!({
+        let mut status = json!({
             "version": env!("CARGO_PKG_VERSION"),
             "node": self.node,
             "mode": self.mode,
@@ -463,7 +490,11 @@ impl ToolHandler for StatusHandler {
             "appliedSeq": applied_seq,
             "metricsSource": metrics_source.mode.as_str(),
             "metricsSourceReason": metrics_source.reason,
-        }))
+        });
+        if let Some(approval) = &self.approval {
+            status["approval"] = approval.json();
+        }
+        Ok(status)
     }
 }
 
@@ -867,6 +898,18 @@ pub fn plan_handlers(
     postgres_image: Option<String>,
     gpu: Option<Arc<dyn GpuBackend>>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    plan_handlers_with(kernel, clock, postgres_image, gpu, ActionSlot::default())
+}
+
+/// The plan handlers, with `actions` as the executor `action_approve` runs an approved action through. `cmd_serve` fills
+/// the slot once the whole handler set exists. An empty slot refuses before the approval is read, so nothing is spent.
+pub fn plan_handlers_with(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    postgres_image: Option<String>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    actions: ActionSlot,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let rate = Arc::new(ProposalRateLimiter::default());
     vec![
         (
@@ -910,7 +953,18 @@ pub fn plan_handlers(
         ),
         (
             "approval_submit",
-            Arc::new(ApprovalSubmit { kernel, clock }) as Arc<dyn ToolHandler>,
+            Arc::new(ApprovalSubmit {
+                kernel: Arc::clone(&kernel),
+                clock: Arc::clone(&clock),
+            }) as Arc<dyn ToolHandler>,
+        ),
+        (
+            "action_approve",
+            Arc::new(ActionApprove {
+                kernel,
+                clock,
+                actions,
+            }) as Arc<dyn ToolHandler>,
         ),
     ]
 }
@@ -975,6 +1029,7 @@ fn action_json(
         "argsDigest": proposal.args_digest,
         "createdAt": proposal.created_ms,
         "expiresAt": proposal.expires_at,
+        "host": host,
     });
     if statement {
         value["statement"] = json!(action_statement(
@@ -1350,6 +1405,63 @@ pub(crate) fn approve_plan(
     }
 }
 
+/// The executor `action_approve` runs approved actions through, filled once the whole handler set is built.
+pub type ActionSlot = Arc<std::sync::OnceLock<ActionExecutor>>;
+
+/// `action_approve`: checks an owner's passkey approval for one waiting action proposal with this kernel's own verifier,
+/// and, when it holds, runs the action once, exactly as the approval page does. The approval page of another kernel on
+/// this machine relays a linked host's approvals here; it never checks them itself.
+struct ActionApprove {
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    actions: ActionSlot,
+}
+
+impl ToolHandler for ActionApprove {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
+        let Some(actions) = self.actions.get() else {
+            return Err(CallError::Internal(
+                "the approved action has no handler".to_string(),
+            ));
+        };
+        let now = (self.clock)();
+        run_approved_action(&self.kernel, actions, &args, now)
+    }
+}
+
+/// The action-proposal approval path shared by `action_approve` and the open approval page: check and spend the approval
+/// under the kernel lock, run the action once outside it, then revoke the grant and journal the result.
+pub fn run_approved_action(
+    kernel: &Mutex<Kernel>,
+    actions: &ActionExecutor,
+    args: &Value,
+    now: u64,
+) -> Result<Value, CallError> {
+    let approved = {
+        let mut kernel = lock(kernel)?;
+        approve_action(&mut kernel, args, now)?
+    };
+    let outcome = actions.run(&approved.action, &approved.args, &approved.grant);
+    let code = match &outcome {
+        Ok(_) => None,
+        Err(CallError::Refused { code, .. }) => Some(code.as_str()),
+        Err(CallError::Invalid(_)) => Some("Invalid"),
+        Err(_) => Some("Internal"),
+    };
+    if let Ok(mut kernel) = kernel.lock() {
+        kernel.revoke_action_grant(&approved.grant);
+        kernel.journal_action_result(&approved, outcome.is_ok(), code);
+    }
+    outcome.map(|result| {
+        json!({
+            "plan": approved.id,
+            "id": approved.id,
+            "action": approved.action,
+            "result": result,
+        })
+    })
+}
+
 /// Checks and spends an owner's approval for one action proposal, retires it and arms exactly one execution grant. The
 /// caller runs the action outside the kernel lock, then journals its result.
 pub fn approve_action(
@@ -1570,7 +1682,7 @@ fn statement_text(
 }
 
 /// Sixteen random bytes as 32 lowercase hex digits: a statement's nonce.
-fn fresh_nonce() -> Result<String, CallError> {
+pub(crate) fn fresh_nonce() -> Result<String, CallError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|_| internal())?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())

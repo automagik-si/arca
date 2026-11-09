@@ -698,6 +698,15 @@
     "NoSuchPlan"
   ]);
   var APPROVAL_REFUSALS = new Set(APPROVAL_REFUSAL_CODES);
+  var RELAY_REFUSALS = Object.freeze({
+    NotLinked: "This machine is not linked for approvals yet. Nothing changed.",
+    LinkToken: "This page is not allowed to approve on that machine yet. Nothing changed.",
+    Unreachable: "That machine could not be reached just now. Reload the page to see whether the change still waits.",
+    Failed: "That machine could not finish this approval. Check Steps to see whether it ran."
+  });
+  function approvalKey(host, id) {
+    return host ? `${host}|${id}` : id;
+  }
   var FINISHED_STATES = /* @__PURE__ */ new Set(["done", "declined", "failed", "expired"]);
   var REFUSALS = Object.freeze({
     Malformed: "Arca could not read this approval. Try again from the card.",
@@ -749,6 +758,7 @@
     return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
   }
   function approvalRefusalText(refusal) {
+    if (typeof refusal === "string" && Object.hasOwn(RELAY_REFUSALS, refusal)) return RELAY_REFUSALS[refusal];
     if (typeof refusal === "string" && APPROVAL_REFUSALS.has(refusal)) return REFUSALS[refusal];
     return NEUTRAL_REFUSAL;
   }
@@ -761,6 +771,7 @@
   function approvalErrorText(body) {
     const refusal = body?.refusal;
     if (typeof refusal === "string" && refusal) {
+      if (Object.hasOwn(RELAY_REFUSALS, refusal)) return RELAY_REFUSALS[refusal];
       return APPROVAL_REFUSALS.has(refusal) ? REFUSALS[refusal] : plainActionError(body);
     }
     if (typeof body?.message === "string" && body.message.trim()) return plainActionError(body);
@@ -1451,6 +1462,7 @@
       deletes: [],
       cards: /* @__PURE__ */ new Map(),
       passkeysTrusted: 0,
+      linkedHosts: /* @__PURE__ */ new Set(),
       loaded: false,
       error: "",
       fetching: false,
@@ -1731,17 +1743,15 @@
           for (const tool of message.tools) tools.append(chatToolCard(doc, tool));
           node.append(tools);
         }
-        const pageHost = text2(state.envelope.pageHost).trim();
         const proposed = /* @__PURE__ */ new Set();
         for (const tool of message.tools) {
-          const id = proposalId(tool.proposal);
-          if (!id || proposed.has(id)) continue;
-          if (!pageHost || tool.host !== pageHost) continue;
-          proposed.add(id);
-          const card = proposalCard(doc, id);
+          const key = toolCardKey(tool);
+          if (!key || proposed.has(key)) continue;
+          proposed.add(key);
+          const card = proposalCard(doc, key);
           if (card) node.append(card);
-          else if (approvals.loaded && !approvals.error && approvals.announced.has(id) && approvals.fetchStartedAt >= (approvals.announced.get(id) ?? 0)) {
-            node.append(missingProposalNote(doc, id));
+          else if (approvals.loaded && !approvals.error && approvals.announced.has(key) && approvals.fetchStartedAt >= (approvals.announced.get(key) ?? 0)) {
+            node.append(missingProposalNote(doc, key));
           }
         }
         for (const note of message.notes ?? []) node.append(chatNotice(doc, note.kind, note.title, note.body));
@@ -1756,9 +1766,19 @@
     };
     const activeAssistant = () => chat.messages.at(-1)?.role === "assistant" ? chat.messages.at(-1) : null;
     const approvalConfigured = () => Boolean(approvalUrl(state.envelope.approvalUrl));
-    function approvalCardFor(id) {
-      const key = proposalId({ id });
-      if (!key) return null;
+    function toolCardKey(tool) {
+      const id = proposalId(tool?.proposal);
+      const pageHost = text2(state.envelope.pageHost).trim();
+      if (!id || !pageHost || typeof tool?.host !== "string") return "";
+      if (tool.host === pageHost) return id;
+      return approvals.linkedHosts.has(tool.host) ? approvalKey(tool.host, id) : "";
+    }
+    function keyId(key) {
+      const id = typeof key === "string" ? key.slice(key.lastIndexOf("|") + 1) : "";
+      return proposalId({ id });
+    }
+    function approvalCardFor(key) {
+      if (!keyId(key)) return null;
       let card = approvals.cards.get(key);
       if (!card) {
         if (!approvals.plans.has(key)) return null;
@@ -1785,6 +1805,11 @@
     function parseApprovalPlans(body) {
       const plans = /* @__PURE__ */ new Map();
       const deletes = [];
+      const linked = /* @__PURE__ */ new Set();
+      for (const entry of Array.isArray(body?.linkedHosts) ? body.linkedHosts : []) {
+        const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+        if (name) linked.add(name);
+      }
       for (const row of Array.isArray(body?.plans) ? body.plans : []) {
         if (!row || typeof row !== "object") continue;
         if (row.kind === "action") {
@@ -1806,7 +1831,9 @@
           const host = typeof statement.host === "string" ? statement.host.trim() : "";
           if (!host) continue;
           const pci = GPU_ACTIONS.has(row.action) && row.args && typeof row.args === "object" ? normalizePci(row.args.pci) : "";
-          plans.set(id, {
+          const linkedHost = typeof row.linkedHost === "string" ? row.linkedHost.trim() : "";
+          if (row.linkedHost !== void 0 && (!linkedHost || !linked.has(linkedHost))) continue;
+          plans.set(approvalKey(linkedHost, id), {
             kind: "action",
             id,
             action: row.action,
@@ -1816,14 +1843,20 @@
             expiresAt,
             host,
             statement: row.statement,
-            pci
+            pci,
+            linkedHost
           });
-        } else if (typeof row.plan === "string" && /^[0-9a-f]{64}$/.test(row.plan)) {
+        } else if (row.linkedHost === void 0 && typeof row.plan === "string" && /^[0-9a-f]{64}$/.test(row.plan)) {
           deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
         }
       }
       const trusted = Number(body?.passkeysTrusted);
-      return { plans, deletes, passkeysTrusted: Number.isInteger(trusted) && trusted > 0 ? trusted : 0 };
+      return {
+        plans,
+        deletes,
+        linked,
+        passkeysTrusted: Number.isInteger(trusted) && trusted > 0 ? trusted : 0
+      };
     }
     async function readApprovalPlans() {
       const response = await fetch("/approve/plans", {
@@ -1880,6 +1913,7 @@
           }
           approvals.plans = next.plans;
           approvals.deletes = next.deletes;
+          approvals.linkedHosts = next.linked;
           approvals.passkeysTrusted = next.passkeysTrusted;
           approvals.error = "";
         } catch (error) {
@@ -1931,15 +1965,14 @@
     }
     function planGpuSlot(plan) {
       if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
-      const pageHost = text2(state.envelope.pageHost).trim();
-      if (!pageHost) return null;
-      const host = (state.dashboard?.hosts ?? []).find((candidate) => candidate.name.toLowerCase() === pageHost.toLowerCase());
+      const owner = plan.linkedHost || text2(state.envelope.pageHost).trim();
+      if (!owner) return null;
+      const host = (state.dashboard?.hosts ?? []).find((candidate) => candidate.name.toLowerCase() === owner.toLowerCase());
       if (!host) return null;
       const gpu = host.gpus?.find((candidate) => candidate.pci === plan.pci);
       return gpu ? { slot: gpu.slotLabel, host: host.name, pci: gpu.pci } : null;
     }
-    function proposalCard(doc2, id) {
-      const key = proposalId({ id });
+    function proposalCard(doc2, key) {
       const card = approvalCardFor(key);
       if (!card || !card.plan) return null;
       const plan = card.plan;
@@ -1965,6 +1998,7 @@
       const hostRow = el(doc2, "div", "arca-approval-fact");
       hostRow.dataset.detail = "host";
       hostRow.append(el(doc2, "dt", "", "Host"), el(doc2, "dd", "", plan.host));
+      if (plan.linkedHost) hostRow.dataset.linkedHost = plan.linkedHost;
       facts.append(hostRow);
       const slot = planGpuSlot(plan);
       if (slot) {
@@ -2084,8 +2118,8 @@ ${statement}`)
         v: 1
       };
     }
-    async function approveProposal(id) {
-      const card = approvals.cards.get(id);
+    async function approveProposal(key) {
+      const card = approvals.cards.get(key);
       const plan = card?.plan;
       if (!card || card.state !== "waiting" || !plan) return;
       if (!plan.statement) {
@@ -2113,7 +2147,7 @@ ${statement}`)
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ plan: id, approval }),
+          body: JSON.stringify(plan.linkedHost ? { plan: plan.id, approval, host: plan.linkedHost } : { plan: plan.id, approval }),
           signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS)
         });
         const body = await response.json().catch(() => ({}));
@@ -2133,7 +2167,7 @@ ${statement}`)
         }
         setCardState(card, "done");
         card.result = plainResult(plan.action, body?.result);
-        approvals.plans.delete(id);
+        approvals.plans.delete(key);
       } catch (error) {
         if (error?.name === "TimeoutError" || error?.name === "AbortError") {
           setCardState(card, "waiting");
@@ -2153,10 +2187,12 @@ ${statement}`)
         void refreshApprovals();
       }
     }
-    async function declineProposal(id) {
-      const card = approvals.cards.get(id);
+    async function declineProposal(key) {
+      const card = approvals.cards.get(key);
       if (!card || card.state !== "waiting") return;
-      if (!proposalId({ id })) return;
+      const id = keyId(key);
+      if (!id) return;
+      const linkedHost = card.plan?.linkedHost ?? "";
       card.busy = "declining";
       updatePanel();
       try {
@@ -2164,7 +2200,7 @@ ${statement}`)
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
-          body: JSON.stringify({ plan: id })
+          body: JSON.stringify(linkedHost ? { plan: id, host: linkedHost } : { plan: id })
         });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {
@@ -2182,7 +2218,7 @@ ${statement}`)
           return;
         }
         setCardState(card, "declined");
-        approvals.plans.delete(id);
+        approvals.plans.delete(key);
       } catch (error) {
         setCardState(card, "failed");
         card.reason = plainError(error);
@@ -2214,10 +2250,12 @@ ${statement}`)
           plan.expiresAt,
           plan.host,
           plan.pci,
-          plan.details
+          plan.details,
+          plan.linkedHost
         ]),
         deletes: approvals.deletes.map((plan) => plan.id),
         cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),
+        linked: [...approvals.linkedHosts],
         passkeysTrusted: approvals.passkeysTrusted,
         loaded: approvals.loaded,
         missing: announcedMissing(),
@@ -2246,7 +2284,10 @@ ${statement}`)
         if (card) Object.assign(card, data);
         else message.tools.push({ ...data });
         const proposedId = proposalId(data?.proposal);
-        if (proposedId && data?.host === text2(state.envelope.pageHost).trim()) void confirmProposal(proposedId);
+        const pageHost = text2(state.envelope.pageHost).trim();
+        if (proposedId && pageHost && typeof data?.host === "string" && data.host) {
+          void confirmProposal(data.host === pageHost ? proposedId : approvalKey(data.host, proposedId));
+        }
       } else if (event === "budget") {
         const message = activeAssistant();
         const body = String(data?.message ?? "Daily budget reached, try tomorrow.");
@@ -2373,15 +2414,13 @@ ${statement}`)
     });
     updateSend();
     function announceHistoryProposals() {
-      const pageHost = text2(state.envelope.pageHost).trim();
-      if (!pageHost) return [];
       const added = [];
       for (const message of chat.messages) {
         for (const tool of message.tools ?? []) {
-          const id = proposalId(tool.proposal);
-          if (!id || tool.host !== pageHost || approvals.announced.has(id)) continue;
-          approvals.announced.set(id, Date.now());
-          added.push(id);
+          const key = toolCardKey(tool);
+          if (!key || approvals.announced.has(key)) continue;
+          approvals.announced.set(key, Date.now());
+          added.push(key);
         }
       }
       return added;

@@ -16,6 +16,7 @@
 //!
 //! Nonces are kept by [`FileNonces`], which makes each spend durable before the action it admits may run.
 
+pub mod foreign;
 pub mod nonces;
 pub mod owner;
 pub mod passkey;
@@ -24,6 +25,7 @@ pub mod sshsig;
 pub mod statement;
 pub mod verifier;
 
+pub use foreign::{ForeignPasskeys, SourceState};
 pub use nonces::FileNonces;
 pub use owner::OwnerKeys;
 pub use passkey::{

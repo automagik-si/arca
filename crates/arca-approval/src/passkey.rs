@@ -35,6 +35,7 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
+use crate::foreign::ForeignPasskeys;
 use crate::nonces::open_records;
 use crate::signers::{TrustRoot, effective_uid, namespaces_ok, read_trusted, trust_for, untrusted};
 use crate::statement::valid_hex;
@@ -763,6 +764,8 @@ fn parse_count_record(line: &[u8]) -> Option<(String, u32)> {
 /// passkey's approval (count 0) is not used up.
 pub struct PasskeyVerifier {
     keys: Keys,
+    /// Other kernels' passkeys files this one also trusts for approvals, read at each check. Empty by default.
+    foreign: ForeignPasskeys,
 }
 
 enum Keys {
@@ -781,7 +784,20 @@ impl PasskeyVerifier {
                 lines,
                 counts: Mutex::new(counts),
             },
+            foreign: ForeignPasskeys::default(),
         }
+    }
+
+    /// Also trusts, for approvals, the passkeys `foreign` reads from other kernels' files. The sign-in route and the passkey
+    /// list never see them, and a verifier whose own file was refused still refuses every proof.
+    pub fn with_foreign(mut self, foreign: ForeignPasskeys) -> Self {
+        self.foreign = foreign;
+        self
+    }
+
+    /// The other kernels' passkeys files this verifier trusts.
+    pub fn foreign(&self) -> &ForeignPasskeys {
+        &self.foreign
     }
 
     /// A verifier for a passkeys file that could not be trusted or read: every passkey proof is refused with `refusal`, which
@@ -789,6 +805,7 @@ impl PasskeyVerifier {
     pub fn refusing(refusal: ApprovalRefusal) -> Self {
         Self {
             keys: Keys::Refused(refusal),
+            foreign: ForeignPasskeys::default(),
         }
     }
 
@@ -822,15 +839,27 @@ impl PasskeyVerifier {
     }
 }
 
-impl SignatureVerifier for PasskeyVerifier {
-    /// Refuses in this order: a passkeys file that could not be trusted; a namespace other than Arca's; a proof that is not
-    /// one strict proof; every check of [`verify_assertion`]; a sign count that does not advance, or a count that cannot be
-    /// made durable. Returns `passkey:<fingerprint>` on a pass.
-    fn verify(
+impl PasskeyVerifier {
+    /// Verifies a proof against this kernel's own passkeys only: the sign-in route's check.
+    pub fn verify_own(
         &self,
         namespace: &str,
         statement: &[u8],
         signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        self.verify_with(namespace, statement, signature, false)
+    }
+
+    /// Refuses in this order: a passkeys file that could not be trusted; a namespace other than Arca's; a proof that is not
+    /// one strict proof; every check of [`verify_assertion`]; a sign count that does not advance, or a count that cannot be
+    /// made durable. With `foreign`, the lines of the trusted foreign files are read now and added after the kernel's own;
+    /// a foreign line never replaces an own line with the same credential or key.
+    fn verify_with(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+        foreign: bool,
     ) -> Result<String, ApprovalRefusal> {
         let (lines, counts) = match &self.keys {
             Keys::Kept { lines, counts } => (lines, counts),
@@ -840,11 +869,36 @@ impl SignatureVerifier for PasskeyVerifier {
             return Err(ApprovalRefusal::WrongNamespace);
         }
         let proof = parse_proof(signature)?;
-        let asserted = verify_assertion(namespace, statement, &proof, lines)?;
+        let asserted = if foreign && !self.foreign.is_empty() {
+            let mut all = lines.clone();
+            for line in self.foreign.load().0 {
+                if !all.iter().any(|own| {
+                    own.credential_id == line.credential_id || own.fingerprint == line.fingerprint
+                }) {
+                    all.push(line);
+                }
+            }
+            verify_assertion(namespace, statement, &proof, &all)?
+        } else {
+            verify_assertion(namespace, statement, &proof, lines)?
+        };
         counts
             .lock()
             .map_err(|_| ApprovalRefusal::Storage("the sign-count store is poisoned".to_string()))?
             .advance(&asserted.fingerprint, asserted.sign_count)?;
         Ok(format!("passkey:{}", asserted.fingerprint))
+    }
+}
+
+impl SignatureVerifier for PasskeyVerifier {
+    /// The approval check: this kernel's own passkeys, then the trusted foreign files' (see [`PasskeyVerifier::with_foreign`]).
+    /// Returns `passkey:<fingerprint>` on a pass.
+    fn verify(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        self.verify_with(namespace, statement, signature, true)
     }
 }
