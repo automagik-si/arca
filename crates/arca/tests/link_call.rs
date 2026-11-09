@@ -64,6 +64,101 @@ impl Drop for Temp {
     }
 }
 
+struct LinkProcess(std::process::Child);
+impl Drop for LinkProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn start_link_process(temp: &Temp, name: &str) -> LinkProcess {
+    let path = temp.0.join("node.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["listen"]["unix"] = json!(temp.0.join("fake.sock"));
+    config["link"] = json!({"name": name, "localOnly": true});
+    fs::write(&path, config.to_string()).unwrap();
+    let mut child = LinkProcess(
+        std::process::Command::new(env!("CARGO_BIN_EXE_arca"))
+            .args(["link", "serve", "--config"])
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.0.try_wait().unwrap().is_none(), "link exited early");
+            if temp.state().status().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("link startup deadline");
+    child
+}
+
+#[tokio::test]
+async fn peer_call_between_two_link_processes_returns_mcp_response() {
+    timeout(Duration::from_secs(30), async {
+        let (host_dir, caller_dir) = (Temp::new(), Temp::new());
+        host_dir.config();
+        let token = caller_dir.config();
+        let listener = UnixListener::bind(host_dir.0.join("fake.sock")).unwrap();
+        // Use the same HTTP server as MCP: it frames requests by Content-Length,
+        // and dispatches work asynchronously rather than waiting for a write EOF.
+        let router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(request): axum::Json<Value>| {
+                    let token = token.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                        tokio::task::spawn_blocking(move || {
+                            let result = match request["method"].as_str().unwrap() {
+                                "initialize" => json!({}),
+                                "tools/call" => {
+                                    assert_eq!(request["params"]["name"], "arca_status");
+                                    json!({"structuredContent": {"owner": "arca"}})
+                                }
+                                method => panic!("unexpected MCP method: {method}"),
+                            };
+                            axum::Json(
+                                json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
+                            )
+                        })
+                        .await
+                        .unwrap()
+                    }
+                },
+            ),
+        );
+        let fake = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let _host = start_link_process(&host_dir, "host").await;
+        let _caller = start_link_process(&caller_dir, "caller").await;
+        let invitation = host_dir.state().pair(1).unwrap().link;
+        arca_link::join_running(&caller_dir.state(), &invitation)
+            .await
+            .unwrap();
+        assert_eq!(host_dir.state().peers().unwrap().len(), 1);
+        assert_eq!(caller_dir.state().peers().unwrap().len(), 1);
+
+        let args = caller_dir.call_args("host");
+        let output = tokio::task::spawn_blocking(move || arca::run(&args))
+            .await
+            .unwrap();
+        assert_eq!(
+            output.unwrap_or_else(|error| panic!("peer call failed: {}", error.message())),
+            Some(json!({"owner": "arca"}))
+        );
+        fake.abort();
+    })
+    .await
+    .expect("two-process peer call deadline");
+}
+
 async fn fake_mcp(listener: UnixListener) -> (UnixListener, Vec<(String, Value)>) {
     let mut requests = Vec::new();
     for _ in 0..2 {
@@ -89,8 +184,7 @@ async fn fake_mcp(listener: UnixListener) -> (UnixListener, Vec<(String, Value)>
             .to_string();
         let mut body = vec![0; length];
         socket.read_exact(&mut body).await.unwrap();
-        // The client half-closes each POST, and the link must propagate that EOF.
-        assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+        // Content-Length completes the request without requiring a write EOF.
         let request: Value = serde_json::from_slice(&body).unwrap();
         let result = if request["method"] == "initialize" {
             json!({})
