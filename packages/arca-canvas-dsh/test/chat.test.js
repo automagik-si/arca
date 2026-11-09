@@ -9,6 +9,8 @@ import {
   dayOf, doctorPrompt, formatToolResult, sseFrame, stateFilePath,
 } from '../src/chat.js';
 
+const GiB = 1024 ** 3;
+
 const PROPOSAL = Object.freeze({
   kind: 'action',
   id: 'act-0123456789ab',
@@ -542,8 +544,9 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
     '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
     '  code fences.',
-    '- Storage sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total.',
-    '  GPU memory uses the same GB rule. Power is W and temperature is °C with one decimal.',
+    '- Sizes are always in GB with one decimal. Memory and GPU memory use 1024-based GB, so a 16 GB card',
+    '  reads 16 GB; disks use decimal GB (17.0 GB) to match the drive labels. Power is W and temperature is',
+    '  °C with one decimal.',
     '- Network rates keep the unit the tool gives: KB/s, MB/s or GB/s, with one decimal. Never show raw bytes.',
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
     '- When the owner asks about a GPU, name each card and say how busy it is. Say who is using it by',
@@ -572,7 +575,7 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
   assert.match(prompt, /If a read fails or a host did not answer, say "could not be read just now"\./);
   assert.match(prompt, /Only a reading the host can\s+never give, such as remote CPU load, is "not measurable from here"\./);
   assert.match(prompt, /Network rates keep the unit the tool gives: KB\/s, MB\/s or GB\/s/);
-  assert.doesNotMatch(prompt, /Sizes are always in GB/);
+  assert.doesNotMatch(prompt, /Storage sizes are always/);
   assert.doesNotMatch(prompt, /\bIncus\b|kernel mode|uptime/i);
   assert.match(doctorPrompt({ hosts: [{ name: 'alpha' }], now: Date.parse('2026-11-08T12:00:00Z') }),
     /No approval page is configured on this canvas/);
@@ -588,10 +591,10 @@ test('a node_metrics result reaches the fake model as plain GB, rounded percenta
       cpu: { usedPct: 70.29, cores: 8, coresKnown: true, reason: null },
       load: { one: 1.25, five: null, fifteen: 0.8, reason: internalReason },
       memory: {
-        totalBytes: 96_300_000_000,
-        availableBytes: 79_300_000_000,
-        usedBytes: 17_000_000_000,
-        swapTotalBytes: 8_000_000_000,
+        totalBytes: 96.3 * GiB,
+        availableBytes: 79.3 * GiB,
+        usedBytes: 17 * GiB,
+        swapTotalBytes: 8 * GiB,
         swapFreeBytes: null,
         reason: null,
       },
@@ -607,10 +610,10 @@ test('a node_metrics result reaches the fake model as plain GB, rounded percenta
       cpu: { usedPct: 64.8, cores: 8, coresKnown: true, reason: null },
       load: { one: 1.0, five: 1.0, fifteen: 1.0, reason: null },
       memory: {
-        totalBytes: 96_300_000_000,
+        totalBytes: 96.3 * GiB,
         availableBytes: null,
         usedBytes: null,
-        swapTotalBytes: 8_000_000_000,
+        swapTotalBytes: 8 * GiB,
         swapFreeBytes: null,
         reason: internalReason,
       },
@@ -642,8 +645,8 @@ test('a node_metrics result reaches the fake model as plain GB, rounded percenta
   assert.match(text, /not measurable from here/);
   assert.doesNotMatch(text, /not available for a remote host/);
   assert.doesNotMatch(text, /70\.29|64\.8/);
-  for (const raw of ['17000000000', '96300000000', '79300000000', '3400000000', '8000000000']) {
-    assert.equal(text.includes(raw), false, `${raw} is never shown to the model`);
+  for (const raw of [17 * GiB, 96.3 * GiB, 79.3 * GiB, 3_400_000_000, 8 * GiB]) {
+    assert.equal(text.includes(String(raw)), false, `${raw} is never shown to the model`);
   }
 });
 
@@ -653,7 +656,7 @@ test('a remote CPU keeps its known core count while its load is unmeasurable', (
     minutes: 5,
     latest: {
       cpu: { usedPct: null, cores: 16, coresKnown: true, reason: 'not available for a remote host' },
-      memory: { totalBytes: 32_000_000_000, availableBytes: 24_000_000_000, usedBytes: 8_000_000_000, reason: null },
+      memory: { totalBytes: 32 * GiB, availableBytes: 24 * GiB, usedBytes: 8 * GiB, reason: null },
       // The real remote payload sets load.reason too: a remote host can never give its load averages.
       load: { one: null, five: null, fifteen: null, reason: 'not available for a remote host' },
       pools: [],
@@ -674,7 +677,7 @@ test('a remote CPU keeps its known core count while its load is unmeasurable', (
     minutes: 5,
     latest: {
       cpu: { usedPct: 88, cores: 0, coresKnown: false, reason: null },
-      memory: { totalBytes: 32_000_000_000, availableBytes: 24_000_000_000, usedBytes: null, reason: null },
+      memory: { totalBytes: 32 * GiB, availableBytes: 24 * GiB, usedBytes: null, reason: null },
       load: { one: 1, five: 1, fifteen: 1, reason: null },
       pools: [],
       network: null,
@@ -751,7 +754,7 @@ test('alert reasons become plain words and keep their exact resolution', () => {
 test('one core is singular and rates choose the unit after rounding', () => {
   const sample = (cpu, network) => ({
     cpu,
-    memory: { totalBytes: 8_000_000_000, availableBytes: 4_000_000_000, usedBytes: 4_000_000_000, reason: null },
+    memory: { totalBytes: 8 * GiB, availableBytes: 4 * GiB, usedBytes: 4 * GiB, reason: null },
     load: { one: 1, five: 1, fifteen: 1, reason: null },
     pools: [],
     network,
@@ -797,7 +800,7 @@ test('network rates use a readable unit at the reported size', () => {
     latest: {
       cpu: { usedPct: 10, cores: 8, coresKnown: true, reason: null },
       memory: {
-        totalBytes: 16_000_000_000, availableBytes: 8_000_000_000, usedBytes: 8_000_000_000, reason: null,
+        totalBytes: 16 * GiB, availableBytes: 8 * GiB, usedBytes: 8 * GiB, reason: null,
       },
       load: { one: 1, five: 1, fifteen: 1, reason: null },
       pools: [],
@@ -814,7 +817,7 @@ test('a missing latest reading and a one-minute average use the right label', ()
   const sample = {
     cpu: { usedPct: 10, cores: 8, coresKnown: true, reason: null },
     memory: {
-      totalBytes: 16_000_000_000, availableBytes: 8_000_000_000, usedBytes: 8_000_000_000, reason: null,
+      totalBytes: 16 * GiB, availableBytes: 8 * GiB, usedBytes: 8 * GiB, reason: null,
     },
     load: { one: 1, five: 1, fifteen: 1, reason: null },
     pools: [],

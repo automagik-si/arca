@@ -11,7 +11,7 @@ const pageJs = await readFile(join(here, '../page.js'));
 const pageCss = await readFile(join(here, '../page.css'));
 const html = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><link rel="stylesheet" href="arca-canvas/page.css"></head><body><main id="arca-root" data-arca-base="/arca-canvas" data-poll-ms="50"></main><script src="arca-canvas/page.js" defer></script></body></html>';
 
-const GB = 1e9;
+const GB = 1024 ** 3;
 const GPU_ID = 'act-0123456789ab';
 const DOCKER_ID = 'b'.repeat(64);
 const NESTED_DOCKER_ID = 'c'.repeat(64);
@@ -21,7 +21,7 @@ function telemetry(overrides = {}) {
   return {
     utilizationPct: 12,
     memoryUsedBytes: 6.1 * GB,
-    memoryTotalBytes: 17.2 * GB,
+    memoryTotalBytes: 16 * GB,
     powerDrawW: 61.2,
     powerLimitW: 165,
     temperatureC: 63.5,
@@ -40,7 +40,7 @@ function gpuCard(pci, overrides = {}) {
     driver: 'nvidia',
     driverVersion: '590.1',
     numaNode: 0,
-    vramTotalBytes: 17.2 * GB,
+    vramTotalBytes: 16 * GB,
     use: 'driver-bound',
     telemetry: telemetry(),
     reason: null,
@@ -91,6 +91,7 @@ function fixture() {
         reason: null,
         skipped: null,
         cards: [
+          gpuCard('0000:02:00.0', { telemetry: telemetry({ eventReasons: '0x0000000000000001' }) }),
           gpuCard('0000:01:00.0', {
             processes: [
               { pci: '0000:01:00.0', pid: 10, vramBytes: 6.1 * GB, owner: { kind: 'instance', project: 'studio', name: 'app' } },
@@ -99,7 +100,6 @@ function fixture() {
               { pci: '0000:01:00.0', pid: 13, vramBytes: 0.5 * GB, owner: { kind: 'host' } },
             ],
           }),
-          gpuCard('0000:02:00.0', { telemetry: telemetry({ eventReasons: '0x0000000000000001' }) }),
         ],
       }),
       machine('beta', {}, {
@@ -113,11 +113,13 @@ function fixture() {
           processes: [],
           processReason: 'not measurable from here',
         })],
-      }),
+      }, { servicesKnown: false }),
       machine('gamma', { mode: 'watch-only' }, { reason: null, skipped: null, cards: [] }, {
         services: [{ name: 'web1', template: 'web', state: 'running', ipv4: '10.0.0.7', ports: [8080], lanPort: 8080 }],
         error: 'service_list: Arca refused the request (403).',
+        metrics: null,
       }),
+      machine('delta', {}, { reason: 'the Incus resources read failed', skipped: null, cards: [] }),
     ],
   };
 }
@@ -132,15 +134,15 @@ function approvalPlan() {
     kind: 'action',
     id: GPU_ID,
     action: 'gpu_attach',
-    summary: 'Attach the GPU at 0000:01:00.0 to instance alpha in project arcak-gpu',
-    args: { project: 'arcak-gpu', instance: 'alpha', kind: 'container', uuid: '11111111-2222-3333-4444-555555555555', pci: '0000:01:00.0' },
+    summary: 'Attach the GPU at 0000:02:00.0 to instance alpha in project arcak-gpu',
+    args: { project: 'arcak-gpu', instance: 'alpha', kind: 'container', uuid: '11111111-2222-3333-4444-555555555555', pci: '0000:02:00.0' },
     argsDigest: digestFor(GPU_ID),
     createdAt: now,
     expiresAt: now + 15 * 60 * 1000,
     details: [
       { label: 'Project', value: 'arcak-gpu' },
       { label: 'Instance', value: 'alpha (container)' },
-      { label: 'GPU', value: 'NVIDIA GeForce RTX 4060 Ti (0000:01:00.0)' },
+      { label: 'GPU', value: 'NVIDIA GeForce RTX 4060 Ti (0000:02:00.0)' },
       { label: 'Effect', value: EFFECT },
     ],
   };
@@ -230,20 +232,31 @@ test('GPU cards render per machine, name their users, and keep the approval safe
   const alpha = page.locator('.arca-machine[data-host="alpha"]');
   const lines = alpha.locator('.arca-gpu');
   assert.deepEqual(await lines.evaluateAll((nodes) => nodes.map((node) => node.dataset.gpu)), ['0000:01:00.0', '0000:02:00.0']);
-  assert.deepEqual(await lines.locator('.arca-gpu-label').evaluateAll((nodes) => nodes.map((node) => node.textContent)), ['GPU 1', 'GPU 2']);
+  assert.deepEqual(await lines.locator('.arca-gpu-label').evaluateAll((nodes) => nodes.map((node) => node.textContent)), ['GPU 1 · 4060 Ti', 'GPU 2 · 4060 Ti']);
   assert.match(await lines.first().getAttribute('title'), /NVIDIA GeForce RTX 4060 Ti/);
   assert.match(await lines.first().getAttribute('title'), /0000:01:00\.0/);
-  assert.match(await lines.first().innerText(), /GPU 1[\s\S]*12%[\s\S]*6\.1 \/ 17 GB/);
+  assert.match(await lines.first().innerText(), /GPU 1 · 4060 Ti[\s\S]*12%[\s\S]*6\.1 \/ 16 GB/);
   assert.equal(await lines.first().locator('.arca-gpu-note').innerText(), 'held back by its power limit');
   assert.equal(await lines.nth(1).locator('.arca-gpu-note').count(), 0, 'bit 0x1 is not the power cap');
 
   const remote = page.locator('.arca-machine[data-host="beta"] .arca-gpu');
   assert.equal(await remote.count(), 1);
   const remoteText = await remote.innerText();
-  assert.match(remoteText, /GPU 4090/);
+  assert.match(remoteText, /GPU 1 · 4090/);
   assert.match(remoteText, /not measurable from here/);
   assert.doesNotMatch(remoteText, /0%/);
   assert.equal(await page.locator('.arca-machine[data-host="gamma"] .arca-gpu').count(), 0, 'no GPU means no GPU line');
+  assert.equal(await page.locator('.arca-machine[data-host="gamma"] .arca-machine-warn').count(), 0, 'an expected watch-only service refusal is not partial data');
+  const failedInventory = page.locator('.arca-machine[data-host="delta"] .arca-gpu');
+  assert.equal(await failedInventory.count(), 1, 'a failed inventory read is one line, not silence');
+  assert.match(await failedInventory.innerText(), /GPU[\s\S]*the Incus resources read failed/);
+
+  await page.locator('.arca-machine[data-host="beta"] .arca-machine-more').click();
+  const betaDetail = page.locator('.arca-detail-panel');
+  await betaDetail.waitFor();
+  assert.match(await betaDetail.innerText(), /Services could not be read just now\./);
+  assert.doesNotMatch(await betaDetail.innerText(), /No services are running/);
+  await betaDetail.locator('.arca-detail-close').click();
 
   await page.locator('.arca-machine[data-host="alpha"] .arca-machine-more').click();
   const alphaDetail = page.locator('.arca-detail-panel');
@@ -275,12 +288,19 @@ test('GPU cards render per machine, name their users, and keep the approval safe
 
   if (process.env.ARCA_CANVAS_EVIDENCE_DIR) {
     await mkdir(process.env.ARCA_CANVAS_EVIDENCE_DIR, { recursive: true });
+    // The four-host fixture is wider than the 1440 layout's machine column. Widen only for the strip
+    // shot so every card is whole; the detail and approval shots keep the standard viewport.
+    const viewport = page.viewportSize();
+    await page.setViewportSize({ width: 1920, height: 900 });
+    await page.waitForTimeout(100);
     for (const theme of ['light', 'dark']) {
       await page.emulateMedia({ colorScheme: theme });
       await page.waitForTimeout(250);
       await page.locator('.arca-machines').screenshot({ path: join(process.env.ARCA_CANVAS_EVIDENCE_DIR, `canvas-gpu-strip-${theme}.png`) });
     }
     await page.emulateMedia({ colorScheme: 'light' });
+    await page.setViewportSize(viewport);
+    await page.waitForTimeout(100);
   }
 
   await page.locator('.arca-composer-input').fill('who is using the gpu?');
@@ -292,6 +312,7 @@ test('GPU cards render per machine, name their users, and keep the approval safe
     node.querySelector('dt').textContent, node.querySelector('dd').textContent,
   ]));
   assert.deepEqual(rows, plan.details.map((row) => [row.label, row.value]));
+  assert.equal(await card.locator('.arca-approval-slot dd').innerText(), 'GPU 2 on alpha');
   assert.equal(rows[3][0], 'Effect');
   assert.equal(rows[3][1], EFFECT, 'the Effect safety sentence is never shortened');
   assert.equal(await card.locator('[data-technical="action"] dd').innerText(), 'gpu_attach');

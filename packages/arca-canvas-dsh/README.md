@@ -163,7 +163,8 @@ host entry has `name`, `address` (the configured LAN address or empty), `at`,
 `error` (null or safe error text), `nodeName`
 (resolved by the host), `machine`, `instances`, `instancesKnown` (false when
 `watch_report` failed), `projects` (the Incus project ids from `watch_report`),
-`databases`, `services`, `metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
+`databases`, `services`, `servicesKnown` (false when `service_list` failed),
+`metrics`, `alerts`, `plans`, `journal`, `journalKnown` (false when
 `journal_list` failed), `journalPending` (true while a deep journal read finishes
 in the background), `devices`, `devicesAt` (ISO time of the last good device
 list, or null), `phones`, and `desktops`. `devices` is `off`, `ok`, `unavailable`,
@@ -255,22 +256,29 @@ own absolute URL when present, and database address, port and link count when
 present. A domain card appears only when the project config sets `domain`.
 
 A machine card draws one line per `node_metrics.latest.gpu.cards[]` entry under
-CPU and Mem. A single card is named by its product (`GPU 4060 Ti`); repeated
-products are labelled by slot (`GPU 1`, `GPU 2`) and every line's tooltip names
-the exact PCI address. The line shows utilization as a whole percentage, a VRAM
-bar and used/total GB from telemetry. A card with no telemetry shows its card
-name and the kernel's plain `reason` instead, never an invented 0%. A card is
-marked "held back by its power limit" only when `telemetry.eventReasons` has the
-SW power cap bit (0x4). A host whose `gpu.cards` is empty draws no GPU line.
+CPU and Mem. Cards are sorted by PCI and every card gets its own slot number, so
+a unique card reads `GPU 1 · 4060 Ti` and two identical cards read
+`GPU 1 · 4060 Ti` / `GPU 2 · 4060 Ti`; every line's tooltip names the exact PCI
+address. The line shows utilization as a whole percentage, a VRAM bar and
+used/total GB from telemetry. Memory and VRAM use 1024-based GB, so a 16 GiB
+card reads `16 GB`; disks keep decimal GB to match their labels. A card with no
+telemetry shows its card name and the kernel's plain `reason` instead, never an
+invented 0%. A card is marked "held back by its power limit" only when
+`telemetry.eventReasons` has the SW power cap bit (0x4). A host whose
+`gpu.cards` is empty draws no GPU line, unless `gpu.reason` says the inventory
+read failed: then one GPU line carries that reason.
 
 The machine Details dialog repeats every card with its PCI address, driver,
 VRAM, power (W), temperature (°C) and clock, then lists who is using it: the
 Incus project and instance (with a Docker container id when the process runs in
 one), a host Docker container, or "on the host", each with its own VRAM in GB.
-Its services area lists the machine's services; when `arca_status.mode` is
-`watch-only` it instead says "Arca watches this machine; it doesn't run services
-here yet" and shows no service error, because the kernel refuses service reads
-by design in that mode.
+Its services area lists the machine's services. A failed `service_list` on a
+normal host says "Services could not be read just now", never "No services".
+When `arca_status.mode` is `watch-only` it instead says "Arca watches this
+machine; it doesn't run services here yet" and shows no service error, because
+the kernel refuses service reads by design in that mode. That expected refusal
+is also the only read hidden from the strip's "Partial data" warning; another
+failed read on a watch-only machine still shows it.
 
 The right-hand Doctor panel has Chat and Steps tabs. Chat is a real
 conversation; Steps renders the newest `journal_list` records across every
@@ -306,15 +314,17 @@ carries a container image: the kernel picks its default.
 
 The Doctor speaks to a non-technical owner: short plain sentences, no markdown
 tables, headings or code fences, sizes in GB with one decimal and percentages as
-whole numbers. Tool results reach the model in that same form. Metrics arrive as
-a short plain-text summary (memory used, available and total in GB, rounded CPU
-percentages, plain labels), and a figure the host cannot report is shown as
-`not measurable from here` rather than an internal reason. GPU cards reach the
-model with their utilization, VRAM, power and temperature, plus who is using
-each card by project/instance, Docker container or "on the host" and that user's
-VRAM in GB, so the Doctor can answer "who is using the GPU" without inventing
-attribution. Byte fields in every
-other read result become GB, network rates pick KB/s, MB/s or GB/s, and
+whole numbers. Memory and VRAM use 1024-based GB (a 16 GiB card reads 16 GB);
+disks keep decimal GB to match their labels. Tool results reach the model in
+that same form. Metrics arrive as a short plain-text summary (memory used,
+available and total in GB, rounded CPU percentages, plain labels), and a figure
+the host cannot report is shown as `not measurable from here` rather than an
+internal reason. GPU cards reach the model with their slot and exact PCI address
+(`GPU 2 (4060 Ti, PCI 0000:02:00.0): ...`), utilization, VRAM, power and
+temperature, plus who is using each card by project/instance, Docker container
+or "on the host" and that user's VRAM in GB, so the Doctor can answer "who is
+using the GPU" and name the right identical card. Byte fields in every other
+read result are disk-like decimal GB, network rates pick KB/s, MB/s or GB/s, and
 percentages become whole numbers, so the model never sees a raw byte count it
 could repeat. Alert reasons are translated to plain words; a resolved alert
 keeps its own resolution instead of reading like a different one.
@@ -352,6 +362,9 @@ An approval card shows, from the kernel's `/approve/plans` row matched by id:
 - the **host from the signed statement**, so two hosts with the same action and
   arguments (the id hashes only those) are never confused; the card signature
   includes it, so a changed host re-renders the card;
+- for `gpu_attach` / `gpu_detach`, a page-built **Slot** row next to Host, which
+  maps the proposal's PCI address through that host's inventory (for example
+  `GPU 2 on alpha`) so two identical cards are unmistakable;
 - the kernel-built `summary`, as text;
 - every `details` row (`label` and `value`) in kernel order, as text;
 - the action, the target id and the first 12 hex characters of `argsDigest`;
@@ -518,11 +531,13 @@ the approval card's kernel-only text, exact approve and decline bodies, the
 host row and statement integrity, a foreign host and an unknown id, expiry,
 action refusal, retry, NoSuchPlan, a hanging approval timeout, passkey
 cancellation, the tool and token caps, the daily budget, the persisted `Doctor`
-session, and the absence of the model key from the page. GPU tests cover two
-identical cards by slot, a remote host with inventory only, no GPU, telemetry
-with a reason, process owners of every kind, a watch-only services area, the
-power-cap bit, and the whole GPU approval-card rows including the Effect
-sentence.
+session, and the absence of the model key from the page. GPU tests cover
+PCI-sorted slots for identical cards, the Doctor's slot+PCI card identity, a
+remote host with inventory only, no GPU, a failed GPU inventory read, telemetry
+with a reason, process owners of every kind, binary 16 GB VRAM, a watch-only
+services area and its partial-data rule, a failed service read on a normal host,
+the power-cap bit, the page-built Slot row, and the whole GPU approval-card rows
+including the Effect sentence.
 
 `npm run build` regenerates the browser module and standalone page assets using
 exact-pinned esbuild. Commit all three artifacts with browser-source changes.

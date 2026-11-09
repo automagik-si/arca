@@ -102,7 +102,7 @@ test('all eight fixtures become one snapshot with project-qualified instances', 
   const { config } = await sandbox(t);
   const calls = await fakeArca(t, config);
   const snapshot = await collectSnapshot(createArcaClient(config));
-  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'services', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
+  assert.deepEqual(Object.keys(snapshot), ['at', 'error', 'approvalUrl', 'nodeName', 'machine', 'instances', 'instancesKnown', 'projects', 'databases', 'services', 'servicesKnown', 'metrics', 'alerts', 'plans', 'journal', 'journalKnown', 'journalPending', 'devices', 'devicesAt', 'phones', 'desktops']);
   assert.equal(snapshot.instancesKnown, true);
   assert.deepEqual(snapshot.projects, fixtures.watch_report.projects.map(({ project }) => project));
   assert.ok(Number.isFinite(Date.parse(snapshot.at)));
@@ -112,6 +112,7 @@ test('all eight fixtures become one snapshot with project-qualified instances', 
   assert.deepEqual(snapshot.instances, fixtures.watch_report.projects.flatMap(({ project, instances }) => instances.map((instance) => ({ ...instance, project }))));
   assert.deepEqual(snapshot.databases, fixtures.postgres_list.databases);
   assert.deepEqual(snapshot.services, fixtures.service_list.services);
+  assert.equal(snapshot.servicesKnown, true);
   assert.deepEqual(snapshot.metrics, fixtures.node_metrics);
   assert.deepEqual(snapshot.alerts, fixtures.alerts_list);
   assert.deepEqual(snapshot.plans, fixtures.plan_list.plans);
@@ -160,6 +161,7 @@ test('missing socket becomes an empty snapshot with an error', async (t) => {
   assert.match(snapshot.error, /socket is unavailable/);
   assert.equal(snapshot.machine, null);
   assert.equal(snapshot.metrics, null);
+  assert.equal(snapshot.servicesKnown, false);
   for (const key of ['instances', 'databases', 'alerts', 'plans']) assert.deepEqual(snapshot[key], []);
 });
 

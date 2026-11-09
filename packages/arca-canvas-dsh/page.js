@@ -60,12 +60,16 @@
     if (!Number.isFinite(value)) return "";
     return `${Math.round(value * 10 ** digits) / 10 ** digits}`;
   }
-  function formatGb(bytes) {
+  var MEMORY_GIGABYTE = 1024 ** 3;
+  function formatGigabyteValue(bytes, base) {
     const value = Number(bytes);
     if (!Number.isFinite(value) || value < 0) return "";
-    const gb = value / 1e9;
+    const gb = value / base;
     if (gb >= 10) return String(Math.round(gb));
     return String(Math.round(gb * 10) / 10);
+  }
+  function formatGb(bytes) {
+    return formatGigabyteValue(bytes, MEMORY_GIGABYTE);
   }
   var WATCH_ONLY_SERVICES = "Arca watches this machine; it doesn't run services here yet";
   function formatWatts(value) {
@@ -163,26 +167,13 @@
     }).map((owner) => ({ ...owner, vramText: owner.vramBytes === null ? "" : `${formatGb(owner.vramBytes)} GB` }));
   }
   function gpuCards(gpu) {
-    const cards = list(gpu?.cards).filter((card) => card && typeof card === "object" && text(card.pci).trim());
-    const products = /* @__PURE__ */ new Map();
-    for (const card of cards) {
-      const key = text(card.product).trim().toLowerCase() || text(card.pci).trim();
-      products.set(key, (products.get(key) ?? 0) + 1);
-    }
-    const slots = /* @__PURE__ */ new Map();
-    return cards.map((card) => {
+    const cards = list(gpu?.cards).filter((card) => card && typeof card === "object" && text(card.pci).trim()).slice().sort((a, b) => text(a.pci).trim().localeCompare(text(b.pci).trim(), "en"));
+    return cards.map((card, index) => {
       const pci = text(card.pci).trim();
       const product = text(card.product).trim();
-      const productKey = product.toLowerCase() || pci;
-      const duplicate = (products.get(productKey) ?? 0) > 1;
-      let label;
-      if (duplicate) {
-        const slot = (slots.get(productKey) ?? 0) + 1;
-        slots.set(productKey, slot);
-        label = `GPU ${slot}`;
-      } else {
-        label = `GPU${gpuProductName(product) ? ` ${gpuProductName(product)}` : ""}`;
-      }
+      const shortName = gpuProductName(product);
+      const slot = index + 1;
+      const label = `GPU ${slot}${shortName ? ` \xB7 ${shortName}` : ""}`;
       const telemetry = card.telemetry && typeof card.telemetry === "object" ? card.telemetry : null;
       const utilizationPct = finite(telemetry?.utilizationPct);
       const usedBytes = finite(telemetry?.memoryUsedBytes);
@@ -196,6 +187,9 @@
       const reason = gpuCardReason(card, gpu);
       return {
         pci,
+        slot,
+        slotLabel: `GPU ${slot}`,
+        shortName,
         label,
         product,
         vendor: text(card.vendor).trim(),
@@ -353,12 +347,22 @@
     if (unknown) parts.push(`${unknown} unknown`);
     return { tone, text: parts.join(" \xB7 ") || "Live" };
   }
+  function readErrorTools(error) {
+    const value = text(error).trim();
+    if (!value) return [];
+    const pattern = /(?:^|\s)(arca_status|watch_report|postgres_list|node_metrics|alerts_list|plan_list|service_list|journal_list):\s/g;
+    const tools = [];
+    let match;
+    while ((match = pattern.exec(value)) !== null) tools.push(match[1]);
+    return [...new Set(tools)];
+  }
   function buildMachine(host) {
     const cpu = hostCpu(host);
     const memory = hostMemory(host);
     const online = isHostOnline(host);
     const mode = text(host.machine?.mode).trim();
     const gpu = host.metrics?.latest?.gpu;
+    const errorTools = readErrorTools(host.error);
     return {
       name: text(host.name, text(host.nodeName, "Machine")),
       label: text(host.name, text(host.nodeName, "Machine")),
@@ -385,6 +389,10 @@
         state: text(service?.state).trim(),
         lanPort: finite(service?.lanPort)
       })).filter((service) => service.name),
+      // Older snapshots have no flag: treat their empty list as known-empty, as before.
+      servicesKnown: host.servicesKnown !== false,
+      errorTools,
+      servicesOnlyError: errorTools.length > 0 && errorTools.every((tool) => tool === "service_list"),
       instanceCount: host.instancesKnown === false ? null : list(host.instances).length,
       instancesKnown: host.instancesKnown !== false,
       error: host.error ?? null,
@@ -654,6 +662,11 @@
     "gpu_attach",
     "gpu_detach"
   ]);
+  var GPU_ACTIONS = /* @__PURE__ */ new Set(["gpu_attach", "gpu_detach"]);
+  function normalizePci(value) {
+    const match = String(value ?? "").trim().toLowerCase().match(/^(?:([0-9a-f]{4}):)?([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$/);
+    return match ? `${match[1] ?? "0000"}:${match[2]}` : "";
+  }
   var APPROVAL_TIMEOUT_MS = 3e4;
   var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
   var MISSING_PROPOSAL = "The proposal is not waiting any more.";
@@ -963,6 +976,14 @@
     }
     return row;
   }
+  function gpuFailureLine(doc, reason) {
+    const row = el(doc, "div", "arca-gpu");
+    row.title = reason;
+    const head = el(doc, "div", "arca-gpu-head");
+    head.append(el(doc, "span", "arca-gpu-label", "GPU"));
+    row.append(head, el(doc, "span", "arca-gpu-reason", reason));
+    return row;
+  }
   function machineCard(doc, machine) {
     const card = el(doc, "article", "arca-machine");
     card.dataset.host = machine.name;
@@ -980,6 +1001,10 @@
       const gpus = el(doc, "div", "arca-gpus");
       for (const gpu of machine.gpus) gpus.append(gpuLine(doc, gpu));
       card.append(gpus);
+    } else if (machine.gpuReason) {
+      const gpus = el(doc, "div", "arca-gpus");
+      gpus.append(gpuFailureLine(doc, machine.gpuReason));
+      card.append(gpus);
     }
     const foot = el(doc, "div", "arca-machine-foot");
     foot.append(el(
@@ -989,7 +1014,9 @@
       machine.instanceCount === null ? "Instances unknown" : count2(machine.instanceCount, "instance")
     ));
     const right = el(doc, "span", "arca-machine-foot-right");
-    if (machine.error && !machine.metricsAt && !machine.watchOnly) right.append(el(doc, "span", "arca-machine-warn", "Partial data"));
+    if (machine.error && !machine.metricsAt && (!machine.watchOnly || !machine.servicesOnlyError)) {
+      right.append(el(doc, "span", "arca-machine-warn", "Partial data"));
+    }
     const more = el(doc, "button", "arca-machine-more", "Details");
     more.type = "button";
     more.dataset.machineDetail = machine.name;
@@ -1588,6 +1615,8 @@
       services.append(el(doc, "h3", "arca-detail-heading", "Services"));
       if (machine.watchOnly) {
         services.append(el(doc, "p", "arca-detail-note arca-detail-watch", WATCH_ONLY_SERVICES));
+      } else if (!machine.servicesKnown) {
+        services.append(el(doc, "p", "arca-detail-note", "Services could not be read just now."));
       } else if (machine.services.length) {
         const rows = el(doc, "ul", "arca-detail-services-list");
         for (const service of machine.services) {
@@ -1622,7 +1651,7 @@
     });
     const updateMachines = () => {
       const hosts = state.dashboard?.hosts ?? [];
-      const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpu, memory, gpus, watchOnly, mode, services }) => ({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct, gpus, watchOnly, mode, services })));
+      const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpu, memory, gpus, gpuReason, watchOnly, mode, services, servicesKnown, servicesOnlyError }) => ({ name, online, cpuLabel: cpuLabel2, cpuReason, memoryLabel: memoryLabel2, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct, gpus, gpuReason, watchOnly, mode, services, servicesKnown, servicesOnlyError })));
       if (signature === state.signatures.machines) return;
       state.signatures.machines = signature;
       const nodes = hosts.map((machine) => machineCard(doc, machine));
@@ -1776,6 +1805,7 @@
           if (statement.target !== id || statement.action !== row.action || statement.paramsDigest !== digest) continue;
           const host = typeof statement.host === "string" ? statement.host.trim() : "";
           if (!host) continue;
+          const pci = GPU_ACTIONS.has(row.action) && row.args && typeof row.args === "object" ? normalizePci(row.args.pci) : "";
           plans.set(id, {
             kind: "action",
             id,
@@ -1785,7 +1815,8 @@
             details,
             expiresAt,
             host,
-            statement: row.statement
+            statement: row.statement,
+            pci
           });
         } else if (typeof row.plan === "string" && /^[0-9a-f]{64}$/.test(row.plan)) {
           deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
@@ -1898,6 +1929,17 @@
       note.dataset.proposal = id;
       return note;
     }
+    function planGpuSlot(plan) {
+      if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
+      const hosts = state.dashboard?.hosts ?? [];
+      const wanted = text2(plan.host).trim().toLowerCase();
+      const pageHost = text2(state.envelope.pageHost).trim();
+      let host = hosts.find((candidate) => candidate.name.toLowerCase() === wanted);
+      if (!host && pageHost) host = hosts.find((candidate) => candidate.name === pageHost);
+      if (!host && hosts.length === 1) host = hosts[0];
+      const gpu = host?.gpus?.find((candidate) => candidate.pci === plan.pci);
+      return gpu && host ? { slot: gpu.slotLabel, host: host.name } : null;
+    }
     function proposalCard(doc2, id) {
       const key = proposalId({ id });
       const card = approvalCardFor(key);
@@ -1926,6 +1968,14 @@
       hostRow.dataset.detail = "host";
       hostRow.append(el(doc2, "dt", "", "Host"), el(doc2, "dd", "", plan.host));
       facts.append(hostRow);
+      const slot = planGpuSlot(plan);
+      if (slot) {
+        const slotRow = el(doc2, "div", "arca-approval-fact arca-approval-slot");
+        slotRow.dataset.slot = "true";
+        slotRow.dataset.pageBuilt = "slot";
+        slotRow.append(el(doc2, "dt", "", "Slot"), el(doc2, "dd", "", `${slot.slot} on ${slot.host}`));
+        facts.append(slotRow);
+      }
       for (const row of plan.details) {
         const line = el(doc2, "div", "arca-approval-fact");
         line.dataset.detail = "true";

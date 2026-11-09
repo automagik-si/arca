@@ -11,6 +11,13 @@ const PROPOSE_ACTIONS = new Set([
   'service_create', 'service_remove', 'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
 ]);
+const GPU_ACTIONS = new Set(['gpu_attach', 'gpu_detach']);
+
+function normalizePci(value) {
+  const match = String(value ?? '').trim().toLowerCase()
+    .match(/^(?:([0-9a-f]{4}):)?([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$/);
+  return match ? `${match[1] ?? '0000'}:${match[2]}` : '';
+}
 const APPROVAL_TIMEOUT_MS = 30_000;
 const NO_SUCH_PLAN = 'This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.';
 const MISSING_PROPOSAL = 'The proposal is not waiting any more.';
@@ -308,6 +315,15 @@ function gpuLine(doc, gpu) {
   return row;
 }
 
+function gpuFailureLine(doc, reason) {
+  const row = el(doc, 'div', 'arca-gpu');
+  row.title = reason;
+  const head = el(doc, 'div', 'arca-gpu-head');
+  head.append(el(doc, 'span', 'arca-gpu-label', 'GPU'));
+  row.append(head, el(doc, 'span', 'arca-gpu-reason', reason));
+  return row;
+}
+
 function machineCard(doc, machine) {
   const card = el(doc, 'article', 'arca-machine');
   card.dataset.host = machine.name;
@@ -325,12 +341,21 @@ function machineCard(doc, machine) {
     const gpus = el(doc, 'div', 'arca-gpus');
     for (const gpu of machine.gpus) gpus.append(gpuLine(doc, gpu));
     card.append(gpus);
+  } else if (machine.gpuReason) {
+    // A failed inventory read is one GPU line with its reason, not silence and not an empty "no GPUs".
+    const gpus = el(doc, 'div', 'arca-gpus');
+    gpus.append(gpuFailureLine(doc, machine.gpuReason));
+    card.append(gpus);
   }
   const foot = el(doc, 'div', 'arca-machine-foot');
   foot.append(el(doc, 'span', 'arca-machine-instances',
     machine.instanceCount === null ? 'Instances unknown' : count(machine.instanceCount, 'instance')));
   const right = el(doc, 'span', 'arca-machine-foot-right');
-  if (machine.error && !machine.metricsAt && !machine.watchOnly) right.append(el(doc, 'span', 'arca-machine-warn', 'Partial data'));
+  // On a watch-only machine a service refusal is expected and must not read as partial data. Any
+  // other failed read on the same machine still does.
+  if (machine.error && !machine.metricsAt && (!machine.watchOnly || !machine.servicesOnlyError)) {
+    right.append(el(doc, 'span', 'arca-machine-warn', 'Partial data'));
+  }
   const more = el(doc, 'button', 'arca-machine-more', 'Details');
   more.type = 'button';
   more.dataset.machineDetail = machine.name;
@@ -980,6 +1005,8 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
       // A watch-only host is not allowed to run services yet. This is the machine's expected state,
       // keyed off arca_status mode, so no service refusal or error text is shown here.
       services.append(el(doc, 'p', 'arca-detail-note arca-detail-watch', WATCH_ONLY_SERVICES));
+    } else if (!machine.servicesKnown) {
+      services.append(el(doc, 'p', 'arca-detail-note', 'Services could not be read just now.'));
     } else if (machine.services.length) {
       const rows = el(doc, 'ul', 'arca-detail-services-list');
       for (const service of machine.services) {
@@ -1017,8 +1044,8 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
 
   const updateMachines = () => {
     const hosts = state.dashboard?.hosts ?? [];
-    const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel, cpuReason, memoryLabel, memoryReason, instanceCount, error, cpu, memory, gpus, watchOnly, mode, services }) =>
-      ({ name, online, cpuLabel, cpuReason, memoryLabel, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct, gpus, watchOnly, mode, services })));
+    const signature = JSON.stringify(hosts.map(({ name, online, cpuLabel, cpuReason, memoryLabel, memoryReason, instanceCount, error, cpu, memory, gpus, gpuReason, watchOnly, mode, services, servicesKnown, servicesOnlyError }) =>
+      ({ name, online, cpuLabel, cpuReason, memoryLabel, memoryReason, instanceCount, error, cpuPct: cpu?.usedPct, memoryPct: memory?.usedPct, gpus, gpuReason, watchOnly, mode, services, servicesKnown, servicesOnlyError })));
     if (signature === state.signatures.machines) return;
     state.signatures.machines = signature;
     const nodes = hosts.map((machine) => machineCard(doc, machine));
@@ -1185,9 +1212,11 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         if (statement.target !== id || statement.action !== row.action || statement.paramsDigest !== digest) continue;
         const host = typeof statement.host === 'string' ? statement.host.trim() : '';
         if (!host) continue;
+        const pci = GPU_ACTIONS.has(row.action) && row.args && typeof row.args === 'object'
+          ? normalizePci(row.args.pci) : '';
         plans.set(id, {
           kind: 'action', id, action: row.action, summary, argsDigest: digest, details, expiresAt,
-          host, statement: row.statement,
+          host, statement: row.statement, pci,
         });
       } else if (typeof row.plan === 'string' && /^[0-9a-f]{64}$/.test(row.plan)) {
         deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
@@ -1311,6 +1340,20 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     return note;
   }
 
+  // The Slot row is page-built: it maps the kernel proposal's PCI back to the host inventory so the
+  // owner can see which physical card a "GPU 2" suggestion means. Kernel details rows are untouched.
+  function planGpuSlot(plan) {
+    if (!GPU_ACTIONS.has(plan.action) || !plan.pci) return null;
+    const hosts = state.dashboard?.hosts ?? [];
+    const wanted = text(plan.host).trim().toLowerCase();
+    const pageHost = text(state.envelope.pageHost).trim();
+    let host = hosts.find((candidate) => candidate.name.toLowerCase() === wanted);
+    if (!host && pageHost) host = hosts.find((candidate) => candidate.name === pageHost);
+    if (!host && hosts.length === 1) host = hosts[0];
+    const gpu = host?.gpus?.find((candidate) => candidate.pci === plan.pci);
+    return gpu && host ? { slot: gpu.slotLabel, host: host.name } : null;
+  }
+
   function proposalCard(doc, id) {
     const key = proposalId({ id });
     const card = approvalCardFor(key);
@@ -1341,6 +1384,14 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     hostRow.dataset.detail = 'host';
     hostRow.append(el(doc, 'dt', '', 'Host'), el(doc, 'dd', '', plan.host));
     facts.append(hostRow);
+    const slot = planGpuSlot(plan);
+    if (slot) {
+      const slotRow = el(doc, 'div', 'arca-approval-fact arca-approval-slot');
+      slotRow.dataset.slot = 'true';
+      slotRow.dataset.pageBuilt = 'slot';
+      slotRow.append(el(doc, 'dt', '', 'Slot'), el(doc, 'dd', '', `${slot.slot} on ${slot.host}`));
+      facts.append(slotRow);
+    }
     for (const row of plan.details) {
       const line = el(doc, 'div', 'arca-approval-fact');
       line.dataset.detail = 'true';

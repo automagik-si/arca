@@ -479,9 +479,9 @@ test('a reason for the absent load never hides a known core count', () => {
 
 test('the host usedBytes figure wins over the total-available derivation', () => {
   const host = structuredClone(fixture.hosts[0]);
-  host.metrics.latest.memory = { totalBytes: 16_000_000_000, availableBytes: 12_000_000_000, usedBytes: 5_000_000_000 };
+  host.metrics.latest.memory = { totalBytes: 16 * 1024 ** 3, availableBytes: 12 * 1024 ** 3, usedBytes: 5 * 1024 ** 3 };
   const machine = buildDashboard({ ...fixture, hosts: [host] }).hosts[0];
-  assert.equal(machine.memory.usedBytes, 5_000_000_000);
+  assert.equal(machine.memory.usedBytes, 5 * 1024 ** 3);
   assert.equal(machine.memory.usedPct, 31.25);
   assert.equal(machine.memoryLabel, '5 / 16 GB');
 });

@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  buildDashboard, formatCelsius, formatGb, formatWatts, gpuCards, gpuPowerCapped, WATCH_ONLY_SERVICES,
+  buildDashboard, formatCelsius, formatDiskGb, formatGb, formatWatts, gpuCards, gpuPowerCapped, WATCH_ONLY_SERVICES,
 } from '../src/model.js';
 import {
   PROPOSE_ACTIONS, createReadTools, doctorPrompt, formatToolResult,
 } from '../src/chat.js';
 
-const GB = 1e9;
+const GB = 1024 ** 3;
 const CONTAINER_ID = 'a'.repeat(64);
 const OTHER_CONTAINER_ID = 'b'.repeat(64);
 
@@ -15,7 +15,7 @@ function telemetry(overrides = {}) {
   return {
     utilizationPct: 12,
     memoryUsedBytes: 6.1 * GB,
-    memoryTotalBytes: 17.2 * GB,
+    memoryTotalBytes: 16 * GB,
     powerDrawW: 61.2,
     powerLimitW: 165,
     temperatureC: 63.5,
@@ -34,7 +34,7 @@ function card(pci, product, overrides = {}) {
     driver: 'nvidia',
     driverVersion: '590.1',
     numaNode: 0,
-    vramTotalBytes: 17.2 * GB,
+    vramTotalBytes: 16 * GB,
     use: 'driver-bound',
     telemetry: telemetry(),
     reason: null,
@@ -62,21 +62,24 @@ function host(name, gpuValue, overrides = {}) {
 test('two identical cards stay two rows and are labelled by slot with the PCI hover', () => {
   const dashboard = buildDashboard({
     hosts: [host('alpha', gpu([
-      card('0000:01:00.0', 'NVIDIA GeForce RTX 4060 Ti'),
       card('0000:02:00.0', 'NVIDIA GeForce RTX 4060 Ti', { telemetry: telemetry({ utilizationPct: 35 }) }),
+      card('0000:01:00.0', 'NVIDIA GeForce RTX 4060 Ti'),
     ]))],
   });
   const cards = dashboard.hosts[0].gpus;
   assert.equal(cards.length, 2);
-  assert.deepEqual(cards.map((entry) => entry.label), ['GPU 1', 'GPU 2']);
+  assert.deepEqual(cards.map((entry) => entry.label), ['GPU 1 · 4060 Ti', 'GPU 2 · 4060 Ti']);
   assert.deepEqual(cards.map((entry) => entry.pci), ['0000:01:00.0', '0000:02:00.0']);
   assert.match(cards[0].title, /RTX 4060 Ti/);
   assert.match(cards[0].title, /0000:01:00\.0/);
   assert.match(cards[1].title, /0000:02:00\.0/);
   assert.equal(cards[0].utilizationText, '12%');
   assert.equal(cards[1].utilizationText, '35%');
-  assert.equal(cards[0].vramText, `${formatGb(6.1 * GB)} / ${formatGb(17.2 * GB)} GB`);
-  assert.ok(cards[0].vramPercent > 35 && cards[0].vramPercent < 36);
+  assert.equal(cards[0].vramText, `${formatGb(6.1 * GB)} / ${formatGb(16 * GB)} GB`);
+  assert.equal(cards[0].vramText, '6.1 / 16 GB');
+  assert.equal(formatGb(16 * 1024 ** 3), '16', 'a 16 GiB card reads 16 GB');
+  assert.equal(formatDiskGb(16_000_000_000), '16', 'a 16 GB drive label stays decimal');
+  assert.ok(cards[0].vramPercent > 38 && cards[0].vramPercent < 39);
 });
 
 test('a remote host with inventory only shows the card and its plain reason, never zero', () => {
@@ -196,9 +199,30 @@ test('a watch-only host is keyed off arca_status mode, not a service refusal', (
   const machine = dashboard.hosts[0];
   assert.equal(machine.watchOnly, true);
   assert.equal(machine.mode, 'watch-only');
+  assert.equal(machine.servicesOnlyError, true);
+  assert.equal(machine.servicesKnown, true, 'an older snapshot without the flag stays known-empty');
   assert.equal(WATCH_ONLY_SERVICES, "Arca watches this machine; it doesn't run services here yet");
   const kernel = buildDashboard({ hosts: [host('alpha', gpu([]))] });
   assert.equal(kernel.hosts[0].watchOnly, false);
+
+  const failedServices = buildDashboard({
+    hosts: [{
+      ...host('gamma', gpu([])),
+      machine: { mode: 'watch-only', incusReachable: true },
+      servicesKnown: false,
+      error: 'service_list: Arca refused the request (403).',
+    }],
+  }).hosts[0];
+  assert.equal(failedServices.servicesKnown, false);
+
+  const anotherReadFailed = buildDashboard({
+    hosts: [{
+      ...host('gamma', gpu([])),
+      machine: { mode: 'watch-only', incusReachable: true },
+      error: 'service_list: Arca refused the request (403). node_metrics: Arca returned an unsuccessful HTTP status.',
+    }],
+  }).hosts[0];
+  assert.equal(anotherReadFailed.servicesOnlyError, false, 'a real partial read still shows on a watch-only host');
 });
 
 test('the Doctor tool text names the cards and every GPU user in plain words', () => {
@@ -213,7 +237,7 @@ test('the Doctor tool text names the cards and every GPU user in plain words', (
             { pci: '0000:01:00.0', pid: 3, vramBytes: 0.5 * GB, owner: { kind: 'host' } },
           ],
         }),
-        card('0000:02:00.0', 'NVIDIA GeForce RTX 4090', {
+        card('0000:02:00.0', 'NVIDIA GeForce RTX 4060 Ti', {
           telemetry: null,
           reason: 'not measurable from here',
           processes: [],
@@ -223,10 +247,12 @@ test('the Doctor tool text names the cards and every GPU user in plain words', (
     },
   };
   const text = formatToolResult('node_metrics', value);
-  assert.match(text, /GPU 4060 Ti: 12% busy, 6\.1 GB used of 17\.2 GB, 61\.2 W of 165 W, 63\.5 °C\./);
-  assert.match(text, /Who is using GPU 4060 Ti: project Studio, instance app \(6\.1 GB\); Docker container a{12} \(2\.0 GB\); on the host \(0\.5 GB\)\./);  assert.match(text, /GPU 4060 Ti is held back by its power limit\./);
-  assert.match(text, /GPU 4090: not measurable from here\./);
-  assert.doesNotMatch(text, /GPU 4090: 0%/);
+  assert.match(text, /GPU 1 \(4060 Ti, PCI 0000:01:00\.0\): 12% busy, 6\.1 GB used of 16\.0 GB, 61\.2 W of 165 W, 63\.5 °C\./);
+  assert.match(text, /Who is using GPU 1 \(4060 Ti, PCI 0000:01:00\.0\): project Studio, instance app \(6\.1 GB\); Docker container a{12} \(2\.0 GB\); on the host \(0\.5 GB\)\./);
+  assert.match(text, /GPU 1 \(4060 Ti, PCI 0000:01:00\.0\) is held back by its power limit\./);
+  const secondCard = text.split('\n').find((line) => line.startsWith('GPU 2 ('));
+  assert.match(secondCard, /^GPU 2 \(4060 Ti, PCI 0000:02:00\.0\): not measurable from here\.$/);
+  assert.doesNotMatch(secondCard, /0%/);
 
   const prompt = doctorPrompt({ hosts: [{ name: 'alpha' }] });
   assert.match(prompt, /When the owner asks about a GPU/);

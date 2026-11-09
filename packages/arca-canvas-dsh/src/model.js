@@ -59,12 +59,25 @@ function formatNumber(value, digits = 1) {
   return `${Math.round(value * 10 ** digits) / 10 ** digits}`;
 }
 
-export function formatGb(bytes) {
+// Memory and VRAM are binary: a 16 GiB card reads "16 GB", not 17.2. Disks keep decimal gigabytes
+// because that is the number printed on a drive. Both helpers keep the visible unit "GB".
+const MEMORY_GIGABYTE = 1024 ** 3;
+const DISK_GIGABYTE = 1e9;
+
+function formatGigabyteValue(bytes, base) {
   const value = Number(bytes);
   if (!Number.isFinite(value) || value < 0) return '';
-  const gb = value / 1e9;
+  const gb = value / base;
   if (gb >= 10) return String(Math.round(gb));
   return String(Math.round(gb * 10) / 10);
+}
+
+export function formatGb(bytes) {
+  return formatGigabyteValue(bytes, MEMORY_GIGABYTE);
+}
+
+export function formatDiskGb(bytes) {
+  return formatGigabyteValue(bytes, DISK_GIGABYTE);
 }
 
 // A watch-only host refuses service reads because it is not allowed to write. That is the expected
@@ -181,29 +194,19 @@ function gpuOwnerRows(processes) {
     .map((owner) => ({ ...owner, vramText: owner.vramBytes === null ? '' : `${formatGb(owner.vramBytes)} GB` }));
 }
 
-// The kernel keys cards by PCI address, so two identical products stay two rows. When a product repeats,
-// its rows are labelled by slot; a unique card keeps its short product name.
+// The kernel keys cards by PCI address, so two identical products stay two rows. Cards are sorted by
+// PCI and every card gets its own slot number, whether or not products repeat.
 export function gpuCards(gpu) {
-  const cards = list(gpu?.cards).filter((card) => card && typeof card === 'object' && text(card.pci).trim());
-  const products = new Map();
-  for (const card of cards) {
-    const key = text(card.product).trim().toLowerCase() || text(card.pci).trim();
-    products.set(key, (products.get(key) ?? 0) + 1);
-  }
-  const slots = new Map();
-  return cards.map((card) => {
+  const cards = list(gpu?.cards)
+    .filter((card) => card && typeof card === 'object' && text(card.pci).trim())
+    .slice()
+    .sort((a, b) => text(a.pci).trim().localeCompare(text(b.pci).trim(), 'en'));
+  return cards.map((card, index) => {
     const pci = text(card.pci).trim();
     const product = text(card.product).trim();
-    const productKey = product.toLowerCase() || pci;
-    const duplicate = (products.get(productKey) ?? 0) > 1;
-    let label;
-    if (duplicate) {
-      const slot = (slots.get(productKey) ?? 0) + 1;
-      slots.set(productKey, slot);
-      label = `GPU ${slot}`;
-    } else {
-      label = `GPU${gpuProductName(product) ? ` ${gpuProductName(product)}` : ''}`;
-    }
+    const shortName = gpuProductName(product);
+    const slot = index + 1;
+    const label = `GPU ${slot}${shortName ? ` · ${shortName}` : ''}`;
     const telemetry = card.telemetry && typeof card.telemetry === 'object' ? card.telemetry : null;
     const utilizationPct = finite(telemetry?.utilizationPct);
     const usedBytes = finite(telemetry?.memoryUsedBytes);
@@ -219,6 +222,9 @@ export function gpuCards(gpu) {
     const reason = gpuCardReason(card, gpu);
     return {
       pci,
+      slot,
+      slotLabel: `GPU ${slot}`,
+      shortName,
       label,
       product,
       vendor: text(card.vendor).trim(),
@@ -407,12 +413,26 @@ function rollup(cards, unknown = 0) {
   return { tone, text: parts.join(' · ') || 'Live' };
 }
 
+// A snapshot error is the joined list of failed reads ("service_list: ... node_metrics: ..."). The machine
+// card needs to know which read failed, so one expected watch-only service refusal does not hide a real
+// partial read elsewhere on the same machine.
+function readErrorTools(error) {
+  const value = text(error).trim();
+  if (!value) return [];
+  const pattern = /(?:^|\s)(arca_status|watch_report|postgres_list|node_metrics|alerts_list|plan_list|service_list|journal_list):\s/g;
+  const tools = [];
+  let match;
+  while ((match = pattern.exec(value)) !== null) tools.push(match[1]);
+  return [...new Set(tools)];
+}
+
 function buildMachine(host) {
   const cpu = hostCpu(host);
   const memory = hostMemory(host);
   const online = isHostOnline(host);
   const mode = text(host.machine?.mode).trim();
   const gpu = host.metrics?.latest?.gpu;
+  const errorTools = readErrorTools(host.error);
   return {
     name: text(host.name, text(host.nodeName, 'Machine')),
     label: text(host.name, text(host.nodeName, 'Machine')),
@@ -441,6 +461,10 @@ function buildMachine(host) {
         lanPort: finite(service?.lanPort),
       }))
       .filter((service) => service.name),
+    // Older snapshots have no flag: treat their empty list as known-empty, as before.
+    servicesKnown: host.servicesKnown !== false,
+    errorTools,
+    servicesOnlyError: errorTools.length > 0 && errorTools.every((tool) => tool === 'service_list'),
     instanceCount: host.instancesKnown === false ? null : list(host.instances).length,
     instancesKnown: host.instancesKnown !== false,
     error: host.error ?? null,

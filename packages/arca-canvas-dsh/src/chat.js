@@ -325,8 +325,9 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
     '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
     '  code fences.',
-    '- Storage sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total.',
-    '  GPU memory uses the same GB rule. Power is W and temperature is °C with one decimal.',
+    '- Sizes are always in GB with one decimal. Memory and GPU memory use 1024-based GB, so a 16 GB card',
+    '  reads 16 GB; disks use decimal GB (17.0 GB) to match the drive labels. Power is W and temperature is',
+    '  °C with one decimal.',
     '- Network rates keep the unit the tool gives: KB/s, MB/s or GB/s, with one decimal. Never show raw bytes.',
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
     '- When the owner asks about a GPU, name each card and say how busy it is. Say who is using it by',
@@ -360,6 +361,9 @@ const REMOTE_HOST_REASON = 'not available for a remote host';
 const KILOBYTE = 1_000;
 const MEGABYTE = 1_000_000;
 const GIGABYTE = 1_000_000_000;
+// Memory and VRAM are binary (a 16 GiB card is 16 GB); disks and rates keep decimal units so they
+// match drive labels and the units the kernel reports. Both visible units stay "GB".
+const MEMORY_GIBIBYTE = 1024 ** 3;
 
 // The kernel explains a missing sample with one of two reasons (crates/arca-metrics/src/sample.rs): a remote
 // host can never give the reading, or a read failed. A local reading with no reason simply is not there yet.
@@ -390,6 +394,11 @@ function measured(value) {
 }
 
 export function formatGigabytes(bytes) {
+  const value = measured(bytes);
+  return value === null || value < 0 ? '' : `${(value / MEMORY_GIBIBYTE).toFixed(1)} GB`;
+}
+
+export function formatDiskGigabytes(bytes) {
   const value = measured(bytes);
   return value === null || value < 0 ? '' : `${(value / GIGABYTE).toFixed(1)} GB`;
 }
@@ -471,9 +480,9 @@ function poolLines(pools) {
   return pools.map((pool) => {
     const name = text(pool?.name).trim();
     const parts = [];
-    const used = formatGigabytes(pool?.usedBytes);
-    const total = formatGigabytes(pool?.totalBytes);
-    const free = formatGigabytes(pool?.freeBytes);
+    const used = formatDiskGigabytes(pool?.usedBytes);
+    const total = formatDiskGigabytes(pool?.totalBytes);
+    const free = formatDiskGigabytes(pool?.freeBytes);
     if (used) parts.push(`${used} used`);
     if (total) parts.push(`${total} total`);
     if (free) parts.push(`${free} free`);
@@ -525,6 +534,13 @@ function gpuOwnerText(owner) {
   return 'on the host';
 }
 
+// Two identical cards need more than a product name: the slot and PCI address tell the model exactly
+// which physical card the owner means, and match the Slot row on the approval card.
+function gpuLineLabel(card) {
+  const model = card.shortName ? `${card.shortName}, ` : '';
+  return `GPU ${card.slot} (${model}PCI ${card.pci})`;
+}
+
 // The Doctor must be able to answer "who is using the GPU" from the tool text alone. One plain line per
 // card carries the reading, who holds its memory, and the power-limit sentence only when bit 0x4 says so.
 function gpuLines(gpu) {
@@ -536,6 +552,7 @@ function gpuLines(gpu) {
   }
   const lines = [];
   for (const card of cards) {
+    const label = gpuLineLabel(card);
     const facts = [];
     if (card.hasReading) {
       if (card.utilizationText) facts.push(`${card.utilizationText} busy`);
@@ -551,18 +568,18 @@ function gpuLines(gpu) {
     } else {
       facts.push(gpuReasonLabel(card.reason));
     }
-    lines.push(`${card.label}: ${facts.join(', ')}.`);
-    if (card.powerCapped) lines.push(`${card.label} is held back by its power limit.`);
+    lines.push(`${label}: ${facts.join(', ')}.`);
+    if (card.powerCapped) lines.push(`${label} is held back by its power limit.`);
     if (card.owners.length) {
       const users = card.owners.map((owner) => {
         const vram = owner.vramBytes === null ? '' : ` (${formatGigabytes(owner.vramBytes)})`;
         return `${gpuOwnerText(owner)}${vram}`;
       });
-      lines.push(`Who is using ${card.label}: ${users.join('; ')}.`);
+      lines.push(`Who is using ${label}: ${users.join('; ')}.`);
     } else if (card.processReason) {
-      lines.push(`Who is using ${card.label}: ${gpuReasonLabel(card.processReason)}.`);
+      lines.push(`Who is using ${label}: ${gpuReasonLabel(card.processReason)}.`);
     } else {
-      lines.push(`No process is using ${card.label}.`);
+      lines.push(`No process is using ${label}.`);
     }
   }
   return lines;
@@ -644,7 +661,9 @@ function presentToolValues(value) {
   const out = {};
   for (const [key, item] of Object.entries(value)) {
     if (typeof item === 'number' && /BytesPerSec$/.test(key)) out[key] = formatRate(item);
-    else if (typeof item === 'number' && /Bytes$/.test(key)) out[key] = formatGigabytes(item);
+    // Read results other than node_metrics carry store/device sizes, which are disk-like: keep the
+    // decimal GB the kernel's disk labels use. Memory and VRAM alone go through the binary helper.
+    else if (typeof item === 'number' && /Bytes$/.test(key)) out[key] = formatDiskGigabytes(item);
     else if (typeof item === 'number' && /Pct$/.test(key)) out[key] = formatPercent(item);
     else out[key] = presentToolValues(item);
   }
