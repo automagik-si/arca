@@ -266,6 +266,17 @@ registered. A request to change something is answered with what the change would
 do and the configured `/approve` link; the panel adds the approval card. Inline
 passkey approval is phase 3. The page never receives a model credential.
 
+The Doctor speaks to a non-technical owner: short plain sentences, no markdown
+tables, headings or code fences, sizes in GB with one decimal and percentages as
+whole numbers. Tool results reach the model in that same form. Metrics arrive as
+a short plain-text summary (memory used, available and total in GB, rounded CPU
+percentages, plain labels), and a figure the host cannot report is shown as
+`not measurable from here` rather than an internal reason. Byte fields in every
+other read result become GB, network rates pick KB/s, MB/s or GB/s, and
+percentages become whole numbers, so the model never sees a raw byte count it
+could repeat. Alert reasons are translated to plain words; a resolved alert
+keeps its own resolution instead of reading like a different one.
+
 Selection lives in the URL fragment as `#project/<name>`, encoded with
 `encodeURIComponent`. Loading with a known project restores it; an unknown or
 missing fragment selects `defaultProject`, else the first configured project,
