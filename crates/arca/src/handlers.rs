@@ -1105,6 +1105,9 @@ fn prepare_attach(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuTarget, CallE
     let cards = gpu.inventory().map_err(gpu_refusal)?;
     let card = card_for(&cards, pci).map_err(gpu_refusal)?;
     let instance = bound_instance(gpu, args)?;
+    if !gpu.is_kernel_object(&instance).map_err(gpu_refusal)? {
+        return Err(gpu_refusal(GpuRefusal::NotKernelObject(instance.name)));
+    }
     if card.usage == arca_metrics::GpuUse::VfioPci && instance.is_container() {
         return Err(gpu_refusal(GpuRefusal::Bound(vec![card.pci.clone()])));
     }
@@ -1125,6 +1128,9 @@ fn prepare_attach(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuTarget, CallE
 fn prepare_detach(gpu: &dyn GpuBackend, args: &Value) -> Result<GpuTarget, CallError> {
     let pci = args["pci"].as_str().unwrap_or_default();
     let instance = bound_instance(gpu, args)?;
+    if !gpu.is_kernel_object(&instance).map_err(gpu_refusal)? {
+        return Err(gpu_refusal(GpuRefusal::NotKernelObject(instance.name)));
+    }
     let state = gpu.device_state(&instance, pci).map_err(gpu_refusal)?;
     match state {
         GpuDeviceState::Arca => {}
@@ -1154,6 +1160,7 @@ fn gpu_refusal(refusal: GpuRefusal) -> CallError {
         GpuRefusal::Identity(_) => "GpuInstanceChanged",
         GpuRefusal::DeviceAbsent(_) => "GpuDeviceAbsent",
         GpuRefusal::ForeignDevice(_) => "GpuDeviceNotArca",
+        GpuRefusal::NotKernelObject(_) => "GpuInstanceNotKernel",
     };
     CallError::Refused {
         code: code.to_string(),

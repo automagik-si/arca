@@ -419,14 +419,18 @@ for each card's numbers and `nvidia-smi --query-compute-apps=gpu_bus_id,pid,used
 killed after 5 seconds and reads at most 1 MiB of output, so a hanging tool never blocks the tick. Each card carries
 `telemetry` and a `reason` when it has none: `not measurable from here` on a remote host, `nvidia-smi is not installed`,
 `the nvidia-smi read timed out`, `the nvidia-smi read failed`, or `no reading yet` when the tool ran but did not list the
-card. A missing number is `null`, never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and an `owner`: an
+card. A killed child that the kernel cannot reap is handed to a background reaper, and a shared guard refuses every new
+query with `the previous nvidia-smi read has not finished` until it is gone; the approval path's in-use read uses the same
+guard. A missing number is `null`, never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and an `owner`: an
 Incus `instance` with its `project` and `name` (and a `container` id when the process is in a Docker container inside that
 instance), a Docker `container` named by exactly 64 hex digits in its `docker-<id>.scope` cgroup, or `host`.
 
 Attribution reads `/proc/<pid>/cgroup` by the host's PID, so a process in another PID namespace resolves the same way. The
 cgroup v2 `0::` line is used when present; on v1 the first path that is not `/` is. `lxc.payload.` counts only as the first
-path segment and is checked before Docker, so a Docker scope inside an instance belongs to the instance. Every shown name
-must be printable ASCII within its cap; a cgroup that cannot name an instance or a container is host attribution.
+path segment and is checked before Docker, so a Docker scope inside an instance belongs to the instance. A host Docker
+container is accepted only as a `docker-<64 hex>.scope` segment below `system.slice`; anywhere else is host attribution.
+Every shown name must be printable ASCII within its cap; a cgroup that cannot name an instance or a container is host
+attribution.
 
 The cards a successful inventory has seen are kept in memory, per process lifetime. A card that disappears is reported in
 `gpu-gone` until it returns; a restart forgets the list, so a card already gone when the node starts is not reported as a
@@ -514,7 +518,9 @@ record. A proposal cannot choose a container image: `postgres_create` uses `kern
 differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains.
 A GPU proposal names an existing Incus instance and the card's PCI address. The kernel resolves the instance's project,
 type and `volatile.uuid` when the proposal is made and puts them in the arguments, so the owner's digest binds them. Only a
-kernel-mode node writes, and only an instance in `kernel.projects`; a droidd or `bench` instance is refused. `gpu_attach`
+kernel-mode node writes, and only an instance in `kernel.projects` whose own config classifies as a kernel object: a
+droidd, `bench`, foreign, contested or retained instance is refused even inside the family. The metrics mode is read again
+at each call, so a later local/remote change is respected. `gpu_attach`
 refuses an address that is not in the inventory, a card bound to `vfio-pci` when the target is a container, and a
 driver-bound NVIDIA card another consumer uses when the target is a virtual machine. `gpu_detach` still names a card that has
 left the inventory by the address in the instance's own `gpu-<pci>` device. At execution the instance is re-read under the

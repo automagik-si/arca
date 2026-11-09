@@ -42,6 +42,9 @@ pub const NVIDIA_FAILED: &str = "the nvidia-smi read failed";
 /// Why a card has no telemetry: `nvidia-smi` did not answer by its deadline and was killed.
 pub const NVIDIA_TIMEOUT_REASON: &str = "the nvidia-smi read timed out";
 
+/// Why a card has no telemetry: a previous `nvidia-smi` read has not finished, even after it was killed.
+pub const NVIDIA_BUSY_REASON: &str = "the previous nvidia-smi read has not finished";
+
 /// How long one `nvidia-smi` query may run before it is killed.
 pub const NVIDIA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -121,6 +124,8 @@ pub enum NvidiaError {
     Missing,
     /// The program did not answer by its deadline and was killed.
     TimedOut,
+    /// A previous read is still stuck after being killed, so no new one is started.
+    Busy,
     /// The program ran, but it failed or its output could not be read. The text is a short reason, never a raw value.
     Failed(String),
 }
@@ -130,6 +135,7 @@ impl fmt::Display for NvidiaError {
         match self {
             Self::Missing => f.write_str(NVIDIA_MISSING),
             Self::TimedOut => f.write_str(NVIDIA_TIMEOUT_REASON),
+            Self::Busy => f.write_str(NVIDIA_BUSY_REASON),
             Self::Failed(why) => write!(f, "{NVIDIA_FAILED}: {why}"),
         }
     }
@@ -416,11 +422,53 @@ pub trait Nvidia: Send + Sync {
     fn processes(&self) -> Result<Vec<NvidiaProcess>, NvidiaError>;
 }
 
+/// The single-flight guard shared by every `nvidia-smi` reader in the process. It is set when a killed child has not
+/// been reaped yet; while it is set, no new child starts, because the driver may still hold the previous one.
+#[derive(Debug, Default)]
+struct NvidiaGate {
+    stuck: std::sync::Mutex<bool>,
+}
+
+impl NvidiaGate {
+    fn begin(&self) -> Result<(), NvidiaError> {
+        let stuck = self
+            .stuck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *stuck {
+            Err(NvidiaError::Busy)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn mark_stuck(&self) {
+        *self
+            .stuck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    fn clear(&self) {
+        *self
+            .stuck
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+    }
+}
+
+/// The process's one gate: the sampler and the approval path's in-use read share it.
+fn global_gate() -> std::sync::Arc<NvidiaGate> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<NvidiaGate>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(GATE.get_or_init(|| std::sync::Arc::new(NvidiaGate::default())))
+}
+
 /// The tool on this host. The program is named `nvidia-smi`; a test may point [`NvidiaSmi::at`] elsewhere.
 #[derive(Debug, Clone)]
 pub struct NvidiaSmi {
     program: std::path::PathBuf,
     timeout: std::time::Duration,
+    gate: std::sync::Arc<NvidiaGate>,
 }
 
 impl Default for NvidiaSmi {
@@ -434,6 +482,7 @@ impl NvidiaSmi {
         NvidiaSmi {
             program: std::path::PathBuf::from("nvidia-smi"),
             timeout: NVIDIA_TIMEOUT,
+            gate: global_gate(),
         }
     }
 
@@ -442,6 +491,7 @@ impl NvidiaSmi {
         NvidiaSmi {
             program: program.into(),
             timeout: NVIDIA_TIMEOUT,
+            gate: global_gate(),
         }
     }
 
@@ -454,6 +504,9 @@ impl NvidiaSmi {
     fn run(&self, args: &[&str]) -> Result<String, NvidiaError> {
         use std::io::Read as _;
 
+        // A child that is still stuck after its kill blocks every new read. The guard is checked before a new process is
+        // spawned, so the stuck child is never overtaken by a second one.
+        self.gate.begin()?;
         let mut child = Command::new(&self.program)
             .args(args)
             .stdout(std::process::Stdio::piped())
@@ -465,7 +518,12 @@ impl NvidiaSmi {
             })?;
         let Some(stdout) = child.stdout.take() else {
             let _ = child.kill();
-            let _ = child.wait();
+            self.gate.mark_stuck();
+            spawn_reaper(
+                child,
+                std::thread::spawn(Vec::new),
+                std::sync::Arc::clone(&self.gate),
+            );
             return Err(NvidiaError::Failed(
                 "the command has no output pipe".to_string(),
             ));
@@ -478,23 +536,33 @@ impl NvidiaSmi {
                 .read_to_end(&mut bytes);
             bytes
         });
+        self.finish(child, reader, std::sync::Arc::clone(&self.gate))
+    }
+
+    /// Waits for a spawned child under the deadline. A child that does not answer is killed, marked stuck, and handed to a
+    /// background reaper with its output reader; the caller returns at once. The reaper clears the gate only after the child
+    /// is reaped and the reader has ended, so a child the kernel cannot kill keeps every later read behind the guard.
+    fn finish<C: Waitable>(
+        &self,
+        mut child: C,
+        reader: std::thread::JoinHandle<Vec<u8>>,
+        gate: std::sync::Arc<NvidiaGate>,
+    ) -> Result<String, NvidiaError> {
         let deadline = std::time::Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if std::time::Instant::now() >= deadline => {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    // Do not join the reader: a grandchild may still hold the pipe. The thread ends when the pipe
-                    // closes, and the caller must not wait for it here.
-                    drop(reader);
+                    gate.mark_stuck();
+                    spawn_reaper(child, reader, gate);
                     return Err(NvidiaError::TimedOut);
                 }
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 Err(error) => {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    drop(reader);
+                    gate.mark_stuck();
+                    spawn_reaper(child, reader, gate);
                     return Err(NvidiaError::Failed(error.kind().to_string()));
                 }
             }
@@ -514,6 +582,43 @@ impl NvidiaSmi {
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+}
+
+/// A child the deadline can wait on. The real `std::process::Child` implements it, and a test gives a handle whose kill
+/// does nothing and whose wait blocks until the test releases it, proving the caller does not wait for a stuck child.
+trait Waitable: Send + 'static {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl Waitable for std::process::Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        std::process::Child::try_wait(self)
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        std::process::Child::kill(self)
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        std::process::Child::wait(self)
+    }
+}
+
+/// Reaps a killed child and its reader on a background thread, then clears the gate. The caller has already returned.
+fn spawn_reaper<C: Waitable>(
+    mut child: C,
+    reader: std::thread::JoinHandle<Vec<u8>>,
+    gate: std::sync::Arc<NvidiaGate>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("nvidia-smi-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+            let _ = reader.join();
+            gate.clear();
+        });
 }
 
 /// The columns the GPU telemetry query asks for.
@@ -645,7 +750,7 @@ pub fn read_cgroup(proc_root: &Path, pid: u32) -> Option<String> {
         if path.is_empty() {
             continue;
         }
-        if hierarchy == "0" && controllers.is_empty() {
+        if hierarchy == "0" && controllers.is_empty() && path != "/" {
             return Some(path.to_string());
         }
         if fallback.is_none() && path != "/" {
@@ -693,13 +798,16 @@ pub fn incus_instance(path: &str, instances: &[InstanceKey]) -> Option<(String, 
 /// The Docker container id from a `docker-<id>.scope` cgroup segment. The id is exactly 64 ASCII hex characters; a segment
 /// that only looks like a Docker scope is ignored, never attributed.
 pub fn docker_container(path: &str) -> Option<String> {
-    path.split('/').find_map(|segment| {
-        let id = segment
-            .strip_prefix("docker-")
-            .and_then(|rest| rest.strip_suffix(".scope"))?;
-        (id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            .then(|| id.to_ascii_lowercase())
-    })
+    path.split('/').find_map(docker_scope)
+}
+
+/// One cgroup segment as a Docker id, exactly 64 hex characters inside `docker-<id>.scope`.
+fn docker_scope(segment: &str) -> Option<String> {
+    let id = segment
+        .strip_prefix("docker-")
+        .and_then(|rest| rest.strip_suffix(".scope"))?;
+    (id.len() == 64 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| id.to_ascii_lowercase())
 }
 
 /// Whether a name is printable ASCII and within its length cap. A name that is not is never shown.
@@ -752,10 +860,33 @@ fn owner_of(path: &str, instances: &[InstanceKey]) -> GpuOwner {
             None => GpuOwner::Host,
         };
     }
-    match docker_container(path) {
+    match host_docker_container(path) {
         Some(name) => GpuOwner::Container { name },
         None => GpuOwner::Host,
     }
+}
+
+/// A Docker container on the host: a strict `docker-<64 hex>.scope` segment below `system.slice`, and nowhere else. A
+/// cgroup under `user.slice` or any other hierarchy, or a path with `.`/`..` segments, is not a host Docker container.
+fn host_docker_container(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| matches!(*segment, "." | ".."))
+    {
+        return None;
+    }
+    if segments.first() != Some(&"system.slice") {
+        return None;
+    }
+    segments[1..]
+        .iter()
+        .find_map(|segment| docker_scope(segment))
 }
 
 /// A fake `nvidia-smi` for tests: fixed readings and processes, or a `Missing`/`Failed` answer. It records which queries
@@ -966,4 +1097,105 @@ pub fn inventory_of(section: &GpuSection) -> Option<BTreeMap<String, GpuCardSamp
             .map(|card| (card.pci.clone(), card.clone()))
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::{Duration, Instant};
+
+    /// A child whose kill does nothing and whose wait blocks until the test releases it. It models a process the kernel
+    /// cannot reap, which is exactly the case the old kill-then-wait branch blocked on.
+    struct StuckChild {
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Waitable for StuckChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+            use std::os::unix::process::ExitStatusExt as _;
+            let _ = self.release.recv();
+            Ok(std::process::ExitStatus::from_raw(0))
+        }
+    }
+
+    #[test]
+    fn every_reader_in_the_process_shares_one_gate() {
+        let first = NvidiaSmi::new();
+        let second = NvidiaSmi::at("nvidia-smi");
+        assert!(
+            std::sync::Arc::ptr_eq(&first.gate, &second.gate),
+            "the sampler and the approval path's in-use read share the guard"
+        );
+    }
+
+    #[test]
+    fn a_stuck_child_is_reaped_in_the_background_and_the_gate_reports_busy() {
+        let gate = Arc::new(NvidiaGate::default());
+        let (child_release, child_wait) = mpsc::channel();
+        let (reader_release, reader_wait) = mpsc::channel();
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&reader_done);
+        let reader = std::thread::spawn(move || {
+            let _ = reader_wait.recv();
+            done.store(true, Ordering::SeqCst);
+            Vec::new()
+        });
+        let smi = NvidiaSmi {
+            program: std::path::PathBuf::from("nvidia-smi"),
+            timeout: Duration::from_millis(20),
+            gate: Arc::clone(&gate),
+        };
+
+        let started = Instant::now();
+        let error = smi
+            .finish(
+                StuckChild {
+                    release: child_wait,
+                },
+                reader,
+                Arc::clone(&gate),
+            )
+            .expect_err("the deadline expires");
+        assert_eq!(error, NvidiaError::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the caller returned without waiting for the stuck child"
+        );
+
+        // The guard refuses a new read, with the exact plain reason, while the child is unreaped.
+        assert_eq!(gate.begin(), Err(NvidiaError::Busy));
+        assert_eq!(
+            NvidiaError::Busy.to_string(),
+            "the previous nvidia-smi read has not finished"
+        );
+        assert_eq!(
+            smi.readings().expect_err("the guard refuses a new run"),
+            NvidiaError::Busy,
+            "the public read path checks the guard before spawning"
+        );
+
+        // The child is released, but its reader is still held: the reaper must wait for both before clearing.
+        child_release.send(()).expect("release the child");
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(gate.begin(), Err(NvidiaError::Busy));
+        assert!(!reader_done.load(Ordering::SeqCst));
+
+        reader_release.send(()).expect("release the reader");
+        let until = Instant::now() + Duration::from_secs(1);
+        while gate.begin().is_err() {
+            assert!(Instant::now() < until, "the reaper cleared the gate");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(reader_done.load(Ordering::SeqCst), "the reader ended");
+    }
 }

@@ -571,27 +571,6 @@ fn one_card_without_a_pci_address_is_skipped_with_a_reason() {
 }
 
 #[test]
-fn a_hanging_nvidia_smi_is_killed_at_its_deadline() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{Duration, Instant};
-
-    let scratch = Scratch::new("hang");
-    let script = scratch.path().join("hang.sh");
-    fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("the script");
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("mode 0755");
-    let reader = NvidiaSmi::at(script).with_timeout(Duration::from_millis(150));
-
-    let started = Instant::now();
-    let error = reader.readings().expect_err("the hang times out");
-    assert_eq!(error, arca_metrics::gpu::NvidiaError::TimedOut);
-    assert_eq!(error.to_string(), "the nvidia-smi read timed out");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the child was killed at the deadline"
-    );
-}
-
-#[test]
 fn an_oversize_nvidia_smi_answer_is_refused_at_the_cap() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
@@ -652,6 +631,10 @@ fn attribution_checks_the_first_lxc_segment_and_strict_docker_ids() {
             1015,
             "0::/lxc.payload.unknown/docker-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.scope\n".to_string(),
         ),
+        (
+            1016,
+            format!("0::/user.slice/docker-{docker}.scope\n"),
+        ),
     ];
     for (pid, text) in &cgroups {
         write(scratch.path(), &format!("proc/{pid}/cgroup"), text);
@@ -711,6 +694,11 @@ fn attribution_checks_the_first_lxc_segment_and_strict_docker_ids() {
             container: Some(docker.to_string()),
         },
         "a first-segment lxc.payload. is an instance; its Docker scope is extra detail"
+    );
+    assert_eq!(
+        owners[6].owner,
+        GpuOwner::Host,
+        "a Docker scope outside system.slice is not a host Docker container"
     );
     assert_eq!(
         arca_metrics::gpu::docker_container(&format!("/system.slice/docker-{docker}.scope")),

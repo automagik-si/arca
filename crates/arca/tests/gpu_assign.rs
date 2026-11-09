@@ -45,17 +45,31 @@ fn state() -> FakeState {
             json!({ "name": "default" }),
             json!({ "name": "droidd" }),
         ],
-        instances: vec![json!({
-            "name": "alpha",
-            "project": FAMILY,
-            "type": "container",
-            "status": "Running",
-            "profiles": [],
-            "config": { "volatile.uuid": "00000000-0000-4000-8000-0000000000a1" },
-            "devices": {
-                "root": { "type": "disk", "path": "/", "pool": "pool1" }
-            }
-        })],
+        instances: vec![
+            json!({
+                "name": "alpha",
+                "project": FAMILY,
+                "type": "container",
+                "status": "Running",
+                "profiles": [],
+                "config": {
+                    "volatile.uuid": "00000000-0000-4000-8000-0000000000a1",
+                    "user.arcakernel.entry": "gpu-alpha"
+                },
+                "devices": {
+                    "root": { "type": "disk", "path": "/", "pool": "pool1" }
+                }
+            }),
+            json!({
+                "name": "unowned",
+                "project": FAMILY,
+                "type": "container",
+                "status": "Stopped",
+                "profiles": [],
+                "config": {},
+                "devices": {}
+            }),
+        ],
         pools: Vec::new(),
         networks: Vec::new(),
     }
@@ -185,7 +199,11 @@ fn the_backend_reads_the_inventory_and_attaches_the_named_card_only() {
         }
     }));
     let kernel_family = arca_incus::ProjectFamily::new([FAMILY], []).expect("the family is valid");
-    let backend = IncusGpu::new(fake.socket().to_path_buf(), kernel_family, false);
+    let backend = IncusGpu::new(
+        fake.socket().to_path_buf(),
+        kernel_family,
+        arca::gpu::GpuRuntime::fixed(false),
+    );
     let cards = backend.inventory().expect("the inventory is read");
     assert_eq!(cards.len(), 2);
     assert_eq!(cards[0].pci, FIRST);
@@ -356,7 +374,11 @@ fn the_backend_refuses_droidd_and_bench_and_a_moved_instance() {
     let fake = FakeIncus::start(scratch.path(), fake_state).expect("the fake serves");
     let kernel_family =
         arca_incus::ProjectFamily::new([FAMILY], ["droidd"]).expect("the family is valid");
-    let backend = IncusGpu::new(fake.socket().to_path_buf(), kernel_family, false);
+    let backend = IncusGpu::new(
+        fake.socket().to_path_buf(),
+        kernel_family,
+        arca::gpu::GpuRuntime::fixed(false),
+    );
 
     assert!(matches!(
         backend.resolve("foreign").expect_err("droidd is refused"),
@@ -378,6 +400,7 @@ fn the_backend_refuses_droidd_and_bench_and_a_moved_instance() {
         name: "foreign".to_string(),
         kind: "container".to_string(),
         uuid: Some("foreign".to_string()),
+        own_config: std::collections::BTreeMap::new(),
     };
     assert!(
         backend.attach(&droidd_instance, FIRST).is_err(),
@@ -435,4 +458,56 @@ fn the_writer_itself_refuses_a_project_outside_its_family() {
         "{refused}"
     );
     assert!(fake.requests().is_empty(), "no request was sent");
+}
+
+#[test]
+fn the_backend_refuses_a_foreign_or_retained_instance_and_reads_the_mode_each_call() {
+    use arca::gpu::{GpuBackend, GpuRuntime, IncusGpu};
+    use arca_kernel::canon::Digest;
+    use arca_kernel::desired::{EntryId, PluginId};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let scratch = Scratch::new("owner");
+    let fake = FakeIncus::start(scratch.path(), state()).expect("the fake serves");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let runtime = GpuRuntime::new(
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            false
+        },
+        || Ok(BTreeMap::new()),
+    );
+    let backend = IncusGpu::new(fake.socket().to_path_buf(), family(), runtime);
+    assert_eq!(backend.in_use(FIRST).expect("mode false"), None);
+    assert_eq!(backend.in_use(FIRST).expect("mode false again"), None);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the mode is read on each call, not once at construction"
+    );
+
+    let unowned = backend.instance(FAMILY, "unowned").expect("the instance");
+    assert!(
+        backend.attach(&unowned, FIRST).is_err(),
+        "an instance without the kernel mark is refused"
+    );
+
+    let retained = Arc::new(BTreeMap::from([(
+        EntryId::parse("gpu-alpha").expect("a plain entry"),
+        (PluginId("test".to_string()), Digest::of(b"retained-plan")),
+    )]));
+    let backend = IncusGpu::new(
+        fake.socket().to_path_buf(),
+        family(),
+        GpuRuntime::new(|| false, move || Ok((*retained).clone())),
+    );
+    let alpha = backend.instance(FAMILY, "alpha").expect("alpha");
+    assert!(
+        backend.attach(&alpha, FIRST).is_err(),
+        "a retained instance is refused even inside the family"
+    );
 }

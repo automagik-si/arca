@@ -254,16 +254,26 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             cfg.kernel.droidd_projects.iter().map(String::as_str),
         )
         .map_err(Failure::Config)?;
-        let local = {
-            let choice = metrics_source
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            choice.is_local() && !choice.provisional
-        };
+        let mode = Arc::clone(&metrics_source);
+        let retained_kernel = Arc::clone(&kernel);
+        let runtime = crate::gpu::GpuRuntime::new(
+            move || {
+                let choice = mode
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                choice.is_local() && !choice.provisional
+            },
+            move || {
+                let kernel = retained_kernel
+                    .lock()
+                    .map_err(|_| "the kernel lock is poisoned".to_string())?;
+                kernel.retained_entries().map_err(|error| error.to_string())
+            },
+        );
         Some(Arc::new(crate::gpu::IncusGpu::new(
             cfg.incus.socket.clone(),
             family,
-            local,
+            runtime,
         )))
     } else {
         None

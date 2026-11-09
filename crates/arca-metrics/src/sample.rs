@@ -905,6 +905,7 @@ fn nvidia_reason(error: &gpu::NvidiaError) -> String {
     match error {
         gpu::NvidiaError::Missing => gpu::NVIDIA_MISSING.to_string(),
         gpu::NvidiaError::TimedOut => gpu::NVIDIA_TIMEOUT_REASON.to_string(),
+        gpu::NvidiaError::Busy => gpu::NVIDIA_BUSY_REASON.to_string(),
         gpu::NvidiaError::Failed(_) => gpu::NVIDIA_FAILED.to_string(),
     }
 }

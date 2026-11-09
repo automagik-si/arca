@@ -29,6 +29,8 @@ pub struct InstanceDevices {
     pub kind: String,
     /// The instance's `volatile.uuid`, when Incus reports one.
     pub uuid: Option<String>,
+    /// The instance's own config, from the same read.
+    pub own_config: BTreeMap<String, String>,
     pub etag: String,
     /// The instance metadata as read, so a PUT can send back the fields Incus replaces.
     pub body: Value,
@@ -106,17 +108,29 @@ impl DeviceAssigner {
             .and_then(Value::as_str)
             .unwrap_or("container")
             .to_string();
-        let uuid = metadata
-            .pointer("/config/volatile.uuid")
-            .and_then(Value::as_str)
+        let own_config: BTreeMap<String, String> = metadata
+            .get("config")
+            .and_then(Value::as_object)
+            .map(|config| {
+                config
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let uuid = own_config
+            .get("volatile.uuid")
             .filter(|uuid| !uuid.is_empty())
-            .map(str::to_string);
+            .cloned();
         let devices = devices_of(&metadata)?;
         Ok(InstanceDevices {
             project: project.to_string(),
             name: name.to_string(),
             kind,
             uuid,
+            own_config,
             etag,
             body: metadata,
             devices,

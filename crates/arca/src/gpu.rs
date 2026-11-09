@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arca_incus::{DeviceAssigner, GpuChange, IncusRead, ProjectFamily, UnixIncus};
-use arca_kernel::ownership::IncusKind;
+use arca_kernel::canon::Digest;
+use arca_kernel::desired::{EntryId, PluginId};
+use arca_kernel::ownership::{IncusKind, ObjectRef, OwnerClass, classify_object};
 use arca_metrics::gpu::{GpuCard, Nvidia, NvidiaError, NvidiaSmi, normalize_pci, read_inventory};
 use serde_json::Value;
 
@@ -25,7 +27,7 @@ pub use arca_incus::GpuChange as GpuChanged;
 pub const INSTANCES_PATH: &str = "/1.0/instances?all-projects=true&recursion=1";
 
 /// One Incus instance an action may name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GpuInstance {
     pub project: String,
     pub name: String,
@@ -33,6 +35,20 @@ pub struct GpuInstance {
     pub kind: String,
     /// The instance's `volatile.uuid`, which tells a recreated instance from the one the proposal named.
     pub uuid: Option<String>,
+    /// The instance's own config, from the same read. The kernel mark in it tells a kernel object from a foreign or
+    /// retained one.
+    pub own_config: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for GpuInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuInstance")
+            .field("project", &self.project)
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("uuid", &self.uuid)
+            .finish_non_exhaustive()
+    }
 }
 
 impl GpuInstance {
@@ -80,6 +96,8 @@ pub enum GpuRefusal {
     DeviceAbsent(String),
     /// The instance holds a GPU device for the card that Arca did not add.
     ForeignDevice(String),
+    /// The instance is not a kernel-owned object, even inside the family.
+    NotKernelObject(String),
 }
 
 impl std::fmt::Display for GpuRefusal {
@@ -107,6 +125,10 @@ impl std::fmt::Display for GpuRefusal {
                 )
             }
             Self::ForeignDevice(pci) => write!(f, "this GPU device was not added by Arca: {pci}"),
+            Self::NotKernelObject(name) => write!(
+                f,
+                "the instance {name} is not a kernel-owned object (foreign, droidd, contested or retained)"
+            ),
         }
     }
 }
@@ -133,29 +155,73 @@ pub trait GpuBackend: Send + Sync {
     fn in_use(&self, pci: &str) -> Result<Option<bool>, GpuRefusal>;
     fn device_state(&self, instance: &GpuInstance, pci: &str)
     -> Result<GpuDeviceState, GpuRefusal>;
+    /// Whether the instance's own config classifies it as a kernel object. Foreign, droidd, contested and retained
+    /// instances are refused even inside the family.
+    fn is_kernel_object(&self, instance: &GpuInstance) -> Result<bool, GpuRefusal>;
     fn attach(&self, instance: &GpuInstance, pci: &str) -> Result<GpuChange, String>;
     fn detach(&self, instance: &GpuInstance, pci: &str) -> Result<GpuChange, String>;
 }
 
+/// The entries whose delete plans were declined, as the kernel holds them now.
+pub type RetainedEntries = BTreeMap<EntryId, (PluginId, Digest)>;
+
+/// What the GPU backend asks the running node at each call: whether the metrics source is a settled local daemon, and the
+/// kernel's current retained set. Both are read on every call, never captured once at start.
+#[derive(Clone)]
+pub struct GpuRuntime {
+    local_telemetry: Arc<dyn Fn() -> bool + Send + Sync>,
+    retained: Arc<dyn Fn() -> Result<RetainedEntries, String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for GpuRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GpuRuntime")
+    }
+}
+
+impl GpuRuntime {
+    pub fn new(
+        local_telemetry: impl Fn() -> bool + Send + Sync + 'static,
+        retained: impl Fn() -> Result<RetainedEntries, String> + Send + Sync + 'static,
+    ) -> GpuRuntime {
+        GpuRuntime {
+            local_telemetry: Arc::new(local_telemetry),
+            retained: Arc::new(retained),
+        }
+    }
+
+    /// A test runtime: no local telemetry and no retained entries.
+    pub fn fixed(local_telemetry: bool) -> GpuRuntime {
+        GpuRuntime::new(move || local_telemetry, || Ok(BTreeMap::new()))
+    }
+}
+
 /// The node's backend: the ordinary GET client for reads, and the narrow device assigner for the approved write.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IncusGpu {
     read: UnixIncus,
     assign: DeviceAssigner,
     family: ProjectFamily,
-    local_telemetry: bool,
+    runtime: GpuRuntime,
     nvidia: NvidiaSmi,
 }
 
+impl std::fmt::Debug for IncusGpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncusGpu")
+            .field("family", &self.family)
+            .finish_non_exhaustive()
+    }
+}
+
 impl IncusGpu {
-    /// A backend for one kernel family. `local_telemetry` is true only when the node's Incus is the local daemon and the
-    /// mode is settled: a remote or provisional source cannot say which local processes use a card.
-    pub fn new(socket: PathBuf, family: ProjectFamily, local_telemetry: bool) -> IncusGpu {
+    /// A backend for one kernel family, with the runtime answers read at each call.
+    pub fn new(socket: PathBuf, family: ProjectFamily, runtime: GpuRuntime) -> IncusGpu {
         IncusGpu {
             read: UnixIncus::new(socket.clone()),
             assign: DeviceAssigner::new(socket, family.clone()),
             family,
-            local_telemetry,
+            runtime,
             nvidia: NvidiaSmi::new(),
         }
     }
@@ -170,15 +236,24 @@ impl IncusGpu {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("container");
+        let own_config: BTreeMap<String, String> = row
+            .get("config")
+            .and_then(Value::as_object)
+            .map(|config| {
+                config
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|value| (key.clone(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Some(GpuInstance {
             project: project.to_string(),
             name: name.to_string(),
             kind: kind.to_string(),
-            uuid: row
-                .pointer("/config/volatile.uuid")
-                .and_then(Value::as_str)
-                .filter(|uuid| !uuid.is_empty())
-                .map(str::to_string),
+            uuid: own_config.get("volatile.uuid").cloned(),
+            own_config,
         })
     }
 }
@@ -260,7 +335,7 @@ impl GpuBackend for IncusGpu {
     }
 
     fn in_use(&self, pci: &str) -> Result<Option<bool>, GpuRefusal> {
-        if !self.local_telemetry {
+        if !(self.runtime.local_telemetry)() {
             return Ok(None);
         }
         let pci = normalize_pci(pci);
@@ -270,7 +345,12 @@ impl GpuBackend for IncusGpu {
                     .iter()
                     .any(|process| normalize_pci(&process.pci) == pci),
             )),
-            Err(NvidiaError::Missing | NvidiaError::TimedOut | NvidiaError::Failed(_)) => Ok(None),
+            Err(
+                NvidiaError::Missing
+                | NvidiaError::TimedOut
+                | NvidiaError::Busy
+                | NvidiaError::Failed(_),
+            ) => Ok(None),
         }
     }
 
@@ -286,6 +366,15 @@ impl GpuBackend for IncusGpu {
         Ok(device_state_of(&row, pci))
     }
 
+    fn is_kernel_object(&self, instance: &GpuInstance) -> Result<bool, GpuRefusal> {
+        self.classify(
+            instance.project.clone(),
+            instance.name.clone(),
+            instance.uuid.clone(),
+            &instance.own_config,
+        )
+    }
+
     fn attach(&self, instance: &GpuInstance, pci: &str) -> Result<GpuChange, String> {
         if !self.allows(&instance.project) {
             return Err("the instance's project is outside the kernel's family".to_string());
@@ -295,6 +384,12 @@ impl GpuBackend for IncusGpu {
             .read(&instance.project, &instance.name)
             .map_err(|error| error.to_string())?;
         self.meets(instance, &row)?;
+        if !self
+            .row_is_kernel_object(&row)
+            .map_err(|refusal| refusal.to_string())?
+        {
+            return Err("the instance is not a kernel-owned object".to_string());
+        }
         self.assign
             .attach_gpu(&row, pci)
             .map_err(|error| error.to_string())
@@ -309,6 +404,12 @@ impl GpuBackend for IncusGpu {
             .read(&instance.project, &instance.name)
             .map_err(|error| error.to_string())?;
         self.meets(instance, &row)?;
+        if !self
+            .row_is_kernel_object(&row)
+            .map_err(|refusal| refusal.to_string())?
+        {
+            return Err("the instance is not a kernel-owned object".to_string());
+        }
         self.assign
             .detach_gpu(&row, pci)
             .map_err(|error| error.to_string())
@@ -316,6 +417,40 @@ impl GpuBackend for IncusGpu {
 }
 
 impl IncusGpu {
+    /// The class of one instance's own config at the current retained set.
+    fn classify(
+        &self,
+        project: String,
+        name: String,
+        uuid: Option<String>,
+        own_config: &BTreeMap<String, String>,
+    ) -> Result<bool, GpuRefusal> {
+        let retained = (self.runtime.retained)().map_err(|why| {
+            GpuRefusal::Instance(format!("the kernel's retained set is unreadable: {why}"))
+        })?;
+        let object = ObjectRef {
+            kind: IncusKind::Instance,
+            project,
+            parent: None,
+            name,
+            uuid,
+        };
+        Ok(matches!(
+            classify_object(&object, own_config, &retained),
+            OwnerClass::Kernel { .. }
+        ))
+    }
+
+    /// The same check against the fresh read that is about to be written.
+    fn row_is_kernel_object(&self, row: &arca_incus::InstanceDevices) -> Result<bool, GpuRefusal> {
+        self.classify(
+            row.project.clone(),
+            row.name.clone(),
+            row.uuid.clone(),
+            &row.own_config,
+        )
+    }
+
     /// Refuses an instance that is no longer the one the proposal named: another kind, or another `volatile.uuid`.
     fn meets(&self, wanted: &GpuInstance, row: &arca_incus::InstanceDevices) -> Result<(), String> {
         if row.kind != wanted.kind {
@@ -362,6 +497,7 @@ pub struct FakeGpu {
     attached: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     foreign: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     in_use: Arc<Mutex<BTreeMap<String, Option<bool>>>>,
+    retained: Arc<Mutex<BTreeMap<EntryId, (PluginId, Digest)>>>,
     calls: Arc<Mutex<Vec<GpuCall>>>,
 }
 
@@ -374,6 +510,7 @@ impl Default for FakeGpu {
             attached: Arc::new(Mutex::new(BTreeSet::new())),
             foreign: Arc::new(Mutex::new(BTreeSet::new())),
             in_use: Arc::new(Mutex::new(BTreeMap::new())),
+            retained: Arc::new(Mutex::new(BTreeMap::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -409,6 +546,19 @@ impl FakeGpu {
             .instances
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = instances;
+    }
+
+    /// Marks `entry` as retained, as a declined delete plan does.
+    pub fn retain(&self, entry: &str) {
+        if let Some(entry) = EntryId::parse(entry) {
+            self.retained
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    entry,
+                    (PluginId("test".to_string()), Digest::of(b"retained-plan")),
+                );
+        }
     }
 
     pub fn set_in_use(&self, pci: &str, state: Option<bool>) {
@@ -549,6 +699,21 @@ impl GpuBackend for FakeGpu {
             return Ok(GpuDeviceState::Foreign);
         }
         Ok(GpuDeviceState::Absent)
+    }
+
+    fn is_kernel_object(&self, instance: &GpuInstance) -> Result<bool, GpuRefusal> {
+        let retained = self.retained.lock().unwrap_or_else(PoisonError::into_inner);
+        let object = ObjectRef {
+            kind: IncusKind::Instance,
+            project: instance.project.clone(),
+            parent: None,
+            name: instance.name.clone(),
+            uuid: instance.uuid.clone(),
+        };
+        Ok(matches!(
+            classify_object(&object, &instance.own_config, &retained),
+            OwnerClass::Kernel { .. }
+        ))
     }
 
     fn attach(&self, instance: &GpuInstance, pci: &str) -> Result<GpuChange, String> {

@@ -69,6 +69,13 @@ impl Rig {
                     gpu_instance("beta", "arcak-gpu", "container"),
                     gpu_instance("foreign", "droidd", "container"),
                     gpu_instance("benchy", "bench", "container"),
+                    arca::gpu::GpuInstance {
+                        project: "arcak-gpu".to_string(),
+                        name: "unowned".to_string(),
+                        kind: "container".to_string(),
+                        uuid: Some("00000000-0000-4000-8000-0000000unowned".to_string()),
+                        own_config: std::collections::BTreeMap::new(),
+                    },
                 ],
             )
             .with_family(["arcak-gpu".to_string()]),
@@ -166,6 +173,10 @@ fn gpu_instance(name: &str, project: &str, kind: &str) -> arca::gpu::GpuInstance
         name: name.to_string(),
         kind: kind.to_string(),
         uuid: Some(format!("00000000-0000-4000-8000-{name:0>12}")),
+        own_config: std::collections::BTreeMap::from([(
+            "user.arcakernel.entry".to_string(),
+            "gpu-alpha".to_string(),
+        )]),
     }
 }
 
@@ -863,12 +874,9 @@ fn a_gpu_proposal_binds_identity_and_execution_refuses_a_recreated_instance() {
     assert_eq!(proposed["details"][0]["value"], json!("arcak-gpu"));
 
     // The same name in the same project, but a recreated instance: its volatile.uuid changed.
-    rig.gpu.set_instances(vec![arca::gpu::GpuInstance {
-        project: "arcak-gpu".to_string(),
-        name: "alpha".to_string(),
-        kind: "container".to_string(),
-        uuid: Some("00000000-0000-4000-8000-00000000ffff".to_string()),
-    }]);
+    let mut recreated = gpu_instance("alpha", "arcak-gpu", "container");
+    recreated.uuid = Some("00000000-0000-4000-8000-00000000ffff".to_string());
+    rig.gpu.set_instances(vec![recreated]);
     let id = proposed["id"].as_str().expect("an id");
     let digest = proposed["argsDigest"].as_str().expect("a digest");
     let approval = approve_statement(
@@ -1116,4 +1124,33 @@ fn a_watch_only_node_has_no_gpu_writer() {
         direct,
         CallError::Refused { ref code, .. } if code == "GpuDisabled"
     ));
+}
+
+#[test]
+fn a_foreign_or_retained_instance_is_refused_even_in_the_family() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-gpu-owner", &key);
+    let unowned = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "unowned", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("an instance without the kernel mark is refused");
+    assert!(
+        matches!(unowned, CallError::Refused { ref code, .. } if code == "GpuInstanceNotKernel"),
+        "{unowned:?}"
+    );
+
+    // The same alpha is a retained object when its entry's plan was declined.
+    rig.gpu.retain("gpu-alpha");
+    let retained = rig
+        .propose(
+            "gpu_attach",
+            json!({ "instance": "alpha", "pci": "0000:02:00.0" }),
+        )
+        .expect_err("a retained instance is refused");
+    assert!(
+        matches!(retained, CallError::Refused { ref code, .. } if code == "GpuInstanceNotKernel"),
+        "{retained:?}"
+    );
 }
