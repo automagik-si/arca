@@ -346,7 +346,9 @@ on when the two differ. The mode is chosen at startup, in this order:
    local and every other path is remote. This choice is provisional: each later sample retries the `/1.0` check, under the
    same 2 s cap and with no added startup delay, until the server names itself, then keeps that answer. The provisional
    choice stands for at most 10 minutes after the first provisional sample; then the sampler settles on the socket-path
-   fallback and stops probing.
+   fallback for alerts and keeps probing `/1.0` every 60 seconds. The first real answer switches to the mode it decides,
+   clears the sample ring, and ends the probing. The window and the cadence use a monotonic clock, so a wall-clock step
+   does not end the window early.
 
 The name comparison cannot tell two machines apart when both keep the same default name, such as two stock images still
 named `ubuntu`: a match reads as local. The sampler has no way to resolve that ambiguity from names alone. Set
@@ -357,7 +359,7 @@ the fallback, and returned by `arca_status` as `metricsSource` (`local` or `remo
 never carries a host name. A proxy whose upstream is the local daemon, such as the recording shim, therefore needs no
 `"local": true`: its server name matches the local host name. A container that mounts the host's Incus socket at the
 standard path is still remote when its own host name differs from the Incus server name, so the sampler never reports the
-container's `/proc` as the managed host's. When a provisional choice resolves to the other mode, the sampler clears its
+container's `/proc` as the managed host's. When a later answer resolves the mode to the other one, the sampler clears its
 sample ring and its rate counters, so the window mean and the next rate cover only samples from the new mode.
 
 - **Local daemon.** The sample is this machine's: `cpu.cores` and `cpu.usedPct`, the `load` averages,
@@ -372,8 +374,8 @@ sample ring and its rate counters, so the window mean and the next rate cover on
   with `no data` after its clear window instead of staying unknown forever. While the choice is still provisional they are
   not reported that way: the mode may yet resolve local, and a `no data` resolve would only fire the alert again after the
   switch. The provisional window is at most 10 minutes, so a fallback that never resolves local settles and the normal
-  no-data handling starts then. The pools, instance counts, incus-osd reading and SMART state still come from the same
-  Incus, so they describe the remote machine too.
+  no-data handling starts then; a later `/1.0` answer can still switch the mode and end the probing. The pools, instance
+  counts, incus-osd reading and SMART state still come from the same Incus, so they describe the remote machine too.
 - **The resources read fails.** On a remote node the totals are `null` and `cpu.coresKnown` is `false`; `cpu.cores` stays an
   integer in the schema, so its `0` is a placeholder a consumer must not show as a count. `cpu.reason` and `memory.reason`
   say `the Incus resources read failed`. The node never falls back to its own `/proc`: a failed read is unknown, not the wrong

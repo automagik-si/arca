@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arca_api::{conforms, verb};
 use arca_incus::{FakeIncus, FakeState, UnixIncus};
 use arca_metrics::{
-    Cpu, HostSample, Load, Memory, Network, PROVISIONAL_WINDOW_MS, Pool, ProjectCount, Psi,
-    Sampler, SamplerConfig, mean, node_metrics,
+    Cpu, HostSample, Load, MODE_PROBE_EVERY_MS, Memory, MonotonicClock, Network,
+    PROVISIONAL_WINDOW_MS, Pool, ProjectCount, Psi, Sampler, SamplerConfig, mean, node_metrics,
 };
 use serde_json::{Value, json};
 
@@ -2190,7 +2190,7 @@ mod smart_readings {
 
 /// The host totals of the machine the node's Incus serves, and the local readings that must never stand in for them.
 mod host_totals {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
     use arca_incus::{IncusError, IncusRead};
@@ -2202,6 +2202,26 @@ mod host_totals {
     const RESOURCES: &str = "/1.0/resources";
     const REMOTE_REASON: &str = "not available for a remote host";
     const FAILED_REASON: &str = "the Incus resources read failed";
+
+    /// A monotonic clock the test advances by hand, so window and cadence tests never sleep.
+    #[derive(Clone)]
+    struct FakeClock(Arc<AtomicU64>);
+
+    impl FakeClock {
+        fn new() -> FakeClock {
+            FakeClock(Arc::new(AtomicU64::new(0)))
+        }
+
+        fn advance(&self, ms: u64) {
+            self.0.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for FakeClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
 
     /// An Incus that answers one `/1.0/resources` result, and 404 for every other path, recording each path it is asked
     /// for.
@@ -2507,6 +2527,17 @@ mod host_totals {
         }
     }
 
+    /// How many `/1.0` probes the fake has seen.
+    fn name_probes(incus: &LateName) -> usize {
+        incus
+            .reads
+            .lock()
+            .expect("the reads are not poisoned")
+            .iter()
+            .filter(|path| path.as_str() == "/1.0")
+            .count()
+    }
+
     #[test]
     fn a_provisional_mode_retries_on_a_later_sample_and_switches_to_local() {
         let scratch = Scratch::new("provisional-retry");
@@ -2662,15 +2693,17 @@ mod host_totals {
     }
 
     #[test]
-    fn a_provisional_mode_settles_on_the_socket_path_fallback_after_the_window() {
-        let scratch = Scratch::new("provisional-window");
+    fn a_remote_fallback_settles_after_the_window_and_a_late_name_switches_it_to_local() {
+        let scratch = Scratch::new("late-name-shim");
         write_first_tree(scratch.path());
         write(scratch.path(), "proc/sys/kernel/hostname", "node1\n");
+        let up = Arc::new(AtomicBool::new(false));
         let incus = LateName {
-            up: Arc::new(AtomicBool::new(false)),
+            up: Arc::clone(&up),
             hostname: "node1".to_string(),
             reads: Arc::new(Mutex::new(Vec::new())),
         };
+        let clock = FakeClock::new();
         let mut sampler = Sampler::new(
             SamplerConfig {
                 proc_root: scratch.path().join("proc"),
@@ -2685,37 +2718,180 @@ mod host_totals {
                 }),
             },
             incus.clone(),
-        );
+        )
+        .with_clock(Arc::new(clock.clone()));
 
-        // The first sample starts the provisional window on the remote path fallback.
+        // The server is unreadable, so the first sample is the provisional remote path fallback.
         let first = sampler.sample(1_000).clone();
         assert!(sampler.mode_provisional());
         assert_eq!(first.load.reason.as_deref(), Some(REMOTE_REASON));
         assert!(!first.cpu.cores_known);
 
-        // One tick before the window ends it is still provisional and still probes.
-        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS - 5_000);
+        // After 10 minutes without a name the mode is settled for alerts, still on the remote fallback.
+        clock.advance(PROVISIONAL_WINDOW_MS);
+        let at_window = sampler.sample(1_000 + PROVISIONAL_WINDOW_MS).clone();
+        assert!(!sampler.mode_provisional(), "the window ended");
+        assert_eq!(at_window.load.reason.as_deref(), Some(REMOTE_REASON));
+        assert!(!at_window.cpu.cores_known);
+
+        // It stays unreadable for another 10 minutes. The slow probe runs every minute, not every sample.
+        let probes_at_window = name_probes(&incus);
+        clock.advance(MODE_PROBE_EVERY_MS - 1_000);
+        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS + MODE_PROBE_EVERY_MS - 1_000);
+        assert_eq!(
+            name_probes(&incus),
+            probes_at_window,
+            "a probe is not due yet"
+        );
+        for step in 1u64..=10 {
+            clock.advance(MODE_PROBE_EVERY_MS);
+            sampler.sample(1_000 + PROVISIONAL_WINDOW_MS + step * MODE_PROBE_EVERY_MS);
+        }
+        assert_eq!(name_probes(&incus), probes_at_window + 10);
+        assert!(
+            !sampler.mode_provisional(),
+            "the slowdown leaves it settled"
+        );
+        assert_eq!(
+            sampler
+                .latest()
+                .expect("the last sample is in the ring")
+                .load
+                .reason
+                .as_deref(),
+            Some(REMOTE_REASON)
+        );
+
+        // A real name arrives behind the shim after 20 minutes: the next slow probe switches to local.
+        up.store(true, Ordering::SeqCst);
+        clock.advance(MODE_PROBE_EVERY_MS);
+        let local = sampler
+            .sample(1_000 + PROVISIONAL_WINDOW_MS + 11 * MODE_PROBE_EVERY_MS)
+            .clone();
+        assert!(!sampler.mode_provisional(), "the name decided the mode");
+        assert_eq!(local.cpu.cores, 4);
+        assert!(local.cpu.cores_known);
+        assert_eq!(local.load.one, Some(0.52));
+        assert_eq!(local.psi.memory_some_avg10, Some(1.25));
+        assert_eq!(local.memory.total_bytes, Some(16_384_000_000));
+        assert_eq!(
+            sampler.history(1).len(),
+            1,
+            "the remote samples were cleared on the switch"
+        );
+
+        // Real CPU: the local counters moved since the switch sample.
+        write_second_counters(scratch.path());
+        clock.advance(5_000);
+        let next = sampler.sample(1_000 + PROVISIONAL_WINDOW_MS + 11 * MODE_PROBE_EVERY_MS + 5_000);
+        assert_eq!(next.cpu.used_pct, Some(25.0));
+
+        // The name decided the mode, so the slow probe stops for good.
+        let probes_at_switch = name_probes(&incus);
+        clock.advance(MODE_PROBE_EVERY_MS);
+        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS + 12 * MODE_PROBE_EVERY_MS + 5_000);
+        assert_eq!(name_probes(&incus), probes_at_switch);
+    }
+
+    #[test]
+    fn a_local_fallback_settles_after_the_window_and_a_mismatch_switches_it_to_remote() {
+        let scratch = Scratch::new("late-mismatch-container");
+        write_first_tree(scratch.path());
+        write(scratch.path(), "proc/sys/kernel/hostname", "node1\n");
+        let up = Arc::new(AtomicBool::new(false));
+        let incus = LateName {
+            up: Arc::clone(&up),
+            hostname: "another-host".to_string(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let clock = FakeClock::new();
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: true,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: true,
+                }),
+            },
+            incus.clone(),
+        )
+        .with_clock(Arc::new(clock.clone()));
+
+        // A container at the standard path starts as the local fallback and reads its own /proc.
+        let first = sampler.sample(1_000).clone();
+        assert!(sampler.mode_provisional());
+        assert_eq!(first.load.one, Some(0.52));
+        assert_eq!(first.psi.memory_some_avg10, Some(1.25));
+
+        // After the window it is settled local for alerts, still reading the local /proc.
+        clock.advance(PROVISIONAL_WINDOW_MS);
+        let settled = sampler.sample(1_000 + PROVISIONAL_WINDOW_MS).clone();
+        assert!(!sampler.mode_provisional(), "the window ended");
+        assert_eq!(settled.load.one, Some(0.52));
+
+        // A mismatched name arrives: the slow probe switches to remote and clears the ring.
+        up.store(true, Ordering::SeqCst);
+        clock.advance(MODE_PROBE_EVERY_MS);
+        let remote = sampler
+            .sample(1_000 + PROVISIONAL_WINDOW_MS + MODE_PROBE_EVERY_MS)
+            .clone();
+        assert!(!sampler.mode_provisional(), "the name decided the mode");
+        assert_eq!(remote.load.reason.as_deref(), Some(REMOTE_REASON));
+        assert!(!remote.cpu.cores_known);
+        assert_eq!(remote.psi, no_psi());
+        assert_eq!(
+            sampler.history(1).len(),
+            1,
+            "the local samples were cleared"
+        );
+    }
+
+    #[test]
+    fn a_wall_clock_jump_does_not_settle_the_provisional_mode_early() {
+        let scratch = Scratch::new("wall-clock-jump");
+        write_first_tree(scratch.path());
+        write(scratch.path(), "proc/sys/kernel/hostname", "node1\n");
+        let incus = LateName {
+            up: Arc::new(AtomicBool::new(false)),
+            hostname: "node1".to_string(),
+            reads: Arc::new(Mutex::new(Vec::new())),
+        };
+        let clock = FakeClock::new();
+        let mut sampler = Sampler::new(
+            SamplerConfig {
+                proc_root: scratch.path().join("proc"),
+                sys_root: scratch.path().join("sys"),
+                pools: Vec::new(),
+                interval_ms: 5_000,
+                history_minutes: 60,
+                incus_local: false,
+                mode_retry: Some(ModeRetry {
+                    explicit: None,
+                    path_is_local: false,
+                }),
+            },
+            incus,
+        )
+        .with_clock(Arc::new(clock.clone()));
+
+        sampler.sample(1_000);
         assert!(sampler.mode_provisional());
 
-        // At the bound it settles on the fallback, and no later sample probes `/1.0`.
-        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS);
-        assert!(!sampler.mode_provisional(), "the window ended");
-        let probes_at_settle = incus
-            .reads
-            .lock()
-            .expect("the reads are not poisoned")
-            .iter()
-            .filter(|path| path.as_str() == "/1.0")
-            .count();
-        sampler.sample(1_000 + PROVISIONAL_WINDOW_MS + 5_000);
-        assert!(!sampler.mode_provisional(), "it stays settled");
-        let probes_after = incus
-            .reads
-            .lock()
-            .expect("the reads are not poisoned")
-            .iter()
-            .filter(|path| path.as_str() == "/1.0")
-            .count();
-        assert_eq!(probes_after, probes_at_settle, "no probe after the window");
+        // The wall clock leaps three hours; the monotonic clock has not moved, so the window stays open.
+        sampler.sample(1_000 + 3 * 3_600_000);
+        assert!(
+            sampler.mode_provisional(),
+            "a wall-clock jump is not a monotonic one"
+        );
+
+        // Only the monotonic clock reaching the window settles it.
+        clock.advance(PROVISIONAL_WINDOW_MS);
+        sampler.sample(1_000 + 3 * 3_600_000 + 5_000);
+        assert!(!sampler.mode_provisional(), "the monotonic window ended");
     }
 }

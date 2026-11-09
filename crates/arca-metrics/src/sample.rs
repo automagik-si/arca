@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arca_incus::IncusRead;
 use serde::{Deserialize, Serialize};
@@ -30,9 +30,36 @@ pub const REMOTE_HOST_REASON: &str = "not available for a remote host";
 pub const RESOURCES_REASON: &str = "the Incus resources read failed";
 
 /// How long the socket-path fallback stands as provisional, in milliseconds: 10 minutes after the first provisional
-/// sample. Past it the sampler settles on the fallback, so a remote reading is treated as never available and its alerts
-/// can resolve with no data.
+/// sample. Past it the sampler settles on the fallback for alerts, so a remote reading is treated as never available and
+/// its alerts can resolve with no data. The sampler keeps probing `/1.0` at [`MODE_PROBE_EVERY_MS`] until a real name
+/// decides the mode.
 pub const PROVISIONAL_WINDOW_MS: u64 = 600_000;
+
+/// How often the sampler probes `/1.0` after the provisional window ends, in milliseconds. A late Incus can still correct
+/// the fallback; the first real name switches the mode and ends the probing.
+pub const MODE_PROBE_EVERY_MS: u64 = 60_000;
+
+/// A monotonic millisecond clock. The sampler measures the provisional window and its slow retry cadence with it, so a
+/// wall-clock step cannot settle the mode early. Tests inject a clock they advance by hand.
+pub trait MonotonicClock: Send + Sync {
+    /// Milliseconds since an arbitrary origin. The value never goes backwards.
+    fn now_ms(&self) -> u64;
+}
+
+/// The process's monotonic clock, in milliseconds since the sampler was built.
+struct SystemClock(Instant);
+
+impl SystemClock {
+    fn new() -> SystemClock {
+        SystemClock(Instant::now())
+    }
+}
+
+impl MonotonicClock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.0.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
 
 /// The window `starts_10m` counts, in milliseconds: a start counts while it is less than this old.
 const START_WINDOW_MS: u64 = 600_000;
@@ -260,11 +287,18 @@ pub struct Sampler<R: IncusRead> {
     osd_memory: UpdateMemory,
     /// When the incus-osd storage document was last read for SMART, in epoch milliseconds. `None` until the first read.
     smart_read_at: Option<u64>,
-    /// How to retry a provisional mode. Cleared once a server-name answer decides it, or once the provisional window ends.
+    /// How to retry a provisional mode. Cleared once a server-name answer decides it.
     mode_retry: Option<ModeRetry>,
-    /// When the first provisional sample retried the mode, in epoch milliseconds. `None` while the mode is settled and
-    /// before the first provisional sample.
+    /// When the first provisional sample started the window, on the monotonic clock. `None` before the first sample and
+    /// after the window ends.
     provisional_since: Option<u64>,
+    /// Whether the provisional window has ended and the fallback is settled for alerts. A slow `/1.0` probe still runs
+    /// until a real name decides the mode.
+    provisional_settled: bool,
+    /// When the last `/1.0` mode probe ran, on the monotonic clock. `None` until the first probe.
+    last_mode_probe: Option<u64>,
+    /// The monotonic clock that measures the window and the probe cadence.
+    clock: Arc<dyn MonotonicClock>,
     /// The choice `arca_status` reads, when the server shares it. A provisional choice is replaced here when a retry
     /// succeeds or the window ends. `None` for a sampler a test builds directly.
     mode_choice: Option<Arc<Mutex<HostModeChoice>>>,
@@ -290,6 +324,9 @@ impl<R: IncusRead> Sampler<R> {
             smart_read_at: None,
             mode_retry,
             provisional_since: None,
+            provisional_settled: false,
+            last_mode_probe: None,
+            clock: Arc::new(SystemClock::new()),
             mode_choice: None,
         }
     }
@@ -297,6 +334,12 @@ impl<R: IncusRead> Sampler<R> {
     /// Shares the startup mode choice with `arca_status`, so a retry that succeeds replaces the provisional answer there too.
     pub fn with_mode_choice(mut self, choice: Arc<Mutex<HostModeChoice>>) -> Self {
         self.mode_choice = Some(choice);
+        self
+    }
+
+    /// Uses `clock` for the provisional window and the slow retry cadence, instead of the process's monotonic clock.
+    pub fn with_clock(mut self, clock: Arc<dyn MonotonicClock>) -> Self {
+        self.clock = clock;
         self
     }
 
@@ -317,7 +360,7 @@ impl<R: IncusRead> Sampler<R> {
     /// A remote host's totals are read from its Incus every tick; a failed read is null with [`RESOURCES_REASON`], never the
     /// local machine's numbers. A local host keeps reading its own procfs and sysfs.
     pub fn sample(&mut self, now_ms: u64) -> &HostSample {
-        self.retry_mode(now_ms);
+        self.retry_mode();
         let previous = self.previous;
         let host = read_host(&self.cfg, &self.incus, previous, now_ms);
         let pools = incus::read_pools(&self.incus, &self.cfg.pools);
@@ -398,15 +441,31 @@ impl<R: IncusRead> Sampler<R> {
             .expect("the sample just pushed is in the ring")
     }
 
-    /// Retries a provisional mode's `/1.0` name check, under [`MODE_PROBE_TIMEOUT`]. Once the server names itself and the
-    /// name comparison succeeds, the answer is kept and no later sample probes again. A mode from `incus.local` or from a
-    /// real name comparison is never provisional, so this does nothing for it. A switch between the local and remote modes
-    /// clears the ring and the rate counters, so a mean never mixes the two sources and no rate spans them. The fallback
-    /// stands for at most [`PROVISIONAL_WINDOW_MS`]; after that the sampler settles on it instead of retrying forever.
-    fn retry_mode(&mut self, now_ms: u64) {
+    /// Retries a provisional mode's `/1.0` name check, under [`MODE_PROBE_TIMEOUT`]. Before [`PROVISIONAL_WINDOW_MS`] the
+    /// check runs on every sample. Once the window ends the fallback is settled for alerts, but the check continues at
+    /// [`MODE_PROBE_EVERY_MS`] until a real name decides the mode. A mode from `incus.local` or from a real name comparison
+    /// is never provisional, so this does nothing for it. A switch between the local and remote modes clears the ring and
+    /// the rate counters, so a mean never mixes the two sources and no rate spans them. The window and the cadence use the
+    /// monotonic [`MonotonicClock`], so a wall-clock step cannot settle the mode early.
+    fn retry_mode(&mut self) {
         let Some(retry) = self.mode_retry.clone() else {
             return;
         };
+        let now = self.clock.now_ms();
+        let mut window_ended = false;
+        if let Some(since) = self.provisional_since {
+            if now.saturating_sub(since) >= PROVISIONAL_WINDOW_MS {
+                self.provisional_since = None;
+                self.provisional_settled = true;
+                window_ended = true;
+            }
+        } else if self.provisional_settled
+            && self
+                .last_mode_probe
+                .is_some_and(|last| now.saturating_sub(last) < MODE_PROBE_EVERY_MS)
+        {
+            return;
+        }
         let choice = choose_host_mode_within(
             &self.incus,
             retry.explicit,
@@ -414,10 +473,23 @@ impl<R: IncusRead> Sampler<R> {
             &self.cfg.proc_root,
             MODE_PROBE_TIMEOUT,
         );
+        self.last_mode_probe = Some(now);
         if choice.provisional {
-            let since = *self.provisional_since.get_or_insert(now_ms);
-            if now_ms.abs_diff(since) >= PROVISIONAL_WINDOW_MS {
-                self.settle_provisional(&choice);
+            if self.provisional_since.is_none() && !self.provisional_settled {
+                self.provisional_since = Some(now);
+            } else if window_ended {
+                // The fallback is settled for alerts, but it is not final: the slow probe below can still replace it
+                // with the mode a real name decides.
+                let mut settled = choice.clone();
+                settled.provisional = false;
+                if let Some(shared) = &self.mode_choice {
+                    *shared.lock().unwrap_or_else(PoisonError::into_inner) = settled;
+                }
+                eprintln!(
+                    "arca: metrics source {}: {}; the provisional window ended, still probing every {MODE_PROBE_EVERY_MS} ms",
+                    choice.mode.as_str(),
+                    choice.reason
+                );
             }
             return;
         }
@@ -427,9 +499,11 @@ impl<R: IncusRead> Sampler<R> {
         eprintln!("arca: metrics source {}: {reason}", mode.as_str());
     }
 
-    /// Keeps a real mode answer or a settled fallback, clears the retry, and drops samples from the mode it replaced.
+    /// Keeps a real mode answer, clears the retry, and drops samples from the mode it replaced.
     fn settle_mode(&mut self, choice: HostModeChoice) {
         self.provisional_since = None;
+        self.provisional_settled = false;
+        self.last_mode_probe = None;
         self.mode_retry = None;
         let was_local = self.cfg.incus_local;
         self.cfg.incus_local = choice.is_local();
@@ -440,20 +514,6 @@ impl<R: IncusRead> Sampler<R> {
         if let Some(shared) = &self.mode_choice {
             *shared.lock().unwrap_or_else(PoisonError::into_inner) = choice;
         }
-    }
-
-    /// Settles a choice that stayed provisional past [`PROVISIONAL_WINDOW_MS`] on the socket-path fallback it already
-    /// carries. The mode does not change; only the retry ends, so a remote reading now counts as never available.
-    fn settle_provisional(&mut self, choice: &HostModeChoice) {
-        let mut settled = choice.clone();
-        settled.provisional = false;
-        let mode = settled.mode;
-        let reason = settled.reason.clone();
-        self.settle_mode(settled);
-        eprintln!(
-            "arca: metrics source {}: {reason}; the provisional window ended",
-            mode.as_str()
-        );
     }
 
     /// Counts each instance's starts against the previous listing and returns the readings with the counts filled in. A start is
@@ -551,9 +611,9 @@ impl<R: IncusRead> Sampler<R> {
     /// Whether the host mode is still the provisional socket-path fallback, which each sample retries for at most
     /// [`PROVISIONAL_WINDOW_MS`]. While it is provisional, a remote-shaped sample does not establish that this machine can
     /// never provide its own PSI or CPU temperature: the mode may still resolve local. Once the window ends, this is false
-    /// and a remote reading is treated as never available.
+    /// and a remote reading is treated as never available, though a slow `/1.0` probe can still correct the mode.
     pub fn mode_provisional(&self) -> bool {
-        self.mode_retry.is_some()
+        self.mode_retry.is_some() && !self.provisional_settled
     }
 
     /// What Incus and the NICs answered at the latest sample. Before the first sample every field is `None`.
