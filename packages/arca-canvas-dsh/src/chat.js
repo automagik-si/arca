@@ -11,13 +11,14 @@ import { snapshotError } from './arca-client.js';
 // for the owner to approve with the passkey, and changes nothing.
 export const READ_TOOLS = Object.freeze([
   'arca_status', 'watch_report', 'postgres_list', 'node_metrics',
-  'alerts_list', 'plan_list', 'journal_list', 'service_list',
+  'alerts_list', 'plan_list', 'journal_list', 'service_list', 'storage_list', 'snapshot_list',
 ]);
 export const PROPOSE_TOOL = 'arca_propose';
 export const DOCTOR_TOOLS = Object.freeze([...READ_TOOLS, PROPOSE_TOOL]);
 export const PROPOSE_ACTIONS = Object.freeze([
   'service_create', 'service_remove', 'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
+  'storage_add', 'snapshot_create', 'snapshot_delete',
 ]);
 
 export const DEFAULTS = Object.freeze({
@@ -347,6 +348,11 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
     '- For a GPU attach or detach, propose gpu_attach or gpu_detach with the instance and the card\'s exact',
     '  PCI address. The approval card shows the project, instance, card and safety effect; never shorten it.',
+    '- For snapshot storage, read storage_list first. Propose storage_add with a disk whose offer is "whole disk"',
+    '  (device) or a folder on a disk whose offer is "folder" (path); never a system disk. A whole disk is erased:',
+    '  say so plainly. To snapshot an app or a data volume, propose snapshot_create onto a pool whose snapshots',
+    '  flag is true; to remove one, propose snapshot_delete with a name from snapshot_list. A snapshot never',
+    '  starts and never changes the app it copies.',
     `- You can propose changes on ${proposeHost} and on any machine linked to it for approvals. Another machine is`,
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -636,6 +642,7 @@ function formatNodeMetrics(value) {
 export function formatToolResult(name, value) {
   if (name === 'node_metrics') return formatNodeMetrics(value);
   if (name === 'alerts_list') return JSON.stringify(presentAlertValues(value));
+  if (name === 'storage_list' || name === 'snapshot_list') return JSON.stringify(presentStorageValues(value));
   return JSON.stringify(presentToolValues(value));
 }
 
@@ -653,6 +660,18 @@ function presentAlertValues(value) {
   translate(presented.resolvedRecent, RESOLVED_REASONS);
   translate(presented.unknown, UNKNOWN_REASONS);
   return presented;
+}
+
+// Disk, pool and snapshot sizes arrive as bytes under plain keys; they are disks, so decimal GB.
+function presentStorageValues(value) {
+  if (Array.isArray(value)) return value.map(presentStorageValues);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === 'number' && ['size', 'used', 'total'].includes(key)) out[key] = formatDiskGigabytes(item);
+    else out[key] = presentStorageValues(item);
+  }
+  return out;
 }
 
 function presentToolValues(value) {
@@ -682,6 +701,8 @@ function toolClient(clientFor, hosts, name, onCall) {
       plan_list: 'List changes waiting for the owner\'s approval.',
       journal_list: 'Read recent Arca activity, oldest first. Optional after cursor and limit (max 500).',
       service_list: 'List the managed services with name, state, address, ports and links.',
+      storage_list: 'List the disks with their role (system, in use or free), what each can be offered as for snapshots, and the storage pools with used and total space.',
+      snapshot_list: 'List the snapshot copies of apps and data volumes, with their source, storage, size and when they were made.',
     }[name],
     parameters: {
       type: 'object',
@@ -750,7 +771,9 @@ export function createReadTools({ hosts = [], clientFor, onCall } = {}) {
 const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name}; '
   + 'service_publish {name, reach: "tailnet"}; service_unpublish {name}; '
   + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}; '
-  + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}.';
+  + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}; '
+  + 'storage_add {name, device} or {name, path}; snapshot_create {project, instance or volume, pool}; '
+  + 'snapshot_delete {name}.';
 
 export const NOT_LINKED = 'this machine is not linked for approvals yet';
 

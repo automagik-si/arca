@@ -43,7 +43,7 @@ use crate::handlers::{
     ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
     Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, Published,
     SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers_with, spawn_watcher,
+    plan_handlers_full, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -295,12 +295,33 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     } else {
         None
     };
+    // Snapshot storage reads the disks and pools on every node; only a kernel-mode node gets the snapshot writer, and it
+    // writes only snapshot pools and the arcak-snapshots project.
+    let storage = Arc::new(crate::storage::Storage::new(
+        cfg.incus.socket.clone(),
+        Arc::new(crate::storage::Lsblk),
+        kernel_mode,
+    ));
+    server = server
+        .handle(
+            "storage_list",
+            Arc::new(crate::storage::StorageListHandler {
+                storage: Arc::clone(&storage),
+            }),
+        )
+        .handle(
+            "snapshot_list",
+            Arc::new(crate::storage::SnapshotListHandler {
+                storage: Arc::clone(&storage),
+            }),
+        );
     let action_slot = ActionSlot::default();
-    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers_with(
+    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers_full(
         Arc::clone(&kernel),
         clock.clone(),
         cfg.kernel.postgres_image.clone(),
         gpu,
+        Some(storage),
         Arc::clone(&action_slot),
     )
     .into_iter()

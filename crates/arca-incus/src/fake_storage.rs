@@ -1,0 +1,533 @@
+//! A fake Incus for the storage and snapshot paths. It serves pools, projects, instances and custom volumes from memory on a
+//! unix socket, and records every request with its method, target and body, so a test can check exactly what was sent.
+//!
+//! GET: `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<p>`, `/1.0/storage-pools/<p>/resources`, `/1.0/projects/<p>`,
+//! `/1.0/instances/<n>?project=<p>`, `/1.0/instances?project=<p>&recursion=1`, `/1.0/instances/<n>/state?project=<p>`,
+//! `/1.0/storage-pools/<p>/volumes/custom?project=<p>&recursion=1`, `/1.0/storage-pools/<p>/volumes/custom/<n>?project=<p>`,
+//! its `/state`, and `/1.0/operations/<id>/wait`. Writes: `POST /1.0/storage-pools`, `POST /1.0/projects`, `POST` of an
+//! instance or a volume with a `copy` source, and `DELETE` of either. An instance or volume create or delete is answered with
+//! an operation that has already ended, unless the test holds operations ([`FakeStorageIncus::hold_operations`]) or fails the
+//! next copy ([`FakeStorageIncus::fail_next_copy`]). A created instance is `Stopped` unless its body says `start: true`. Any
+//! other request is 404 for a GET and 405 otherwise. Nothing here touches a disk.
+
+use std::collections::BTreeMap;
+use std::io::{self, Read};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use crate::shim::{drain, head_end, parse_request_line, respond};
+
+/// One request the fake received.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StorageRequest {
+    pub method: String,
+    pub target: String,
+    pub body: Value,
+}
+
+#[derive(Default)]
+struct State {
+    pools: BTreeMap<String, Value>,
+    resources: BTreeMap<String, Value>,
+    projects: BTreeMap<String, Value>,
+    instances: BTreeMap<(String, String), Value>,
+    usage: BTreeMap<(String, String), u64>,
+    volumes: BTreeMap<(String, String, String), Value>,
+    operations: BTreeMap<String, Value>,
+    requests: Vec<StorageRequest>,
+    counter: u64,
+    hold: bool,
+    fail_next: Option<String>,
+}
+
+/// The running fake. Dropping it stops it.
+pub struct FakeStorageIncus {
+    socket: PathBuf,
+    state: Arc<Mutex<State>>,
+    stop: Arc<AtomicBool>,
+    accept: Option<JoinHandle<()>>,
+}
+
+fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl FakeStorageIncus {
+    /// Binds `incus.sock` under `dir`. The `default` project exists.
+    pub fn start(dir: &Path) -> io::Result<FakeStorageIncus> {
+        let socket = dir.join("incus.sock");
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let state = Arc::new(Mutex::new(State::default()));
+        lock(&state).projects.insert(
+            "default".to_string(),
+            json!({ "name": "default", "config": { "features.networks": "true" } }),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept = {
+            let state = Arc::clone(&state);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => serve(stream, &state),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        Ok(FakeStorageIncus {
+            socket,
+            state,
+            stop,
+            accept: Some(accept),
+        })
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
+    /// Adds a pool with its config and its space.
+    pub fn add_pool(
+        &self,
+        name: &str,
+        driver: &str,
+        description: &str,
+        config: Value,
+        used: u64,
+        total: u64,
+    ) {
+        let mut state = lock(&self.state);
+        state.pools.insert(
+            name.to_string(),
+            json!({ "name": name, "driver": driver, "description": description, "config": config, "status": "Created" }),
+        );
+        state.resources.insert(
+            name.to_string(),
+            json!({ "space": { "used": used, "total": total } }),
+        );
+    }
+
+    /// Adds a project with its config.
+    pub fn add_project(&self, name: &str, config: Value) {
+        lock(&self.state)
+            .projects
+            .insert(name.to_string(), json!({ "name": name, "config": config }));
+    }
+
+    /// Adds an instance as `GET /1.0/instances/<n>` answers it. Its `project` field names its project.
+    pub fn add_instance(&self, instance: Value) {
+        let project = instance["project"]
+            .as_str()
+            .unwrap_or("default")
+            .to_string();
+        let name = instance["name"].as_str().unwrap_or_default().to_string();
+        lock(&self.state)
+            .instances
+            .insert((project, name), instance);
+    }
+
+    /// Adds a custom volume on `pool` as Incus answers it. Its `project` field names its project.
+    pub fn add_volume(&self, pool: &str, volume: Value) {
+        let project = volume["project"].as_str().unwrap_or("default").to_string();
+        let name = volume["name"].as_str().unwrap_or_default().to_string();
+        lock(&self.state)
+            .volumes
+            .insert((pool.to_string(), project, name), volume);
+    }
+
+    /// Sets the disk use an instance's or volume's state reports.
+    pub fn set_usage(&self, project: &str, name: &str, bytes: u64) {
+        lock(&self.state)
+            .usage
+            .insert((project.to_string(), name.to_string()), bytes);
+    }
+
+    /// Keeps every new operation running, so a wait answers that it is still running.
+    pub fn hold_operations(&self) {
+        lock(&self.state).hold = true;
+    }
+
+    /// Fails the next instance or volume copy with Incus's message.
+    pub fn fail_next_copy(&self, message: &str) {
+        lock(&self.state).fail_next = Some(message.to_string());
+    }
+
+    pub fn requests(&self) -> Vec<StorageRequest> {
+        lock(&self.state).requests.clone()
+    }
+
+    /// The requests that were not GETs.
+    pub fn writes(&self) -> Vec<StorageRequest> {
+        self.requests()
+            .into_iter()
+            .filter(|request| request.method != "GET")
+            .collect()
+    }
+
+    pub fn instance(&self, project: &str, name: &str) -> Option<Value> {
+        lock(&self.state)
+            .instances
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    pub fn instances(&self) -> Vec<Value> {
+        lock(&self.state).instances.values().cloned().collect()
+    }
+
+    pub fn volume(&self, pool: &str, project: &str, name: &str) -> Option<Value> {
+        lock(&self.state)
+            .volumes
+            .get(&(pool.to_string(), project.to_string(), name.to_string()))
+            .cloned()
+    }
+
+    pub fn pool(&self, name: &str) -> Option<Value> {
+        lock(&self.state).pools.get(name).cloned()
+    }
+
+    pub fn project(&self, name: &str) -> Option<Value> {
+        lock(&self.state).projects.get(name).cloned()
+    }
+}
+
+impl Drop for FakeStorageIncus {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+fn serve(mut stream: UnixStream, state: &Mutex<State>) {
+    if stream.set_nonblocking(false).is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .is_err()
+    {
+        return;
+    }
+    let Ok(Some((method, target, body))) = read_request(&mut stream) else {
+        let _ = respond(&mut stream, 400, "Bad Request", "", b"");
+        drain(&mut stream);
+        return;
+    };
+    let (status, envelope) = {
+        let mut state = lock(state);
+        state.requests.push(StorageRequest {
+            method: method.clone(),
+            target: target.clone(),
+            body: body.clone(),
+        });
+        handle(&mut state, &method, &target, &body)
+    };
+    let bytes = serde_json::to_vec(&envelope).unwrap_or_default();
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        _ => "Bad Request",
+    };
+    let _ = respond(&mut stream, status, reason, "", &bytes);
+    drain(&mut stream);
+}
+
+fn read_request(stream: &mut UnixStream) -> io::Result<Option<(String, String, Value)>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_len = loop {
+        if let Some(end) = head_end(&buffer) {
+            break end;
+        }
+        match stream.read(&mut chunk)? {
+            0 => return Ok(None),
+            n => buffer.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&buffer[..head_len]).to_string();
+    let mut lines = head.lines();
+    let Some((method, target)) = parse_request_line(lines.next().unwrap_or("")) else {
+        return Ok(None);
+    };
+    let (method, target) = (method.to_string(), target.to_string());
+    let length = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = buffer[head_len..].to_vec();
+    while body.len() < length {
+        match stream.read(&mut chunk)? {
+            0 => break,
+            n => body.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let body = if body.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&body).unwrap_or(Value::Null)
+    };
+    Ok(Some((method, target, body)))
+}
+
+fn sync(metadata: Value) -> (u16, Value) {
+    (
+        200,
+        json!({ "type": "sync", "status": "Success", "status_code": 200, "metadata": metadata }),
+    )
+}
+
+fn error(code: u16, message: &str) -> (u16, Value) {
+    (
+        code,
+        json!({ "type": "error", "error": message, "error_code": code }),
+    )
+}
+
+fn operation(state: &mut State, failure: Option<String>) -> (u16, Value) {
+    state.counter += 1;
+    let id = format!("00000000-0000-4000-8000-{:012x}", state.counter);
+    let (code, err) = match (failure, state.hold) {
+        (Some(message), _) => (400, message),
+        (None, true) => (103, String::new()),
+        (None, false) => (200, String::new()),
+    };
+    let op = json!({ "id": id, "status_code": code, "err": err });
+    state.operations.insert(id.clone(), op.clone());
+    (
+        202,
+        json!({ "type": "async", "status": "Operation created", "status_code": 100,
+                "operation": format!("/1.0/operations/{id}"), "metadata": op }),
+    )
+}
+
+fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, Value) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let params: BTreeMap<&str, &str> = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .collect();
+    let project = params
+        .get("project")
+        .copied()
+        .unwrap_or("default")
+        .to_string();
+    let segments: Vec<&str> = path.trim_start_matches("/1.0/").split('/').collect();
+    match (method, segments.as_slice()) {
+        ("GET", ["storage-pools"]) => {
+            sync(json!(state.pools.values().cloned().collect::<Vec<_>>()))
+        }
+        ("GET", ["storage-pools", pool]) => match state.pools.get(*pool) {
+            Some(found) => sync(found.clone()),
+            None => error(404, "Storage pool not found"),
+        },
+        ("GET", ["storage-pools", pool, "resources"]) => match state.resources.get(*pool) {
+            Some(found) => sync(found.clone()),
+            None => error(404, "Storage pool not found"),
+        },
+        ("POST", ["storage-pools"]) => {
+            let name = body["name"].as_str().unwrap_or_default().to_string();
+            if state.pools.contains_key(&name) {
+                return error(409, "Storage pool already exists");
+            }
+            let mut pool = body.clone();
+            pool["status"] = json!("Created");
+            state.pools.insert(name.clone(), pool);
+            state.resources.insert(
+                name,
+                json!({ "space": { "used": 0, "total": 1_000_000_000_000u64 } }),
+            );
+            sync(Value::Null)
+        }
+        ("GET", ["projects", name]) => match state.projects.get(*name) {
+            Some(found) => sync(found.clone()),
+            None => error(404, "Project not found"),
+        },
+        ("POST", ["projects"]) => {
+            let name = body["name"].as_str().unwrap_or_default().to_string();
+            if state.projects.contains_key(&name) {
+                return error(409, "Project already exists");
+            }
+            state.projects.insert(name, body.clone());
+            sync(Value::Null)
+        }
+        ("GET", ["instances"]) => {
+            if !state.projects.contains_key(&project) {
+                return error(404, "Project not found");
+            }
+            let rows: Vec<Value> = state
+                .instances
+                .iter()
+                .filter(|((owner, _), _)| *owner == project)
+                .map(|(_, row)| row.clone())
+                .collect();
+            sync(json!(rows))
+        }
+        ("GET", ["instances", name]) => {
+            match state.instances.get(&(project.clone(), (*name).to_string())) {
+                Some(found) => sync(found.clone()),
+                None => error(404, "Instance not found"),
+            }
+        }
+        ("GET", ["instances", name, "state"]) => {
+            let key = (project.clone(), (*name).to_string());
+            match state.instances.get(&key) {
+                Some(found) => {
+                    let usage = state.usage.get(&key).copied().unwrap_or(0);
+                    sync(
+                        json!({ "status": found["status"], "disk": { "root": { "usage": usage } } }),
+                    )
+                }
+                None => error(404, "Instance not found"),
+            }
+        }
+        ("POST", ["instances"]) => {
+            if !state.projects.contains_key(&project) {
+                return error(404, "Project not found");
+            }
+            let name = body["name"].as_str().unwrap_or_default().to_string();
+            if state
+                .instances
+                .contains_key(&(project.clone(), name.clone()))
+            {
+                return error(409, "Instance already exists");
+            }
+            let from_project = body["source"]["project"]
+                .as_str()
+                .unwrap_or("default")
+                .to_string();
+            let from = body["source"]["source"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if body["source"]["type"] != json!("copy")
+                || !state.instances.contains_key(&(from_project, from))
+            {
+                return error(404, "Source instance not found");
+            }
+            if let Some(message) = state.fail_next.take() {
+                return operation(state, Some(message));
+            }
+            let running = body["start"] == json!(true);
+            let row = json!({
+                "name": name, "project": project, "type": body["type"],
+                "description": body["description"], "profiles": body["profiles"],
+                "config": body["config"], "devices": body["devices"],
+                "expanded_config": body["config"], "expanded_devices": body["devices"],
+                "status": if running { "Running" } else { "Stopped" },
+                "created_at": "2026-11-09T14:05:00Z",
+            });
+            state.instances.insert((project, name), row);
+            operation(state, None)
+        }
+        ("DELETE", ["instances", name]) => {
+            if state
+                .instances
+                .remove(&(project, (*name).to_string()))
+                .is_none()
+            {
+                return error(404, "Instance not found");
+            }
+            operation(state, None)
+        }
+        ("GET", ["storage-pools", pool, "volumes", "custom"]) => {
+            let rows: Vec<Value> = state
+                .volumes
+                .iter()
+                .filter(|((on, owner, _), _)| on == pool && *owner == project)
+                .map(|(_, row)| row.clone())
+                .collect();
+            sync(json!(rows))
+        }
+        ("GET", ["storage-pools", pool, "volumes", "custom", name]) => {
+            match state
+                .volumes
+                .get(&((*pool).to_string(), project.clone(), (*name).to_string()))
+            {
+                Some(found) => sync(found.clone()),
+                None => error(404, "Storage volume not found"),
+            }
+        }
+        ("GET", ["storage-pools", pool, "volumes", "custom", name, "state"]) => {
+            if !state.volumes.contains_key(&(
+                (*pool).to_string(),
+                project.clone(),
+                (*name).to_string(),
+            )) {
+                return error(404, "Storage volume not found");
+            }
+            let usage = state
+                .usage
+                .get(&(project, (*name).to_string()))
+                .copied()
+                .unwrap_or(0);
+            sync(json!({ "usage": { "used": usage } }))
+        }
+        ("POST", ["storage-pools", pool, "volumes", "custom"]) => {
+            let name = body["name"].as_str().unwrap_or_default().to_string();
+            let key = ((*pool).to_string(), project.clone(), name.clone());
+            if state.volumes.contains_key(&key) {
+                return error(409, "Storage volume already exists");
+            }
+            let source = (
+                body["source"]["pool"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                body["source"]["project"]
+                    .as_str()
+                    .unwrap_or("default")
+                    .to_string(),
+                body["source"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            if !state.volumes.contains_key(&source) {
+                return error(404, "Source volume not found");
+            }
+            if let Some(message) = state.fail_next.take() {
+                return operation(state, Some(message));
+            }
+            let row = json!({
+                "name": name, "project": project, "pool": pool, "type": "custom",
+                "content_type": body["content_type"], "description": body["description"],
+                "config": body["config"], "created_at": "2026-11-09T14:05:00Z",
+            });
+            state.volumes.insert(key, row);
+            operation(state, None)
+        }
+        ("DELETE", ["storage-pools", pool, "volumes", "custom", name]) => {
+            if state
+                .volumes
+                .remove(&((*pool).to_string(), project, (*name).to_string()))
+                .is_none()
+            {
+                return error(404, "Storage volume not found");
+            }
+            sync(Value::Null)
+        }
+        ("GET", ["operations", id, "wait"]) => match state.operations.get(*id) {
+            Some(found) => sync(found.clone()),
+            None => error(404, "Operation not found"),
+        },
+        ("GET", _) => error(404, "not found"),
+        _ => error(405, "method not allowed"),
+    }
+}

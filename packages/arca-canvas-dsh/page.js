@@ -660,7 +660,10 @@
     "service_disconnect",
     "postgres_create",
     "gpu_attach",
-    "gpu_detach"
+    "gpu_detach",
+    "storage_add",
+    "snapshot_create",
+    "snapshot_delete"
   ]);
   var GPU_ACTIONS = /* @__PURE__ */ new Set(["gpu_attach", "gpu_detach"]);
   function normalizePci(value) {

@@ -467,10 +467,11 @@ test('SSE framing keeps one JSON object per data line and cannot forge an event'
   assert.equal(frame.includes('\ndata: {"text":"hello'), true);
 });
 
-test('the proposal tool offers exactly the nine allowed actions, never a database delete', () => {
+test('the proposal tool offers exactly the twelve allowed actions, never a database delete', () => {
   assert.deepEqual([...PROPOSE_ACTIONS], [
     'service_create', 'service_remove', 'service_publish', 'service_unpublish',
     'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
+    'storage_add', 'snapshot_create', 'snapshot_delete',
   ]);
   assert.equal(PROPOSE_ACTIONS.includes('postgres_delete'), false);
   assert.equal(PROPOSE_ACTIONS.includes('gpu_delete'), false);
@@ -620,6 +621,11 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
     '- For a GPU attach or detach, propose gpu_attach or gpu_detach with the instance and the card\'s exact',
     '  PCI address. The approval card shows the project, instance, card and safety effect; never shorten it.',
+    '- For snapshot storage, read storage_list first. Propose storage_add with a disk whose offer is "whole disk"',
+    '  (device) or a folder on a disk whose offer is "folder" (path); never a system disk. A whole disk is erased:',
+    '  say so plainly. To snapshot an app or a data volume, propose snapshot_create onto a pool whose snapshots',
+    '  flag is true; to remove one, propose snapshot_delete with a name from snapshot_list. A snapshot never',
+    '  starts and never changes the app it copies.',
     '- You can propose changes on alpha and on any machine linked to it for approvals. Another machine is',
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -1746,4 +1752,24 @@ test('a stale resume rejection cannot corrupt the live agent', async (t) => {
 
   await chat.close();
   assert.deepEqual(race.disposed, ['saved-doctor']);
+});
+
+test('the Doctor reads disks and snapshots and may propose storage and snapshot changes', () => {
+  for (const name of ['storage_list', 'snapshot_list']) assert.equal(READ_TOOLS.includes(name), true, name);
+  for (const name of ['storage_add', 'snapshot_create', 'snapshot_delete']) {
+    assert.equal(PROPOSE_ACTIONS.includes(name), true, name);
+  }
+  const tool = createProposeTool({ hosts: [{ name: 'alpha' }], proposalHost: 'alpha' });
+  assert.match(tool.description, /storage_add \{name, device\} or \{name, path\}/);
+  assert.match(tool.description, /snapshot_delete \{name\}/);
+  const disks = JSON.parse(formatToolResult('storage_list', {
+    disks: [{ name: 'sdb', size: 1_000_204_886_016, role: 'free', offer: 'whole disk', children: [{ name: 'sdb1', size: 32_000_000_000 }] }],
+    pools: [{ name: 'usb1', used: 0, total: 999_000_000_000, snapshots: true }],
+  }));
+  assert.equal(disks.disks[0].size, '1000.2 GB');
+  assert.equal(disks.disks[0].children[0].size, '32.0 GB');
+  assert.equal(disks.pools[0].total, '999.0 GB');
+  assert.equal(disks.disks[0].role, 'free');
+  const snapshots = JSON.parse(formatToolResult('snapshot_list', { snapshots: [{ name: 'shop--web--20261109T1405', size: 3_000_000_000 }] }));
+  assert.equal(snapshots.snapshots[0].size, '3.0 GB');
 });

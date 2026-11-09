@@ -61,6 +61,11 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_unpublish",
             "gpu_attach",
             "gpu_detach",
+            "storage_list",
+            "storage_add",
+            "snapshot_create",
+            "snapshot_list",
+            "snapshot_delete",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -92,6 +97,11 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("service_remove", VerbClass::L, Scope::Doctor, true, true),
         ("gpu_attach", VerbClass::L, Scope::Doctor, true, false),
         ("gpu_detach", VerbClass::L, Scope::Doctor, true, true),
+        ("storage_list", VerbClass::L, Scope::Viewer, false, false),
+        ("storage_add", VerbClass::L, Scope::Doctor, true, true),
+        ("snapshot_create", VerbClass::L, Scope::Doctor, true, false),
+        ("snapshot_list", VerbClass::L, Scope::Viewer, false, false),
+        ("snapshot_delete", VerbClass::L, Scope::Doctor, true, true),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -198,6 +208,9 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "postgres_create",
         "gpu_attach",
         "gpu_detach",
+        "storage_add",
+        "snapshot_create",
+        "snapshot_delete",
     ];
     let action_proposal = open(
         json!({

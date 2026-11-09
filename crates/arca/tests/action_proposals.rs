@@ -290,6 +290,19 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "uuid": "00000000-0000-4000-8000-0000000000a1",
                 "pci": "0000:01:00.0",
             }),
+            ActionKind::StorageAdd => json!({
+                "name": "usb1", "device": "sdb", "disk": "sdb", "model": "Acme Portable 1T",
+                "serial": "FAKE-SDB", "transport": "usb", "size": 1_000_000_000_000u64,
+                "contents": "sdb1 ext4 \"PHOTOS\" 1000.0 GB",
+            }),
+            ActionKind::SnapshotCreate => json!({
+                "project": "shop", "instance": "web", "pool": "usb1", "kind": "container",
+                "uuid": null, "name": "shop--web--20261030T1200",
+            }),
+            ActionKind::SnapshotDelete => json!({
+                "name": "shop--web--20261030T1200", "kind": "instance", "pool": "usb1",
+                "source": "shop/web",
+            }),
         }
     }
 
@@ -312,6 +325,44 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 prepared["pci"], "0000:01:00.0",
                 "the address is normalized before the digest"
             );
+            continue;
+        }
+        if action.is_storage() {
+            // Every value the owner approves is on the card in plain words; the kernel-read facts are bound in args.
+            let shown: String = details
+                .iter()
+                .map(|row| format!("{}={};", row.label, row.value))
+                .collect();
+            let expected: &[&str] = match action {
+                ActionKind::StorageAdd => &[
+                    "usb1",
+                    "/dev/sdb",
+                    "Acme Portable 1T",
+                    "1000.0 GB",
+                    "USB",
+                    "PHOTOS",
+                    "Everything on this disk will be erased.",
+                ],
+                ActionKind::SnapshotCreate => &[
+                    "shop",
+                    "web",
+                    "usb1",
+                    "shop--web--20261030T1200",
+                    "never starts",
+                ],
+                _ => &[
+                    "shop--web--20261030T1200",
+                    "shop/web",
+                    "usb1",
+                    "not touched",
+                ],
+            };
+            for value in expected {
+                assert!(
+                    shown.contains(value),
+                    "{action:?} card lacks {value}: {shown}"
+                );
+            }
             continue;
         }
         let schema = action.params_schema();

@@ -10,6 +10,7 @@ const APPROVAL_DOMAIN = 'arca-kernel-approval/v1';
 const PROPOSE_ACTIONS = new Set([
   'service_create', 'service_remove', 'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
+  'storage_add', 'snapshot_create', 'snapshot_delete',
 ]);
 const GPU_ACTIONS = new Set(['gpu_attach', 'gpu_detach']);
 
