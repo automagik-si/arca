@@ -346,6 +346,7 @@ body,
 
 .arca-machines-row {
   display: flex;
+  align-items: flex-start;
   gap: 12px;
   overflow-x: auto;
   padding-bottom: 2px;
@@ -355,7 +356,7 @@ body,
 .arca-machine {
   flex: 0 0 250px;
   width: 250px;
-  height: 118px;
+  min-height: 118px;
   padding: 11px 12px;
   border-radius: var(--arca-r-md);
   background: var(--arca-surface);
@@ -443,6 +444,81 @@ body,
   white-space: nowrap;
 }
 
+/* GPU cards sit under CPU/Mem, one line per PCI card. */
+.arca-gpus {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 1px;
+}
+
+.arca-gpu {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.arca-gpu-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--arca-muted);
+}
+
+.arca-gpu-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--arca-ink);
+}
+
+.arca-gpu-util {
+  flex: none;
+  font-size: 11px;
+  color: var(--arca-ink);
+}
+
+.arca-gpu-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.arca-gpu-bar {
+  width: 100%;
+  height: 6px;
+}
+
+.arca-gpu-bar-empty {
+  height: 6px;
+  border-radius: 3px;
+  border: 1px dashed var(--arca-line-2);
+}
+
+.arca-gpu-vram {
+  font-size: 10.5px;
+  color: var(--arca-muted);
+  white-space: nowrap;
+}
+
+.arca-gpu-reason {
+  font-size: 10.5px;
+  color: var(--arca-faint);
+  overflow-wrap: anywhere;
+}
+
+.arca-gpu-note {
+  font-size: 10.5px;
+  color: var(--arca-warn-ink);
+}
+
 .arca-machine-foot {
   margin-top: auto;
   display: flex;
@@ -451,6 +527,28 @@ body,
   gap: 8px;
   font-size: 11.5px;
   color: var(--arca-muted);
+}
+
+.arca-machine-foot-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.arca-machine-more {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  color: var(--arca-muted);
+  background: var(--arca-fill);
+  transition: background 160ms var(--arca-ease), color 160ms var(--arca-ease);
+}
+
+.arca-machine-more:hover {
+  background: var(--arca-fill-2);
+  color: var(--arca-ink);
 }
 
 .arca-machine-warn {
@@ -1440,6 +1538,222 @@ body,
   }
 }
 
+/* machine detail dialog: who is using each card, and the machine's services */
+.arca-detail-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: light-dark(rgba(16, 18, 27, .3), rgba(0, 0, 0, .62));
+}
+
+.arca-detail-backdrop[hidden] {
+  display: none;
+}
+
+.arca-detail-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(760px, 100%);
+  max-height: min(86vh, 820px);
+  border-radius: var(--arca-r-lg);
+  background: var(--arca-surface);
+  border: 1px solid var(--arca-line-2);
+  box-shadow: var(--arca-shadow-2);
+  overflow: hidden;
+}
+
+.arca-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--arca-line);
+}
+
+.arca-detail-heading {
+  min-width: 0;
+}
+
+.arca-detail-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -.02em;
+}
+
+.arca-detail-sub {
+  margin: 3px 0 0;
+  font-size: 12px;
+  color: var(--arca-muted);
+}
+
+.arca-detail-close {
+  flex: none;
+  padding: 5px 11px;
+  border-radius: var(--arca-r-sm);
+  background: var(--arca-fill);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--arca-muted);
+}
+
+.arca-detail-close:hover {
+  background: var(--arca-fill-2);
+  color: var(--arca-ink);
+}
+
+.arca-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 18px 20px 24px;
+  overflow-y: auto;
+}
+
+.arca-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.arca-detail-section > .arca-detail-heading {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--arca-faint);
+}
+
+.arca-detail-gpu {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 13px 14px;
+  border-radius: var(--arca-r-md);
+  background: var(--arca-surface-2);
+  border: 1px solid var(--arca-line);
+}
+
+.arca-detail-gpu-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.arca-detail-gpu-name {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.arca-detail-gpu-util {
+  font-size: 13px;
+  color: var(--arca-ink);
+}
+
+.arca-detail-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 20px;
+  margin: 0;
+}
+
+.arca-detail-fact {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.arca-detail-fact dt {
+  font-size: 10.5px;
+  color: var(--arca-faint);
+}
+
+.arca-detail-fact dd {
+  margin: 0;
+  font-size: 12px;
+  color: var(--arca-ink);
+  overflow-wrap: anywhere;
+}
+
+.arca-detail-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--arca-muted);
+}
+
+.arca-detail-power {
+  color: var(--arca-warn-ink);
+}
+
+.arca-detail-watch {
+  padding: 10px 12px;
+  border-radius: var(--arca-r-sm);
+  background: var(--arca-fill);
+  color: var(--arca-muted);
+}
+
+.arca-detail-users {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--arca-line);
+}
+
+.arca-detail-users-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 650;
+  color: var(--arca-muted);
+}
+
+.arca-detail-owners,
+.arca-detail-services-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.arca-detail-owner,
+.arca-detail-service {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.arca-detail-owner-where {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.arca-detail-owner-detail {
+  font-size: 10.5px;
+  color: var(--arca-faint);
+}
+
+.arca-detail-owner-vram,
+.arca-detail-service-port,
+.arca-detail-service-state {
+  flex: none;
+  font-size: 11px;
+  color: var(--arca-muted);
+}
+
 @media (max-width: 1120px) {
   .arca-readonly {
     display: none;
@@ -1496,6 +1810,18 @@ body,
 
   .arca-panel-scroll {
     max-height: 520px;
+  }
+
+  .arca-detail-backdrop {
+    padding: 12px;
+  }
+
+  .arca-detail-panel {
+    max-height: 92vh;
+  }
+
+  .arca-detail-facts {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

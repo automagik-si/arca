@@ -67,6 +67,190 @@ export function formatGb(bytes) {
   return String(Math.round(gb * 10) / 10);
 }
 
+// A watch-only host refuses service reads because it is not allowed to write. That is the expected
+// state of the machine, so the services area explains it instead of surfacing the refusal as an error.
+export const WATCH_ONLY_SERVICES = "Arca watches this machine; it doesn't run services here yet";
+
+export function formatWatts(value) {
+  const number = finite(value);
+  return number === null || number < 0 ? '' : `${formatNumber(number, 1)} W`;
+}
+
+export function formatCelsius(value) {
+  const number = finite(value);
+  return number === null ? '' : `${formatNumber(number, 1)} °C`;
+}
+
+export function formatMhz(value) {
+  const number = finite(value);
+  return number === null || number < 0 ? '' : `${Math.round(number)} MHz`;
+}
+
+// nvidia-smi reports clocks_event_reasons.active as a bit mask. Bit 0x4 is SW Power Cap; no other
+// bit may show that sentence. The mask is a string in the kernel sample, so parse it as a big integer.
+export function gpuPowerCapped(value) {
+  if (value === null || value === undefined || value === '') return false;
+  let mask;
+  try {
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value) || value < 0) return false;
+      mask = BigInt(Math.trunc(value));
+    } else {
+      const raw = String(value).trim().toLowerCase();
+      if (!/^(?:0x[0-9a-f]+|[0-9]+)$/.test(raw)) return false;
+      mask = BigInt(raw);
+    }
+  } catch {
+    return false;
+  }
+  return (mask & 4n) === 4n;
+}
+
+function gpuProductName(product) {
+  let value = text(product).trim();
+  // The PCI database often names a chip first and the market name in brackets: keep the market name.
+  const bracket = value.match(/\[([^\]]+)\]/);
+  if (bracket) value = bracket[1];
+  value = value
+    .replace(/\b(?:NVIDIA|AMD|ATI|Intel|Corporation)\b/gi, ' ')
+    .replace(/\b(?:GeForce|Radeon|Graphics)\b/gi, ' ')
+    .replace(/\b(?:RTX|GTX|RX|Arc)\b/gi, ' ')
+    .replace(/\b\d+\s*GB\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // A product that lists several models ("880M / 890M") keeps the first as the short card name.
+  value = value.split(/\s*\/\s*/)[0].trim();
+  return value;
+}
+
+function gpuCardReason(card, gpu) {
+  return text(card?.reason).trim() || text(gpu?.reason).trim();
+}
+
+function containerLabel(value) {
+  const id = text(value).trim();
+  if (!id) return '';
+  // The kernel names a host Docker container by its full 64-hex cgroup id. Twelve digits are enough
+  // to tell containers apart in the canvas; the full id stays on the element's title attribute.
+  return /^[0-9a-f]{64}$/i.test(id) ? id.slice(0, 12) : id;
+}
+
+function gpuOwnerRows(processes) {
+  const groups = new Map();
+  for (const process of list(processes)) {
+    if (!process || typeof process !== 'object') continue;
+    const owner = process.owner && typeof process.owner === 'object' ? process.owner : {};
+    const project = text(owner.project).trim();
+    const name = text(owner.name).trim();
+    const container = text(owner.container).trim();
+    const kind = text(owner.kind).trim().toLowerCase();
+    let row;
+    if (project || name) {
+      const where = [project ? projectLabel(project) : '', name].filter(Boolean).join(' / ');
+      row = {
+        kind: 'instance', project, name, container,
+        label: where || 'an instance',
+        detail: container ? `Docker ${containerLabel(container)}` : '',
+      };
+    } else if (container || kind === 'docker' || kind === 'container') {
+      row = {
+        kind: 'docker', project: '', name: '', container,
+        label: container ? `Docker container ${containerLabel(container)}` : 'a Docker container',
+        detail: '',
+      };
+    } else {
+      row = { kind: 'host', project: '', name: '', container: '', label: 'on the host', detail: '' };
+    }
+    const key = `${row.kind}|${project}|${name}|${container}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = { ...row, key, vramBytes: null, processes: 0 };
+      groups.set(key, group);
+    }
+    group.processes += 1;
+    const bytes = finite(process.vramBytes);
+    if (bytes !== null && bytes >= 0) group.vramBytes = (group.vramBytes ?? 0) + bytes;
+  }
+  return [...groups.values()]
+    .sort((a, b) => {
+      if (a.vramBytes === null && b.vramBytes !== null) return 1;
+      if (a.vramBytes !== null && b.vramBytes === null) return -1;
+      if (a.vramBytes !== b.vramBytes) return (b.vramBytes ?? 0) - (a.vramBytes ?? 0);
+      return byName(a.label, b.label);
+    })
+    .map((owner) => ({ ...owner, vramText: owner.vramBytes === null ? '' : `${formatGb(owner.vramBytes)} GB` }));
+}
+
+// The kernel keys cards by PCI address, so two identical products stay two rows. When a product repeats,
+// its rows are labelled by slot; a unique card keeps its short product name.
+export function gpuCards(gpu) {
+  const cards = list(gpu?.cards).filter((card) => card && typeof card === 'object' && text(card.pci).trim());
+  const products = new Map();
+  for (const card of cards) {
+    const key = text(card.product).trim().toLowerCase() || text(card.pci).trim();
+    products.set(key, (products.get(key) ?? 0) + 1);
+  }
+  const slots = new Map();
+  return cards.map((card) => {
+    const pci = text(card.pci).trim();
+    const product = text(card.product).trim();
+    const productKey = product.toLowerCase() || pci;
+    const duplicate = (products.get(productKey) ?? 0) > 1;
+    let label;
+    if (duplicate) {
+      const slot = (slots.get(productKey) ?? 0) + 1;
+      slots.set(productKey, slot);
+      label = `GPU ${slot}`;
+    } else {
+      label = `GPU${gpuProductName(product) ? ` ${gpuProductName(product)}` : ''}`;
+    }
+    const telemetry = card.telemetry && typeof card.telemetry === 'object' ? card.telemetry : null;
+    const utilizationPct = finite(telemetry?.utilizationPct);
+    const usedBytes = finite(telemetry?.memoryUsedBytes);
+    const totalBytes = finite(telemetry?.memoryTotalBytes) ?? finite(card.vramTotalBytes);
+    const vramPercent = usedBytes !== null && totalBytes !== null && totalBytes > 0
+      ? Math.max(0, Math.min(100, (usedBytes / totalBytes) * 100)) : null;
+    let vramText = '';
+    if (usedBytes !== null && totalBytes !== null) vramText = `${formatGb(usedBytes)} / ${formatGb(totalBytes)} GB`;
+    else if (usedBytes !== null) vramText = `${formatGb(usedBytes)} GB used`;
+    else if (totalBytes !== null) vramText = `${formatGb(totalBytes)} GB`;
+    const hasReading = Boolean(telemetry)
+      && (utilizationPct !== null || usedBytes !== null || totalBytes !== null);
+    const reason = gpuCardReason(card, gpu);
+    return {
+      pci,
+      label,
+      product,
+      vendor: text(card.vendor).trim(),
+      uuid: text(card.uuid).trim(),
+      driver: text(card.driver).trim(),
+      driverVersion: text(card.driverVersion).trim(),
+      use: text(card.use).trim(),
+      numaNode: finite(card.numaNode),
+      telemetry,
+      hasReading,
+      utilizationPct: utilizationPct === null ? null : Math.max(0, Math.min(100, utilizationPct)),
+      utilizationText: utilizationPct === null ? '' : `${Math.round(Math.max(0, Math.min(100, utilizationPct)))}%`,
+      usedBytes,
+      totalBytes,
+      vramText,
+      vramPercent,
+      reason,
+      // With no usable telemetry the plain kernel reason is the whole reading, never a zero.
+      statusText: hasReading ? '' : (reason || 'No reading yet'),
+      powerDrawW: finite(telemetry?.powerDrawW),
+      powerLimitW: finite(telemetry?.powerLimitW),
+      temperatureC: finite(telemetry?.temperatureC),
+      smClockMhz: finite(telemetry?.smClockMhz),
+      eventReasons: telemetry?.eventReasons ?? null,
+      powerCapped: gpuPowerCapped(telemetry?.eventReasons),
+      processReason: text(card.processReason).trim(),
+      owners: gpuOwnerRows(card.processes),
+      title: product ? `${product} · ${pci}` : pci,
+    };
+  });
+}
+
 export function isHostOnline(host = {}) {
   return Boolean(host.machine) && host.machine.incusReachable !== false;
 }
@@ -227,6 +411,8 @@ function buildMachine(host) {
   const cpu = hostCpu(host);
   const memory = hostMemory(host);
   const online = isHostOnline(host);
+  const mode = text(host.machine?.mode).trim();
+  const gpu = host.metrics?.latest?.gpu;
   return {
     name: text(host.name, text(host.nodeName, 'Machine')),
     label: text(host.name, text(host.nodeName, 'Machine')),
@@ -234,6 +420,10 @@ function buildMachine(host) {
     online,
     status: online ? 'Online' : 'Offline',
     tone: online ? 'ok' : 'bad',
+    mode,
+    // The kernel says watch-only when it has no project it may write in. It is a mode of the machine,
+    // not an error, and the services area keys off this value rather than any service refusal text.
+    watchOnly: mode.toLowerCase() === 'watch-only',
     cpu,
     cpuLabel: cpuLabel(cpu),
     // The reason is the CPU n/a tooltip: it only applies while no load is shown.
@@ -241,6 +431,16 @@ function buildMachine(host) {
     memory,
     memoryLabel: memoryLabel(memory),
     memoryReason: memory?.reason ?? '',
+    gpus: gpuCards(gpu),
+    gpuReason: text(gpu?.reason).trim(),
+    gpuSkipped: text(gpu?.skipped).trim(),
+    services: list(host.services)
+      .map((service) => ({
+        name: text(service?.name).trim(),
+        state: text(service?.state).trim(),
+        lanPort: finite(service?.lanPort),
+      }))
+      .filter((service) => service.name),
     instanceCount: host.instancesKnown === false ? null : list(host.instances).length,
     instancesKnown: host.instancesKnown !== false,
     error: host.error ?? null,

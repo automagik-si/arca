@@ -465,12 +465,13 @@ test('SSE framing keeps one JSON object per data line and cannot forge an event'
   assert.equal(frame.includes('\ndata: {"text":"hello'), true);
 });
 
-test('the proposal tool offers exactly the seven allowed actions, never a database delete', () => {
+test('the proposal tool offers exactly the nine allowed actions, never a database delete', () => {
   assert.deepEqual([...PROPOSE_ACTIONS], [
     'service_create', 'service_remove', 'service_publish', 'service_unpublish',
-    'service_connect', 'service_disconnect', 'postgres_create',
+    'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   ]);
   assert.equal(PROPOSE_ACTIONS.includes('postgres_delete'), false);
+  assert.equal(PROPOSE_ACTIONS.includes('gpu_delete'), false);
   const tool = createProposeTool({ hosts: [{ name: 'alpha' }], proposalHost: 'alpha' });
   assert.equal(tool.name, PROPOSE_TOOL);
   assert.match(tool.description, /only on alpha from here for now/);
@@ -542,8 +543,13 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
     '  code fences.',
     '- Storage sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total.',
+    '  GPU memory uses the same GB rule. Power is W and temperature is °C with one decimal.',
     '- Network rates keep the unit the tool gives: KB/s, MB/s or GB/s, with one decimal. Never show raw bytes.',
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
+    '- When the owner asks about a GPU, name each card and say how busy it is. Say who is using it by',
+    '  project and instance, by Docker container, or "on the host", with that user\'s memory in GB. A card',
+    '  with no reading is "not measurable from here" or "could not be read just now"; never say 0% without',
+    '  a reading. Say a card is held back by its power limit only when the reading says so.',
     '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
     '  explicitly asks for it.',
     '- If a read fails or a host did not answer, say "could not be read just now". Only a reading the host can',
@@ -555,6 +561,8 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- For a change request, call arca_propose with the action and its arguments, then tell the owner in one',
     '  plain sentence what will happen and to tap Approve on the card. Never claim the change is done before',
     '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
+    '- For a GPU attach or detach, propose gpu_attach or gpu_detach with the instance and the card\'s exact',
+    '  PCI address. The approval card shows the project, instance, card and safety effect; never shorten it.',
     '- You can propose changes only on alpha from here for now. Another host is refused because its',
     '  approval page is not this one.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
