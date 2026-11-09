@@ -419,9 +419,10 @@ for each card's numbers and `nvidia-smi --query-compute-apps=gpu_bus_id,pid,used
 killed after 5 seconds and reads at most 1 MiB of output, so a hanging tool never blocks the tick. Each card carries
 `telemetry` and a `reason` when it has none: `not measurable from here` on a remote host, `nvidia-smi is not installed`,
 `the nvidia-smi read timed out`, `the nvidia-smi read failed`, or `no reading yet` when the tool ran but did not list the
-card. A killed child that the kernel cannot reap is handed to a background reaper, and a shared guard refuses every new
-query with `the previous nvidia-smi read has not finished` until it is gone; the approval path's in-use read uses the same
-guard. A missing number is `null`, never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and an `owner`: an
+card. One query runs at a time: a shared gate refuses a second query with `the previous nvidia-smi read has not finished`
+while one is in flight, and a killed child that the kernel cannot reap is handed to a background reaper that keeps the gate
+closed until the child and its reader are gone; the approval path's in-use read uses the same gate. A query that cannot
+spawn its child gives its place back. A missing number is `null`, never a zero. The card's own `processes` rows carry `pid`, `vramBytes` and an `owner`: an
 Incus `instance` with its `project` and `name` (and a `container` id when the process is in a Docker container inside that
 instance), a Docker `container` named by exactly 64 hex digits in its `docker-<id>.scope` cgroup, or `host`.
 
@@ -483,7 +484,7 @@ A call sends `initialize` and then `tools/call`, each on its own connection. Its
 | `desired.json` | the current signed desired-state document, with the entries that converged and the plans that were declined. Mode 0600 |
 | `desired.lock` | the lock held while `serve` runs. A second process over the same directory is refused |
 | `journal.jsonl` | the journal of every effect the reconciler sent, as intents and outcomes |
-| `action-proposals.jsonl` | the action proposals and their `proposed`, `approved`, `declined` and `result` events. Opening compacts it to the waiting, unexpired proposals; an unreadable or oversized file is renamed `*.bad-<ts>` and the kernel starts empty |
+| `action-proposals.jsonl` | the action proposals and their `proposed`, `approved`, `declined` and `result` events. Opening re-checks every proposed record against its action's validation and `kernel.postgresImage`, then compacts it to the waiting, unexpired proposals; an unreadable, invalid or oversized file is renamed `*.bad-<ts>` and the kernel starts empty. An append that takes it past about 1 MiB compacts it too, and a stale compaction temporary file is removed at open |
 | `approval-nonces.jsonl` | the approval nonces that were spent |
 | `passkey-counts.jsonl` | the last sign count kept for each passkey. Mode 0600 |
 | `secrets/` | the secret files the writer reads, if any |
@@ -547,11 +548,16 @@ in a GPU row comes from the inventory at proposal time; it is kept in the kernel
 restart still shows it after the card is gone. A direct `gpu_attach` or `gpu_detach` call carries no usable approval: the
 handler accepts only the one-shot grant an approved proposal arms, and consumes it before the change. At most eight
 unexpired proposals wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same
-`argsDigest` returns the record that already waits instead of adding another. One token may have thirty accepted proposals in
-ten minutes; beyond that it gets `RateLimited`. A proposal lapses fifteen minutes after it was made. The journal writes
-`proposed` when the record is made, `approved` when its proof verifies, `declined` on a decline, and `result` after the one
-run. On start the journal is compacted to the waiting, unexpired proposals; an unreadable or larger-than-16-MiB file is
-quarantined as `action-proposals.jsonl.bad-<ts>` and the kernel starts empty, so this file never stops a start.
+`argsDigest` returns the record that already waits instead of adding another; that deduplicated request records nothing.
+One token may record thirty new proposals in ten minutes, and a deduplicated or refused proposal counts nothing against
+that window; the thirty-first new proposal gets `RateLimited`. A proposal lapses fifteen minutes after it was made. The
+journal writes `proposed` when the record is made, `approved` when its proof verifies, `declined` on a decline, and `result`
+after the one run. On start every `proposed` record is validated again: the verb's parameter schema without `approval`, its
+semantic checks, and the kernel's configured `kernel.postgresImage`, never the image the file itself carries. A record that
+fails is not accepted, and the file is quarantined. The journal is compacted to the waiting, unexpired proposals at start,
+and again during an append once it passes about 1 MiB; an unreadable, invalid or larger-than-16-MiB file is quarantined as
+`action-proposals.jsonl.bad-<ts>` and the kernel starts empty, so this file never stops a start. A temporary file that a
+crashed compaction left behind is removed when the kernel next opens the state directory.
 
 `plan_list` carries an action proposal as
 `{"kind":"action","id":"act-…","action":"…","summary":"…","details":[…],"args":{…},"argsDigest":"…","createdAt":<ms>,"expiresAt":<ms>}`.

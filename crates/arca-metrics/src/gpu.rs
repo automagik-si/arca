@@ -422,38 +422,66 @@ pub trait Nvidia: Send + Sync {
     fn processes(&self) -> Result<Vec<NvidiaProcess>, NvidiaError>;
 }
 
-/// The single-flight guard shared by every `nvidia-smi` reader in the process. It is set when a killed child has not
-/// been reaped yet; while it is set, no new child starts, because the driver may still hold the previous one.
+/// The single-flight guard shared by every `nvidia-smi` reader in the process. One read holds it at a time; a killed child
+/// that has not been reaped yet also holds it, because the driver may still hold the previous process. A dropped
+/// [`NvidiaGuard`] always returns its slot, including when the child cannot be spawned.
 #[derive(Debug, Default)]
 struct NvidiaGate {
-    stuck: std::sync::Mutex<bool>,
+    state: std::sync::Mutex<GateState>,
+}
+
+/// The gate's two facts: how many reads hold it, and whether a killed child has not been reaped yet.
+#[derive(Debug, Default)]
+struct GateState {
+    in_flight: usize,
+    stuck: bool,
+}
+
+/// One read's hold on an [`NvidiaGate`]. Dropping it returns the slot.
+#[derive(Debug)]
+struct NvidiaGuard {
+    gate: std::sync::Arc<NvidiaGate>,
 }
 
 impl NvidiaGate {
-    fn begin(&self) -> Result<(), NvidiaError> {
-        let stuck = self
-            .stuck
+    /// Enters the gate for one read, or refuses it as busy while another read runs or a killed child waits to be reaped.
+    fn begin(self: &std::sync::Arc<Self>) -> Result<NvidiaGuard, NvidiaError> {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *stuck {
-            Err(NvidiaError::Busy)
-        } else {
-            Ok(())
+        if state.stuck || state.in_flight > 0 {
+            return Err(NvidiaError::Busy);
         }
+        state.in_flight = state.in_flight.saturating_add(1);
+        Ok(NvidiaGuard {
+            gate: std::sync::Arc::clone(self),
+        })
     }
 
     fn mark_stuck(&self) {
-        *self
-            .stuck
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stuck = true;
     }
 
     fn clear(&self) {
-        *self
-            .stuck
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stuck = false;
+    }
+}
+
+impl Drop for NvidiaGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.saturating_sub(1);
     }
 }
 
@@ -504,9 +532,9 @@ impl NvidiaSmi {
     fn run(&self, args: &[&str]) -> Result<String, NvidiaError> {
         use std::io::Read as _;
 
-        // A child that is still stuck after its kill blocks every new read. The guard is checked before a new process is
-        // spawned, so the stuck child is never overtaken by a second one.
-        self.gate.begin()?;
+        // One read at a time, and no read while a killed child is unreaped. The guard returns the slot however this
+        // function ends, including when the child cannot be spawned at all.
+        let _guard = self.gate.begin()?;
         let mut child = Command::new(&self.program)
             .args(args)
             .stdout(std::process::Stdio::piped())
@@ -1139,6 +1167,41 @@ mod tests {
     }
 
     #[test]
+    fn a_second_read_is_busy_until_the_first_read_finishes() {
+        let gate = Arc::new(NvidiaGate::default());
+        let first = gate.begin().expect("the first read enters");
+        let refused = gate.begin().expect_err("a concurrent read is refused");
+        assert_eq!(refused, NvidiaError::Busy);
+        assert_eq!(
+            NvidiaError::Busy.to_string(),
+            "the previous nvidia-smi read has not finished"
+        );
+        drop(first);
+        let third = gate.begin().expect("the slot is free again");
+        drop(third);
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_spawned_releases_the_gate_slot() {
+        let gate = Arc::new(NvidiaGate::default());
+        let smi = NvidiaSmi {
+            program: std::path::PathBuf::from("/nonexistent/arca-test-nvidia-smi"),
+            timeout: Duration::from_millis(20),
+            gate: Arc::clone(&gate),
+        };
+        assert_eq!(
+            smi.readings().expect_err("the program is missing"),
+            NvidiaError::Missing
+        );
+        assert_eq!(
+            smi.readings()
+                .expect_err("the next read is missing, not busy"),
+            NvidiaError::Missing,
+            "the spawn failure returned its gate slot"
+        );
+    }
+
+    #[test]
     fn a_stuck_child_is_reaped_in_the_background_and_the_gate_reports_busy() {
         let gate = Arc::new(NvidiaGate::default());
         let (child_release, child_wait) = mpsc::channel();
@@ -1173,7 +1236,7 @@ mod tests {
         );
 
         // The guard refuses a new read, with the exact plain reason, while the child is unreaped.
-        assert_eq!(gate.begin(), Err(NvidiaError::Busy));
+        assert!(gate.begin().is_err(), "an unreaped child holds the gate");
         assert_eq!(
             NvidiaError::Busy.to_string(),
             "the previous nvidia-smi read has not finished"
@@ -1187,7 +1250,10 @@ mod tests {
         // The child is released, but its reader is still held: the reaper must wait for both before clearing.
         child_release.send(()).expect("release the child");
         std::thread::sleep(Duration::from_millis(30));
-        assert_eq!(gate.begin(), Err(NvidiaError::Busy));
+        assert!(
+            gate.begin().is_err(),
+            "the reader still holds the gate with the child reaped"
+        );
         assert!(!reader_done.load(Ordering::SeqCst));
 
         reader_release.send(()).expect("release the reader");

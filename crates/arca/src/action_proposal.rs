@@ -6,10 +6,15 @@
 //! silently retiring an older one. A repeated digest returns the record that already waits.
 //!
 //! The proposals live in an append-only journal next to the effect journal, `action-proposals.jsonl`. Every record is one
-//! line with an `event` of `proposed`, `approved`, `declined` or `result`. Opening the kernel replays the file, keeps only
-//! the waiting, unexpired proposals and rewrites it atomically. A file that cannot be read or is too large is quarantined
-//! as `<name>.bad-<ts>` and the kernel starts with no proposals: this file can never stop a start. The file holds no
-//! approval string, proof or secret.
+//! line with an `event` of `proposed`, `approved`, `declined` or `result`. Opening the kernel replays the file, re-checks
+//! every proposed record against its action's own validation and the kernel's configured image, keeps only the waiting,
+//! unexpired proposals and rewrites it atomically. A file that cannot be read, holds a line that fails validation, or is too
+//! large is quarantined as `<name>.bad-<ts>` and the kernel starts with no proposals: this file can never stop a start. The
+//! file holds no approval string, proof or secret.
+//!
+//! Appending keeps the journal bounded as well: once the file passes [`MAX_COMPACT_BYTES`] it is compacted to the waiting set
+//! before the call returns. A stale temporary file from a compaction that a crash interrupted is removed when the kernel next
+//! opens the directory, so a reused process id cannot stand in the way.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -34,6 +39,9 @@ pub const PROPOSAL_RATE_MAX: usize = 30;
 pub const PROPOSAL_RATE_WINDOW_MS: u64 = 10 * 60 * 1000;
 /// The largest proposals journal this build will read. A larger one is quarantined.
 const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+/// A journal past this size is compacted to its waiting set during an append, so a long-running kernel does not wait for a
+/// restart to shed retired events.
+const MAX_COMPACT_BYTES: u64 = 1024 * 1024;
 
 /// One action an owner may be asked to approve. The names are the gated verbs themselves, so a statement and the action
 /// it admits say the same word.
@@ -400,12 +408,14 @@ pub enum ProposeError {
 }
 
 impl ActionProposalStore {
-    /// Opens the journal, quarantines an unreadable or oversized one, keeps only waiting unexpired proposals and rewrites
-    /// the file atomically. No failure here stops the kernel: a file that cannot be read or rewritten is logged and the
-    /// store starts empty or keeps what it read.
-    pub fn open(state_dir: &Path, now: u64) -> Self {
+    /// Opens the journal, quarantines an unreadable, unsafe or invalid one, keeps only waiting unexpired proposals and
+    /// rewrites the file atomically. Every proposed record is re-checked against its action's validation and the kernel's
+    /// configured `postgres_image`; the journal never supplies that image itself. No failure here stops the kernel: a file
+    /// that cannot be read or rewritten is logged and the store starts empty or keeps what it read.
+    pub fn open(state_dir: &Path, now: u64, postgres_image: Option<&str>) -> Self {
         let path = state_dir.join(ACTION_PROPOSALS_FILE);
-        let waiting = match Self::read(&path) {
+        Self::remove_stale_temps(state_dir);
+        let waiting = match Self::read(&path, postgres_image) {
             Ok(waiting) => waiting,
             Err(reason) => {
                 Self::quarantine(&path, now, &reason);
@@ -473,6 +483,7 @@ impl ActionProposalStore {
         })
         .map_err(ProposeError::Store)?;
         self.waiting.push(proposal.clone());
+        self.compact_if_large();
         Ok(proposal)
     }
 
@@ -497,7 +508,9 @@ impl ActionProposalStore {
             ok: None,
             code: None,
         })?;
-        Ok(Some(self.waiting.remove(index)))
+        let retired = self.waiting.remove(index);
+        self.compact_if_large();
+        Ok(Some(retired))
     }
 
     /// Journals the result of one approved action: whether it ran, and the refusal code when it did not.
@@ -508,12 +521,16 @@ impl ActionProposalStore {
             id: Some(id.to_string()),
             ok: Some(ok),
             code: code.map(str::to_string),
-        })
+        })?;
+        self.compact_if_large();
+        Ok(())
     }
 
-    /// Reads the journal into the proposals that were waiting at its end. Any unsafe file, oversized file or malformed
-    /// line is a reason to quarantine the whole file.
-    fn read(path: &Path) -> Result<Vec<ActionProposal>, String> {
+    /// Reads the journal into the proposals that were waiting at its end. Every proposed record is validated again, now,
+    /// with the kernel's configured pinned image: stored arguments are never trusted on their own. Any unsafe file,
+    /// oversized file or malformed line is a reason to quarantine the whole file, except a malformed last line without its
+    /// trailing newline, which a crash can leave torn; that line is dropped and the compaction writes the rest.
+    fn read(path: &Path, postgres_image: Option<&str>) -> Result<Vec<ActionProposal>, String> {
         let meta = match fs::symlink_metadata(path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -529,10 +546,20 @@ impl ActionProposalStore {
             return Err("it is larger than 16 MiB".to_string());
         }
         let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let lines: Vec<&str> = text.lines().collect();
+        let last_line_is_torn = !text.ends_with('\n');
         let mut waiting: Vec<ActionProposal> = Vec::new();
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let event: ActionEvent = serde_json::from_str(line)
-                .map_err(|_| "it holds a line that is not an event".to_string())?;
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: ActionEvent = match serde_json::from_str(line) {
+                Ok(event) => event,
+                // A crash can leave the last write half-done. Only a line with no trailing newline is that torn tail; a
+                // complete but malformed line, and a malformed line anywhere else, still quarantine the file.
+                Err(_) if last_line_is_torn && index + 1 == lines.len() => break,
+                Err(_) => return Err("it holds a line that is not an event".to_string()),
+            };
             match event.event.as_str() {
                 "proposed" => {
                     let proposal = event
@@ -541,21 +568,23 @@ impl ActionProposalStore {
                     let action = ActionKind::from_name(&proposal.action).ok_or_else(|| {
                         "a proposed event names an action this build lacks".to_string()
                     })?;
-                    let digest =
-                        action_args_digest(&proposal.action, &proposal.args).ok_or_else(|| {
-                            "a proposed event's arguments do not canonicalize".to_string()
-                        })?;
+                    let args = action
+                        .prepare(&proposal.args, postgres_image)
+                        .map_err(|why| format!("a proposed event fails its validation: {why}"))?;
+                    let digest = action_args_digest(action.as_str(), &args).ok_or_else(|| {
+                        "a proposed event's arguments do not canonicalize".to_string()
+                    })?;
                     if proposal.id != action_id(&digest) || proposal.args_digest != digest {
                         return Err("a proposed event does not match its arguments".to_string());
                     }
                     let (summary, details) =
-                        loaded_words(action, &proposal.args, &proposal.summary, &proposal.details);
+                        loaded_words(action, &args, &proposal.summary, &proposal.details);
                     waiting.push(ActionProposal {
                         id: proposal.id,
-                        action: proposal.action,
+                        action: action.as_str().to_string(),
                         summary,
                         details,
-                        args: proposal.args,
+                        args,
                         args_digest: digest,
                         created_ms: proposal.created_ms,
                         expires_at: proposal.expires_at,
@@ -577,11 +606,7 @@ impl ActionProposalStore {
         if !self.path.exists() {
             return;
         }
-        let temp = self.path.with_file_name(format!(
-            ".{ACTION_PROPOSALS_FILE}.tmp-{}-{:x}",
-            std::process::id(),
-            monotonic_nonce()
-        ));
+        let temp = self.path.with_file_name(compaction_temp_name());
         let result = (|| -> io::Result<()> {
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -612,6 +637,43 @@ impl ActionProposalStore {
         if result.is_err() {
             let _ = fs::remove_file(&temp);
             eprintln!("arca: the action proposals journal could not be compacted");
+        }
+    }
+
+    /// Compacts the journal in place once it has outgrown [`MAX_COMPACT_BYTES`]. A failed compaction is logged and the
+    /// journal keeps its events, so the next append tries again.
+    fn compact_if_large(&mut self) {
+        let large = fs::metadata(&self.path).is_ok_and(|meta| meta.len() > MAX_COMPACT_BYTES);
+        if large {
+            self.compact();
+        }
+    }
+
+    /// Removes temporary files this module's compaction left behind when a crash interrupted it. Only the exact private
+    /// naming is touched, and only regular files: a directory entry or a link that merely looks similar is left alone. A
+    /// reused process id must not make the next compaction collide with a stale temporary.
+    fn remove_stale_temps(state_dir: &Path) {
+        let Ok(entries) = fs::read_dir(state_dir) else {
+            return;
+        };
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if file_type.is_file()
+                && is_compaction_temp(name)
+                && fs::remove_file(entry.path()).is_ok()
+            {
+                removed = removed.saturating_add(1);
+            }
+        }
+        if removed > 0 {
+            eprintln!("arca: removed {removed} stale action proposals journal temporary file(s)");
         }
     }
 
@@ -668,14 +730,42 @@ fn monotonic_nonce() -> u64 {
     NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
-/// A per-token sliding window over accepted proposals. The window is in memory; a restart forgets it.
+/// The private temporary file one compaction writes before its rename. A crash can leave one behind.
+fn compaction_temp_name() -> String {
+    format!(
+        ".{ACTION_PROPOSALS_FILE}.tmp-{}-{:x}",
+        std::process::id(),
+        monotonic_nonce()
+    )
+}
+
+/// Whether `name` is exactly one of this module's compaction temporary files. The process id and the nonce are the only
+/// variable parts, and the nonce is lower-case hex.
+fn is_compaction_temp(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(&format!(".{ACTION_PROPOSALS_FILE}.tmp-")) else {
+        return false;
+    };
+    let Some((pid, nonce)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && !nonce.is_empty()
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A per-token sliding window over newly recorded proposals. The window is in memory; a restart forgets it.
 #[derive(Default)]
 pub struct ProposalRateLimiter {
     seen: Mutex<HashMap<String, VecDeque<u64>>>,
 }
 
 impl ProposalRateLimiter {
-    /// Records one accepted proposal for `token`, or refuses when the token already made the window's maximum.
+    /// Reserves one place in `token`'s window, or refuses when the token already made the window's maximum. The caller
+    /// reserves only for a proposal that will be recorded as new; a deduplicated or refused proposal must refund or never
+    /// reserve, so it counts nothing.
     pub fn allow(&self, token: &str, now: u64) -> bool {
         let Ok(mut seen) = self.seen.lock() else {
             return false;
@@ -692,6 +782,20 @@ impl ProposalRateLimiter {
         }
         window.push_back(now);
         true
+    }
+
+    /// Gives back the place [`Self::allow`] just reserved when the proposal was refused after all, so a refusal never
+    /// counts toward the window. It removes only a place taken at `now`; an older one stays.
+    pub fn refund(&self, token: &str, now: u64) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        let Some(window) = seen.get_mut(token) else {
+            return;
+        };
+        if window.back() == Some(&now) {
+            window.pop_back();
+        }
     }
 }
 
@@ -733,6 +837,50 @@ mod tests {
         json!({ "name": name, "template": "nats" })
     }
 
+    /// A proposed journal line whose id and digest match its arguments, as the store writes them.
+    fn proposed_line(action: &str, args: &Value, now: u64) -> String {
+        let kind = ActionKind::from_name(action).expect("a known action");
+        let digest = action_args_digest(action, args).expect("canonical arguments");
+        serde_json::to_string(&json!({
+            "event": "proposed",
+            "proposal": {
+                "id": action_id(&digest),
+                "action": action,
+                "args": args,
+                "argsDigest": digest,
+                "createdMs": now,
+                "expiresAt": now.saturating_add(PLAN_TTL_MS),
+                "summary": kind.summary(args),
+                "details": kind.details(args),
+            }
+        }))
+        .expect("a journal line")
+    }
+
+    fn write_journal(dir: &Path, text: &str) -> PathBuf {
+        let path = dir.join(ACTION_PROPOSALS_FILE);
+        fs::write(&path, text).expect("the journal");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode 0600");
+        path
+    }
+
+    fn quarantined(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .expect("the directory")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{ACTION_PROPOSALS_FILE}.bad-"))
+            })
+    }
+
+    /// A digest-pinned image distinct from [`OTHER_IMAGE`].
+    const PINNED_IMAGE: &str = "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    /// Another pinned image, as a kernel configured differently would name.
+    const OTHER_IMAGE: &str = "docker.io/library/postgres@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     #[test]
     fn a_twenty_mib_journal_is_quarantined_and_the_store_starts_empty() {
         let dir = Temp::new("large");
@@ -746,7 +894,7 @@ mod tests {
         file.sync_all().expect("sync");
         drop(file);
 
-        let store = ActionProposalStore::open(&dir.0, 1_000);
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
         assert!(store.waiting().is_empty(), "the large file was not read");
         assert!(!path.exists(), "the large file was moved aside");
         let quarantined = fs::read_dir(&dir.0)
@@ -764,7 +912,7 @@ mod tests {
     #[test]
     fn opening_compacts_to_waiting_unexpired_proposals() {
         let dir = Temp::new("compact");
-        let mut store = ActionProposalStore::open(&dir.0, 1_000);
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
         let first = store
             .propose(ActionKind::ServiceCreate, create_args("first"), 1_000, None)
             .expect("the first proposal");
@@ -779,7 +927,7 @@ mod tests {
         store.approve(&first.id).expect("the approval event");
         drop(store);
 
-        let store = ActionProposalStore::open(&dir.0, 2_000);
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
         assert_eq!(store.waiting().len(), 1);
         assert_eq!(store.waiting()[0].id, second.id);
         let text =
@@ -791,7 +939,7 @@ mod tests {
         assert!(!text.contains("approved"));
         drop(store);
 
-        let store = ActionProposalStore::open(&dir.0, second.expires_at + 1);
+        let store = ActionProposalStore::open(&dir.0, second.expires_at + 1, None);
         assert!(store.waiting().is_empty(), "the lapsed proposal is dropped");
         assert_eq!(
             fs::read_to_string(dir.0.join(ACTION_PROPOSALS_FILE)).expect("the compacted journal"),
@@ -802,7 +950,7 @@ mod tests {
     #[test]
     fn a_gpu_product_survives_a_restart_without_the_inventory() {
         let dir = Temp::new("gpu-product");
-        let mut store = ActionProposalStore::open(&dir.0, 1_000);
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
         let proposed = store
             .propose(
                 ActionKind::GpuAttach,
@@ -824,11 +972,188 @@ mod tests {
         drop(store);
 
         // A restart without an inventory still shows the product the owner approved; the journal is the kernel's own.
-        let store = ActionProposalStore::open(&dir.0, 2_000);
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
         assert_eq!(store.waiting().len(), 1);
         assert_eq!(store.waiting()[0].details, proposed.details);
         assert_eq!(store.waiting()[0].summary, proposed.summary);
         assert!(store.waiting()[0].details[3].value.contains("shared"));
+    }
+
+    #[test]
+    fn a_replayed_proposal_is_validated_again_and_a_failed_one_quarantines() {
+        let dir = Temp::new("replay-invalid");
+        // The id and digest match these arguments, so only the action's own validation can refuse them.
+        let line = proposed_line(
+            "service_create",
+            &json!({ "name": "BAD NAME", "template": "nats" }),
+            1_000,
+        );
+        let path = write_journal(&dir.0, &format!("{line}\n"));
+
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
+        assert!(
+            store.waiting().is_empty(),
+            "an invalid proposal is not accepted from the journal"
+        );
+        assert!(!path.exists(), "the journal was moved aside");
+        assert!(quarantined(&dir.0), "the invalid journal was quarantined");
+    }
+
+    #[test]
+    fn the_kernels_configured_image_is_the_authority_on_replay() {
+        let dir = Temp::new("replay-image");
+        let args = json!({ "name": "orders", "image": PINNED_IMAGE });
+        let line = proposed_line("postgres_create", &args, 1_000);
+        let path = write_journal(&dir.0, &format!("{line}\n"));
+
+        // The configured image matches the journal's, so the proposal waits and carries the configured image.
+        let store = ActionProposalStore::open(&dir.0, 1_000, Some(PINNED_IMAGE));
+        assert_eq!(store.waiting().len(), 1);
+        assert_eq!(store.waiting()[0].args["image"], json!(PINNED_IMAGE));
+        drop(store);
+
+        // A restart configured with another pinned image must not trust the copy the journal carries.
+        let store = ActionProposalStore::open(&dir.0, 1_000, Some(OTHER_IMAGE));
+        assert!(
+            store.waiting().is_empty(),
+            "a different configured image refuses the replayed proposal"
+        );
+        assert!(!path.exists());
+        assert!(quarantined(&dir.0));
+
+        // Nor does a kernel with no configured image read one out of the journal.
+        let path = write_journal(&dir.0, &format!("{line}\n"));
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
+        assert!(
+            store.waiting().is_empty(),
+            "the journal's image is never the configured default"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_torn_last_line_without_its_newline_is_dropped_and_the_journal_compacted() {
+        let dir = Temp::new("torn-tail");
+        let valid = proposed_line("service_create", &create_args("nats"), 1_000);
+        let path = write_journal(
+            &dir.0,
+            &format!("{valid}\n{{\"event\":\"proposed\",\"proposal\":{{"),
+        );
+
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
+        assert_eq!(store.waiting().len(), 1, "the complete event survives");
+        assert!(!quarantined(&dir.0), "a torn tail does not quarantine");
+        let text = fs::read_to_string(&path).expect("the compacted journal");
+        assert_eq!(text.lines().count(), 1, "the torn tail was dropped");
+        assert!(text.ends_with('\n'), "the rewrite terminates every line");
+    }
+
+    #[test]
+    fn a_malformed_line_before_the_last_still_quarantines() {
+        let dir = Temp::new("malformed-middle");
+        let valid = proposed_line("service_create", &create_args("nats"), 1_000);
+        let path = write_journal(&dir.0, &format!("{valid}\nthis is not an event\n{valid}\n"));
+
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
+        assert!(store.waiting().is_empty());
+        assert!(!path.exists());
+        assert!(quarantined(&dir.0));
+    }
+
+    #[test]
+    fn a_malformed_last_line_with_its_newline_quarantines() {
+        let dir = Temp::new("malformed-last");
+        let valid = proposed_line("service_create", &create_args("nats"), 1_000);
+        let path = write_journal(&dir.0, &format!("{valid}\nthis is not an event\n"));
+
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
+        assert!(store.waiting().is_empty());
+        assert!(!path.exists());
+        assert!(quarantined(&dir.0));
+    }
+
+    #[test]
+    fn opening_removes_only_its_own_stale_compaction_temps() {
+        let dir = Temp::new("stale-temps");
+        let stale = dir.0.join(format!(".{ACTION_PROPOSALS_FILE}.tmp-4242-0"));
+        fs::write(&stale, b"half written").expect("a stale temp");
+        let stale_hex = dir
+            .0
+            .join(format!(".{ACTION_PROPOSALS_FILE}.tmp-1-deadbeef"));
+        fs::write(&stale_hex, b"half written").expect("a stale temp");
+        let foreign = dir.0.join("notes.txt");
+        fs::write(&foreign, b"keep").expect("a foreign file");
+        let lookalike = dir
+            .0
+            .join(format!(".{ACTION_PROPOSALS_FILE}.tmp-not-a-pid-0"));
+        fs::write(&lookalike, b"keep").expect("a lookalike file");
+        let temp_dir = dir.0.join(format!(".{ACTION_PROPOSALS_FILE}.tmp-7-aa"));
+        fs::create_dir(&temp_dir).expect("a directory with a similar name");
+
+        let store = ActionProposalStore::open(&dir.0, 1_000, None);
+        assert!(store.waiting().is_empty());
+        assert!(!stale.exists(), "the exact temp naming is removed");
+        assert!(
+            !stale_hex.exists(),
+            "another process id's temp is removed too"
+        );
+        assert!(foreign.exists(), "an unrelated file is never touched");
+        assert!(
+            lookalike.exists(),
+            "a similar name that is not the exact naming stays"
+        );
+        assert!(temp_dir.exists(), "a directory is never removed");
+    }
+
+    #[test]
+    fn the_journal_compacts_after_it_passes_its_size_threshold() {
+        let dir = Temp::new("threshold");
+        let path = dir.0.join(ACTION_PROPOSALS_FILE);
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let mut appended = 0u64;
+        let mut compacted = false;
+        for index in 0..6_000u32 {
+            let before = fs::metadata(&path).map_or(0, |meta| meta.len());
+            let proposal = store
+                .propose(
+                    ActionKind::ServiceCreate,
+                    create_args(&format!("bulk{index}")),
+                    1_000,
+                    None,
+                )
+                .expect("a proposal");
+            let after = fs::metadata(&path).expect("the journal").len();
+            if after < before {
+                compacted = true;
+                break;
+            }
+            appended = appended.saturating_add(after.saturating_sub(before));
+
+            store.approve(&proposal.id).expect("the approval");
+            let approved = fs::metadata(&path).expect("the journal").len();
+            if approved < after {
+                compacted = true;
+                break;
+            }
+            appended = appended.saturating_add(approved.saturating_sub(after));
+        }
+        assert!(
+            appended > MAX_COMPACT_BYTES / 2,
+            "the journal grew through many appended events"
+        );
+        assert!(
+            compacted,
+            "an append compacted the journal once it passed its size threshold"
+        );
+        let text = fs::read_to_string(&path).expect("the compacted journal");
+        assert_eq!(
+            text.lines().count(),
+            store.waiting().len(),
+            "the journal holds exactly the waiting set"
+        );
+        for proposal in store.waiting() {
+            assert!(text.contains(&proposal.id));
+        }
     }
 
     #[test]

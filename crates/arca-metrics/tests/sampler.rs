@@ -769,6 +769,14 @@ mod pools_from_incus {
     }
 
     impl IncusRead for Switchable {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             let refused = self
                 .refused
@@ -1045,6 +1053,14 @@ mod instance_readings {
     }
 
     impl IncusRead for Listing {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path != LISTED {
                 return Err(IncusError::Decode(format!("no answer for {path}")));
@@ -1507,6 +1523,14 @@ mod osd_readings {
     }
 
     impl IncusRead for Docs {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             self.reads
                 .lock()
@@ -2041,6 +2065,14 @@ mod smart_readings {
     }
 
     impl IncusRead for Storage {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path != STORAGE {
                 return Err(IncusError::Status {
@@ -2279,6 +2311,14 @@ mod host_totals {
     }
 
     impl IncusRead for Resources {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             self.reads
                 .lock()
@@ -2522,6 +2562,14 @@ mod host_totals {
     }
 
     impl IncusRead for LateName {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             self.reads
                 .lock()
@@ -2640,6 +2688,14 @@ mod host_totals {
     }
 
     impl IncusRead for LateTotals {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             match path {
                 "/1.0" => {

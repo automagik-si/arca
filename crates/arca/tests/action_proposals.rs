@@ -58,7 +58,8 @@ impl Rig {
         let fake = start_fake(&scratch);
         let verifier = verifier_for(&scratch, &[key], tag);
         let kernel = Arc::new(Mutex::new(
-            kernel(&scratch, &fake, verifier, NOW).expect("the kernel opens"),
+            kernel_with_image(&scratch, &fake, verifier, NOW, postgres_image)
+                .expect("the kernel opens"),
         ));
         let clock = Arc::new(AtomicU64::new(NOW));
         let gpu = Arc::new(
@@ -494,6 +495,88 @@ fn the_per_token_proposal_rate_holds_across_propose_and_decline() {
     let error = rig
         .propose("service_create", create_args("rate-extra"))
         .expect_err("the token's window is full");
+    assert!(matches!(
+        error,
+        CallError::Refused { ref code, .. } if code == "RateLimited"
+    ));
+}
+
+#[test]
+fn a_deduplicated_proposal_does_not_consume_the_token_window() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-rate-dedupe", &key);
+    let first = rig
+        .propose("service_create", create_args("nats"))
+        .expect("the first new proposal");
+    for _ in 0..PROPOSAL_RATE_MAX * 2 {
+        assert_eq!(
+            rig.propose("service_create", create_args("nats"))
+                .expect("the duplicate still answers"),
+            first,
+            "a deduplicated proposal returns the waiting record"
+        );
+    }
+    // The duplicates counted nothing: one new proposal plus twenty-nine more still fit the window.
+    for index in 0..PROPOSAL_RATE_MAX - 1 {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("new{index}")))
+            .expect("a new proposal inside the window");
+        let id = proposed["id"].as_str().expect("an id");
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    let error = rig
+        .propose("service_create", create_args("new-extra"))
+        .expect_err("the thirty accepted proposals fill the window");
+    assert!(matches!(
+        error,
+        CallError::Refused { ref code, .. } if code == "RateLimited"
+    ));
+    assert_eq!(
+        rig.propose("service_create", create_args("nats"))
+            .expect("a duplicate answers even with a full window"),
+        first,
+        "a duplicate records nothing, so the full window does not refuse it"
+    );
+}
+
+#[test]
+fn a_refused_proposal_does_not_consume_the_token_window() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-rate-refused", &key);
+    let mut waiting = Vec::new();
+    for index in 0..MAX_WAITING {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("busy{index}")))
+            .expect("a proposal inside the window");
+        waiting.push(proposed["id"].as_str().expect("an id").to_string());
+    }
+    // Forty refusals for a full waiting set. If they counted, this loop would turn into RateLimited well before its end.
+    for index in 0..40 {
+        let error = rig
+            .propose("service_create", create_args(&format!("overflow{index}")))
+            .expect_err("a ninth proposal waits for room");
+        assert!(
+            matches!(error, CallError::Refused { ref code, .. } if code == "TooManyProposals"),
+            "a refusal, not a rate limit: {error:?}"
+        );
+    }
+    for id in &waiting {
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    // Eight accepted proposals are already counted, so twenty-two more fill the window exactly.
+    for index in 0..PROPOSAL_RATE_MAX - MAX_WAITING {
+        let proposed = rig
+            .propose("service_create", create_args(&format!("spent{index}")))
+            .expect("a new proposal inside the window");
+        let id = proposed["id"].as_str().expect("an id");
+        call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
+            .expect("the proposal is declined");
+    }
+    let error = rig
+        .propose("service_create", create_args("spent-extra"))
+        .expect_err("the refusals counted nothing, so thirty new proposals fill the window");
     assert!(matches!(
         error,
         CallError::Refused { ref code, .. } if code == "RateLimited"

@@ -112,6 +112,7 @@ impl Rig {
                 plugins,
                 verifier,
                 "node1".into(),
+                None,
                 move |retained| {
                     Ok(Box::new(
                         IncusProvider::new(

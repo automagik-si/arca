@@ -33,7 +33,9 @@ use arca_watch::{WatchConfig, watch_once};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::action_proposal::{ActionKind, ActionProposal, ProposalRateLimiter, ProposeError};
+use crate::action_proposal::{
+    ActionKind, ActionProposal, ProposalRateLimiter, ProposeError, action_args_digest,
+};
 use crate::config::NodeConfig;
 use crate::gpu::{GpuBackend, GpuDeviceState, GpuInstance, GpuRefusal, card_for};
 use crate::kernel::{ActionApprovalError, AppliedSeq, ApprovedAction, JOURNAL_FILE, Kernel};
@@ -1037,16 +1039,31 @@ impl ToolHandler for ActionPropose {
             _ => None,
         };
         let now = (self.clock)();
-        if !self.rate.allow(&caller.token_id, now) {
+        let mut kernel = lock(&self.kernel)?;
+        // A proposal whose digest already waits is a deduplicated request: it returns that record and records nothing, so it
+        // never consumes the token's window and a full window does not refuse it.
+        let duplicate = action_args_digest(action.as_str(), &payload).is_some_and(|digest| {
+            kernel
+                .action_proposals()
+                .iter()
+                .any(|proposal| proposal.args_digest == digest && !proposal.expired(now))
+        });
+        if !duplicate && !self.rate.allow(&caller.token_id, now) {
             return Err(CallError::Refused {
                 code: "RateLimited".to_string(),
                 message: "too many proposals from this token; try again in ten minutes".to_string(),
             });
         }
-        let mut kernel = lock(&self.kernel)?;
-        let proposal = kernel
-            .propose_action(action, payload, now, gpu_product.as_deref())
-            .map_err(propose_failure)?;
+        let proposal = match kernel.propose_action(action, payload, now, gpu_product.as_deref()) {
+            Ok(proposal) => proposal,
+            Err(error) => {
+                // Only a newly recorded proposal counts. A refusal gives back the place reserved above.
+                if !duplicate {
+                    self.rate.refund(&caller.token_id, now);
+                }
+                return Err(propose_failure(error));
+            }
+        };
         Ok(json!({
             "kind": "action",
             "id": proposal.id,
@@ -1654,6 +1671,14 @@ mod tests {
     }
 
     impl IncusRead for Scripted {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path == PROJECTS_PATH {
                 let names = next_answer(&self.index);

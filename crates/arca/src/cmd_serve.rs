@@ -153,6 +153,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         plugins,
         verifier,
         host,
+        cfg.kernel.postgres_image.as_deref(),
         write_provider(&cfg, kernel_mode),
         now_ms(),
     )

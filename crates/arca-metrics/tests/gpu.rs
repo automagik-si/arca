@@ -455,6 +455,14 @@ fn a_vfio_card_has_its_own_use_and_a_missing_gpu_list_is_empty_not_unknown() {
     );
     struct NoGpu(Value);
     impl arca_incus::IncusRead for NoGpu {
+        fn get_within(
+            &self,
+            _path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, arca_incus::IncusError> {
+            Ok(self.0.clone())
+        }
+
         fn get(&self, _path: &str) -> Result<Value, arca_incus::IncusError> {
             Ok(self.0.clone())
         }
@@ -536,6 +544,14 @@ fn cgroups_resolve_incus_projects_and_docker_containers() {
 fn a_failed_resources_read_is_a_reason_not_an_empty_inventory() {
     struct Offline;
     impl arca_incus::IncusRead for Offline {
+        fn get_within(
+            &self,
+            _path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, arca_incus::IncusError> {
+            self.get(_path)
+        }
+
         fn get(&self, _path: &str) -> Result<Value, arca_incus::IncusError> {
             Err(arca_incus::IncusError::Status {
                 code: 503,

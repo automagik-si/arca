@@ -308,6 +308,18 @@ pub fn kernel(
     verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
     now: u64,
 ) -> Result<Kernel, arca_kernel::KernelError> {
+    kernel_with_image(scratch, fake, verifier, now, None)
+}
+
+/// The same kernel, with `postgres_image` configured as its pinned default. Replaying the proposals journal checks every
+/// replayed record against it.
+pub fn kernel_with_image(
+    scratch: &Scratch,
+    fake: &FakeIncus,
+    verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
+    now: u64,
+    postgres_image: Option<&str>,
+) -> Result<Kernel, arca_kernel::KernelError> {
     let mut plugins = PluginSet::new();
     plugins.add::<Toy>().expect("the toy plugin is valid");
     let socket = fake.socket().to_path_buf();
@@ -318,6 +330,7 @@ pub fn kernel(
         plugins,
         verifier,
         HOST.to_string(),
+        postgres_image,
         move |retained| {
             let provider = IncusProvider::new(socket, family(), secrets, retained)
                 .map_err(|refusal| arca_kernel::KernelError::Plugin(refusal.to_string()))?;

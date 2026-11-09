@@ -113,19 +113,22 @@ pub enum ServiceRemovalError {
 impl Kernel {
     /// Opens the kernel over `state_dir`. The store takes its lock first, so a second kernel over the same directory is refused.
     /// The journal is opened and its intents settled, then the store's current document is reconciled once, so the delete plans
-    /// it implies are waiting again. `provider` builds the provider from the retained set the reconciler shares with it, and
-    /// `now_ms` is the clock every check of the start reads.
+    /// it implies are waiting again. `provider` builds the provider from the retained set the reconciler shares with it,
+    /// `postgres_image` is the kernel's configured pinned default (the authority every replayed proposal is checked against),
+    /// and `now_ms` is the clock every check of the start reads.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         state_dir: &Path,
         key: NodeKey,
         plugins: PluginSet,
         verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
         host: String,
+        postgres_image: Option<&str>,
         provider: impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError>,
         now_ms: u64,
     ) -> Result<Self, KernelError> {
         let mut store = DesiredStore::open(state_dir, key)?;
-        let action_proposals = ActionProposalStore::open(state_dir, now_ms);
+        let action_proposals = ActionProposalStore::open(state_dir, now_ms, postgres_image);
         let retained = RetainedSet::new(store.retained().clone());
         let provider = provider(retained.clone())?;
         let journal = Journal::open(FileJournal::open(&state_dir.join(JOURNAL_FILE))?)?;

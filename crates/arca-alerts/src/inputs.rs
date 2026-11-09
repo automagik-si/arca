@@ -151,6 +151,14 @@ mod tests {
     struct Offline;
 
     impl IncusRead for Offline {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             Err(IncusError::Decode(format!("offline: {path}")))
         }
@@ -160,6 +168,14 @@ mod tests {
     struct Pools(PoolList);
 
     impl IncusRead for Pools {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path == "/1.0/storage-pools?recursion=1" {
                 return Ok(Value::Array(
@@ -328,6 +344,14 @@ mod tests {
     struct Rows(Arc<Mutex<Vec<Value>>>);
 
     impl IncusRead for Rows {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path == "/1.0/instances?all-projects=true&recursion=2" {
                 let rows = self.0.lock().expect("the rows are not poisoned").clone();
@@ -398,6 +422,14 @@ mod tests {
     }
 
     impl IncusRead for Live {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if self.down.load(Ordering::SeqCst) {
                 return Err(IncusError::Decode(format!("offline: {path}")));
@@ -494,6 +526,14 @@ mod tests {
     }
 
     impl IncusRead for SlowName {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path == "/1.0" {
                 return if self.up.load(Ordering::SeqCst) {

@@ -675,6 +675,14 @@ mod tests {
     }
 
     impl IncusRead for Osd {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             match (&self.served, path) {
                 (Some((security, _)), "/os/1.0/system/security") => Ok(security.clone()),
@@ -691,6 +699,14 @@ mod tests {
     struct Storage;
 
     impl IncusRead for Storage {
+        fn get_within(
+            &self,
+            path: &str,
+            _timeout: std::time::Duration,
+        ) -> Result<Value, IncusError> {
+            self.get(path)
+        }
+
         fn get(&self, path: &str) -> Result<Value, IncusError> {
             if path != "/os/1.0/system/storage" {
                 return Err(IncusError::Status {
