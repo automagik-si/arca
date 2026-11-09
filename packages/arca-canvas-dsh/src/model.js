@@ -4,6 +4,12 @@ const count = (value, singular, plural = `${singular}s`) => `${value} ${value ==
 const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 const INTERNAL_PROJECT = 'arcak-svc';
 
+// The kernel names an action proposal `act-` plus the first twelve hex digits of its arguments digest.
+export function proposalId(value) {
+  const id = value && typeof value === 'object' ? text(value.id) : '';
+  return /^act-[0-9a-f]{12}$/.test(id) ? id : '';
+}
+
 export function humanize(value) {
   const raw = text(value, 'Unnamed');
   return raw.replace(/[_-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());

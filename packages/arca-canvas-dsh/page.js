@@ -16,6 +16,10 @@
   var count = (value, singular, plural = `${singular}s`) => `${value} ${value === 1 ? singular : plural}`;
   var byName = (a, b) => a.localeCompare(b, void 0, { numeric: true, sensitivity: "base" });
   var INTERNAL_PROJECT = "arcak-svc";
+  function proposalId(value) {
+    const id = value && typeof value === "object" ? text(value.id) : "";
+    return /^act-[0-9a-f]{12}$/.test(id) ? id : "";
+  }
   function humanize(value) {
     const raw = text(value, "Unnamed");
     return raw.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -463,9 +467,84 @@
 
   // src/render.js
   var SVG_NS = "http://www.w3.org/2000/svg";
+  var APPROVAL_NAMESPACE = "arca-kernel-approve";
+  var APPROVAL_DOMAIN = "arca-kernel-approval/v1";
+  var PROPOSE_ACTIONS = /* @__PURE__ */ new Set([
+    "service_create",
+    "service_remove",
+    "service_publish",
+    "service_unpublish",
+    "service_connect",
+    "service_disconnect",
+    "postgres_create"
+  ]);
+  var REFUSALS = Object.freeze({
+    Expired: "This proposal ran out of time. Nothing changed.",
+    Replayed: "This approval was already used. Reload the page to see what is still waiting.",
+    NoSuchPlan: "This proposal is no longer waiting in Arca.",
+    Untrusted: "Arca does not trust this passkey. Use the passkey you set up for Arca.",
+    BadSignature: "Arca could not check the passkey's answer. Try again.",
+    NoUserPresence: "Your device did not confirm it was you. Try again.",
+    NoUserVerification: "Your device did not confirm it was you. Try again.",
+    WrongOrigin: "This page's address does not match Arca's settings.",
+    WrongRp: "This page's address does not match Arca's settings.",
+    WrongHost: "This approval was made for a different Arca.",
+    owner_approval: "Arca did not accept this approval. Try again from the card."
+  });
   var text2 = (value, fallback = "") => value == null ? fallback : String(value);
   var list2 = (value) => Array.isArray(value) ? value : [];
   var count2 = (value, singular, plural = `${singular}s`) => `${value} ${value === 1 ? singular : plural}`;
+  function b64(bytes) {
+    let text3 = "";
+    for (const byte of bytes) text3 += String.fromCharCode(byte);
+    return btoa(text3);
+  }
+  function b64url(bytes) {
+    return b64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+  function fromB64url(value) {
+    const text3 = String(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = text3 + "=".repeat((4 - text3.length % 4) % 4);
+    const raw = atob(padded);
+    return Uint8Array.from(raw, (character) => character.charCodeAt(0));
+  }
+  function expiryText(expiresAt, now = Date.now()) {
+    const left = Number(expiresAt) - now;
+    if (!Number.isFinite(left) || left <= 0) return "Expired";
+    const seconds = Math.ceil(left / 1e3);
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
+  }
+  function plainRefusal(refusal, status) {
+    if (typeof refusal === "string" && REFUSALS[refusal]) return REFUSALS[refusal];
+    if (status === 401 || status === 403) return "Arca did not accept this approval.";
+    if (status === 404) return "This proposal is no longer waiting in Arca.";
+    if (status === 429) return "Arca is busy. Try again shortly.";
+    return "Arca could not complete this just now. Try again in a moment.";
+  }
+  function plainError(error) {
+    if (!error) return "Something went wrong. Try again.";
+    if (error.name === "TypeError") return "Can't reach Arca. Check your connection, then try again.";
+    if (error.name === "SecurityError") return "Passkeys can't be used at this page's address. Open Arca from its usual address.";
+    if (error.name === "InvalidStateError") return "This device already has a different passkey. Try again.";
+    const message = String(error.message || error).trim();
+    return message ? `${message.charAt(0).toUpperCase()}${message.slice(1)}` : "Something went wrong. Try again.";
+  }
+  function plainResult(action, result) {
+    const value = result && typeof result === "object" ? result : {};
+    if (value.removed === true) return "The service was removed.";
+    if (value.unpublished === true) return "The service is no longer published.";
+    if (typeof value.url === "string" && value.url) return `The change is live at ${value.url}.`;
+    if (Array.isArray(value.env)) return `The link is set up; ${count2(value.env.length, "environment variable")} updated.`;
+    if (action === "postgres_create" && typeof value.name === "string") {
+      return `The database ${value.name} is ${value.status === "running" ? "ready" : "being created"}.`;
+    }
+    if (typeof value.name === "string") {
+      const state = typeof value.state === "string" && value.state ? ` and is ${value.state}` : "";
+      return `The service ${value.name} was created${state}.`;
+    }
+    return "Arca finished the change.";
+  }
   function el(doc, tag, className, value) {
     const node = doc.createElement(tag);
     if (className) node.className = className;
@@ -833,7 +912,7 @@
     return card;
   }
   function approvalCard(doc, plans, url) {
-    const card = el(doc, "article", "arca-card arca-card-warn arca-approval");
+    const card = el(doc, "article", "arca-card arca-card-warn arca-approval arca-approval-delete");
     const head = el(doc, "div", "arca-card-head");
     head.append(el(doc, "span", "arca-badge wait", "Waiting for approval"));
     head.append(el(doc, "span", "arca-card-meta", count2(plans, "plan")));
@@ -897,20 +976,6 @@
     head.append(el(doc, "span", "arca-tool-meta", card.host ?? ""));
     node.append(head, el(doc, "p", "arca-tool-text", toolSummary(card)));
     return node;
-  }
-  function chatApprovalCard(doc, approval) {
-    const card = el(doc, "article", "arca-card arca-card-warn arca-approval");
-    const head = el(doc, "div", "arca-card-head");
-    head.append(el(doc, "span", "arca-badge wait", "Approval needed"), el(doc, "span", "arca-card-meta", "read only"));
-    card.append(head, el(doc, "p", "arca-card-text", approval.detail || "This chat cannot change anything."));
-    if (approval.url) {
-      const link = el(doc, "a", "arca-btn arca-btn-ink", "Review approvals");
-      link.href = approval.url;
-      card.append(link);
-    } else {
-      card.append(el(doc, "span", "arca-card-note", "The approval page is not configured."));
-    }
-    return card;
   }
   function chatNotice(doc, kind, title, body) {
     if (kind === "cutoff") return el(doc, "p", "arca-thread-note arca-cutoff", body);
@@ -1037,7 +1102,7 @@
     send.append(icon(doc, "send"));
     composerBar.append(plus, perm, barSpacer, model, send);
     composerBox.append(composerRow, composerBar);
-    const composerNote = el(doc, "p", "arca-composer-note", "Read only \xB7 changes need your passkey on the approval page.");
+    const composerNote = el(doc, "p", "arca-composer-note", "Read only \xB7 approve the Doctor's proposals with your passkey.");
     composer.append(composerBox, composerNote);
     panel.append(panelHead, chatScroll, stepsScroll, composer);
     main.append(left, panel);
@@ -1059,6 +1124,16 @@
       loaded: false,
       controller: null,
       sessionId: null
+    };
+    const approvals = {
+      plans: /* @__PURE__ */ new Map(),
+      deletes: [],
+      cards: /* @__PURE__ */ new Map(),
+      passkeysTrusted: 0,
+      loaded: false,
+      error: "",
+      fetching: false,
+      credentialIds: null
     };
     let clockTimer;
     const tick = () => {
@@ -1085,6 +1160,7 @@
       chatScroll.hidden = name !== "chat";
       stepsScroll.hidden = name !== "steps";
       updateSubtitle();
+      if (name === "steps" && approvalConfigured()) void refreshApprovals();
     };
     chatTab.addEventListener("click", () => setTab("chat"));
     stepsTab.addEventListener("click", () => setTab("steps"));
@@ -1175,13 +1251,13 @@
       const banner = el(doc, "div", "arca-chat-banner");
       const shield = el(doc, "span", "arca-chat-banner-icon");
       shield.append(icon(doc, "shield"));
-      banner.append(shield, el(doc, "span", "", "Read only \xB7 changes need your passkey on the approval page"));
+      banner.append(shield, el(doc, "span", "", "Read only \xB7 the Doctor proposes, you approve with your passkey"));
       thread.append(banner);
       if (chat.error) {
         thread.append(chatNotice(doc, "error", "Doctor unavailable", chat.error));
       }
       if (!chat.messages.length && !chat.error) {
-        const empty = emptyState(doc, "Ask the Doctor", "A read-only assistant for this Arca deployment. It reads live hosts and services; any change needs your passkey on the approval page.");
+        const empty = emptyState(doc, "Ask the Doctor", "An assistant for this Arca deployment. It reads live hosts and services; a change waits for your approval on a card.");
         empty.classList.add("arca-chat-empty");
         thread.append(empty);
       }
@@ -1197,11 +1273,17 @@
           for (const tool of message.tools) tools.append(chatToolCard(doc, tool));
           node.append(tools);
         }
-        if (message.approval) node.append(chatApprovalCard(doc, message.approval));
+        const proposed = /* @__PURE__ */ new Set();
+        for (const tool of message.tools) {
+          const id = proposalId(tool.proposal);
+          if (!id || proposed.has(id)) continue;
+          proposed.add(id);
+          const card = proposalCard(doc, id);
+          if (card) node.append(card);
+        }
         for (const note of message.notes ?? []) node.append(chatNotice(doc, note.kind, note.title, note.body));
         thread.append(node);
       }
-      if (state.plans > 0) thread.append(approvalCard(doc, state.plans, state.approvalUrl));
       if (nearBottom) chatScroll.scrollTop = chatScroll.scrollHeight;
       else chatScroll.scrollTop = scrollTop;
     };
@@ -1210,6 +1292,362 @@
       send.setAttribute("aria-disabled", String(!ready));
     };
     const activeAssistant = () => chat.messages.at(-1)?.role === "assistant" ? chat.messages.at(-1) : null;
+    const approvalConfigured = () => Boolean(approvalUrl(state.envelope.approvalUrl));
+    function approvalCardFor(id) {
+      const key = proposalId({ id });
+      if (!key) return null;
+      let card = approvals.cards.get(key);
+      if (!card) {
+        if (!approvals.plans.has(key)) return null;
+        card = { plan: null, state: "waiting", reason: "", note: "", result: "", busy: "" };
+        approvals.cards.set(key, card);
+      }
+      if (!card.plan && approvals.plans.has(key)) card.plan = approvals.plans.get(key);
+      return card;
+    }
+    function approvalDetails(value) {
+      if (!Array.isArray(value) || !value.length) return null;
+      const rows = [];
+      for (const row of value) {
+        if (!row || typeof row !== "object" || typeof row.label !== "string") return null;
+        if (typeof row.value !== "string" && typeof row.value !== "number" && typeof row.value !== "boolean") return null;
+        rows.push({ label: row.label, value: String(row.value) });
+      }
+      return rows;
+    }
+    function parseApprovalPlans(body) {
+      const plans = /* @__PURE__ */ new Map();
+      const deletes = [];
+      for (const row of Array.isArray(body?.plans) ? body.plans : []) {
+        if (!row || typeof row !== "object") continue;
+        if (row.kind === "action") {
+          if (!PROPOSE_ACTIONS.has(row.action)) continue;
+          const id = proposalId(row);
+          const summary2 = typeof row.summary === "string" ? row.summary.trim() : "";
+          const digest = typeof row.argsDigest === "string" && /^[0-9a-f]{64}$/.test(row.argsDigest) ? row.argsDigest : "";
+          const details = approvalDetails(row.details);
+          const expiresAt = Number(row.expiresAt);
+          if (!id || !summary2 || !digest || !details || !Number.isFinite(expiresAt) || expiresAt <= 0) continue;
+          plans.set(id, {
+            kind: "action",
+            id,
+            action: row.action,
+            summary: summary2,
+            argsDigest: digest,
+            details,
+            expiresAt,
+            statement: typeof row.statement === "string" ? row.statement : ""
+          });
+        } else if (typeof row.plan === "string" && /^[0-9a-f]{64}$/.test(row.plan)) {
+          deletes.push({ id: row.plan, expiresAt: Number(row.expiresAt) || 0 });
+        }
+      }
+      const trusted = Number(body?.passkeysTrusted);
+      return { plans, deletes, passkeysTrusted: Number.isInteger(trusted) && trusted > 0 ? trusted : 0 };
+    }
+    async function readApprovalPlans() {
+      const response = await fetch("/approve/plans", {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "application/json" }
+      });
+      if (!response.ok) throw new Error(`The approval list answered ${response.status}.`);
+      return parseApprovalPlans(await response.json());
+    }
+    async function refreshApprovals() {
+      if (approvals.fetching) return;
+      if (!approvalConfigured()) {
+        approvals.loaded = true;
+        approvals.error = "The approval page is not configured on this canvas.";
+        updatePanel();
+        return;
+      }
+      approvals.fetching = true;
+      try {
+        const next = await readApprovalPlans();
+        const now = Date.now();
+        for (const [id, plan] of next.plans) {
+          const existing = approvals.cards.get(id);
+          if (existing) existing.plan = plan;
+        }
+        for (const [id, card] of approvals.cards) {
+          if (next.plans.has(id) || card.state !== "waiting") continue;
+          if (card.plan && now >= card.plan.expiresAt) card.state = "expired";
+          else {
+            card.state = "failed";
+            card.reason = "This proposal is no longer waiting in Arca.";
+          }
+        }
+        approvals.plans = next.plans;
+        approvals.deletes = next.deletes;
+        approvals.passkeysTrusted = next.passkeysTrusted;
+        approvals.error = "";
+      } catch (error) {
+        approvals.error = plainError(error);
+      } finally {
+        approvals.fetching = false;
+        approvals.loaded = true;
+        updatePanel();
+      }
+    }
+    function expireApprovals(now = Date.now()) {
+      let changed = false;
+      for (const card of approvals.cards.values()) {
+        if (card.state === "waiting" && card.plan && now >= card.plan.expiresAt) {
+          card.state = "expired";
+          card.busy = "";
+          changed = true;
+        }
+      }
+      return changed;
+    }
+    function updateExpiryLabels(now = Date.now()) {
+      for (const node of root2.querySelectorAll(".arca-approval-expiry[data-expires-at]")) {
+        node.textContent = `Expires in ${expiryText(Number(node.dataset.expiresAt), now)}`;
+      }
+    }
+    function cardBadge(card) {
+      if (card.busy === "declining") return ["wait", "Declining"];
+      if (card.state === "approving") return ["wait", "Confirm passkey"];
+      if (card.state === "done") return ["ok", "Done"];
+      if (card.state === "declined") return ["", "Declined"];
+      if (card.state === "expired") return ["", "Expired"];
+      if (card.state === "failed") return ["bad", "Failed"];
+      return ["wait", "Waiting for approval"];
+    }
+    function proposalCard(doc2, id) {
+      const key = proposalId({ id });
+      const card = approvalCardFor(key);
+      if (!card || !card.plan) return null;
+      const plan = card.plan;
+      const article = el(doc2, "article", "arca-card arca-card-warn arca-approval arca-proposal");
+      article.dataset.proposal = key;
+      article.dataset.state = card.state;
+      article.setAttribute("aria-label", `Approval: ${plan.summary}`);
+      const head = el(doc2, "div", "arca-card-head");
+      const [tone, label] = cardBadge(card);
+      head.append(el(doc2, "span", `arca-badge${tone ? ` ${tone}` : ""}`, label));
+      const meta = el(doc2, "span", "arca-card-meta");
+      if (card.state === "waiting" || card.state === "approving") {
+        const expiry = el(doc2, "time", "arca-approval-expiry", `Expires in ${expiryText(plan.expiresAt)}`);
+        expiry.dateTime = new Date(plan.expiresAt).toISOString();
+        expiry.title = new Date(plan.expiresAt).toLocaleString();
+        expiry.dataset.expiresAt = String(plan.expiresAt);
+        if (plan.expiresAt - Date.now() < 5 * 6e4) expiry.dataset.soon = "true";
+        meta.append(expiry);
+      }
+      head.append(meta);
+      article.append(head, el(doc2, "p", "arca-card-text arca-approval-summary", plan.summary));
+      const facts = el(doc2, "dl", "arca-approval-facts");
+      for (const row of plan.details) {
+        const line = el(doc2, "div", "arca-approval-fact");
+        line.dataset.detail = "true";
+        line.append(el(doc2, "dt", "", row.label), el(doc2, "dd", "", row.value));
+        facts.append(line);
+      }
+      const technical = (label2, value, name) => {
+        const line = el(doc2, "div", "arca-approval-fact");
+        line.dataset.technical = name;
+        line.append(el(doc2, "dt", "", label2), el(doc2, "dd", "", value));
+        facts.append(line);
+      };
+      technical("Action", plan.action, "action");
+      technical("Target", plan.id, "target");
+      technical("Fingerprint", plan.argsDigest.slice(0, 12), "digest");
+      article.append(facts);
+      if (card.state === "waiting") {
+        const actions = el(doc2, "div", "arca-approval-actions");
+        const approve = el(doc2, "button", "arca-btn arca-btn-ink arca-approve", "Approve");
+        approve.type = "button";
+        approve.dataset.approve = key;
+        approve.setAttribute("aria-label", `Approve: ${plan.summary}`);
+        approve.disabled = Boolean(card.busy) || !plan.statement || approvals.passkeysTrusted < 1;
+        approve.addEventListener("click", () => {
+          void approveProposal(key);
+        });
+        const decline = el(doc2, "button", "arca-btn arca-btn-quiet arca-decline", "Decline");
+        decline.type = "button";
+        decline.dataset.decline = key;
+        decline.disabled = Boolean(card.busy) || !plan.statement;
+        decline.addEventListener("click", () => {
+          void declineProposal(key);
+        });
+        actions.append(approve, decline);
+        article.append(actions);
+        if (card.busy === "declining") article.append(el(doc2, "span", "arca-card-note", "Declining\u2026"));
+        else if (card.note) article.append(el(doc2, "span", "arca-card-note", card.note));
+        if (!plan.statement) article.append(el(doc2, "span", "arca-card-note", "Arca did not send the approval statement. Reload the page."));
+        else if (approvals.passkeysTrusted < 1) article.append(el(doc2, "span", "arca-card-note", "No passkey is set up for this Arca."));
+      } else if (card.state === "approving") {
+        article.append(el(doc2, "p", "arca-approval-status", "Confirm with your passkey\u2026"));
+      } else if (card.state === "done") {
+        article.append(el(doc2, "p", "arca-approval-status", card.result || "Arca finished the change."));
+      } else if (card.state === "declined") {
+        article.append(el(doc2, "p", "arca-approval-status", "Declined. Nothing changed."));
+      } else if (card.state === "expired") {
+        article.append(el(doc2, "p", "arca-approval-status", "Expired. Nothing changed."));
+      } else if (card.state === "failed") {
+        article.append(el(doc2, "p", "arca-approval-status arca-approval-reason", card.reason || "The approval failed."));
+      }
+      return article;
+    }
+    async function loadCredentialIds() {
+      if (approvals.credentialIds) return approvals.credentialIds;
+      const response = await fetch("/approve", {
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { Accept: "text/html" }
+      });
+      if (!response.ok) throw new Error("Passkeys are not available from this page.");
+      const page = await response.text();
+      const parsed = new DOMParser().parseFromString(page, "text/html");
+      let ids = [];
+      try {
+        ids = JSON.parse(parsed.body?.dataset?.credentialIds || "[]");
+      } catch {
+        ids = [];
+      }
+      if (!Array.isArray(ids)) ids = [];
+      approvals.credentialIds = ids.filter((value) => typeof value === "string" && value).map((value) => ({ type: "public-key", id: fromB64url(value) }));
+      return approvals.credentialIds;
+    }
+    async function passkeyProof(statement) {
+      if (!navigator.credentials || typeof navigator.credentials.get !== "function") {
+        throw new Error("This browser cannot use passkeys.");
+      }
+      if (typeof crypto?.subtle?.digest !== "function") {
+        throw new Error("Passkeys can't be used at this page's address.");
+      }
+      const allowCredentials = await loadCredentialIds();
+      if (!allowCredentials.length) throw new Error("No passkey is set up for this Arca.");
+      const challenge = new Uint8Array(await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(`${APPROVAL_DOMAIN}
+${APPROVAL_NAMESPACE}
+${statement}`)
+      ));
+      const credential = await navigator.credentials.get({
+        publicKey: {
+          challenge,
+          rpId: location.hostname,
+          userVerification: "required",
+          timeout: 6e4,
+          allowCredentials
+        }
+      });
+      if (!credential) throw new Error("No passkey was selected.");
+      const response = credential.response;
+      return {
+        alg: "ES256",
+        authenticatorData: b64url(new Uint8Array(response.authenticatorData)),
+        clientDataJSON: b64url(new Uint8Array(response.clientDataJSON)),
+        credentialId: b64url(new Uint8Array(credential.rawId)),
+        kind: "webauthn",
+        signature: b64url(new Uint8Array(response.signature)),
+        v: 1
+      };
+    }
+    async function approveProposal(id) {
+      const card = approvals.cards.get(id);
+      const plan = card?.plan;
+      if (!card || card.state !== "waiting" || !plan) return;
+      if (!plan.statement) {
+        card.state = "failed";
+        card.reason = "Arca did not send the approval statement. Reload the page.";
+        updatePanel();
+        return;
+      }
+      if (Date.now() >= plan.expiresAt) {
+        card.state = "expired";
+        updatePanel();
+        return;
+      }
+      card.state = "approving";
+      card.busy = "";
+      card.reason = "";
+      card.note = "";
+      updatePanel();
+      try {
+        const proof = await passkeyProof(plan.statement);
+        const statementBytes = new TextEncoder().encode(plan.statement);
+        const proofBytes = new TextEncoder().encode(JSON.stringify(proof));
+        const approval = `${b64(statementBytes)}.${b64(proofBytes)}`;
+        const response = await fetch("/approve/approve", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ plan: id, approval })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          card.state = body?.refusal === "Expired" || body?.refusal === "NoSuchPlan" ? "expired" : "failed";
+          card.reason = plainRefusal(body?.refusal, response.status);
+          return;
+        }
+        card.state = "done";
+        card.result = plainResult(plan.action, body?.result);
+        approvals.plans.delete(id);
+      } catch (error) {
+        if (error?.name === "NotAllowedError" || error?.name === "AbortError") {
+          card.state = "waiting";
+          card.note = "Passkey cancelled.";
+        } else {
+          card.state = "failed";
+          card.reason = plainError(error);
+        }
+      } finally {
+        updatePanel();
+        void refreshApprovals();
+      }
+    }
+    async function declineProposal(id) {
+      const card = approvals.cards.get(id);
+      if (!card || card.state !== "waiting") return;
+      if (!proposalId({ id })) return;
+      card.busy = "declining";
+      updatePanel();
+      try {
+        const response = await fetch("/approve/decline", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body: JSON.stringify({ plan: id })
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          card.busy = "";
+          card.state = body?.refusal === "Expired" || body?.refusal === "NoSuchPlan" ? "expired" : "failed";
+          card.reason = plainRefusal(body?.refusal, response.status);
+          return;
+        }
+        card.state = "declined";
+        approvals.plans.delete(id);
+      } catch (error) {
+        card.state = "failed";
+        card.reason = plainError(error);
+      } finally {
+        card.busy = "";
+        updatePanel();
+        void refreshApprovals();
+      }
+    }
+    function approvalSignature() {
+      return JSON.stringify({
+        plans: [...approvals.plans.values()].map((plan) => [plan.id, plan.summary, plan.action, plan.argsDigest, plan.expiresAt, plan.details]),
+        deletes: approvals.deletes.map((plan) => plan.id),
+        cards: [...approvals.cards].map(([id, card]) => [id, card.state, card.reason, card.result, card.note, card.busy]),
+        passkeysTrusted: approvals.passkeysTrusted,
+        loaded: approvals.loaded,
+        error: approvals.error
+      });
+    }
+    function approvalsWanted() {
+      if (!approvalConfigured()) return false;
+      if (!approvals.loaded || approvals.error) return true;
+      if (approvals.plans.size || approvals.deletes.length) return true;
+      if ([...approvals.cards.values()].some((card) => card.state === "waiting" || card.state === "approving")) return true;
+      return (state.dashboard?.plans ?? 0) > 0 || state.tab === "steps";
+    }
     const applyEvent = (event, data) => {
       if (event === "start") {
         chat.session = typeof data?.session === "string" && data.session ? data.session : "Doctor";
@@ -1224,9 +1662,7 @@
         const card = message.tools.find((tool) => tool.callId === data.callId);
         if (card) Object.assign(card, data);
         else message.tools.push({ ...data });
-      } else if (event === "approval") {
-        const message = activeAssistant();
-        if (message) message.approval = { url: approvalUrl(data?.url), detail: String(data?.detail ?? "") };
+        if (proposalId(data?.proposal)) void refreshApprovals();
       } else if (event === "budget") {
         const message = activeAssistant();
         const body = String(data?.message ?? "Daily budget reached, try tomorrow.");
@@ -1369,13 +1805,13 @@
             role: message.role,
             text: String(message.text ?? ""),
             tools: Array.isArray(message.tools) ? message.tools.map((tool) => ({ ...tool })) : [],
-            notes: [],
-            approval: null
+            notes: []
           }));
         }
         chat.usage = data?.usage ?? null;
         chat.loaded = true;
         renderChat();
+        if (approvalsWanted()) void refreshApprovals();
       } catch {
         chat.loaded = true;
       }
@@ -1388,7 +1824,7 @@
       const pending = (state.envelope.hosts ?? []).some((host) => host.journalPending);
       state.plans = plans;
       state.approvalUrl = url;
-      const signature = JSON.stringify({ journal, plans, url, pending });
+      const signature = JSON.stringify({ journal, plans, url, pending, approvals: approvalSignature() });
       if (signature === state.signatures.panel) return;
       state.signatures.panel = signature;
       const now = Date.now();
@@ -1405,7 +1841,24 @@
         if (pending) steps.append(el(doc, "p", "arca-thread-note", "Reading the latest activity\u2026"));
         for (const record of journal) steps.append(stepCard(doc, record, now));
       }
-      if (plans > 0) steps.append(approvalCard(doc, plans, url));
+      const shown = /* @__PURE__ */ new Set();
+      for (const id of approvals.plans.keys()) {
+        const card = proposalCard(doc, id);
+        if (card) {
+          steps.append(card);
+          shown.add(id);
+        }
+      }
+      for (const [id, card] of approvals.cards) {
+        if (shown.has(id) || !card.plan || card.state === "waiting" || card.state === "approving") continue;
+        const node = proposalCard(doc, id);
+        if (node) steps.append(node);
+      }
+      if (approvals.deletes.length) steps.append(approvalCard(doc, approvals.deletes.length, url));
+      else if ((!approvals.loaded || approvals.error) && plans > 0) steps.append(approvalCard(doc, plans, url));
+      if (approvals.error) {
+        steps.append(el(doc, "p", "arca-thread-note arca-approval-error", approvals.error));
+      }
       stepsScroll.scrollTop = stepsScrollTop;
       renderChat();
     };
@@ -1458,13 +1911,19 @@
       updatePicker();
       updateCanvas();
       updatePanel();
+      if (approvalsWanted()) void refreshApprovals();
     };
+    const approvalTimer = setInterval(() => {
+      if (expireApprovals()) updatePanel();
+      else updateExpiryLabels();
+    }, 1e3);
     void loadHistory();
     renderChat();
     return {
       update,
       stop() {
         clearInterval(clockTimer);
+        clearInterval(approvalTimer);
         window.removeEventListener("hashchange", onHash);
         chat.controller?.abort();
       }

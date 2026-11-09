@@ -5,9 +5,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  ChatStore, DEFAULTS, READ_TOOLS, createDoctorChat, dayOf, doctorPrompt, formatToolResult, sseFrame,
-  stateFilePath, writeIntent,
+  ChatStore, DEFAULTS, DOCTOR_TOOLS, PROPOSE_ACTIONS, PROPOSE_TOOL, READ_TOOLS, createDoctorChat, createProposeTool,
+  dayOf, doctorPrompt, formatToolResult, sseFrame, stateFilePath,
 } from '../src/chat.js';
+
+const PROPOSAL = Object.freeze({
+  kind: 'action',
+  id: 'act-0123456789ab',
+  action: 'service_create',
+  summary: 'Create the service nats',
+  args: { name: 'nats', template: 'nats' },
+  argsDigest: 'a'.repeat(64),
+  createdAt: 1_700_000_000_000,
+  expiresAt: 1_700_000_900_000,
+  details: [{ label: 'Name', value: 'nats' }, { label: 'Template', value: 'nats' }],
+});
 
 function listeners() {
   const map = new Map();
@@ -453,17 +465,31 @@ test('SSE framing keeps one JSON object per data line and cannot forge an event'
   assert.equal(frame.includes('\ndata: {"text":"hello'), true);
 });
 
-test('write intent is a presentation hint and the prompt pins the read-only contract', () => {
-  assert.equal(writeIntent('delete the app database'), true);
-  assert.equal(writeIntent('link automagik to postgres'), true);
-  assert.equal(writeIntent('what is running on alpha?'), false);
-  assert.equal(writeIntent('show me the journal'), false);
+test('the proposal tool offers exactly the seven allowed actions, never a database delete', () => {
+  assert.deepEqual([...PROPOSE_ACTIONS], [
+    'service_create', 'service_remove', 'service_publish', 'service_unpublish',
+    'service_connect', 'service_disconnect', 'postgres_create',
+  ]);
+  assert.equal(PROPOSE_ACTIONS.includes('postgres_delete'), false);
+  const tool = createProposeTool({ hosts: [{ name: 'alpha' }] });
+  assert.equal(tool.name, PROPOSE_TOOL);
+  assert.deepEqual(tool.parameters.properties.action.enum, [...PROPOSE_ACTIONS]);
+  assert.equal(tool.parameters.properties.action.enum.includes('postgres_delete'), false);
+  assert.equal(tool.parameters.required.includes('action'), true);
+  assert.equal(tool.parameters.required.includes('args'), true);
+  assert.match(tool.description, /postgres_create \{name\}/);
+  assert.doesNotMatch(tool.description, /postgres_delete|image/);
+});
+
+test('the prompt pins the propose-and-approve contract', () => {
   const prompt = doctorPrompt({ hosts: [{ name: 'alpha' }], approvalUrl: 'https://example.com/approve' });
-  assert.match(prompt, /strictly read-only/i);
-  assert.match(prompt, /what the change would do/i);
+  assert.match(prompt, /arca_propose/);
+  assert.match(prompt, /tap Approve on the card/);
+  assert.match(prompt, /Never claim the change is done/);
+  assert.match(prompt, /never propose a database delete/);
   assert.match(prompt, /https:\/\/example\.com\/approve/);
   assert.match(prompt, /Never invent/i);
-  assert.doesNotMatch(prompt, /postgres_link|service_remove/);
+  assert.doesNotMatch(prompt, /postgres_link|service_remove|postgres_delete|service_create/);
   assert.match(stateFilePath({ DSH_HOME: '/tmp/example-home' }), /^\/tmp\/example-home\/storages\/arca-canvas-chat\.json$/);
   assert.equal(stateFilePath({ DSH_HOME: '/tmp/example-home' }, '/tmp/other.json'), '/tmp/other.json');
 });
@@ -475,7 +501,7 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     now: Date.parse('2026-11-08T12:00:00Z'),
   });
   const snapshot = [
-    'You are the Arca Doctor, a friendly read-only helper in the Arca canvas.',
+    'You are the Arca Doctor, a friendly helper in the Arca canvas.',
     'You talk to the owner in plain language, not to an engineer.',
     'You can read live Arca data from these hosts: alpha, beta.',
     'Today is 2026-11-08.',
@@ -494,12 +520,14 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- If a read fails or a host did not answer, say "could not be read just now". Only a reading the host can',
     '  never give, such as remote CPU load, is "not measurable from here". Never repeat an internal reason or',
     '  error string.',
-    '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
-    '  approve, mint or change anything. Never claim that you did.',
-    "- If asked to change something, answer in two short parts: what the change would do (using the real names",
-    "  and data you can read), and that it needs the owner's passkey on the approval page. Do not attempt an",
-    '  inline approval and do not ask for a passkey in the chat.',
-    '- The approval page is at https://example.com/approve.',
+    '- You cannot link, unlink, delete, start, stop, restart, create, adopt, apply, approve, mint or change',
+    '  anything by yourself. arca_propose is the only way to ask for a change: it records a request for the',
+    '  owner and changes nothing.',
+    '- For a change request, call arca_propose with the action and its arguments, then tell the owner in one',
+    '  plain sentence what will happen and to tap Approve on the card. Never claim the change is done before',
+    '  the result arrives. If the owner declines it, or it expires or fails, say so plainly.',
+    '- Do not propose a change the owner did not ask for, and never propose a database delete.',
+    '- The approval page is at https://example.com/approve. The canvas card uses the same passkey.',
   ].join('\n');
   assert.equal(prompt, snapshot);
   assert.match(prompt, /If a read fails or a host did not answer, say "could not be read just now"\./);
@@ -789,18 +817,24 @@ test('a turn streams assistant text, one card per real call, and persists the tr
   assert.equal(text, 'Checking alpha. Everything is up.');
   assert.deepEqual(fake.executed.map((call) => call.name), ['arca_status', 'node_metrics']);
   assert.equal(fake.globals.has('service_list'), true);
-  for (const name of ['postgres_link', 'postgres_unlink', 'postgres_delete', 'service_start', 'service_remove', 'plan_apply', 'token_mint', 'adopt', 'bash', 'run_code']) {
+  for (const name of ['action_propose', 'postgres_link', 'postgres_unlink', 'postgres_delete', 'service_start', 'service_remove', 'plan_apply', 'token_mint', 'adopt', 'bash', 'run_code']) {
     assert.equal(fake.globals.has(name), false, `${name} is never registered`);
   }
-  assert.deepEqual([...fake.globals.keys()].sort(), [...READ_TOOLS].sort());
+  assert.deepEqual([...fake.globals.keys()].sort(), [...DOCTOR_TOOLS].sort());
+  assert.equal(fake.globals.has(PROPOSE_TOOL), true);
+  assert.equal(fake.globals.has('action_propose'), false, 'the backend verb is not registered under its own name');
   const restrictions = fake.restrictions.at(-1);
-  assert.deepEqual([...restrictions.allow].sort(), [...READ_TOOLS].sort());
+  assert.deepEqual([...restrictions.allow].sort(), [...DOCTOR_TOOLS].sort());
+  assert.equal(restrictions.allow.includes(PROPOSE_TOOL), true);
   assert.equal(fake.globals.get('arca_status').when({ agent: { id: 'session-doctor-1' } }), true);
   assert.equal(fake.globals.get('arca_status').when({ agent: { id: 'another-session' } }), false);
+  assert.equal(fake.globals.get(PROPOSE_TOOL).when({ agent: { id: 'session-doctor-1' } }), true);
   const guard = fake.guards.at(-1);
   assert.equal(guard({ name: 'arca_status' }), undefined);
-  assert.match(guard({ name: 'bash' }), /read-only/);
-  assert.match(guard({ name: 'run_code' }), /read-only/);
+  assert.equal(guard({ name: PROPOSE_TOOL }), undefined);
+  assert.match(guard({ name: 'bash' }), /read or propose/);
+  assert.match(guard({ name: 'run_code' }), /read or propose/);
+  assert.match(guard({ name: 'action_propose' }), /read or propose/);
   const sections = fake.sections.map((section) => section.name);
   assert.deepEqual(sections, ['deployment:persona-prefix', 'arca-doctor']);
   const stored = JSON.parse(await readFile(statePath, 'utf8'));
@@ -813,27 +847,99 @@ test('a turn streams assistant text, one card per real call, and persists the tr
   assert.equal(stored.day, dayOf(Date.now()));
 });
 
-test('a write request gets the what-it-would-do answer and the approval card', async (t) => {
-  const { fake, port } = await harness(t, {
+test('a change request records a kernel proposal and never applies it', async (t) => {
+  const calls = [];
+  const { fake, port, statePath } = await harness(t, {
     script: async (api) => {
       const denied = {};
       for (const name of ['bash', 'run_code', 'postgres_link']) denied[name] = (await api.attempt(name)).kind;
-      api.text(`That would unlink the automagik service from its database (${JSON.stringify(denied)}). Approve it at https://example.com/approve.`);
+      const value = await api.call(PROPOSE_TOOL, {
+        action: 'service_create', args: { name: 'nats', template: 'nats' },
+      });
+      assert.equal(value.kind, 'action');
+      assert.equal(value.id, PROPOSAL.id);
+      assert.deepEqual(value.details, PROPOSAL.details);
+      api.text(`I can create the nats service for you (${JSON.stringify(denied)}). Tap Approve on the card.`);
       api.usage({ inputTokens: 5, outputTokens: 8 });
       api.end();
     },
+    clientFor: () => ({
+      async call(tool, args) {
+        calls.push({ tool, args });
+        return structuredClone(PROPOSAL);
+      },
+    }),
   });
-  const result = await post(port, { message: 'unlink automagik from postgres' });
-  const approval = result.events.find((event) => event.event === 'approval');
-  assert.ok(approval);
-  assert.equal(approval.data.url, 'https://example.com/approve');
+  const result = await post(port, { message: 'create the nats service' });
+  assert.equal(result.events.some((event) => event.event === 'approval'), false, 'no model-text approval card');
+  const tools = result.events.filter((event) => event.event === 'tool');
+  const proposed = tools.find((event) => event.data.proposal);
+  assert.ok(proposed, 'the tool event carries the kernel proposal id');
+  assert.equal(proposed.data.name, PROPOSE_TOOL);
+  assert.equal(proposed.data.host, 'alpha');
+  assert.equal(proposed.data.proposal.id, PROPOSAL.id);
+  assert.equal(tools.some((event) => event.data.name === PROPOSE_TOOL && event.data.state === 'done'), true);
   const text = result.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
-  assert.match(text, /would unlink/i);
-  assert.match(text, /https:\/\/example\.com\/approve/);
+  assert.match(text, /Tap Approve on the card/);
   assert.match(text, /"bash":"deny"/);
   assert.match(text, /"run_code":"deny"/);
   assert.match(text, /"postgres_link":"deny"/);
-  assert.equal(fake.executed.length, 0, 'a denied write-like tool is never executed');
+  assert.deepEqual(calls, [{ tool: 'action_propose', args: { action: 'service_create', args: { name: 'nats', template: 'nats' } } }]);
+  assert.deepEqual(fake.executed.map((call) => call.name), [PROPOSE_TOOL], 'no write verb ran');
+  const stored = JSON.parse(await readFile(statePath, 'utf8'));
+  const record = stored.messages.at(-1).tools[0];
+  assert.equal(record.name, PROPOSE_TOOL);
+  assert.deepEqual(record.proposal, { id: PROPOSAL.id });
+  assert.equal(stored.messages.at(-1).text.includes('Tap Approve'), true);
+});
+
+test('the proposal tool refuses a disallowed action before any Arca call', async (t) => {
+  const seen = [];
+  const { fake, port } = await harness(t, {
+    script: async (api) => {
+      const failure = {};
+      for (const call of [
+        [PROPOSE_TOOL, { action: 'postgres_delete', args: { name: 'legacy' } }],
+        [PROPOSE_TOOL, { action: 'service_create', args: 'not-an-object' }],
+      ]) {
+        try {
+          await api.call(call[0], call[1]);
+          failure[call[1].action] = 'allowed';
+        } catch (error) {
+          failure[call[1].action] = String(error.message);
+        }
+      }
+      api.text(JSON.stringify(failure));
+      api.end();
+    },
+    clientFor: () => ({ async call(tool, args) { seen.push({ tool, args }); return structuredClone(PROPOSAL); } }),
+  });
+  const result = await post(port, { message: 'delete the legacy database' });
+  const text = result.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
+  assert.match(text, /postgres_delete.*cannot be proposed/);
+  assert.match(text, /service_create.*arguments object/);
+  assert.deepEqual(seen, [], 'a refused proposal never reaches Arca');
+  assert.deepEqual(fake.executed, [], 'no tool call was dispatched');
+});
+
+test('a postgres_create proposal never carries an image field', async (t) => {
+  const calls = [];
+  const { port } = await harness(t, {
+    script: async (api) => {
+      await api.call(PROPOSE_TOOL, {
+        action: 'postgres_create', args: { name: 'orders', image: 'attacker/image' },
+      });
+      api.end();
+    },
+    clientFor: () => ({
+      async call(tool, args) {
+        calls.push({ tool, args });
+        return { ...structuredClone(PROPOSAL), action: 'postgres_create', summary: 'Create the database orders', args: { name: 'orders' } };
+      },
+    }),
+  });
+  await post(port, { message: 'create the orders database' });
+  assert.deepEqual(calls, [{ tool: 'action_propose', args: { action: 'postgres_create', args: { name: 'orders' } } }]);
 });
 
 test('the per-turn tool-call cap stops at 40 by default and never registers the 41st', async (t) => {

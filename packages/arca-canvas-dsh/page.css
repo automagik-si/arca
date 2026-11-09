@@ -1026,6 +1026,84 @@ body,
   background: var(--arca-ink);
   color: var(--arca-bg);
 }
+.arca-btn-quiet {
+  background: var(--arca-fill);
+  color: var(--arca-ink);
+}
+.arca-btn[disabled] {
+  opacity: .5;
+  cursor: default;
+}
+.arca-proposal {
+  gap: 9px;
+}
+.arca-badge.ok {
+  background: color-mix(in srgb, var(--arca-ok) 14%, transparent);
+  color: var(--arca-ok-ink);
+}
+.arca-badge.bad {
+  background: color-mix(in srgb, var(--arca-bad) 14%, transparent);
+  color: var(--arca-bad);
+}
+.arca-approval-summary {
+  font-weight: 600;
+}
+.arca-approval-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 9px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--arca-line);
+  background: var(--arca-surface-2);
+}
+.arca-approval-fact {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+  font-size: 12.5px;
+}
+.arca-approval-fact dt {
+  color: var(--arca-faint);
+}
+.arca-approval-fact dd {
+  margin: 0;
+  font-family: var(--arca-mono);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.arca-approval-fact[data-detail=true] dd {
+  font-family: inherit;
+  font-size: 12.5px;
+}
+.arca-approval-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.arca-approval-actions .arca-btn {
+  align-self: auto;
+}
+.arca-approval-expiry {
+  font-variant-numeric: tabular-nums;
+}
+.arca-approval-expiry[data-soon=true] {
+  color: var(--arca-warn-ink);
+}
+.arca-approval-status {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--arca-muted);
+}
+.arca-approval-reason {
+  color: var(--arca-bad);
+}
+.arca-approval-error {
+  color: var(--arca-warn-ink);
+}
 .arca-composer {
   flex: none;
   display: flex;
