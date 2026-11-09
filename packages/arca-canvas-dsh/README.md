@@ -366,15 +366,16 @@ with the same id after a decline is waiting again. An approve POST that gets no
 answer after 30 seconds returns to `waiting` with "No answer from Arca, try
 again." A `NoSuchPlan` answer says the proposal may have been approved or
 declined elsewhere and points at Steps, never "Nothing changed". Every kernel
-refusal code has its own plain sentence. An unknown refusal code, or an
-unreadable refusal body, says only that Arca did not accept the approval; it
-never claims the change was approved. An approval the kernel accepted but whose
-action handler refused (a response with a message and no refusal) shows
-the action's own plain error. Each finished card records when it settled: a poll
-that started before that moment cannot put it back to waiting, while a later
-poll that lists the id again (a re-proposal) can. While a card is open, the page
-refreshes `/approve/plans` with the snapshot poll; an expired card disables its
-buttons and says nothing changed.
+approval refusal code has its own plain sentence. A refusal after the passkey
+was spent is the action handler's own snake_case refusal: the card says the
+change was approved but Arca could not run it, with the handler's message, and
+keeps no Retry. An empty or unreadable 400/500 says only that Arca could not
+finish it and points at Steps, without claiming either outcome or suggesting a
+retry. Each finished card records when it settled: a poll that started before
+that moment cannot put it back to waiting, while a later poll that lists the id
+again (a re-proposal) can. While a card is open, the page refreshes
+`/approve/plans` with the snapshot poll; an expired card disables its buttons and
+says nothing changed.
 
 ## Doctor chat contract
 

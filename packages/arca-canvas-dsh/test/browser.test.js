@@ -396,17 +396,17 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       if (payload.plan === FAILED_ID) {
         approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
         res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ message: 'The service nats: not found' }));
+        res.end(JSON.stringify({ refusal: 'not_found', message: 'The service nats: not found' }));
         return;
       }
       if (payload.plan === REFUSAL_ID || payload.plan === EMPTY_REFUSAL_ID) {
         approvalPlans = approvalPlans.filter((row) => row.id !== payload.plan);
         if (payload.plan === REFUSAL_ID) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ refusal: 'FutureRefusal', message: 'a refusal this page does not know' }));
+          res.end(JSON.stringify({ refusal: 'stopped', message: 'The service refusal was stopped' }));
         } else {
-          // An unreadable refusal body: no JSON and no refusal code.
-          res.writeHead(403).end();
+          // An empty 500 after the passkey was spent: the outcome is unreadable.
+          res.writeHead(500).end();
         }
         return;
       }
@@ -800,20 +800,22 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     assert.match(await card.locator('.arca-approval-status').innerText(), /The service retry was created and is running/);
   });
 
-  await t.test('an unknown refusal code and an unreadable body stay neutral, never approved', async () => {
-    const unknown = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${REFUSAL_ID}"]`);
-    await unknown.locator('.arca-approve').click();
+  await t.test('a handler refusal after the passkey is spent shows approved but could not run', async () => {
+    const card = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${REFUSAL_ID}"]`);
+    await card.locator('.arca-approve').click();
     await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', REFUSAL_ID);
-    const unknownText = await unknown.innerText();
-    assert.match(unknownText, /Arca did not accept this approval\. Try again from the card\./);
-    assert.doesNotMatch(unknownText, /The change was approved|could not run it/);
+    const text = await card.innerText();
+    assert.match(text, /The change was approved, but Arca could not run it: The service refusal was stopped\./);
+    assert.doesNotMatch(text, /did not accept this approval|Try again/);
+    assert.equal(await card.locator('.arca-approve').count(), 0, 'a spent approval has no retry');
 
     const empty = page.locator(`.arca-steps-view .arca-proposal[data-proposal="${EMPTY_REFUSAL_ID}"]`);
     await empty.locator('.arca-approve').click();
     await page.waitForFunction((id) => document.querySelector(`.arca-steps-view .arca-proposal[data-proposal="${id}"]`)?.dataset.state === 'failed', EMPTY_REFUSAL_ID);
     const emptyText = await empty.innerText();
-    assert.match(emptyText, /Arca did not accept this approval\. Try again from the card\./);
-    assert.doesNotMatch(emptyText, /The change was approved|could not run it/);
+    assert.match(emptyText, /Arca could not finish this\. Check Steps to see whether it ran\./);
+    assert.doesNotMatch(emptyText, /Try again|The change was approved|did not accept this approval/);
+    assert.equal(await empty.locator('.arca-approve').count(), 0, 'an unreadable outcome offers no retry');
   });
 
   await t.test('NoSuchPlan says it may have been handled elsewhere, never Nothing changed', async () => {

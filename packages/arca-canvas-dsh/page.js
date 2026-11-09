@@ -482,6 +482,7 @@
   var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
   var MISSING_PROPOSAL = "The proposal is not waiting any more.";
   var NEUTRAL_REFUSAL = "Arca did not accept this approval. Try again from the card.";
+  var UNCLEAR_APPROVAL = "Arca could not finish this. Check Steps to see whether it ran.";
   var APPROVAL_REFUSAL_CODES = Object.freeze([
     "Malformed",
     "NotCanonical",
@@ -564,15 +565,17 @@
   }
   function plainActionError(body) {
     const message = typeof body?.message === "string" ? body.message.trim() : "";
-    if (!message) return NEUTRAL_REFUSAL;
+    if (!message) return "The change was approved, but Arca could not run it.";
     const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
     return /[.!?]$/.test(sentence) ? `The change was approved, but Arca could not run it: ${sentence}` : `The change was approved, but Arca could not run it: ${sentence}.`;
   }
   function approvalErrorText(body) {
     const refusal = body?.refusal;
-    if (typeof refusal === "string" && refusal) return approvalRefusalText(refusal);
-    if (refusal != null) return NEUTRAL_REFUSAL;
-    return plainActionError(body);
+    if (typeof refusal === "string" && refusal) {
+      return APPROVAL_REFUSALS.has(refusal) ? REFUSALS[refusal] : plainActionError(body);
+    }
+    if (typeof body?.message === "string" && body.message.trim()) return plainActionError(body);
+    return UNCLEAR_APPROVAL;
   }
   function plainError(error) {
     if (!error) return "Something went wrong. Try again.";
@@ -1365,7 +1368,7 @@
       if (!card.plan && approvals.plans.has(key)) card.plan = approvals.plans.get(key);
       return card;
     }
-    function setCardState(card, state2, now = Date.now()) {
+    function setCardState(card, state2, now = performance.now()) {
       card.state = state2;
       card.settledAt = FINISHED_STATES.has(state2) ? now : 0;
     }
@@ -1439,8 +1442,8 @@
       }
       approvals.fetching = true;
       approvalInflight = (async () => {
-        const startedAt = Date.now();
-        approvals.fetchStartedAt = startedAt;
+        const startedAt = performance.now();
+        approvals.fetchStartedAt = Date.now();
         try {
           const next = await readApprovalPlans();
           const now = Date.now();
@@ -1452,7 +1455,7 @@
             if (startedAt <= card.settledAt) continue;
             if (card.state === "expired" && plan.expiresAt <= now) continue;
             const failedReason = card.state === "failed" ? card.reason || card.note : "";
-            setCardState(card, "waiting", now);
+            setCardState(card, "waiting");
             card.result = "";
             card.reason = "";
             card.busy = "";
@@ -1466,9 +1469,9 @@
           }
           for (const [id, card] of approvals.cards) {
             if (next.plans.has(id) || card.state !== "waiting") continue;
-            if (card.plan && now >= card.plan.expiresAt) setCardState(card, "expired", now);
+            if (card.plan && now >= card.plan.expiresAt) setCardState(card, "expired");
             else {
-              setCardState(card, "failed", now);
+              setCardState(card, "failed");
               card.reason = NO_SUCH_PLAN;
               card.retry = false;
             }
@@ -1498,7 +1501,7 @@
       let changed = false;
       for (const card of approvals.cards.values()) {
         if (card.state === "waiting" && card.plan && now >= card.plan.expiresAt) {
-          setCardState(card, "expired", now);
+          setCardState(card, "expired");
           card.busy = "";
           changed = true;
         }

@@ -13,9 +13,10 @@ const PROPOSE_ACTIONS = new Set([
 const APPROVAL_TIMEOUT_MS = 30_000;
 const NO_SUCH_PLAN = 'This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.';
 const MISSING_PROPOSAL = 'The proposal is not waiting any more.';
-// An unknown refusal code, or a body with no readable refusal, may not be evidence that the kernel
-// accepted the approval. Say only this, and never claim the change was approved.
+// An approval refusal names the approval itself, so it gets a plain sentence. A handler refusal after
+// the passkey was spent names the action, not the approval; an empty or unreadable body is neither.
 const NEUTRAL_REFUSAL = 'Arca did not accept this approval. Try again from the card.';
+const UNCLEAR_APPROVAL = 'Arca could not finish this. Check Steps to see whether it ran.';
 // Every refusal code `refusal_code` can return from the approval endpoint (crates/arca/src/handlers.rs),
 // plus NoSuchPlan, which no_such_plan() returns once the entry is gone.
 export const APPROVAL_REFUSAL_CODES = Object.freeze([
@@ -80,31 +81,33 @@ function expiryText(expiresAt, now = Date.now()) {
   return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-// A refusal code the kernel named always gets a plain sentence. An unrecognized code is not proof that
-// the approval was accepted, so it falls back to the neutral sentence.
+// A refusal code the kernel named as an approval refusal gets its plain sentence. This is also the
+// decline path, where any unrecognized refusal stays neutral.
 export function approvalRefusalText(refusal) {
   if (typeof refusal === 'string' && APPROVAL_REFUSALS.has(refusal)) return REFUSALS[refusal];
   return NEUTRAL_REFUSAL;
 }
 
-// The kernel accepted the approval and ran (or tried to run) the action. Its own message is the plain
-// reason the action refused; do not replace it with an approval-refusal sentence.
+// After the approve POST spends the passkey, the action runs and its own handler may refuse with a
+// snake_case code and a message. That refusal is not a refusal of the approval.
 function plainActionError(body) {
   const message = typeof body?.message === 'string' ? body.message.trim() : '';
-  if (!message) return NEUTRAL_REFUSAL;
+  if (!message) return 'The change was approved, but Arca could not run it.';
   const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
   return /[.!?]$/.test(sentence)
     ? `The change was approved, but Arca could not run it: ${sentence}`
     : `The change was approved, but Arca could not run it: ${sentence}.`;
 }
 
-// Only a body that carries no refusal at all is the action's own error after a spent approval. A body
-// with an unknown refusal code stays neutral, because it may be a refusal the kernel added later.
+// An approval refusal keeps its neutral sentence. Any other non-empty refusal, or a message, is the
+// action's own refusal after the approval was spent. Only an empty or unreadable body stays unknown.
 export function approvalErrorText(body) {
   const refusal = body?.refusal;
-  if (typeof refusal === 'string' && refusal) return approvalRefusalText(refusal);
-  if (refusal != null) return NEUTRAL_REFUSAL;
-  return plainActionError(body);
+  if (typeof refusal === 'string' && refusal) {
+    return APPROVAL_REFUSALS.has(refusal) ? REFUSALS[refusal] : plainActionError(body);
+  }
+  if (typeof body?.message === 'string' && body.message.trim()) return plainActionError(body);
+  return UNCLEAR_APPROVAL;
 }
 
 function plainError(error) {
@@ -935,9 +938,10 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     return card;
   }
 
-  // A finished card keeps the moment it finished. A poll that started before that moment may still be
-  // carrying a plan row from before the click, so it may not put the card back to waiting.
-  function setCardState(card, state, now = Date.now()) {
+  // A finished card keeps the moment it finished on the monotonic clock. A poll that started before
+  // that moment may still be carrying a plan row from before the click, so it may not put the card
+  // back to waiting. Wall-clock Date.now() is not used here because it can move backwards.
+  function setCardState(card, state, now = performance.now()) {
     card.state = state;
     card.settledAt = FINISHED_STATES.has(state) ? now : 0;
   }
@@ -1007,8 +1011,10 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     }
     approvals.fetching = true;
     approvalInflight = (async () => {
-      const startedAt = Date.now();
-      approvals.fetchStartedAt = startedAt;
+      // The settle guard uses the monotonic clock; fetchStartedAt stays on the wall clock because the
+      // announced-missing note compares it with Date.now() times.
+      const startedAt = performance.now();
+      approvals.fetchStartedAt = Date.now();
       try {
         const next = await readApprovalPlans();
         const now = Date.now();
@@ -1023,7 +1029,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
           // or a failure while the proposal still waits) is waiting again.
           if (card.state === 'expired' && plan.expiresAt <= now) continue;
           const failedReason = card.state === 'failed' ? (card.reason || card.note) : '';
-          setCardState(card, 'waiting', now);
+          setCardState(card, 'waiting');
           card.result = '';
           card.reason = '';
           card.busy = '';
@@ -1037,9 +1043,9 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         }
         for (const [id, card] of approvals.cards) {
           if (next.plans.has(id) || card.state !== 'waiting') continue;
-          if (card.plan && now >= card.plan.expiresAt) setCardState(card, 'expired', now);
+          if (card.plan && now >= card.plan.expiresAt) setCardState(card, 'expired');
           else {
-            setCardState(card, 'failed', now);
+            setCardState(card, 'failed');
             card.reason = NO_SUCH_PLAN;
             card.retry = false;
           }
@@ -1071,7 +1077,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     let changed = false;
     for (const card of approvals.cards.values()) {
       if (card.state === 'waiting' && card.plan && now >= card.plan.expiresAt) {
-        setCardState(card, 'expired', now);
+        setCardState(card, 'expired');
         card.busy = '';
         changed = true;
       }
