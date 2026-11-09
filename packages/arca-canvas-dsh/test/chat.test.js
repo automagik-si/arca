@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
-  ChatStore, DEFAULTS, READ_TOOLS, createDoctorChat, dayOf, doctorPrompt, sseFrame, stateFilePath, writeIntent,
+  ChatStore, DEFAULTS, READ_TOOLS, createDoctorChat, dayOf, doctorPrompt, formatToolResult, sseFrame,
+  stateFilePath, writeIntent,
 } from '../src/chat.js';
 
 function listeners() {
@@ -458,8 +459,8 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
     '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
     '  explicitly asks for it.',
-    '- If a figure cannot be read, say "not measurable from here". Never repeat an internal reason or error',
-    '  string.',
+    '- If a read fails or a host did not answer, say that plainly. If a reading the host can never give is',
+    '  missing, say "not measurable from here". Never repeat an internal reason or error string.',
     '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
     '  approve, mint or change anything. Never claim that you did.',
     "- If asked to change something, answer in two short parts: what the change would do (using the real names",
@@ -540,6 +541,121 @@ test('a node_metrics result reaches the fake model as plain GB, rounded percenta
   for (const raw of ['17000000000', '96300000000', '79300000000', '3400000000', '8000000000']) {
     assert.equal(text.includes(raw), false, `${raw} is never shown to the model`);
   }
+});
+
+test('a remote CPU keeps its known core count while its load is unmeasurable', () => {
+  const text = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: {
+      cpu: { usedPct: null, cores: 16, coresKnown: true, reason: 'not available for a remote host' },
+      memory: { totalBytes: 32_000_000_000, availableBytes: null, usedBytes: null, reason: null },
+      load: { one: null, five: null, fifteen: null, reason: null },
+      pools: [],
+      network: null,
+      psi: null,
+      projects: [],
+    },
+    mean: null,
+  });
+  assert.match(text, /CPU: 16 cores; load not measurable from here\./);
+  assert.match(text, /Memory: 32\.0 GB total\./);
+  assert.doesNotMatch(text, /not available for a remote host/);
+  assert.doesNotMatch(text, /CPU:.*%/);
+
+  const derived = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: {
+      cpu: { usedPct: 88, cores: 0, coresKnown: false, reason: null },
+      memory: { totalBytes: 32_000_000_000, availableBytes: 24_000_000_000, usedBytes: null, reason: null },
+      load: { one: 1, five: 1, fifteen: 1, reason: null },
+      pools: [],
+      network: null,
+      psi: null,
+      projects: [],
+    },
+    mean: null,
+  });
+  assert.match(derived, /CPU: core count not measurable from here\./);
+  assert.doesNotMatch(derived, /88%/);
+  assert.match(derived, /Memory: 8\.0 GB used of 32\.0 GB, 24\.0 GB available\./);
+});
+
+test('alert reasons become plain words and keep their exact resolution', () => {
+  const text = formatToolResult('alerts_list', {
+    firing: [],
+    unknown: [
+      { rule: 'cpu-high', labels: {}, state: 'ok', reason: 'missing' },
+      { rule: 'load-high', labels: {}, state: 'ok', reason: 'stale' },
+      { rule: 'mem-high', labels: {}, state: 'ok', reason: 'unavailable' },
+      { rule: 'other', labels: {}, state: 'ok', reason: 'vendor-specific' },
+    ],
+    resolvedRecent: [
+      { rule: 'disk-pool-full', state: 'resolved', reason: 'rule-disabled' },
+      { rule: 'cpu-high', state: 'resolved', reason: 'cleared' },
+      { rule: 'app-down', state: 'resolved', reason: 'subject-gone' },
+      { rule: 'backup', state: 'resolved', reason: 'no data' },
+    ],
+    disabled: [],
+    sampleAgeMs: null,
+    watchAgeMs: null,
+    commitMs: null,
+    storeError: null,
+    storeReset: false,
+    storeBytes: 1_500_000_000,
+    healthLine: 'ok',
+  });
+  const parsed = JSON.parse(text);
+  assert.equal(parsed.resolvedRecent[0].reason, 'the alert was switched off');
+  assert.notEqual(parsed.resolvedRecent[0].reason, 'the problem cleared');
+  assert.equal(parsed.resolvedRecent[1].reason, 'the problem cleared');
+  assert.equal(parsed.resolvedRecent[2].reason, 'the thing it watched is gone');
+  assert.equal(parsed.resolvedRecent[3].reason, 'no data to check');
+  assert.equal(parsed.unknown[0].reason, 'no reading yet');
+  assert.equal(parsed.unknown[1].reason, 'reading is old');
+  assert.equal(parsed.unknown[2].reason, 'not measurable from here');
+  assert.equal(parsed.unknown[3].reason, 'vendor-specific');
+  assert.equal(parsed.storeBytes, '1.5 GB');
+});
+
+test('network rates use a readable unit at the reported size', () => {
+  const text = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: {
+      cpu: { usedPct: 10, cores: 8, coresKnown: true, reason: null },
+      memory: {
+        totalBytes: 16_000_000_000, availableBytes: 8_000_000_000, usedBytes: 8_000_000_000, reason: null,
+      },
+      load: { one: 1, five: 1, fifteen: 1, reason: null },
+      pools: [],
+      network: { rxBytesPerSec: 45_000_000, txBytesPerSec: 120_000 },
+      psi: null,
+      projects: [],
+    },
+    mean: null,
+  });
+  assert.match(text, /Network: 45\.0 MB\/s received, 120\.0 KB\/s sent\./);
+});
+
+test('a missing latest reading and a one-minute average use the right label', () => {
+  const sample = {
+    cpu: { usedPct: 10, cores: 8, coresKnown: true, reason: null },
+    memory: {
+      totalBytes: 16_000_000_000, availableBytes: 8_000_000_000, usedBytes: 8_000_000_000, reason: null,
+    },
+    load: { one: 1, five: 1, fifteen: 1, reason: null },
+    pools: [],
+    network: null,
+    psi: null,
+    projects: [],
+  };
+  const text = formatToolResult('node_metrics', { host: 'alpha', minutes: 1, latest: null, mean: sample });
+  assert.match(text, /^Host alpha\.\nLatest reading: not measurable from here\.\nAverage over the last 1 minute:/);
+  assert.doesNotMatch(text, /1 minutes|Latest reading for the last/);
+  const plural = formatToolResult('node_metrics', { host: 'alpha', minutes: 5, latest: null, mean: sample });
+  assert.match(plural, /Average over the last 5 minutes:/);
 });
 
 test('a turn streams assistant text, one card per real call, and persists the transcript', async (t) => {

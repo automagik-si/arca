@@ -314,8 +314,8 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
     '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
     '  explicitly asks for it.',
-    '- If a figure cannot be read, say "not measurable from here". Never repeat an internal reason or error',
-    '  string.',
+    '- If a read fails or a host did not answer, say that plainly. If a reading the host can never give is',
+    '  missing, say "not measurable from here". Never repeat an internal reason or error string.',
     '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
     '  approve, mint or change anything. Never claim that you did.',
     "- If asked to change something, answer in two short parts: what the change would do (using the real names",
@@ -326,7 +326,22 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
 }
 
 const NOT_MEASURABLE = 'not measurable from here';
+const KILOBYTE = 1_000;
+const MEGABYTE = 1_000_000;
 const GIGABYTE = 1_000_000_000;
+
+const RESOLVED_REASONS = Object.freeze({
+  cleared: 'the problem cleared',
+  'rule-disabled': 'the alert was switched off',
+  'subject-gone': 'the thing it watched is gone',
+  'no data': 'no data to check',
+});
+
+const UNKNOWN_REASONS = Object.freeze({
+  missing: 'no reading yet',
+  stale: 'reading is old',
+  unavailable: NOT_MEASURABLE,
+});
 
 function measured(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -339,9 +354,12 @@ export function formatGigabytes(bytes) {
   return value === null || value < 0 ? '' : `${(value / GIGABYTE).toFixed(1)} GB`;
 }
 
-function formatGigabytesPerSecond(bytes) {
+function formatRate(bytes) {
   const value = measured(bytes);
-  return value === null || value < 0 ? '' : `${(value / GIGABYTE).toFixed(1)} GB/s`;
+  if (value === null || value < 0) return '';
+  if (value >= GIGABYTE) return `${(value / GIGABYTE).toFixed(1)} GB/s`;
+  if (value >= MEGABYTE) return `${(value / MEGABYTE).toFixed(1)} MB/s`;
+  return `${(value / KILOBYTE).toFixed(1)} KB/s`;
 }
 
 function formatPercent(value) {
@@ -350,14 +368,16 @@ function formatPercent(value) {
 }
 
 function cpuLine(cpu) {
-  if (!cpu || cpu.reason) return `CPU: ${NOT_MEASURABLE}.`;
+  if (!cpu) return `CPU: ${NOT_MEASURABLE}.`;
   const cores = measured(cpu.cores);
-  const coresKnown = cores !== null && cores > 0 && cpu.coresKnown !== false;
+  // A reason only explains a missing load, never a known core count (the same rule the machine card uses).
+  const coresKnown = cores !== null && cores > 0
+    && (typeof cpu.coresKnown === 'boolean' ? cpu.coresKnown : true);
+  if (!coresKnown) return `CPU: core count ${NOT_MEASURABLE}.`;
   const percent = formatPercent(cpu.usedPct);
-  if (!percent) {
-    return coresKnown ? `CPU: ${cores} cores; load ${NOT_MEASURABLE}.` : `CPU: ${NOT_MEASURABLE}.`;
-  }
-  return `CPU: ${percent} used${coresKnown ? ` across ${cores} cores` : ''}.`;
+  return percent
+    ? `CPU: ${percent} used across ${cores} cores.`
+    : `CPU: ${cores} cores; load ${NOT_MEASURABLE}.`;
 }
 
 function memoryLine(memory) {
@@ -418,8 +438,8 @@ function poolLines(pools) {
 
 function networkLine(network) {
   if (!network) return '';
-  const received = formatGigabytesPerSecond(network.rxBytesPerSec);
-  const sent = formatGigabytesPerSecond(network.txBytesPerSec);
+  const received = formatRate(network.rxBytesPerSec);
+  const sent = formatRate(network.txBytesPerSec);
   const parts = [];
   if (received) parts.push(`${received} received`);
   if (sent) parts.push(`${sent} sent`);
@@ -465,13 +485,16 @@ function formatNodeMetrics(value) {
   const minutes = measured(data.minutes);
   const lines = [`Host ${host}.`];
   if (data.latest) {
-    lines.push(minutes !== null ? `Latest reading for the last ${minutes} minutes:` : 'Latest reading:');
+    lines.push('Latest reading:');
     lines.push(...sampleLines(data.latest));
   } else {
     lines.push(`Latest reading: ${NOT_MEASURABLE}.`);
   }
   if (data.mean) {
-    lines.push(minutes !== null ? `Average over ${minutes} minutes:` : 'Average:');
+    const span = minutes !== null
+      ? `Average over the last ${minutes} minute${minutes === 1 ? '' : 's'}:`
+      : 'Average:';
+    lines.push(span);
     lines.push(...sampleLines(data.mean));
   }
   return lines.join('\n');
@@ -479,10 +502,28 @@ function formatNodeMetrics(value) {
 
 // The model must never see a raw byte count or an internal host reason it could repeat to the owner. Metrics
 // get a short plain-language summary with GB sizes and whole percentages; every other result keeps its shape
-// but has byte, rate and percentage fields replaced by the same display strings.
+// but has byte, rate and percentage fields replaced by the same display strings. Alerts get their reason
+// vocabulary translated in place so a resolved alert cannot be confused with a different resolution.
 export function formatToolResult(name, value) {
   if (name === 'node_metrics') return formatNodeMetrics(value);
+  if (name === 'alerts_list') return JSON.stringify(presentAlertValues(value));
   return JSON.stringify(presentToolValues(value));
+}
+
+function presentAlertValues(value) {
+  const presented = presentToolValues(value);
+  if (!presented || typeof presented !== 'object' || Array.isArray(presented)) return presented;
+  const translate = (rows, labels) => {
+    if (!Array.isArray(rows)) return;
+    for (const row of rows) {
+      if (row && typeof row === 'object' && typeof row.reason === 'string') {
+        row.reason = labels[row.reason] ?? row.reason;
+      }
+    }
+  };
+  translate(presented.resolvedRecent, RESOLVED_REASONS);
+  translate(presented.unknown, UNKNOWN_REASONS);
+  return presented;
 }
 
 function presentToolValues(value) {
@@ -490,10 +531,9 @@ function presentToolValues(value) {
   if (!value || typeof value !== 'object') return value;
   const out = {};
   for (const [key, item] of Object.entries(value)) {
-    if (typeof item === 'number' && /BytesPerSec$/.test(key)) out[key] = formatGigabytesPerSecond(item);
+    if (typeof item === 'number' && /BytesPerSec$/.test(key)) out[key] = formatRate(item);
     else if (typeof item === 'number' && /Bytes$/.test(key)) out[key] = formatGigabytes(item);
     else if (typeof item === 'number' && /Pct$/.test(key)) out[key] = formatPercent(item);
-    else if (key === 'reason' && typeof item === 'string' && item) out[key] = NOT_MEASURABLE;
     else out[key] = presentToolValues(item);
   }
   return out;
@@ -503,8 +543,8 @@ function toolClient(clientFor, hosts, name, onCall) {
   return {
     name,
     description: {
-      arca_status: 'Check whether this machine is up, its version and how recently Arca last applied an update.',
-      watch_report: 'List the apps and machines running on this host, grouped by project.',
+      arca_status: 'Check whether this machine is up, its version and its last applied update.',
+      watch_report: 'List the instances on this host and their state, grouped by project.',
       postgres_list: 'List the databases Arca knows about.',
       node_metrics: 'Read how busy the CPU is and how much memory and disk the host is using.',
       alerts_list: 'List current warnings and recently resolved ones.',
