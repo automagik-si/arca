@@ -20,6 +20,7 @@ pub mod foreign;
 pub mod nonces;
 pub mod owner;
 pub mod passkey;
+pub mod peer;
 pub mod signers;
 pub mod sshsig;
 pub mod statement;
@@ -33,6 +34,10 @@ pub use passkey::{
     PasskeyLine, PasskeyProof, PasskeyVerifier, STATE_PASSKEYS_FILE, TEST_PASSKEYS_ENV,
     challenge_for, format_passkey_line, load_passkeys, load_state_passkeys, parse_passkeys,
     parse_proof, passkeys_trust, verify_assertion,
+};
+pub use peer::{
+    PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set, peer_target,
+    set_digest,
 };
 pub use signers::{SignerLine, TrustRoot, effective_uid, load_signers, signers_trust};
 pub use sshsig::SshSigVerifier;

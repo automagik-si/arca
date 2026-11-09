@@ -42,6 +42,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "plan_decline",
             "approval_submit",
             "action_approve",
+            "peer_keys_sync",
             "alerts_list",
             "postgres_create",
             "postgres_list",
@@ -78,6 +79,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("plan_decline", VerbClass::L, Scope::Doctor, true, false),
         ("approval_submit", VerbClass::L, Scope::Doctor, true, true),
         ("action_approve", VerbClass::L, Scope::Doctor, true, true),
+        ("peer_keys_sync", VerbClass::L, Scope::Doctor, true, false),
         ("alerts_list", VerbClass::L, Scope::Viewer, false, false),
         ("postgres_create", VerbClass::L, Scope::Doctor, true, false),
         ("postgres_list", VerbClass::L, Scope::Viewer, false, false),
@@ -340,6 +342,32 @@ fn action_approve_takes_an_action_id_and_an_approval_and_names_what_ran() {
 }
 
 #[test]
+fn peer_keys_sync_takes_lines_and_an_optional_signed_statement_and_never_echoes_a_line() {
+    let v = verb("peer_keys_sync").expect("present");
+    assert_eq!(
+        (v.params)(),
+        closed_with(
+            json!({
+                "lines": { "type": "array", "items": { "type": "string", "maxLength": 2048 }, "maxItems": 64 },
+                "statement": { "type": "string", "maxLength": 4096 },
+                "approval": { "type": "string", "maxLength": 8192 },
+            }),
+            &["lines"]
+        )
+    );
+    let result = (v.result)();
+    assert_eq!(result["required"], json!(["status", "keys"]));
+    assert!(result["properties"].get("lines").is_none());
+    assert!(
+        arca_api::conforms(
+            &result,
+            &json!({ "status": "needs_approval", "keys": 2, "statement": "{}" })
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn arca_status_schemas_equal_its_table_row() {
     let v = verb("arca_status").expect("present");
     assert_eq!((v.params)(), closed(json!({})));
@@ -371,6 +399,16 @@ fn arca_status_schemas_equal_its_table_row() {
                                 },
                                 "required": ["index", "name", "keys", "reason"],
                             },
+                        },
+                        "peerKeys": {
+                            "type": "object",
+                            "properties": {
+                                "from": { "type": "string" },
+                                "keys": { "type": "integer", "minimum": 0 },
+                                "since": { "type": ["string", "null"] },
+                                "reason": { "type": "string" },
+                            },
+                            "required": ["from", "keys", "since", "reason"],
                         },
                     },
                     "required": ["linkedHosts", "trustedKeyFiles"],

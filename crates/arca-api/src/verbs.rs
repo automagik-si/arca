@@ -77,7 +77,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 29] = [
+static VERBS: [Verb; 30] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -217,6 +217,20 @@ static VERBS: [Verb; 29] = [
         cut: no_cut,
         params: action_approve_params,
         result: action_approve_result,
+    },
+    Verb {
+        name: "peer_keys_sync",
+        summary: "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_peer_keys_sync,
+        cut: no_cut,
+        params: peer_keys_sync_params,
+        result: peer_keys_sync_result,
     },
     Verb {
         name: "alerts_list",
@@ -580,6 +594,15 @@ pub fn summary_action_approve(v: &Value) -> String {
     )
 }
 
+/// A short line for a successful `peer_keys_sync`.
+pub fn summary_peer_keys_sync(v: &Value) -> String {
+    format!(
+        "peer passkeys {} ({} kept)",
+        v["status"].as_str().unwrap_or("?"),
+        v["keys"]
+    )
+}
+
 /// A short line for a successful `alerts_list`.
 pub fn summary_alerts(v: &Value) -> String {
     format!(
@@ -778,6 +801,16 @@ fn arca_status_result() -> Value {
                         ("keys", true, at_least(0)),
                         ("reason", true, nullable(string())),
                     ])),
+                ),
+                (
+                    "peerKeys",
+                    false,
+                    result(vec![
+                        ("from", true, string()),
+                        ("keys", true, at_least(0)),
+                        ("since", true, nullable(string())),
+                        ("reason", true, string()),
+                    ]),
                 ),
             ]),
         ),
@@ -1192,6 +1225,30 @@ fn action_approve_result() -> Value {
         ("id", true, action_id()),
         ("action", true, one_of(&ACTION_NAMES)),
         ("result", true, json!({ "type": "object" })),
+    ])
+}
+
+fn peer_keys_sync_params() -> Value {
+    params(vec![
+        (
+            "lines",
+            true,
+            json!({ "type": "array", "items": string_max(2048), "maxItems": 64 }),
+        ),
+        ("statement", false, string_max(4096)),
+        ("approval", false, string_max(8192)),
+    ])
+}
+
+fn peer_keys_sync_result() -> Value {
+    result(vec![
+        (
+            "status",
+            true,
+            one_of(&["trusted", "unchanged", "needs_approval", "changed"]),
+        ),
+        ("keys", true, at_least(0)),
+        ("statement", false, string()),
     ])
 }
 

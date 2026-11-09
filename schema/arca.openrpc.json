@@ -28,6 +28,33 @@
                   },
                   "type": "array"
                 },
+                "peerKeys": {
+                  "properties": {
+                    "from": {
+                      "type": "string"
+                    },
+                    "keys": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "reason": {
+                      "type": "string"
+                    },
+                    "since": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "from",
+                    "keys",
+                    "since",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
                 "trustedKeyFiles": {
                   "items": {
                     "properties": {
@@ -2024,6 +2051,72 @@
         }
       },
       "summary": "Submits an owner's passkey approval for a waiting action proposal, which runs its action once. The approval is checked by this kernel's own verifier and never echoed; an approval page on the same machine relays a linked host's approvals here.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "peer_keys_sync",
+      "params": [
+        {
+          "name": "lines",
+          "required": true,
+          "schema": {
+            "items": {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          }
+        },
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "maxLength": 8192,
+            "type": "string"
+          }
+        },
+        {
+          "name": "statement",
+          "required": false,
+          "schema": {
+            "maxLength": 4096,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "keys": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "statement": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "trusted",
+                "unchanged",
+                "needs_approval",
+                "changed"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "keys"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "doctor",

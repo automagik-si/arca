@@ -37,6 +37,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::foreign::ForeignPasskeys;
 use crate::nonces::open_records;
+use crate::peer::PeerPasskeys;
 use crate::signers::{TrustRoot, effective_uid, namespaces_ok, read_trusted, trust_for, untrusted};
 use crate::statement::valid_hex;
 use crate::verifier::SignatureVerifier;
@@ -766,6 +767,8 @@ pub struct PasskeyVerifier {
     keys: Keys,
     /// Other kernels' passkeys files this one also trusts for approvals, read at each check. Empty by default.
     foreign: ForeignPasskeys,
+    /// Another machine's page host's passkeys kept in sync here, trusted for approvals and read at each check. None by default.
+    peer: Option<PeerPasskeys>,
 }
 
 enum Keys {
@@ -785,6 +788,7 @@ impl PasskeyVerifier {
                 counts: Mutex::new(counts),
             },
             foreign: ForeignPasskeys::default(),
+            peer: None,
         }
     }
 
@@ -800,12 +804,26 @@ impl PasskeyVerifier {
         &self.foreign
     }
 
+    /// Also trusts, for approvals, the passkeys another machine's page host keeps in sync in `peer`. Like the foreign files,
+    /// the sign-in route and the passkey list never see them. A refusing verifier keeps the value (so a sync can still be
+    /// answered) and still refuses every proof.
+    pub fn with_peer(mut self, peer: PeerPasskeys) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+
+    /// The peer passkeys this verifier trusts, when the config keeps them.
+    pub fn peer(&self) -> Option<&PeerPasskeys> {
+        self.peer.as_ref()
+    }
+
     /// A verifier for a passkeys file that could not be trusted or read: every passkey proof is refused with `refusal`, which
     /// names the file, the rule and at most a line number. The SSH path beside it is unaffected.
     pub fn refusing(refusal: ApprovalRefusal) -> Self {
         Self {
             keys: Keys::Refused(refusal),
             foreign: ForeignPasskeys::default(),
+            peer: None,
         }
     }
 
@@ -852,8 +870,8 @@ impl PasskeyVerifier {
 
     /// Refuses in this order: a passkeys file that could not be trusted; a namespace other than Arca's; a proof that is not
     /// one strict proof; every check of [`verify_assertion`]; a sign count that does not advance, or a count that cannot be
-    /// made durable. With `foreign`, the lines of the trusted foreign files are read now and added after the kernel's own;
-    /// a foreign line never replaces an own line with the same credential or key.
+    /// made durable. With `foreign`, the lines of the trusted foreign files and the peer file are read now and added after the
+    /// kernel's own; such a line never replaces an own line, or an earlier trusted one, with the same credential or key.
     fn verify_with(
         &self,
         namespace: &str,
@@ -869,9 +887,15 @@ impl PasskeyVerifier {
             return Err(ApprovalRefusal::WrongNamespace);
         }
         let proof = parse_proof(signature)?;
-        let asserted = if foreign && !self.foreign.is_empty() {
+        let asserted = if foreign && (!self.foreign.is_empty() || self.peer.is_some()) {
             let mut all = lines.clone();
-            for line in self.foreign.load().0 {
+            let trusted = self
+                .foreign
+                .load()
+                .0
+                .into_iter()
+                .chain(self.peer.iter().flat_map(|peer| peer.load().0.into_iter()));
+            for line in trusted {
                 if !all.iter().any(|own| {
                     own.credential_id == line.credential_id || own.fingerprint == line.fingerprint
                 }) {

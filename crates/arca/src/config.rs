@@ -79,9 +79,23 @@ pub struct ApprovalConfig {
     /// The page origins a passkey from those files may answer from. Required when `trustOwnerKeysFrom` names a file.
     #[serde(default)]
     pub origins: Vec<String>,
-    /// The kernels on this machine whose waiting proposals this kernel's approval page lists and relays approvals to.
+    /// The kernels whose waiting proposals this kernel's approval page lists and relays approvals to: on this machine, or on
+    /// another machine whose MCP socket is forwarded to a path here.
     #[serde(default)]
     pub linked_hosts: Vec<LinkedHost>,
+    /// Another machine's page host whose owner passkeys this kernel keeps in sync (`peer_keys_sync`) and trusts for action
+    /// approvals. Absent, `peer_keys_sync` is not served and no peer passkey is trusted.
+    #[serde(default)]
+    pub peer_keys: Option<PeerKeysConfig>,
+}
+
+/// The `approval.peerKeys` key: the page host's name, as its own kernel names itself (its approval host), and the page
+/// origins its passkeys may answer from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PeerKeysConfig {
+    pub from: String,
+    pub origins: Vec<String>,
 }
 
 /// One linked kernel: the name the canvas knows it by, its MCP unix socket, and the file holding the token the page relays
@@ -357,6 +371,19 @@ fn check_approval(approval: &ApprovalConfig) -> Result<(), ConfigError> {
             "each origin must be https://, a lowercase host name, and at most a non-443 port, with no path",
         ));
     }
+    if let Some(peer) = &approval.peer_keys {
+        if !host_name_ok(&peer.from) {
+            return Err(ConfigError::Approval(
+                "peerKeys.from must be the page host's name: letters, digits, dots and hyphens",
+            ));
+        }
+        if peer.origins.is_empty() || !peer.origins.iter().all(|origin| approval_origin_ok(origin))
+        {
+            return Err(ConfigError::Approval(
+                "peerKeys.origins must list at least one page origin, each https://, a lowercase host name, and at most a non-443 port",
+            ));
+        }
+    }
     let mut names = BTreeSet::new();
     for host in &approval.linked_hosts {
         if !host_name_ok(&host.name) || !names.insert(host.name.as_str()) {
@@ -613,6 +640,36 @@ mod tests {
                 "no value is echoed"
             );
         }
+        config.approval = Some(parse(serde_json::json!({
+            "peerKeys": { "from": "alpha", "origins": ["https://alpha.example.com:8443"] }
+        })));
+        assert_eq!(check(&config), Ok(()), "peerKeys alone is enough");
+        for (bad, rule) in [
+            (
+                serde_json::json!({ "peerKeys": { "from": "alpha", "origins": [] } }),
+                "peerKeys.origins",
+            ),
+            (
+                serde_json::json!({ "peerKeys": { "from": "alpha", "origins": ["http://alpha.example.com"] } }),
+                "peerKeys.origins",
+            ),
+            (
+                serde_json::json!({ "peerKeys": { "from": "al pha", "origins": ["https://alpha.example.com"] } }),
+                "peerKeys.from",
+            ),
+        ] {
+            config.approval = Some(parse(bad));
+            let refused = check(&config).expect_err("the peerKeys key is refused");
+            assert!(refused.to_string().contains(rule), "{refused}");
+            assert!(
+                !refused.to_string().contains("alpha.example"),
+                "no value is echoed"
+            );
+        }
+        let unknown: Result<ApprovalConfig, _> = serde_json::from_value(
+            serde_json::json!({ "peerKeys": { "from": "alpha", "origins": [], "keys": [] } }),
+        );
+        assert!(unknown.is_err(), "an unknown peerKeys key is refused");
         let unknown: Result<ApprovalConfig, _> =
             serde_json::from_value(serde_json::json!({ "trustOwnerKeys": [] }));
         assert!(unknown.is_err(), "an unknown key is refused");
