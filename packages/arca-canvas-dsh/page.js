@@ -66,10 +66,17 @@
   function isHostOnline(host = {}) {
     return Boolean(host.machine) && host.machine.incusReachable !== false;
   }
+  function cpuCoresKnown(cpu) {
+    const cores = finite(cpu?.cores);
+    return cores !== null && cores > 0 && (typeof cpu?.coresKnown === "boolean" ? cpu.coresKnown : true);
+  }
+  function cpuCoreCount(cpu) {
+    return cpuCoresKnown(cpu) ? finite(cpu.cores) : 0;
+  }
   function hostCpu(host = {}) {
     const cpu = host.metrics?.latest?.cpu;
     const cores = finite(cpu?.cores);
-    const coresKnown = cores !== null && cores > 0 && (typeof cpu?.coresKnown === "boolean" ? cpu.coresKnown : true);
+    const coresKnown = cpuCoresKnown(cpu);
     const usedPct = finite(cpu?.usedPct);
     const reason = typeof cpu?.reason === "string" ? cpu.reason.trim() : "";
     if (cores === null && usedPct === null && !reason) return null;
@@ -101,9 +108,8 @@
   }
   function cpuLabel(cpu) {
     if (!cpu) return "";
-    const cores = finite(cpu.cores);
-    const coresKnown = cores !== null && cores > 0 && (typeof cpu.coresKnown === "boolean" ? cpu.coresKnown : true);
-    if (!coresKnown) return "cores n/a";
+    const cores = cpuCoreCount(cpu);
+    if (!cores) return "cores n/a";
     const usedPct = finite(cpu.usedPct);
     if (usedPct === null) return `n/a / ${count(cores, "core")}`;
     const usedCores = finite(cpu.usedCores);
@@ -119,10 +125,7 @@
   function fleetSummary(hosts = []) {
     const rows = list(hosts);
     const parts = [count(rows.length, "machine")];
-    const cores = rows.reduce((sum, host) => {
-      const cpu = hostCpu(host);
-      return sum + (cpu?.coresKnown ? cpu.cores : 0);
-    }, 0);
+    const cores = rows.reduce((sum, host) => sum + cpuCoreCount(hostCpu(host)), 0);
     if (cores > 0) parts.push(count(cores, "core"));
     const bytes = rows.reduce((sum, host) => sum + (hostMemory(host)?.totalBytes ?? 0), 0);
     if (bytes > 0) parts.push(`${formatGb(bytes)} GB`);

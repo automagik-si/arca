@@ -28,7 +28,8 @@ function listeners() {
 
 function fakeDsh({
   sessionId = 'session-doctor-1', script = async () => {}, noRestrict = false, noDefinitions = false,
-  hangCreateOnce = false, endOnCancel = true, onCancel = null,
+  noGuard = false, hangCreateOnce = false, endOnCancel = true, onCancel = null,
+  failResume = false, hangFirstDispose = false,
 } = {}) {
   const events = listeners();
   const globals = new Map();
@@ -85,6 +86,7 @@ function fakeDsh({
     delete globalTools.restrict;
     agentCtx.tools.restrict = undefined;
   }
+  if (noGuard) agentCtx.tools.guard = undefined;
   if (noDefinitions) delete globalTools.definitions;
   const agent = {
     id: sessionId,
@@ -132,9 +134,10 @@ function fakeDsh({
       return currentTurn;
     },
     text(value) {
+      // Real DSH text chunks carry no turn field: only durable session events do.
       events.emit('agent/assistant-stream', {
         agent,
-        frame: { type: 'chunk', turn: currentTurn, index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
+        frame: { type: 'chunk', index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
       });
     },
     usage(usage) {
@@ -173,10 +176,10 @@ function fakeDsh({
     errorOnly(error) {
       events.emit('agent/error', { agent, turn: currentTurn, error });
     },
-    lateText(turn, value) {
+    lateText(value) {
       events.emit('agent/assistant-stream', {
         agent,
-        frame: { type: 'chunk', turn, index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
+        frame: { type: 'chunk', index: 0, chunk: { type: 'text-delta', index: 0, text: value } },
       });
     },
     lateUsage(turn, usage) {
@@ -203,10 +206,21 @@ function fakeDsh({
         agent.session = { id: options.sessionId };
         if (createGate && created.length === 1) await createGate;
         await options.setup?.(agentCtx);
-        return { agent, dispose: async () => {} };
+        const first = created.length === 1;
+        return {
+          agent,
+          dispose: async () => {
+            if (hangFirstDispose && first) await new Promise(() => {});
+          },
+        };
       },
       async resume(options) {
         resumed.push(options);
+        if (failResume) {
+          const error = new Error(`session "${options.resumeSessionId}" is already owned by an active write handle`);
+          error.name = 'SessionAlreadyOwnedError';
+          throw error;
+        }
         agent.session = { id: options.resumeSessionId };
         await options.setup?.(agentCtx);
         return { agent, dispose: async () => {} };
@@ -231,7 +245,7 @@ function fakeDsh({
 
 // A minimal DSH whose first create/resume hangs until released, so a newer attempt can publish a live
 // handle before that stale attempt settles.
-function raceDsh() {
+function raceDsh({ conflictResume = false } = {}) {
   let resolveGate;
   let rejectGate;
   const gate = new Promise((resolve, reject) => { resolveGate = resolve; rejectGate = reject; });
@@ -242,6 +256,7 @@ function raceDsh() {
   const resumeIds = [];
   let createAttempts = 0;
   let resumeAttempts = 0;
+  let firstResumePending = false;
   let turns = 0;
   let title = null;
   const toolRegistry = {
@@ -285,7 +300,7 @@ function raceDsh() {
         bus.emit('session/event', agent.session, { type: 'turn/start', data: { turn } });
         bus.emit('agent/assistant-stream', {
           agent,
-          frame: { type: 'chunk', turn, chunk: { type: 'text-delta', index: 0, text: 'live ok' } },
+          frame: { type: 'chunk', chunk: { type: 'text-delta', index: 0, text: 'live ok' } },
         });
         bus.emit('session/event', agent.session, {
           type: 'turn/end', data: { turn, reason: { kind: 'completed' } },
@@ -313,7 +328,19 @@ function raceDsh() {
       async resume(options) {
         resumeAttempts += 1;
         resumeIds.push(options.resumeSessionId);
-        if (resumeAttempts === 1) await gate;
+        if (conflictResume && firstResumePending) {
+          const error = new Error(`session "${options.resumeSessionId}" is already owned by an active write handle`);
+          error.name = 'SessionAlreadyOwnedError';
+          throw error;
+        }
+        if (resumeAttempts === 1) {
+          firstResumePending = true;
+          try {
+            await gate;
+          } finally {
+            firstResumePending = false;
+          }
+        }
         const handle = makeAgent(options.resumeSessionId);
         await options.setup?.(handle.agent.ctx);
         return handle;
@@ -335,6 +362,10 @@ async function harness(t, options = {}) {
   t.after(() => rm(dir, { recursive: true, force: true }));
   const statePath = join(dir, 'chat.json');
   const fake = options.fake ?? fakeDsh(options);
+  const store = options.store ?? new ChatStore(statePath, {
+    now: options.now,
+    ...(options.readFile ? { readFile: options.readFile } : {}),
+  });
   const clientCalls = [];
   const chat = createDoctorChat({
     hosts: [{ name: 'alpha' }, { name: 'beta' }],
@@ -348,6 +379,7 @@ async function harness(t, options = {}) {
         },
       };
     },
+    store,
     statePath,
     log: options.log ?? (() => {}),
     turnMs: options.turnMs ?? 2000,
@@ -454,13 +486,14 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
     '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
     '  code fences.',
-    '- Sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total. Never show',
-    '  raw bytes.',
+    '- Storage sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total.',
+    '- Network rates keep the unit the tool gives: KB/s, MB/s or GB/s, with one decimal. Never show raw bytes.',
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
     '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
     '  explicitly asks for it.',
-    '- If a read fails or a host did not answer, say that plainly. If a reading the host can never give is',
-    '  missing, say "not measurable from here". Never repeat an internal reason or error string.',
+    '- If a read fails or a host did not answer, say "could not be read just now". Only a reading the host can',
+    '  never give, such as remote CPU load, is "not measurable from here". Never repeat an internal reason or',
+    '  error string.',
     '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
     '  approve, mint or change anything. Never claim that you did.',
     "- If asked to change something, answer in two short parts: what the change would do (using the real names",
@@ -469,6 +502,10 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '- The approval page is at https://example.com/approve.',
   ].join('\n');
   assert.equal(prompt, snapshot);
+  assert.match(prompt, /If a read fails or a host did not answer, say "could not be read just now"\./);
+  assert.match(prompt, /Only a reading the host can\s+never give, such as remote CPU load, is "not measurable from here"\./);
+  assert.match(prompt, /Network rates keep the unit the tool gives: KB\/s, MB\/s or GB\/s/);
+  assert.doesNotMatch(prompt, /Sizes are always in GB/);
   assert.doesNotMatch(prompt, /\bIncus\b|kernel mode|uptime/i);
   assert.match(doctorPrompt({ hosts: [{ name: 'alpha' }], now: Date.parse('2026-11-08T12:00:00Z') }),
     /No approval page is configured on this canvas/);
@@ -549,8 +586,9 @@ test('a remote CPU keeps its known core count while its load is unmeasurable', (
     minutes: 5,
     latest: {
       cpu: { usedPct: null, cores: 16, coresKnown: true, reason: 'not available for a remote host' },
-      memory: { totalBytes: 32_000_000_000, availableBytes: null, usedBytes: null, reason: null },
-      load: { one: null, five: null, fifteen: null, reason: null },
+      memory: { totalBytes: 32_000_000_000, availableBytes: 24_000_000_000, usedBytes: 8_000_000_000, reason: null },
+      // The real remote payload sets load.reason too: a remote host can never give its load averages.
+      load: { one: null, five: null, fifteen: null, reason: 'not available for a remote host' },
       pools: [],
       network: null,
       psi: null,
@@ -559,7 +597,8 @@ test('a remote CPU keeps its known core count while its load is unmeasurable', (
     mean: null,
   });
   assert.match(text, /CPU: 16 cores; load not measurable from here\./);
-  assert.match(text, /Memory: 32\.0 GB total\./);
+  assert.match(text, /Load: not measurable from here\./);
+  assert.match(text, /Memory: 8\.0 GB used of 32\.0 GB, 24\.0 GB available\./);
   assert.doesNotMatch(text, /not available for a remote host/);
   assert.doesNotMatch(text, /CPU:.*%/);
 
@@ -577,9 +616,32 @@ test('a remote CPU keeps its known core count while its load is unmeasurable', (
     },
     mean: null,
   });
-  assert.match(derived, /CPU: core count not measurable from here\./);
+  assert.match(derived, /CPU: core count no reading yet\./);
   assert.doesNotMatch(derived, /88%/);
   assert.match(derived, /Memory: 8\.0 GB used of 32\.0 GB, 24\.0 GB available\./);
+});
+
+test('a failed core and memory read says could not be read just now', () => {
+  const failedReason = 'the Incus resources read failed';
+  const text = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: {
+      cpu: { usedPct: null, cores: 0, coresKnown: false, reason: failedReason },
+      memory: { totalBytes: null, availableBytes: null, usedBytes: null, reason: failedReason },
+      load: { one: null, five: null, fifteen: null, reason: null },
+      pools: [],
+      network: null,
+      psi: null,
+      projects: [],
+    },
+    mean: null,
+  });
+  assert.match(text, /CPU: core count could not be read just now\./);
+  assert.match(text, /Memory: could not be read just now\./);
+  assert.match(text, /Load: no reading yet\./);
+  assert.doesNotMatch(text, /not measurable from here/);
+  assert.doesNotMatch(text, /the Incus resources read failed/);
 });
 
 test('alert reasons become plain words and keep their exact resolution', () => {
@@ -619,6 +681,48 @@ test('alert reasons become plain words and keep their exact resolution', () => {
   assert.equal(parsed.storeBytes, '1.5 GB');
 });
 
+test('one core is singular and rates choose the unit after rounding', () => {
+  const sample = (cpu, network) => ({
+    cpu,
+    memory: { totalBytes: 8_000_000_000, availableBytes: 4_000_000_000, usedBytes: 4_000_000_000, reason: null },
+    load: { one: 1, five: 1, fifteen: 1, reason: null },
+    pools: [],
+    network,
+    psi: null,
+    projects: [],
+  });
+  const loaded = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: sample(
+      { usedPct: 50, cores: 1, coresKnown: true, reason: null },
+      { rxBytesPerSec: 1_000_000, txBytesPerSec: 1_000 },
+    ),
+    mean: null,
+  });
+  assert.match(loaded, /CPU: 50% used across 1 core\./);
+  assert.match(loaded, /Network: 1\.0 MB\/s received, 1\.0 KB\/s sent\./);
+
+  const justBelow = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: sample(
+      { usedPct: 50, cores: 1, coresKnown: true, reason: null },
+      { rxBytesPerSec: 999_960, txBytesPerSec: 999_960_000 },
+    ),
+    mean: null,
+  });
+  assert.match(justBelow, /Network: 1\.0 MB\/s received, 1\.0 GB\/s sent\./);
+
+  const idle = formatToolResult('node_metrics', {
+    host: 'alpha',
+    minutes: 5,
+    latest: sample({ usedPct: null, cores: 1, coresKnown: true, reason: null }, null),
+    mean: null,
+  });
+  assert.match(idle, /CPU: 1 core; load no reading yet\./);
+});
+
 test('network rates use a readable unit at the reported size', () => {
   const text = formatToolResult('node_metrics', {
     host: 'alpha',
@@ -652,7 +756,7 @@ test('a missing latest reading and a one-minute average use the right label', ()
     projects: [],
   };
   const text = formatToolResult('node_metrics', { host: 'alpha', minutes: 1, latest: null, mean: sample });
-  assert.match(text, /^Host alpha\.\nLatest reading: not measurable from here\.\nAverage over the last 1 minute:/);
+  assert.match(text, /^Host alpha\.\nLatest reading: no reading yet\.\nAverage over the last 1 minute:/);
   assert.doesNotMatch(text, /1 minutes|Latest reading for the last/);
   const plural = formatToolResult('node_metrics', { host: 'alpha', minutes: 5, latest: null, mean: sample });
   assert.match(plural, /Average over the last 5 minutes:/);
@@ -756,6 +860,29 @@ test('the per-turn tool-call cap stops at 40 by default and never registers the 
   assert.equal(fake.executed.length, 2);
   assert.equal(result.events.filter((event) => event.event === 'tool' && event.data.state === 'running').length, 2);
   assert.ok(fake.cancels.includes('tool-calls'));
+});
+
+test('a cap reached mid-response stops the next tool from dispatching', async (t) => {
+  let blocked = '';
+  const { fake, port } = await harness(t, {
+    outputTokensPerTurn: 10,
+    script: async (api) => {
+      api.usage({ inputTokens: 1, outputTokens: 11 });
+      try {
+        await api.call('arca_status', {});
+      } catch (error) {
+        blocked = error.message;
+      }
+      api.text('after the cap');
+      api.end();
+    },
+  });
+  const result = await post(port, { message: 'go past the cap' });
+  assert.equal(blocked, 'Doctor turn cap reached: output-tokens');
+  assert.equal(fake.executed.length, 0, 'the tool after the cap is never dispatched');
+  assert.equal(result.events.filter((event) => event.event === 'tool').length, 0);
+  assert.equal(result.events.find((event) => event.event === 'cap')?.data.reason, 'output-tokens');
+  assert.equal(result.events.at(-1).data.reason, 'output-tokens');
 });
 
 test('the per-turn output-token cap and the persisted daily budget both stop the turn', async (t) => {
@@ -964,14 +1091,20 @@ test('a state file with a hostile shape is normalized, never trusted', async () 
   }
 });
 
-test('agent setup fails closed when the tool registry cannot restrict or enumerate tools', async (t) => {
-  for (const [label, options] of [['restrict', { noRestrict: true }], ['definitions', { noDefinitions: true }]]) {
-    const { fake, port } = await harness(t, { ...options, setupMs: 500 });
+test('agent setup fails closed when a tool fence cannot be installed', async (t) => {
+  for (const [label, options] of [
+    ['restrict', { noRestrict: true }],
+    ['guard', { noGuard: true }],
+    ['definitions', { noDefinitions: true }],
+  ]) {
+    const { chat, fake, port } = await harness(t, { ...options, setupMs: 500 });
     const result = await post(port, { message: `fail ${label}` });
     assert.equal(result.events[0].event, 'start');
     assert.equal(result.events.find((event) => event.event === 'error')?.data.message, 'The Doctor could not answer.');
     assert.equal(result.events.at(-1).data.reason, 'error');
-    assert.equal(fake.created.length, 0, `${label}: no agent is created`);
+    // installTools rejects before create; a missing agent-scope guard is only detectable inside setup.
+    if (label !== 'guard') assert.equal(fake.created.length, 0, `${label}: no agent is created`);
+    assert.equal(chat.sessionId, null, `${label}: no agent is published`);
     assert.equal(fake.followed.length, 0, `${label}: no model call`);
   }
 });
@@ -1009,7 +1142,6 @@ test('a cancelled run must end before the next; its late events are dropped', as
       }
       api.text('fresh');
       api.usage({ inputTokens: 1, outputTokens: 2 });
-      api.lateText(1, 'stale text');
       api.lateUsage(1, { inputTokens: 500, outputTokens: 500 });
       api.end();
     },
@@ -1023,6 +1155,8 @@ test('a cancelled run must end before the next; its late events are dropped', as
   const firstResult = await firstPost;
   assert.equal(firstResult.events.at(-1).data.reason, 'timeout');
 
+  // The cancelled run's stream is over: a late text frame has no listener left to reach.
+  fake.api.lateText('stale text');
   const second = await post(port, { message: 'second' });
   assert.equal(second.events.at(-1).data.reason, 'complete');
   const text = second.events.filter((event) => event.event === 'text').map((event) => event.data.text).join('');
@@ -1096,6 +1230,80 @@ test('a corrupt state file is quarantined and the rest of the day stays exhauste
   assert.equal(budget.data.message, 'Daily budget reached, try tomorrow.');
   assert.equal(reply.events.at(-1).data.reason, 'budget');
   assert.equal(fake.followed.length, 0);
+});
+
+test('a transient state read error is retried once and never quarantined', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'arca-chat-retry-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'chat.json');
+  await writeFile(path, JSON.stringify({
+    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 42, messages: [],
+  }));
+  let calls = 0;
+  const flaky = async (...args) => {
+    calls += 1;
+    if (calls === 1) throw Object.assign(new Error('state file busy'), { code: 'EAGAIN' });
+    return readFile(...args);
+  };
+  const state = await new ChatStore(path, { readFile: flaky }).read();
+  assert.equal(calls, 2, 'the read is retried exactly once');
+  assert.equal(state.sessionId, 'saved-doctor');
+  assert.equal(state.dailyTokens, 42);
+  assert.equal(state.budgetExhausted, false);
+  assert.deepEqual((await readdir(dir)).filter((name) => name.includes('.corrupt-')), []);
+  assert.equal(JSON.parse(await readFile(path, 'utf8')).dailyTokens, 42, 'the state file is untouched');
+});
+
+test('a persistent state read error fails closed without quarantining the file', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'arca-chat-read-fail-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'chat.json');
+  const contents = JSON.stringify({
+    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 42, messages: [],
+  });
+  await writeFile(path, contents);
+  let calls = 0;
+  const broken = async () => {
+    calls += 1;
+    throw Object.assign(new Error('state file busy'), { code: 'EAGAIN' });
+  };
+  await assert.rejects(new ChatStore(path, { readFile: broken }).read(), /state file busy/);
+  assert.equal(calls, 2);
+  assert.deepEqual((await readdir(dir)).filter((name) => name.includes('.corrupt-')), []);
+  assert.equal(await readFile(path, 'utf8'), contents, 'a read error never renames or overwrites the file');
+});
+
+test('a state read that fails twice during usage and transcript saves exhausts the day', async (t) => {
+  const logged = [];
+  let reads = 0;
+  const flaky = async (...args) => {
+    reads += 1;
+    // 1 handle read, 2 ensureAgent read, 3 session-id patch, 4 runTurn read, 5 user-message patch;
+    // 6-7 usage and 8-9 transcript retries fail.
+    if (reads >= 6 && reads <= 9) throw Object.assign(new Error('state file busy'), { code: 'EAGAIN' });
+    return readFile(...args);
+  };
+  const { fake, port } = await harness(t, {
+    readFile: flaky,
+    log: (line) => logged.push(line),
+    script: async (api) => {
+      api.text('answer');
+      api.usage({ inputTokens: 10, outputTokens: 20 });
+      api.end();
+    },
+  });
+  const first = await post(port, { message: 'first' });
+  assert.equal(first.events.at(-1).data.reason, 'complete');
+  assert.equal(reads, 9, 'both saves retried the read and failed');
+  assert.ok(logged.some((line) => /usage counter not written \(EAGAIN\); daily budget exhausted for the day/.test(line)));
+  assert.ok(logged.some((line) => /transcript not written \(EAGAIN\); daily budget exhausted for the day/.test(line)));
+
+  // Once the file is readable again the day is still exhausted: no model call, no lost tokens.
+  const second = await post(port, { message: 'second' });
+  const budget = second.events.find((event) => event.event === 'budget');
+  assert.ok(budget);
+  assert.equal(second.events.at(-1).data.reason, 'budget');
+  assert.equal(fake.followed.length, 1, 'the exhausted day makes no second model call');
 });
 
 test('a failed state write leaves no temporary file behind', async (t) => {
@@ -1239,6 +1447,73 @@ test('a stale create cannot replace or dispose the live agent', async (t) => {
 
   await chat.close();
   assert.ok(race.disposed.includes(liveId), 'close disposes the live handle');
+});
+
+test('a stale resume overlapping a newer setup reuses the live session id', async (t) => {
+  const race = raceDsh({ conflictResume: true });
+  let sequence = 0;
+  const { chat, port, statePath } = await harness(t, {
+    fake: race,
+    setupMs: 200,
+    turnMs: 1000,
+    cancelMs: 20,
+    uuid: () => `candidate-${++sequence}`,
+  });
+  await writeFile(statePath, JSON.stringify({
+    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 0, messages: [],
+  }));
+  const first = await post(port, { message: 'stale resume' });
+  assert.equal(first.events.at(-1).data.reason, 'error');
+  // The first resume is still holding the session write handle. The second attempt races it and must wait,
+  // not treat the write conflict as a missing session and create a new id.
+  const secondPromise = post(port, { message: 'live resume' });
+  await until(() => race.resumeIds.length === 2);
+  race.resolveGate();
+  const second = await secondPromise;
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(race.createdIds.length, 0, 'the newer setup never forks a new DSH session');
+  assert.deepEqual([...new Set(race.resumeIds)], ['saved-doctor'], 'both setups stay on the stored session id');
+  assert.equal(chat.sessionId, 'saved-doctor');
+  assert.equal(JSON.parse(await readFile(statePath, 'utf8')).sessionId, 'saved-doctor');
+  await chat.close();
+});
+
+test('a write conflict with no live holder recovers with a fresh session', async (t) => {
+  const logged = [];
+  let first = true;
+  let sequence = 0;
+  const { chat, fake, port } = await harness(t, {
+    failResume: true,
+    hangFirstDispose: true,
+    endOnCancel: false,
+    turnMs: 25,
+    cancelMs: 20,
+    setupMs: 500,
+    log: (line) => logged.push(line),
+    uuid: () => `candidate-${++sequence}`,
+    script: async (api) => {
+      if (first) {
+        first = false;
+        await new Promise(() => {});
+        return;
+      }
+      api.text('recovered');
+      api.end();
+    },
+  });
+  const firstReply = await post(port, { message: 'hang' });
+  assert.equal(firstReply.events.at(-1).data.reason, 'timeout');
+  // The discarded handle's dispose never finishes, so the next resume sees a write conflict with no
+  // overlapping attempt left in this process. The Doctor must recover, not stay down for good.
+  const second = await post(port, { message: 'after the conflict' });
+  assert.equal(second.status, 200);
+  assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(fake.created.length, 2);
+  assert.notEqual(fake.created[0].sessionId, fake.created[1].sessionId, 'a fresh session recovers the Doctor');
+  assert.equal(chat.sessionId, fake.created[1].sessionId);
+  assert.equal(fake.followed.length, 2);
+  assert.ok(logged.some((line) => line
+    === 'Arca canvas chat: stored session is still owned (SessionAlreadyOwnedError); starting a new one'));
 });
 
 test('a stale resume rejection cannot corrupt the live agent', async (t) => {

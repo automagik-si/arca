@@ -65,13 +65,24 @@ export function isHostOnline(host = {}) {
   return Boolean(host.machine) && host.machine.incusReachable !== false;
 }
 
+// The kernel's coresKnown flag is authoritative. Older snapshots have no flag, so only a positive count is
+// real there; zero has always been the placeholder for an unread host total. The machine card and the fleet
+// total must apply this one rule, or a mixed fleet counts a failed read as capacity.
+export function cpuCoresKnown(cpu) {
+  const cores = finite(cpu?.cores);
+  return cores !== null && cores > 0
+    && (typeof cpu?.coresKnown === 'boolean' ? cpu.coresKnown : true);
+}
+
+// The same rule as a count: zero when the card must say "cores n/a" and the fleet total must skip this host.
+export function cpuCoreCount(cpu) {
+  return cpuCoresKnown(cpu) ? finite(cpu.cores) : 0;
+}
+
 export function hostCpu(host = {}) {
   const cpu = host.metrics?.latest?.cpu;
   const cores = finite(cpu?.cores);
-  // The kernel's coresKnown flag is authoritative. Older snapshots have no flag, so only a positive count is
-  // real there; zero has always been the placeholder for an unread host total.
-  const coresKnown = cores !== null && cores > 0
-    && (typeof cpu?.coresKnown === 'boolean' ? cpu.coresKnown : true);
+  const coresKnown = cpuCoresKnown(cpu);
   const usedPct = finite(cpu?.usedPct);
   const reason = typeof cpu?.reason === 'string' ? cpu.reason.trim() : '';
   if (cores === null && usedPct === null && !reason) return null;
@@ -109,12 +120,10 @@ export function hostMemory(host = {}) {
 
 export function cpuLabel(cpu) {
   if (!cpu) return '';
-  // Trust coresKnown when present; an older snapshot without it only has a core count when cores is positive.
+  // Trust the shared cores rule; an older snapshot without the flag is handled there too.
   // A reason describes an absent load, not an absent capacity, so it never turns a known count into "cores n/a".
-  const cores = finite(cpu.cores);
-  const coresKnown = cores !== null && cores > 0
-    && (typeof cpu.coresKnown === 'boolean' ? cpu.coresKnown : true);
-  if (!coresKnown) return 'cores n/a';
+  const cores = cpuCoreCount(cpu);
+  if (!cores) return 'cores n/a';
   // A null load is unknown, never zero: keep the real capacity and invent no percentage.
   const usedPct = finite(cpu.usedPct);
   if (usedPct === null) return `n/a / ${count(cores, 'core')}`;
@@ -133,10 +142,7 @@ export function memoryLabel(memory) {
 export function fleetSummary(hosts = []) {
   const rows = list(hosts);
   const parts = [count(rows.length, 'machine')];
-  const cores = rows.reduce((sum, host) => {
-    const cpu = hostCpu(host);
-    return sum + (cpu?.coresKnown ? cpu.cores : 0);
-  }, 0);
+  const cores = rows.reduce((sum, host) => sum + cpuCoreCount(hostCpu(host)), 0);
   if (cores > 0) parts.push(count(cores, 'core'));
   const bytes = rows.reduce((sum, host) => sum + (hostMemory(host)?.totalBytes ?? 0), 0);
   if (bytes > 0) parts.push(`${formatGb(bytes)} GB`);

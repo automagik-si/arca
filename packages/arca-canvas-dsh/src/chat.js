@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, open, readFile as readStateFile, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
+import { cpuCoresKnown } from './model.js';
 
 // The Doctor chat is read-only by construction: only these verbs are registered with DSH. Every write verb
 // (postgres_link/unlink/delete, service_*, plan/approve/apply, token_*, adopt, ...) is absent from this list and
@@ -141,9 +142,10 @@ function normalizeState(raw, ms) {
 // One JSON document under the canvas DSH home. Writes are serialized and atomic, so a crash leaves the previous
 // document (never a half-written counter) and a read never sees a partial update.
 export class ChatStore {
-  constructor(path, { now = Date.now } = {}) {
+  constructor(path, { now = Date.now, readFile = readStateFile } = {}) {
     this.path = path;
     this.now = typeof now === 'function' ? now : () => now;
+    this.readFile = readFile;
     this.queue = Promise.resolve();
     this.exhaustedDay = null;
   }
@@ -168,31 +170,46 @@ export class ChatStore {
     return run;
   }
 
+  /** Mark the rest of the UTC day exhausted after a state read/write failure that could lose token counts. */
+  exhaust() {
+    this.exhaustedDay = dayOf(this.now());
+  }
+
   #roll(state) {
     const day = dayOf(this.now());
-    if (state.day === day) return state;
-    return { ...state, day, dailyTokens: 0, budgetExhausted: false };
+    const rolled = state.day === day ? state : { ...state, day, dailyTokens: 0, budgetExhausted: false };
+    // A quarantine or an uncounted usage write stays exhausted for the day, even if a later read succeeds.
+    return this.exhaustedDay === day ? { ...rolled, budgetExhausted: true } : rolled;
   }
 
   async #load() {
     let raw;
     try {
-      raw = await readFile(this.path, 'utf8');
+      raw = await this.readFile(this.path, 'utf8');
     } catch (error) {
-      if (error?.code === 'ENOENT') {
-        // A quarantine whose marker could not be written still stays exhausted for this process and day.
-        if (this.exhaustedDay === dayOf(this.now())) {
-          return { ...emptyState(this.now()), budgetExhausted: true };
-        }
-        return emptyState(this.now());
+      if (error?.code === 'ENOENT') return this.#missing();
+      // A read error is not corruption: the next read may succeed. Retry once before failing the read, and
+      // never rename or overwrite a file that was merely busy for a moment.
+      try {
+        raw = await this.readFile(this.path, 'utf8');
+      } catch (retry) {
+        if (retry?.code === 'ENOENT') return this.#missing();
+        throw retry;
       }
-      return this.#quarantine();
     }
     try {
       return normalizeState(JSON.parse(raw), this.now());
     } catch {
       return this.#quarantine();
     }
+  }
+
+  #missing() {
+    // A quarantine whose marker could not be written still stays exhausted for this process and day.
+    if (this.exhaustedDay === dayOf(this.now())) {
+      return { ...emptyState(this.now()), budgetExhausted: true };
+    }
+    return emptyState(this.now());
   }
 
   // A corrupt counter must never reset to zero (that would hand out a fresh budget). Keep the bad file for
@@ -309,13 +326,14 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
     '- Call a tool when the answer depends on current state. Do not answer data questions from memory.',
     '- Keep answers short: a sentence or a few bullets. Plain sentences only; no markdown tables, headings or',
     '  code fences.',
-    '- Sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total. Never show',
-    '  raw bytes.',
+    '- Storage sizes are always in GB with one decimal, for example 17.0 GB, 3.4 GB used or 96.3 GB total.',
+    '- Network rates keep the unit the tool gives: KB/s, MB/s or GB/s, with one decimal. Never show raw bytes.',
     '- Percentages are whole numbers, for example 70%, not 70.29%.',
     '- Leave out low-level system detail, raw timers and internal ids. Add technical detail only when the owner',
     '  explicitly asks for it.',
-    '- If a read fails or a host did not answer, say that plainly. If a reading the host can never give is',
-    '  missing, say "not measurable from here". Never repeat an internal reason or error string.',
+    '- If a read fails or a host did not answer, say "could not be read just now". Only a reading the host can',
+    '  never give, such as remote CPU load, is "not measurable from here". Never repeat an internal reason or',
+    '  error string.',
     '- You are strictly read-only. You cannot link, unlink, delete, start, stop, restart, create, adopt, apply,',
     '  approve, mint or change anything. Never claim that you did.',
     "- If asked to change something, answer in two short parts: what the change would do (using the real names",
@@ -326,9 +344,21 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', now = Date.now() } 
 }
 
 const NOT_MEASURABLE = 'not measurable from here';
+const COULD_NOT_READ = 'could not be read just now';
+const NO_READING = 'no reading yet';
+const REMOTE_HOST_REASON = 'not available for a remote host';
 const KILOBYTE = 1_000;
 const MEGABYTE = 1_000_000;
 const GIGABYTE = 1_000_000_000;
+
+// The kernel explains a missing sample with one of two reasons (crates/arca-metrics/src/sample.rs): a remote
+// host can never give the reading, or a read failed. A local reading with no reason simply is not there yet.
+function readingStatus(reason) {
+  const value = typeof reason === 'string' ? reason.trim() : '';
+  if (!value) return NO_READING;
+  if (value === REMOTE_HOST_REASON) return NOT_MEASURABLE;
+  return COULD_NOT_READ;
+}
 
 const RESOLVED_REASONS = Object.freeze({
   cleared: 'the problem cleared',
@@ -357,8 +387,9 @@ export function formatGigabytes(bytes) {
 function formatRate(bytes) {
   const value = measured(bytes);
   if (value === null || value < 0) return '';
-  if (value >= GIGABYTE) return `${(value / GIGABYTE).toFixed(1)} GB/s`;
-  if (value >= MEGABYTE) return `${(value / MEGABYTE).toFixed(1)} MB/s`;
+  // Pick the unit from the rounded value: 999,960 B/s rounds to 1000.0 KB/s, so it is shown as 1.0 MB/s.
+  if (value / MEGABYTE >= 999.95) return `${(value / GIGABYTE).toFixed(1)} GB/s`;
+  if (value / KILOBYTE >= 999.95) return `${(value / MEGABYTE).toFixed(1)} MB/s`;
   return `${(value / KILOBYTE).toFixed(1)} KB/s`;
 }
 
@@ -367,27 +398,30 @@ function formatPercent(value) {
   return number === null ? '' : `${Math.round(number)}%`;
 }
 
+function coreLabel(cores) {
+  return `${cores} ${cores === 1 ? 'core' : 'cores'}`;
+}
+
 function cpuLine(cpu) {
-  if (!cpu) return `CPU: ${NOT_MEASURABLE}.`;
+  if (!cpu) return `CPU: ${NO_READING}.`;
   const cores = measured(cpu.cores);
-  // A reason only explains a missing load, never a known core count (the same rule the machine card uses).
-  const coresKnown = cores !== null && cores > 0
-    && (typeof cpu.coresKnown === 'boolean' ? cpu.coresKnown : true);
-  if (!coresKnown) return `CPU: core count ${NOT_MEASURABLE}.`;
+  // The same shared rule as the machine card and the fleet total: a reason only explains a missing load.
+  if (!cpuCoresKnown(cpu)) return `CPU: core count ${readingStatus(cpu.reason)}.`;
   const percent = formatPercent(cpu.usedPct);
   return percent
-    ? `CPU: ${percent} used across ${cores} cores.`
-    : `CPU: ${cores} cores; load ${NOT_MEASURABLE}.`;
+    ? `CPU: ${percent} used across ${coreLabel(cores)}.`
+    : `CPU: ${coreLabel(cores)}; load ${readingStatus(cpu.reason)}.`;
 }
 
 function memoryLine(memory) {
-  if (!memory || memory.reason) return `Memory: ${NOT_MEASURABLE}.`;
+  if (!memory) return `Memory: ${NO_READING}.`;
+  if (memory.reason) return `Memory: ${readingStatus(memory.reason)}.`;
   const total = measured(memory.totalBytes);
   const available = measured(memory.availableBytes);
   const reportedUsed = measured(memory.usedBytes);
   const used = reportedUsed ?? (total !== null && available !== null ? Math.max(0, total - available) : null);
   const totalText = formatGigabytes(total);
-  if (!totalText) return `Memory: ${NOT_MEASURABLE}.`;
+  if (!totalText) return `Memory: ${NO_READING}.`;
   const usedText = formatGigabytes(used);
   const availableText = formatGigabytes(available);
   if (usedText && availableText) return `Memory: ${usedText} used of ${totalText}, ${availableText} available.`;
@@ -397,14 +431,15 @@ function memoryLine(memory) {
 }
 
 function loadLine(load) {
-  if (!load || load.reason) return `Load: ${NOT_MEASURABLE}.`;
+  if (!load) return `Load: ${NO_READING}.`;
+  if (load.reason) return `Load: ${readingStatus(load.reason)}.`;
   const values = [
     ['one', '1 minute'], ['five', '5 minutes'], ['fifteen', '15 minutes'],
   ].flatMap(([key, label]) => {
     const number = measured(load[key]);
     return number === null ? [] : [`${number.toFixed(1)} (${label})`];
   });
-  return values.length ? `Load: ${values.join(', ')}.` : `Load: ${NOT_MEASURABLE}.`;
+  return values.length ? `Load: ${values.join(', ')}.` : `Load: ${NO_READING}.`;
 }
 
 function pressureLines(psi) {
@@ -432,7 +467,7 @@ function poolLines(pools) {
     if (used) parts.push(`${used} used`);
     if (total) parts.push(`${total} total`);
     if (free) parts.push(`${free} free`);
-    return `${name ? `Disk pool ${name}` : 'Disk pool'}: ${parts.length ? `${parts.join(', ')}.` : `${NOT_MEASURABLE}.`}`;
+    return `${name ? `Disk pool ${name}` : 'Disk pool'}: ${parts.length ? `${parts.join(', ')}.` : `${NO_READING}.`}`;
   });
 }
 
@@ -443,7 +478,7 @@ function networkLine(network) {
   const parts = [];
   if (received) parts.push(`${received} received`);
   if (sent) parts.push(`${sent} sent`);
-  return parts.length ? `Network: ${parts.join(', ')}.` : `Network: ${NOT_MEASURABLE}.`;
+  return parts.length ? `Network: ${parts.join(', ')}.` : `Network: ${NO_READING}.`;
 }
 
 function projectLine(projects) {
@@ -488,7 +523,7 @@ function formatNodeMetrics(value) {
     lines.push('Latest reading:');
     lines.push(...sampleLines(data.latest));
   } else {
-    lines.push(`Latest reading: ${NOT_MEASURABLE}.`);
+    lines.push(`Latest reading: ${NO_READING}.`);
   }
   if (data.mean) {
     const span = minutes !== null
@@ -667,8 +702,32 @@ export function createDoctorChat(options = {}) {
   let runSequence = 0;
   let ensureGeneration = 0;
   let cancelCurrent = null;
+  // DSH gives one write handle per persisted session. Track every setup that is opening one so a newer setup
+  // that races the same session can wait for the holder and retry, instead of reading the conflict as a
+  // missing session and forking a fresh id.
+  const sessionAttempts = new Map();
 
   const primaryApproval = safeApprovalUrl(approvalUrl);
+
+  function beginSessionAttempt(sessionId) {
+    const entry = { sessionId, promise: null, resolve: null };
+    entry.promise = new Promise((resolve) => { entry.resolve = resolve; });
+    let entries = sessionAttempts.get(sessionId);
+    if (!entries) sessionAttempts.set(sessionId, entries = new Set());
+    entries.add(entry);
+    return entry;
+  }
+
+  function endSessionAttempt(entry) {
+    const entries = sessionAttempts.get(entry.sessionId);
+    entries?.delete(entry);
+    if (entries && !entries.size) sessionAttempts.delete(entry.sessionId);
+    entry.resolve();
+  }
+
+  function alreadyOwned(error) {
+    return error?.name === 'SessionAlreadyOwnedError';
+  }
 
   function discardAgent() {
     const handle = agentHandle;
@@ -710,6 +769,23 @@ export function createDoctorChat(options = {}) {
     }
   }
 
+  // Open one persisted session for write. Another setup may already hold it: wait for that attempt to settle
+  // (it either publishes the same live session or disposes its stale handle), then retry the same id. A
+  // session-write conflict is never a reason to create a new id.
+  async function resumeStored(dsh, sessionId, agentOptions, setup, own) {
+    const open = () => dsh.agents.resume({ resumeSessionId: sessionId, agentOptions, setup });
+    try {
+      return await open();
+    } catch (error) {
+      if (!alreadyOwned(error)) throw error;
+      const peers = [...(sessionAttempts.get(sessionId) ?? [])].filter((entry) => entry !== own);
+      if (!peers.length) throw error;
+      await Promise.allSettled(peers.map((entry) => entry.promise));
+      if (agent?.session?.id === sessionId) return null;
+      return open();
+    }
+  }
+
   async function ensureAgent(dsh) {
     if (agent) return agent;
     const attempt = ++ensureGeneration;
@@ -717,7 +793,8 @@ export function createDoctorChat(options = {}) {
     let candidateId = state.sessionId ?? uuid();
     installTools(dsh);
     const setup = (agentCtx) => {
-      if (!agentCtx?.tools || typeof agentCtx.tools.restrict !== 'function') {
+      if (!agentCtx?.tools || typeof agentCtx.tools.restrict !== 'function'
+        || typeof agentCtx.tools.guard !== 'function') {
         throw new Error('The DSH tool restriction is unavailable.');
       }
       agentCtx.tools.restrict({ allow: [...READ_TOOLS] });
@@ -730,11 +807,10 @@ export function createDoctorChat(options = {}) {
         return next();
       });
       // The guard runs after an allow decision, so a later policy cannot open the door this check closes.
-      if (typeof agentCtx.tools.guard === 'function') {
-        agentCtx.tools.guard((exec) => (READ_TOOLS.includes(exec?.name)
-          ? undefined
-          : 'The Doctor is read-only: that tool is not available.'));
-      }
+      // It is required exactly like the restriction: a setup that cannot install both fences fails closed.
+      agentCtx.tools.guard((exec) => (READ_TOOLS.includes(exec?.name)
+        ? undefined
+        : 'The Doctor is read-only: that tool is not available.'));
       if (agentCtx.systemPrompt?.section) {
         agentCtx.systemPrompt.section({
           name: 'deployment:persona-prefix',
@@ -753,49 +829,66 @@ export function createDoctorChat(options = {}) {
       model: MODEL.model,
       maxTokens: limits.outputTokensPerTurn,
     };
-    let candidateHandle;
-    let created = false;
-    if (state.sessionId) {
-      try {
-        candidateHandle = await dsh.agents.resume({ resumeSessionId: state.sessionId, agentOptions, setup });
-      } catch (error) {
-        // A stale attempt must not change the live session or start a replacement; a current attempt may
-        // recover a corrupt/missing stored session by creating a fresh one.
-        if (attempt !== ensureGeneration) throw error;
-        candidateId = uuid();
-        log(`Arca canvas chat: stored session could not resume (${safeErrorCode(error)}); starting a new one`);
+    const sessionAttempt = state.sessionId ? beginSessionAttempt(state.sessionId) : null;
+    try {
+      let candidateHandle;
+      let created = false;
+      if (state.sessionId) {
+        try {
+          candidateHandle = await resumeStored(dsh, state.sessionId, agentOptions, setup, sessionAttempt);
+          if (!candidateHandle) {
+            // Another setup published this exact session while we waited. Reuse the live session, never fork it.
+            if (attempt !== ensureGeneration) throw new Error('Doctor setup was superseded');
+            return agent;
+          }
+        } catch (error) {
+          // A stale attempt must not change the live session or start a replacement.
+          if (attempt !== ensureGeneration) throw error;
+          if (alreadyOwned(error)) {
+            // No overlapping attempt is left to wait for: the previous holder may be a discarded agent whose
+            // dispose never finished. Do not leave the Doctor down; log the conflict and recover with a fresh
+            // session, as before this batch.
+            log(`Arca canvas chat: stored session is still owned (${safeErrorCode(error)}); starting a new one`);
+          } else {
+            // A current attempt may recover a corrupt or missing stored session by creating a fresh one.
+            log(`Arca canvas chat: stored session could not resume (${safeErrorCode(error)}); starting a new one`);
+          }
+          candidateId = uuid();
+        }
       }
-    }
-    if (!candidateHandle) {
-      if (attempt !== ensureGeneration) throw new Error('Doctor setup was superseded');
-      candidateHandle = await dsh.agents.create({ sessionId: candidateId, agentOptions, setup });
-      created = true;
-    }
-    if (closed || attempt !== ensureGeneration) {
-      // A timed-out or closed setup resolved late. Dispose only its own handle; the live handle is untouched.
-      try { await candidateHandle?.dispose?.(); } catch { /* already gone */ }
-      throw new Error('Doctor setup was superseded');
-    }
-    // Publish only after the generation check. No shared state is written by a stale attempt.
-    agentHandle = candidateHandle;
-    agent = candidateHandle.agent;
-    liveSessionId = agent.session.id;
-    if (lastAgentId !== agent.session.id) {
-      // A fresh session starts its turn numbering over; stale counters from another session must not hide it.
-      lastAgentId = agent.session.id;
-      lastTurn = 0;
-    }
-    if (dsh.sessionTitle?.rename) {
-      try {
-        const current = dsh.sessionTitle.get?.(agent.session)?.title;
-        if (current !== SESSION_NAME) dsh.sessionTitle.rename(agent.session, SESSION_NAME);
-      } catch (error) {
-        log(`Arca canvas chat: session title not set (${safeErrorCode(error)})`);
+      if (!candidateHandle) {
+        if (attempt !== ensureGeneration) throw new Error('Doctor setup was superseded');
+        candidateHandle = await dsh.agents.create({ sessionId: candidateId, agentOptions, setup });
+        created = true;
       }
+      if (closed || attempt !== ensureGeneration) {
+        // A timed-out or closed setup resolved late. Dispose only its own handle; the live handle is untouched.
+        try { await candidateHandle?.dispose?.(); } catch { /* already gone */ }
+        throw new Error('Doctor setup was superseded');
+      }
+      // Publish only after the generation check. No shared state is written by a stale attempt.
+      agentHandle = candidateHandle;
+      agent = candidateHandle.agent;
+      liveSessionId = agent.session.id;
+      if (lastAgentId !== agent.session.id) {
+        // A fresh session starts its turn numbering over; stale counters from another session must not hide it.
+        lastAgentId = agent.session.id;
+        lastTurn = 0;
+      }
+      if (dsh.sessionTitle?.rename) {
+        try {
+          const current = dsh.sessionTitle.get?.(agent.session)?.title;
+          if (current !== SESSION_NAME) dsh.sessionTitle.rename(agent.session, SESSION_NAME);
+        } catch (error) {
+          log(`Arca canvas chat: session title not set (${safeErrorCode(error)})`);
+        }
+      }
+      await chatStore.patch((next) => ({ ...next, sessionId: agent.session.id }));
+      if (created) log('Arca canvas chat: Doctor session created');
+      return agent;
+    } finally {
+      if (sessionAttempt) endSessionAttempt(sessionAttempt);
     }
-    await chatStore.patch((next) => ({ ...next, sessionId: agent.session.id }));
-    if (created) log('Arca canvas chat: Doctor session created');
-    return agent;
   }
 
   function finaliseTool(callId, state, summary) {
@@ -830,6 +923,10 @@ export function createDoctorChat(options = {}) {
 
   function onToolCall({ name, host, input, callId }) {
     if (!turn) throw new Error('No active Doctor turn.');
+    // A cap can land between two steps of the same model response (usage arrives after the text). Any tool
+    // call that follows it must not dispatch, or the cap overshoots by one response. This reason is checked
+    // before the coarse cancellation state so the refusal names the cap that caused it.
+    if (turn.reason) throw new TurnCap(turn.reason);
     if (turn.cancelled) throw new Error('The Doctor turn was stopped.');
     if (turn.toolCalls >= limits.toolCallsPerTurn) {
       cap('tool-calls');
@@ -850,6 +947,13 @@ export function createDoctorChat(options = {}) {
     return finite(usage.inputTokens) + finite(usage.outputTokens);
   }
 
+  function noteStoreFailure(kind, error) {
+    // The tokens were counted in memory but could not reach the state file. Keep the rest of the day safe
+    // rather than silently handing out a fresh budget if the file becomes readable again.
+    chatStore.exhaust();
+    log(`Arca canvas chat: ${kind} not written (${safeErrorCode(error)}); daily budget exhausted for the day`);
+  }
+
   // Usage rides the durable `assistant/message` event (normal and interrupted); see dsh-agent-loop/lib/index.js:891-903
   // and :949-953. It is counted synchronously, before persistence, so a cap on the final event still stops the turn.
   function noteUsage(usage) {
@@ -861,7 +965,7 @@ export function createDoctorChat(options = {}) {
     turn.persist = turn.persist.then(() => chatStore.patch((state) => ({
       ...state,
       dailyTokens: state.dailyTokens + total,
-    }))).catch((error) => log(`Arca canvas chat: usage counter not written (${safeErrorCode(error)})`));
+    }))).catch((error) => noteStoreFailure('usage counter', error));
     if (!sse.closed) {
       sse.send('usage', {
         turnToolCalls: turn.toolCalls,
@@ -1057,7 +1161,7 @@ export function createDoctorChat(options = {}) {
             ...(summary ? { summary: bound(summary, 240) } : {}),
           })),
         }].slice(-DEFAULTS.historyMessages),
-      })).catch((error) => log(`Arca canvas chat: transcript not written (${safeErrorCode(error)})`));
+      })).catch((error) => noteStoreFailure('transcript', error));
     }
     // A new turn may not start until the previous run is actually idle. If the loop cannot prove that quickly,
     // drop the agent; the next request resumes the persisted session instead of overlapping this run.
