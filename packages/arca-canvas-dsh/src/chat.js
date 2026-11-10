@@ -16,7 +16,8 @@ export const READ_TOOLS = Object.freeze([
 export const PROPOSE_TOOL = 'arca_propose';
 export const DOCTOR_TOOLS = Object.freeze([...READ_TOOLS, PROPOSE_TOOL]);
 export const PROPOSE_ACTIONS = Object.freeze([
-  'service_create', 'service_remove', 'service_publish', 'service_unpublish',
+  'service_create', 'service_remove', 'service_import', 'service_release',
+  'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   'storage_add', 'snapshot_create', 'snapshot_delete',
   'instance_start', 'instance_stop', 'instance_restart',
@@ -359,6 +360,12 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '  stop or a restart interrupts what the instance serves and runs only after the owner approves the card. A',
     '  stop is graceful and never forced: an instance that does not shut down in time stays running and the',
     '  change is refused; say so plainly.',
+    '- To take over a service another manager created, where it stands, propose service_import with its name;',
+    '  to give it back, propose service_release. Propose an import only for a service this node\'s configuration',
+    '  lists for import. The proposal itself is refused, with the check that failed, when the import cannot run;',
+    '  say plainly that it was refused and that nothing changed. An imported service can be listed and read,',
+    '  but not changed, removed or rewired through Arca until it is released or fully moved. Both actions run',
+    '  only after the owner approves the card.',
     `- You can propose changes on ${proposeHost} and on any machine linked to it for approvals. Another machine is`,
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -775,6 +782,7 @@ export function createReadTools({ hosts = [], clientFor, onCall } = {}) {
 }
 
 const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name}; '
+  + 'service_import {name}; service_release {name}; '
   + 'service_publish {name, reach: "tailnet"}; service_unpublish {name}; '
   + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}; '
   + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}; '

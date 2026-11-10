@@ -654,6 +654,8 @@
   var PROPOSE_ACTIONS = /* @__PURE__ */ new Set([
     "service_create",
     "service_remove",
+    "service_import",
+    "service_release",
     "service_publish",
     "service_unpublish",
     "service_connect",
@@ -802,6 +804,8 @@
       return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
     }
     if (value.removed === true) return "The service was removed.";
+    if (value.imported === true) return "The service was imported. Arca lists it now and changes nothing on it.";
+    if (value.released === true) return "The service was released back to the manager that created it.";
     if (value.unpublished === true) return "The service is no longer published.";
     if (typeof value.url === "string" && value.url) return `The change is live at ${value.url}.`;
     if (Array.isArray(value.env)) return `The link is set up; ${count2(value.env.length, "environment variable")} updated.`;
