@@ -375,6 +375,50 @@ fn a_pattern_added_is_one_parameter_narrowing() {
     assert_eq!(got, [minutes_narrowed("pattern changed")]);
 }
 
+/// `propertyNames` and an `additionalProperties` schema are checked by `check.rs` but not modelled here: a change is a break.
+#[test]
+fn a_property_names_or_additional_properties_schema_added_is_one_parameter_narrowing() {
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["propertyNames"] =
+            json!({ "maxLength": 4 })
+    });
+    assert_eq!(got, [minutes_narrowed("propertyNames changed")]);
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["additionalProperties"] =
+            json!({ "type": "integer" })
+    });
+    assert_eq!(got, [minutes_narrowed("additionalProperties changed")]);
+}
+
+/// The reviewer's case: a released result object whose unnamed fields must be integers gains a named string field. The
+/// released schema refused that field, so the current result is broader: one break, at the object.
+#[test]
+fn a_result_object_with_an_additional_properties_schema_that_names_a_new_field_is_one_break() {
+    let doc = |schema: Value| json!({ "methods": [{ "name": "m", "params": [], "result": { "name": "result", "schema": schema } }] });
+    let old = json!({ "type": "object", "additionalProperties": { "type": "integer" } });
+    let mut new = old.clone();
+    new["properties"] = json!({ "x": { "type": "string" } });
+    assert_eq!(
+        compatible(&doc(old.clone()), &doc(new)),
+        [Break::ResultTypeChanged {
+            method: "m".into(),
+            path: "$".into()
+        }]
+    );
+    let names = json!({ "type": "object", "propertyNames": { "maxLength": 2 } });
+    let mut named = names.clone();
+    named["properties"] = json!({ "longer": { "type": "string" } });
+    assert_eq!(
+        compatible(&doc(names), &doc(named)).len(),
+        1,
+        "propertyNames too"
+    );
+    assert!(
+        compatible(&doc(old.clone()), &doc(old)).is_empty(),
+        "unchanged is no break"
+    );
+}
+
 /// The released result admits any array length. A `maxItems` the module cannot relate is refused, even though it narrows.
 #[test]
 fn a_result_keyword_outside_the_subset_is_one_type_break() {

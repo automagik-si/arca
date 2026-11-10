@@ -3950,6 +3950,377 @@
       "x-arca-writes": false
     },
     {
+      "name": "owner_approval_request",
+      "params": [
+        {
+          "name": "kind",
+          "required": true,
+          "schema": {
+            "description": "arca: an Arca action, approved on Arca's passkey page. upgrade: an identity phone's upgrade step, approved through droidd's MCP and refused here.",
+            "enum": [
+              "arca",
+              "upgrade"
+            ]
+          }
+        },
+        {
+          "name": "action",
+          "required": false,
+          "schema": {
+            "enum": [
+              "delete",
+              "publish",
+              "spend"
+            ]
+          }
+        },
+        {
+          "name": "args",
+          "required": false,
+          "schema": {
+            "description": "The call's arguments, without approval (at most 4096 bytes of JSON); the owner sees them.",
+            "type": "object"
+          }
+        },
+        {
+          "name": "confirmSnapshotLoss",
+          "required": false,
+          "schema": {
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "droid",
+          "required": false,
+          "schema": {
+            "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "droidd",
+          "required": false,
+          "schema": {
+            "description": "droidd's own field: Arca's statements name no droidd, so a request that names one is refused.",
+            "pattern": "^droid[a-z0-9]{0,7}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "eyes",
+          "required": false,
+          "schema": {
+            "enum": [
+              "enable",
+              "skip"
+            ]
+          }
+        },
+        {
+          "name": "fromFp",
+          "required": false,
+          "schema": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "look",
+          "required": false,
+          "schema": {
+            "enum": [
+              "apply",
+              "skip"
+            ]
+          }
+        },
+        {
+          "name": "openWhatsApp",
+          "required": false,
+          "schema": {
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "step",
+          "required": false,
+          "schema": {
+            "enum": [
+              "split",
+              "upgrade",
+              "split_rollback",
+              "upgrade_rollback",
+              "retired_delete"
+            ]
+          }
+        },
+        {
+          "name": "target",
+          "required": false,
+          "schema": {
+            "description": "What the action is on (a service's name).",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "toFp",
+          "required": false,
+          "schema": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "dashboard": {
+              "anyOf": [
+                {
+                  "maxLength": 300,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Arca's approval page, where the owner approves it; null when the node serves none."
+            },
+            "expiresAt": {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+              "type": "string"
+            },
+            "id": {
+              "pattern": "^ar_[0-9a-f]{16}$",
+              "type": "string"
+            },
+            "state": {
+              "const": "pending",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "state",
+            "expiresAt",
+            "dashboard"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Ask the owner to approve an Arca action (kind arca: action delete, publish or spend, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Kind upgrade is approved through droidd's MCP, not here.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "owner_approval_status",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "pattern": "^ar_[0-9a-f]{16}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "waitMs",
+          "required": false,
+          "schema": {
+            "maximum": 30000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "approval": {
+              "description": "The approval string, <base64 statement>.<base64 proof>: to the token that asked only, until it is spent or expires.",
+              "maxLength": 16384,
+              "pattern": "^[A-Za-z0-9+/]+={0,2}\\.[A-Za-z0-9+/]+={0,2}$",
+              "type": "string"
+            },
+            "approvalExpiresAt": {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+              "type": "string"
+            },
+            "expiresAt": {
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+              "type": "string"
+            },
+            "id": {
+              "pattern": "^ar_[0-9a-f]{16}$",
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "pending",
+                "approved",
+                "denied",
+                "expired"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "state",
+            "expiresAt"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "An owner approval request's state (pending, approved, denied, expired); waits up to waitMs (at most 30 s) while it is pending. The approval string goes only to the token that asked.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": false
+    },
+    {
+      "name": "owner_approval_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "requests": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "approvalExpiresAt": {
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                    "type": "string"
+                  },
+                  "args": {
+                    "additionalProperties": {},
+                    "description": "The call's arguments the digest is over, as the requester gave them: untrusted.",
+                    "propertyNames": {
+                      "maxLength": 64,
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "createdAt": {
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                    "type": "string"
+                  },
+                  "droidd": {
+                    "description": "Who spends the approval: arca.",
+                    "maxLength": 16,
+                    "type": "string"
+                  },
+                  "expiresAt": {
+                    "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                    "type": "string"
+                  },
+                  "fields": {
+                    "additionalProperties": {
+                      "anyOf": [
+                        {
+                          "maxLength": 200,
+                          "type": "string"
+                        },
+                        {
+                          "type": "boolean"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    },
+                    "description": "The fields its statement carries: action, target, paramsDigest.",
+                    "propertyNames": {
+                      "maxLength": 32,
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "host": {
+                    "maxLength": 253,
+                    "type": "string"
+                  },
+                  "id": {
+                    "pattern": "^ar_[0-9a-f]{16}$",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "arca",
+                      "upgrade"
+                    ],
+                    "type": "string"
+                  },
+                  "requester": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "maxLength": 16,
+                        "type": "string"
+                      },
+                      "name": {
+                        "maxLength": 200,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "name"
+                    ],
+                    "type": "object"
+                  },
+                  "state": {
+                    "enum": [
+                      "pending",
+                      "approved",
+                      "denied",
+                      "expired"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "createdAt",
+                  "droidd",
+                  "expiresAt",
+                  "fields",
+                  "host",
+                  "id",
+                  "kind",
+                  "requester",
+                  "state"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "type": "array"
+            }
+          },
+          "required": [
+            "requests"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The owner approval requests of the last 24 h, every pending one first, then the newest others, 50 in all (never an approval string). The arguments are the requesters' words: untrusted.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
       "name": "gpu_attach",
       "params": [
         {

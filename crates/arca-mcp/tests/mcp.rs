@@ -427,6 +427,7 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "service_list",
             "service_status",
             "service_logs",
+            "owner_approval_list",
             "storage_list",
             "snapshot_list"
         ]
@@ -501,6 +502,50 @@ fn a_doctor_tools_list_shows_the_three_omni_tools_and_a_viewer_does_not() {
             tool["annotations"]["readOnlyHint"],
             tool["name"] == "omni_status"
         );
+    }
+}
+
+#[test]
+fn owner_approval_request_and_status_are_a_doctors_and_the_list_is_a_viewers_too() {
+    let fx = Fixture::start("list-owner-approval");
+    let listed = |token: &str| -> Vec<String> {
+        names_of(&fx.call(token, "tools/list", json!({})))
+            .into_iter()
+            .filter(|n| n.starts_with("owner_approval_"))
+            .collect()
+    };
+    let all = [
+        "owner_approval_request",
+        "owner_approval_status",
+        "owner_approval_list",
+    ];
+    assert_eq!(listed(&fx.doctor), all);
+    assert_eq!(listed(&fx.operator), all);
+    assert_eq!(listed(&fx.viewer), ["owner_approval_list"]);
+    // A viewer's request or status is refused before any handler runs: a status may carry an approval string.
+    for verb in ["owner_approval_request", "owner_approval_status"] {
+        let reply = fx.tool_call(&fx.viewer, verb, json!({ "id": "ar_0123456789abcdef" }));
+        assert_eq!(reply.status, 403, "{verb}");
+    }
+    let tools = fx.call(&fx.doctor, "tools/list", json!({})).json()["result"]["tools"].clone();
+    for tool in tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| all.contains(&t["name"].as_str().unwrap()))
+    {
+        let name = tool["name"].as_str().unwrap();
+        assert_eq!(
+            tool["outputSchema"]["properties"]["untrusted"].is_object(),
+            name == "owner_approval_list",
+            "only the list is untrusted: {name}"
+        );
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            name == "owner_approval_list",
+            "{name}"
+        );
+        assert_eq!(tool["annotations"]["destructiveHint"], false, "{name}");
     }
 }
 

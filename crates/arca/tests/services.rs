@@ -1,5 +1,7 @@
 //! Service verbs against a fake Incus: create, list and status are hermetic; no live host is touched.
 mod common;
+#[path = "../../arca-approval/tests/common/webauthn.rs"]
+mod webauthn;
 
 use arca::{
     config::NodeConfig,
@@ -158,6 +160,21 @@ impl Rig {
         key: Option<&common::SkKey>,
         pause: Option<RemovalPause>,
     ) -> Self {
+        let verifier = key.map(|key| {
+            let scratch = common::Scratch::new("service-owner");
+            common::verifier_for(&scratch, &[key], "service")
+        });
+        Self::with_verifier(state, projects, cidr, verifier, pause)
+    }
+
+    /// The rig over `verifier`, or over a verifier that trusts no key when it is `None`.
+    fn with_verifier(
+        state: FakeState,
+        projects: Vec<String>,
+        cidr: Option<&str>,
+        verifier: Option<ApprovalVerifier<OwnerKeys, FileNonces>>,
+        pause: Option<RemovalPause>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-service-{}-{}",
             std::process::id(),
@@ -185,11 +202,8 @@ impl Rig {
             "kernel": kernel_config
         }))
         .expect("config");
-        let verifier = match key {
-            Some(key) => {
-                let scratch = common::Scratch::new("service-owner");
-                common::verifier_for(&scratch, &[key], "service")
-            }
+        let verifier = match verifier {
+            Some(verifier) => verifier,
             None => ApprovalVerifier::new(
                 "node1".into(),
                 OwnerKeys::new(
@@ -2307,6 +2321,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
     );
 }
 
+#[path = "services/approval_requests.rs"]
+mod approval_requests;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/wiring.rs"]

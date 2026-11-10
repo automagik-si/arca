@@ -1,6 +1,7 @@
 //! A JSON Schema subset, enough to check the arguments and results of the verb table: `type` (a name or an array of names),
-//! `properties`, `required`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `anyOf` and
-//! `additionalProperties: false` and `pattern`. The pattern is an ECMA-style regular expression; the schema is code, not a
+//! `properties`, `required`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `anyOf`,
+//! `additionalProperties` (false, true or a schema for the fields `properties` does not name), `propertyNames` (a schema
+//! every field name must meet) and `pattern`. The pattern is an ECMA-style regular expression; the schema is code, not a
 //! caller value, so it is compiled when the schema is checked.
 //!
 //! The schema is checked before the value. A keyword outside the subset is an error, not a silent pass, so a schema that
@@ -37,6 +38,7 @@ const SUPPORTED: &[&str] = &[
     "pattern",
     "anyOf",
     "additionalProperties",
+    "propertyNames",
 ];
 
 const TYPE_NAMES: &[&str] = &[
@@ -125,14 +127,18 @@ pub(crate) fn check_schema(schema: &Value, at: &str) -> Result<(), String> {
             return Err(format!("{}: {bound} must be a whole number", here(at)));
         }
     }
-    if map
-        .get("additionalProperties")
-        .is_some_and(|a| !a.is_boolean())
-    {
-        return Err(format!(
-            "{}: additionalProperties must be true or false",
-            here(at)
-        ));
+    match map.get("additionalProperties") {
+        None | Some(Value::Bool(_)) => {}
+        Some(sub @ Value::Object(_)) => check_schema(sub, &format!("{at}/additionalProperties"))?,
+        Some(_) => {
+            return Err(format!(
+                "{}: additionalProperties must be true, false or a schema",
+                here(at)
+            ));
+        }
+    }
+    if let Some(names) = map.get("propertyNames") {
+        check_schema(names, &format!("{at}/propertyNames"))?;
     }
     Ok(())
 }
@@ -282,11 +288,32 @@ fn check_object(
             }
         }
     }
-    if map.get("additionalProperties") == Some(&Value::Bool(false)) {
-        // The unknown key is not echoed: a client may have put a secret in the key.
+    // An unknown key is never echoed, here or in a path: a client may have put a secret in the key.
+    match map.get("additionalProperties") {
+        Some(Value::Bool(false)) => {
+            for name in fields.keys() {
+                if !props.is_some_and(|p| p.contains_key(name)) {
+                    return Err(format!("{}: a field the schema does not name", here(at)));
+                }
+            }
+        }
+        Some(sub @ Value::Object(_)) => {
+            for (name, field) in fields {
+                if !props.is_some_and(|p| p.contains_key(name)) && validate(sub, field, at).is_err()
+                {
+                    return Err(format!(
+                        "{}: a field the schema does not name holds a value it refuses",
+                        here(at)
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(names) = map.get("propertyNames") {
         for name in fields.keys() {
-            if !props.is_some_and(|p| p.contains_key(name)) {
-                return Err(format!("{}: a field the schema does not name", here(at)));
+            if validate(names, &Value::String(name.clone()), at).is_err() {
+                return Err(format!("{}: a field name the schema refuses", here(at)));
             }
         }
     }
@@ -328,6 +355,36 @@ fn here(at: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn additional_properties_as_a_schema_and_property_names_check_every_unnamed_field_and_name() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "additionalProperties": { "type": "integer" },
+            "propertyNames": { "type": "string", "maxLength": 4 }
+        });
+        assert_eq!(
+            conforms(&schema, &serde_json::json!({ "id": "x", "n": 1 })),
+            Ok(())
+        );
+        let refused = conforms(&schema, &serde_json::json!({ "n": "secret-value" })).unwrap_err();
+        assert!(!refused.contains("secret-value"));
+        assert!(refused.contains("holds a value it refuses"), "{refused}");
+        let refused = conforms(&schema, &serde_json::json!({ "secret-key": 1 })).unwrap_err();
+        assert!(!refused.contains("secret-key"), "the key is never echoed");
+        assert!(
+            refused.contains("a field name the schema refuses"),
+            "{refused}"
+        );
+        let bad = serde_json::json!({ "propertyNames": { "type": "text" } });
+        assert!(
+            conforms(&bad, &serde_json::json!({})).is_err(),
+            "a nested schema is checked"
+        );
+        let bad = serde_json::json!({ "additionalProperties": 3 });
+        assert!(conforms(&bad, &serde_json::json!({})).is_err());
+    }
     use serde_json::json;
 
     #[test]

@@ -656,6 +656,30 @@ impl Kernel {
         Ok(())
     }
 
+    /// Checks an owner approval exactly as [`Kernel::check_approval`] would, and spends nothing: no nonce, no sign count. The
+    /// approval page approves an owner approval request with this, and the requester's call spends the approval later.
+    pub fn preview_approval(
+        &self,
+        action: ArcaAction,
+        target: &str,
+        args: &serde_json::Value,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<arca_approval::Spent, ApprovalRefusal> {
+        self.verifier
+            .preview(action, target, args, approval, now_ms)
+    }
+
+    /// Why every passkey approval is refused, when the owner's passkeys file could not be trusted or read.
+    pub fn owner_passkey_refusal(&self) -> Option<ApprovalRefusal> {
+        self.verifier.verifier().passkey_refusal().cloned()
+    }
+
+    /// Whether an approval's nonce is spent.
+    pub fn approval_nonce_spent(&self, nonce: &str) -> bool {
+        self.verifier.nonce_spent(nonce)
+    }
+
     /// Spends one service-action approval, removes its entry and runs its pending plan under the caller's one kernel lock.
     /// A concurrent plan approval cannot observe the plan between the proposal and its execution.
     pub fn remove_service(
