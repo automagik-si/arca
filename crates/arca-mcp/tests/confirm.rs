@@ -68,6 +68,18 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             json!({ "snapshot": "snap1", "pool": "arca-snapshots-pool1", "kind": "instance", "state": "deleted" }),
             "confirm is false: nothing was deleted and no approval was spent",
         ),
+        (
+            "instance_stop",
+            json!({ "project": "arcak-svc", "instance": "web", "approval": "x.y" }),
+            json!({ "project": "arcak-svc", "instance": "web", "action": "stop", "status": "Stopped", "changed": true, "message": "stopped the instance web in project arcak-svc" }),
+            "confirm is false: nothing was stopped and no approval was spent",
+        ),
+        (
+            "instance_restart",
+            json!({ "project": "arcak-svc", "instance": "web", "approval": "x.y" }),
+            json!({ "project": "arcak-svc", "instance": "web", "action": "restart", "status": "Running", "changed": true, "message": "restarted the instance web in project arcak-svc" }),
+            "confirm is false: nothing was restarted and no approval was spent",
+        ),
     ]
 }
 

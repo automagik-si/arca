@@ -26,6 +26,7 @@ pub mod desired_store;
 pub mod gpu;
 pub mod handlers;
 pub mod kernel;
+pub mod lifecycle;
 pub mod linked;
 pub mod omni;
 mod passkey_change;

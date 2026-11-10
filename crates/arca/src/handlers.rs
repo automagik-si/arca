@@ -966,7 +966,24 @@ pub fn plan_handlers_full(
     storage: Option<Arc<crate::storage::Storage>>,
     actions: ActionSlot,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    plan_handlers_node(kernel, clock, postgres_image, gpu, storage, None, actions)
+}
+
+/// The plan handlers of a served node: with the instance state writer too, and the three instance verbs
+/// (`instance_start`, `instance_stop`, `instance_restart`) beside the GPU and storage ones. `lifecycle` is `None` on a
+/// watch-only node, where the three verbs and their proposals are refused.
+pub fn plan_handlers_node(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    postgres_image: Option<String>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    storage: Option<Arc<crate::storage::Storage>>,
+    lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
+    actions: ActionSlot,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let rate = Arc::new(ProposalRateLimiter::default());
+    let instance_handlers =
+        crate::lifecycle::handlers(Arc::clone(&kernel), Arc::clone(&clock), lifecycle.clone());
     let storage_handler = |action: ActionKind| -> Arc<dyn ToolHandler> {
         Arc::new(crate::storage::StorageActionHandler {
             action,
@@ -995,6 +1012,7 @@ pub fn plan_handlers_full(
                 rate,
                 gpu: gpu.clone(),
                 storage: storage.clone(),
+                lifecycle,
             }) as Arc<dyn ToolHandler>,
         ),
         ("storage_add", storage_add),
@@ -1042,6 +1060,9 @@ pub fn plan_handlers_full(
             Arc::new(PeerKeysSync { kernel, clock }) as Arc<dyn ToolHandler>,
         ),
     ]
+    .into_iter()
+    .chain(instance_handlers)
+    .collect()
 }
 
 /// `peer_keys_sync`: keeps the page host's owner passkeys in this kernel's peer passkeys file (see
@@ -1163,8 +1184,8 @@ fn action_json(
     Ok(value)
 }
 
-/// `action_propose`: validates one allowed action's arguments, resolves a GPU action's project, type and identity, and
-/// records an inert proposal. A disallowed action is an invalid call and leaves no record.
+/// `action_propose`: validates one allowed action's arguments, resolves a GPU action's project, type and identity, checks
+/// that an instance start, stop or restart names an instance of Arca's, and records an inert proposal. A disallowed action is an invalid call and leaves no record.
 struct ActionPropose {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -1172,6 +1193,7 @@ struct ActionPropose {
     rate: Arc<ProposalRateLimiter>,
     gpu: Option<Arc<dyn GpuBackend>>,
     storage: Option<Arc<crate::storage::Storage>>,
+    lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
 }
 
 impl ToolHandler for ActionPropose {
@@ -1211,6 +1233,9 @@ impl ToolHandler for ActionPropose {
             .map_err(CallError::Invalid)?;
         if let Some(storage) = storage {
             crate::storage::check_proposal(storage, action, &payload, now)?;
+        }
+        if action.is_lifecycle() {
+            crate::lifecycle::check_proposal(self.lifecycle.as_deref(), &payload)?;
         }
         let gpu_product = match action {
             ActionKind::GpuAttach => prepare_attach(
@@ -1628,7 +1653,8 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
 }
 
 /// Runs one already approved action through the same handler its gated verb uses. The verbs that take an inline approval
-/// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs) get the random grant in that field, and the
+/// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs, `instance_stop` and `instance_restart`) get
+/// the random grant in that field, and the
 /// handler consumes it, so the owner's real approval is never stored or replayed.
 #[derive(Clone, Default)]
 pub struct ActionExecutor {
@@ -1657,6 +1683,8 @@ impl ActionExecutor {
                 | "storage_add"
                 | "snapshot_create"
                 | "snapshot_delete"
+                | "instance_stop"
+                | "instance_restart"
         ) {
             call["approval"] = json!(grant);
         }
