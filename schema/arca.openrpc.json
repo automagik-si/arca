@@ -3687,6 +3687,269 @@
       "x-arca-writes": true
     },
     {
+      "name": "omni_instance_create",
+      "params": [
+        {
+          "name": "channel",
+          "required": true,
+          "schema": {
+            "description": "whatsapp-baileys (paired with omni_pair) or telegram (the owner's bot).",
+            "enum": [
+              "whatsapp-baileys",
+              "telegram"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The new instance's name (a-z, 0-9, _ and -, at most 63).",
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The omni-api service's name (service_create, template omni-api).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "channel": {
+              "maxLength": 32,
+              "type": "string"
+            },
+            "id": {
+              "description": "The instance id: what omni_pair and omni_status take.",
+              "maxLength": 36,
+              "type": "string"
+            },
+            "isActive": {
+              "description": "Whether Omni runs its connection.",
+              "type": "boolean"
+            },
+            "name": {
+              "maxLength": 64,
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "channel",
+            "isActive"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Create an Omni instance (a WhatsApp or a Telegram channel) in an omni-api service. Arca holds Omni's key, and for telegram adds the owner's bot token (the service's telegram_bot_token secret, which the owner sets with service_secret_set). Returns its id, name, channel and whether it runs.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "omni_pair",
+      "params": [
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The instance's id (from omni_instance_create or omni_status), or its name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The omni-api service's name (service_create, template omni-api).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "description": "The pairing code to enter on the phone: WhatsApp > Linked devices > Link with phone number.",
+              "maxLength": 16,
+              "type": "string"
+            },
+            "expiresIn": {
+              "description": "Seconds the code lasts.",
+              "maximum": 3600,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "instance": {
+              "maxLength": 36,
+              "type": "string"
+            },
+            "phoneNumber": {
+              "description": "The owner's number, masked: Arca holds it, and no tool shows it.",
+              "maxLength": 20,
+              "type": "string"
+            }
+          },
+          "required": [
+            "instance",
+            "code",
+            "expiresIn",
+            "phoneNumber"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Ask Omni for a WhatsApp pairing code for a whatsapp-baileys instance, for the owner's number (the service's whatsapp_phone_number secret: Arca holds it, and the result shows it masked). The owner enters the code on the phone (WhatsApp > Linked devices > Link with phone number). Ask once: another code is refused while one lasts.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "omni_status",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The omni-api service's name (service_create, template omni-api).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": false,
+          "schema": {
+            "description": "The instance's id (from omni_instance_create or omni_status), or its name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "instance": {
+                  "maxLength": 36,
+                  "type": "string"
+                },
+                "isConnected": {
+                  "type": "boolean"
+                },
+                "message": {
+                  "anyOf": [
+                    {
+                      "maxLength": 300,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Omni's status message, untrusted."
+                },
+                "profileName": {
+                  "anyOf": [
+                    {
+                      "maxLength": 100,
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The account's profile name on its channel, untrusted."
+                },
+                "state": {
+                  "description": "Omni's connection state (connected, connecting, qr, disconnected, error, unknown, …).",
+                  "maxLength": 32,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "instance",
+                "state",
+                "isConnected",
+                "profileName",
+                "message"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "instances": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "channel": {
+                        "maxLength": 32,
+                        "type": "string"
+                      },
+                      "id": {
+                        "description": "The instance id: what omni_pair and omni_status take.",
+                        "maxLength": 36,
+                        "type": "string"
+                      },
+                      "isActive": {
+                        "description": "Whether Omni runs its connection.",
+                        "type": "boolean"
+                      },
+                      "name": {
+                        "maxLength": 64,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "name",
+                      "channel",
+                      "isActive"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 100,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "instances"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "summary": "An Omni instance's connection state (connected, connecting, qr, disconnected, …), or without instance the service's instances (id, name, channel, whether each runs).",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": false
+    },
+    {
       "name": "gpu_attach",
       "params": [
         {
