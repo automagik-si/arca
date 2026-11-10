@@ -663,14 +663,19 @@
     "gpu_detach",
     "storage_add",
     "snapshot_create",
-    "snapshot_delete"
+    "snapshot_delete",
+    "instance_start",
+    "instance_stop",
+    "instance_restart"
   ]);
   var GPU_ACTIONS = /* @__PURE__ */ new Set(["gpu_attach", "gpu_detach"]);
+  var INSTANCE_ACTIONS = /* @__PURE__ */ new Set(["instance_start", "instance_stop", "instance_restart"]);
   function normalizePci(value) {
     const match = String(value ?? "").trim().toLowerCase().match(/^(?:([0-9a-f]{4}):)?([0-9a-f]{2}:[0-9a-f]{2}\.[0-7])$/);
     return match ? `${match[1] ?? "0000"}:${match[2]}` : "";
   }
   var APPROVAL_TIMEOUT_MS = 3e4;
+  var INSTANCE_APPROVAL_TIMEOUT_MS = 18e4;
   var NO_SUCH_PLAN = "This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.";
   var MISSING_PROPOSAL = "The proposal is not waiting any more.";
   var NEUTRAL_REFUSAL = "Arca did not accept this approval. Try again from the card.";
@@ -790,6 +795,12 @@
   }
   function plainResult(action, result) {
     const value = result && typeof result === "object" ? result : {};
+    if (INSTANCE_ACTIONS.has(action)) {
+      const message = typeof value.message === "string" ? value.message.trim() : "";
+      if (!message) return "Arca finished the change.";
+      const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
+      return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
+    }
     if (value.removed === true) return "The service was removed.";
     if (value.unpublished === true) return "The service is no longer published.";
     if (typeof value.url === "string" && value.url) return `The change is live at ${value.url}.`;
@@ -2151,7 +2162,7 @@ ${statement}`)
           credentials: "same-origin",
           headers: { "Content-Type": "application/json", Accept: "application/json" },
           body: JSON.stringify(plan.linkedHost ? { plan: plan.id, approval, host: plan.linkedHost } : { plan: plan.id, approval }),
-          signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS)
+          signal: AbortSignal.timeout(INSTANCE_ACTIONS.has(plan.action) ? INSTANCE_APPROVAL_TIMEOUT_MS : APPROVAL_TIMEOUT_MS)
         });
         const body = await response.json().catch(() => ({}));
         if (!response.ok) {

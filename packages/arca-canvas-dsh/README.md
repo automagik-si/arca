@@ -291,11 +291,15 @@ The Doctor has the ten read-only Arca tools (`arca_status`, `watch_report`,
 `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`, `journal_list`,
 `service_list`, `storage_list`, `snapshot_list`) plus one non-read tool,
 `arca_propose`. `arca_propose` calls the kernel's `action_propose` viewer verb and
-records an inert proposal for one of twelve actions (`service_create`,
+records an inert proposal for one of fifteen actions (`service_create`,
 `service_remove`, `service_publish`, `service_unpublish`, `service_connect`,
 `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`,
-`storage_add`, `snapshot_create`, `snapshot_delete`); it changes nothing and a
-database delete cannot be proposed. A `storage_add` card for a whole disk always
+`storage_add`, `snapshot_create`, `snapshot_delete`, `instance_start`,
+`instance_stop`, `instance_restart`); it changes nothing and a
+database delete cannot be proposed. The three instance actions take
+`{project, instance}` and only for an instance Arca owns or has adopted; a stop
+and a restart are graceful, and their cards wait up to 180 seconds for the
+kernel's answer. A `storage_add` card for a whole disk always
 says "Everything on this disk will be erased." The `storage_list` and
 `snapshot_list` sizes reach the model as decimal GB. `arca_propose` may
 target `pageHost`, the host whose kernel serves this canvas and its approval
@@ -422,7 +426,7 @@ in plain words), `declined`, `expired` and `failed` (a plain reason). A cancelle
 passkey prompt returns the card to `waiting`. A failed approval whose entry is
 still listed becomes `waiting` again with a Retry button; a new waiting entry
 with the same id after a decline is waiting again. An approve POST that gets no
-answer after 30 seconds returns to `waiting` with "No answer from Arca, try
+answer after 30 seconds (180 for an instance start, stop or restart) returns to `waiting` with "No answer from Arca, try
 again." A `NoSuchPlan` answer says the proposal may have been approved or
 declined elsewhere and points at Steps, never "Nothing changed". Every kernel
 approval refusal code has its own plain sentence. A refusal after the passkey

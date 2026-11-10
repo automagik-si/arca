@@ -467,11 +467,12 @@ test('SSE framing keeps one JSON object per data line and cannot forge an event'
   assert.equal(frame.includes('\ndata: {"text":"hello'), true);
 });
 
-test('the proposal tool offers exactly the twelve allowed actions, never a database delete', () => {
+test('the proposal tool offers exactly the fifteen allowed actions, never a database delete', () => {
   assert.deepEqual([...PROPOSE_ACTIONS], [
     'service_create', 'service_remove', 'service_publish', 'service_unpublish',
     'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
     'storage_add', 'snapshot_create', 'snapshot_delete',
+    'instance_start', 'instance_stop', 'instance_restart',
   ]);
   assert.equal(PROPOSE_ACTIONS.includes('postgres_delete'), false);
   assert.equal(PROPOSE_ACTIONS.includes('gpu_delete'), false);
@@ -660,6 +661,11 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '  say so plainly. To snapshot an app, a data volume or a host folder such as /home, propose snapshot_create',
     '  onto a pool whose snapshots flag is true; to remove one, propose snapshot_delete with a name from',
     '  snapshot_list. A snapshot never starts and never changes what it copies.',
+    '- To start, stop or restart an instance, propose instance_start, instance_stop or instance_restart with its',
+    '  project and instance. Arca does this only for an instance it owns or has adopted; any other is refused. A',
+    '  stop or a restart interrupts what the instance serves and runs only after the owner approves the card. A',
+    '  stop is graceful and never forced: an instance that does not shut down in time stays running and the',
+    '  change is refused; say so plainly.',
     '- You can propose changes on alpha and on any machine linked to it for approvals. Another machine is',
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -1806,4 +1812,55 @@ test('the Doctor reads disks and snapshots and may propose storage and snapshot 
   assert.equal(disks.disks[0].role, 'free');
   const snapshots = JSON.parse(formatToolResult('snapshot_list', { snapshots: [{ name: 'shop--web--20261109T1405', size: 3_000_000_000 }] }));
   assert.equal(snapshots.snapshots[0].size, '3.0 GB');
+});
+
+test('the Doctor may propose a start, a stop and a restart of an instance, and each reaches action_propose', async () => {
+  const actions = ['instance_start', 'instance_stop', 'instance_restart'];
+  const calls = [];
+  const proposals = [];
+  const tool = createProposeTool({
+    hosts: [{ name: 'alpha' }],
+    proposalHost: 'alpha',
+    clientFor(name) {
+      return {
+        async call(verb, args) {
+          calls.push({ host: name, verb, args });
+          const word = { instance_start: 'Start', instance_stop: 'Stop', instance_restart: 'Restart' }[args.action];
+          return {
+            id: `act-${String(actions.indexOf(args.action) + 1).repeat(12)}`,
+            action: args.action,
+            summary: `${word} the instance ${args.args.instance} in project ${args.args.project}`,
+          };
+        },
+      };
+    },
+    onProposal(proposal) { proposals.push(proposal); },
+  });
+  assert.match(tool.description, /instance_start \{project, instance\}; instance_stop \{project, instance\}; instance_restart \{project, instance\}\./);
+  for (const action of actions) {
+    assert.equal(PROPOSE_ACTIONS.includes(action), true, action);
+    assert.equal(tool.parameters.properties.action.enum.includes(action), true, action);
+    const accepted = await tool.execute({ action, args: { project: 'studio', instance: 'web' } }, { callId: `call-${action}` });
+    assert.equal(accepted.id, `act-${String(actions.indexOf(action) + 1).repeat(12)}`);
+    const rendered = tool.output.render({}, accepted)[0].text;
+    assert.match(rendered, /the instance web in project studio\. It waits for the owner's approval\./);
+  }
+  assert.deepEqual(calls, actions.map((action) => ({
+    host: 'alpha', verb: 'action_propose', args: { action, args: { project: 'studio', instance: 'web' } },
+  })));
+  assert.deepEqual(proposals.map(({ id }) => id), ['act-111111111111', 'act-222222222222', 'act-333333333333']);
+  // A force stop or a delete of an instance is not something the canvas can ask for.
+  for (const action of ['instance_delete', 'instance_kill', 'instance_force_stop']) {
+    await assert.rejects(
+      tool.execute({ action, args: { project: 'studio', instance: 'web' } }, { callId: 'c' }),
+      /That action cannot be proposed\./,
+    );
+  }
+
+  const prompt = doctorPrompt({ hosts: [{ name: 'alpha' }], approvalUrl: 'https://example.com/approve' });
+  assert.match(prompt, /propose instance_start, instance_stop or instance_restart/);
+  assert.match(prompt, /only for an instance it owns or has adopted/);
+  assert.match(prompt, /runs only after the owner approves the card/);
+  assert.match(prompt, /graceful and never forced/);
+  assert.match(prompt, /does not shut down in time stays running/);
 });
