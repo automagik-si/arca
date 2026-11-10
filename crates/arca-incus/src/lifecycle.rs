@@ -19,8 +19,12 @@ use crate::write::ProjectFamily;
 
 /// How long Incus lets an instance shut down by itself before the stop, or the stop half of a restart, fails.
 pub const GRACE_SECONDS: u64 = 60;
-/// The longest one state change is waited on, its grace included.
-const DEADLINE: Duration = Duration::from_secs(150);
+/// The longest one state change's operation is waited on: the grace, and time for Incus to fail the operation after it.
+const DEADLINE: Duration = Duration::from_secs(90);
+/// The longest one caller's whole action may take: two reads before the change, the change's own request, the wait on its
+/// operation, the read-back and one more read after a failure, each read and request bounded by the client's timeout. A
+/// relay that waits for the answer must wait longer than this.
+pub const CALL_BUDGET: Duration = Duration::from_secs(150);
 /// How long one wait request asks Incus to hold.
 const WAIT_SECONDS: u64 = 5;
 /// The pause between two looks at an operation that is still running.
@@ -219,11 +223,13 @@ impl StateChanger {
                 return Err(IncusError::Timeout);
             }
             let path = format!("/1.0/operations/{id}/wait?timeout={WAIT_SECONDS}");
+            // One wait never outlasts what is left of the deadline, so the whole wait is bounded by it.
+            let left = self.deadline.saturating_sub(started.elapsed());
             let framed = self.send_within(
                 "GET",
                 &path,
                 None,
-                Duration::from_secs(WAIT_SECONDS) + self.timeout,
+                (Duration::from_secs(WAIT_SECONDS) + self.timeout).min(left),
             )?;
             let answer = checked_envelope(framed).map_err(|error| match error {
                 IncusError::Status { .. } => {
@@ -379,4 +385,16 @@ fn refused(reason: &str) -> IncusError {
 
 fn decode(reason: &str) -> IncusError {
     IncusError::Decode(reason.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_call_budget_covers_every_request_of_one_action() {
+        // Two reads, the PUT, the wait, the read-back and the read after a failure.
+        assert!(TIMEOUT * 5 + DEADLINE <= CALL_BUDGET);
+        assert!(Duration::from_secs(GRACE_SECONDS) < DEADLINE);
+    }
 }

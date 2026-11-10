@@ -268,6 +268,7 @@ fn a_doctor_starts_a_stopped_instance_of_arcas_and_a_second_start_says_it_alread
     assert_eq!(journal[0]["project"], json!(PROJECT));
     assert_eq!(journal[0]["instance"], json!("web"));
     assert_eq!(journal[0]["token_id"], json!("doctor-1"));
+    assert_eq!(journal[0]["proposal"], Value::Null, "a direct start");
     assert_eq!(journal[0]["at_ms"], json!(NOW));
     assert_eq!(journal[1]["kind"], json!("end"));
     assert_eq!(journal[1]["id"], journal[0]["id"]);
@@ -472,6 +473,10 @@ fn a_stop_and_a_restart_run_only_from_an_approved_proposal() {
     assert_eq!(rig.status(PROJECT, "api"), "Stopped");
     let journal = rig.journal();
     assert_eq!(journal[0]["token_id"], json!("owner-approval"));
+    assert_eq!(
+        journal[0]["proposal"], proposal["id"],
+        "the journal names the approved proposal"
+    );
     assert_eq!(journal[1]["outcome"], json!("stopped"));
 
     // A stop of a stopped instance is approved like any other, changes nothing, succeeds and says so.
@@ -634,6 +639,25 @@ fn an_instance_that_will_not_shut_down_stays_running_and_nothing_is_forced() {
     assert_eq!(ends[0]["outcome"], json!("failed"));
     assert_eq!(ends[0]["code"], json!("InstanceStopFailed"));
     assert_eq!(ends[1]["code"], json!("InstanceRestartFailed"));
+}
+
+#[test]
+fn an_instance_recreated_after_it_was_read_is_refused_before_any_write() {
+    let rig = Rig::new("life-recreated");
+    let changer = arca_incus::StateChanger::new(
+        rig.fake.socket().to_path_buf(),
+        ProjectFamily::new([PROJECT], ["droid"]).expect("the family is valid"),
+    );
+    let mut seen = changer.read(PROJECT, "api").expect("the instance reads");
+    // The instance the caller checked had another uuid: this one was made under its name since.
+    seen.uuid = Some("00000000-0000-4000-8000-00000000dead".to_string());
+    let refused = changer.change(&seen, arca_incus::StateAction::Stop);
+    assert!(
+        matches!(refused, Err(arca_incus::IncusError::Refused(_))),
+        "{refused:?}"
+    );
+    assert_eq!(rig.state_writes(), 0, "nothing was sent");
+    assert_eq!(rig.status(PROJECT, "api"), "Running");
 }
 
 #[test]

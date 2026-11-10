@@ -490,7 +490,7 @@ one when the owner says so.
 They act only on an instance Arca owns or has adopted: one in `kernel.projects` whose own config carries the kernel's
 mark (`user.arcakernel.entry`, which an adoption leaves as `adopt-<name>`), the same check `gpu_attach` makes. An instance
 outside the family, one with no mark, droidd's, one both marks contest, and one whose delete plan was declined are each
-refused with `InstanceNotArca` and a sentence that says why; nothing is sent to it. A name that does not exist is
+refused with `InstanceNotArca` and a sentence that says why; no write is sent to it (an instance inside the family is read first). A name that does not exist is
 `InstanceUnknown`. A watch-only node has no state writer and answers `InstanceLifecycleDisabled`.
 
 | Verb | Who runs it | On a running instance | On a stopped instance |
@@ -506,10 +506,13 @@ ask and the owner approves on the approval page; an approved `instance_start` ru
 requests (`owner_approval_request`) have no word for a stop or a restart, so those two run through a proposal only. An
 instance that is not Arca's cannot be proposed either, so the owner is never shown a card for it.
 
-A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. An instance
+A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. One call takes
+at most 150 seconds, and the approval page waits 180 seconds for a linked kernel's answer to an approval (30 for any other
+relayed write), so a slow stop on a linked host still answers as done or with its own refusal. An instance
 that does not shut down stays running and the call is refused with `InstanceStopFailed` or `InstanceRestartFailed`, with
 the state the instance is in now. A frozen instance, or one in an error state, is left as it is
-(`InstanceStateUnsupported`).
+(`InstanceStateUnsupported`). An instance recreated between the owner check and the change is refused with
+`InstanceChanged`, and nothing is sent to it.
 
 The result is `{project, instance, action, status, changed, message}`: `status` is the state after the call and `message`
 is the sentence a person reads.
@@ -518,12 +521,13 @@ A power state is not a desired-state entry, so these changes are not in `journal
 them. Each call that passes its gate is written to `instance-actions.jsonl` in the state directory instead:
 
 ```
-{"kind":"begin","id":"ia-<ms>-<n>","at_ms":<ms>,"token_id":"<the caller's token, or owner-approval>","action":"start","project":"<project>","instance":"<instance>"}
+{"kind":"begin","id":"ia-<ms>-<n>","at_ms":<ms>,"token_id":"<the caller's token, or owner-approval>","proposal":"<act-… of the approved proposal, or null>","action":"start","project":"<project>","instance":"<instance>"}
 {"kind":"end","id":"ia-<ms>-<n>","outcome":"started","code":null,"uuid":"<volatile uuid>","status":"Running"}
 ```
 
 `outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`, `refused` or
-`failed`, and `code` is the refusal's code for the last two. The `begin` line is durable before anything is sent to Incus:
+`failed`, and `code` is the refusal's code for the last two: `failed` only when a state change was sent and did not finish.
+`proposal` is the approved proposal a stop or a restart ran from; a start carries no grant, so it is `null` there. The `begin` line is durable before anything is sent to Incus:
 when it cannot be written (the file is a link, or is not mode 0600) the call is refused with `InstanceJournalUnavailable`
 and nothing changes. A file past 8 MiB is set aside as `instance-actions.jsonl.1`, replacing the one set aside before.
 

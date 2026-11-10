@@ -3,7 +3,7 @@
 //! The three verbs name one instance by its project and its name. They act only on an instance Arca owns or has adopted:
 //! one in the kernel's project family whose own config classes it as a kernel object, the check the GPU verbs make
 //! (OWNERSHIP Rules 5 and 8). A foreign, droidd, contested or retained instance, and any instance outside the family, is
-//! refused in plain words and nothing is sent to it. A watch-only node builds no state writer at all.
+//! refused in plain words and no write is sent to it. A watch-only node builds no state writer at all.
 //!
 //! `instance_start` runs for a doctor's direct call: starting what Arca owns takes nothing away. `instance_stop` and
 //! `instance_restart` interrupt whatever the instance serves, so they run only with the one-shot grant of an action
@@ -157,13 +157,15 @@ impl InstanceLifecycle {
         }
     }
 
-    /// Runs one action for the caller `token`, journalled before and after. Returns the verb's result.
+    /// Runs one action for the caller `token`, journalled before and after. `proposal` is the approved proposal whose
+    /// grant the call consumed, when it consumed one. Returns the verb's result.
     pub fn run(
         &self,
         action: StateAction,
         project: &str,
         instance: &str,
         token: &str,
+        proposal: Option<&str>,
         now_ms: u64,
     ) -> Result<Value, CallError> {
         let mut last = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
@@ -174,6 +176,7 @@ impl InstanceLifecycle {
             "id": id,
             "at_ms": now_ms,
             "token_id": token,
+            "proposal": proposal,
             "action": action.as_str(),
             "project": project,
             "instance": instance,
@@ -287,6 +290,13 @@ impl InstanceLifecycle {
                 outcome,
                 message: changed_words,
             }),
+            // The writer refused before it sent the change: the instance was recreated after the owner check. Nothing was
+            // sent, so this is a refusal and not a failed change.
+            Err(IncusError::Refused(why)) => Err(Stopped {
+                refusal: changed_refusal(&named, &why),
+                uuid: seen.uuid.clone(),
+                was: Some(seen.status.clone()),
+            }),
             Err(error) => {
                 // What the instance is now is read again, so the refusal says what is true and not what was asked.
                 let now = self
@@ -367,6 +377,14 @@ fn refused(code: &str, message: impl Into<String>) -> CallError {
     }
 }
 
+/// The refusal of a change the writer did not send, because the instance is no longer the one that was checked.
+fn changed_refusal(named: &str, why: &str) -> CallError {
+    refused(
+        "InstanceChanged",
+        format!("{named} changed after it was checked ({why}); nothing was sent to it"),
+    )
+}
+
 fn not_arca(project: &str, instance: &str, why: &str) -> CallError {
     refused(
         "InstanceNotArca",
@@ -444,10 +462,12 @@ impl ToolHandler for LifecycleHandler {
             .action
             .prepare(&bare, None)
             .map_err(CallError::Invalid)?;
+        let mut proposal = None;
         if let Some(grant) = grant {
             let mut kernel = self.kernel.lock().map_err(|_| {
                 CallError::Internal("the kernel could not complete the call".into())
             })?;
+            proposal = kernel.action_grant_id(&grant);
             if !kernel.consume_action_grant(self.action.as_str(), &args, &grant) {
                 return Err(refused(
                     "NotApproved",
@@ -460,6 +480,7 @@ impl ToolHandler for LifecycleHandler {
             args["project"].as_str().unwrap_or_default(),
             args["instance"].as_str().unwrap_or_default(),
             &caller.token_id,
+            proposal.as_deref(),
             (self.clock)(),
         )
     }
@@ -490,4 +511,23 @@ pub fn handlers(
         )
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_the_writer_never_sent_is_a_refusal_and_not_a_failed_change() {
+        let CallError::Refused { code, message } = changed_refusal(
+            "the instance web in project p",
+            "the instance was recreated since it was read",
+        ) else {
+            panic!("a refusal");
+        };
+        assert_eq!(code, "InstanceChanged");
+        assert!(message.contains("nothing was sent"), "{message}");
+        // The journal calls an outcome failed only for the codes of a change that was sent.
+        assert!(!code.ends_with("Failed"));
+    }
 }

@@ -39,7 +39,7 @@ pub use assign::{DeviceAssigner, GpuChange, InstanceDevices, device_name, normal
 pub use fake::{Appears, OpId};
 pub use fake::{FakeIncus, FakeState, RecordedRequest, WriteRecord};
 #[cfg(feature = "write")]
-pub use lifecycle::{GRACE_SECONDS, InstanceState, StateAction, StateChanger};
+pub use lifecycle::{CALL_BUDGET, GRACE_SECONDS, InstanceState, StateAction, StateChanger};
 pub use read::{IncusError, IncusRead, Target, Unconfirmed, UnixIncus};
 pub use read::{
     OPERATIONS_PATH, RunningOp, SESSION_DESCRIPTIONS, TOKEN_CLASS, operation_names, running_on,
