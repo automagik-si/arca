@@ -19,6 +19,7 @@ export const PROPOSE_ACTIONS = Object.freeze([
   'service_create', 'service_remove', 'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   'storage_add', 'snapshot_create', 'snapshot_delete',
+  'instance_start', 'instance_stop', 'instance_restart',
 ]);
 
 export const DEFAULTS = Object.freeze({
@@ -353,6 +354,11 @@ export function doctorPrompt({ hosts = [], approvalUrl = '', proposalHost = '', 
     '  say so plainly. To snapshot an app, a data volume or a host folder such as /home, propose snapshot_create',
     '  onto a pool whose snapshots flag is true; to remove one, propose snapshot_delete with a name from',
     '  snapshot_list. A snapshot never starts and never changes what it copies.',
+    '- To start, stop or restart an instance, propose instance_start, instance_stop or instance_restart with its',
+    '  project and instance. Arca does this only for an instance it owns or has adopted; any other is refused. A',
+    '  stop or a restart interrupts what the instance serves and runs only after the owner approves the card. A',
+    '  stop is graceful and never forced: an instance that does not shut down in time stays running and the',
+    '  change is refused; say so plainly.',
     `- You can propose changes on ${proposeHost} and on any machine linked to it for approvals. Another machine is`,
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -773,7 +779,8 @@ const PROPOSE_ARGUMENTS = 'service_create {name, template}; service_remove {name
   + 'service_connect {from, to}; service_disconnect {from, to}; postgres_create {name}; '
   + 'gpu_attach {instance, pci}; gpu_detach {instance, pci}; '
   + 'storage_add {name, device} or {name, path}; snapshot_create {project, instance or volume, pool} or {folder, pool}; '
-  + 'snapshot_delete {name}.';
+  + 'snapshot_delete {name}; instance_start {project, instance}; instance_stop {project, instance}; '
+  + 'instance_restart {project, instance}.';
 
 export const NOT_LINKED = 'this machine is not linked for approvals yet';
 
