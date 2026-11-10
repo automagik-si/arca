@@ -52,6 +52,7 @@ struct PausedProvider {
     inner: IncusProvider,
     pause: Option<RemovalPause>,
     fail_observe: Arc<Mutex<Option<String>>>,
+    unknown_create: Arc<Mutex<bool>>,
 }
 
 impl Provider for PausedProvider {
@@ -77,6 +78,18 @@ impl Provider for PausedProvider {
         op: &EffectOp,
         planned: &Planned,
     ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
+        // An instance create whose answer never came: the provider cannot tell whether it landed.
+        if *self.unknown_create.lock().expect("unknown switch")
+            && matches!(
+                op,
+                EffectOp::IncusCreate {
+                    kind: IncusKind::Instance,
+                    ..
+                }
+            )
+        {
+            return Err(EffectRefusal::Unresolved);
+        }
         self.inner.effect(entry, op, planned)
     }
     fn read_back(
@@ -123,6 +136,7 @@ struct Rig {
     kernel: Arc<Mutex<Kernel>>,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     fail_observe: Arc<Mutex<Option<String>>>,
+    unknown_create: Arc<Mutex<bool>>,
 }
 
 impl Rig {
@@ -220,6 +234,8 @@ impl Rig {
         let secrets = dir.join("secrets");
         let fail_observe = Arc::new(Mutex::new(None));
         let provider_fail_observe = Arc::clone(&fail_observe);
+        let unknown_create = Arc::new(Mutex::new(false));
+        let provider_unknown_create = Arc::clone(&unknown_create);
         let kernel = Arc::new(Mutex::new(
             Kernel::open(
                 &dir,
@@ -244,6 +260,7 @@ impl Rig {
                         .expect("provider"),
                         pause,
                         fail_observe: provider_fail_observe,
+                        unknown_create: provider_unknown_create,
                     }))
                 },
                 NOW,
@@ -260,6 +277,7 @@ impl Rig {
             kernel,
             handlers,
             fail_observe,
+            unknown_create,
         }
     }
 
@@ -792,10 +810,13 @@ fn a_failed_create_leaves_no_acl_behind_and_no_row() {
     .unwrap();
     rig.fake.set_reject_config_on_post("/1.0/instances");
     let failed = rig.call("service_create", json!({"name":"nats","template":"nats"}));
-    assert!(matches!(
-        failed,
-        Err(CallError::Refused { message, .. }) if message == "create service nats from template nats"
-    ));
+    let Err(CallError::Refused { message, .. }) = failed else {
+        panic!("a failed create is refused");
+    };
+    assert_eq!(
+        message,
+        "create service nats from template nats: the create did not land; nothing was left behind"
+    );
     assert!(
         rig.get(&format!(
             "/1.0/network-acls/{PROJECT}-svc-nats?project=default"
@@ -833,7 +854,7 @@ fn a_failed_create_leaves_no_acl_behind_and_no_row() {
     );
     assert!(
         matches!(rig.call("service_create", json!({"name":"another","template":"nats"})),
-        Err(CallError::Refused { message, .. }) if message == "create service another from template nats")
+        Err(CallError::Refused { message, .. }) if message == "create service another from template nats: the create did not land; nothing was left behind")
     );
     assert!(
         !rig.dir.join("secrets/service-another").exists(),
@@ -2185,6 +2206,7 @@ fn service_logs_reads_a_system_services_console_without_a_template_mark() {
             "ports":[],"env":{},"publishable":false
         }),
     );
+    rig.fake.add_image(PROJECT, "dash-image");
     rig.call("service_create", json!({"name":"dash","template":"dash"}))
         .expect("system service");
     rig.edit(
@@ -2613,5 +2635,275 @@ fn a_netproject_read_failure_does_not_refuse_a_service_remove_or_skip_secret_cle
         rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
             .is_none(),
         "the instance was deleted"
+    );
+}
+
+#[test]
+fn service_create_names_the_missing_entrypoint_script_and_how_it_gets_there() {
+    let rig = Rig::new();
+    rig.template(
+        "jet",
+        json!({
+            "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+            "ports":[8080],"env":{},"publishable":false,
+            "entrypoint":["/bin/sh","-ec",{"file":"jet.sh"},"jet"]
+        }),
+    );
+    let Err(CallError::Refused { code, message }) =
+        rig.call("service_create", json!({"name":"jet","template":"jet"}))
+    else {
+        panic!("a template without its script is refused");
+    };
+    assert_eq!(code, "refused");
+    let path = rig.dir.join("templates/jet.sh");
+    assert!(
+        message.starts_with(
+            "template jet: its entrypoint script is not installed (templates/jet.sh does not exist). \
+             The script belongs beside templates/jet.json in the state directory"
+        ),
+        "the refusal names the file it looked for and where it belongs: {message}"
+    );
+    assert!(
+        message.contains("for a template Arca ships, `arca templates install --config <file>`"),
+        "the one-step install is offered for shipped templates only: {message}"
+    );
+    assert!(
+        !message.contains(&rig.dir.display().to_string()) && !message.contains("ships beside"),
+        "no absolute state path, and no claim that this template is shipped: {message}"
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
+            .is_none()
+            && rig
+                .get(&format!(
+                    "/1.0/network-acls/{PROJECT}-svc-jet?project=default"
+                ))
+                .is_none()
+            && !rig
+                .entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-jet"),
+        "nothing was created"
+    );
+    // The script in place, the same call creates the service.
+    fs::write(&path, "exec jet\n").expect("script");
+    rig.call("service_create", json!({"name":"jet","template":"jet"}))
+        .expect("create");
+}
+
+#[test]
+fn an_entrypoint_script_is_a_plain_file_name_in_the_template_directory() {
+    let rig = Rig::new();
+    fs::write(rig.dir.join("outside.sh"), "exec evil\n").expect("script");
+    for file in ["../outside.sh", "/etc/hostname", ".hidden", ""] {
+        rig.template(
+            "jet",
+            json!({
+                "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+                "ports":[8080],"env":{},"publishable":false,
+                "entrypoint":["/bin/sh","-ec",{"file":file}]
+            }),
+        );
+        assert!(
+            matches!(
+                rig.call("service_create", json!({"name":"jet","template":"jet"})),
+                Err(CallError::Refused { message, .. })
+                    if message.starts_with("entrypoint: invalid file (a plain file name in the templates directory")
+            ),
+            "{file:?} is refused"
+        );
+    }
+}
+
+#[test]
+fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_step() {
+    let rig = Rig::new();
+    let dir = rig.dir.join("templates");
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("install");
+    assert_eq!(report["dir"], json!(dir.display().to_string()));
+    assert_eq!(report["unchanged"], json!([]));
+    assert_eq!(report["kept"], json!([]));
+    let installed: Vec<&str> = report["installed"]
+        .as_array()
+        .expect("installed")
+        .iter()
+        .map(|name| name.as_str().expect("a name"))
+        .collect();
+    // Every template the repository ships is installed, and each loads with its entrypoint script readable.
+    let mut templates = 0;
+    for entry in fs::read_dir(&shipped).expect("templates/") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .into_string()
+            .expect("name");
+        let Some(template) = name.strip_suffix(".json") else {
+            continue;
+        };
+        templates += 1;
+        assert!(installed.contains(&name.as_str()), "{name} is installed");
+        assert_eq!(
+            fs::read(dir.join(&name)).expect("installed"),
+            fs::read(shipped.join(&name)).expect("shipped"),
+            "{name} is the shipped file"
+        );
+        let loaded = service::load_template(&dir, template).expect("the installed template loads");
+        service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
+    }
+    assert_eq!(templates, 5);
+    assert!(installed.contains(&"postgres-autopg.sh"));
+    assert_eq!(
+        fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
+        0o700
+    );
+
+    // A second run changes nothing. A file that differs is kept, and replaced only when asked.
+    let again = arca::cmd_templates::install_into(&dir, false).expect("again");
+    assert_eq!(again["installed"], json!([]));
+    assert_eq!(
+        again["unchanged"].as_array().expect("unchanged").len(),
+        installed.len()
+    );
+    fs::write(dir.join("nats.json"), "{}").expect("an edit");
+    fs::remove_file(dir.join("postgres-autopg.sh")).expect("remove");
+    fs::write(dir.join("mine.json"), "{}").expect("the owner's own template");
+    let partial = arca::cmd_templates::install_into(&dir, false).expect("partial");
+    assert_eq!(partial["installed"], json!(["postgres-autopg.sh"]));
+    assert_eq!(partial["kept"], json!(["nats.json"]));
+    assert_eq!(
+        fs::read_to_string(dir.join("nats.json")).expect("kept"),
+        "{}"
+    );
+    let replaced = arca::cmd_templates::install_into(&dir, true).expect("replace");
+    assert_eq!(replaced["installed"], json!(["nats.json"]));
+    assert_eq!(replaced["kept"], json!([]));
+    service::load_template(&dir, "nats").expect("the shipped nats again");
+    assert_eq!(
+        fs::read_to_string(dir.join("mine.json")).expect("mine"),
+        "{}"
+    );
+}
+
+#[test]
+fn service_create_refuses_a_local_image_the_service_project_does_not_hold_and_names_it() {
+    let rig = Rig::new();
+    rig.template(
+        "dash",
+        json!({
+            "name":"dash","kind":"system","image":"local:dash-image",
+            "ports":[],"env":{},"secrets":["TOKEN"],"generate":{"TOKEN":"test_"},"publishable":false
+        }),
+    );
+    // The service project exists once a service was made in it. Another alias there does not stand in for the template's.
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("nats");
+    rig.fake.add_image(PROJECT, "other-image");
+    let writes = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| request.method != "GET")
+            .count()
+    };
+    let before = writes(&rig);
+    let Err(CallError::Refused { code, message }) =
+        rig.call("service_create", json!({"name":"dash","template":"dash"}))
+    else {
+        panic!("a missing local image is refused");
+    };
+    assert_eq!(code, "refused");
+    assert!(
+        message.starts_with(&format!(
+            "template dash: its image dash-image is not on this node: no image in the service project {PROJECT} has that alias"
+        )),
+        "{message}"
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-dash?project=default"
+        ))
+        .is_none()
+            && !rig.dir.join("secrets/service-dash").exists()
+            && !rig
+                .entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-dash")
+            && writes(&rig) == before,
+        "nothing was written"
+    );
+    rig.fake.add_image(PROJECT, "dash-image");
+    rig.call("service_create", json!({"name":"dash","template":"dash"}))
+        .expect("the image in place, the service is created");
+}
+
+#[test]
+fn a_failed_create_of_a_data_template_names_the_volume_left_for_the_owners_approval() {
+    let rig = Rig::with(
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![("pool1".into(), json!({}))],
+        },
+        vec![PROJECT.into()],
+        Some("192.0.2.0/24"),
+    );
+    let mut template = nats_template();
+    template["data"] = json!({"path":"/data"});
+    rig.template("nats", template);
+    rig.fake.set_reject_config_on_post("/1.0/instances");
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+    else {
+        panic!("a failed create is refused");
+    };
+    assert_eq!(
+        message,
+        "create service nats from template nats: the create did not land; its data volume nats-data still exists, \
+         waiting for the owner's approval to be deleted (plan_list shows the plan)"
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/storage-pools/pool1/volumes/custom/nats-data?project={PROJECT}"
+        ))
+        .is_some(),
+        "the volume the refusal names is there"
+    );
+    let plans = rig.kernel.lock().unwrap().pending_plans();
+    assert_eq!(plans.len(), 1, "one delete plan waits");
+    assert!(
+        plans[0]
+            .objects
+            .iter()
+            .any(|object| object.kind == IncusKind::Volume && object.name == "nats-data"),
+        "and it holds the volume"
+    );
+}
+
+#[test]
+fn a_create_whose_outcome_is_not_known_does_not_claim_that_nothing_was_left_behind() {
+    let rig = Rig::new();
+    rig.template("nats", nats_template());
+    *rig.unknown_create.lock().unwrap() = true;
+    let Err(CallError::Refused { message, .. }) =
+        rig.call("service_create", json!({"name":"nats","template":"nats"}))
+    else {
+        panic!("an unresolved create is refused");
+    };
+    assert_eq!(
+        message,
+        "create service nats from template nats: the outcome is not known; the intent stays open; \
+         the cleanup did not complete (an earlier effect is unresolved; the step does not run), \
+         so objects of this service may remain"
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-nats?project=default"
+        ))
+        .is_some(),
+        "nothing was reverted: the ACL the refusal warns about is still there"
     );
 }
