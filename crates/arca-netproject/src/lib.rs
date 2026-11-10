@@ -1,4 +1,5 @@
-//! The shared service project and its bridge, owned by one desired-state entry.
+//! The shared service project and its bridge, owned by one desired-state entry. On a bridged node the project is made
+//! alone, by [`BridgedProject`]: no network, no profile.
 use arca_kernel::{
     desired::PluginId,
     journal::EffectClass,
@@ -98,6 +99,71 @@ pub fn create(
         body,
     })?;
     Ok(())
+}
+
+/// The entry that owns the service project on a bridged node.
+pub const BRIDGED_ENTRY: &str = "bridged-arcak-svc";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgedProjectConfig {
+    pub project: String,
+    /// The caps on everything in the project together, set as its `limits.*` keys when it is created.
+    pub virtual_machines: u32,
+    pub cpu: u32,
+    pub memory: String,
+    pub disk: String,
+}
+
+/// The service project of a bridged node. It creates the project and nothing else: no Incus network, no profile. The
+/// project lets a NIC name a host bridge (`restricted.devices.nic=allow`), which the provider grants to this entry alone,
+/// and carries the node's caps as `limits.*`. Nothing changes the project after its create: new caps are set by hand.
+pub struct BridgedProject;
+
+impl Plugin for BridgedProject {
+    const ID: &'static str = "arca.bridgedproject";
+    type Config = BridgedProjectConfig;
+    fn manifest() -> Manifest {
+        Manifest {
+            id: PluginId(Self::ID.into()),
+            version: "0.1.0".into(),
+            provides: vec![],
+            effects: vec![(IncusKind::Project, EffectClass::B)],
+            projects: vec![PROJECT.into()],
+            observes: true,
+        }
+    }
+    fn apply(ctx: &mut Ctx<'_>, cfg: &BridgedProjectConfig) -> Result<(), PluginError> {
+        if cfg.project != PROJECT || ctx.entry().0 != BRIDGED_ENTRY {
+            return Err(PluginError::Config(
+                "the bridged entry owns the service project".into(),
+            ));
+        }
+        // `observed` refuses a project another entry made, so a node that already has the managed service network is
+        // never turned into a bridged one.
+        if observed(
+            ctx,
+            format!("/1.0/projects/{}?project={}", cfg.project, cfg.project),
+        )?
+        .is_none()
+        {
+            create(
+                ctx,
+                IncusKind::Project,
+                &cfg.project,
+                &cfg.project,
+                json!({"name": cfg.project, "config": {
+                    "restricted.devices.nic": "allow",
+                    "limits.containers": "0",
+                    "limits.virtual-machines": cfg.virtual_machines.to_string(),
+                    "limits.cpu": cfg.cpu.to_string(),
+                    "limits.memory": cfg.memory,
+                    "limits.disk": cfg.disk
+                }}),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 impl Plugin for NetProject {

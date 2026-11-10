@@ -4087,6 +4087,97 @@ fn proxy_allowance_is_scoped_to_the_service_network_entry_and_project() {
 }
 
 #[test]
+fn the_host_bridge_nic_allowance_is_scoped_to_the_bridged_project_entry_and_to_a_create() {
+    let (scratch, fake) = start("bridged-nic-allowance");
+    let mut family = family();
+    family.projects.push("arcak-svc".into());
+    let mut provider = IncusProvider::new(
+        fake.socket().into(),
+        family,
+        secrets_dir(&scratch),
+        RetainedSet::empty(),
+    )
+    .unwrap();
+    let project = |project: &str, key: &str, value: &str| {
+        create(
+            IncusKind::Project,
+            project,
+            None,
+            project,
+            json!({"config":{key:value}}),
+        )
+    };
+    for (owner, name, key, value) in [
+        ("toy", "arcak-svc", "restricted.devices.nic", "allow"),
+        (
+            "net-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.nic",
+            "allow",
+        ),
+        (
+            "bridged-arcak-svc",
+            "svc",
+            "restricted.devices.nic",
+            "allow",
+        ),
+        (
+            "bridged-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.nic",
+            "block",
+        ),
+        (
+            "bridged-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.disk",
+            "allow",
+        ),
+        (
+            "bridged-arcak-svc",
+            "arcak-svc",
+            "restricted.devices.proxy",
+            "allow",
+        ),
+        ("bridged-arcak-svc", "arcak-svc", "restricted", "false"),
+    ] {
+        assert!(
+            matches!(
+                provider.plan(&entry(owner), &project(name, key, value)),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{owner}: {name} {key}={value}"
+        );
+    }
+    assert!(fake.requests().is_empty(), "refused before any request");
+
+    // The bridged entry creates its own project with the key, restricted like every kernel project.
+    let owner = entry("bridged-arcak-svc");
+    let op = project("arcak-svc", "restricted.devices.nic", "allow");
+    let plan = provider.plan(&owner, &op).expect("the create is planned");
+    provider
+        .effect(&owner, &op, &plan)
+        .expect("the project is created");
+    let made = arca_incus::UnixIncus::new(fake.socket().into())
+        .get("/1.0/projects/arcak-svc?project=arcak-svc")
+        .expect("the project");
+    assert_eq!(made["config"]["restricted"], "true");
+    assert_eq!(made["config"]["restricted.devices.nic"], "allow");
+
+    // No patch sets or clears the key afterwards, by the owner or anyone else.
+    for value in [Some("allow"), Some("managed"), None] {
+        let op = patch(
+            object(IncusKind::Project, "arcak-svc", None, "arcak-svc"),
+            &[("restricted.devices.nic", value)],
+        );
+        assert!(
+            matches!(provider.plan(&owner, &op), Err(EffectRefusal::Provider(_))),
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
 fn custom_volume_observe_checks_pool_route_family_project_and_ownership() {
     let (scratch, fake) = start("volume-observe");
     let mut provider = provider(&fake, &secrets_dir(&scratch));

@@ -75,6 +75,7 @@ refused without the value being echoed back.
 | `kernel.reservedCidrs` | no | Subnets reserved for droidd. Read by later steps only. |
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
+| `kernel.bridged` | no | Bridged mode: `{ "bridges": ["<host bridge>", ...], "pool": "<Incus storage pool>", "limits": { "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" } }`, every key required. The node runs virtual-machine services on host bridges that already exist, and Arca creates no Incus network on it. It excludes `kernel.serviceCidr`. See "Bridged nodes and virtual machines". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
@@ -251,8 +252,9 @@ needs is available. `service_list` and `service_status` derive state from Incus 
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
 listener. `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The five shipped templates live in `templates/`, with their pinned
-images and vendored npm lockfile.
+secrets redacted and a capped, truncated result. The six shipped templates live in `templates/`, with their pinned
+images and vendored npm lockfile. One of them, `workspace-vm`, is a virtual machine for a bridged node (see
+"Bridged nodes and virtual machines").
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint reads (`postgres-autopg.sh` for `postgres-autopg`), from the build itself, so no checkout is
@@ -1960,6 +1962,122 @@ When a commit fails, for example on a full disk:
   second also counts as a failure, although its events are kept.
 - A rollup that fails, which runs at the first tick of a minute, takes the same path: that tick's `storeError` is set and
   `store-write-failed` fires.
+
+## Bridged nodes and virtual machines
+
+A bridged node is a host where Arca must not create a network: it runs beside another hypervisor, on that hypervisor's
+bridges and storage, and shares its memory. The node config says so:
+
+```json
+"kernel": {
+  "projects": ["arcak-svc"],
+  "droiddProjects": ["app1"],
+  "bridged": {
+    "bridges": ["br0"],
+    "pool": "vmpool",
+    "limits": { "virtualMachines": 8, "cpu": 16, "memory": "64GiB", "disk": "1TiB" }
+  }
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `bridges` | The host bridges a virtual machine's NIC may join. Each is an interface name of 1 to 15 letters, digits, `-`, `_` and `.`, listed once; at least one is required. |
+| `pool` | The name of an Incus storage pool (as `incus storage list` shows it, a Ceph RBD pool for example), not a Ceph pool name or a path. Every virtual machine's root disk is created on it. |
+| `limits` | What all of Arca's virtual machines on this node may use together. All four caps are required: `virtualMachines` and `cpu` are whole numbers of at least 1, `memory` and `disk` are sizes such as `64GiB`. |
+
+Arca writes neither the bridges nor the pool: both must exist before the first create. `arca serve` refuses to start
+when a listed bridge is not a bridge on this host. It reads `/sys/class/net/<bridge>/bridge` for that and asks Incus
+nothing. `kernel.bridged` and `kernel.serviceCidr` cannot both be set, and a scratch run cannot be bridged.
+
+On a bridged node Arca creates no Incus network, no bridge, no network ACL, no profile and no address reservation, so
+Incus adds no firewall rule for it. The first `service_create` adds the entry `bridged-arcak-svc`, which creates the
+project `arcak-svc` and nothing else. That project is restricted like every kernel project, with these keys more:
+
+| Project key | Value | Why |
+|-------------|-------|-----|
+| `restricted.devices.nic` | `allow` | Incus needs it before a NIC may name a bridge it does not manage. The provider grants the key to this entry alone, in this project alone, and only when the project is created. |
+| `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk` | the caps of `kernel.bridged.limits` | Incus itself refuses an instance that would exceed them. |
+| `limits.containers` | `0` | The project holds virtual machines only. |
+
+`restricted.devices.nic=allow` is wider than the one NIC Arca creates: Incus has no per-bridge allowlist for a bridge
+it does not manage, so the key admits every NIC type on every host interface for the whole project. The only guard on
+which bridge a virtual machine joins is Arca's own: `service_create` checks the request against `kernel.bridged.bridges`
+and the service plugin writes one fixed NIC shape. Anything that can write instances in `arcak-svc` outside Arca (an
+Incus admin on the host) is not bound by the list.
+
+**The caps.** `service_create` adds up the CPUs, memory and root disks of the virtual-machine records it holds, running
+or not, and refuses a create that would pass a cap, before it writes anything, naming the cap and the amounts. Arca's
+own check follows the config as soon as `arca serve` is restarted with new caps. The project's `limits.*` keys do not:
+they are set once, when the project is created, and no Arca path changes them afterwards. After changing
+`kernel.bridged.limits`, set the same values by hand, for example
+`incus project set arcak-svc limits.memory=96GiB`. Until then the lower of the two applies.
+
+**The mode cannot be switched.** A node is bridged from its first service, or not at all. `arca serve` refuses to start,
+naming the entry, when the config and the desired state disagree: `kernel.bridged` on a node that holds the managed
+service network, a container service, a database or a consumer; or no `kernel.bridged` on a node that holds the bridged
+project entry or a virtual machine. The check runs before the kernel reconciles anything, so a switched config never
+creates or repairs an object of the other mode. A virtual-machine create makes the same check again before its first
+write. It also refuses, naming the reason and leaving no entry behind, when an Incus project `arcak-svc` exists that
+this bridged node did not create (one made by hand, or left by the managed service network).
+
+A template is a virtual machine when its `kind` is `virtual-machine`:
+
+```json
+{
+  "name": "workspace-vm",
+  "kind": "virtual-machine",
+  "image": "images:debian/13",
+  "limits": { "cpu": "2", "memory": "4GiB" },
+  "rootSize": "20GiB",
+  "autostart": true
+}
+```
+
+`image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`.
+`limits` must set both `cpu` and `memory`, and `rootSize` is required; all three follow the size rules above. A
+virtual-machine template may also set `description` and `autostart`. It may not set `ports`, `env`, `secrets`,
+`generate`, `provides`, `entrypoint`, `publishable`, `dashPort`, `droiddPort`, `data` or `lan`: each of those depends on
+the service network, its per-service ACL or a container's environment.
+
+`service_create` takes two more arguments for a virtual-machine template:
+
+| Argument | Meaning |
+|----------|---------|
+| `bridge` | The host bridge the NIC joins. It must be in `kernel.bridged.bridges`; any other name is refused. It may be left out when the node allows exactly one bridge. |
+| `mac` | A fixed MAC, six hex octets joined by `:`. A group address and the all-zero address are refused. So is a MAC another Arca record or another Incus instance in any project holds: on its own device, on a device a profile gives it, as the address Incus assigned it (`volatile.<device>.hwaddr`), or on a live interface. Left out, Incus picks one. |
+
+Arca can compare a MAC only with what Incus knows. A device on the bridge that Incus does not run (another
+hypervisor's virtual machine, the router, a physical host) cannot be checked, so a fixed MAC must be chosen to be unique
+on that network.
+
+The virtual machine is created in `arcak-svc` with `type: virtual-machine`, no profile, `limits.cpu` and `limits.memory`
+from the template, a root disk of `rootSize` on the configured pool, and one NIC
+`{ "type": "nic", "nictype": "bridged", "parent": "<bridge>" }` (plus `hwaddr` when `mac` is given). It carries the
+kernel's mark and `user.arca.template`. It gets its address from the bridge's own network; Arca
+neither assigns nor filters it. `service_list` and `service_status` show the address the guest reports, or an empty
+`ipv4` when the guest reports none.
+
+Ownership, the journal and approvals are the same as for a container. `service_create` needs a doctor token, can be
+proposed with `action_propose`, and writes the same journal records. A proposal is checked when it is made, so the
+owner is never asked to approve a create the node is sure to refuse: the template's kind must fit the node's mode, the
+mode must fit the desired state, and the bridge must be an allowed one. A bridge the request leaves out is filled in
+then. The owner's card says "Create the virtual machine <name> from template <template> on the host bridge <bridge>"
+and lists the bridge and the MAC. The caps and the MAC are checked when the approved create runs, because both can
+change while a proposal waits. `service_remove` needs the owner's approval and retires the virtual machine through the same delete plan.
+`service_logs` returns the virtual machine's console log.
+
+What a bridged node refuses, and why:
+
+| Call | Refusal |
+|------|---------|
+| `service_create` with a container template | The node is bridged and runs virtual-machine templates only. |
+| `service_create` with a virtual-machine template on a node without `kernel.bridged` | The node is not a bridged node. |
+| `service_create` that would pass a cap of `kernel.bridged.limits` | The cap, what is in use, what was asked and what is allowed. |
+| `service_connect`, `service_disconnect` | Links need the service network and its per-service firewall rules. |
+| `service_publish`, `service_unpublish` | The virtual machine cannot be published from Arca; reach it on its bridge's own network. |
+| `service_secret_set` | A virtual machine has no template secrets or environment. |
+| `postgres_create` and the probe consumer | They need `kernel.serviceCidr`. |
 
 ## Tests
 

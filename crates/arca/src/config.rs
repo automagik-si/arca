@@ -185,6 +185,32 @@ pub struct KernelConfig {
     /// writes them.
     #[serde(default)]
     pub attach_networks: Vec<String>,
+    /// Bridged mode: this node runs virtual-machine services on host bridges that already exist, and Arca creates no
+    /// Incus network on it. It excludes `serviceCidr`.
+    #[serde(default)]
+    pub bridged: Option<BridgedConfig>,
+}
+
+/// The `kernel.bridged` key: the host bridges a virtual machine's NIC may name, and the storage pool its root disk is on.
+/// Nothing writes the bridges or the pool.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgedConfig {
+    pub bridges: Vec<String>,
+    /// The name of an Incus storage pool.
+    pub pool: String,
+    pub limits: BridgedLimits,
+}
+
+/// The `kernel.bridged.limits` key: what all of Arca's virtual machines on this node may use together. Every cap is
+/// required. They are set on the project when it is created, and Arca checks them before every create.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BridgedLimits {
+    pub virtual_machines: u32,
+    pub cpu: u32,
+    pub memory: String,
+    pub disk: String,
 }
 
 /// Why a config is refused. No variant carries a config value, except a project name the rules themselves name.
@@ -222,6 +248,8 @@ pub enum ConfigError {
     Adopt(&'static str),
     /// The `approval` key breaks a rule. The text names the rule, never a value.
     Approval(&'static str),
+    /// The `kernel.bridged` key breaks a rule. The text names the rule, never a value.
+    Bridged(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -254,6 +282,7 @@ impl fmt::Display for ConfigError {
             ),
             Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
             Self::Approval(why) => write!(f, "approval is refused: {why}"),
+            Self::Bridged(why) => write!(f, "kernel.bridged is refused: {why}"),
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
@@ -319,6 +348,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::PostgresImage);
     }
     check_adopt(kernel)?;
+    check_bridged(kernel)?;
     if kernel.scratch {
         for name in &kernel.projects {
             if !name.starts_with(SCRATCH_PREFIX) {
@@ -452,6 +482,52 @@ fn dns_name_ok(name: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
+}
+
+/// The bridged rules: at least one bridge, each a host interface name listed once and never the service bridge Arca
+/// manages; a plain pool name; no service /24 and no scratch run.
+fn check_bridged(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    let Some(bridged) = &kernel.bridged else {
+        return Ok(());
+    };
+    if kernel.service_cidr.is_some() {
+        return Err(ConfigError::Bridged(
+            "a bridged node has no kernel.serviceCidr: Arca creates no network on it",
+        ));
+    }
+    if kernel.scratch {
+        return Err(ConfigError::Bridged(
+            "kernel.scratch must be false on a bridged node",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    if bridged.bridges.is_empty()
+        || !bridged.bridges.iter().all(|bridge| {
+            crate::service::host_bridge_ok(bridge)
+                && bridge != arca_netproject::BRIDGE
+                && names.insert(bridge)
+        })
+    {
+        return Err(ConfigError::Bridged(
+            "bridges must list at least one existing host bridge, each an interface name listed once",
+        ));
+    }
+    if !arca_postgres::pool_ok(&bridged.pool) {
+        return Err(ConfigError::Bridged(
+            "pool must be the name of an Incus storage pool",
+        ));
+    }
+    let limits = &bridged.limits;
+    if limits.virtual_machines == 0
+        || limits.cpu == 0
+        || crate::service::size_bytes(&limits.memory).is_none()
+        || crate::service::size_bytes(&limits.disk).is_none()
+    {
+        return Err(ConfigError::Bridged(
+            "limits must set virtualMachines and cpu of at least 1, and memory and disk as sizes such as 64GiB",
+        ));
+    }
+    Ok(())
 }
 
 /// The adoption rules: plain names, each adoption project starting `arcak-adopt-` and listed in `kernel.projects`, no
@@ -685,6 +761,92 @@ mod tests {
                 "{bad:?} is not a host name"
             );
         }
+    }
+
+    static LIMITS: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
+        || serde_json::json!({ "virtualMachines": 4, "cpu": 8, "memory": "64GiB", "disk": "1TiB" }),
+    );
+
+    fn bridged(kernel: serde_json::Value) -> Result<(), ConfigError> {
+        let mut value = serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": ["droid"], "projects": ["arcak-svc"],
+                "bridged": { "bridges": ["br0", "vmbr1"], "pool": "vmpool", "limits": LIMITS.clone() } }
+        });
+        if let serde_json::Value::Object(extra) = kernel {
+            value["kernel"]
+                .as_object_mut()
+                .expect("kernel")
+                .extend(extra);
+        }
+        let config: NodeConfig =
+            serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        check(&config)
+    }
+
+    #[test]
+    fn a_bridged_node_is_refused_unless_every_rule_holds() {
+        use serde_json::json;
+        let limits = LIMITS.clone();
+        for bad in [
+            json!({ "virtualMachines": 0, "cpu": 8, "memory": "64GiB", "disk": "1TiB" }),
+            json!({ "virtualMachines": 4, "cpu": 0, "memory": "64GiB", "disk": "1TiB" }),
+            json!({ "virtualMachines": 4, "cpu": 8, "memory": "64", "disk": "1TiB" }),
+            json!({ "virtualMachines": 4, "cpu": 8, "memory": "64GiB", "disk": "0TiB" }),
+        ] {
+            assert!(
+                matches!(
+                    bridged(
+                        json!({ "bridged": { "bridges": ["br0"], "pool": "vmpool", "limits": bad } })
+                    ),
+                    Err(ConfigError::Bridged(_))
+                ),
+                "{bad}"
+            );
+        }
+        for missing in ["virtualMachines", "cpu", "memory", "disk"] {
+            let mut partial = limits.clone();
+            partial.as_object_mut().expect("limits").remove(missing);
+            assert!(
+                matches!(
+                    bridged(
+                        json!({ "bridged": { "bridges": ["br0"], "pool": "vmpool", "limits": partial } })
+                    ),
+                    Err(ConfigError::Parse(_))
+                ),
+                "{missing} is required"
+            );
+        }
+        assert!(matches!(
+            bridged(json!({ "bridged": { "bridges": ["br0"], "pool": "vmpool" } })),
+            Err(ConfigError::Parse(_))
+        ));
+        assert_eq!(bridged(json!({})), Ok(()));
+        let refused = [
+            json!({ "serviceCidr": "192.0.2.0/24" }),
+            json!({ "bridged": { "bridges": [], "pool": "vmpool", "limits": limits } }),
+            json!({ "bridged": { "bridges": ["br0", "br0"], "pool": "vmpool", "limits": limits } }),
+            json!({ "bridged": { "bridges": ["br0,br1"], "pool": "vmpool", "limits": limits } }),
+            json!({ "bridged": { "bridges": ["a-name-longer-than-an-interface"], "pool": "vmpool", "limits": limits } }),
+            json!({ "bridged": { "bridges": ["arcak-svcbr"], "pool": "vmpool", "limits": limits } }),
+            json!({ "bridged": { "bridges": ["br0"], "pool": "", "limits": limits } }),
+            json!({ "bridged": { "bridges": ["br0"], "pool": "a/b", "limits": limits } }),
+        ];
+        for kernel in refused {
+            assert!(
+                matches!(bridged(kernel.clone()), Err(ConfigError::Bridged(_))),
+                "{kernel}"
+            );
+        }
+        assert!(matches!(
+            bridged(
+                json!({ "bridged": { "bridges": ["br0"], "pool": "vmpool", "limits": limits, "cidr": "x" } })
+            ),
+            Err(ConfigError::Parse(_))
+        ));
     }
 
     fn adopting(kernel: serde_json::Value) -> Result<(), ConfigError> {

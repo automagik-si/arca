@@ -1,0 +1,9 @@
+{
+  "name": "workspace-vm",
+  "description": "A plain Debian 13 workspace virtual machine from the public images server (images.linuxcontainers.org), for a bridged node: 2 CPUs, 4GiB of memory and a 20GiB root disk on the node's configured pool, with one NIC on an existing host bridge. It gets its address from that bridge's own network.",
+  "kind": "virtual-machine",
+  "image": "images:debian/13",
+  "limits": { "cpu": "2", "memory": "4GiB" },
+  "rootSize": "20GiB",
+  "autostart": true
+}

@@ -95,6 +95,15 @@ fn service_proxy_allowance(entry: &EntryId, project: &str, key: &str, value: Opt
         && value == Some("allow")
 }
 
+// Only the bridged project entry may let a NIC name a host bridge Incus does not manage, only in its own project, and only
+// when that project is created. No patch sets the key.
+fn bridged_nic_allowance(entry: &EntryId, project: &str, key: &str, value: Option<&str>) -> bool {
+    entry.0 == "bridged-arcak-svc"
+        && project == "arcak-svc"
+        && key == "restricted.devices.nic"
+        && value == Some("allow")
+}
+
 /// Whether a project key is guarded: `restricted`, any `restricted.*` key, and any `features.*` key.
 fn guarded_project_key(key: &str) -> bool {
     key == RESTRICTED_KEY || key.starts_with("restricted.") || key.starts_with("features.")
@@ -460,7 +469,8 @@ impl IncusProvider {
                 .collect();
             // A plugin may set a guarded key only to the value the kernel pins it at. Any other guarded key, pinned or not,
             // would loosen the project, so it is refused before any request. Bridge grants are checked name by name;
-            // the service network entry alone may also allow proxy devices in its own project.
+            // the service network entry alone may also allow proxy devices in its own project, and the bridged project
+            // entry alone may allow NICs on a host bridge in its own project.
             for (key, set) in &config {
                 if key == NETWORK_ACCESS_KEY {
                     let list = set.as_str().ok_or_else(|| {
@@ -470,6 +480,9 @@ impl IncusProvider {
                     continue;
                 }
                 if service_proxy_allowance(entry, project, key, set.as_str()) {
+                    continue;
+                }
+                if bridged_nic_allowance(entry, project, key, set.as_str()) {
                     continue;
                 }
                 if !guarded_project_key(key) {

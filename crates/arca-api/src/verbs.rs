@@ -334,7 +334,7 @@ static VERBS: [Verb; 44] = [
     },
     Verb {
         name: "service_create",
-        summary: "Create a service from a template, in the service project and under the kernel's mark.",
+        summary: "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or on a bridged node a virtual machine on an existing host bridge.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -1950,6 +1950,16 @@ fn service_create_params() -> Value {
             "template": {
                 "description": "The template's name.",
                 "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                "type": "string"
+            },
+            "bridge": {
+                "description": "For a virtual-machine template on a bridged node: the existing host bridge its NIC joins, one of the node's allowed bridges. It may be left out when the node allows exactly one.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$",
+                "type": "string"
+            },
+            "mac": {
+                "description": "For a virtual-machine template: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one.",
+                "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
                 "type": "string"
             }
         },

@@ -192,6 +192,19 @@ impl ActionKind {
         }
         conforms(&self.params_schema(), &args)?;
         match self {
+            Self::ServiceCreate => {
+                // The digest the owner approves covers the MAC in the one form the record keeps.
+                if let Some(mac) = args.get("mac") {
+                    let normalized = mac
+                        .as_str()
+                        .and_then(crate::service::normalize_mac)
+                        .ok_or_else(|| {
+                            "args/mac: expected six hex octets joined by \":\", not a group or all-zero address"
+                                .to_string()
+                        })?;
+                    args["mac"] = Value::String(normalized);
+                }
+            }
             Self::ServicePublish => {
                 if args["reach"].as_str() != Some("tailnet") {
                     return Err("args/reach: the only reach is the owner's tailnet".to_string());
@@ -247,7 +260,15 @@ impl ActionKind {
         };
         match self {
             Self::ServiceCreate => {
-                vec![row("Name", text("name")), row("Template", text("template"))]
+                let mut rows = vec![row("Name", text("name")), row("Template", text("template"))];
+                // Only a virtual machine on a host bridge names these.
+                if args.get("bridge").is_some() {
+                    rows.push(row("Host bridge", text("bridge")));
+                }
+                if args.get("mac").is_some() {
+                    rows.push(row("MAC address", text("mac")));
+                }
+                rows
             }
             Self::ServiceRemove | Self::ServiceUnpublish => vec![row("Name", text("name"))],
             Self::ServicePublish => vec![row("Name", text("name")), row("Reach", text("reach"))],
@@ -328,6 +349,13 @@ impl ActionKind {
                 .to_string()
         };
         match self {
+            // Only a virtual machine on a bridged node names a bridge; a proposal made on one always does.
+            Self::ServiceCreate if args.get("bridge").is_some() => format!(
+                "Create the virtual machine {} from template {} on the host bridge {}",
+                text("name"),
+                text("template"),
+                text("bridge")
+            ),
             Self::ServiceCreate => format!(
                 "Create the service {} from template {}",
                 text("name"),

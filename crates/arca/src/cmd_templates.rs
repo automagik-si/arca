@@ -29,6 +29,7 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
     "omni-api.json",
     "postgres-autopg.json",
     "postgres-autopg.sh",
+    "workspace-vm.json",
 ];
 
 pub fn install(flags: &Flags) -> Result<Option<Value>, Failure> {

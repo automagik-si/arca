@@ -1375,8 +1375,9 @@ impl Store {
             .and_then(Value::as_object)
     }
 
-    /// The reason an instance body is refused by its project's restriction, when a NIC names a network the project does not
-    /// list in `restricted.networks.access`. A project that is not restricted lists nothing and refuses nothing.
+    /// The reason an instance body is refused by its project's restriction: a NIC names a network the project does not
+    /// list in `restricted.networks.access`, or names no managed network while `restricted.devices.nic` is not `allow`.
+    /// A project that is not restricted lists nothing and refuses nothing.
     fn restricted_nic(&self, project: &str, body: &Map<String, Value>) -> Option<&'static str> {
         let config = self.project_config(project)?;
         if config.get("restricted").and_then(Value::as_str) != Some("true") {
@@ -1389,12 +1390,23 @@ impl Store {
             .split(',')
             .collect();
         let devices = body.get("devices").and_then(Value::as_object)?;
-        let refused = devices.values().any(|device| {
-            device.get("type").and_then(Value::as_str) == Some("nic")
-                && device
-                    .get("network")
-                    .and_then(Value::as_str)
-                    .is_some_and(|network| !granted.contains(&network))
+        let nics = || {
+            devices
+                .values()
+                .filter(|device| device.get("type").and_then(Value::as_str) == Some("nic"))
+        };
+        // A NIC that names no managed network (a host bridge as `parent`, say) needs `restricted.devices.nic=allow`:
+        // Incus's default, `managed`, refuses it (`checkRestrictions`).
+        if config.get("restricted.devices.nic").and_then(Value::as_str) != Some("allow")
+            && nics().any(|device| device.get("network").and_then(Value::as_str).is_none())
+        {
+            return Some("Project restricted: only managed network devices are allowed");
+        }
+        let refused = nics().any(|device| {
+            device
+                .get("network")
+                .and_then(Value::as_str)
+                .is_some_and(|network| !granted.contains(&network))
         });
         refused.then_some("the project may not use the network")
     }
