@@ -6,7 +6,7 @@
 
 use arca_api::Scope;
 use arca_api::compat::{Break, compatible};
-use arca_api::openrpc::{check_document, openrpc};
+use arca_api::openrpc::{check_document, check_released_document, openrpc};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -93,7 +93,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 /// Checks every released document under `dir` against `current`. Returns how many it checked. An empty directory is an
 /// error, so the check cannot pass by checking nothing. The current document must first pass `check_document`, the shape
-/// the compatibility check reads.
+/// the compatibility check reads; a released one `check_released_document`, which lets it predate the read-only hint.
 fn check_released_dir(dir: &Path, current: &Value) -> Result<usize, String> {
     check_document(current).map_err(|e| format!("the current document: {e}"))?;
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -109,7 +109,7 @@ fn check_released_dir(dir: &Path, current: &Value) -> Result<usize, String> {
         let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let released: Value =
             serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", file.display()))?;
-        check_document(&released).map_err(|e| format!("{}: {e}", file.display()))?;
+        check_released_document(&released).map_err(|e| format!("{}: {e}", file.display()))?;
         let breaks = compatible(&released, current);
         if !breaks.is_empty() {
             let named: Vec<String> = breaks.iter().map(ToString::to_string).collect();
@@ -119,7 +119,7 @@ fn check_released_dir(dir: &Path, current: &Value) -> Result<usize, String> {
     Ok(files.len())
 }
 
-// The thirteen failing fixtures: eleven break variants, with ParamNarrowed covered three times.
+// The failing fixtures: twelve break variants, with ParamNarrowed covered three times.
 
 #[test]
 fn a_removed_method_is_one_break() {
@@ -326,6 +326,81 @@ fn writes_turned_on_is_one_break() {
     );
 }
 
+/// The released document with the current read-only hint added to every method it shares with the current document, as a
+/// release made after the hint would carry it.
+fn released_with_hints() -> Value {
+    let current = openrpc();
+    let mut doc = released();
+    for m in doc["methods"].as_array_mut().expect("methods") {
+        let hint = current["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .find(|c| c["name"] == m["name"])
+            .map(|c| c["x-arca-read-only-hint"].clone())
+            .expect("every released method is current");
+        m["x-arca-read-only-hint"] = hint;
+    }
+    assert_eq!(
+        check_document(&doc),
+        Ok(()),
+        "the hinted release is well formed"
+    );
+    doc
+}
+
+#[test]
+fn a_read_only_hint_flip_either_way_is_one_break() {
+    for (from, to) in [(true, false), (false, true)] {
+        let mut base = released_with_hints();
+        method_mut(&mut base, "arca_status")["x-arca-read-only-hint"] = json!(from);
+        let mut current = base.clone();
+        method_mut(&mut current, "arca_status")["x-arca-read-only-hint"] = json!(to);
+        assert_eq!(
+            compatible(&base, &current),
+            [Break::ReadOnlyHintChanged {
+                method: "arca_status".into()
+            }],
+            "{from} to {to}"
+        );
+    }
+}
+
+#[test]
+fn a_removed_read_only_hint_is_one_break() {
+    let base = released_with_hints();
+    let mut current = base.clone();
+    method_mut(&mut current, "arca_status")
+        .as_object_mut()
+        .expect("a method is an object")
+        .remove("x-arca-read-only-hint");
+    assert_eq!(
+        compatible(&base, &current),
+        [Break::ReadOnlyHintChanged {
+            method: "arca_status".into()
+        }]
+    );
+}
+
+#[test]
+fn a_release_without_read_only_hints_compares_none() {
+    let released = released();
+    assert!(
+        released["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .all(|m| m.get("x-arca-read-only-hint").is_none()),
+        "the 0.1.0 document predates the hint"
+    );
+    assert_eq!(check_released_document(&released), Ok(()));
+    assert!(
+        check_document(&released).is_err(),
+        "a current document must carry the hint"
+    );
+    assert!(compatible(&released, &openrpc()).is_empty());
+}
+
 // Keywords outside the subset and schemas that are not objects. The module cannot relate them to the released schema, so
 // any difference is a break, and the first differing keyword is named.
 
@@ -498,11 +573,12 @@ fn an_unchanged_any_of_with_a_narrowed_sibling_names_the_sibling() {
     );
 }
 
-// Duplicate names: the compared entry is the first one, so a second entry must fail the gate instead.
+// Duplicate names: the compared entry is the first one, so a second entry must fail the gate instead. The current document
+// is the hinted release, so that the duplicate is its only fault.
 
 #[test]
 fn a_duplicate_method_name_fails_the_gate() {
-    let mut current = released();
+    let mut current = released_with_hints();
     let mut dup = method_mut(&mut current, "arca_status").clone();
     dup["x-arca-scope"] = json!("operator");
     current["methods"]
@@ -516,14 +592,14 @@ fn a_duplicate_method_name_fails_the_gate() {
     let got = check_released_dir(Path::new(RELEASED_DIR), &current);
     let message = got.expect_err("a second arca_status must fail the gate");
     assert!(
-        message.contains("arca_status"),
+        message.contains("arca_status is listed twice"),
         "the duplicate is named: {message}"
     );
 }
 
 #[test]
 fn a_duplicate_parameter_name_fails_the_gate() {
-    let mut current = released();
+    let mut current = released_with_hints();
     let mut dup = param_mut(&mut current, "node_metrics", "minutes").clone();
     dup["required"] = json!(true);
     params_mut(&mut current, "node_metrics").push(dup);
@@ -534,7 +610,7 @@ fn a_duplicate_parameter_name_fails_the_gate() {
     let got = check_released_dir(Path::new(RELEASED_DIR), &current);
     let message = got.expect_err("a second minutes must fail the gate");
     assert!(
-        message.contains("minutes"),
+        message.contains("lists parameter minutes twice"),
         "the duplicate is named: {message}"
     );
 }

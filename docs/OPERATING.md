@@ -296,6 +296,15 @@ record is refused.
 
 `action_propose` records a durable proposal, so its MCP annotation advertises `readOnlyHint: false` even though it changes no desired state.
 
+#### The OpenRPC method flags
+
+`schema/arca.openrpc.json` gives every method two flags about writing. They are different questions:
+
+- `x-arca-writes`: the verb changes desired state, so a viewer may not call it and `tools/list` hides it from one. A released method may not turn it on.
+- `x-arca-read-only-hint`: the `readOnlyHint` the MCP door serves for the verb in `tools/list`. It is `false` for every verb that writes, and also for `action_propose` (it records a durable proposal) and `owner_approval_status` (it hands the requester an approval string), which change no desired state. A client that reads the hint from the OpenRPC document sees exactly what the MCP door serves. A change in either direction against a released document is a break.
+
+The 0.1.0 release predates `x-arca-read-only-hint`, so its methods carry only `x-arca-writes`.
+
 `tools/list` advertises each verb's MCP `outputSchema`: the natural result schema, wrapped under its `output.key` when the result is not an object, with `truncated` and (for an untrusted verb) `untrusted` added and every object level open. The OpenRPC document keeps the natural schemas.
 
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
