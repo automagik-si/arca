@@ -69,9 +69,14 @@ impl G7 {
     }
 
     fn with_lines(lines: impl FnOnce(&SoftPasskey) -> String) -> Self {
+        Self::with_keys(&[], lines)
+    }
+
+    /// As `with_lines`, with the owner's SSH keys `ssh` trusted beside the passkey.
+    fn with_keys(ssh: &[&common::SkKey], lines: impl FnOnce(&SoftPasskey) -> String) -> Self {
         let key = SoftPasskey::from_seed(1);
         let owner = common::Scratch::new("g7-owner");
-        let verifier = common::verifier_with_passkeys(&owner, &[], &lines(&key), "g7");
+        let verifier = common::verifier_with_passkeys(&owner, ssh, &lines(&key), "g7");
         let rig = Rig::with_verifier(
             empty_state(),
             vec![PROJECT.to_string()],
@@ -1473,5 +1478,254 @@ fn a_request_drops_confirm_true_from_the_args_it_binds_and_refuses_confirm_false
         listed["requests"].as_array().map(Vec::len),
         Some(1),
         "the refused request was not kept"
+    );
+}
+
+// ---- the approval paths that exist only here ---------------------------------------------------------------------------------
+
+/// The nonces the kernel's verifier has spent, in order: one record per spend in its nonce file.
+fn spent_nonces(g: &G7) -> Vec<String> {
+    fs::read_to_string(g._owner.path("nonces-g7.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            let record: Value = serde_json::from_str(line).expect("a nonce record");
+            text(&record, "nonce")
+        })
+        .collect()
+}
+
+/// The statement of a delete of `pg` on `host` with `nonce`, valid five minutes from the rig's clock, with `extra` fields.
+fn delete_pg_statement(host: &str, nonce: &str, extra: Value) -> String {
+    let mut fields = json!({
+        "host": host,
+        "action": "delete",
+        "target": "pg",
+        "paramsDigest": params_digest(&json!({ "name": "pg" })).expect("digest"),
+        "issuedAt": iso_utc(NOW),
+        "expiresAt": iso_utc(NOW + 5 * MINUTE),
+        "nonce": nonce,
+    });
+    for (key, value) in extra.as_object().expect("an object") {
+        fields[key.as_str()] = value.clone();
+    }
+    canonical_json(&fields).expect("canonical")
+}
+
+/// The refusal code and the words of a call the door answered with an error.
+fn door_refusal(reply: &Value) -> (String, String) {
+    assert!(reply.get("error").is_some(), "a refusal: {reply}");
+    (
+        text(&reply["error"]["data"], "refusal"),
+        text(&reply["error"], "message"),
+    )
+}
+
+#[test]
+fn g7_through_the_door_a_page_approval_is_audited_with_its_passkey_and_spent_once_and_a_replay_another_host_and_a_droidd_are_refused()
+ {
+    let g = G7::new();
+    g.service();
+    let door = Door::serving(&g, &["service_remove"]);
+    let remove = |approval: &str| {
+        door.call(
+            &door.doctor,
+            "service_remove",
+            json!({ "name": "pg", "approval": approval, "confirm": true }),
+        )
+    };
+    let direct = |statement: &str| {
+        passkey_approval(
+            statement,
+            &g.key
+                .assert(&Assert::over(ARCA_NAMESPACE, statement.as_bytes())),
+        )
+    };
+
+    // The request is made through the door, approved by the passkey on the page's begin and approve, and read back.
+    let id = id_of(&door.ok(&door.doctor, "owner_approval_request", delete("pg")));
+    let statement = g.statement(&id);
+    let nonce = parse_statement(statement.as_bytes()).expect("parses").nonce;
+    g.approve(&id, &statement, &g.proof(&statement, |_| {}))
+        .expect("the passkey approves");
+    let status = door.ok(&door.doctor, "owner_approval_status", json!({ "id": id }));
+    assert_eq!(status["state"], "approved");
+    let approval = text(&status, "approval");
+
+    // The approval is audited when the owner taps: the page as the principal, the request, the passkey and how it signed.
+    let audit = g.audit();
+    let rows: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains(APPROVED_AUDIT))
+        .collect();
+    assert_eq!(rows.len(), 1, "one approval row");
+    let row: Value = serde_json::from_str(rows[0]).expect("JSON");
+    assert_eq!(row["principal"], PAGE_PRINCIPAL);
+    assert_eq!(
+        text(&row, "outcome"),
+        format!(
+            "approved:{id}:arca:delete:pg:params={}:requester=doctor:key=passkey:{}:via=passkey:count=0:synced=0",
+            params_digest(&json!({ "name": "pg" })).expect("digest"),
+            g.key.fingerprint()
+        )
+    );
+    assert!(spent_nonces(&g).is_empty(), "the tap spent nothing");
+
+    // service_remove spends it, once: one nonce record, and the request no longer hands the approval out.
+    let removed = remove(&approval);
+    assert_eq!(
+        removed["result"]["structuredContent"],
+        json!({ "removed": true }),
+        "{removed}"
+    );
+    assert!(!instance_exists(&g, "pg"));
+    assert_eq!(spent_nonces(&g), vec![nonce.clone()]);
+    let after = door.ok(&door.doctor, "owner_approval_status", json!({ "id": id }));
+    assert_eq!(after["state"], "approved");
+    assert!(after.get("approval").is_none(), "spent: no longer held");
+
+    // A replay: the same name made again, and the same approval refused for its nonce.
+    g.service();
+    assert_eq!(
+        door_refusal(&remove(&approval)),
+        (
+            "owner_approval".to_string(),
+            "the approval's nonce is spent".to_string()
+        )
+    );
+    // A passkey approval for another host, and one that names a droidd, are not this kernel's to spend.
+    assert_eq!(
+        door_refusal(&remove(&direct(&delete_pg_statement(
+            "node2",
+            &"c".repeat(32),
+            json!({})
+        )))),
+        (
+            "owner_approval".to_string(),
+            "the approval names another host".to_string()
+        )
+    );
+    let (code, why) = door_refusal(&remove(&direct(&delete_pg_statement(
+        "node1",
+        &"d".repeat(32),
+        json!({ "droidd": "box1" }),
+    ))));
+    assert_eq!(code, "owner_approval");
+    assert!(
+        why.contains("names a droidd, which Arca does not accept"),
+        "{why}"
+    );
+    assert!(instance_exists(&g, "pg"), "no refusal removed it");
+    assert_eq!(spent_nonces(&g).len(), 1, "no refusal spent a nonce");
+
+    // A passkey approval made for the call itself, with no request, removes the service.
+    let fresh = "e".repeat(32);
+    let removed = remove(&direct(&delete_pg_statement("node1", &fresh, json!({}))));
+    assert_eq!(
+        removed["result"]["structuredContent"],
+        json!({ "removed": true }),
+        "{removed}"
+    );
+    assert!(!instance_exists(&g, "pg"));
+    assert_eq!(spent_nonces(&g), vec![nonce, fresh]);
+}
+
+#[test]
+fn g7_an_ssh_approval_cannot_approve_a_request_it_goes_to_the_call_itself_and_every_spend_is_one_nonce_record()
+ {
+    let ssh = common::SkKey::from_seed(3);
+    let g = G7::with_keys(&[&ssh], |key| format!("{}\n", key.line(ARCA_NAMESPACE)));
+    g.service();
+    g.rig
+        .call(
+            "service_create",
+            json!({ "name": "svc2", "template": "pg" }),
+        )
+        .expect("a second service");
+    let door = Door::serving(&g, &["service_remove"]);
+    let remove = |name: &str, approval: &str| {
+        door.ok(
+            &door.doctor,
+            "service_remove",
+            json!({ "name": name, "approval": approval, "confirm": true }),
+        )
+    };
+    let nonce_of = |statement: &str| parse_statement(statement.as_bytes()).expect("parses").nonce;
+
+    // Arca has no verb that delivers an approval into a request. The page's approve takes the passkey's answer only: the
+    // owner's SSH signature over the request's own statement is refused in every form it could be sent in.
+    let id = id_of(&door.ok(&door.doctor, "owner_approval_request", delete("pg")));
+    let statement = g.statement(&id);
+    let signature = ssh.sign(common::NAMESPACE, statement.as_bytes());
+    let ssh_approval = common::approve_statement(&ssh, &statement);
+    for (name, proof) in [
+        ("the armoured signature", json!(signature)),
+        ("the approval string", json!(ssh_approval)),
+        (
+            "the signature in an object",
+            json!({ "kind": "sshsig", "signature": signature, "v": 1 }),
+        ),
+    ] {
+        let refused = refusal(g.approve(&id, &statement, &proof));
+        assert_eq!((refused.status, refused.code), (400, "invalid"), "{name}");
+        assert!(
+            refused
+                .message
+                .starts_with("the proof is the passkey's answer"),
+            "{name}: {}",
+            refused.message
+        );
+        assert!(
+            !refused.message.contains(&signature[..40]),
+            "{name}: never the signature's bytes"
+        );
+    }
+    let status = door.ok(&door.doctor, "owner_approval_status", json!({ "id": id }));
+    assert_eq!(status["state"], "pending", "the request stays pending");
+    assert!(status.get("approval").is_none());
+    assert!(!g.audit().contains(APPROVED_AUDIT), "nothing approved");
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+
+    // The same SSH approval goes to the call itself, which spends it: one nonce record.
+    assert_eq!(remove("pg", &ssh_approval), json!({ "removed": true }));
+    assert!(!instance_exists(&g, "pg"));
+    assert_eq!(spent_nonces(&g), vec![nonce_of(&statement)]);
+    // The request's statement is spent with it: the passkey can no longer approve that statement.
+    let late = refusal(g.approve(&id, &statement, &g.proof(&statement, |_| {})));
+    assert_eq!((late.status, late.code), (403, "owner_approval"));
+    assert!(late.message.contains("its nonce is spent"), "{late:?}");
+
+    // A request approved by the passkey spends beside it: a second record, and the only approval row is the passkey's.
+    let other = id_of(&door.ok(&door.doctor, "owner_approval_request", delete("svc2")));
+    let tapped = g.statement(&other);
+    g.approve(&other, &tapped, &g.proof(&tapped, |_| {}))
+        .expect("the passkey approves");
+    let approval = text(
+        &door.ok(
+            &door.doctor,
+            "owner_approval_status",
+            json!({ "id": other }),
+        ),
+        "approval",
+    );
+    assert_eq!(remove("svc2", &approval), json!({ "removed": true }));
+    assert_eq!(
+        spent_nonces(&g),
+        vec![nonce_of(&statement), nonce_of(&tapped)],
+        "the ssh spend, then the passkey's"
+    );
+    let audit = g.audit();
+    let approved: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains(APPROVED_AUDIT))
+        .collect();
+    assert_eq!(approved.len(), 1);
+    assert!(
+        approved[0].contains(&format!("approved:{other}:arca:delete:svc2:"))
+            && approved[0].contains(&format!(
+                ":key=passkey:{}:via=passkey:",
+                g.key.fingerprint()
+            )),
+        "the passkey's request"
     );
 }

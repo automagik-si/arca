@@ -3868,3 +3868,137 @@ fn g7_a_kind_arca_request_is_approved_by_one_tap_on_the_page_and_kind_upgrade_is
         assert!(!page.contains(unsafe_sink), "text only: {unsafe_sink}");
     }
 }
+
+#[test]
+fn g7_the_approve_route_takes_what_a_delivery_would_and_refuses_another_target_another_host_and_an_ssh_signature()
+ {
+    // Arca has no verb that delivers an approval into a request: `POST /approve/requests/approve` is the one way in.
+    let (rig, key) = Rig::new("page-g7-deliver", true);
+    let read = Arc::clone(&rig.clock);
+    let clock: Clock = Arc::new(move || read.load(Ordering::SeqCst));
+    let verbs: std::collections::HashMap<_, _> =
+        approval_requests::handlers(Arc::clone(&rig.kernel), clock, Arc::clone(&rig.requests))
+            .into_iter()
+            .collect();
+    let caller = |token: &str| Caller {
+        token_id: token.to_string(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let created = verbs["owner_approval_request"]
+        .call(
+            json!({ "kind": "arca", "action": "delete", "target": "nats", "args": { "name": "nats" } }),
+            &caller("doctor"),
+        )
+        .expect("the request is made");
+    let id = created["id"].as_str().expect("an id").to_string();
+    let (status, begun) = rig.post("/approve/requests/begin", Some(ORIGIN), json!({ "id": id }));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&begun));
+    let begun: Value = serde_json::from_slice(&begun).expect("begin JSON");
+    let statement = begun["statement"]
+        .as_str()
+        .expect("a statement")
+        .to_string();
+    let passkey = |statement: &str| key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+    let crafted = |field: &str, value: &str| {
+        let mut fields: Value = serde_json::from_str(&statement).expect("JSON");
+        fields[field] = json!(value);
+        canonical_json(&fields).expect("canonical")
+    };
+    let approve = |statement: &str, proof: Value| {
+        let (status, body) = rig.post(
+            "/approve/requests/approve",
+            Some(ORIGIN),
+            json!({ "id": id, "statement": statement, "proof": proof }),
+        );
+        let body: Value = serde_json::from_slice(&body).expect("the route's JSON");
+        (status, body)
+    };
+
+    let other_target = crafted("target", "svc2");
+    let other_host = crafted("host", "node2");
+    let ssh = SkKey::from_seed(3);
+    let signature = ssh.sign(NAMESPACE, statement.as_bytes());
+    for (name, sent, proof, want_status, want_code, want) in [
+        (
+            "the passkey over another target",
+            other_target.as_str(),
+            passkey(&other_target),
+            403,
+            "owner_approval",
+            "it approves another target than the request's",
+        ),
+        (
+            "the passkey over another host",
+            other_host.as_str(),
+            passkey(&other_host),
+            403,
+            "owner_approval",
+            "it is for host node2, and this is node1",
+        ),
+        (
+            "an ssh signature",
+            statement.as_str(),
+            json!(signature),
+            400,
+            "invalid",
+            "the proof is the passkey's answer",
+        ),
+        (
+            "an ssh approval string",
+            statement.as_str(),
+            json!(approve_statement(&ssh, &statement)),
+            400,
+            "invalid",
+            "the proof is the passkey's answer",
+        ),
+    ] {
+        let (status, body) = approve(sent, proof);
+        assert_eq!(status, want_status, "{name}: {body}");
+        assert_eq!(body["refusal"], want_code, "{name}");
+        let message = body["message"].as_str().expect("words");
+        assert!(message.contains(want), "{name}: {message}");
+        assert!(
+            !message.contains(sent) && !message.contains(&signature[..40]),
+            "{name}: nothing sent is echoed"
+        );
+    }
+    let pending = verbs["owner_approval_status"]
+        .call(json!({ "id": id }), &caller("doctor"))
+        .expect("the requester reads its status");
+    assert_eq!(
+        pending["state"], "pending",
+        "every refusal leaves it pending"
+    );
+    assert!(pending.get("approval").is_none());
+
+    // The matching passkey answer approves it, for its asker only.
+    let (status, body) = approve(&statement, passkey(&statement));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "approved");
+    assert!(
+        body.get("approval").is_none(),
+        "the page gets the state only"
+    );
+    let mine = verbs["owner_approval_status"]
+        .call(json!({ "id": id }), &caller("doctor"))
+        .expect("the requester reads its status");
+    assert_eq!(mine["state"], "approved");
+    let approval = mine["approval"].as_str().expect("the asker's approval");
+    let theirs = verbs["owner_approval_status"]
+        .call(json!({ "id": id }), &caller("other"))
+        .expect("another token reads the state");
+    assert_eq!(theirs["state"], "approved");
+    assert!(theirs.get("approval").is_none(), "never another token's");
+    rig.kernel
+        .lock()
+        .expect("kernel")
+        .check_approval(
+            ArcaAction::Delete,
+            "nats",
+            &json!({ "name": "nats" }),
+            approval,
+            NOW,
+        )
+        .expect("the kernel spends the asker's approval");
+}
