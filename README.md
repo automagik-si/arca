@@ -58,3 +58,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ```
+
+A plain `cargo build --release` needs the build machine's glibc or newer on the host that runs the binary.
+`scripts/build-portable.sh` builds `arca` against glibc 2.34 (Enterprise Linux 9 and newer) with cargo-zigbuild and zig; both are pinned, checked by SHA-256 and kept under `~/.cache/arca-portable-tools`, with no root.
+It prints the binary's path, its SHA-256 and the highest GLIBC symbol version it needs, and fails when that version is above 2.34.
