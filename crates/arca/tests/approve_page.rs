@@ -3828,6 +3828,24 @@ fn g7_a_kind_arca_request_is_approved_by_one_tap_on_the_page_and_kind_upgrade_is
     );
 
     let other = ask("svc2", &json!({ "name": "svc2" }));
+    for path in [
+        "/approve/requests/begin",
+        "/approve/requests/approve",
+        "/approve/requests/deny",
+    ] {
+        let body = json!({ "id": other }).to_string();
+        let (status, _, _) = rig.request_full_on(
+            false,
+            None,
+            "POST",
+            path,
+            Some(ORIGIN),
+            body.as_bytes(),
+            None,
+            &[("Content-Type", "text/plain")],
+        );
+        assert_eq!(status, 415, "{path} takes application/json only");
+    }
     let (status, denied) = rig.post(
         "/approve/requests/deny",
         Some(ORIGIN),

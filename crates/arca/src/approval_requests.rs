@@ -66,6 +66,11 @@ pub const PENDING_PER_TOKEN: usize = 5;
 pub const PENDING_PER_KERNEL: usize = 20;
 /// Bytes of JSON a request's `args` may hold.
 pub const ARGS_MAX: usize = 4096;
+/// The longest top-level args key, and the longest requester name: the bounds `owner_approval_list`'s result carries.
+pub const ARGS_KEY_MAX: usize = 64;
+pub const REQUESTER_MAX: usize = 200;
+/// The longest passkey page address a request names.
+pub const DASHBOARD_MAX: usize = 300;
 /// The longest `owner_approval_status` waits.
 pub const WAIT_MAX_MS: u64 = 30_000;
 /// The audit tools of a request's life.
@@ -94,8 +99,10 @@ const LIST_MAX: usize = 50;
 const ARGS_DEPTH: usize = 8;
 /// `O_NOFOLLOW`: the audit file is never opened through a link.
 const NOFOLLOW: i32 = 0o400_000;
-/// The largest requests file this build reads. A larger one is set aside.
-const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// The largest requests file this build reads. A larger one is set aside. The sweep keeps the file far below it (at most 20
+/// pending rows and 50 decided ones, each under 25 KiB), so the rows it cannot drop, approvals not yet spent, are never
+/// set aside for the file's size.
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A request's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +236,17 @@ impl ApprovalRequests {
                 Vec::new()
             }
         };
+        // owner_approval_request's result holds a dashboard of at most 300 characters; a longer page address is left out
+        // rather than failing every request.
+        let dashboard = dashboard.filter(|address| {
+            let fits = address.chars().count() <= DASHBOARD_MAX;
+            if !fits {
+                eprintln!(
+                    "arca: the passkey page address is longer than {DASHBOARD_MAX} characters; requests name no dashboard"
+                );
+            }
+            fits
+        });
         let audit = OpenOptions::new()
             .append(true)
             .create(true)
@@ -314,6 +332,11 @@ impl ApprovalRequests {
         now: u64,
     ) -> Result<Value, CallError> {
         let (subject, call_args, digest) = fields_of(args, kernel.host(), now)?;
+        if caller.token_id.chars().count() > REQUESTER_MAX {
+            return Err(invalid(format!(
+                "the token's name is longer than {REQUESTER_MAX} characters, more than the owner's list shows"
+            )));
+        }
         let mut inner = self.lock()?;
         self.sweep(&mut inner, kernel, now);
         if let Some(same) = inner.rows.iter().find(|row| {
@@ -366,15 +389,26 @@ impl ApprovalRequests {
             decided_at: None,
             version: 0,
         };
+        // Everything a request keeps must come back through its own list: one the list's result schema refuses would fail
+        // every owner_approval_list call while it is in the list's window.
+        if let Err(why) = listable(&row, kernel.host()) {
+            return Err(invalid(format!(
+                "the request could not be shown in the owner's list as it is ({why})"
+            )));
+        }
         let principal = format!("{}:{}", row.requester_kind, row.requester);
         let outcome = format!("requested:{}:{}", row.id, row.outcome());
-        audit(&mut inner.audit, now, &principal, REQUESTED_AUDIT, &outcome)
-            .map_err(|_| internal())?;
+        let before = inner.rows.clone();
         inner.rows.push(row.clone());
-        if self.persist(&inner).is_err() {
-            inner.rows.retain(|kept| kept.id != row.id);
-            return Err(internal());
-        }
+        self.commit(
+            &mut inner,
+            before,
+            now,
+            &principal,
+            REQUESTED_AUDIT,
+            &outcome,
+        )
+        .map_err(|_| internal())?;
         (self.log)(&format!(
             "arca: approval request {} ({}) by {}",
             row.id,
@@ -592,14 +626,6 @@ impl ApprovalRequests {
             spent.key,
             u8::from(synced)
         );
-        audit(
-            &mut inner.audit,
-            now,
-            PAGE_PRINCIPAL,
-            APPROVED_AUDIT,
-            &outcome,
-        )
-        .map_err(|_| page_internal())?;
         let before = inner.rows.clone();
         let stored = inner
             .rows
@@ -611,10 +637,15 @@ impl ApprovalRequests {
         stored.approval_expires_at = Some(expires);
         stored.decided_at = Some(now);
         stored.version += 1;
-        if self.persist(&inner).is_err() {
-            inner.rows = before;
-            return Err(page_internal());
-        }
+        self.commit(
+            &mut inner,
+            before,
+            now,
+            PAGE_PRINCIPAL,
+            APPROVED_AUDIT,
+            &outcome,
+        )
+        .map_err(|_| page_internal())?;
         self.changed.notify_all();
         (self.log)(&format!(
             "arca: approval request {} approved ({}): nonce {}…, key {}…, valid until {}",
@@ -645,14 +676,6 @@ impl ApprovalRequests {
             return Err(stale());
         }
         let outcome = format!("denied:{}:{}", row.id, row.outcome());
-        audit(
-            &mut inner.audit,
-            now,
-            PAGE_PRINCIPAL,
-            DENIED_AUDIT,
-            &outcome,
-        )
-        .map_err(|_| page_internal())?;
         let before = inner.rows.clone();
         let stored = inner
             .rows
@@ -664,10 +687,15 @@ impl ApprovalRequests {
         stored.begun_at = None;
         stored.decided_at = Some(now);
         stored.version += 1;
-        if self.persist(&inner).is_err() {
-            inner.rows = before;
-            return Err(page_internal());
-        }
+        self.commit(
+            &mut inner,
+            before,
+            now,
+            PAGE_PRINCIPAL,
+            DENIED_AUDIT,
+            &outcome,
+        )
+        .map_err(|_| page_internal())?;
         self.changed.notify_all();
         (self.log)(&format!(
             "arca: approval request {} denied ({})",
@@ -723,6 +751,23 @@ impl ApprovalRequests {
             row.version += 1;
             changed = true;
         }
+        // Keep every pending request and every approval not yet spent; of the rest, the newest LIST_MAX of the last 24 h,
+        // which is all the list can show. The file stays bounded, and nothing it drops was still worth anything.
+        let live = |row: &Row| row.state == RequestState::Pending || row.approval.is_some();
+        let since = now.saturating_sub(LIST_MS);
+        let mut others: Vec<(u64, String)> = inner
+            .rows
+            .iter()
+            .filter(|row| !live(row) && row.created_at >= since)
+            .map(|row| (row.created_at, row.id.clone()))
+            .collect();
+        others.sort_by(|a, b| b.cmp(a));
+        others.truncate(LIST_MAX);
+        let count = inner.rows.len();
+        inner
+            .rows
+            .retain(|row| live(row) || others.iter().any(|(_, id)| *id == row.id));
+        changed |= inner.rows.len() != count;
         if changed {
             if let Err(error) = self.persist(inner) {
                 (self.log)(&format!(
@@ -732,6 +777,34 @@ impl ApprovalRequests {
             }
             self.changed.notify_all();
         }
+    }
+
+    /// Saves the rows as they are now, then appends their audit line: a line is never written for a change that was not
+    /// saved. When either fails the rows go back to `before` (saved again when the line was what failed) and nothing is
+    /// decided.
+    fn commit(
+        &self,
+        inner: &mut Inner,
+        before: Vec<Row>,
+        now: u64,
+        principal: &str,
+        tool: &str,
+        outcome: &str,
+    ) -> io::Result<()> {
+        if let Err(error) = self.persist(inner) {
+            inner.rows = before;
+            return Err(error);
+        }
+        if let Err(error) = audit(&mut inner.audit, now, principal, tool, outcome) {
+            inner.rows = before;
+            if self.persist(inner).is_err() {
+                (self.log)(
+                    "arca: an approval request change was saved and could not be audited or undone",
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Writes the requests whole to a temporary file, syncs it, renames it over the requests file and syncs the directory.
@@ -772,6 +845,17 @@ fn audit(file: &mut File, at: u64, principal: &str, tool: &str, outcome: &str) -
     text.push('\n');
     file.write_all(text.as_bytes())?;
     file.sync_all()
+}
+
+/// Whether `row`'s list view meets `owner_approval_list`'s result schema. The reason names a path, never a value.
+fn listable(row: &Row, host: &str) -> Result<(), String> {
+    let Some(verb) = arca_api::verb("owner_approval_list") else {
+        return Ok(());
+    };
+    arca_api::conforms(
+        &(verb.result)(),
+        &json!({ "requests": [view_of(row, host)] }),
+    )
 }
 
 /// A request as the page and the list show it: never its approval string.
@@ -878,6 +962,11 @@ fn fields_of(
         .as_str()
         .filter(|target| valid_target(target))
         .ok_or_else(|| invalid("target must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"))?;
+    if names_a_plan(target) {
+        return Err(invalid(
+            "the target names a delete plan: a plan is approved through its own card on the passkey page, not through a request",
+        ));
+    }
     let call_args = &input["args"];
     let Some(object) = call_args.as_object() else {
         return Err(invalid("args must be a JSON object"));
@@ -888,6 +977,11 @@ fn fields_of(
         ));
     }
     check_shown(call_args, "args", 0)?;
+    if object.keys().any(|key| key.chars().count() > ARGS_KEY_MAX) {
+        return Err(invalid(format!(
+            "an args key is longer than {ARGS_KEY_MAX} characters, more than the owner's list shows"
+        )));
+    }
     let text = serde_json::to_string(call_args).map_err(|_| internal())?;
     if text.len() > ARGS_MAX {
         return Err(invalid(format!(
@@ -920,6 +1014,13 @@ fn fields_of(
         )));
     }
     Ok((subject, call_args.clone(), digest))
+}
+
+/// Whether `target` is a delete plan's: `plan-` and its 64-digit digest.
+fn names_a_plan(target: &str) -> bool {
+    target
+        .strip_prefix("plan-")
+        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Whether `text` is an approval's target, as the statement's grammar has it.

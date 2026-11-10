@@ -1917,7 +1917,10 @@ An assistant that needs the owner's approval for a call (a `service_remove`, say
 `owner_approval_request`: `kind` `arca`, the `action` (`delete`, `publish` or `spend`), the call's `target`, and its `args`
 without `approval`. Arca checks the fields as the statement will carry them and refuses, in plain words, a request no
 statement can carry: a missing action ("an arca request needs action"), a bad target, args that are not an object, args
-over 4096 bytes or nested more than 8 levels, a control or bidi character, or an argument that reads as an approval string.
+over 4096 bytes or nested more than 8 levels, an args key longer than 64 characters, a control or bidi character, or an
+argument that reads as an approval string. A target that names a delete plan (`plan-` and its digest) is refused: a plan
+is approved through its own card on the passkey page. Everything a request keeps must come back through
+`owner_approval_list` as that verb's result allows, so a request the list could not show is refused when it is made.
 Kind `upgrade` is an identity phone's step: it is refused with `upgrade_not_here` and approved through droidd's MCP.
 A token keeps at most 5 pending requests and Arca at most 20; an identical pending request from the same token is the same
 request. The request names the passkey page in `dashboard`. Requests and statuses are a doctor's or an operator's, and
@@ -1925,13 +1928,25 @@ request. The request names the passkey page in `dashboard`. Requests and statuse
 
 The request waits on the passkey page under "Asked by your assistant", drawn as text. One tap on Approve asks Arca for the
 statement (this host, the request's action, target and argument digest, a fresh nonce, valid 15 minutes), the passkey signs
-it, and Arca checks the proof as the call will, spending nothing. The owner has 120 seconds from the tap. Decline needs no
-passkey and is final. Only passkeys made for the page's address are offered; a passkey made for an earlier address is
-refused with `passkey_rp_changed`, and the owner adds it again on the page. Approval is the owner's built-in passkey only.
+it, and Arca checks the proof as the call will, spending nothing. The owner has 120 seconds from the tap. Only passkeys made
+for the page's address are offered; a passkey made for an earlier address is refused with `passkey_rp_changed`, and the
+owner adds it again on the page. Approval is the owner's built-in passkey only. Decline is final and needs no passkey:
+whoever can open the passkey page at its address can decline a request there, as they can decline an action proposal,
+because declining only takes away. The page's request posts need the page's exact `Origin` and an `application/json` body.
 
 `owner_approval_status` (with `waitMs` up to 30000 to wait for the decision) answers the state. The approval string goes
 to the token that asked, never to another token or to the page, and the assistant passes it to its call, which spends it
-once. A pending request expires after 60 minutes; an approved one's string is dropped once its nonce is spent or its
-statement expires. The requests live in `approval-requests.json` in the state directory (mode 0600). Each request, approval
-and decline is a line in `approval-requests-audit.jsonl` naming the request, its digest and the requester, never an
+once. With a passkey that counts its signatures (most hardware keys; synced passkeys report 0), approvals must be spent in
+the order they were tapped: once a later approval is spent, an earlier one is refused as `SignCountRegressed`. A spend that
+is refused after the signature has verified (for another host, action, target, arguments or time) also uses up that
+approval's count, so the owner taps again.
+
+A pending request expires after 60 minutes. The requests live in `approval-requests.json` in the state directory (mode
+0600), which every request verb, the page's list and each page step reads and, when anything changed, rewrites whole (a
+temporary file renamed over it). On that read an approved request's approval string is removed from the file once its
+nonce is spent or its statement expires, and the request is kept without it. A request that is neither pending nor holding
+an unspent approval is kept while it is among the newest 50 of the last 24 hours (what the list shows) and dropped after.
+Until the next read, a spent or expired string stays in the file, where it can no longer be spent. The rewrite does not
+scrub the disk blocks the older file used. Each request, approval and decline is saved first, then written as a line in
+`approval-requests-audit.jsonl` (append-only, never pruned) naming the request, its digest and the requester, never an
 approval string, a credential or a challenge.

@@ -1106,3 +1106,226 @@ fn g7_arca_checks_a_proof_in_full_against_its_request_and_spends_it_exactly_once
         "exactly once"
     );
 }
+
+// ---- fix round 1 ---------------------------------------------------------------------------------------------------------
+
+/// The MCP door over the rig's three verbs: `arca_mcp::Server` with the real verb table, so every result is checked against
+/// its verb's result schema as it is in production. A doctor's and a viewer's token are minted into a private directory.
+struct Door {
+    socket: std::path::PathBuf,
+    doctor: String,
+    viewer: String,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl Door {
+    fn over(g: &G7) -> Door {
+        use arca_mcp::{Server, TokenStore, mint, serve_unix};
+        let tokens = g.rig.dir.join("door-tokens");
+        fs::create_dir(&tokens).expect("the token directory");
+        fs::set_permissions(&tokens, fs::Permissions::from_mode(0o700)).expect("0700");
+        let mut secrets = Vec::new();
+        for (id, scope) in [("doctor", Scope::Doctor), ("phone", Scope::Viewer)] {
+            let (secret, hash) = mint(scope);
+            let path = tokens.join(format!("{id}.hash"));
+            fs::write(&path, hash).expect("the hash file");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("0400");
+            secrets.push(secret);
+        }
+        let mut server = Server::new(
+            arca_api::verbs(),
+            TokenStore::load(&tokens).expect("the tokens load"),
+        );
+        for (verb, handler) in &g.verbs {
+            server = server.handle(verb, Arc::clone(handler));
+        }
+        let socket = g.rig.dir.join("door.sock");
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let served = socket.clone();
+        let router = server.router();
+        runtime.spawn(async move {
+            let _ = serve_unix(router, &served).await;
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < until, "the door started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Door {
+            socket,
+            viewer: secrets.pop().expect("the viewer's"),
+            doctor: secrets.pop().expect("the doctor's"),
+            _runtime: runtime,
+        }
+    }
+
+    /// A `tools/call` through the door; the JSON-RPC reply.
+    fn call(&self, secret: &str, name: &str, arguments: Value) -> Value {
+        use std::io::{Read as _, Write as _};
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        }))
+        .expect("the call");
+        let head = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&self.socket).expect("connect to the door");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a read timeout");
+        stream.write_all(head.as_bytes()).expect("the head");
+        stream.write_all(&body).expect("the body");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("the answer");
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("a response head");
+        serde_json::from_slice(&raw[split + 4..]).expect("JSON-RPC")
+    }
+
+    /// The structured result of a call the door answered without error.
+    fn ok(&self, secret: &str, name: &str, arguments: Value) -> Value {
+        let reply = self.call(secret, name, arguments);
+        assert_eq!(reply["result"]["isError"], json!(false), "{name}: {reply}");
+        reply["result"]["structuredContent"].clone()
+    }
+}
+
+/// A request at every bound the list's result carries: a 64-character args key, a 128-character target, 4096 bytes of args
+/// and args nested 8 levels deep.
+fn at_every_bound() -> Value {
+    let deep = (0..7).fold(json!("leaf"), |inner, _| json!({ "in": inner }));
+    let target = format!("t{}", "x".repeat(127));
+    let mut args = json!({ "k".repeat(64): 1, "deep": deep, "pad": "" });
+    let size = serde_json::to_string(&args).expect("JSON").len();
+    args["pad"] = json!("p".repeat(requests::ARGS_MAX - size));
+    assert_eq!(
+        serde_json::to_string(&args).expect("JSON").len(),
+        requests::ARGS_MAX
+    );
+    json!({ "kind": "arca", "action": "delete", "target": target, "args": args })
+}
+
+#[test]
+fn m1_through_the_door_a_65_character_args_key_is_refused_and_a_request_at_every_bound_lists_and_answers()
+ {
+    let g = G7::new();
+    let door = Door::over(&g);
+    let long = json!({ "kind": "arca", "action": "delete", "target": "pg", "args": { "k".repeat(65): 1 } });
+    let refused = door.call(&door.doctor, "owner_approval_request", long);
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("longer than 64 characters"), "{refused}");
+    assert!(!message.contains(&"k".repeat(65)), "the key is not quoted");
+    let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
+    assert_eq!(listed["requests"], json!([]), "nothing was kept");
+
+    let created = door.ok(&door.doctor, "owner_approval_request", at_every_bound());
+    let id = text(&created, "id");
+    let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
+    assert_eq!(
+        listed["requests"][0]["id"],
+        json!(id),
+        "the list still answers"
+    );
+    let status = door.ok(&door.doctor, "owner_approval_status", json!({ "id": id }));
+    assert_eq!(status["state"], "pending");
+    g.tap(&id);
+    let status = door.ok(&door.doctor, "owner_approval_status", json!({ "id": id }));
+    assert_eq!(status["state"], "approved");
+    assert!(
+        status["approval"].is_string(),
+        "the approval string passes the result check"
+    );
+    let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
+    assert_eq!(listed["requests"][0]["state"], "approved");
+}
+
+#[test]
+fn l6_a_target_that_names_a_delete_plan_is_refused() {
+    let g = G7::new();
+    let plan = format!("plan-{}", "e3".repeat(32));
+    let why = invalid(g.ask(
+        "doctor",
+        Scope::Doctor,
+        json!({ "kind": "arca", "action": "delete", "target": plan, "args": { "plan": "x" } }),
+    ));
+    assert!(why.contains("names a delete plan"), "{why}");
+    g.asked(delete("plan-b"));
+}
+
+#[test]
+fn l1_decided_rows_leave_the_file_once_out_of_the_list_and_an_unspent_approval_never_does() {
+    let g = G7::new();
+    let kept = g.asked(delete("svc1"));
+    g.tap(&kept);
+    let approval = g.approval(&kept);
+    let rows = |g: &G7| {
+        serde_json::from_str::<Vec<Value>>(&g.stored())
+            .expect("rows")
+            .len()
+    };
+    let kernel = g.rig.kernel.lock().expect("kernel");
+    for n in 0..70u64 {
+        let at = NOW + 1_000 + n * 100;
+        let created = g
+            .requests
+            .request(
+                &kernel,
+                &delete(&format!("s{n}")),
+                &caller(&format!("t{n}"), Scope::Doctor),
+                at,
+            )
+            .expect("a request");
+        g.requests
+            .deny(&kernel, &id_of(&created), at)
+            .expect("denied");
+    }
+    let listed = g.requests.list(&kernel, NOW + 10_000).expect("the list");
+    drop(kernel);
+    assert_eq!(listed.len(), 50);
+    assert_eq!(
+        rows(&g),
+        51,
+        "the unspent approval and the newest 50 others; the rest are gone"
+    );
+    assert_eq!(
+        g.approval(&kept),
+        approval,
+        "an unspent approval is never dropped"
+    );
+    // After the approval expires and the window passes, the file holds only what the list could show.
+    g.at(NOW + 25 * HOUR);
+    assert!(g.list().is_empty());
+    assert_eq!(rows(&g), 0, "nothing older than 24 h is kept");
+    assert!(!g.stored().contains(&approval));
+}
+
+#[test]
+fn l3_a_change_that_cannot_be_saved_is_never_audited() {
+    let g = G7::new();
+    let id = g.asked(delete("pg"));
+    let statement = g.statement(&id);
+    let lines = g.audit().lines().count();
+    let locked = |mode: u32| {
+        fs::set_permissions(&g.rig.dir, fs::Permissions::from_mode(mode)).expect("the mode");
+    };
+    locked(0o500);
+    let asked = g.ask("doctor", Scope::Doctor, delete("svc2"));
+    let approved = g.approve(&id, &statement, &g.proof(&statement, |_| {}));
+    let denied = g.deny(&id);
+    locked(0o700);
+    assert!(matches!(asked, Err(CallError::Internal(_))), "{asked:?}");
+    assert_eq!(refusal(approved).status, 500);
+    assert_eq!(refusal(denied).status, 500);
+    assert_eq!(
+        g.audit().lines().count(),
+        lines,
+        "no audit line for a change not saved"
+    );
+    assert_eq!(g.mine(&id)["state"], "pending");
+    assert_eq!(g.list().len(), 1, "the request not saved was not kept");
+}

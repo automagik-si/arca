@@ -497,7 +497,8 @@ fn g7_a_missing_untrusted_or_malformed_passkeys_file_refuses_passkey_approvals_w
 }
 
 #[test]
-fn g7_passkey_sign_counts_advance_only_on_a_spend_and_a_preview_counts_nothing() {
+fn g7_passkey_sign_counts_rise_above_the_kept_one_a_preview_counts_nothing_and_a_refusal_after_the_signature_uses_it_up()
+ {
     let key = SoftPasskey::from_seed(1);
     let scratch = Scratch::new("g7-counts");
     let mut v = verifier(&scratch, &[], &lines_for(&[&key]));

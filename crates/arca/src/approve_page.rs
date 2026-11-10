@@ -1119,24 +1119,50 @@ enum RequestStep {
     Deny,
 }
 
-async fn request_begin(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
-    request_step(state, body, RequestStep::Begin).await
+async fn request_begin(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    request_step(state, &headers, body, RequestStep::Begin).await
 }
 
-async fn request_approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
-    request_step(state, body, RequestStep::Approve).await
+async fn request_approve(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    request_step(state, &headers, body, RequestStep::Approve).await
 }
 
-async fn request_deny(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
-    request_step(state, body, RequestStep::Deny).await
+async fn request_deny(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    request_step(state, &headers, body, RequestStep::Deny).await
 }
 
-/// One step of an owner approval request: `{id}` to begin or deny, `{id, statement, proof}` to approve. Nothing the body
-/// holds is echoed back.
-async fn request_step(state: Arc<PageState>, body: Bytes, step: RequestStep) -> Response {
+/// One step of an owner approval request: `{id}` to begin or deny, `{id, statement, proof}` to approve, as
+/// `application/json`. Nothing the body holds is echoed back.
+async fn request_step(
+    state: Arc<PageState>,
+    headers: &HeaderMap,
+    body: Bytes,
+    step: RequestStep,
+) -> Response {
     let Some(requests) = state.requests.clone() else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // As droidd's: a step is a JSON body, so a form or a text/plain post (which a page elsewhere could send) is refused.
+    if !is_json_content_type(headers) {
+        return page_refusal(PageRefusal {
+            status: 415,
+            code: "invalid",
+            message: "the body must be sent as application/json".to_string(),
+            extra: serde_json::Map::new(),
+        });
+    }
     let invalid = || {
         page_refusal(PageRefusal {
             status: 400,
