@@ -47,6 +47,9 @@ ed25519-dalek.workspace = true
 rusqlite.workspace = true
 # The passkey tests sign with a software P-256 passkey.
 p256.workspace = true
+# The browser passkey test serves the page over https://localhost to a real Chromium.
+rustls.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

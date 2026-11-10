@@ -847,3 +847,122 @@ fn peer_keys_sync_is_served_only_to_a_node_that_keeps_another_machines_passkeys(
     );
     assert_eq!(serve.terminate().code(), Some(0));
 }
+
+/// The Doctor's token: the 16 tools droidd moved to Arca, which are also the golden 16 the parity token carries.
+const DOCTOR_16: [&str; 16] = [
+    "service_create",
+    "service_list",
+    "service_status",
+    "service_logs",
+    "service_remove",
+    "service_connect",
+    "service_disconnect",
+    "service_secret_set",
+    "service_publish",
+    "service_unpublish",
+    "omni_instance_create",
+    "omni_pair",
+    "omni_status",
+    "owner_approval_request",
+    "owner_approval_status",
+    "owner_approval_list",
+];
+
+/// The canvas forward's token: the two service reads and the journal.
+const FORWARD_3: [&str; 3] = ["service_list", "service_logs", "journal_list"];
+
+/// Mints `id` through the binary with `--tools` set to `tools`, and returns its secret.
+fn mint_with_list(
+    scratch: &Scratch,
+    hash_dir: &Path,
+    id: &str,
+    scope: &str,
+    tools: &[&str],
+) -> String {
+    let out_file = scratch.at(&format!("{id}.secret"));
+    let out = arca()
+        .args(["token", "mint", "--scope", scope, "--id", id, "--tools"])
+        .arg(tools.join(","))
+        .arg("--hash-dir")
+        .arg(hash_dir)
+        .arg("--out")
+        .arg(&out_file)
+        .output()
+        .expect("run token mint");
+    assert!(
+        out.status.success(),
+        "minting {id} with its list succeeds: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::read_to_string(&out_file)
+        .expect("read the secret")
+        .trim_end()
+        .to_string()
+}
+
+#[test]
+fn g8_the_doctors_16_and_the_forwards_3_each_reach_exactly_their_list() {
+    let scratch = Scratch::new("exact-lists");
+    let rig = rig(&scratch);
+    let (hash_dir, _) = mint_tokens(&scratch);
+    let lists: [(&str, &str, &[&str]); 2] = [
+        ("doctor-16", "doctor", &DOCTOR_16),
+        ("forward-3", "viewer", &FORWARD_3),
+    ];
+    let secrets: Vec<String> = lists
+        .iter()
+        .map(|(id, scope, tools)| mint_with_list(&scratch, &hash_dir, id, scope, tools))
+        .collect();
+    // On disk each hash file carries its list as the third line, in the order it was minted.
+    for (id, _, tools) in &lists {
+        let text = fs::read_to_string(hash_dir.join(format!("{id}.hash"))).expect("the hash file");
+        assert_eq!(
+            text.lines().nth(2),
+            Some(format!("tools={}", tools.join(",")).as_str()),
+            "{id}"
+        );
+    }
+    let config = write_config(&scratch, rig.shim.socket(), &hash_dir);
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+
+    let mut id = 0;
+    for ((name, _, tools), secret) in lists.iter().zip(&secrets) {
+        id += 1;
+        let (status, text) = post(
+            &socket,
+            &[bearer(secret)],
+            &rpc(id, "tools/list", json!({})),
+        );
+        assert_eq!(status, 200, "{name}: tools/list");
+        let listed: Value = serde_json::from_str(&text).expect("JSON");
+        let mut names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|t| t["name"].as_str().expect("a name"))
+            .collect();
+        names.sort_unstable();
+        let mut wanted = tools.to_vec();
+        wanted.sort_unstable();
+        assert_eq!(names, wanted, "{name}: tools/list holds exactly its list");
+
+        // Every verb of the table: one in the list reaches its handler (any answer but 403, here a refusal of the empty
+        // arguments or a read), one outside it is refused before any handler runs.
+        for verb in arca_api::verbs() {
+            id += 1;
+            let (status, text) = post(&socket, &[bearer(secret)], &call(id, verb.name, json!({})));
+            if tools.contains(&verb.name) {
+                assert_ne!(status, 403, "{name} reaches {}: {text}", verb.name);
+            } else if matches!(verb.name, "action_approve" | "peer_keys_sync") {
+                // This node serves neither (no relayed approvals, no peer keys), so neither is in its table at all.
+                let reply: Value = serde_json::from_str(&text).expect("JSON");
+                assert_eq!(reply["error"]["message"], "not_found", "{name}: {text}");
+            } else {
+                assert_eq!(status, 403, "{name} is refused {}: {text}", verb.name);
+            }
+        }
+    }
+    assert_eq!(serve.terminate().code(), Some(0));
+}

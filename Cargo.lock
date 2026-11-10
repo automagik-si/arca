@@ -118,10 +118,12 @@ dependencies = [
  "regex",
  "rusqlite",
  "rustix",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
 ]
 

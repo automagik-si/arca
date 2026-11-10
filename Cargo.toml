@@ -41,6 +41,9 @@ regex = "=1.13.1"
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "std"] }
 # SQLite is compiled from its bundled source, so the static musl build needs no system library.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
+# The browser passkey test's TLS front (dev only). Both are in the lock already through iroh; ring, never aws-lc.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring"] }
 # Safe wrappers for the few file calls std lacks: an exclusive read-only open of a disk, and mkdirat/openat walks.
 rustix = { version = "=1.1.4", features = ["fs"] }
 serde = { version = "=1.0.229", features = ["derive"] }
