@@ -2079,8 +2079,15 @@ fn snapshot_create_params() -> Value {
         ),
         ("fsUuid", false, string_max(128)),
         ("size", false, int()),
+        ("allocated", false, int()),
         ("files", false, int()),
         ("unreadable", false, int()),
+        (
+            "separate",
+            false,
+            json!({ "type": "array", "items": string_max(4096), "maxItems": 100 }),
+        ),
+        ("separateCount", false, int()),
         ("poolFree", false, int()),
         ("instance", false, instance_name_schema()),
         (
@@ -2134,6 +2141,17 @@ fn snapshot_change_result() -> Value {
         ("files", false, int()),
         ("bytes", false, int()),
         ("ioCaps", false, boolean()),
+        ("io", false, one_of(&["incus-caps", "throttled-by-tar"])),
+        ("changedDuringCopy", false, int()),
+        ("changedFiles", false, array(string())),
+        (
+            "skipped",
+            false,
+            result(vec![("sockets", true, int()), ("devices", true, int())]),
+        ),
+        ("separate", false, array(string())),
+        ("separateCount", false, int()),
+        ("notes", false, array(string())),
     ])
 }
 
@@ -2196,6 +2214,8 @@ fn snapshot_list_result() -> Value {
         ("sourcePool", true, nullable(string())),
         ("sourcePath", false, nullable(string())),
         ("reason", false, nullable(string())),
+        ("changedDuringCopy", false, nullable(int())),
+        ("note", false, nullable(string())),
         ("pool", true, string()),
         ("size", true, nullable(int())),
         ("created", true, string()),

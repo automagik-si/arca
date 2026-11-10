@@ -21,8 +21,10 @@
 //! deleted, and a stopped one cannot be stopped again, as in Incus. As on a real host, a failed start leaves the instance
 //! reading back as stopped while Incus still holds it, so a delete is refused until it is stopped; and an instance whose
 //! root disk is on a snapshot pool fails to start, since its unprivileged root cannot walk that pool's folder; and one with
-//! `limits.read`/`limits.write` on a disk while a host folder disk is attached fails to start with `Invalid block device
-//! "tmpfs"`.
+//! `limits.read`/`limits.write` on a disk on a `dir` pool fails to start with `Invalid block device "tmpfs"` (Incus finds
+//! no block device under the pool's folder to cap; a real host answered that with the pool on a tmpfs). A fetch of an
+//! image can be made to lose a race with another ([`FakeStorageIncus::race_next_image`]), and an instance delete can be
+//! failed ([`FakeStorageIncus::fail_next_delete`]).
 //!
 //! An instance copy behaves as Incus's own does (`createFromCopy`): every local config key and local device of the source
 //! that the request leaves unset is carried into the copy (volatile keys aside), an empty config value is not stored, the
@@ -68,6 +70,10 @@ struct State {
     aliases: std::collections::BTreeSet<(String, String)>,
     exec: (i64, String),
     fail_start: std::collections::VecDeque<String>,
+    /// The next image fetch finds the alias made by another fetch first and fails.
+    image_race: bool,
+    /// Instance deletes left to fail, with Incus's message.
+    fail_delete: std::collections::VecDeque<String>,
     fail_exec: Option<String>,
     logs: BTreeMap<String, String>,
     profiles: BTreeMap<(String, String), Value>,
@@ -215,6 +221,17 @@ impl FakeStorageIncus {
     /// Fails the next instance start with Incus's message. Called again, it fails the start after that too.
     pub fn fail_next_start(&self, message: &str) {
         lock(&self.state).fail_start.push_back(message.to_string());
+    }
+
+    /// Makes the next image fetch lose a race: the alias appears (another fetch made it) and this fetch fails with
+    /// `Alias already exists`.
+    pub fn race_next_image(&self) {
+        lock(&self.state).image_race = true;
+    }
+
+    /// Fails the next instance delete with Incus's message. Called again, it fails the delete after that too.
+    pub fn fail_next_delete(&self, message: &str) {
+        lock(&self.state).fail_delete.push_back(message.to_string());
     }
 
     /// Fails the next exec operation with Incus's message.
@@ -634,6 +651,9 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
                 }
                 Some(_) => {}
             }
+            if let Some(message) = state.fail_delete.pop_front() {
+                return operation(state, Some(message));
+            }
             state.instances.remove(&key);
             operation(state, None)
         }
@@ -649,21 +669,22 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             let root_on_snapshots = state.pools.get(&root_pool).is_some_and(|pool| {
                 pool["config"].get("user.arcasnapshot.storage") == Some(&pool["name"])
             });
-            // As on a real host: read/write caps on a disk while a host folder is attached refuse the start.
-            let disks: Vec<&Value> = state.instances[&key]["expanded_devices"]
+            // Read/write caps need a block device under the disk's pool; a dir pool's folder may have none.
+            let caps_on_dir_pool = state.instances[&key]["expanded_devices"]
                 .as_object()
                 .into_iter()
                 .flatten()
                 .map(|(_, device)| device)
                 .filter(|device| device["type"] == json!("disk"))
-                .collect();
-            let caps_with_folder = disks.iter().any(|disk| {
-                disk.get("limits.read").is_some() || disk.get("limits.write").is_some()
-            }) && disks.iter().any(|disk| {
-                disk["source"]
-                    .as_str()
-                    .is_some_and(|source| source.starts_with('/'))
-            });
+                .filter(|disk| {
+                    disk.get("limits.read").is_some() || disk.get("limits.write").is_some()
+                })
+                .any(|disk| {
+                    disk["pool"]
+                        .as_str()
+                        .and_then(|pool| state.pools.get(pool))
+                        .is_some_and(|pool| pool["driver"] == json!("dir"))
+                });
             let status = match body["action"].as_str() {
                 Some("start") => {
                     let failure = state
@@ -674,7 +695,7 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
                                 "Failed to run: Permission denied - Failed to mount \"credentials\" onto \"/dev/.incus-systemd-credentials\"".to_string()
                             })
                         })
-                        .or_else(|| caps_with_folder.then(|| "Invalid block device \"tmpfs\"".to_string()));
+                        .or_else(|| caps_on_dir_pool.then(|| "Invalid block device \"tmpfs\"".to_string()));
                     if let Some(message) = failure {
                         state.half_started.insert(key);
                         return operation(state, Some(message));
@@ -742,6 +763,9 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
                 if let Some(name) = alias["name"].as_str() {
                     state.aliases.insert((project.clone(), name.to_string()));
                 }
+            }
+            if std::mem::take(&mut state.image_race) {
+                return operation(state, Some("Alias already exists".to_string()));
             }
             operation(state, None)
         }

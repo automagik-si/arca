@@ -10,13 +10,16 @@
 //! - `ARCA_PROOF_ROOT_POOL`: the machine's regular pool the helper's root disk goes on (default: the default profile's
 //!   root pool), as `incus.pools` names it for the kernel.
 //! - `ARCA_PROOF_SOURCE`: a scratch folder that does not exist yet. The test fills it with files of several modes, a
-//!   folder, a symlink, a hard link and an extended attribute, copies it, and removes it.
+//!   folder, a symlink, a hard link, a sparse file, an extended attribute and a socket (which is left out and counted as
+//!   skipped), copies it, and removes it.
 //!
 //! It runs the same calls the approved `snapshot_create` makes after its checks: the volume, the helper (read-only folder,
 //! no NIC), the copy, the counts and the helper's removal. The copy is then read back through a short-lived checker
 //! container in the snapshot project (the folder read-only at `/src`, the copy's volume read-only at `/dst`, no NIC,
 //! deleted afterwards), since the pool's files are root's and this test runs unprivileged: `find -printf '%M %U:%G %n
-//! %T@ %p %l'` and each path's extended attributes (from a `tar --xattrs` header) must match on both sides.
+//! %T@ %p %l'` and each path's extended attributes (from a `tar --xattrs` header) must match on both sides, sockets
+//! aside. The checker is named like a copy helper and carries its mark, so the writer's removal (and the kernel's
+//! startup sweep, if the test dies) deletes it.
 
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
@@ -50,6 +53,10 @@ fn build_source(source: &Path) -> bool {
             .expect("a mode");
     }
     std::os::unix::fs::symlink("docs/report.bin", source.join("report-link")).expect("a link");
+    drop(std::os::unix::net::UnixListener::bind(source.join("app.sock")).expect("a socket"));
+    std::fs::File::create(source.join("docs/holes"))
+        .and_then(|file| file.set_len(64 << 20))
+        .expect("a sparse file");
     std::fs::hard_link(
         source.join("readme.txt"),
         source.join("docs/readme-again.txt"),
@@ -73,16 +80,18 @@ fn build_source(source: &Path) -> bool {
 /// each path's extended attributes with their values, read from a `tar --xattrs` header; then one file's bytes.
 const CHECK_SCRIPT: &str = r#"list() {
   cd "$1" || exit 9
-  find . -mindepth 1 ! -path ./.arca-manifest.json \( -type d -printf '%M %U:%G - %T@ %p\n' -o -printf '%M %U:%G %n %T@ %p %l\n' \) \
+  find . -mindepth 1 ! -path ./.arca-manifest.json ! -type s \( -type d -printf '%M %U:%G - %T@ %p\n' -o -printf '%M %U:%G %n %T@ %p %l\n' \) \
     | sed -E 's/ ([0-9]+)\.[0-9]+ / \1 /' | LC_ALL=C sort
   echo '--- xattrs'
-  find . -mindepth 1 ! -path ./.arca-manifest.json | LC_ALL=C sort | while IFS= read -r f; do
+  find . -mindepth 1 ! -path ./.arca-manifest.json ! -type s | LC_ALL=C sort | while IFS= read -r f; do
     x=$(tar --format=posix --xattrs --xattrs-include='*' --no-recursion -cf - "$f" \
       | grep -ao 'SCHILY\.xattr\.[^=]*=[^[:cntrl:]]*' | LC_ALL=C sort | tr '\n' ';')
     if [ -n "$x" ]; then printf '%s %s\n' "$f" "$x"; fi
   done
   echo '--- secret'
   cat ./docs/private/secret
+  echo '--- blocks'
+  echo "$(( $(stat -c %b ./docs/holes) * 512 < 1048576 ))"
 }
 list /src
 echo '=== copy'
@@ -167,7 +176,7 @@ fn check_through_container(
 ) -> (String, String) {
     let checker = Checker {
         writer,
-        name: format!("arca-check-{}", &copy.helper["arca-copy-".len()..]),
+        name: format!("{}-check", copy.helper),
     };
     let project = format!("?project={SNAPSHOT_PROJECT}");
     incus(
@@ -295,6 +304,10 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         fs_uuid: "proof".to_string(),
         size: measured.bytes,
         paths: measured.paths,
+        allocated: measured.allocated,
+        unreadable: measured.unreadable,
+        separate: measured.separate.clone(),
+        separate_count: measured.separate.len() as u64,
         created: "proof".to_string(),
     };
     println!("COPY {copy:?}");
@@ -307,6 +320,11 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         outcome.source.map(|counts| (counts.paths, counts.bytes)),
         Some((measured.paths, measured.bytes)),
         "the helper counts what the kernel measured"
+    );
+    assert_eq!(
+        (outcome.skipped_sockets, outcome.skipped_devices),
+        (1, 0),
+        "the socket is left out and counted"
     );
     let helper = writer.get(&format!(
         "/1.0/instances/{}?project={SNAPSHOT_PROJECT}",
@@ -348,6 +366,7 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         format!("-rw-r--r-- {uid_gid} 2 1600000000 ./readme.txt"),
         "./report-link docs/report.bin".to_string(),
         "only me".to_string(),
+        "--- blocks\n1\n".to_string(),
     ] {
         assert!(got.contains(&expected), "the copy shows {expected:?}");
     }

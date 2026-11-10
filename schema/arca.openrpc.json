@@ -4274,6 +4274,13 @@
           }
         },
         {
+          "name": "allocated",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
           "name": "files",
           "required": false,
           "schema": {
@@ -4353,6 +4360,25 @@
           }
         },
         {
+          "name": "separate",
+          "required": false,
+          "schema": {
+            "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        {
+          "name": "separateCount",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
           "name": "size",
           "required": false,
           "schema": {
@@ -4406,10 +4432,26 @@
             "bytes": {
               "type": "integer"
             },
+            "changedDuringCopy": {
+              "type": "integer"
+            },
+            "changedFiles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "files": {
               "type": "integer"
             },
             "folder": {
+              "type": "string"
+            },
+            "io": {
+              "enum": [
+                "incus-caps",
+                "throttled-by-tar"
+              ],
               "type": "string"
             },
             "ioCaps": {
@@ -4418,8 +4460,38 @@
             "kind": {
               "type": "string"
             },
+            "notes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "pool": {
               "type": "string"
+            },
+            "separate": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "separateCount": {
+              "type": "integer"
+            },
+            "skipped": {
+              "properties": {
+                "devices": {
+                  "type": "integer"
+                },
+                "sockets": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "sockets",
+                "devices"
+              ],
+              "type": "object"
             },
             "snapshot": {
               "type": "string"
@@ -4459,6 +4531,12 @@
             "snapshots": {
               "items": {
                 "properties": {
+                  "changedDuringCopy": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
                   "created": {
                     "type": "string"
                   },
@@ -4479,6 +4557,12 @@
                   },
                   "name": {
                     "type": "string"
+                  },
+                  "note": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "pool": {
                     "type": "string"
@@ -4617,10 +4701,26 @@
             "bytes": {
               "type": "integer"
             },
+            "changedDuringCopy": {
+              "type": "integer"
+            },
+            "changedFiles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "files": {
               "type": "integer"
             },
             "folder": {
+              "type": "string"
+            },
+            "io": {
+              "enum": [
+                "incus-caps",
+                "throttled-by-tar"
+              ],
               "type": "string"
             },
             "ioCaps": {
@@ -4629,8 +4729,38 @@
             "kind": {
               "type": "string"
             },
+            "notes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "pool": {
               "type": "string"
+            },
+            "separate": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "separateCount": {
+              "type": "integer"
+            },
+            "skipped": {
+              "properties": {
+                "devices": {
+                  "type": "integer"
+                },
+                "sockets": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "sockets",
+                "devices"
+              ],
+              "type": "object"
             },
             "snapshot": {
               "type": "string"

@@ -29,7 +29,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arca_incus::folder::{FolderCopy, FolderOutcome, HELPER_KEY, INCOMPLETE_KEY, SOURCE_PATH_KEY};
+use arca_incus::folder::{
+    CHANGED_KEY, FolderCopy, FolderOutcome, HELPER_KEY, INCOMPLETE_KEY, SEPARATE_SHOWN,
+    SOURCE_PATH_KEY, changed_note, space_estimate,
+};
 use arca_incus::snapshot::{
     CREATED_KEY, DROPPED_KEY, SNAPSHOT_LABEL_PREFIX, SOURCE_KIND_KEY, SOURCE_NAME_KEY,
     SOURCE_POOL_KEY, SOURCE_PROJECT_KEY, folder_pool_path, instance_copy_body, plain_name,
@@ -1094,6 +1097,8 @@ pub struct SnapshotView {
     pub verified: bool,
     /// Why a folder snapshot is incomplete ([`INCOMPLETE_KEY`]).
     pub reason: Option<String>,
+    /// How many files changed while a verified folder copy read them ([`CHANGED_KEY`]).
+    pub changed: Option<u64>,
     pub dropped: Vec<String>,
 }
 
@@ -1118,6 +1123,8 @@ impl SnapshotView {
                 "incomplete"
             },
             "reason": if self.copying || self.verified { None } else { self.reason.clone() },
+            "changedDuringCopy": self.changed,
+            "note": self.changed.filter(|_| self.verified && !self.copying).map(changed_note),
             "droppedDevices": self.dropped,
         })
     }
@@ -1466,6 +1473,7 @@ impl Storage {
                 source_name: config(SOURCE_NAME_KEY).unwrap_or_default(),
                 source_pool: None,
                 source_path: None,
+                changed: None,
                 pool,
                 size,
                 created: config(CREATED_KEY).unwrap_or_else(|| {
@@ -1544,6 +1552,11 @@ impl Storage {
                     verified: !folder
                         || config(arca_incus::VERIFIED_KEY).as_deref() == Some("true"),
                     reason: folder.then(|| config(INCOMPLETE_KEY)).flatten(),
+                    changed: folder
+                        .then(|| config(CHANGED_KEY))
+                        .flatten()
+                        .and_then(|count| count.parse().ok())
+                        .filter(|count| *count > 0),
                     dropped: Vec::new(),
                 });
             }
@@ -1809,11 +1822,25 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
                 }
             };
             resolved(&args, &["name", "kind"])?;
-            let folder_keys = ["fsUuid", "size", "files", "unreadable", "poolFree"];
+            let folder_keys = FOLDER_KEYS;
             if source == "folder" {
                 let clean = clean_folder(text(&args, "folder"))
                     .map_err(|why| why.replace("args/path", "args/folder"))?;
                 resolved(&args, &folder_keys)?;
+                let separate = args["separate"]
+                    .as_array()
+                    .ok_or("args/separate: a list of folders")?;
+                if separate.len() > SEPARATE_SHOWN
+                    || separate.iter().any(|path| {
+                        path.as_str()
+                            .is_none_or(|path| !path.starts_with(&format!("{clean}/")))
+                    })
+                {
+                    return Err("args/separate: folders inside the folder, at most 100".to_string());
+                }
+                if args["separateCount"].as_u64().unwrap_or(0) < separate.len() as u64 {
+                    return Err("args/separateCount: fewer than the folders listed".to_string());
+                }
                 if text(&args, "kind") != "folder" {
                     return Err("args/kind: it does not match the source".to_string());
                 }
@@ -2236,19 +2263,36 @@ fn folder_rules(folder: &str) -> Result<(), StorageRefusal> {
     Ok(())
 }
 
-/// What walking a folder found: the bytes of its regular files, every path under it, and the folders it could not open.
-/// It stays on the folder's own file system (a folder mounted inside it counts as one empty folder, as the copy sees it)
-/// and leaves out a top-level `lost+found`, as the copy's count does.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The facts the kernel resolves for a folder snapshot when it is proposed; the owner's digest binds them all.
+const FOLDER_KEYS: [&str; 8] = [
+    "fsUuid",
+    "size",
+    "allocated",
+    "files",
+    "unreadable",
+    "separate",
+    "separateCount",
+    "poolFree",
+];
+
+/// What walking a folder found: the bytes of its regular files, the bytes its paths take on disk, every path under it,
+/// the folders it could not open, and the separate file systems inside it. It stays on the folder's own file system, as
+/// the copy does: a mount or btrfs subvolume inside it counts as one path and is listed in `separate`, not walked. A
+/// top-level `lost+found`, sockets and device nodes are left out, as the copy and its count leave them out.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FolderMeasure {
     pub bytes: u64,
+    /// The blocks the measured paths take, in bytes (sparse files count only what is written).
+    pub allocated: u64,
     pub paths: u64,
     pub unreadable: u64,
+    /// The paths where another file system starts, sorted.
+    pub separate: Vec<String>,
 }
 
 /// Walks a folder without following links and measures it ([`FolderMeasure`]). Nothing is read but names and sizes.
 pub fn measure_folder(folder: &str) -> FolderMeasure {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let root = Path::new(folder);
     let mut out = FolderMeasure::default();
     let Ok(top) = std::fs::symlink_metadata(root) else {
@@ -2269,22 +2313,35 @@ pub fn measure_folder(folder: &str) -> FolderMeasure {
             if dir == root && entry.file_name() == "lost+found" {
                 continue;
             }
-            out.paths += 1;
             let path = entry.path();
             let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                out.paths += 1;
                 continue;
             };
+            let kind = meta.file_type();
+            if kind.is_socket() || kind.is_block_device() || kind.is_char_device() {
+                continue;
+            }
+            out.paths += 1;
+            if meta.dev() != device {
+                out.separate.push(path.to_string_lossy().into_owned());
+                continue;
+            }
+            out.allocated = out
+                .allocated
+                .saturating_add(meta.blocks().saturating_mul(512));
             if meta.is_file() {
                 out.bytes = out.bytes.saturating_add(meta.len());
-            } else if meta.is_dir() && meta.dev() == device {
+            } else if meta.is_dir() {
                 stack.push(path);
             }
         }
     }
+    out.separate.sort();
     out
 }
 
-/// Whether a folder of `size` bytes fits in `free` bytes with 10% headroom.
+/// Whether a copy estimated at `size` bytes ([`space_estimate`]) fits in `free` bytes with 10% headroom.
 fn fits(size: u64, free: u64) -> bool {
     size.saturating_add(size / 10) <= free
 }
@@ -2374,14 +2431,17 @@ fn folder_target(storage: &Storage, args: &Value, created: String) -> Result<Tar
         .into());
     }
     let size = args["size"].as_u64().unwrap_or(u64::MAX);
+    let number = |key: &str| args[key].as_u64().unwrap_or(u64::MAX);
+    let (allocated, paths) = (number("allocated"), number("files"));
+    let needed = space_estimate(allocated, paths);
     let root_pool = storage.helper_root_pool()?;
     let free = storage.pool_free(pool)?;
-    if !fits(size, free) {
+    if !fits(needed, free) {
         return Err(StorageRefusal::new(
             "FolderTooBig",
             format!(
-                "{folder} holds {} and the snapshot storage {pool} has {} free; it needs room for the folder and 10% more",
-                short_size(size),
+                "{folder} takes about {} on disk and the snapshot storage {pool} has {} free; it needs room for the folder and 10% more",
+                short_size(needed),
                 short_size(free)
             ),
         )
@@ -2395,9 +2455,45 @@ fn folder_target(storage: &Storage, args: &Value, created: String) -> Result<Tar
         folder: folder.to_string(),
         fs_uuid,
         size,
-        paths: args["files"].as_u64().unwrap_or(0),
+        paths,
+        allocated,
+        unreadable: args["unreadable"].as_u64().unwrap_or(0),
+        separate: args["separate"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        separate_count: args["separateCount"].as_u64().unwrap_or(0),
         created,
     }))
+}
+
+/// What the owner should know about a verified folder copy, in plain words: files that changed while being copied,
+/// sockets and device nodes left out, separate file systems not copied, and anything that went wrong after the copy
+/// (such as a helper that could not be deleted).
+fn copy_notes(outcome: &FolderOutcome, copy: &FolderCopy) -> Vec<String> {
+    let mut notes = Vec::new();
+    if outcome.changed > 0 {
+        notes.push(changed_note(outcome.changed));
+    }
+    if outcome.skipped_sockets + outcome.skipped_devices > 0 {
+        notes.push(format!(
+            "{} socket(s) and {} device node(s) were left out; apps make them again",
+            outcome.skipped_sockets, outcome.skipped_devices
+        ));
+    }
+    if copy.separate_count > 0 {
+        notes.push(format!(
+            "{} separate file system(s) inside the folder were not copied; snapshot them separately",
+            copy.separate_count
+        ));
+    }
+    if let Some(reason) = &outcome.reason {
+        notes.push(reason.clone());
+    }
+    notes
 }
 
 /// A size in decimal units, as a card says it: `177 GB`, `4.2 GB`, `512 MB`.
@@ -2484,26 +2580,32 @@ pub fn details(action: ActionKind, args: &Value) -> Vec<ActionDetail> {
             let pool = text(args, "pool");
             let number = |key: &str| args[key].as_u64().unwrap_or(0);
             let (size, unreadable) = (number("size"), number("unreadable"));
+            let needed = space_estimate(number("allocated"), number("files"));
+            let estimate = if unreadable > 0 {
+                format!(
+                    " (an estimate: {} folder(s) could not be measured)",
+                    grouped(unreadable)
+                )
+            } else {
+                String::new()
+            };
             let mut rows = vec![
                 row("Folder", folder.to_string()),
-                row(
-                    "Size",
-                    if unreadable > 0 {
-                        format!("{} (at least)", short_size(size))
-                    } else {
-                        short_size(size)
-                    },
-                ),
+                row("Size", format!("{}{estimate}", short_size(size))),
                 row(
                     "Files",
                     format!("{} files and folders", grouped(number("files"))),
                 ),
                 row("Target", format!("Snapshot storage {pool}")),
                 row(
+                    "Space it takes",
+                    format!("about {}{estimate}", short_size(needed)),
+                ),
+                row(
                     "Free space after",
                     format!(
                         "about {}",
-                        short_size(number("poolFree").saturating_sub(size))
+                        short_size(number("poolFree").saturating_sub(needed))
                     ),
                 ),
                 row("Snapshot name", text(args, "name").to_string()),
@@ -2512,8 +2614,35 @@ pub fn details(action: ActionKind, args: &Value) -> Vec<ActionDetail> {
                 rows.push(row(
                     "Not measured",
                     format!(
-                        "{} folder(s) Arca could not open; they are copied, but their files are not counted above",
+                        "{} folder(s) Arca could not open; they are copied, but their files are not counted above, so the snapshot gets no size limit",
                         grouped(unreadable)
+                    ),
+                ));
+            }
+            let separate: Vec<&str> = args["separate"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let separate_count = number("separateCount").max(separate.len() as u64);
+            if separate_count > 0 {
+                let shown = separate
+                    .iter()
+                    .take(10)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = separate_count.saturating_sub(separate.len().min(10) as u64);
+                rows.push(row(
+                    "Not copied (separate file system)",
+                    format!(
+                        "{shown}{}; snapshot them separately",
+                        if more > 0 {
+                            format!(" and {} more", grouped(more))
+                        } else {
+                            String::new()
+                        }
                     ),
                 ));
             }
@@ -2809,7 +2938,7 @@ pub fn enrich(
                 .and_then(Value::as_str)
                 .map(str::to_string)
             {
-                for key in ["fsUuid", "size", "files", "unreadable", "poolFree"] {
+                for key in FOLDER_KEYS {
                     object.remove(key);
                 }
                 if !folder.is_empty() && folder.bytes().all(|b| b == b'/') {
@@ -2835,8 +2964,20 @@ pub fn enrich(
                     ("name", json!(name)),
                     ("fsUuid", json!(fs_uuid)),
                     ("size", json!(measured.bytes)),
+                    ("allocated", json!(measured.allocated)),
                     ("files", json!(measured.paths)),
                     ("unreadable", json!(measured.unreadable)),
+                    (
+                        "separate",
+                        json!(
+                            measured
+                                .separate
+                                .iter()
+                                .take(SEPARATE_SHOWN)
+                                .collect::<Vec<_>>()
+                        ),
+                    ),
+                    ("separateCount", json!(measured.separate.len())),
                     ("poolFree", json!(free)),
                 ] {
                     object.insert(key.to_string(), value);
@@ -3456,8 +3597,12 @@ impl StorageActionHandler {
                     true,
                     "SnapshotCopied",
                     format!(
-                        "the folder snapshot {} is copied and verified",
-                        thread_copy.name
+                        "the folder snapshot {} is copied and verified{}",
+                        thread_copy.name,
+                        copy_notes(outcome, &thread_copy)
+                            .iter()
+                            .map(|note| format!("; {note}"))
+                            .collect::<String>()
                     ),
                 ),
                 Ok(outcome) => (
@@ -3504,9 +3649,28 @@ impl StorageActionHandler {
             Some(Ok(outcome)) if outcome.verified => {
                 let mut done = answer("copied");
                 done["ioCaps"] = json!(outcome.io_caps);
+                done["io"] = json!(if outcome.io_caps {
+                    "incus-caps"
+                } else {
+                    "throttled-by-tar"
+                });
                 if let Some(copied) = outcome.copy {
                     done["files"] = json!(copied.paths);
                     done["bytes"] = json!(copied.bytes);
+                }
+                done["changedDuringCopy"] = json!(outcome.changed);
+                if !outcome.changed_head.is_empty() {
+                    done["changedFiles"] = json!(outcome.changed_head);
+                }
+                done["skipped"] = json!({
+                    "sockets": outcome.skipped_sockets,
+                    "devices": outcome.skipped_devices,
+                });
+                done["separate"] = json!(copy.separate);
+                done["separateCount"] = json!(copy.separate_count);
+                let notes = copy_notes(&outcome, &copy);
+                if !notes.is_empty() {
+                    done["notes"] = json!(notes);
                 }
                 Ok(done)
             }
@@ -3921,6 +4085,55 @@ mod tests {
         assert_ne!(helper_name(&a), helper_name(&b));
     }
 
+    /// Folders that could not be measured make the size an estimate with no limit, and separate file systems are named
+    /// (ten of them, then how many more) with the advice to snapshot them separately.
+    #[test]
+    fn a_folder_card_names_estimates_and_separate_file_systems() {
+        let separate: Vec<String> = (0..12).map(|n| format!("/home/sub{n:02}")).collect();
+        let args = json!({
+            "folder": "/home", "pool": "usb1", "kind": "folder", "name": "folder--home--20261109T1405",
+            "size": 177_000_000_000u64, "allocated": 100_000_000_000u64, "files": 1_000_000,
+            "unreadable": 2, "separate": separate, "separateCount": 12, "poolFree": 2_000_000_000_000u64,
+            "fsUuid": "uuid-home",
+        });
+        let rows = details(ActionKind::SnapshotCreate, &args);
+        let row = |label: &str| {
+            rows.iter()
+                .find(|row| row.label == label)
+                .map(|row| row.value.clone())
+                .unwrap_or_else(|| panic!("no {label} row in {rows:?}"))
+        };
+        assert_eq!(
+            row("Size"),
+            "177 GB (an estimate: 2 folder(s) could not be measured)"
+        );
+        assert_eq!(
+            row("Space it takes"),
+            "about 104 GB (an estimate: 2 folder(s) could not be measured)",
+            "the blocks plus 4 KiB a path"
+        );
+        assert!(row("Not measured").contains("no size limit"));
+        let not_copied = row("Not copied (separate file system)");
+        assert!(
+            not_copied.starts_with("/home/sub00, /home/sub01"),
+            "{not_copied}"
+        );
+        assert!(not_copied.contains("/home/sub09") && !not_copied.contains("/home/sub10"));
+        assert!(
+            not_copied.ends_with(" and 2 more; snapshot them separately"),
+            "{not_copied}"
+        );
+        assert!(
+            prepare(ActionKind::SnapshotCreate, {
+                let mut wrong = args.clone();
+                wrong["separate"] = json!(["/etc/elsewhere"]);
+                wrong
+            })
+            .is_err_and(|why| why.contains("args/separate")),
+            "a separate file system outside the folder is refused"
+        );
+    }
+
     #[test]
     fn card_sizes_and_counts_read_plainly() {
         assert_eq!(short_size(177_000_000_000), "177 GB");
@@ -3944,19 +4157,58 @@ mod tests {
         std::fs::write(root.join("a/one"), vec![0u8; 100]).expect("a file");
         std::fs::write(root.join("lost+found/x/skip"), vec![0u8; 50]).expect("a file");
         std::os::unix::fs::symlink("/etc", root.join("a/link")).expect("a link");
+        let _socket =
+            std::os::unix::net::UnixListener::bind(root.join("a/s.sock")).expect("a socket");
+        std::fs::File::create(root.join("a/holes"))
+            .and_then(|file| file.set_len(64 << 20))
+            .expect("a sparse file");
         std::fs::create_dir(root.join("closed")).expect("a folder");
         std::fs::write(root.join("closed/hidden"), b"x").expect("a file");
         std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o000))
             .expect("mode");
         let measured = measure_folder(root.to_str().expect("utf-8"));
         let running_as_root = std::fs::read_dir(root.join("closed")).is_ok();
-        // a, a/b, a/one, a/link, closed (and closed/hidden when this runs as root); lost+found is left out.
-        assert_eq!(measured.bytes, if running_as_root { 101 } else { 100 });
-        assert_eq!(measured.paths, if running_as_root { 6 } else { 5 });
+        // a, a/b, a/one, a/link, a/holes, closed (and closed/hidden when this runs as root); lost+found and the socket
+        // are left out.
+        let holes = 64 << 20;
+        assert_eq!(
+            measured.bytes,
+            holes + if running_as_root { 101 } else { 100 }
+        );
+        assert_eq!(measured.paths, if running_as_root { 7 } else { 6 });
         assert_eq!(measured.unreadable, u64::from(!running_as_root));
+        assert!(
+            measured.allocated > 0 && measured.allocated < holes,
+            "a sparse file counts its blocks, not its length: {measured:?}"
+        );
+        assert!(measured.separate.is_empty());
         std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o755))
             .expect("mode");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file system mounted inside a folder is not walked and is listed. `/dev` has mounts inside it on most hosts
+    /// (`/dev/pts`, `/dev/shm`); where it has none, there is nothing to check.
+    #[test]
+    fn a_separate_file_system_inside_a_folder_is_listed_and_not_walked() {
+        use std::os::unix::fs::MetadataExt;
+        let dev = |path: &str| std::fs::symlink_metadata(path).map(|meta| meta.dev()).ok();
+        let mounted: Vec<&str> = ["/dev/pts", "/dev/shm", "/dev/mqueue"]
+            .into_iter()
+            .filter(|path| dev(path).is_some() && dev(path) != dev("/dev"))
+            .collect();
+        if mounted.is_empty() {
+            eprintln!("nothing is mounted inside /dev here; nothing to check");
+            return;
+        }
+        let measured = measure_folder("/dev");
+        for path in mounted {
+            assert!(
+                measured.separate.iter().any(|found| found == path),
+                "{path} is listed: {:?}",
+                measured.separate
+            );
+        }
     }
 
     #[test]
