@@ -18,7 +18,20 @@
 //! ```
 //!
 //! `ARCA_TEST_CHROME` names another Chromium binary (default `/usr/bin/google-chrome`). Every secret stays in the scratch
-//! directory, which is removed when the test ends; nothing is printed but the outcome.
+//! directory, which is removed when the test ends; nothing is printed but the outcome. Chromium runs with `HOME` and its
+//! profile in that directory and with its background networking and component updates off.
+//!
+//! The replay: once the requester has spent the approval, `nats` is created again under the same name and the approval is
+//! sent again, so the call reaches the approval check rather than a not_found. Both devices are device-bound passkeys that
+//! count, and Arca checks the count before the nonce, so the replay is refused by the sign count (`owner_approval`,
+//! `SignCountRegressed`), with no nonce spent and the kept count unchanged. The nonce refusal (`Replayed`) belongs to a
+//! synced passkey that reports count 0. Chromium's virtual authenticator cannot be one: with backup eligibility and state
+//! set it still counts (Chrome 155: 2, then 3). That path is proved in process, with a synced software passkey at count 0,
+//! by `g7_a_spent_approval_re_encoded_as_its_high_s_twin_verifies_and_is_refused_as_a_replay_by_its_nonce`.
+//!
+//! The server is not a scratch run (`kernel.scratch` stays false): a scratch run takes only `arcak-scratch-*` projects, and
+//! the service and postgres verbs this test drives work only in the `arcak-svc` project, so serve would refuse the config.
+//! The state directory, the token directory, the fake Incus and the trust are all the test's own.
 
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -315,7 +328,10 @@ struct Chrome {
 }
 
 impl Chrome {
-    fn launch(binary: &str, profile: &Path, spki: &str, log: &Path) -> Chrome {
+    /// Launches `binary` with its profile and `HOME` in the scratch directory, and with no background traffic of its own.
+    fn launch(binary: &str, home: &Path, spki: &str, log: &Path) -> Chrome {
+        private_dir(home);
+        let profile = home.join("profile");
         let mut child = Command::new("sh")
             .arg("-c")
             .arg(r#"exec "$0" "$@" 3<&0 4>&1 </dev/null >/dev/null"#)
@@ -325,9 +341,12 @@ impl Chrome {
                 "--remote-debugging-pipe",
                 "--no-first-run",
                 "--no-default-browser-check",
+                "--disable-background-networking",
+                "--disable-component-update",
                 "--disable-sync",
                 "--password-store=basic",
             ])
+            .env("HOME", home)
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg(format!("--ignore-certificate-errors-spki-list={spki}"))
             .arg("about:blank")
@@ -895,22 +914,48 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
         Some(count),
         "the spend kept the count the audit names"
     );
+    // The replay: `nats` is made again under the same name, so the call reaches the approval check (a missing service would
+    // answer not_found before it). The approval names `delete nats {name: nats}`, which this call matches exactly.
+    result(
+        &mcp(
+            &socket,
+            &doctor,
+            7,
+            "service_create",
+            json!({ "name": "nats", "template": "nats" }),
+        ),
+        "service_create again",
+    );
+    assert!(instance_exists(&fake, "nats"), "nats runs again");
     let replay = mcp(
         &socket,
         &doctor,
-        7,
+        8,
         "service_remove",
         json!({ "name": "nats", "approval": approval }),
     );
+    assert_eq!(
+        replay["error"]["data"]["refusal"], "owner_approval",
+        "the replay is refused as an owner approval, not as a missing service: {replay}"
+    );
+    // A device-bound passkey counts, and the count is checked before the nonce: its replay is refused by the sign count.
     assert!(
-        replay.get("error").is_some() || replay["result"]["isError"] == true,
-        "the approval spends once: {replay}"
+        replay["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("sign count is not above the last one kept")),
+        "a counting passkey's replay is refused by its sign count: {replay}"
     );
     assert_eq!(
         lines(&nonces),
         spent_before + 1,
-        "the replay spends nothing"
+        "the replay spends no nonce"
     );
+    assert_eq!(
+        kept_count(&state, &phone),
+        Some(count),
+        "the replay leaves the kept count as it was"
+    );
+    assert!(instance_exists(&fake, "nats"), "the replay removes nothing");
 
     // No approval string, code or credential reaches the server's log.
     let log = serve.log_text();
@@ -920,6 +965,7 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
     assert_eq!(serve.terminate(), Some(0), "the server stops cleanly");
     println!(
         "browser passkey ceremony: 2 passkeys registered (setup code, passkey_add), 1 delete plan and 1 request approved, \
-         request spend audited with via=passkey count={count} synced=0, service_remove spent it once"
+         request spend audited with via=passkey count={count} synced=0, service_remove spent it once, \
+         the replay on a re-created nats refused by the sign count with no nonce spent"
     );
 }
