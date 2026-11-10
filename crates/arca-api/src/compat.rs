@@ -252,7 +252,10 @@ fn result_node(method: &str, old: &Value, new: &Value, path: &str, out: &mut Vec
     }
     // A closed released object refuses every field it does not name, so a field the current result adds is a broader result,
     // and so is an object the current result leaves open.
-    let widened = closed(old) && (!closed(new) || names_new_property(old, new));
+    // A released object whose unnamed fields meet a schema (additionalProperties as a schema, or propertyNames) may have
+    // refused the field the current result names now; that cannot be related, so it is a break too (fail closed).
+    let widened = (closed(old) && (!closed(new) || names_new_property(old, new)))
+        || (restricts_unnamed(old) && names_new_property(old, new));
     if let Some(old_fields) = properties(old) {
         for (field, old_field) in old_fields {
             let child = format!("{path}.{field}");
@@ -462,6 +465,13 @@ fn required_names(schema: &Value) -> Vec<&str> {
 
 fn closed(schema: &Value) -> bool {
     schema.get("additionalProperties") == Some(&Value::Bool(false))
+}
+
+/// Whether a schema restricts the fields it does not name by a schema: `additionalProperties` as a schema, or
+/// `propertyNames`.
+fn restricts_unnamed(schema: &Value) -> bool {
+    matches!(schema.get("additionalProperties"), Some(Value::Object(_)))
+        || schema.get("propertyNames").is_some()
 }
 
 /// Whether `new` names a property that `old` does not name.
