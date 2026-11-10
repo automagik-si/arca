@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 44] = [
+static VERBS: [Verb; 46] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -401,6 +401,34 @@ static VERBS: [Verb; 44] = [
         cut: no_cut,
         params: service_remove_params,
         result: service_remove_result,
+    },
+    Verb {
+        name: "service_import",
+        summary: "Take over a service another manager created, where it stands: write one key on its instance, the kernel's import mark, and record it as an adopted service. Only a service kernel.importServices lists, only from an approved proposal. Nothing is stopped, moved or changed otherwise.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_import,
+        cut: no_cut,
+        params: service_import_params,
+        result: service_import_result,
+    },
+    Verb {
+        name: "service_release",
+        summary: "Undo a service import: clear the one key the import wrote and remove Arca's record of the service, only from an approved proposal. The instance keeps running and nothing else on it changes.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_release,
+        cut: no_cut,
+        params: service_release_params,
+        result: service_release_result,
     },
     Verb {
         name: "service_connect",
@@ -913,6 +941,8 @@ pub fn take_confirm(v: &Verb, args: &mut Value) -> Result<(), String> {
 fn not_confirmed(name: &str) -> String {
     let undone = match name {
         "service_remove" => "nothing was removed",
+        "service_import" => "nothing was imported",
+        "service_release" => "nothing was released",
         "gpu_detach" => "nothing was detached",
         "storage_add" => "nothing was added",
         "action_approve" => "nothing was run",
@@ -1345,10 +1375,12 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The fifteen verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 15] = [
+/// The seventeen verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 17] = [
     "service_create",
     "service_remove",
+    "service_import",
+    "service_release",
     "service_publish",
     "service_unpublish",
     "service_connect",
@@ -2125,6 +2157,75 @@ fn service_remove_params() -> Value {
         "required": ["name", "approval"],
         "type": "object"
     }))
+}
+
+/// The params of `service_import` and `service_release`: the service's name and the grant of its approved proposal.
+fn service_import_params() -> Value {
+    with_confirm(json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": {
+                "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+                "maxLength": 16384,
+                "minLength": 1,
+                "type": "string"
+            },
+            "name": service_name_schema("The service name, as kernel.importServices lists it (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).")
+        },
+        "required": ["name", "approval"],
+        "type": "object"
+    }))
+}
+
+fn service_release_params() -> Value {
+    service_import_params()
+}
+
+fn service_import_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "imported": { "const": true, "type": "boolean" },
+            "preImage": {
+                "description": "The SHA-256 of the instance's pre-image, as the adoption record holds it.",
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+            },
+            "service": service_status_result()
+        },
+        "required": ["imported", "preImage", "service"],
+        "type": "object"
+    })
+}
+
+fn service_release_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "preImage": {
+                "description": "The SHA-256 of the instance's image after the release, or null when the instance is gone.",
+                "pattern": "^[0-9a-f]{64}$",
+                "type": ["string", "null"]
+            },
+            "released": { "const": true, "type": "boolean" },
+            "restored": {
+                "description": "Whether the instance's image is the pre-image the import recorded.",
+                "type": "boolean"
+            }
+        },
+        "required": ["released", "restored", "preImage"],
+        "type": "object"
+    })
+}
+
+/// A short line for a successful `service_import`.
+pub fn summary_service_import(_: &Value) -> String {
+    "Service imported.".to_string()
+}
+
+/// A short line for a successful `service_release`.
+pub fn summary_service_release(_: &Value) -> String {
+    "Service released.".to_string()
 }
 
 fn service_remove_result() -> Value {

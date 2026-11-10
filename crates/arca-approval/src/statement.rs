@@ -23,6 +23,8 @@ pub enum ArcaAction {
     PeerKeysSet,
     ServiceCreate,
     ServiceRemove,
+    ServiceImport,
+    ServiceRelease,
     ServicePublish,
     ServiceUnpublish,
     ServiceConnect,
@@ -51,6 +53,8 @@ impl ArcaAction {
             Self::PeerKeysSet => "peer_keys_set",
             Self::ServiceCreate => "service_create",
             Self::ServiceRemove => "service_remove",
+            Self::ServiceImport => "service_import",
+            Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
             Self::ServiceUnpublish => "service_unpublish",
             Self::ServiceConnect => "service_connect",
@@ -79,6 +83,8 @@ impl ArcaAction {
             "peer_keys_set" => Some(Self::PeerKeysSet),
             "service_create" => Some(Self::ServiceCreate),
             "service_remove" => Some(Self::ServiceRemove),
+            "service_import" => Some(Self::ServiceImport),
+            "service_release" => Some(Self::ServiceRelease),
             "service_publish" => Some(Self::ServicePublish),
             "service_unpublish" => Some(Self::ServiceUnpublish),
             "service_connect" => Some(Self::ServiceConnect),
@@ -275,7 +281,7 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
         bad(
             "action",
-            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop or instance_restart",
+            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_import, service_release, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop or instance_restart",
         )
     })?;
     let target = field("target");

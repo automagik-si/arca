@@ -51,6 +51,25 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             "confirm is false: nothing was removed and no approval was spent",
         ),
         (
+            "service_import",
+            json!({ "name": "db1", "approval": "0123456789abcdef" }),
+            json!({
+                "imported": true,
+                "preImage": "c".repeat(64),
+                "service": {
+                    "name": "db1", "template": "postgres-autopg", "state": "running", "ipv4": "10.0.5.10",
+                    "ports": [5432], "links": [], "published": null, "lanPort": null
+                }
+            }),
+            "confirm is false: nothing was imported and no approval was spent",
+        ),
+        (
+            "service_release",
+            json!({ "name": "db1", "approval": "0123456789abcdef" }),
+            json!({ "released": true, "restored": true, "preImage": "c".repeat(64) }),
+            "confirm is false: nothing was released and no approval was spent",
+        ),
+        (
             "gpu_detach",
             json!({ "instance": "box", "pci": "0000:01:00.0", "approval": "x.y" }),
             json!({ "instance": "box", "project": "default", "pci": "0000:01:00.0", "device": "gpu0", "attached": false, "changed": true }),
