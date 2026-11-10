@@ -542,7 +542,7 @@ static VERBS: [Verb; 35] = [
     },
     Verb {
         name: "snapshot_list",
-        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made.",
+        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished is incomplete.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -2032,6 +2032,7 @@ fn storage_add_params() -> Value {
             }),
         ),
         ("disk", false, string_max(64)),
+        ("fsUuid", false, string_max(128)),
         ("model", false, string_max(256)),
         ("serial", false, string_max(256)),
         ("transport", false, string_max(32)),
@@ -2170,7 +2171,7 @@ fn snapshot_list_result() -> Value {
         ("pool", true, string()),
         ("size", true, nullable(int())),
         ("created", true, string()),
-        ("state", true, one_of(&["ready", "copying"])),
+        ("state", true, one_of(&["ready", "copying", "incomplete"])),
         ("droppedDevices", true, array(string())),
     ]);
     result(vec![("snapshots", true, array(snapshot))])

@@ -2,7 +2,8 @@
 //! unix socket, and records every request with its method, target and body, so a test can check exactly what was sent.
 //!
 //! GET: `/1.0/storage-pools?recursion=1`, `/1.0/storage-pools/<p>`, `/1.0/storage-pools/<p>/resources`, `/1.0/projects/<p>`,
-//! `/1.0/instances/<n>?project=<p>`, `/1.0/instances?project=<p>&recursion=1`, `/1.0/instances/<n>/state?project=<p>`,
+//! `/1.0/instances/<n>?project=<p>`, `/1.0/instances?project=<p>&recursion=1`,
+//! `/1.0/instances?all-projects=true&recursion=1`, `/1.0/instances/<n>/state?project=<p>`,
 //! `/1.0/storage-pools/<p>/volumes/custom?project=<p>&recursion=1`, `/1.0/storage-pools/<p>/volumes/custom/<n>?project=<p>`,
 //! its `/state`, and `/1.0/operations/<id>/wait`. Writes: `POST /1.0/storage-pools`, `POST /1.0/projects`, `POST` of an
 //! instance or a volume with a `copy` source, `PUT` of an instance, and `DELETE` of either. An instance or volume create or
@@ -437,6 +438,9 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             }
             state.projects.insert(name, body.clone());
             sync(Value::Null)
+        }
+        ("GET", ["instances"]) if params.get("all-projects") == Some(&"true") => {
+            sync(json!(state.instances.values().cloned().collect::<Vec<_>>()))
         }
         ("GET", ["instances"]) => {
             if !state.projects.contains_key(&project) {

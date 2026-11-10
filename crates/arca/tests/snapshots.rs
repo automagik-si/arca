@@ -13,8 +13,8 @@ use arca::action_proposal::ActionKind;
 use arca::handlers::{ActionExecutor, ActionSlot, plan_handlers_full};
 use arca::kernel::Kernel;
 use arca::storage::{
-    ERASE_SENTENCE, FixedBlockDevices, SnapshotListHandler, Storage, StorageListHandler,
-    snapshot_name,
+    DeviceLinks, ERASE_SENTENCE, ExclusiveOpen, FixedBlockDevices, SnapshotListHandler, Storage,
+    StorageListHandler, snapshot_name,
 };
 use arca_incus::fake_storage::FakeStorageIncus;
 use arca_incus::snapshot::{
@@ -529,15 +529,31 @@ fn a_whole_disk_plan_says_everything_will_be_erased_and_incus_formats_it() {
     assert_write_family(&rig.incus);
 }
 
-/// A real folder stands in for the stick's mount point (sdc1), so links and folder rights in it are real.
+fn folder_source(path: &str) -> arca_incus::PoolSource {
+    arca_incus::PoolSource::Folder {
+        path: path.to_string(),
+        fs_uuid: None,
+    }
+}
+
+/// The host's disks with the stick's partition (sdc1) formatted ext4 and mounted at `mount`.
+fn disks_with_stick_at(mount: Option<&str>) -> Value {
+    let mut disks = host_disks();
+    disks["blockdevices"][2]["children"][0]["fstype"] = json!("ext4");
+    disks["blockdevices"][2]["children"][0]["mountpoints"] = match mount {
+        Some(mount) => json!([mount]),
+        None => json!([null]),
+    };
+    disks
+}
+
+/// A real folder stands in for the stick's mount point (sdc1, ext4), so links and folder rights in it are real.
 fn stick_mount(rig: &Rig) -> String {
     let path = rig._scratch.path("stick");
     std::fs::create_dir(&path).expect("the mount folder");
     let mount = std::fs::canonicalize(path).expect("a real path");
     let mount = mount.to_str().expect("utf-8").to_string();
-    let mut disks = host_disks();
-    disks["blockdevices"][2]["children"][0]["mountpoints"] = json!([mount]);
-    rig.devices.set(Ok(disks));
+    rig.devices.set(Ok(disks_with_stick_at(Some(&mount))));
     mount
 }
 
@@ -568,8 +584,13 @@ fn a_folder_plan_keeps_the_rest_of_the_disk() {
         .expect("a folder on a mounted disk may be proposed");
     let details = &proposed["details"];
     assert_eq!(row(details, "Disk"), "Acme Stick 64G (64.0 GB, USB)");
-    assert_eq!(row(details, "On it now"), "sdc1 exfat \"BACKUP\" 64.0 GB");
+    assert_eq!(row(details, "On it now"), "sdc1 ext4 \"BACKUP\" 64.0 GB");
     assert_eq!(row(details, "Folder"), format!("{mount}/arca-pool"));
+    assert_eq!(
+        proposed["args"]["fsUuid"],
+        json!("uuid-sdc1"),
+        "the owner approves the file system"
+    );
     assert_eq!(row(details, "Mounted at"), mount);
     assert!(
         !details.to_string().contains(ERASE_SENTENCE),
@@ -589,6 +610,7 @@ fn a_folder_plan_keeps_the_rest_of_the_disk() {
         json!(format!("{mount}/arca-pool"))
     );
     assert_eq!(pool["config"][SNAPSHOT_STORAGE_KEY], json!("stick"));
+    assert_eq!(pool["config"][arca_incus::FS_UUID_KEY], json!("uuid-sdc1"));
     assert!(pool["config"].get("source.wipe").is_none());
     // Incus makes a folder pool only in a folder that is there and empty: Arca made it, for Incus alone.
     assert_eq!(mode_of(&format!("{mount}/arca-pool")), 0o700);
@@ -607,18 +629,18 @@ fn incus_refuses_a_folder_pool_whose_folder_is_missing() {
     std::fs::create_dir(&folder).expect("a folder");
     let folder = folder.to_str().expect("utf-8").to_string();
     let missing = writer
-        .create_pool("a", &arca_incus::PoolSource::Folder(folder.clone()))
+        .create_pool("a", &folder_source(&folder))
         .expect_err("no arca-pool folder");
     assert!(missing.to_string().contains("doesn't exist"), "{missing}");
     std::fs::create_dir(format!("{folder}/arca-pool")).expect("arca-pool");
     std::fs::write(format!("{folder}/arca-pool/old"), "x").expect("a file");
     let full = writer
-        .create_pool("a", &arca_incus::PoolSource::Folder(folder.clone()))
+        .create_pool("a", &folder_source(&folder))
         .expect_err("arca-pool has a file in it");
     assert!(full.to_string().contains("isn't empty"), "{full}");
     std::fs::remove_file(format!("{folder}/arca-pool/old")).expect("remove");
     writer
-        .create_pool("a", &arca_incus::PoolSource::Folder(folder))
+        .create_pool("a", &folder_source(&folder))
         .expect("an empty arca-pool folder is fine");
 }
 
@@ -778,11 +800,11 @@ fn system_member_mounted_and_unlisted_disks_are_refused() {
         (json!({ "name": "x", "device": "loop0" }), "DiskNotListed"),
         (json!({ "name": "x", "path": "/home/owner" }), "SystemDisk"),
         (json!({ "name": "x", "path": "/srv/data" }), "SystemDisk"),
-        (
-            json!({ "name": "fast", "path": "/media/owner/BACKUP" }),
-            "PoolExists",
-        ),
         (json!({ "name": "x", "device": "sdh" }), "SnapshotDisk"),
+        (
+            json!({ "name": "x", "path": "/media/owner/BACKUP/snaps" }),
+            "FolderFileSystem",
+        ),
     ];
     for (args, code) in cases {
         assert_eq!(
@@ -806,6 +828,17 @@ fn system_member_mounted_and_unlisted_disks_are_refused() {
             "{args}: {refused:?}"
         );
     }
+    // On a Linux file system, a folder pool still needs a name no pool has.
+    rig.devices
+        .set(Ok(disks_with_stick_at(Some("/media/owner/BACKUP"))));
+    assert_eq!(
+        refused_code(rig.propose(
+            "storage_add",
+            json!({ "name": "fast", "path": "/media/owner/BACKUP" })
+        )),
+        "PoolExists"
+    );
+    rig.devices.set(Ok(host_disks()));
     assert!(rig.incus.writes().is_empty(), "no refusal wrote anything");
 
     // A direct call without the owner's one-shot grant is refused before any write.
@@ -955,6 +988,11 @@ fn an_app_snapshot_is_a_stopped_self_contained_copy_and_the_source_is_only_read(
             "{key} is kept as a mark"
         );
     }
+    assert_eq!(
+        copy["config"][arca_incus::VERIFIED_KEY],
+        json!("true"),
+        "the clean-up PUT marks the copy verified"
+    );
     assert_eq!(
         copy["config"]["user.arcasnapshot.dropped-devices"],
         json!("http,photos,share")
@@ -1316,4 +1354,385 @@ fn the_doctor_may_propose_the_three_storage_actions() {
         assert_eq!(verb.min_scope, arca_api::Scope::Viewer);
         assert!(!verb.writes);
     }
+}
+
+// ---- Round 2: nothing that holds data is ever offered for erase, whatever `lsblk` shows. ----
+
+/// A host with only the system NVMe and the given extra disks.
+fn host_with(extra: Vec<Value>) -> Value {
+    let mut disks = vec![host_disks()["blockdevices"][0].clone()];
+    disks.extend(extra);
+    json!({ "blockdevices": disks })
+}
+
+fn role_and_reason(rig: &Rig, name: &str) -> (String, String) {
+    let list = rig.storage_list();
+    let view = disk_view(&list, name);
+    (
+        view["role"].as_str().unwrap_or_default().to_string(),
+        view["reason"].as_str().unwrap_or_default().to_string(),
+    )
+}
+
+#[test]
+fn every_member_of_a_mounted_multi_device_file_system_is_taken() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-multi-device", &key);
+    // The root file system is a btrfs over the NVMe partition and a USB disk; lsblk lists / on the NVMe partition only.
+    let mut system = host_disks()["blockdevices"][0].clone();
+    system["children"][1]["fstype"] = json!("btrfs");
+    system["children"][1]["uuid"] = json!("uuid-rootfs");
+    rig.devices.set(Ok(json!({ "blockdevices": [
+        system,
+        disk("sdb", "Acme Portable 1T", "usb", true, 1000 * GB, json!({ "fstype": "btrfs", "uuid": "uuid-rootfs" })),
+        // A bcachefs over two disks, mounted at /srv/bulk; lsblk lists the mount on sdc only.
+        disk("sdc", "Fakedisk SATA 2T", "sata", false, 2000 * GB, json!({
+            "fstype": "bcachefs", "uuid": "uuid-bulk", "mountpoints": ["/srv/bulk"],
+        })),
+        disk("sdd", "Fakedisk SATA 2T", "sata", false, 2000 * GB, json!({ "fstype": "bcachefs", "uuid": "uuid-bulk" })),
+        // A btrfs member lsblk knows nothing about; the kernel lists it under a mounted file system.
+        disk("sde", "Acme Portable 500G", "usb", true, 500 * GB, json!({})),
+    ]})));
+    rig.devices.set_links(DeviceLinks {
+        members: vec![("btrfs".into(), "uuid-elsewhere".into(), vec!["sde".into()])],
+        ..DeviceLinks::default()
+    });
+    let (role, reason) = role_and_reason(&rig, "sdb");
+    assert_eq!(role, "system");
+    assert!(
+        reason.contains("part of the btrfs file system that holds /"),
+        "{reason}"
+    );
+    assert!(reason.contains("nvme0n1p2"), "{reason}");
+    assert_eq!(
+        role_and_reason(&rig, "sdd").0,
+        "in use",
+        "a bcachefs member is mounted with its set"
+    );
+    let (role, reason) = role_and_reason(&rig, "sde");
+    assert_eq!(role, "system");
+    assert!(
+        reason.contains("part of a mounted btrfs file system"),
+        "{reason}"
+    );
+    for (device, code) in [
+        ("sdb", "SystemDisk"),
+        ("sdd", "DiskMounted"),
+        ("sde", "SystemDisk"),
+    ] {
+        assert_eq!(
+            refused_code(rig.propose("storage_add", json!({ "name": "x", "device": device }))),
+            code,
+            "{device}"
+        );
+    }
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn raid_lvm_zfs_luks_swap_and_held_disks_are_never_free_even_unmounted() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-members", &key);
+    let part = |disk_name: &str, fstype: Option<&str>| {
+        node(
+            &format!("{disk_name}1"),
+            "part",
+            fstype,
+            None,
+            &[],
+            500 * GB,
+        )
+    };
+    rig.devices.set(Ok(host_with(vec![
+        // One half of a failing RAID1: the array is not assembled, so lsblk shows the member alone.
+        disk(
+            "sdb",
+            "Fakedisk SATA 500G",
+            "sata",
+            false,
+            500 * GB,
+            json!({ "children": [part("sdb", Some("linux_raid_member"))] }),
+        ),
+        disk(
+            "sdc",
+            "Fakedisk SATA 500G",
+            "sata",
+            false,
+            500 * GB,
+            json!({ "children": [part("sdc", Some("LVM2_member"))] }),
+        ),
+        disk(
+            "sdd",
+            "Fakedisk SATA 500G",
+            "sata",
+            false,
+            500 * GB,
+            json!({ "fstype": "zfs_member" }),
+        ),
+        disk(
+            "sde",
+            "Acme Portable 500G",
+            "usb",
+            true,
+            500 * GB,
+            json!({ "children": [part("sde", Some("crypto_LUKS"))] }),
+        ),
+        disk(
+            "sdf",
+            "Acme Portable 500G",
+            "usb",
+            true,
+            500 * GB,
+            json!({ "children": [part("sdf", Some("swap"))] }),
+        ),
+        // Nothing on it says so, but the kernel lists holders: a partition held by an inactive array, a disk held by a
+        // device-mapper target.
+        disk(
+            "sdg",
+            "Fakedisk SATA 500G",
+            "sata",
+            false,
+            500 * GB,
+            json!({ "children": [part("sdg", None)] }),
+        ),
+        disk(
+            "sdh",
+            "Fakedisk SATA 500G",
+            "sata",
+            false,
+            500 * GB,
+            json!({}),
+        ),
+    ])));
+    rig.devices.set_links(DeviceLinks {
+        holders: [
+            ("sdg1".to_string(), vec!["md127".to_string()]),
+            ("sdh".to_string(), vec!["dm-3".to_string()]),
+        ]
+        .into_iter()
+        .collect(),
+        ..DeviceLinks::default()
+    });
+    for device in ["sdb", "sdc", "sdd", "sde", "sdf", "sdg", "sdh"] {
+        let (role, reason) = role_and_reason(&rig, device);
+        assert_eq!(role, "system", "{device}: {reason}");
+        assert_eq!(
+            refused_code(rig.propose("storage_add", json!({ "name": "x", "device": device }))),
+            "SystemDisk",
+            "{device}"
+        );
+    }
+    assert!(role_and_reason(&rig, "sdg").1.contains("held by md127"));
+    assert!(role_and_reason(&rig, "sdh").1.contains("held by dm-3"));
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn the_kernel_must_let_arca_hold_the_disk_alone_before_it_is_erased() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-exclusive", &key);
+    // lsblk says sdb is free, but the kernel holds its partition (a mount in another namespace, say).
+    rig.devices.set_open("/dev/sdb1", ExclusiveOpen::Busy);
+    match rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" })) {
+        Err(CallError::Refused { code, message }) => {
+            assert_eq!(code, "DiskBusy");
+            assert!(message.contains("sdb1 is in use right now"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(
+        rig.devices.opened(),
+        vec!["/dev/sdb", "/dev/sdb1"],
+        "the disk and every partition"
+    );
+    // A device Arca may not open is not erased either.
+    rig.devices.set_open(
+        "/dev/sdb1",
+        ExclusiveOpen::Denied("Permission denied".into()),
+    );
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
+        "DiskUncheckable"
+    );
+    // Checked again when the approved add runs: something took the disk after the proposal.
+    rig.devices.set_open("/dev/sdb1", ExclusiveOpen::Free);
+    let proposed = rig
+        .propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))
+        .expect("free when proposed");
+    rig.devices.set_open("/dev/sdb", ExclusiveOpen::Busy);
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &proposed)),
+        "DiskBusy"
+    );
+    assert!(rig.incus.writes().is_empty(), "nothing was wiped");
+    // A folder target is mounted by nature and is never opened.
+    let before = rig.devices.opened().len();
+    let mount = stick_mount(&rig);
+    rig.propose("storage_add", json!({ "name": "stick", "path": mount }))
+        .expect("a folder");
+    assert_eq!(rig.devices.opened().len(), before);
+}
+
+#[test]
+fn a_disk_with_this_machines_folder_snapshots_is_known_while_unplugged() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-folder-uuid", &key);
+    let mount = stick_mount(&rig);
+    let proposed = rig
+        .propose("storage_add", json!({ "name": "stick", "path": mount }))
+        .expect("a folder on the stick");
+    rig.approve_and_run(&key, &proposed).expect("the add runs");
+    assert_eq!(role_and_reason(&rig, "sdc").0, "snapshots");
+    // The stick is unmounted: lsblk no longer shows where the folder is, and the pool's folder is gone with it.
+    rig.devices.set(Ok(disks_with_stick_at(None)));
+    std::fs::remove_dir(format!("{mount}/arca-pool")).expect("the folder goes with the disk");
+    let (role, reason) = role_and_reason(&rig, "sdc");
+    assert_eq!(role, "snapshots", "{reason}");
+    assert!(reason.contains("snapshot storage stick"), "{reason}");
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "x", "device": "sdc" }))),
+        "SnapshotDisk"
+    );
+    // And while that folder can't be reached, no disk is erased at all: it might be the one about to be.
+    match rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" })) {
+        Err(CallError::Refused { code, message }) => {
+            assert_eq!(code, "SnapshotStorageUnreachable");
+            assert!(
+                message.contains("plug it in or remove it first"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // A folder pool made before the file system was recorded, whose folder is gone, blocks erases the same way.
+    let rig = Rig::new("storage-folder-old", &key);
+    rig.incus.add_pool(
+        "old",
+        "dir",
+        SNAPSHOT_POOL_DESCRIPTION,
+        json!({ "source": "/media/owner/GONE/arca-pool", SNAPSHOT_STORAGE_KEY: "old" }),
+        0,
+        GB,
+    );
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
+        "SnapshotStorageUnreachable"
+    );
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn a_disk_given_to_an_app_is_never_offered() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-passthrough", &key);
+    rig.incus.add_project("lab", json!({}));
+    rig.incus.add_instance(json!({
+        "name": "vm1", "project": "lab", "type": "virtual-machine", "status": "Stopped", "profiles": [],
+        "config": {}, "devices": {},
+        "expanded_devices": { "usb": { "type": "unix-block", "source": "/dev/sdb" } },
+    }));
+    rig.incus.add_instance(json!({
+        "name": "nas", "project": "default", "type": "container", "status": "Running", "profiles": [],
+        "config": {}, "expanded_devices": {},
+        "devices": { "raw": { "type": "disk", "source": "/dev/sdc1", "path": "/mnt/raw" } },
+    }));
+    let (role, reason) = role_and_reason(&rig, "sdb");
+    assert_eq!(role, "system");
+    assert!(reason.contains("given to the app lab/vm1"), "{reason}");
+    let (role, reason) = role_and_reason(&rig, "sdc");
+    assert_eq!(role, "system");
+    assert!(reason.contains("given to the app default/nas"), "{reason}");
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
+        "SystemDisk"
+    );
+}
+
+#[test]
+fn a_pool_with_a_name_arca_never_writes_still_takes_its_disk() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-odd-pool", &key);
+    rig.incus.add_pool(
+        "Old Pool",
+        "btrfs",
+        "",
+        json!({ "source": "/dev/sdb" }),
+        0,
+        GB,
+    );
+    let (role, reason) = role_and_reason(&rig, "sdb");
+    assert_eq!(role, "system");
+    assert!(reason.contains("Old Pool"), "{reason}");
+}
+
+#[test]
+fn an_app_copy_whose_clean_up_never_finished_is_incomplete_and_journalled() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("snapshot-incomplete", &key);
+    rig.add_snapshot_pool("usb1");
+    rig.incus.hold_operations();
+    rig.incus.ignore_puts();
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "project": "shop", "instance": "web", "pool": "usb1" }),
+        )
+        .expect("a proposal");
+    let id = proposed["id"].as_str().expect("an id").to_string();
+    let result = rig
+        .approve_and_run(&key, &proposed)
+        .expect("a long copy keeps going");
+    assert_eq!(result["state"], json!("copying"));
+    let name = snapshot_name("shop", "web", NOW).expect("a name");
+    // Incus finishes; the clean-up is lost, so the read-back refuses and deletes the copy, in the background.
+    rig.incus.release_operations();
+    let journal = (0..200).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(25));
+        let text = find_file(rig._scratch.dir.as_path(), "action-proposals.jsonl")
+            .and_then(|path| std::fs::read_to_string(path).ok())?;
+        text.contains("SnapshotCleanupFailed").then_some(text)
+    });
+    let journal = journal.expect("the background failure is journalled");
+    let line = journal
+        .lines()
+        .find(|line| line.contains("SnapshotCleanupFailed"))
+        .expect("a line");
+    let event: Value = serde_json::from_str(line).expect("json");
+    assert_eq!(event["id"], json!(id));
+    assert_eq!(event["ok"], json!(false));
+    assert!(
+        rig.incus.instance(SNAPSHOT_PROJECT, &name).is_none(),
+        "the unclean copy was deleted"
+    );
+
+    // A copy left without its clean-up (the process stopped before it) is listed as incomplete.
+    rig.incus.add_project(SNAPSHOT_PROJECT, json!({}));
+    rig.incus.add_instance(json!({
+        "name": "shop--web--20261108t0900", "project": SNAPSHOT_PROJECT, "type": "container", "status": "Stopped",
+        "profiles": [], "config": { "user.arcasnapshot.source-project": "shop", "user.arcasnapshot.source-name": "web" },
+        "devices": {},
+    }));
+    let listed = rig.snapshot_list();
+    let row = listed["snapshots"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|row| row["name"] == json!("shop--web--20261108t0900"))
+        .expect("listed");
+    assert_eq!(row["state"], json!("incomplete"));
+}
+
+fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(path);
+        }
+        if path.is_dir()
+            && let Some(found) = find_file(&path, name)
+        {
+            return Some(found);
+        }
+    }
+    None
 }

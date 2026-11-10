@@ -45,6 +45,12 @@ pub const SNAPSHOT_STORAGE_KEY: &str = "user.arcasnapshot.storage";
 /// name, and a whole-disk snapshot pool is named `arca-snapshots-<name>`, so the disk is known as snapshot storage even on a
 /// machine that has no pool for it yet.
 pub const SNAPSHOT_LABEL_PREFIX: &str = "arca-snapshots-";
+/// The file system UUID of the disk a folder snapshot pool's folder is on, bound into the owner's approval and written
+/// into the pool's config when it is created, so the disk is known as snapshot storage even while it is not mounted.
+pub const FS_UUID_KEY: &str = "user.arcasnapshot.fs-uuid";
+/// Written by the one clean-up `PUT` of an instance copy. A copy without it never finished its clean-up (the process
+/// stopped, or the clean-up failed and the copy could not be deleted), and is listed as incomplete.
+pub const VERIFIED_KEY: &str = "user.arcasnapshot.verified";
 /// The folder a folder-backed snapshot pool lives in, under the folder the owner picked.
 pub const POOL_DIR_NAME: &str = "arca-pool";
 /// The namespace of a copy's own keys. It is outside every ownership namespace (`user.arcakernel.`, and droidd's
@@ -73,8 +79,12 @@ const FINISH_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 /// Where a new snapshot pool lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoolSource {
-    /// A folder on a mounted disk: an Incus `dir` pool at `<folder>/arca-pool`.
-    Folder(String),
+    /// A folder on a mounted disk: an Incus `dir` pool at `<path>/arca-pool`. `fs_uuid` is the UUID of the file system
+    /// the folder is on, written as [`FS_UUID_KEY`].
+    Folder {
+        path: String,
+        fs_uuid: Option<String>,
+    },
     /// A whole block device, such as `/dev/sdb`: an Incus `btrfs` pool, which Incus formats.
     Device(String),
 }
@@ -84,12 +94,19 @@ pub enum PoolSource {
 /// it formats it, since `mkfs.btrfs` refuses a disk that still has them. Both carry [`SNAPSHOT_STORAGE_KEY`].
 pub fn pool_body(name: &str, source: &PoolSource) -> Value {
     match source {
-        PoolSource::Folder(folder) => json!({
-            "name": name,
-            "driver": "dir",
-            "description": SNAPSHOT_POOL_DESCRIPTION,
-            "config": { "source": folder_pool_path(folder), SNAPSHOT_STORAGE_KEY: name },
-        }),
+        PoolSource::Folder { path, fs_uuid } => {
+            let mut config =
+                json!({ "source": folder_pool_path(path), SNAPSHOT_STORAGE_KEY: name });
+            if let Some(uuid) = fs_uuid {
+                config[FS_UUID_KEY] = json!(uuid);
+            }
+            json!({
+                "name": name,
+                "driver": "dir",
+                "description": SNAPSHOT_POOL_DESCRIPTION,
+                "config": config,
+            })
+        }
         PoolSource::Device(device) => json!({
             "name": name,
             "driver": "btrfs",
@@ -361,6 +378,13 @@ pub fn copy_problems(copy: &Value, pool: &str, devices: &Map<String, Value>) -> 
     {
         problems.push("the copy uses a profile".to_string());
     }
+    if copy
+        .pointer(&format!("/config/{VERIFIED_KEY}"))
+        .and_then(Value::as_str)
+        != Some("true")
+    {
+        problems.push("the copy's clean-up was not written".to_string());
+    }
     for field in ["config", "expanded_config"] {
         if let Some(config) = copy.get(field).and_then(Value::as_object) {
             for key in config.keys() {
@@ -500,6 +524,9 @@ pub enum Progress {
     Running(String),
 }
 
+/// Told why a copy finished in the background failed, once, so the failure is journalled: it has no caller left to answer.
+pub type LateReport = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The narrow writer for snapshot storage and copies.
 #[derive(Debug, Clone)]
 pub struct SnapshotWriter {
@@ -533,7 +560,8 @@ impl SnapshotWriter {
         self.reader().get(path)
     }
 
-    /// Adds a snapshot pool. Incus creates the folder, or formats the whole device; this process touches no disk.
+    /// Adds a snapshot pool. Incus makes the pool in the folder (which must already be there and be empty), or wipes and
+    /// formats the whole device.
     pub fn create_pool(&self, name: &str, source: &PoolSource) -> Result<(), IncusError> {
         if !plain_name(name) {
             return Err(refused("the pool name is not plain"));
@@ -587,6 +615,16 @@ impl SnapshotWriter {
     /// the copy, one `PUT` rewrites it to its clean config and devices and it is read back; a copy that is not clean is
     /// deleted and refused. A copy still running when the wait ends is followed in the background and finished the same way.
     pub fn copy_instance(&self, pool: &str, body: &Value) -> Result<Progress, IncusError> {
+        self.copy_instance_reporting(pool, body, std::sync::Arc::new(|_: &str| {}))
+    }
+
+    /// [`Self::copy_instance`], telling `late` why a copy finished in the background failed.
+    pub fn copy_instance_reporting(
+        &self,
+        pool: &str,
+        body: &Value,
+        late: LateReport,
+    ) -> Result<Progress, IncusError> {
         self.snapshot_pool(pool)?;
         if body
             .get("start")
@@ -604,8 +642,15 @@ impl SnapshotWriter {
                 let (operation, pool, body) = (operation.clone(), pool.to_string(), body.clone());
                 std::thread::spawn(move || {
                     let followed = writer.clone().with_wait(FINISH_WAIT);
-                    if followed.wait_for(&operation) == Ok(Progress::Done) {
-                        let _ = writer.finish_instance(&name, &pool, &body);
+                    let outcome = match followed.wait_for(&operation) {
+                        Ok(Progress::Done) => writer.finish_instance(&name, &pool, &body),
+                        Ok(Progress::Running(_)) => Err(decode("the copy did not finish in a day")),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = outcome {
+                        late(&format!(
+                            "the snapshot copy {name} failed in the background: {error}"
+                        ));
                     }
                 });
             }
@@ -623,6 +668,7 @@ impl SnapshotWriter {
             if copy.get("status").and_then(Value::as_str) == Some("Running") {
                 return Err(decode("the snapshot copy reads back as running"));
             }
+            config.insert(VERIFIED_KEY.to_string(), json!("true"));
             // Incus keeps a copy's volatile keys and refuses a rewrite that drops its idmap ones.
             if let Some(found) = copy.get("config").and_then(Value::as_object) {
                 for (key, value) in found {
@@ -666,6 +712,16 @@ impl SnapshotWriter {
     /// Copies one custom volume into the snapshot project on `pool`, with a body from [`volume_copy_body`].
     /// The copy is read back once Incus finishes; one that carries a live ownership mark is deleted and refused.
     pub fn copy_volume(&self, pool: &str, body: &Value) -> Result<Progress, IncusError> {
+        self.copy_volume_reporting(pool, body, std::sync::Arc::new(|_: &str| {}))
+    }
+
+    /// [`Self::copy_volume`], telling `late` why a copy finished in the background failed.
+    pub fn copy_volume_reporting(
+        &self,
+        pool: &str,
+        body: &Value,
+        late: LateReport,
+    ) -> Result<Progress, IncusError> {
         self.snapshot_pool(pool)?;
         let name = body_name(body)?;
         let path = format!("/1.0/storage-pools/{pool}/volumes/custom?project={SNAPSHOT_PROJECT}");
@@ -677,8 +733,15 @@ impl SnapshotWriter {
                 let (operation, pool) = (operation.clone(), pool.to_string());
                 std::thread::spawn(move || {
                     let followed = writer.clone().with_wait(FINISH_WAIT);
-                    if followed.wait_for(&operation) == Ok(Progress::Done) {
-                        let _ = writer.finish_volume(&pool, &name);
+                    let outcome = match followed.wait_for(&operation) {
+                        Ok(Progress::Done) => writer.finish_volume(&pool, &name),
+                        Ok(Progress::Running(_)) => Err(decode("the copy did not finish in a day")),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = outcome {
+                        late(&format!(
+                            "the snapshot copy {name} failed in the background: {error}"
+                        ));
                     }
                 });
             }
@@ -1054,7 +1117,8 @@ mod tests {
             "t",
         )
         .expect("a body");
-        let (config, devices) = clean_parts(&body);
+        let (mut config, devices) = clean_parts(&body);
+        config.insert(VERIFIED_KEY.to_string(), json!("true"));
         let clean = json!({
             "status": "Stopped", "profiles": [],
             "config": config, "expanded_config": config,
@@ -1082,6 +1146,15 @@ mod tests {
         assert!(
             problems.iter().any(|p| p.contains("device data")),
             "{problems:?}"
+        );
+        let mut unverified = clean.clone();
+        unverified["config"]
+            .as_object_mut()
+            .expect("config")
+            .remove(VERIFIED_KEY);
+        assert_eq!(
+            copy_problems(&unverified, "usb1", &devices),
+            vec!["the copy's clean-up was not written".to_string()]
         );
         let mut started = clean.clone();
         started["status"] = json!("Running");
@@ -1188,9 +1261,16 @@ mod tests {
 
     #[test]
     fn pool_bodies_say_what_incus_will_do() {
-        let folder = pool_body("usb1", &PoolSource::Folder("/media/usb/".to_string()));
+        let folder = pool_body(
+            "usb1",
+            &PoolSource::Folder {
+                path: "/media/usb/".to_string(),
+                fs_uuid: Some("uuid-usb".to_string()),
+            },
+        );
         assert_eq!(folder["driver"], json!("dir"));
         assert_eq!(folder["config"]["source"], json!("/media/usb/arca-pool"));
+        assert_eq!(folder["config"][FS_UUID_KEY], json!("uuid-usb"));
         let device = pool_body("usb2", &PoolSource::Device("/dev/sdb".to_string()));
         assert_eq!(device["driver"], json!("btrfs"));
         assert_eq!(device["config"]["source"], json!("/dev/sdb"));

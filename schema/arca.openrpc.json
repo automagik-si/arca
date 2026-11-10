@@ -4150,6 +4150,14 @@
           }
         },
         {
+          "name": "fsUuid",
+          "required": false,
+          "schema": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        {
           "name": "model",
           "required": false,
           "schema": {
@@ -4427,7 +4435,8 @@
                   "state": {
                     "enum": [
                       "ready",
-                      "copying"
+                      "copying",
+                      "incomplete"
                     ],
                     "type": "string"
                   }
@@ -4456,7 +4465,7 @@
           "type": "object"
         }
       },
-      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made.",
+      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished is incomplete.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",

@@ -3,15 +3,18 @@
 //!
 //! `storage_list` reads the host's disks (`lsblk`) and the Incus pools, and gives each disk one plain role:
 //!
-//! - **system**: it holds `/`, `/boot` or swap, it is a RAID, LVM, LUKS or ZFS member, or it holds an Incus pool. It is never
-//!   offered.
+//! - **system**: it holds `/`, `/boot` or swap, it is a RAID, LVM, LUKS or ZFS member (mounted or not), something holds it
+//!   (`/sys/class/block/*/holders`), it is a member of a multi-device file system that holds `/` or is mounted, it is given
+//!   to an app, or it holds an Incus pool. It is never offered.
+//! - **snapshots**: it holds Arca snapshots. It is never offered, so it is never erased.
 //! - **in use**: it is mounted somewhere else. It is offered only as a folder target: a `dir` pool in a folder on it.
 //! - **free**: nothing on it is mounted or a member of anything. It is offered as a whole-disk target, which Incus erases and
 //!   formats as btrfs.
 //!
 //! `storage_add`, `snapshot_create` and `snapshot_delete` are gated: a viewer proposes one, the owner approves it with the
 //! passkey, and the approved action runs once. Every write goes through Incus ([`arca_incus::SnapshotWriter`]); this process
-//! never formats, mounts or writes a disk. The facts a proposal depends on (the disk's model, size, serial, transport and
+//! never formats, mounts or writes a disk device, and makes only a folder pool's empty `arca-pool` folder. Before a whole
+//! disk is erased the kernel must let this process open it and every partition exclusively. The facts a proposal depends on (the disk's model, size, serial, transport and
 //! contents; a source's kind and identity; a snapshot's name) are read when it is made and bound into its arguments, so the
 //! owner's digest covers them and the run refuses anything that changed. A watch-only node reads but has no writer.
 
@@ -53,9 +56,112 @@ const MEMBER_FSTYPES: [&str; 6] = [
 /// The longest snapshot name Incus accepts for an instance.
 const MAX_SNAPSHOT_NAME: usize = 63;
 
-/// The host's block devices as `lsblk --json` prints them. A test gives a fixture; the node runs `lsblk`.
+/// The host's block devices as `lsblk --json` prints them, the kernel's links between them, and the exclusive-open probe.
+/// A test gives fixtures; the node runs `lsblk`, reads `/sys` and opens the device.
 pub trait BlockDevices: Send + Sync {
     fn read(&self) -> Result<Value, String>;
+
+    /// The members of mounted multi-device file systems and every device's holders, as the kernel lists them in `/sys`.
+    fn links(&self) -> DeviceLinks {
+        DeviceLinks::from_sysfs(Path::new("/sys"))
+    }
+
+    /// Opens the block device at `path` read-only and exclusively, and closes it again.
+    fn open_exclusive(&self, path: &str) -> ExclusiveOpen {
+        open_exclusive(path)
+    }
+}
+
+/// What the kernel says about a device the instant Arca asks to hold it alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExclusiveOpen {
+    /// Nothing holds it: no mounted file system, RAID, volume group, encrypted mapping or swap.
+    Free,
+    /// The kernel refused (`EBUSY`): something holds it.
+    Busy,
+    /// This process may not open it, so it cannot tell.
+    Denied(String),
+    /// Any other answer, such as a device that is gone or a path that is not a block device.
+    Failed(String),
+}
+
+/// The node's exclusive-open probe. `O_EXCL` on a block device without `O_CREAT` makes the kernel refuse with `EBUSY` while
+/// a mounted file system, a RAID, LVM, device-mapper or swap holds it. It only reads, and the device is closed at once.
+pub fn open_exclusive(path: &str) -> ExclusiveOpen {
+    use rustix::fs::{FileType, Mode, OFlags};
+    use rustix::io::Errno;
+    let flags = OFlags::RDONLY | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::NOCTTY;
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => match rustix::fs::fstat(&fd) {
+            Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::BlockDevice => {
+                ExclusiveOpen::Free
+            }
+            Ok(_) => ExclusiveOpen::Failed(format!("{path} is not a block device")),
+            Err(error) => ExclusiveOpen::Failed(error.to_string()),
+        },
+        Err(Errno::BUSY) => ExclusiveOpen::Busy,
+        Err(error @ (Errno::ACCESS | Errno::PERM)) => ExclusiveOpen::Denied(error.to_string()),
+        Err(error) => ExclusiveOpen::Failed(error.to_string()),
+    }
+}
+
+/// The kernel's own links between block devices.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceLinks {
+    /// Each mounted multi-device file system the kernel lists: its type (`btrfs` or `bcachefs`), its UUID and the kernel
+    /// names of its member devices.
+    pub members: Vec<(String, String, Vec<String>)>,
+    /// Each device that something holds (a RAID, LVM, device-mapper or bcache device on it), by kernel name, with the names
+    /// of its holders.
+    pub holders: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl DeviceLinks {
+    /// Reads `/sys/fs/btrfs/<uuid>/devices/`, `/sys/fs/bcachefs/<uuid>/dev-*/block` and `/sys/class/block/*/holders/`
+    /// under `root`. A part that cannot be read adds nothing; the exclusive open still guards every erase.
+    pub fn from_sysfs(root: &Path) -> DeviceLinks {
+        let names = |dir: &Path| -> Vec<String> {
+            let mut out: Vec<String> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                .collect();
+            out.sort();
+            out
+        };
+        let mut links = DeviceLinks::default();
+        let btrfs = root.join("fs/btrfs");
+        for uuid in names(&btrfs) {
+            let devices = names(&btrfs.join(&uuid).join("devices"));
+            if !devices.is_empty() {
+                links.members.push(("btrfs".to_string(), uuid, devices));
+            }
+        }
+        let bcachefs = root.join("fs/bcachefs");
+        for uuid in names(&bcachefs) {
+            let devices: Vec<String> = names(&bcachefs.join(&uuid))
+                .into_iter()
+                .filter(|entry| entry.starts_with("dev-"))
+                .filter_map(|entry| {
+                    let link =
+                        std::fs::read_link(bcachefs.join(&uuid).join(entry).join("block")).ok()?;
+                    link.file_name()?.to_str().map(str::to_string)
+                })
+                .collect();
+            if !devices.is_empty() {
+                links.members.push(("bcachefs".to_string(), uuid, devices));
+            }
+        }
+        let block = root.join("class/block");
+        for device in names(&block) {
+            let holders = names(&block.join(&device).join("holders"));
+            if !holders.is_empty() {
+                links.holders.insert(device, holders);
+            }
+        }
+        links
+    }
 }
 
 /// The node's `lsblk`, run read-only with a deadline.
@@ -100,28 +206,64 @@ impl BlockDevices for Lsblk {
     }
 }
 
-/// A fixed `lsblk` answer, for tests.
-pub struct FixedBlockDevices(pub Mutex<Result<Value, String>>);
+/// A fixed `lsblk` answer, device links and exclusive-open answers, for tests. Every device opens as free unless a test
+/// says otherwise.
+pub struct FixedBlockDevices {
+    lsblk: Mutex<Result<Value, String>>,
+    links: Mutex<DeviceLinks>,
+    opens: Mutex<std::collections::BTreeMap<String, ExclusiveOpen>>,
+    opened: Mutex<Vec<String>>,
+}
+
+fn held<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 impl FixedBlockDevices {
     pub fn new(value: Value) -> Self {
-        Self(Mutex::new(Ok(value)))
+        Self {
+            lsblk: Mutex::new(Ok(value)),
+            links: Mutex::new(DeviceLinks::default()),
+            opens: Mutex::new(std::collections::BTreeMap::new()),
+            opened: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn set(&self, value: Result<Value, String>) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+        *held(&self.lsblk) = value;
+    }
+
+    pub fn set_links(&self, links: DeviceLinks) {
+        *held(&self.links) = links;
+    }
+
+    /// What the exclusive open of `path` answers from now on.
+    pub fn set_open(&self, path: &str, answer: ExclusiveOpen) {
+        held(&self.opens).insert(path.to_string(), answer);
+    }
+
+    /// Every path opened exclusively so far, in order.
+    pub fn opened(&self) -> Vec<String> {
+        held(&self.opened).clone()
     }
 }
 
 impl BlockDevices for FixedBlockDevices {
     fn read(&self) -> Result<Value, String> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        held(&self.lsblk).clone()
+    }
+
+    fn links(&self) -> DeviceLinks {
+        held(&self.links).clone()
+    }
+
+    fn open_exclusive(&self, path: &str) -> ExclusiveOpen {
+        held(&self.opened).push(path.to_string());
+        held(&self.opens)
+            .get(path)
+            .cloned()
+            .unwrap_or(ExclusiveOpen::Free)
     }
 }
 
@@ -239,6 +381,8 @@ pub struct PoolView {
     pub total: Option<u64>,
     /// Whether the pool was added as snapshot storage.
     pub snapshots: bool,
+    /// For a folder snapshot pool: the UUID of the file system its folder is on ([`arca_incus::FS_UUID_KEY`]).
+    pub fs_uuid: Option<String>,
 }
 
 impl PoolView {
@@ -381,11 +525,149 @@ fn resolved_device(source: &str) -> String {
         .unwrap_or_else(|| source.to_string())
 }
 
-/// Gives every disk its role. A pool is matched by the device it names, by a UUID or label, or, for a folder pool, by the
-/// file system its folder is on.
+/// What the host says about its disks beyond `lsblk`: the kernel's links between devices, and the devices given to apps.
+#[derive(Debug, Clone, Default)]
+pub struct HostFacts {
+    pub links: DeviceLinks,
+    /// Each host device passed through to an instance (a `unix-block` device, or a `disk` device whose source is under
+    /// `/dev/`), with the app it is given to as `<project>/<instance>`.
+    pub passthrough: Vec<(String, String)>,
+}
+
+/// What one device shares with the other members of its file system.
+#[derive(Debug, Clone, Default)]
+struct SharedFs {
+    fstype: String,
+    /// Mount points that `lsblk` lists on another member only.
+    borrowed: Vec<String>,
+    /// The other members.
+    with: Vec<String>,
+    /// The kernel lists the file system as mounted.
+    mounted: bool,
+}
+
+/// Gives every disk its role, from `lsblk` and the pools alone.
 pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
+    classify_with(disks, pools, &HostFacts::default())
+}
+
+/// Gives every disk its role. Every member of one file system (the same type and UUID, or listed together by the kernel)
+/// shares the mount points of all of them, since `lsblk` lists a multi-device btrfs or bcachefs mount on one member only. A
+/// pool is matched by the device it names, by a UUID or label, by the file system UUID a folder snapshot pool recorded
+/// (mounted or not), or, for any other folder pool, by the file system its folder is on.
+pub fn classify_with(
+    disks: &[BlockDevice],
+    pools: &[PoolView],
+    facts: &HostFacts,
+) -> Vec<DiskView> {
+    // The members of each file system, by (type, UUID).
+    let mut groups: std::collections::BTreeMap<(String, String), BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut kernel_mounted: BTreeSet<(String, String)> = BTreeSet::new();
+    for disk in disks {
+        for node in disk.walk() {
+            if let (Some(fstype), Some(uuid)) = (&node.fstype, &node.uuid) {
+                groups
+                    .entry((fstype.clone(), uuid.clone()))
+                    .or_default()
+                    .insert(node.name.clone());
+            }
+        }
+    }
+    for (fstype, uuid, members) in &facts.links.members {
+        let key = (fstype.clone(), uuid.clone());
+        groups
+            .entry(key.clone())
+            .or_default()
+            .extend(members.iter().cloned());
+        kernel_mounted.insert(key);
+    }
+    let mounts_of = |name: &str| -> Vec<String> {
+        disks
+            .iter()
+            .flat_map(|disk| disk.walk())
+            .filter(|node| node.name == name)
+            .flat_map(|node| node.mountpoints.clone())
+            .collect()
+    };
+    let mut shared: std::collections::BTreeMap<String, SharedFs> =
+        std::collections::BTreeMap::new();
+    for ((fstype, uuid), members) in &groups {
+        let mounted = kernel_mounted.contains(&(fstype.clone(), uuid.clone()));
+        if members.len() < 2 && !mounted {
+            continue;
+        }
+        for member in members {
+            let own = mounts_of(member);
+            let mut borrowed: Vec<String> = members
+                .iter()
+                .filter(|other| *other != member)
+                .flat_map(|other| mounts_of(other))
+                .filter(|mount| !own.contains(mount))
+                .collect();
+            borrowed.sort();
+            borrowed.dedup();
+            shared.insert(
+                member.clone(),
+                SharedFs {
+                    fstype: fstype.clone(),
+                    borrowed,
+                    with: members
+                        .iter()
+                        .filter(|other| *other != member)
+                        .cloned()
+                        .collect(),
+                    mounted,
+                },
+            );
+        }
+    }
+    // The disks as the roles see them: each member carries the mount points of its whole file system.
+    let disks: Vec<BlockDevice> = disks
+        .iter()
+        .map(|disk| {
+            fn spread(
+                device: &mut BlockDevice,
+                shared: &std::collections::BTreeMap<String, SharedFs>,
+            ) {
+                if let Some(fs) = shared.get(&device.name) {
+                    for mount in &fs.borrowed {
+                        if !device.mountpoints.contains(mount) {
+                            device.mountpoints.push(mount.clone());
+                        }
+                    }
+                }
+                for child in &mut device.children {
+                    spread(child, shared);
+                }
+            }
+            let mut disk = disk.clone();
+            spread(&mut disk, &shared);
+            disk
+        })
+        .collect();
+
     let mut pool_disks: Vec<Option<&PoolView>> = vec![None; disks.len()];
     for pool in pools {
+        let by_fs_uuid: Vec<usize> = pool
+            .fs_uuid
+            .as_deref()
+            .map(|fs_uuid| {
+                disks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, disk)| {
+                        disk.walk()
+                            .iter()
+                            .any(|node| node.uuid.as_deref() == Some(fs_uuid))
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for index in &by_fs_uuid {
+            pool_disks[*index].get_or_insert(pool);
+        }
         for source in &pool.sources {
             if source.starts_with("/dev/") {
                 let device = resolved_device(source);
@@ -399,7 +681,11 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
                     }
                 }
             } else if source.starts_with('/') {
-                if let Some((index, _)) = mount_owner(disks, source) {
+                // A folder pool whose file system is known is on that disk, whether it is mounted now or not; only one
+                // without it is judged by where its folder is mounted.
+                if by_fs_uuid.is_empty()
+                    && let Some((index, _)) = mount_owner(&disks, source)
+                {
                     pool_disks[index].get_or_insert(pool);
                 }
             } else {
@@ -414,11 +700,21 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
             }
         }
     }
+    let passthrough: Vec<(String, &str)> = facts
+        .passthrough
+        .iter()
+        .flat_map(|(source, app)| {
+            [
+                (source.clone(), app.as_str()),
+                (resolved_device(source), app.as_str()),
+            ]
+        })
+        .collect();
     disks
         .iter()
         .zip(pool_disks)
         .map(|(disk, pool)| {
-            let (role, reason) = role_of(disk, pool);
+            let (role, reason) = role_of(disk, pool, &shared, &facts.links.holders, &passthrough);
             DiskView {
                 disk: disk.clone(),
                 role,
@@ -428,9 +724,24 @@ pub fn classify(disks: &[BlockDevice], pools: &[PoolView]) -> Vec<DiskView> {
         .collect()
 }
 
-fn role_of(disk: &BlockDevice, pool: Option<&PoolView>) -> (DiskRole, String) {
+fn role_of(
+    disk: &BlockDevice,
+    pool: Option<&PoolView>,
+    shared: &std::collections::BTreeMap<String, SharedFs>,
+    holders: &std::collections::BTreeMap<String, Vec<String>>,
+    passthrough: &[(String, &str)],
+) -> (DiskRole, String) {
     let nodes = disk.walk();
     for node in &nodes {
+        if let Some((_, app)) = passthrough.iter().find(|(source, _)| *source == node.path) {
+            return (
+                DiskRole::System,
+                format!(
+                    "is given to the app {app} ({}); it is never offered",
+                    node.name
+                ),
+            );
+        }
         for mount in &node.mountpoints {
             if system_mount(mount) {
                 let what = if mount == "[SWAP]" {
@@ -438,6 +749,20 @@ fn role_of(disk: &BlockDevice, pool: Option<&PoolView>) -> (DiskRole, String) {
                 } else {
                     mount.clone()
                 };
+                if let Some(fs) = shared
+                    .get(&node.name)
+                    .filter(|fs| fs.borrowed.contains(mount))
+                {
+                    return (
+                        DiskRole::System,
+                        format!(
+                            "is part of the {} file system that holds {what} ({} with {}); it is never offered",
+                            fs.fstype,
+                            node.name,
+                            fs.with.join(", ")
+                        ),
+                    );
+                }
                 return (
                     DiskRole::System,
                     format!("holds {what} ({}); it is never offered", node.name),
@@ -462,6 +787,27 @@ fn role_of(disk: &BlockDevice, pool: Option<&PoolView>) -> (DiskRole, String) {
                 format!(
                     "is part of a RAID, LVM, encrypted or ZFS set ({}); it is never offered",
                     node.name
+                ),
+            );
+        }
+        if let Some(found) = holders.get(&node.name) {
+            return (
+                DiskRole::System,
+                format!(
+                    "is held by {} ({}); it is never offered",
+                    found.join(", "),
+                    node.name
+                ),
+            );
+        }
+        if let Some(fs) = shared.get(&node.name).filter(|fs| fs.mounted)
+            && node.mountpoints.is_empty()
+        {
+            return (
+                DiskRole::System,
+                format!(
+                    "is part of a mounted {} file system ({}); it is never offered",
+                    fs.fstype, node.name
                 ),
             );
         }
@@ -537,6 +883,9 @@ pub struct SnapshotView {
     pub size: Option<u64>,
     pub created: String,
     pub copying: bool,
+    /// An instance copy's clean-up was written ([`arca_incus::VERIFIED_KEY`]). A volume copy is made with its final config
+    /// in one request and needs none, so it is always true.
+    pub verified: bool,
     pub dropped: Vec<String>,
 }
 
@@ -552,7 +901,13 @@ impl SnapshotView {
             "pool": self.pool,
             "size": self.size,
             "created": self.created,
-            "state": if self.copying { "copying" } else { "ready" },
+            "state": if self.copying {
+                "copying"
+            } else if self.verified {
+                "ready"
+            } else {
+                "incomplete"
+            },
             "droppedDevices": self.dropped,
         })
     }
@@ -643,7 +998,8 @@ impl Storage {
         })
     }
 
-    /// Every Incus pool, with its space.
+    /// Every Incus pool, with its space. A pool whose name is not plain is kept, so the disk under it is still known to be
+    /// taken, but its space is not read and nothing is ever written to it.
     pub fn pools(&self) -> Result<Vec<PoolView>, StorageRefusal> {
         let rows = self
             .read
@@ -657,9 +1013,6 @@ impl Storage {
             let Some(name) = row.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            if !plain_name(name) {
-                continue;
-            }
             let mut sources = Vec::new();
             for key in ["source", "volatile.initial_source"] {
                 if let Some(source) = row
@@ -671,10 +1024,13 @@ impl Storage {
                     sources.push(source.to_string());
                 }
             }
-            let space = self
-                .read
-                .get(&format!("/1.0/storage-pools/{name}/resources"))
-                .ok();
+            let space = plain_name(name)
+                .then(|| {
+                    self.read
+                        .get(&format!("/1.0/storage-pools/{name}/resources"))
+                        .ok()
+                })
+                .flatten();
             let space_of = |key: &str| {
                 space
                     .as_ref()
@@ -691,7 +1047,12 @@ impl Storage {
                 sources,
                 used: space_of("used"),
                 total: space_of("total"),
-                snapshots: arca_incus::snapshot::is_snapshot_pool(row),
+                snapshots: plain_name(name) && arca_incus::snapshot::is_snapshot_pool(row),
+                fs_uuid: row
+                    .pointer(&format!("/config/{}", arca_incus::FS_UUID_KEY))
+                    .and_then(Value::as_str)
+                    .filter(|uuid| !uuid.is_empty())
+                    .map(str::to_string),
             });
         }
         Ok(pools)
@@ -708,10 +1069,58 @@ impl Storage {
         })?;
         let disks =
             parse_lsblk(&lsblk).map_err(|why| StorageRefusal::new("StorageUnavailable", why))?;
+        let facts = HostFacts {
+            links: self.devices.links(),
+            passthrough: self.passthrough()?,
+        };
         Ok(Survey {
-            disks: classify(&disks, &pools),
+            disks: classify_with(&disks, &pools, &facts),
             pools,
         })
+    }
+
+    /// Every host device given to an instance, in any project: a `unix-block` device (its source, or its path when it has
+    /// none), or a `disk` device whose source is under `/dev/`.
+    fn passthrough(&self) -> Result<Vec<(String, String)>, StorageRefusal> {
+        let rows = self
+            .read
+            .get("/1.0/instances?all-projects=true&recursion=1")
+            .map_err(|error| unavailable("the apps", &error))?;
+        let mut out = Vec::new();
+        for row in rows.as_array().into_iter().flatten() {
+            let app = format!(
+                "{}/{}",
+                row.get("project")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default"),
+                row.get("name").and_then(Value::as_str).unwrap_or_default()
+            );
+            let devices = row
+                .get("expanded_devices")
+                .filter(|devices| devices.as_object().is_some_and(|map| !map.is_empty()))
+                .or_else(|| row.get("devices"));
+            for device in devices
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(|map| map.values())
+            {
+                let source = device
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let host = match device.get("type").and_then(Value::as_str) {
+                    Some("unix-block") => {
+                        source.or_else(|| device.get("path").and_then(Value::as_str))
+                    }
+                    Some("disk") => source.filter(|source| source.starts_with("/dev/")),
+                    _ => None,
+                };
+                if let Some(host) = host {
+                    out.push((host.to_string(), app.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Every snapshot copy: the instances in [`SNAPSHOT_PROJECT`] and the custom volumes it holds on snapshot pools.
@@ -780,6 +1189,7 @@ impl Storage {
                         .to_string()
                 }),
                 copying: busy(arca_kernel::ownership::IncusKind::Instance, None, name),
+                verified: config(arca_incus::VERIFIED_KEY).as_deref() == Some("true"),
                 dropped: config(DROPPED_KEY)
                     .map(|list| {
                         list.split(',')
@@ -790,7 +1200,11 @@ impl Storage {
                     .unwrap_or_default(),
             });
         }
-        for pool in self.pools()?.into_iter().filter(|pool| pool.snapshots) {
+        for pool in self
+            .pools()?
+            .into_iter()
+            .filter(|pool| pool.snapshots && plain_name(&pool.name))
+        {
             let rows = self
                 .read
                 .get(&format!(
@@ -838,6 +1252,7 @@ impl Storage {
                         Some(&pool.name),
                         name,
                     ),
+                    verified: true,
                     dropped: Vec::new(),
                 });
             }
@@ -1048,6 +1463,7 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
                         "size",
                         "contents",
                         "mount",
+                        "fsUuid",
                     ],
                 )?;
                 if let Some(object) = args.as_object_mut() {
@@ -1061,7 +1477,7 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
                     &args,
                     &["disk", "model", "serial", "transport", "size", "contents"],
                 )?;
-                if args.get("mount").is_some() {
+                if args.get("mount").is_some() || args.get("fsUuid").is_some() {
                     return Err("args/mount: a whole-disk target has no mount".to_string());
                 }
                 if text(&args, "disk") != name {
@@ -1251,12 +1667,38 @@ fn check_pool_folder(folder: &str) -> Result<(), StorageRefusal> {
     }
 }
 
-/// Makes `<folder>/arca-pool` for a folder pool, as Incus needs it to exist and be empty: each missing part of the folder
-/// one at a time (0755), then `arca-pool` itself (0700). No step follows a link: a part that is a link or not a folder,
-/// or an `arca-pool` that is not an empty plain folder, is refused, and the result is checked to be where it was asked
-/// for. Returns whether `arca-pool` was made here, so a pool create that then fails can remove it again.
-pub fn make_pool_folder(folder: &str) -> Result<bool, StorageRefusal> {
-    use std::os::unix::fs::DirBuilderExt;
+/// The `arca-pool` folder made for a new folder pool, held by its parent folder's handle.
+pub struct PoolFolder {
+    parent: std::os::fd::OwnedFd,
+    made: bool,
+}
+
+impl PoolFolder {
+    /// Whether `arca-pool` was made just now.
+    pub fn made(&self) -> bool {
+        self.made
+    }
+
+    /// Removes `arca-pool` again if it was made just now and is still empty, through the parent's handle (never by path).
+    pub fn remove_if_made(&self) {
+        if self.made {
+            let _ = rustix::fs::unlinkat(
+                &self.parent,
+                arca_incus::snapshot::POOL_DIR_NAME,
+                rustix::fs::AtFlags::REMOVEDIR,
+            );
+        }
+    }
+}
+
+/// Makes `<folder>/arca-pool` for a folder pool, as Incus needs it to exist and be empty. The walk starts at `/` and opens
+/// each part of the folder relative to the part before it, never following a link (`openat` with `O_NOFOLLOW`); a part
+/// that is missing is made there (`mkdirat`, 0755) and then opened the same way, and `arca-pool` itself is made in the last
+/// one (0700). A part that is a link or not a folder is refused, and so is an `arca-pool` that is not an empty plain
+/// folder. Nothing is looked up by path twice.
+pub fn make_pool_folder(folder: &str) -> Result<PoolFolder, StorageRefusal> {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
     check_pool_folder(folder)?;
     let changed = || {
         StorageRefusal::new(
@@ -1264,50 +1706,69 @@ pub fn make_pool_folder(folder: &str) -> Result<bool, StorageRefusal> {
             "the folder now leads somewhere else through a link; propose it again",
         )
     };
-    let mut path = std::path::PathBuf::new();
-    for part in std::path::Path::new(folder).components() {
-        path.push(part);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_dir() => {}
-            Ok(_) => return Err(changed()),
-            Err(_) => match std::fs::DirBuilder::new().mode(0o755).create(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir()) {
-                        return Err(changed());
-                    }
-                }
-                Err(error) => {
-                    return Err(StorageRefusal::new(
-                        "FolderNotWritable",
-                        format!("Arca could not create {}: {error}", path.display()),
-                    ));
-                }
-            },
-        }
-    }
-    let pool_dir = std::path::PathBuf::from(folder_pool_path(folder));
-    let made = match std::fs::DirBuilder::new().mode(0o700).create(&pool_dir) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            pool_folder_usable(&pool_dir)?;
-            false
-        }
-        Err(error) => {
-            return Err(StorageRefusal::new(
-                "FolderNotWritable",
-                format!("Arca could not create {}: {error}", pool_dir.display()),
-            ));
-        }
+    let failed = |what: &str, error: Errno| {
+        StorageRefusal::new(
+            "FolderNotWritable",
+            format!("Arca could not create {what}: {error}"),
+        )
     };
-    // A part swapped for a link while the folders were made shows here: the folder is not where it was asked for.
-    if std::fs::canonicalize(&pool_dir).ok().as_deref() != Some(pool_dir.as_path()) {
-        if made && let Ok(real) = std::fs::canonicalize(&pool_dir) {
-            let _ = std::fs::remove_dir(real);
-        }
-        return Err(changed());
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir =
+        rustix::fs::open("/", flags, Mode::empty()).map_err(|error| failed("/", error))?;
+    let mut walked = PathBuf::from("/");
+    for part in Path::new(folder).components() {
+        let name = match part {
+            std::path::Component::RootDir => continue,
+            std::path::Component::Normal(name) => name,
+            _ => return Err(changed()),
+        };
+        walked.push(name);
+        let next = match rustix::fs::openat(&dir, name, flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(Errno::NOENT) => {
+                match rustix::fs::mkdirat(&dir, name, Mode::from_raw_mode(0o755)) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(error) => return Err(failed(&walked.display().to_string(), error)),
+                }
+                rustix::fs::openat(&dir, name, flags, Mode::empty()).map_err(|_| changed())?
+            }
+            Err(Errno::LOOP | Errno::NOTDIR) => return Err(changed()),
+            Err(error) => return Err(failed(&walked.display().to_string(), error)),
+        };
+        dir = next;
     }
-    Ok(made)
+    let pool_name = arca_incus::snapshot::POOL_DIR_NAME;
+    let pool_path = folder_pool_path(folder);
+    let made = match rustix::fs::mkdirat(&dir, pool_name, Mode::from_raw_mode(0o700)) {
+        Ok(()) => true,
+        Err(Errno::EXIST) => false,
+        Err(error) => return Err(failed(&pool_path, error)),
+    };
+    let in_use = |why: &str| {
+        StorageRefusal::new(
+            "PoolFolderInUse",
+            format!("{pool_path} is already there and {why}; choose another folder"),
+        )
+    };
+    let pool = match rustix::fs::openat(&dir, pool_name, flags, Mode::empty()) {
+        Ok(pool) => pool,
+        Err(Errno::LOOP | Errno::NOTDIR) => return Err(in_use("is not a plain folder")),
+        Err(error) => return Err(failed(&pool_path, error)),
+    };
+    if !made {
+        let empty = rustix::fs::Dir::read_from(&pool)
+            .map(|entries| {
+                entries.flatten().all(|entry| {
+                    let name = entry.file_name().to_bytes();
+                    name == b"." || name == b".."
+                })
+            })
+            .unwrap_or(false);
+        if !empty {
+            return Err(in_use("has files in it"));
+        }
+    }
+    Ok(PoolFolder { parent: dir, made })
 }
 
 /// A folder target's path, checked: absolute, without `.` or `..` parts, doubled or trailing slashes, or control
@@ -1571,6 +2032,7 @@ pub fn enrich(
                 "size",
                 "contents",
                 "mount",
+                "fsUuid",
             ] {
                 object.remove(key);
             }
@@ -1593,6 +2055,7 @@ pub fn enrich(
                 object.insert(key.to_string(), value);
             }
             if let Some(mount) = mount {
+                object.insert("fsUuid".to_string(), json!(folder_fs_uuid(view, &mount)?));
                 object.insert("mount".to_string(), json!(mount));
             }
         }
@@ -1672,6 +2135,91 @@ fn disk_facts(view: &DiskView) -> Vec<(&'static str, Value)> {
         ("size", json!(disk.size)),
         ("contents", json!(contents_words(disk))),
     ]
+}
+
+/// File systems a folder pool cannot use: they have no Linux owners or permissions, so they cannot hold app copies.
+const FOLDER_UNFIT_FSTYPES: [&str; 6] = ["vfat", "exfat", "ntfs", "ntfs3", "msdos", "fat"];
+
+/// The UUID of the file system a folder target's mount point belongs to (empty when `lsblk` shows none), after refusing a
+/// file system that cannot hold app copies.
+fn folder_fs_uuid(view: &DiskView, mount: &str) -> Result<String, StorageRefusal> {
+    let node = view
+        .disk
+        .walk()
+        .into_iter()
+        .find(|node| node.mountpoints.iter().any(|found| found == mount));
+    if let Some(fstype) = node
+        .and_then(|node| node.fstype.as_deref())
+        .filter(|fstype| FOLDER_UNFIT_FSTYPES.contains(fstype))
+    {
+        return Err(StorageRefusal::new(
+            "FolderFileSystem",
+            format!(
+                "the folder is on a {fstype} file system, which cannot keep app copies (it has no Linux owners or permissions); choose a folder on a Linux file system such as ext4 or btrfs, or use a free disk whole"
+            ),
+        ));
+    }
+    Ok(node.and_then(|node| node.uuid.clone()).unwrap_or_default())
+}
+
+/// Refuses every whole-disk erase while a folder snapshot pool cannot be reached: its disk may be the one about to be
+/// erased, unmounted and so not recognised.
+fn no_unreachable_snapshot_folder(survey: &Survey) -> Result<(), StorageRefusal> {
+    for pool in survey
+        .pools
+        .iter()
+        .filter(|pool| pool.snapshots && pool.driver == "dir")
+    {
+        let source = pool.sources.first().map(String::as_str).unwrap_or_default();
+        let folder_there = std::fs::symlink_metadata(source).is_ok_and(|meta| meta.is_dir());
+        let disk_mounted = pool.fs_uuid.as_deref().is_none_or(|fs_uuid| {
+            survey.disks.iter().any(|view| {
+                view.disk.walk().iter().any(|node| {
+                    node.uuid.as_deref() == Some(fs_uuid) && !node.mountpoints.is_empty()
+                })
+            })
+        });
+        if !folder_there || !disk_mounted {
+            return Err(StorageRefusal::new(
+                "SnapshotStorageUnreachable",
+                format!(
+                    "a snapshot storage folder isn't reachable: {} keeps its snapshots in {source}, whose disk isn't mounted now; plug it in or remove it first",
+                    pool.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Opens the whole disk and every partition on it read-only and exclusively. The kernel refuses that while a mounted file
+/// system, a RAID, a volume group, an encrypted mapping or swap holds it, whatever `lsblk` showed. A disk that cannot be
+/// checked is not erased either.
+fn nothing_holds(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusal> {
+    for node in view.disk.walk() {
+        match storage.devices.open_exclusive(&node.path) {
+            ExclusiveOpen::Free => {}
+            ExclusiveOpen::Busy => {
+                return Err(StorageRefusal::new(
+                    "DiskBusy",
+                    format!(
+                        "{} is in use right now: the system holds it (a mounted file system, a RAID, a volume group or swap); it is never erased",
+                        node.name
+                    ),
+                ));
+            }
+            ExclusiveOpen::Denied(why) | ExclusiveOpen::Failed(why) => {
+                return Err(StorageRefusal::new(
+                    "DiskUncheckable",
+                    format!(
+                        "Arca could not open {} to check that nothing uses it ({why}); a disk is erased only after that check",
+                        node.path
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn find_whole_disk<'a>(survey: &'a Survey, device: &str) -> Result<&'a DiskView, StorageRefusal> {
@@ -1806,6 +2354,7 @@ fn check(
             }
             let (view, mount, source) = if args.get("device").is_some_and(|d| !d.is_null()) {
                 let view = find_whole_disk(&survey, text(args, "device"))?;
+                no_unreachable_snapshot_folder(&survey)?;
                 (view, None, PoolSource::Device(view.disk.path.clone()))
             } else {
                 let path = text(args, "path");
@@ -1817,7 +2366,19 @@ fn check(
                     .into());
                 }
                 let (view, mount) = find_folder_disk(&survey, path)?;
-                (view, Some(mount), PoolSource::Folder(path.to_string()))
+                let fs_uuid = folder_fs_uuid(view, &mount)?;
+                if text(args, "fsUuid") != fs_uuid {
+                    return Err(StorageRefusal::new(
+                        "DiskChanged",
+                        "the folder's file system changed after the proposal; propose it again",
+                    )
+                    .into());
+                }
+                let source = PoolSource::Folder {
+                    path: path.to_string(),
+                    fs_uuid: (!fs_uuid.is_empty()).then_some(fs_uuid),
+                };
+                (view, Some(mount), source)
             };
             let changed = disk_facts(view)
                 .into_iter()
@@ -1832,8 +2393,10 @@ fn check(
                 )
                 .into());
             }
-            if let PoolSource::Folder(folder) = &source {
-                check_pool_folder(folder)?;
+            match &source {
+                PoolSource::Folder { path, .. } => check_pool_folder(path)?,
+                // Last, on the disk the owner approved: the kernel itself says whether anything holds it now.
+                PoolSource::Device(_) => nothing_holds(storage, view)?,
             }
             Ok(Target::Pool(name.to_string(), source))
         }
@@ -1943,6 +2506,20 @@ pub struct StorageActionHandler {
     pub clock: crate::handlers::Clock,
 }
 
+impl StorageActionHandler {
+    /// Where a snapshot copy finished in the background reports a failure: the service log, and the action journal against
+    /// the approved proposal, as `SnapshotCleanupFailed`.
+    fn late_report(&self, approved_id: Option<String>) -> arca_incus::LateReport {
+        let kernel = Arc::clone(&self.kernel);
+        Arc::new(move |message: &str| {
+            eprintln!("arca: {message}");
+            if let (Some(id), Ok(mut kernel)) = (&approved_id, kernel.lock()) {
+                kernel.journal_late_failure(id, "SnapshotCleanupFailed");
+            }
+        })
+    }
+}
+
 impl ToolHandler for StorageActionHandler {
     fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let Some(storage) = &self.storage else {
@@ -1962,18 +2539,20 @@ impl ToolHandler for StorageActionHandler {
             .action
             .prepare(&bare, None)
             .map_err(CallError::Invalid)?;
-        {
+        let approved_id = {
             let mut kernel = self
                 .kernel
                 .lock()
                 .map_err(|_| CallError::Internal("the kernel lock is poisoned".to_string()))?;
+            let approved_id = kernel.action_grant_id(&grant);
             if !kernel.consume_action_grant(self.action.as_str(), &args, &grant) {
                 return Err(CallError::Refused {
                     code: "NotApproved".to_string(),
                     message: "this action runs only from an approved proposal".to_string(),
                 });
             }
-        }
+            approved_id
+        };
         let now = (self.clock)();
         let target = check(storage, self.action, &args, now)?;
         let writer = storage.writer()?;
@@ -1985,25 +2564,26 @@ impl ToolHandler for StorageActionHandler {
             Target::Pool(name, source) => {
                 // Incus makes a folder pool only in a folder that is already there and empty, so Arca makes it first.
                 let made = match &source {
-                    PoolSource::Folder(folder) => make_pool_folder(folder)?,
-                    PoolSource::Device(_) => false,
+                    PoolSource::Folder { path, .. } => Some(make_pool_folder(path)?),
+                    PoolSource::Device(_) => None,
                 };
                 if let Err(error) = writer.create_pool(&name, &source) {
-                    if let (true, PoolSource::Folder(folder)) = (made, &source) {
-                        // Only the empty folder made just now goes; anything Incus left in it keeps it.
-                        let _ = std::fs::remove_dir(folder_pool_path(folder));
+                    if let Some(folder) = &made {
+                        folder.remove_if_made();
                     }
                     return Err(write_failed(error));
                 }
                 let (driver, path) = match &source {
-                    PoolSource::Folder(folder) => ("dir", folder_pool_path(folder)),
+                    PoolSource::Folder { path, .. } => ("dir", folder_pool_path(path)),
                     PoolSource::Device(device) => ("btrfs", device.clone()),
                 };
                 Ok(json!({ "pool": name, "driver": driver, "source": path }))
             }
             Target::Instance { pool, body } => {
                 writer.ensure_project().map_err(write_failed)?;
-                let progress = writer.copy_instance(&pool, &body).map_err(write_failed)?;
+                let progress = writer
+                    .copy_instance_reporting(&pool, &body, self.late_report(approved_id))
+                    .map_err(write_failed)?;
                 Ok(json!({
                     "snapshot": body["name"], "pool": pool, "kind": text(&args, "kind"),
                     "state": state(progress, "copied", "copying"),
@@ -2011,7 +2591,9 @@ impl ToolHandler for StorageActionHandler {
             }
             Target::Volume { pool, body } => {
                 writer.ensure_project().map_err(write_failed)?;
-                let progress = writer.copy_volume(&pool, &body).map_err(write_failed)?;
+                let progress = writer
+                    .copy_volume_reporting(&pool, &body, self.late_report(approved_id))
+                    .map_err(write_failed)?;
                 Ok(json!({
                     "snapshot": body["name"], "pool": pool, "kind": "volume",
                     "state": state(progress, "copied", "copying"),
@@ -2067,6 +2649,75 @@ impl ToolHandler for SnapshotListHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kernels_device_links_are_read_from_sysfs() {
+        let root = std::env::temp_dir().join(format!(
+            "arca-sysfs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let make = |path: &str| std::fs::create_dir_all(root.join(path)).expect("a folder");
+        let link = |target: &str, path: &str| {
+            std::os::unix::fs::symlink(target, root.join(path)).expect("a link")
+        };
+        make("fs/btrfs/uuid-a/devices");
+        make("fs/btrfs/features");
+        link("../../../../devices/x/sda2", "fs/btrfs/uuid-a/devices/sda2");
+        link("../../../../devices/x/sdb", "fs/btrfs/uuid-a/devices/sdb");
+        make("fs/bcachefs/uuid-b/dev-0");
+        make("fs/bcachefs/uuid-b/options");
+        link(
+            "../../../../devices/y/block/sdc",
+            "fs/bcachefs/uuid-b/dev-0/block",
+        );
+        make("class/block/sdd1/holders");
+        make("class/block/sde/holders");
+        link("../../dm-0", "class/block/sdd1/holders/md127");
+        let links = DeviceLinks::from_sysfs(&root);
+        assert_eq!(
+            links.members,
+            vec![
+                (
+                    "btrfs".to_string(),
+                    "uuid-a".to_string(),
+                    vec!["sda2".to_string(), "sdb".to_string()]
+                ),
+                (
+                    "bcachefs".to_string(),
+                    "uuid-b".to_string(),
+                    vec!["sdc".to_string()]
+                ),
+            ]
+        );
+        assert_eq!(
+            links.holders,
+            [("sdd1".to_string(), vec!["md127".to_string()])]
+                .into_iter()
+                .collect()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            DeviceLinks::from_sysfs(&root),
+            DeviceLinks::default(),
+            "no sysfs, no links"
+        );
+    }
+
+    #[test]
+    fn an_exclusive_open_of_something_that_is_not_a_block_device_fails() {
+        assert!(matches!(
+            open_exclusive("/proc/self/status"),
+            ExclusiveOpen::Failed(_)
+        ));
+        assert!(matches!(
+            open_exclusive("/dev/arca-no-such-disk"),
+            ExclusiveOpen::Failed(_)
+        ));
+    }
 
     fn disk(name: &str, children: Vec<Value>) -> Value {
         json!({

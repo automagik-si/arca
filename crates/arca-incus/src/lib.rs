@@ -40,8 +40,8 @@ pub use read::{
 pub use shim::{RecordingShim, ShimHandle, ShimSummary};
 #[cfg(feature = "write")]
 pub use snapshot::{
-    PoolSource, Progress, SNAPSHOT_POOL_DESCRIPTION, SNAPSHOT_PROJECT, SNAPSHOT_STORAGE_KEY,
-    SnapshotWriter,
+    FS_UUID_KEY, LateReport, PoolSource, Progress, SNAPSHOT_POOL_DESCRIPTION, SNAPSHOT_PROJECT,
+    SNAPSHOT_STORAGE_KEY, SnapshotWriter, VERIFIED_KEY,
 };
 #[cfg(feature = "write")]
 pub use write::{Owned, ProjectFamily, Reading, UnixIncusWriter};

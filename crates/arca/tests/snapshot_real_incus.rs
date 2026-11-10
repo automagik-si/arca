@@ -57,9 +57,15 @@ fn a_real_incus_copy_is_clean_and_never_started() {
 
     let writer = SnapshotWriter::new(socket.into()).with_wait(Duration::from_secs(300));
     // As the approved storage_add does: Arca makes <folder>/arca-pool, then Incus makes the pool in it.
-    make_pool_folder(&folder).expect("the pool folder");
+    let _pool_folder = make_pool_folder(&folder).expect("the pool folder");
     writer
-        .create_pool(&pool, &PoolSource::Folder(folder))
+        .create_pool(
+            &pool,
+            &PoolSource::Folder {
+                path: folder,
+                fs_uuid: None,
+            },
+        )
         .expect("the snapshot pool is added");
     writer.ensure_project().expect("the snapshot project");
     let now = u64::try_from(
