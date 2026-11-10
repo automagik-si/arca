@@ -43,6 +43,28 @@ pub(super) fn failed_for(outcomes: &[Outcome], entries: &[&str]) -> bool {
     })
 }
 
+/// Why [`failed_for`] is true, in the words the kernel recorded: the first failed entry's reason, the document's refusal,
+/// or that the document was held. A reason names a rule and never a value.
+pub(super) fn failure_reason(outcomes: &[Outcome], entries: &[&str]) -> Option<String> {
+    outcomes.iter().find_map(|outcome| match outcome {
+        Outcome::Failed { entry, why } if entries.iter().any(|id| entry.0 == *id) => {
+            let why = why
+                .strip_prefix("refused: ")
+                .or_else(|| why.strip_prefix("failed: "))
+                .unwrap_or(why);
+            Some(why.to_string())
+        }
+        Outcome::Refused(refusal) => Some(format!("the desired state was refused ({refusal})")),
+        Outcome::Held { stale: true } => {
+            Some("the desired state changed meanwhile, so nothing was applied".to_string())
+        }
+        Outcome::Held { stale: false } => {
+            Some("the desired state is held, so nothing was applied".to_string())
+        }
+        _ => None,
+    })
+}
+
 /// The reference to service `cfg`'s secret `key`: one `service_secret_set` stored, or the file `service_create` made.
 pub(super) fn secret_reference_in(
     node: &NodeConfig,

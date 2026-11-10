@@ -1083,8 +1083,12 @@ pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, Tem
                     .get("file")
                     .and_then(Value::as_str)
                     .ok_or_else(|| TemplateError::refused("entrypoint: invalid file"))?;
-                let script = std::fs::read_to_string(dir.join(file))
-                    .map_err(|_| TemplateError::refused("entrypoint: file cannot be read"))?;
+                if !script_name_ok(file) {
+                    return Err(TemplateError::refused("entrypoint: invalid file"));
+                }
+                let path = dir.join(file);
+                let script = std::fs::read_to_string(&path)
+                    .map_err(|error| script_unreadable(&template.name, file, &path, &error))?;
                 out.push(shell_quote(script.trim_end_matches('\n')));
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
@@ -1095,6 +1099,38 @@ pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, Tem
         return Err(TemplateError::refused("entrypoint: too long"));
     }
     Ok(Some(joined))
+}
+
+/// Whether `file` is a plain file name, so an entrypoint script is read from the template directory and nowhere else.
+fn script_name_ok(file: &str) -> bool {
+    !file.is_empty()
+        && file.len() <= 128
+        && !file.starts_with('.')
+        && file
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The refusal for an entrypoint script that cannot be read: the path that was tried, and for a missing file how it gets
+/// there. A template's JSON copied in without its script is the usual cause.
+fn script_unreadable(
+    template: &str,
+    file: &str,
+    path: &Path,
+    error: &std::io::Error,
+) -> TemplateError {
+    let shown = path.display();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return TemplateError::refused(format!(
+            "template {template}: its entrypoint script {file} is not installed ({shown} does not exist). \
+             It ships beside {template}.json in templates/ and belongs in the same directory on this node; \
+             `arca templates install --config <file>` puts every shipped template and its script there"
+        ));
+    }
+    TemplateError::refused(format!(
+        "template {template}: its entrypoint script {shown} cannot be read ({})",
+        error.kind()
+    ))
 }
 
 fn shell_quote(value: &str) -> String {

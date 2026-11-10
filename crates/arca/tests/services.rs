@@ -792,10 +792,13 @@ fn a_failed_create_leaves_no_acl_behind_and_no_row() {
     .unwrap();
     rig.fake.set_reject_config_on_post("/1.0/instances");
     let failed = rig.call("service_create", json!({"name":"nats","template":"nats"}));
-    assert!(matches!(
-        failed,
-        Err(CallError::Refused { message, .. }) if message == "create service nats from template nats"
-    ));
+    let Err(CallError::Refused { message, .. }) = failed else {
+        panic!("a failed create is refused");
+    };
+    assert_eq!(
+        message,
+        "create service nats from template nats: the create did not land; nothing was left behind"
+    );
     assert!(
         rig.get(&format!(
             "/1.0/network-acls/{PROJECT}-svc-nats?project=default"
@@ -833,7 +836,7 @@ fn a_failed_create_leaves_no_acl_behind_and_no_row() {
     );
     assert!(
         matches!(rig.call("service_create", json!({"name":"another","template":"nats"})),
-        Err(CallError::Refused { message, .. }) if message == "create service another from template nats")
+        Err(CallError::Refused { message, .. }) if message == "create service another from template nats: the create did not land; nothing was left behind")
     );
     assert!(
         !rig.dir.join("secrets/service-another").exists(),
@@ -2185,6 +2188,7 @@ fn service_logs_reads_a_system_services_console_without_a_template_mark() {
             "ports":[],"env":{},"publishable":false
         }),
     );
+    rig.fake.add_image(PROJECT, "dash-image");
     rig.call("service_create", json!({"name":"dash","template":"dash"}))
         .expect("system service");
     rig.edit(
@@ -2614,4 +2618,200 @@ fn a_netproject_read_failure_does_not_refuse_a_service_remove_or_skip_secret_cle
             .is_none(),
         "the instance was deleted"
     );
+}
+
+#[test]
+fn service_create_names_the_missing_entrypoint_script_and_how_it_gets_there() {
+    let rig = Rig::new();
+    rig.template(
+        "jet",
+        json!({
+            "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+            "ports":[8080],"env":{},"publishable":false,
+            "entrypoint":["/bin/sh","-ec",{"file":"jet.sh"},"jet"]
+        }),
+    );
+    let Err(CallError::Refused { code, message }) =
+        rig.call("service_create", json!({"name":"jet","template":"jet"}))
+    else {
+        panic!("a template without its script is refused");
+    };
+    assert_eq!(code, "refused");
+    let path = rig.dir.join("templates/jet.sh");
+    assert!(
+        message.starts_with("template jet: its entrypoint script jet.sh is not installed"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("{} does not exist", path.display())),
+        "the refusal names the path it looked for: {message}"
+    );
+    assert!(
+        message.contains("arca templates install --config"),
+        "the refusal says how the file gets there: {message}"
+    );
+    assert!(
+        rig.get(&format!("/1.0/instances/jet?project={PROJECT}"))
+            .is_none()
+            && rig
+                .get(&format!(
+                    "/1.0/network-acls/{PROJECT}-svc-jet?project=default"
+                ))
+                .is_none()
+            && !rig
+                .entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-jet"),
+        "nothing was created"
+    );
+    // The script in place, the same call creates the service.
+    fs::write(&path, "exec jet\n").expect("script");
+    rig.call("service_create", json!({"name":"jet","template":"jet"}))
+        .expect("create");
+}
+
+#[test]
+fn an_entrypoint_script_is_a_plain_file_name_in_the_template_directory() {
+    let rig = Rig::new();
+    fs::write(rig.dir.join("outside.sh"), "exec evil\n").expect("script");
+    for file in ["../outside.sh", "/etc/hostname", ".hidden", ""] {
+        rig.template(
+            "jet",
+            json!({
+                "name":"jet","kind":"oci","image":"docker.io/library/jet","digest":DIGEST,
+                "ports":[8080],"env":{},"publishable":false,
+                "entrypoint":["/bin/sh","-ec",{"file":file}]
+            }),
+        );
+        assert!(
+            matches!(
+                rig.call("service_create", json!({"name":"jet","template":"jet"})),
+                Err(CallError::Refused { message, .. }) if message == "entrypoint: invalid file"
+            ),
+            "{file:?} is refused"
+        );
+    }
+}
+
+#[test]
+fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_step() {
+    let rig = Rig::new();
+    let dir = rig.dir.join("templates");
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let report = arca::cmd_templates::install_into(&dir, false).expect("install");
+    assert_eq!(report["dir"], json!(dir.display().to_string()));
+    assert_eq!(report["unchanged"], json!([]));
+    assert_eq!(report["kept"], json!([]));
+    let installed: Vec<&str> = report["installed"]
+        .as_array()
+        .expect("installed")
+        .iter()
+        .map(|name| name.as_str().expect("a name"))
+        .collect();
+    // Every template the repository ships is installed, and each loads with its entrypoint script readable.
+    let mut templates = 0;
+    for entry in fs::read_dir(&shipped).expect("templates/") {
+        let name = entry
+            .expect("entry")
+            .file_name()
+            .into_string()
+            .expect("name");
+        let Some(template) = name.strip_suffix(".json") else {
+            continue;
+        };
+        templates += 1;
+        assert!(installed.contains(&name.as_str()), "{name} is installed");
+        assert_eq!(
+            fs::read(dir.join(&name)).expect("installed"),
+            fs::read(shipped.join(&name)).expect("shipped"),
+            "{name} is the shipped file"
+        );
+        let loaded = service::load_template(&dir, template).expect("the installed template loads");
+        service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
+    }
+    assert_eq!(templates, 5);
+    assert!(installed.contains(&"postgres-autopg.sh"));
+    assert_eq!(
+        fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
+        0o700
+    );
+
+    // A second run changes nothing. A file that differs is kept, and replaced only when asked.
+    let again = arca::cmd_templates::install_into(&dir, false).expect("again");
+    assert_eq!(again["installed"], json!([]));
+    assert_eq!(
+        again["unchanged"].as_array().expect("unchanged").len(),
+        installed.len()
+    );
+    fs::write(dir.join("nats.json"), "{}").expect("an edit");
+    fs::remove_file(dir.join("postgres-autopg.sh")).expect("remove");
+    fs::write(dir.join("mine.json"), "{}").expect("the owner's own template");
+    let partial = arca::cmd_templates::install_into(&dir, false).expect("partial");
+    assert_eq!(partial["installed"], json!(["postgres-autopg.sh"]));
+    assert_eq!(partial["kept"], json!(["nats.json"]));
+    assert_eq!(
+        fs::read_to_string(dir.join("nats.json")).expect("kept"),
+        "{}"
+    );
+    let replaced = arca::cmd_templates::install_into(&dir, true).expect("replace");
+    assert_eq!(replaced["installed"], json!(["nats.json"]));
+    assert_eq!(replaced["kept"], json!([]));
+    service::load_template(&dir, "nats").expect("the shipped nats again");
+    assert_eq!(
+        fs::read_to_string(dir.join("mine.json")).expect("mine"),
+        "{}"
+    );
+}
+
+#[test]
+fn service_create_refuses_a_local_image_the_service_project_does_not_hold_and_names_it() {
+    let rig = Rig::new();
+    rig.template(
+        "dash",
+        json!({
+            "name":"dash","kind":"system","image":"local:dash-image",
+            "ports":[],"env":{},"secrets":["TOKEN"],"generate":{"TOKEN":"test_"},"publishable":false
+        }),
+    );
+    // The service project exists once a service was made in it. Another alias there does not stand in for the template's.
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("nats");
+    rig.fake.add_image(PROJECT, "other-image");
+    let writes = |rig: &Rig| {
+        rig.fake
+            .requests()
+            .iter()
+            .filter(|request| request.method != "GET")
+            .count()
+    };
+    let before = writes(&rig);
+    let Err(CallError::Refused { code, message }) =
+        rig.call("service_create", json!({"name":"dash","template":"dash"}))
+    else {
+        panic!("a missing local image is refused");
+    };
+    assert_eq!(code, "refused");
+    assert!(
+        message.starts_with(&format!(
+            "template dash: its image dash-image is not on this node: no image in the service project {PROJECT} has that alias"
+        )),
+        "{message}"
+    );
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-dash?project=default"
+        ))
+        .is_none()
+            && !rig.dir.join("secrets/service-dash").exists()
+            && !rig
+                .entries()
+                .iter()
+                .any(|entry| entry.id.0 == "service-dash")
+            && writes(&rig) == before,
+        "nothing was written"
+    );
+    rig.fake.add_image(PROJECT, "dash-image");
+    rig.call("service_create", json!({"name":"dash","template":"dash"}))
+        .expect("the image in place, the service is created");
 }

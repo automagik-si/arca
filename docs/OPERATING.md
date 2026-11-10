@@ -10,6 +10,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
+| `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
@@ -252,6 +253,12 @@ not create as `unknown` without touching them. A row's `ports` are the container
 listener. `service_logs` returns console lines as untrusted text with stored
 secrets redacted and a capped, truncated result. The five shipped templates live in `templates/`, with their pinned
 images and vendored npm lockfile.
+
+`arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
+script its entrypoint reads (`postgres-autopg.sh` for `postgres-autopg`), from the build itself, so no checkout is
+needed. A template whose script is missing is refused by `service_create` with the path it looked for. A template
+whose `image` is `local:<alias>` (`automagik`, `automagik-server`) needs that image in the service project's image
+store first; `service_create` refuses with the alias when no image there carries it, before anything is created.
 
 Templates may also set `limits` with an optional decimal-string `cpu` and/or a size-string `memory` (for example,
 `{"cpu":"4","memory":"4GiB"}`); at least one is required when `limits` is present. These instance settings override the

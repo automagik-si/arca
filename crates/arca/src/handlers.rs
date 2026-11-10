@@ -2937,6 +2937,45 @@ fn service_template_error(error: crate::service::TemplateError) -> CallError {
     }
 }
 
+/// Refuses a template whose image is a local alias that no image in the service project's image store carries, before
+/// anything is created: such an image is built or copied in by hand, and Incus's own answer to the create names no reason.
+/// Only a listing that answers and lacks the alias refuses. A listing that cannot be read (the project is not made yet, or
+/// the read fails) decides nothing, and the create goes on.
+fn local_image_present(
+    read: &UnixIncus,
+    template: &crate::service::Template,
+) -> Result<(), CallError> {
+    let Some(alias) = (template.kind == "system")
+        .then(|| template.image.strip_prefix("local:"))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let Ok(images) = read.get(&format!(
+        "/1.0/images?project={}&recursion=1",
+        arca_netproject::PROJECT
+    )) else {
+        return Ok(());
+    };
+    let Some(images) = images.as_array() else {
+        return Ok(());
+    };
+    let held = images.iter().any(|image| {
+        image["aliases"]
+            .as_array()
+            .is_some_and(|aliases| aliases.iter().any(|a| a["name"].as_str() == Some(alias)))
+    });
+    if held {
+        return Ok(());
+    }
+    Err(service_refused(format!(
+        "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
+         A local image is built or copied into that project before the service is created; the template's description says how",
+        template.name,
+        arca_netproject::PROJECT
+    )))
+}
+
 /// The service project's CIDR and gateway, or a refusal before any Incus read.
 fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
     let cidr = cfg
@@ -3676,6 +3715,7 @@ impl ToolHandler for ServiceHandler {
                 let templates_dir = self.cfg.state_dir.join("templates");
                 let template = crate::service::load_template(&templates_dir, template_name)
                     .map_err(service_template_error)?;
+                local_image_present(&read, &template)?;
                 let candidates =
                     crate::service::candidates(&cidr).map_err(service_template_error)?;
                 let leases = service_leases(&read)?;
@@ -3742,8 +3782,10 @@ impl ToolHandler for ServiceHandler {
                         )
                     };
                     cleanup_service_secrets(&service_secrets, &seeded);
+                    let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
+                        .unwrap_or_else(|| "the kernel recorded no reason".to_string());
                     return Err(service_refused(format!(
-                        "create service {name} from template {template_name}"
+                        "create service {name} from template {template_name}: {why}; nothing was left behind"
                     )));
                 }
                 let live = match read.get(&format!(
