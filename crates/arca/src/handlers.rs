@@ -3772,7 +3772,7 @@ impl ToolHandler for ServiceHandler {
                         Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
                         Err(_) => return Err(internal()),
                     }
-                    let _ = {
+                    let removal = {
                         let mut kernel = lock(&self.kernel)?;
                         kernel.propose(
                             vec![crate::desired_store::EntryChange::Remove(EntryId(
@@ -3784,8 +3784,9 @@ impl ToolHandler for ServiceHandler {
                     cleanup_service_secrets(&service_secrets, &seeded);
                     let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
                         .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+                    let left = service_wiring::left_behind(removal.ok().as_deref(), &id);
                     return Err(service_refused(format!(
-                        "create service {name} from template {template_name}: {why}; nothing was left behind"
+                        "create service {name} from template {template_name}: {why}; {left}"
                     )));
                 }
                 let live = match read.get(&format!(

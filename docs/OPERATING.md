@@ -256,9 +256,17 @@ images and vendored npm lockfile.
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint reads (`postgres-autopg.sh` for `postgres-autopg`), from the build itself, so no checkout is
-needed. A template whose script is missing is refused by `service_create` with the path it looked for. A template
-whose `image` is `local:<alias>` (`automagik`, `automagik-server`) needs that image in the service project's image
-store first; `service_create` refuses with the alias when no image there carries it, before anything is created.
+needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
+dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
+`service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
+(`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
+`service_create` refuses with the alias when the project's image listing answers and no image there carries it,
+before anything is created. A listing that cannot be read decides nothing, and the create goes on.
+
+When a create fails in the kernel, the refusal carries the recorded reason and says what remains: `nothing was left
+behind` only when the cleanup that follows completed and nothing waits for an approval. A template with `data`
+leaves its data volume in a delete plan for the owner's approval, and the refusal names it. When the cleanup did not
+complete (for example the create's outcome is not known), the refusal says so.
 
 Templates may also set `limits` with an optional decimal-string `cpu` and/or a size-string `memory` (for example,
 `{"cpu":"4","memory":"4GiB"}`); at least one is required when `limits` is present. These instance settings override the

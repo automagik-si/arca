@@ -65,6 +65,49 @@ pub(super) fn failure_reason(outcomes: &[Outcome], entries: &[&str]) -> Option<S
     })
 }
 
+/// What a failed create left on the node, from the outcomes of the removal that followed it (`None` when the removal itself
+/// could not be proposed). "nothing was left behind" is said only when every step of that removal completed and no object
+/// waits for an approval. Otherwise the text names what remains: the objects a delete plan holds for the owner's approval,
+/// or that the cleanup did not complete and why.
+pub(super) fn left_behind(removal: Option<&[Outcome]>, entry: &str) -> String {
+    let Some(outcomes) = removal else {
+        return "the cleanup could not be started, so objects of this service may remain"
+            .to_string();
+    };
+    if let Some(why) = failure_reason(outcomes, &[entry]) {
+        return format!(
+            "the cleanup did not complete ({why}), so objects of this service may remain"
+        );
+    }
+    let waiting: Vec<String> = outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            Outcome::AwaitingApproval { plan } if plan.entry.0 == entry => Some(&plan.objects),
+            _ => None,
+        })
+        .flatten()
+        .map(|object| {
+            let kind = match object.kind {
+                arca_kernel::ownership::IncusKind::Volume => "data volume".to_string(),
+                kind => format!("{kind:?}").to_lowercase(),
+            };
+            format!("{kind} {}", object.name)
+        })
+        .collect();
+    if waiting.is_empty() {
+        return "nothing was left behind".to_string();
+    }
+    format!(
+        "its {} still {}, waiting for the owner's approval to be deleted (plan_list shows the plan)",
+        waiting.join(" and its "),
+        if waiting.len() == 1 {
+            "exists"
+        } else {
+            "exist"
+        }
+    )
+}
+
 /// The reference to service `cfg`'s secret `key`: one `service_secret_set` stored, or the file `service_create` made.
 pub(super) fn secret_reference_in(
     node: &NodeConfig,
