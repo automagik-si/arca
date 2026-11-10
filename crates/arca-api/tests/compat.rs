@@ -1071,3 +1071,40 @@ fn a_current_document_that_breaks_a_released_file_fails_the_check() {
         "the break is named: {message}"
     );
 }
+
+/// The current document as it was before the destructive verbs took `confirm`: the same document with that one optional
+/// parameter removed from each of them.
+fn without_confirm(mut doc: Value) -> Value {
+    for method in doc["methods"].as_array_mut().expect("methods") {
+        if let Some(params) = method["params"].as_array_mut() {
+            params.retain(|p| p["name"] != "confirm");
+        }
+    }
+    doc
+}
+
+#[test]
+fn an_added_optional_confirm_on_the_destructive_verbs_is_compatible() {
+    let current = openrpc();
+    let before = without_confirm(current.clone());
+    assert_ne!(before, current, "the current document carries confirm");
+    assert_eq!(
+        compatible(&before, &current),
+        vec![],
+        "adding it breaks nothing"
+    );
+    assert_eq!(compatible(&released(), &current), vec![]);
+    // Taking it away again would be a break, one per destructive verb, so the checker does see the parameter.
+    let mut removed: Vec<Break> = compatible(&current, &before);
+    removed.sort_by_key(|b| b.to_string());
+    let mut expected: Vec<Break> = arca_api::verbs()
+        .iter()
+        .filter(|v| v.destructive)
+        .map(|v| Break::ParamRemoved {
+            method: v.name.to_string(),
+            param: "confirm".to_string(),
+        })
+        .collect();
+    expected.sort_by_key(|b| b.to_string());
+    assert_eq!(removed, expected);
+}

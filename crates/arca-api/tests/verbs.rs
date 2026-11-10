@@ -314,6 +314,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
             json!({
                 "plan": hex64(),
                 "approval": { "type": "string", "maxLength": 16384 },
+                "confirm": confirm(),
             }),
             &["plan", "approval"]
         )
@@ -342,6 +343,7 @@ fn action_approve_takes_an_action_id_and_an_approval_and_names_what_ran() {
             json!({
                 "plan": id.clone(),
                 "approval": { "type": "string", "maxLength": 16384 },
+                "confirm": confirm(),
             }),
             &["plan", "approval"]
         )
@@ -876,6 +878,14 @@ fn open(props: Value, required: &[&str]) -> Value {
     json!({ "type": "object", "properties": props, "required": required })
 }
 
+/// The optional `confirm` every destructive verb's params carry.
+fn confirm() -> Value {
+    json!({
+        "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+        "type": "boolean"
+    })
+}
+
 fn hex64() -> Value {
     json!({ "type": "string", "minLength": 64, "maxLength": 64 })
 }
@@ -1193,4 +1203,105 @@ fn owner_approval_schemas_equal_the_golden_with_list_untrusted_and_status_not_re
         verb("owner_approval_list").unwrap().min_scope,
         Scope::Viewer
     );
+}
+
+#[test]
+fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_does() {
+    let destructive: Vec<&str> = verbs()
+        .iter()
+        .filter(|v| v.destructive)
+        .map(|v| v.name)
+        .collect();
+    assert_eq!(
+        destructive,
+        [
+            "approval_submit",
+            "action_approve",
+            "postgres_delete",
+            "service_remove",
+            "gpu_detach",
+            "storage_add",
+            "snapshot_delete",
+        ]
+    );
+    for v in verbs() {
+        let params = (v.params)();
+        if !v.destructive {
+            assert!(params["properties"].get("confirm").is_none(), "{}", v.name);
+            continue;
+        }
+        assert_eq!(params["properties"]["confirm"], confirm(), "{}", v.name);
+        assert!(
+            !params["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("confirm"))),
+            "{}: confirm is optional",
+            v.name
+        );
+        assert!(
+            conforms(&params["properties"]["confirm"], &json!(true)).is_ok()
+                && conforms(&params["properties"]["confirm"], &json!(false)).is_ok()
+        );
+        for wrong in [json!("yes"), json!(1), json!(null)] {
+            assert!(
+                conforms(&params["properties"]["confirm"], &wrong).is_err(),
+                "{}: confirm {wrong} is refused",
+                v.name
+            );
+        }
+    }
+}
+
+#[test]
+fn take_confirm_drops_true_refuses_false_and_leaves_other_verbs_alone() {
+    use arca_api::verbs::take_confirm;
+    let remove = verb("service_remove").expect("present");
+    let mut absent = json!({ "name": "pg", "approval": "x" });
+    assert_eq!(take_confirm(remove, &mut absent), Ok(()));
+    assert_eq!(absent, json!({ "name": "pg", "approval": "x" }));
+    let mut yes = json!({ "name": "pg", "approval": "x", "confirm": true });
+    assert_eq!(take_confirm(remove, &mut yes), Ok(()));
+    assert_eq!(
+        yes,
+        json!({ "name": "pg", "approval": "x" }),
+        "confirm is gone"
+    );
+    let mut no = json!({ "name": "pg", "approval": "x", "confirm": false });
+    assert_eq!(
+        take_confirm(remove, &mut no),
+        Err("confirm is false: nothing was removed and no approval was spent".to_string())
+    );
+    let pg = verb("postgres_delete").expect("present");
+    assert_eq!(
+        take_confirm(pg, &mut json!({ "name": "orders", "confirm": false })),
+        Err("confirm is false: nothing was deleted".to_string()),
+        "postgres_delete takes no approval, so it names none"
+    );
+    let create = verb("service_create").expect("present");
+    let mut other = json!({ "name": "pg", "template": "pg", "confirm": false });
+    assert_eq!(take_confirm(create, &mut other), Ok(()));
+    assert_eq!(
+        other["confirm"],
+        json!(false),
+        "a verb that is not destructive is untouched"
+    );
+}
+
+/// droidd's golden row for `service_remove` (droid `packages/droidd/test/fixtures/arca-moved-tools.json`, source droid dev
+/// 91f5a95): `confirm` is an optional boolean.
+#[test]
+fn service_remove_params_equal_droidds_golden_row() {
+    let golden = json!({
+        "additionalProperties": false,
+        "properties": {
+            "approval": { "maxLength": 16384, "minLength": 1, "type": "string" },
+            "confirm": { "type": "boolean" },
+            "name": { "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$", "type": "string" }
+        },
+        "required": ["approval", "name"],
+        "type": "object"
+    });
+    let v = verb("service_remove").expect("present");
+    assert_eq!(parity_shape(&(v.params)()), golden);
+    assert!(v.destructive);
 }

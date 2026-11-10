@@ -967,10 +967,24 @@ fn fields_of(
             "the target names a delete plan: a plan is approved through its own card on the passkey page, not through a request",
         ));
     }
-    let call_args = &input["args"];
-    let Some(object) = call_args.as_object() else {
+    let mut owned_args = input["args"].clone();
+    let Some(object) = owned_args.as_object_mut() else {
         return Err(invalid("args must be a JSON object"));
     };
+    // A destructive call's `confirm` is taken out at Arca's door before the approval is checked, so the statement binds
+    // the arguments without it: `true` is dropped here, and `false` asks for nothing. Any other value stays and is bound,
+    // and the call that would spend it is refused by its schema.
+    match object.get(arca_api::verbs::CONFIRM) {
+        Some(Value::Bool(true)) => {
+            object.remove(arca_api::verbs::CONFIRM);
+        }
+        Some(Value::Bool(false)) => {
+            return Err(invalid("confirm is false: no approval was asked for"));
+        }
+        _ => {}
+    }
+    let call_args = &owned_args;
+    let object = call_args.as_object().ok_or_else(internal)?;
     if object.contains_key("approval") {
         return Err(invalid(
             "args are the call's arguments without approval: the approval is what this request asks for",

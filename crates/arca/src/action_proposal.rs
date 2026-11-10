@@ -111,6 +111,7 @@ impl ActionKind {
     }
 
     /// The verb's own params schema, with the inline `approval` field removed: the proposal is what replaces that field.
+    /// A destructive verb's `confirm` is removed too: it is the door's, and an approved action never binds it.
     pub fn params_schema(self) -> Value {
         let mut schema = (verb(self.as_str())
             .expect("every allowed action is a verb in the table")
@@ -120,6 +121,7 @@ impl ActionKind {
         }
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
             properties.remove("approval");
+            properties.remove(arca_api::verbs::CONFIRM);
         }
         schema
     }
@@ -132,6 +134,20 @@ impl ActionKind {
     /// `service_create`'s template is already constrained to the catalog's name grammar by its schema.
     pub fn prepare(self, args: &Value, postgres_image: Option<&str>) -> Result<Value, String> {
         let mut args = args.clone();
+        // A destructive verb's `confirm: true` is dropped, so the proposal (and the approval the owner signs) binds the
+        // call without it; `false` proposes nothing. Any other value stays, and the schema below refuses it.
+        let destructive = verb(self.as_str()).is_some_and(|v| v.destructive);
+        if destructive && let Some(object) = args.as_object_mut() {
+            match object.get(arca_api::verbs::CONFIRM) {
+                Some(Value::Bool(true)) => {
+                    object.remove(arca_api::verbs::CONFIRM);
+                }
+                Some(Value::Bool(false)) => {
+                    return Err("args/confirm: confirm is false: nothing was proposed".to_string());
+                }
+                _ => {}
+            }
+        }
         if self == Self::PostgresCreate {
             let Some(default) = postgres_image else {
                 return Err(

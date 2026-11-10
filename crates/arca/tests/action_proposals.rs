@@ -1358,3 +1358,54 @@ fn a_foreign_or_retained_instance_is_refused_even_in_the_family() {
         "{retained:?}"
     );
 }
+
+#[test]
+fn a_proposal_drops_confirm_true_from_what_it_binds_and_proposes_nothing_for_confirm_false() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("proposal-confirm", &key);
+    for action in ActionKind::ALL {
+        assert!(
+            action.params_schema()["properties"]
+                .get("confirm")
+                .is_none(),
+            "{}: an approved action never binds confirm",
+            action.as_str()
+        );
+    }
+    let bare = rig
+        .propose("service_remove", json!({ "name": "nats" }))
+        .expect("a removal proposal");
+    let confirmed = rig
+        .propose("service_remove", json!({ "name": "nats", "confirm": true }))
+        .expect("confirm: true is dropped");
+    assert_eq!(confirmed["args"], json!({ "name": "nats" }));
+    assert_eq!(confirmed["args"], bare["args"]);
+    assert_eq!(confirmed["argsDigest"], bare["argsDigest"]);
+    assert_eq!(
+        confirmed["id"], bare["id"],
+        "with confirm: true it is the very proposal made without it"
+    );
+    assert_eq!(confirmed["summary"], bare["summary"]);
+    let declined = rig
+        .propose(
+            "service_remove",
+            json!({ "name": "nats", "confirm": false }),
+        )
+        .expect_err("confirm: false proposes nothing");
+    assert!(
+        matches!(&declined, CallError::Invalid(why) if why == "args/confirm: confirm is false: nothing was proposed"),
+        "{declined:?}"
+    );
+    let yes = rig
+        .propose(
+            "service_remove",
+            json!({ "name": "nats", "confirm": "yes" }),
+        )
+        .expect_err("a confirm that is not a boolean is refused");
+    assert!(matches!(yes, CallError::Invalid(_)));
+    assert_eq!(
+        rig.list()["plans"].as_array().map(Vec::len),
+        Some(1),
+        "one proposal, recorded once; the refusals recorded nothing"
+    );
+}

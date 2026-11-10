@@ -1120,6 +1120,11 @@ struct Door {
 
 impl Door {
     fn over(g: &G7) -> Door {
+        Self::serving(g, &[])
+    }
+
+    /// The door over the three verbs and the rig's own handlers for `extra`.
+    fn serving(g: &G7, extra: &[&'static str]) -> Door {
         use arca_mcp::{Server, TokenStore, mint, serve_unix};
         let tokens = g.rig.dir.join("door-tokens");
         fs::create_dir(&tokens).expect("the token directory");
@@ -1138,6 +1143,9 @@ impl Door {
         );
         for (verb, handler) in &g.verbs {
             server = server.handle(verb, Arc::clone(handler));
+        }
+        for verb in extra {
+            server = server.handle(verb, Arc::clone(&g.rig.handlers[verb]));
         }
         let socket = g.rig.dir.join("door.sock");
         let runtime = tokio::runtime::Runtime::new().expect("a runtime");
@@ -1328,4 +1336,142 @@ fn l3_a_change_that_cannot_be_saved_is_never_audited() {
     );
     assert_eq!(g.mine(&id)["state"], "pending");
     assert_eq!(g.list().len(), 1, "the request not saved was not kept");
+}
+
+// ---- confirm on a destructive verb ---------------------------------------------------------------------------------------
+
+/// Whether the rig's fake Incus still holds the service instance `name`.
+fn instance_exists(g: &G7, name: &str) -> bool {
+    g.rig
+        .get(&format!("/1.0/instances/{name}?project={PROJECT}"))
+        .is_some()
+}
+
+#[test]
+fn confirm_never_enters_what_an_approval_binds_and_a_false_one_spends_nothing() {
+    let g = G7::new();
+    g.service();
+    g.rig
+        .call(
+            "service_create",
+            json!({ "name": "svc2", "template": "pg" }),
+        )
+        .expect("a second service");
+    let door = Door::serving(&g, &["service_remove"]);
+    // The approval is minted for { name } alone.
+    let created = door.ok(&door.doctor, "owner_approval_request", delete("pg"));
+    let id = id_of(&created);
+    g.tap(&id);
+    let approval = g.approval(&id);
+
+    // confirm: false is refused in plain words before the handler runs: nothing is removed and nothing is spent.
+    let refused = door.call(
+        &door.doctor,
+        "service_remove",
+        json!({ "name": "pg", "approval": approval, "confirm": false }),
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        json!("confirm is false: nothing was removed and no approval was spent"),
+        "{refused}"
+    );
+    assert_eq!(refused["error"]["data"]["refusal"], json!("NotConfirmed"));
+    assert!(instance_exists(&g, "pg"), "nothing was removed");
+
+    // A value that is not a boolean is refused by the schema, and spends nothing either.
+    let yes = door.call(
+        &door.doctor,
+        "service_remove",
+        json!({ "name": "pg", "approval": approval, "confirm": "yes" }),
+    );
+    assert_eq!(yes["error"]["code"], json!(-32602), "{yes}");
+    assert!(instance_exists(&g, "pg"));
+
+    // The same approval is refused for another name, with or without confirm.
+    for confirm in [json!(true), Value::Null] {
+        let mut args = json!({ "name": "svc2", "approval": approval });
+        if !confirm.is_null() {
+            args["confirm"] = confirm;
+        }
+        let crossed = door.call(&door.doctor, "service_remove", args);
+        assert!(crossed.get("error").is_some(), "{crossed}");
+        assert!(
+            instance_exists(&g, "svc2"),
+            "another name keeps its service"
+        );
+    }
+
+    // Minted for { name }, it spends with { name, confirm: true }, once, through the door's result check.
+    assert_eq!(
+        door.ok(
+            &door.doctor,
+            "service_remove",
+            json!({ "name": "pg", "approval": approval, "confirm": true }),
+        ),
+        json!({ "removed": true })
+    );
+    assert!(!instance_exists(&g, "pg"));
+    assert!(instance_exists(&g, "svc2"));
+    assert_eq!(
+        g.spend("pg", &approval),
+        Err(arca_approval::ApprovalRefusal::Replayed),
+        "spent exactly once"
+    );
+    let again = door.call(
+        &door.doctor,
+        "service_remove",
+        json!({ "name": "pg", "approval": approval, "confirm": true }),
+    );
+    assert!(again.get("error").is_some(), "no second removal: {again}");
+}
+
+#[test]
+fn a_request_drops_confirm_true_from_the_args_it_binds_and_refuses_confirm_false() {
+    let g = G7::new();
+    g.service();
+    let door = Door::serving(&g, &["service_remove"]);
+    let mut with_confirm = delete("pg");
+    with_confirm["args"]["confirm"] = json!(true);
+    let created = door.ok(&door.doctor, "owner_approval_request", with_confirm);
+    let id = id_of(&created);
+    let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
+    assert_eq!(
+        listed["requests"][0]["args"],
+        json!({ "name": "pg" }),
+        "the owner is shown the args without confirm"
+    );
+    let statement = g.statement(&id);
+    let parsed = parse_statement(statement.as_bytes()).expect("the statement parses");
+    assert_eq!(
+        parsed.params_digest,
+        params_digest(&json!({ "name": "pg" })).expect("a digest"),
+        "the statement binds the name alone"
+    );
+    g.approve(&id, &statement, &g.proof(&statement, |_| {}))
+        .expect("the tap approves");
+    let approval = g.approval(&id);
+    assert_eq!(
+        door.ok(
+            &door.doctor,
+            "service_remove",
+            json!({ "name": "pg", "approval": approval }),
+        ),
+        json!({ "removed": true }),
+        "and it spends without confirm too"
+    );
+
+    let mut declined = delete("svc2");
+    declined["args"]["confirm"] = json!(false);
+    let refused = door.call(&door.doctor, "owner_approval_request", declined);
+    assert_eq!(
+        refused["error"]["message"],
+        json!("confirm is false: no approval was asked for"),
+        "{refused}"
+    );
+    let listed = door.ok(&door.viewer, "owner_approval_list", json!({}));
+    assert_eq!(
+        listed["requests"].as_array().map(Vec::len),
+        Some(1),
+        "the refused request was not kept"
+    );
 }

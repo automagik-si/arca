@@ -4,6 +4,7 @@
 //! method without an id is refused as an invalid request, so a write never runs with no answer to its caller. An `id` is
 //! a string or a number; a `null` id is invalid.
 
+use arca_api::verbs::{NOT_CONFIRMED, take_confirm};
 use arca_api::{API_VERSION, Verb, conforms, may_call};
 use serde_json::{Value, json};
 
@@ -141,12 +142,22 @@ async fn call_tool(
             verb: name.to_string(),
         });
     }
-    let arguments = params
+    let mut arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
     if let Err(why) = conforms(&(verb.params)(), &arguments) {
         return Ok(Some(error_reply(id, INVALID_PARAMS, &why, None)));
+    }
+    // A destructive verb's `confirm` is the door's: it is taken out here, so the handler, and every approval it checks or
+    // binds, sees the call without it. `false` refuses before the handler runs, so nothing changes and nothing is spent.
+    if let Err(message) = take_confirm(verb, &mut arguments) {
+        return Ok(Some(error_reply(
+            id,
+            REFUSED,
+            &message,
+            Some(json!({ "refusal": NOT_CONFIRMED })),
+        )));
     }
     let Some(handler) = server.handlers.get(name).cloned() else {
         return Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None)));

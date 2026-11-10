@@ -842,6 +842,62 @@ pub fn may_call(scope: Scope, v: &Verb) -> bool {
     scope >= v.min_scope
 }
 
+/// The optional boolean every destructive verb takes. It belongs to the door, not to the call: absent or `true` the call
+/// runs as it would without it, `false` refuses the call before it reaches its handler. [`take_confirm`] takes it out of the
+/// arguments first, so it never reaches what an approval binds (a statement's `paramsDigest`, a plan, a proposal, the
+/// journal or the desired state).
+pub const CONFIRM: &str = "confirm";
+
+/// The refusal code of a destructive call sent with `confirm: false`.
+pub const NOT_CONFIRMED: &str = "NotConfirmed";
+
+/// Takes `confirm` out of a destructive verb's arguments, which have already met its params schema. `Err` carries the plain
+/// words of the refusal when `confirm` is `false`: nothing ran and no approval was spent. A verb that is not destructive
+/// has no `confirm`, so its arguments are left as they are.
+pub fn take_confirm(v: &Verb, args: &mut Value) -> Result<(), String> {
+    if !v.destructive {
+        return Ok(());
+    }
+    let Some(object) = args.as_object_mut() else {
+        return Ok(());
+    };
+    match object.remove(CONFIRM) {
+        Some(Value::Bool(false)) => Err(not_confirmed(v.name)),
+        _ => Ok(()),
+    }
+}
+
+/// The plain words of a destructive call refused for `confirm: false`.
+fn not_confirmed(name: &str) -> String {
+    let undone = match name {
+        "service_remove" => "nothing was removed",
+        "gpu_detach" => "nothing was detached",
+        "storage_add" => "nothing was added",
+        "action_approve" => "nothing was run",
+        _ => "nothing was deleted",
+    };
+    let spent = if name == "postgres_delete" {
+        ""
+    } else {
+        " and no approval was spent"
+    };
+    format!("confirm is false: {undone}{spent}")
+}
+
+/// `schema` with the optional `confirm` a destructive verb takes.
+fn with_confirm(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert(
+            CONFIRM.to_string(),
+            json!({
+                "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+                "type": "boolean"
+            }),
+        );
+    }
+    schema
+}
+
 // The JSON Schema builders. A builder yields exactly the subset `check::conforms` reads.
 
 /// One named field of an object: its name, whether it is required, and its schema.
@@ -1356,10 +1412,10 @@ fn plan_decline_result() -> Value {
 }
 
 fn approval_submit_params() -> Value {
-    params(vec![
+    with_confirm(params(vec![
         ("plan", true, hex64()),
         ("approval", true, string_max(16_384)),
-    ])
+    ]))
 }
 
 fn approval_submit_result() -> Value {
@@ -1372,10 +1428,10 @@ fn approval_submit_result() -> Value {
 }
 
 fn action_approve_params() -> Value {
-    params(vec![
+    with_confirm(params(vec![
         ("plan", true, action_id()),
         ("approval", true, string_max(16_384)),
-    ])
+    ]))
 }
 
 fn action_approve_result() -> Value {
@@ -1546,7 +1602,7 @@ fn postgres_unlink_result() -> Value {
     ])
 }
 fn postgres_delete_params() -> Value {
-    params(vec![("name", true, string_max(31))])
+    with_confirm(params(vec![("name", true, string_max(31))]))
 }
 fn postgres_delete_result() -> Value {
     result(vec![
@@ -1774,7 +1830,7 @@ fn gpu_attach_params() -> Value {
 }
 
 fn gpu_detach_params() -> Value {
-    gpu_params()
+    with_confirm(gpu_params())
 }
 
 fn gpu_change_result() -> Value {
@@ -1955,7 +2011,7 @@ fn service_logs_result() -> Value {
 }
 
 fn service_remove_params() -> Value {
-    json!({
+    with_confirm(json!({
         "additionalProperties": false,
         "properties": {
             "approval": {
@@ -1968,7 +2024,7 @@ fn service_remove_params() -> Value {
         },
         "required": ["name", "approval"],
         "type": "object"
-    })
+    }))
 }
 
 fn service_remove_result() -> Value {
@@ -2095,7 +2151,7 @@ fn plain_name_schema(description: &'static str) -> Value {
 /// `storage_add`: exactly one of `path` and `device`. The disk's facts are read by the kernel when the proposal is made and
 /// are part of the approved arguments, so a disk swapped in afterwards is refused.
 fn storage_add_params() -> Value {
-    params(vec![
+    with_confirm(params(vec![
         ("name", true, pool_name_schema()),
         (
             "path",
@@ -2131,7 +2187,7 @@ fn storage_add_params() -> Value {
         ("contents", false, string_max(4096)),
         ("mount", false, string_max(1024)),
         ("approval", true, approval_schema()),
-    ])
+    ]))
 }
 
 fn storage_add_result() -> Value {
@@ -2204,13 +2260,13 @@ fn snapshot_create_params() -> Value {
 
 /// `snapshot_delete`: the snapshot's name. Its kind, pool and source are resolved by the kernel when the proposal is made.
 fn snapshot_delete_params() -> Value {
-    params(vec![
+    with_confirm(params(vec![
         ("name", true, plain_name_schema("The snapshot's name.")),
         ("kind", false, one_of(&["instance", "volume"])),
         ("pool", false, plain_name_schema("The snapshot's pool.")),
         ("source", false, string_max(512)),
         ("approval", true, approval_schema()),
-    ])
+    ]))
 }
 
 fn snapshot_change_result() -> Value {
