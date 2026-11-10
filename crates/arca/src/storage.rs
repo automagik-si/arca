@@ -70,6 +70,102 @@ pub trait BlockDevices: Send + Sync {
     fn open_exclusive(&self, path: &str) -> ExclusiveOpen {
         open_exclusive(path)
     }
+
+    /// The system's own lists of what uses a device, read when the exclusive open is not allowed.
+    fn system_lists(&self) -> Result<SystemLists, String> {
+        SystemLists::read(Path::new("/proc"), Path::new("/sys"))
+    }
+}
+
+/// The system's own lists of what uses a device: every mount in this process's mount namespace, the active swap areas, and
+/// each block device's `major:minor` number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SystemLists {
+    /// `/proc/self/mountinfo` as read.
+    pub mountinfo: String,
+    /// `/proc/swaps` as read.
+    pub swaps: String,
+    /// Each block device's kernel name and its `major:minor`, from `/sys/class/block/<name>/dev`.
+    pub numbers: std::collections::BTreeMap<String, String>,
+}
+
+impl SystemLists {
+    /// Reads the lists under `proc` and `sys`. The mount and swap lists must be readable; a check without them is no check.
+    pub fn read(proc: &Path, sys: &Path) -> Result<SystemLists, String> {
+        let mountinfo = std::fs::read_to_string(proc.join("self/mountinfo"))
+            .map_err(|error| format!("the mount list could not be read: {error}"))?;
+        let swaps = std::fs::read_to_string(proc.join("swaps"))
+            .map_err(|error| format!("the swap list could not be read: {error}"))?;
+        let mut numbers = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(sys.join("class/block"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if let (Some(name), Ok(number)) = (
+                entry.file_name().to_str().map(str::to_string),
+                std::fs::read_to_string(entry.path().join("dev")),
+            ) {
+                numbers.insert(name, number.trim().to_string());
+            }
+        }
+        Ok(SystemLists {
+            mountinfo,
+            swaps,
+            numbers,
+        })
+    }
+
+    /// Where the device with kernel name `name`, device number `number` and one of `paths` is mounted, if anywhere. A mount
+    /// matches by its device number (field 3) or by its source (the field after the file system type).
+    fn mount_of(&self, number: Option<&str>, paths: &[String]) -> Option<String> {
+        self.mountinfo.lines().find_map(|line| {
+            let (left, right) = line.split_once(" - ")?;
+            let left: Vec<&str> = left.split_whitespace().collect();
+            let source = right.split_whitespace().nth(1).map(unescape_octal);
+            let by_number = number.is_some_and(|number| left.get(2) == Some(&number));
+            let by_source = source.is_some_and(|source| paths.contains(&source));
+            (by_number || by_source).then(|| {
+                left.get(4)
+                    .map(|mount| unescape_octal(mount))
+                    .unwrap_or_default()
+            })
+        })
+    }
+
+    /// Whether one of `paths` is an active swap area.
+    fn swap_of(&self, paths: &[String]) -> bool {
+        self.swaps
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_whitespace().next())
+            .any(|path| paths.contains(&unescape_octal(path)))
+    }
+}
+
+/// The kernel's escaping in mount and swap lists: a space is `\040`, a tab `\011`, a newline `\012`, a backslash `\134`.
+fn unescape_octal(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && index + 3 < bytes.len()
+            && bytes[index + 1..index + 4]
+                .iter()
+                .all(|digit| (b'0'..=b'7').contains(digit))
+        {
+            let value = (bytes[index + 1] - b'0') * 64
+                + (bytes[index + 2] - b'0') * 8
+                + (bytes[index + 3] - b'0');
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// What the kernel says about a device the instant Arca asks to hold it alone.
@@ -213,6 +309,7 @@ pub struct FixedBlockDevices {
     links: Mutex<DeviceLinks>,
     opens: Mutex<std::collections::BTreeMap<String, ExclusiveOpen>>,
     opened: Mutex<Vec<String>>,
+    lists: Mutex<Result<SystemLists, String>>,
 }
 
 fn held<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -227,7 +324,13 @@ impl FixedBlockDevices {
             links: Mutex::new(DeviceLinks::default()),
             opens: Mutex::new(std::collections::BTreeMap::new()),
             opened: Mutex::new(Vec::new()),
+            lists: Mutex::new(Ok(SystemLists::default())),
         }
+    }
+
+    /// What the system's own lists say from now on.
+    pub fn set_lists(&self, lists: Result<SystemLists, String>) {
+        *held(&self.lists) = lists;
     }
 
     pub fn set(&self, value: Result<Value, String>) {
@@ -264,6 +367,10 @@ impl BlockDevices for FixedBlockDevices {
             .get(path)
             .cloned()
             .unwrap_or(ExclusiveOpen::Free)
+    }
+
+    fn system_lists(&self) -> Result<SystemLists, String> {
+        held(&self.lists).clone()
     }
 }
 
@@ -1466,6 +1573,9 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
                         "fsUuid",
                     ],
                 )?;
+                if args.get("inUseCheck").is_some() {
+                    return Err("args/inUseCheck: a folder target is not opened".to_string());
+                }
                 if let Some(object) = args.as_object_mut() {
                     object.insert("path".to_string(), json!(clean));
                 }
@@ -1475,8 +1585,19 @@ pub fn prepare(action: ActionKind, mut args: Value) -> Result<Value, String> {
                 let name = device.strip_prefix("/dev/").unwrap_or(device).to_string();
                 resolved(
                     &args,
-                    &["disk", "model", "serial", "transport", "size", "contents"],
+                    &[
+                        "disk",
+                        "model",
+                        "serial",
+                        "transport",
+                        "size",
+                        "contents",
+                        "inUseCheck",
+                    ],
                 )?;
+                if !["exclusive open", "system lists"].contains(&text(&args, "inUseCheck")) {
+                    return Err("args/inUseCheck: it is exclusive open or system lists".to_string());
+                }
                 if args.get("mount").is_some() || args.get("fsUuid").is_some() {
                     return Err("args/mount: a whole-disk target has no mount".to_string());
                 }
@@ -1801,10 +1922,15 @@ pub fn details(action: ActionKind, args: &Value) -> Vec<ActionDetail> {
     };
     match action {
         ActionKind::StorageAdd if args.get("device").is_some_and(|device| !device.is_null()) => {
-            vec![
+            let mut rows = vec![
                 row("Disk", disk_words(args)),
                 row("Device", text(args, "device").to_string()),
                 row("On it now", text(args, "contents").to_string()),
+            ];
+            if text(args, "inUseCheck") == "system lists" {
+                rows.push(row("In-use check", SYSTEM_LISTS_SENTENCE.to_string()));
+            }
+            rows.extend([
                 row("Storage name", text(args, "name").to_string()),
                 row(
                     "Effect",
@@ -1813,7 +1939,8 @@ pub fn details(action: ActionKind, args: &Value) -> Vec<ActionDetail> {
                         text(args, "name")
                     ),
                 ),
-            ]
+            ]);
+            rows
         }
         ActionKind::StorageAdd => vec![
             row("Disk", disk_words(args)),
@@ -2033,12 +2160,17 @@ pub fn enrich(
                 "contents",
                 "mount",
                 "fsUuid",
+                "inUseCheck",
             ] {
                 object.remove(key);
             }
             let survey = storage.survey()?;
             let (view, mount) = if let Some(device) = object.get("device").and_then(Value::as_str) {
-                (find_whole_disk(&survey, device)?, None)
+                let view = find_whole_disk(&survey, device)?;
+                // How the disk was found unused is bound too, so the card can say it plainly.
+                let how = nothing_holds(storage, view)?;
+                object.insert("inUseCheck".to_string(), json!(how.as_str()));
+                (view, None)
             } else if let Some(path) = object.get("path").and_then(Value::as_str) {
                 let path = clean_folder(path).map_err(CallError::Invalid)?;
                 // The disk is decided by where the folder really is, after its links are followed.
@@ -2192,23 +2324,52 @@ fn no_unreachable_snapshot_folder(survey: &Survey) -> Result<(), StorageRefusal>
     Ok(())
 }
 
+/// How a whole disk was found unused before it is erased.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InUseCheck {
+    /// The kernel let this process open the disk and every partition exclusively.
+    ExclusiveOpen,
+    /// This process may not open the disk, so the system's own lists were read instead, and every one of them passed.
+    SystemLists,
+}
+
+impl InUseCheck {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExclusiveOpen => "exclusive open",
+            Self::SystemLists => "system lists",
+        }
+    }
+}
+
+/// The card's line for a disk checked through the system's lists.
+pub const SYSTEM_LISTS_SENTENCE: &str =
+    "In-use check through system lists (Arca can't open the disk directly).";
+
+fn disk_busy(name: &str, why: &str) -> StorageRefusal {
+    StorageRefusal::new(
+        "DiskBusy",
+        format!("{name} is in use right now ({why}); it is never erased"),
+    )
+}
+
 /// Opens the whole disk and every partition on it read-only and exclusively. The kernel refuses that while a mounted file
-/// system, a RAID, a volume group, an encrypted mapping or swap holds it, whatever `lsblk` showed. A disk that cannot be
-/// checked is not erased either.
-fn nothing_holds(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusal> {
+/// system, a RAID, a volume group, an encrypted mapping or swap holds it, whatever `lsblk` showed. When this process may not
+/// open the disk (`EACCES` or `EPERM`, and only then), the system's own lists are read instead and every one must pass; any
+/// other failure to open it means it cannot be checked, and it is not erased.
+fn nothing_holds(storage: &Storage, view: &DiskView) -> Result<InUseCheck, StorageRefusal> {
+    let mut denied = false;
     for node in view.disk.walk() {
         match storage.devices.open_exclusive(&node.path) {
             ExclusiveOpen::Free => {}
             ExclusiveOpen::Busy => {
-                return Err(StorageRefusal::new(
-                    "DiskBusy",
-                    format!(
-                        "{} is in use right now: the system holds it (a mounted file system, a RAID, a volume group or swap); it is never erased",
-                        node.name
-                    ),
+                return Err(disk_busy(
+                    &node.name,
+                    "the system holds it: a mounted file system, a RAID, a volume group or swap",
                 ));
             }
-            ExclusiveOpen::Denied(why) | ExclusiveOpen::Failed(why) => {
+            ExclusiveOpen::Denied(_) => denied = true,
+            ExclusiveOpen::Failed(why) => {
                 return Err(StorageRefusal::new(
                     "DiskUncheckable",
                     format!(
@@ -2217,6 +2378,65 @@ fn nothing_holds(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusa
                     ),
                 ));
             }
+        }
+    }
+    if !denied {
+        return Ok(InUseCheck::ExclusiveOpen);
+    }
+    listed_unused(storage, view)?;
+    Ok(InUseCheck::SystemLists)
+}
+
+/// The in-use check through the system's lists, for a disk this process may not open. Every check must pass, for the disk
+/// and every partition: no mount in `/proc/self/mountinfo` (by device number or source), no swap in `/proc/swaps`, no
+/// holders, no membership of a mounted btrfs or bcachefs, no RAID, LVM, ZFS, LUKS or swap signature, and the classifier's
+/// own rules (the file system siblings of a mount, and devices given to apps) must still find the disk free.
+fn listed_unused(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusal> {
+    if view.role != DiskRole::Free {
+        return Err(disk_busy(&view.disk.name, &view.reason));
+    }
+    let lists = storage.devices.system_lists().map_err(|why| {
+        StorageRefusal::new(
+            "DiskUncheckable",
+            format!(
+                "Arca could not check that {} is unused: {why}",
+                view.disk.name
+            ),
+        )
+    })?;
+    let links = storage.devices.links();
+    for node in view.disk.walk() {
+        let mut paths = vec![node.path.clone(), resolved_device(&node.path)];
+        paths.dedup();
+        let number = lists.numbers.get(&node.name).map(String::as_str);
+        if let Some(mount) = lists.mount_of(number, &paths) {
+            return Err(disk_busy(&node.name, &format!("it is mounted at {mount}")));
+        }
+        if lists.swap_of(&paths) {
+            return Err(disk_busy(&node.name, "it is used as swap"));
+        }
+        if let Some(holders) = links.holders.get(&node.name) {
+            return Err(disk_busy(
+                &node.name,
+                &format!("it is held by {}", holders.join(", ")),
+            ));
+        }
+        if let Some((fstype, _, _)) = links
+            .members
+            .iter()
+            .find(|(_, _, members)| members.contains(&node.name))
+        {
+            return Err(disk_busy(
+                &node.name,
+                &format!("it is part of a mounted {fstype} file system"),
+            ));
+        }
+        if let Some(fstype) = node
+            .fstype
+            .as_deref()
+            .filter(|fstype| MEMBER_FSTYPES.contains(fstype) || *fstype == "swap")
+        {
+            return Err(disk_busy(&node.name, &format!("it is a {fstype} member")));
         }
     }
     Ok(())
@@ -2396,7 +2616,9 @@ fn check(
             match &source {
                 PoolSource::Folder { path, .. } => check_pool_folder(path)?,
                 // Last, on the disk the owner approved: the kernel itself says whether anything holds it now.
-                PoolSource::Device(_) => nothing_holds(storage, view)?,
+                PoolSource::Device(_) => {
+                    nothing_holds(storage, view)?;
+                }
             }
             Ok(Target::Pool(name.to_string(), source))
         }
@@ -2705,6 +2927,38 @@ mod tests {
             DeviceLinks::default(),
             "no sysfs, no links"
         );
+    }
+
+    #[test]
+    fn the_system_lists_are_read_and_matched() {
+        assert_eq!(unescape_octal("/mnt/a\\040b\\134c"), "/mnt/a b\\c");
+        assert_eq!(unescape_octal("/x\\04"), "/x\\04", "a short escape is kept");
+        let lists = SystemLists {
+            mountinfo: "30 1 8:17 / /srv/a rw - ext4 /dev/sdb1 rw\n31 1 0:45 / /srv/b rw - btrfs /dev/sdc rw\n"
+                .to_string(),
+            swaps: "Filename Type Size Used Priority\n/dev/sdd2 partition 1 0 -2\n".to_string(),
+            numbers: Default::default(),
+        };
+        assert_eq!(
+            lists.mount_of(Some("8:17"), &[]),
+            Some("/srv/a".to_string())
+        );
+        assert_eq!(
+            lists.mount_of(None, &["/dev/sdc".to_string()]),
+            Some("/srv/b".to_string())
+        );
+        assert_eq!(
+            lists.mount_of(Some("8:32"), &["/dev/sde".to_string()]),
+            None
+        );
+        assert!(lists.swap_of(&["/dev/sdd2".to_string()]));
+        assert!(
+            !lists.swap_of(&["Filename".to_string()]),
+            "the header is not a swap"
+        );
+        // This host's own lists read.
+        let here = SystemLists::read(Path::new("/proc"), Path::new("/sys")).expect("readable");
+        assert!(here.mountinfo.contains(" / / "), "the root mount is listed");
     }
 
     #[test]

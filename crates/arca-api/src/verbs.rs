@@ -2033,6 +2033,11 @@ fn storage_add_params() -> Value {
         ),
         ("disk", false, string_max(64)),
         ("fsUuid", false, string_max(128)),
+        (
+            "inUseCheck",
+            false,
+            one_of(&["exclusive open", "system lists"]),
+        ),
         ("model", false, string_max(256)),
         ("serial", false, string_max(256)),
         ("transport", false, string_max(32)),

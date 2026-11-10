@@ -4158,6 +4158,17 @@
           }
         },
         {
+          "name": "inUseCheck",
+          "required": false,
+          "schema": {
+            "enum": [
+              "exclusive open",
+              "system lists"
+            ],
+            "type": "string"
+          }
+        },
+        {
           "name": "model",
           "required": false,
           "schema": {

@@ -13,8 +13,8 @@ use arca::action_proposal::ActionKind;
 use arca::handlers::{ActionExecutor, ActionSlot, plan_handlers_full};
 use arca::kernel::Kernel;
 use arca::storage::{
-    DeviceLinks, ERASE_SENTENCE, ExclusiveOpen, FixedBlockDevices, SnapshotListHandler, Storage,
-    StorageListHandler, snapshot_name,
+    DeviceLinks, ERASE_SENTENCE, ExclusiveOpen, FixedBlockDevices, SYSTEM_LISTS_SENTENCE,
+    SnapshotListHandler, Storage, StorageListHandler, SystemLists, snapshot_name,
 };
 use arca_incus::fake_storage::FakeStorageIncus;
 use arca_incus::snapshot::{
@@ -847,7 +847,8 @@ fn system_member_mounted_and_unlisted_disks_are_refused() {
         "storage_add",
         json!({ "name": "usb1", "device": "sdb", "disk": "sdb", "model": "Acme Portable 1T",
                 "serial": "FAKE-SDB", "transport": "usb", "size": 1000 * GB,
-                "contents": "sdb1 ext4 \"PHOTOS\" 1000.0 GB", "approval": "not-a-grant" }),
+                "contents": "sdb1 ext4 \"PHOTOS\" 1000.0 GB", "inUseCheck": "exclusive open",
+                "approval": "not-a-grant" }),
     );
     assert_eq!(refused_code(direct), "NotApproved");
     assert!(rig.incus.writes().is_empty());
@@ -1545,11 +1546,9 @@ fn the_kernel_must_let_arca_hold_the_disk_alone_before_it_is_erased() {
         vec!["/dev/sdb", "/dev/sdb1"],
         "the disk and every partition"
     );
-    // A device Arca may not open is not erased either.
-    rig.devices.set_open(
-        "/dev/sdb1",
-        ExclusiveOpen::Denied("Permission denied".into()),
-    );
+    // A device that fails to open for any reason but permission cannot be checked, and is not erased.
+    rig.devices
+        .set_open("/dev/sdb1", ExclusiveOpen::Failed("No such device".into()));
     assert_eq!(
         refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
         "DiskUncheckable"
@@ -1559,6 +1558,11 @@ fn the_kernel_must_let_arca_hold_the_disk_alone_before_it_is_erased() {
     let proposed = rig
         .propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))
         .expect("free when proposed");
+    assert_eq!(proposed["args"]["inUseCheck"], json!("exclusive open"));
+    assert!(
+        !proposed["details"].to_string().contains("In-use check"),
+        "the kernel's own answer needs no note"
+    );
     rig.devices.set_open("/dev/sdb", ExclusiveOpen::Busy);
     assert_eq!(
         refused_code(rig.approve_and_run(&key, &proposed)),
@@ -1735,4 +1739,132 @@ fn find_file(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn denied_disk(rig: &Rig) {
+    for path in ["/dev/sdb", "/dev/sdb1"] {
+        rig.devices
+            .set_open(path, ExclusiveOpen::Denied("Permission denied".into()));
+    }
+}
+
+fn lists(mountinfo: &str, swaps: &str) -> SystemLists {
+    SystemLists {
+        mountinfo: mountinfo.to_string(),
+        swaps: swaps.to_string(),
+        numbers: [
+            ("sdb".to_string(), "8:16".to_string()),
+            ("sdb1".to_string(), "8:17".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+const ROOT_MOUNT: &str = "22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n";
+const NO_SWAP: &str = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+
+#[test]
+fn a_disk_arca_may_not_open_is_checked_through_the_system_lists() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-lists", &key);
+    // The service user is not in the disk group: the exclusive open answers EACCES, so the system's lists decide.
+    denied_disk(&rig);
+    rig.devices.set_lists(Ok(lists(ROOT_MOUNT, NO_SWAP)));
+    let proposed = rig
+        .propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))
+        .expect("nothing in the lists uses sdb");
+    assert_eq!(proposed["args"]["inUseCheck"], json!("system lists"));
+    assert_eq!(
+        row(&proposed["details"], "In-use check"),
+        SYSTEM_LISTS_SENTENCE
+    );
+    assert_eq!(
+        SYSTEM_LISTS_SENTENCE,
+        "In-use check through system lists (Arca can't open the disk directly)."
+    );
+    rig.approve_and_run(&key, &proposed)
+        .expect("the approved add runs");
+    assert!(rig.incus.pool("arca-snapshots-usb1").is_some());
+
+    // Each list that shows the disk in use refuses it.
+    let cases = [
+        (
+            lists(
+                &format!("{ROOT_MOUNT}40 22 8:17 / /mnt/old\\040photos rw - ext4 /dev/sdb1 rw\n"),
+                NO_SWAP,
+            ),
+            "sdb1 is in use right now (it is mounted at /mnt/old photos)",
+        ),
+        (
+            // A btrfs mount names another device; the device number still matches.
+            lists(
+                &format!("{ROOT_MOUNT}41 22 8:17 / /data rw - btrfs /dev/mapper/other rw\n"),
+                NO_SWAP,
+            ),
+            "it is mounted at /data",
+        ),
+        (
+            lists(
+                ROOT_MOUNT,
+                &format!(
+                    "{NO_SWAP}/dev/sdb1                               partition\t8388604\t\t0\t\t-2\n"
+                ),
+            ),
+            "it is used as swap",
+        ),
+    ];
+    for (found, why) in cases {
+        let rig = Rig::new("storage-lists-busy", &key);
+        denied_disk(&rig);
+        rig.devices.set_lists(Ok(found));
+        match rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" })) {
+            Err(CallError::Refused { code, message }) => {
+                assert_eq!(code, "DiskBusy");
+                assert!(message.contains(why), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(rig.incus.writes().is_empty());
+    }
+
+    // Holders and multi-device membership are in the lists too; the classifier already takes such a disk.
+    let rig = Rig::new("storage-lists-held", &key);
+    denied_disk(&rig);
+    rig.devices.set_lists(Ok(lists(ROOT_MOUNT, NO_SWAP)));
+    rig.devices.set_links(DeviceLinks {
+        members: vec![("btrfs".into(), "uuid-x".into(), vec!["sdb1".into()])],
+        ..DeviceLinks::default()
+    });
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
+        "SystemDisk"
+    );
+
+    // Lists that cannot be read are no check.
+    let rig = Rig::new("storage-lists-unreadable", &key);
+    denied_disk(&rig);
+    rig.devices
+        .set_lists(Err("the mount list could not be read: denied".into()));
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
+        "DiskUncheckable"
+    );
+
+    // Checked again through the lists when the approved add runs.
+    let rig = Rig::new("storage-lists-run", &key);
+    denied_disk(&rig);
+    rig.devices.set_lists(Ok(lists(ROOT_MOUNT, NO_SWAP)));
+    let proposed = rig
+        .propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))
+        .expect("free when proposed");
+    rig.devices.set_lists(Ok(lists(
+        &format!("{ROOT_MOUNT}42 22 8:17 / /media/owner/PHOTOS rw - ext4 /dev/sdb1 rw\n"),
+        NO_SWAP,
+    )));
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &proposed)),
+        "DiskBusy"
+    );
+    assert!(rig.incus.writes().is_empty(), "nothing was wiped");
 }

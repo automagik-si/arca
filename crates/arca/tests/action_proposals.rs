@@ -293,7 +293,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::StorageAdd => json!({
                 "name": "usb1", "device": "sdb", "disk": "sdb", "model": "Acme Portable 1T",
                 "serial": "FAKE-SDB", "transport": "usb", "size": 1_000_000_000_000u64,
-                "contents": "sdb1 ext4 \"PHOTOS\" 1000.0 GB",
+                "contents": "sdb1 ext4 \"PHOTOS\" 1000.0 GB", "inUseCheck": "system lists",
             }),
             ActionKind::SnapshotCreate => json!({
                 "project": "shop", "instance": "web", "pool": "usb1", "kind": "container",
@@ -342,6 +342,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     "USB",
                     "PHOTOS",
                     "Everything on this disk will be erased.",
+                    "In-use check through system lists (Arca can't open the disk directly).",
                 ],
                 ActionKind::SnapshotCreate => &[
                     "shop",

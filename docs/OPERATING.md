@@ -527,9 +527,15 @@ anything that changed (`DiskChanged`), so a different disk plugged in under the 
 Before a whole disk is erased, when the proposal is made and again when it runs, the kernel opens the disk and every
 partition on it read-only with `O_EXCL` and closes them at once. The kernel refuses that while a mounted file system (in any
 mount namespace), a RAID, a volume group, an encrypted mapping or swap holds the device, whatever `lsblk` showed: that is
-`DiskBusy`. A disk the kernel process may not open is `DiskUncheckable`, since it cannot be checked: the process needs read
-access to the disk device (on most hosts, membership of the `disk` group) for whole-disk storage. Folder targets are not
-opened. While any folder snapshot pool cannot be reached (its folder is missing or its recorded file system is not mounted),
+`DiskBusy`. When the open is refused for permission (`EACCES` or `EPERM`, as for a service user outside the `disk` group),
+and only then, the kernel checks through the system's own lists instead, and every check must pass for the disk and each
+partition: no mount in `/proc/self/mountinfo` (by device number or by source), no active swap in `/proc/swaps`, no holders,
+no membership of a mounted btrfs or bcachefs (`/sys/fs/btrfs`, `/sys/fs/bcachefs`), no RAID, LVM, ZFS, LUKS or swap
+signature, and the classifier's own rules (the file system siblings of a mount, devices given to apps) still find the disk
+`free`. A disk in use by any of them is `DiskBusy`; lists that cannot be read are `DiskUncheckable`. Which check was used
+is bound into the arguments (`inUseCheck`: `exclusive open` or `system lists`), and a card checked through the lists says
+**"In-use check through system lists (Arca can't open the disk directly)."** Any other failure to open the disk (it is
+gone, or is not a block device) is `DiskUncheckable`. Folder targets are not opened. While any folder snapshot pool cannot be reached (its folder is missing or its recorded file system is not mounted),
 every whole-disk erase is refused (`SnapshotStorageUnreachable`: "plug it in or remove it first"), since the disk about to
 be erased could be that one.
 
