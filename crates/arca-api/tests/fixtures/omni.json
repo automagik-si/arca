@@ -1,0 +1,220 @@
+[
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "channel": {
+          "enum": [
+            "whatsapp-baileys",
+            "telegram"
+          ],
+          "type": "string"
+        },
+        "instance": {
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "instance",
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "omni_instance_create",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "channel": {
+          "maxLength": 32,
+          "type": "string"
+        },
+        "id": {
+          "maxLength": 36,
+          "type": "string"
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "name": {
+          "maxLength": 64,
+          "type": "string"
+        }
+      },
+      "required": [
+        "channel",
+        "id",
+        "isActive",
+        "name"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "maxLength": 63,
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "omni_pair",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "maxLength": 16,
+          "type": "string"
+        },
+        "expiresIn": {
+          "maximum": 3600,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "instance": {
+          "maxLength": 36,
+          "type": "string"
+        },
+        "phoneNumber": {
+          "maxLength": 20,
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "expiresIn",
+        "instance",
+        "phoneNumber"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "maxLength": 63,
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "name": "omni_status",
+    "outputSchema": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "instance": {
+              "maxLength": 36,
+              "type": "string"
+            },
+            "isConnected": {
+              "type": "boolean"
+            },
+            "message": {
+              "anyOf": [
+                {
+                  "maxLength": 300,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "profileName": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state": {
+              "maxLength": 32,
+              "type": "string"
+            }
+          },
+          "required": [
+            "instance",
+            "isConnected",
+            "message",
+            "profileName",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "instances": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "channel": {
+                    "maxLength": 32,
+                    "type": "string"
+                  },
+                  "id": {
+                    "maxLength": 36,
+                    "type": "string"
+                  },
+                  "isActive": {
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "maxLength": 64,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "channel",
+                  "id",
+                  "isActive",
+                  "name"
+                ],
+                "type": "object"
+              },
+              "maxItems": 100,
+              "type": "array"
+            }
+          },
+          "required": [
+            "instances"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  }
+]

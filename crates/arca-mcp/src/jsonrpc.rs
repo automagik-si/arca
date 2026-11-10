@@ -193,6 +193,12 @@ async fn call_tool(
             &message,
             Some(json!({ "refusal": code })),
         ))),
+        Err(CallError::UntrustedRefused { code, message }) => Ok(Some(error_reply(
+            id,
+            REFUSED,
+            &message,
+            Some(json!({ "refusal": code, "untrusted": true })),
+        ))),
         Err(CallError::Internal(_)) => Ok(Some(result_reply(
             id,
             tool_failure("internal", "the tool failed"),

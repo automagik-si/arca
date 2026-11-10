@@ -2307,6 +2307,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
     );
 }
 
+#[path = "services/omni.rs"]
+mod omni;
 #[path = "services/wiring.rs"]
 mod wiring;
 

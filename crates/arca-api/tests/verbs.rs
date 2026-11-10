@@ -60,6 +60,9 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "service_secret_set",
             "service_publish",
             "service_unpublish",
+            "omni_instance_create",
+            "omni_pair",
+            "omni_status",
             "gpu_attach",
             "gpu_detach",
             "storage_list",
@@ -1073,5 +1076,58 @@ fn service_wiring_schemas_equal_the_frozen_contract() {
         let v = verb(row["name"].as_str().unwrap()).unwrap();
         assert_eq!((v.params)(), row["inputSchema"]);
         assert_eq!((v.result)(), row["outputSchema"]);
+    }
+}
+
+/// A schema as the parity check compares it: annotations dropped, an open `additionalProperties` dropped, and `required`
+/// sorted, since its order never changes a schema.
+fn parity_shape(schema: &Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, sub) in map {
+                if ["description", "title", "examples"].contains(&key.as_str())
+                    || (key == "additionalProperties" && sub == &Value::Bool(true))
+                {
+                    continue;
+                }
+                let mut sub = parity_shape(sub);
+                if key == "required"
+                    && let Some(list) = sub.as_array_mut()
+                {
+                    list.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+                }
+                out.insert(key.clone(), sub);
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(parity_shape).collect()),
+        other => other.clone(),
+    }
+}
+
+#[test]
+fn omni_schemas_equal_the_golden_and_every_omni_verb_is_untrusted() {
+    let rows: Value = serde_json::from_str(include_str!("fixtures/omni.json")).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let v = verb(row["name"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            parity_shape(&(v.params)()),
+            parity_shape(&row["inputSchema"]),
+            "{}",
+            v.name
+        );
+        assert_eq!(
+            parity_shape(&(v.result)()),
+            parity_shape(&row["outputSchema"]),
+            "{}",
+            v.name
+        );
+        assert!(v.untrusted, "{} is untrusted", v.name);
+        assert!(!v.destructive, "{}", v.name);
+        assert_eq!(v.min_scope, Scope::Doctor, "{}", v.name);
+        assert_eq!(v.read_only_hint(), v.name == "omni_status", "{}", v.name);
     }
 }

@@ -1088,7 +1088,7 @@ async fn decline(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
 
 fn call_error_response(error: CallError) -> Response {
     match error {
-        CallError::Refused { code, message } => (
+        CallError::Refused { code, message } | CallError::UntrustedRefused { code, message } => (
             StatusCode::FORBIDDEN,
             Json(json!({ "refusal": code, "message": message })),
         )
