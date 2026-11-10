@@ -108,8 +108,9 @@ pub fn watch_kernel_handler(cfg: &NodeConfig, kernel: Arc<Mutex<Kernel>>) -> Wat
     })
 }
 
-/// Refuses a start whose mode and desired state disagree, and a bridged start that names a bridge this host does not
-/// have. The desired document is read under the state directory's lock, which is released before the kernel takes it.
+/// Refuses a start whose config would leave a half-state under the desired state (a network dropped from under what
+/// lives on it), and a start that names a host bridge this host does not have. A node that holds containers and virtual
+/// machines together starts. The desired document is read under the state directory's lock, which is released before the kernel takes it.
 pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> {
     if let Some(bridged) = &cfg.kernel.bridged {
         let missing = crate::handlers::missing_bridges(bridged, sys);

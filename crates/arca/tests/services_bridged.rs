@@ -166,6 +166,27 @@ impl Rig {
         (cfg, handlers)
     }
 
+    /// A write made by hand on the host, outside Arca.
+    fn edit(&self, method: &str, path: &str, body: Value) {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(self.fake.socket()).expect("the fake");
+        let body = body.to_string();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("the request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("the answer");
+        assert!(
+            response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 202"),
+            "an edit by hand failed: {}",
+            response.lines().next().unwrap_or("")
+        );
+    }
+
     fn entries(&self) -> Vec<arca_kernel::desired::Entry> {
         self.kernel.lock().expect("kernel").entries().to_vec()
     }
@@ -322,9 +343,10 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
         instance["devices"],
         json!({
             "root": { "type": "disk", "path": "/", "pool": "vmpool", "size": "20GiB" },
-            "eth0": { "type": "nic", "nictype": "bridged", "parent": "br1", "hwaddr": "02:aa:bb:00:00:01" }
+            "eth0": { "type": "nic", "name": "enp5s0", "nictype": "bridged", "parent": "br1", "hwaddr": "02:aa:bb:00:00:01" },
+            "agent": { "type": "disk", "source": "agent:config" }
         }),
-        "one root disk on the configured pool and one NIC on the host bridge: no network, address, ACL or filter key"
+        "one root disk on the configured pool, one NIC on the host bridge and the agent's config drive: no network, address, ACL or filter key"
     );
     let config = instance["config"].as_object().expect("config");
     assert_eq!(config["limits.cpu"], "2");
@@ -337,6 +359,7 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     assert_eq!(
         keys,
         [
+            "agent.nic_config",
             "boot.autostart",
             "limits.cpu",
             "limits.memory",
@@ -425,7 +448,7 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
         .expect("second instance");
     assert_eq!(
         second["devices"]["eth0"],
-        json!({ "type": "nic", "nictype": "bridged", "parent": "br0" }),
+        json!({ "type": "nic", "name": "enp5s0", "nictype": "bridged", "parent": "br0" }),
         "without a mac, Incus picks one"
     );
     assert_eq!(rig.fake.writes().len(), 3);
@@ -573,7 +596,7 @@ fn a_vm_template_is_refused_on_a_node_that_is_not_bridged_and_a_container_takes_
             "service_create",
             json!({"name":"ws1","template":"ws","bridge":"br0"})
         )),
-        "template ws is a virtual machine, and this node is not a bridged node (kernel.bridged is not set)"
+        "template ws is a virtual machine, and this node sets no virtual-machine caps (kernel.vmLimits, or kernel.bridged with its limits)"
     );
     for extra in [json!({"bridge":"br0"}), json!({"mac":"02:aa:bb:00:00:01"})] {
         let mut args = json!({"name":"nats","template":"nats"});
@@ -725,7 +748,7 @@ fn a_vm_create_is_proposed_approved_by_the_owner_and_run_by_the_same_handler() {
     assert_eq!(instance["type"], "virtual-machine");
     assert_eq!(
         instance["devices"]["eth0"],
-        json!({ "type": "nic", "nictype": "bridged", "parent": "br1", "hwaddr": "02:aa:bb:00:00:01" })
+        json!({ "type": "nic", "name": "enp5s0", "nictype": "bridged", "parent": "br1", "hwaddr": "02:aa:bb:00:00:01" })
     );
 }
 
@@ -772,12 +795,17 @@ fn a_vm_template_needs_both_limits_and_a_root_size_and_nothing_of_the_service_ne
         (without("rootSize"), "needs a rootSize"),
         (with("rootSize", json!("20")), "needs a rootSize"),
         (with("rootSize", json!("0GiB")), "needs a rootSize"),
-        (with("ports", json!([22])), "it has no ports"),
-        (with("lan", json!({"port": 22})), "it has no ports"),
-        (with("publishable", json!(true)), "it has no ports"),
-        (with("env", json!({"A":"b"})), "it has no ports"),
-        (with("secrets", json!(["TOKEN"])), "it has no ports"),
-        (with("data", json!({"path":"/data"})), "it has no ports"),
+        (with("ports", json!([22, 22])), "ports are distinct"),
+        (with("ports", json!([0])), "ports are distinct"),
+        (
+            with("provides", json!({"env":{"URL":"x"}})),
+            "provides needs a port",
+        ),
+        (with("lan", json!({"port": 22})), "has no env, secrets"),
+        (with("publishable", json!(true)), "has no env, secrets"),
+        (with("env", json!({"A":"b"})), "has no env, secrets"),
+        (with("secrets", json!(["TOKEN"])), "has no env, secrets"),
+        (with("data", json!({"path":"/data"})), "has no env, secrets"),
         (
             with("image", json!("docker.io/library/debian")),
             "invalid system image",
@@ -961,12 +989,10 @@ fn a_bridged_node_switched_to_managed_is_refused_at_start() {
     assert_eq!(arca::handlers::mode_refusal(&rig.cfg, &entries), None);
     let (cfg, _) = rig.switched(managed_kernel());
     let why = arca::handlers::mode_refusal(&cfg, &entries).expect("serve refuses to start");
-    assert!(
-        why.starts_with("kernel.bridged is not set, but this node already holds ")
-            && why.ends_with(
-                "from bridged mode. Put kernel.bridged back, or remove its virtual machines first"
-            ),
-        "{why}"
+    // Removing the machine would not help: the project stays a bridged-only one. The advice is one that can be followed.
+    assert_eq!(
+        why,
+        "kernel.bridged is not set, but this node already holds service-ws1 from bridged mode, in a service project created in bridged mode. Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one"
     );
     // The project entry alone, with every machine removed, still marks the node as bridged.
     let project_only: Vec<_> = entries
@@ -974,7 +1000,13 @@ fn a_bridged_node_switched_to_managed_is_refused_at_start() {
         .filter(|entry| entry.id.0 == BRIDGED_ENTRY)
         .cloned()
         .collect();
-    assert!(arca::handlers::mode_refusal(&cfg, &project_only).is_some());
+    // No machine is left to remove, so the advice names what can be done: the node becomes mixed, never managed-only.
+    assert_eq!(
+        arca::handlers::mode_refusal(&cfg, &project_only).as_deref(),
+        Some(
+            "kernel.bridged is not set, but this node's service project was created in bridged mode (bridged-arcak-svc). Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one"
+        )
+    );
     assert_eq!(arca::handlers::mode_refusal(&cfg, &[]), None);
 }
 
@@ -1068,7 +1100,7 @@ fn a_proposal_this_node_is_sure_to_refuse_is_refused_when_proposed_and_an_omitte
     let managed = Rig::managed();
     assert_eq!(
         refusal(propose(&managed, json!({"name":"ws1","template":"ws"}))),
-        "template ws is a virtual machine, and this node is not a bridged node (kernel.bridged is not set)"
+        "template ws is a virtual machine, and this node sets no virtual-machine caps (kernel.vmLimits, or kernel.bridged with its limits)"
     );
     let container = propose(&managed, json!({"name":"nats","template":"nats"}))
         .expect("a container proposal is as before");
@@ -1078,3 +1110,6 @@ fn a_proposal_this_node_is_sure_to_refuse_is_refused_when_proposed_and_an_omitte
     );
     assert!(rig.fake.writes().is_empty() && managed.fake.writes().is_empty());
 }
+
+#[path = "services/mixed.rs"]
+mod mixed;

@@ -372,7 +372,8 @@ impl ActionKind {
                 .to_string()
         };
         match self {
-            // Only a virtual machine on a bridged node names a bridge; a proposal made on one always does.
+            // Only a virtual machine on a host bridge names a bridge, and a proposal for one always does: a bridge left out
+            // on a bridged node is filled in when the proposal is made.
             Self::ServiceCreate if args.get("bridge").is_some() => format!(
                 "Create the virtual machine {} from template {} on the host bridge {}",
                 text("name"),
@@ -538,7 +539,13 @@ struct ActionEvent {
     ok: Option<bool>,
     #[serde(default)]
     code: Option<String>,
+    /// Why an approved action did not run, in the words its caller was given. Absent on every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
 }
+
+/// The longest refusal message a result event keeps, in characters.
+const RESULT_MESSAGE_MAX: usize = 1024;
 
 /// The waiting proposals and the journal they are written to.
 pub struct ActionProposalStore {
@@ -630,6 +637,7 @@ impl ActionProposalStore {
             id: None,
             ok: None,
             code: None,
+            message: None,
         })
         .map_err(ProposeError::Store)?;
         self.waiting.push(proposal.clone());
@@ -657,20 +665,28 @@ impl ActionProposalStore {
             id: Some(id.to_string()),
             ok: None,
             code: None,
+            message: None,
         })?;
         let retired = self.waiting.remove(index);
         self.compact_if_large();
         Ok(Some(retired))
     }
 
-    /// Journals the result of one approved action: whether it ran, and the refusal code when it did not.
-    pub fn journal_result(&mut self, id: &str, ok: bool, code: Option<&str>) -> io::Result<()> {
+    /// Journals the result of one approved action: whether it ran, and the refusal code and message when it did not.
+    pub fn journal_result(
+        &mut self,
+        id: &str,
+        ok: bool,
+        code: Option<&str>,
+        message: Option<&str>,
+    ) -> io::Result<()> {
         self.append(ActionEvent {
             event: "result".to_string(),
             proposal: None,
             id: Some(id.to_string()),
             ok: Some(ok),
             code: code.map(str::to_string),
+            message: message.map(|message| message.chars().take(RESULT_MESSAGE_MAX).collect()),
         })?;
         self.compact_if_large();
         Ok(())
@@ -770,6 +786,7 @@ impl ActionProposalStore {
                     id: None,
                     ok: None,
                     code: None,
+                    message: None,
                 })
                 .map_err(io::Error::other)?;
                 bytes.push(b'\n');

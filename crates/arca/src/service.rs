@@ -1,6 +1,6 @@
-//! Services: one template-derived container in the service project, with its own NIC ACL. On a bridged node a service
-//! is one template-derived virtual machine in the same project, with a NIC on a host bridge that already exists; it
-//! has no ACL, no fixed address and no Incus-managed network.
+//! Services: one template-derived container in the service project, with its own NIC ACL. A virtual-machine service is
+//! in the same project. On the managed service network it has an address of the same plan and its own NIC ACL, like a
+//! container. On a host bridge that already exists it has no ACL, no fixed address and no Incus-managed network.
 //!
 //! The desired-state entry is the record. Its config names the template, address, ports, links and publication; the
 //! live state comes from Incus on every read. Secret values stay in files and enter the Incus config only as references.
@@ -87,6 +87,10 @@ pub struct Lan {
     pub port: u16,
 }
 
+/// The name every virtual machine's NIC is given inside the guest: the one interface the public images configure. The
+/// agent renames the NIC to it, whatever PCI slot the host's QEMU gave it.
+pub const VM_NIC_NAME: &str = "enp5s0";
+
 /// What only a virtual-machine service records: its root disk size and the fixed MAC the request gave, if any.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -143,7 +147,7 @@ pub struct ServiceConfig {
     /// A record whose create has not settled, shown as `creating` after a restart.
     #[serde(default)]
     pub creating: bool,
-    /// Present on a virtual machine on a host bridge. A container's record never carries the key.
+    /// Present on a virtual machine. A container's record never carries the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<Vm>,
 }
@@ -151,6 +155,12 @@ pub struct ServiceConfig {
 impl ServiceConfig {
     pub fn acl(&self) -> String {
         acl_name(&self.project, &self.name)
+    }
+
+    /// Whether this is a virtual machine on a host bridge: one with no address, ACL or link. A virtual machine on the
+    /// managed service network names the service bridge, as a container does.
+    pub fn on_host_bridge(&self) -> bool {
+        self.vm.is_some() && self.bridge != BRIDGE
     }
 }
 
@@ -205,11 +215,9 @@ pub fn normalize_mac(text: &str) -> Option<String> {
     (first & 1 == 0 && mac != "00:00:00:00:00:00").then_some(mac)
 }
 
-/// The create body of a virtual-machine service: its own root disk on the configured pool and one NIC on the host
-/// bridge. It names no profile, no Incus network, no address and no ACL or filter, so Incus adds no firewall rule for it.
-/// Its only `user.arca.*` key is the template: the kernel's ownership rule admits no new one, and the bridge is the NIC's
-/// `parent`.
-fn vm_body(cfg: &ServiceConfig, vm: &Vm) -> Value {
+/// The config keys every virtual machine carries: its template, both limits, autostart, and the switch that has the
+/// agent rename the NIC to its device's `name`.
+fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
     let mut config = Map::new();
     config.insert(TEMPLATE_KEY.to_string(), json!(cfg.template));
     if let Some(limits) = &cfg.limits {
@@ -223,8 +231,29 @@ fn vm_body(cfg: &ServiceConfig, vm: &Vm) -> Value {
     if cfg.autostart {
         config.insert("boot.autostart".into(), json!("true"));
     }
-    let mut nic = Map::new();
+    config.insert("agent.nic_config".into(), json!("true"));
+    config
+}
+
+/// The devices every virtual machine carries: its own root disk on the node's pool, the NIC as `eth0`, and the agent's
+/// config share as a drive. Incus 7.6 offers that share over 9p only, which a QEMU built without virtio-9p cannot give the
+/// guest, so without the drive the agent never starts. The NIC is named for the guest: the public images configure
+/// `enp5s0` alone, and the slot name the guest's kernel picks depends on the devices of the host's QEMU.
+fn vm_devices(cfg: &ServiceConfig, vm: &Vm, mut nic: Map<String, Value>) -> Value {
     nic.insert("type".into(), json!("nic"));
+    nic.insert("name".into(), json!(VM_NIC_NAME));
+    json!({
+        "root": { "type": "disk", "path": "/", "pool": cfg.pool, "size": vm.root_size },
+        "eth0": nic,
+        "agent": { "type": "disk", "source": "agent:config" }
+    })
+}
+
+/// The create body of a virtual machine on a host bridge. It names no profile, no Incus network, no address and no ACL
+/// or filter, so Incus adds no firewall rule for it. Its only `user.arca.*` key is the template: the kernel's ownership
+/// rule admits no new one, and the bridge is the NIC's `parent`.
+fn vm_body(cfg: &ServiceConfig, vm: &Vm) -> Value {
+    let mut nic = Map::new();
     nic.insert("nictype".into(), json!("bridged"));
     nic.insert("parent".into(), json!(cfg.bridge));
     if let Some(mac) = &vm.mac {
@@ -235,16 +264,66 @@ fn vm_body(cfg: &ServiceConfig, vm: &Vm) -> Value {
         "type": VM_KIND,
         "source": cfg.source,
         "profiles": [],
-        "config": config,
-        "devices": {
-            "root": { "type": "disk", "path": "/", "pool": cfg.pool, "size": vm.root_size },
-            "eth0": nic
-        },
+        "config": vm_config(cfg),
+        "devices": vm_devices(cfg, vm, nic),
         "start": cfg.start
     })
 }
 
-/// A virtual-machine service: the instance alone. Nothing on it is changed after its create.
+/// The create body of a virtual machine on the managed service network: the address, filters and ACL of a container's
+/// NIC, and no profile, since the service profile holds container keys.
+fn managed_vm_body(cfg: &ServiceConfig, vm: &Vm, links: &[String]) -> Value {
+    let mut config = vm_config(cfg);
+    config.insert(ADDRESS_KEY.to_string(), json!(cfg.ipv4));
+    if !cfg.ports.is_empty() {
+        let ports = cfg
+            .ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        config.insert(PORTS_KEY.to_string(), json!(ports));
+    }
+    if !links.is_empty() {
+        config.insert(LINKS_KEY.to_string(), json!(links.join(",")));
+    }
+    let nic = json!({
+        "network": cfg.bridge,
+        "ipv4.address": cfg.ipv4,
+        "security.port_isolation": "false",
+        "security.mac_filtering": "true",
+        "security.ipv4_filtering": "true",
+        "security.acls": cfg.acl(),
+        "security.acls.default.ingress.action": "reject",
+        "security.acls.default.egress.action": "reject"
+    });
+    json!({
+        "name": cfg.name,
+        "type": VM_KIND,
+        "source": cfg.source,
+        "profiles": [],
+        "config": config,
+        "devices": vm_devices(cfg, vm, nic.as_object().cloned().unwrap_or_default()),
+        "start": cfg.start
+    })
+}
+
+/// Whether a virtual machine's record holds what its create needs: a pool, both limits, a root disk size, and a MAC in
+/// the recorded form when it has one.
+fn vm_record_ok(cfg: &ServiceConfig, vm: &Vm) -> bool {
+    !cfg.pool.is_empty()
+        && cfg.limits.as_ref().is_some_and(|limits| {
+            limits.cpu.as_deref().is_some_and(decimal)
+                && limits.memory.as_deref().is_some_and(size_ok)
+        })
+        && size_ok(&vm.root_size)
+        && vm
+            .mac
+            .as_deref()
+            .is_none_or(|mac| normalize_mac(mac).as_deref() == Some(mac))
+}
+
+/// A virtual machine on a host bridge: the instance alone. Nothing on it is changed after its create.
 fn apply_vm(ctx: &mut Ctx<'_>, cfg: &ServiceConfig, vm: &Vm) -> Result<(), PluginError> {
     if cfg.project != PROJECT || !host_bridge_ok(&cfg.bridge) || cfg.bridge == BRIDGE {
         return Err(PluginError::Config(
@@ -254,17 +333,7 @@ fn apply_vm(ctx: &mut Ctx<'_>, cfg: &ServiceConfig, vm: &Vm) -> Result<(), Plugi
     if !service_name_ok(&cfg.name) || ctx.entry().0 != format!("service-{}", cfg.name) {
         return Err(PluginError::Config("invalid service name".into()));
     }
-    let limits_ok = cfg.limits.as_ref().is_some_and(|limits| {
-        limits.cpu.as_deref().is_some_and(decimal) && limits.memory.as_deref().is_some_and(size_ok)
-    });
-    if cfg.pool.is_empty()
-        || !limits_ok
-        || !size_ok(&vm.root_size)
-        || vm
-            .mac
-            .as_deref()
-            .is_some_and(|mac| normalize_mac(mac).as_deref() != Some(mac))
-    {
+    if !vm_record_ok(cfg, vm) {
         return Err(PluginError::Config(
             "invalid virtual machine pool, limits, disk size or MAC".into(),
         ));
@@ -383,6 +452,9 @@ pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
 }
 
 fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
+    if let Some(vm) = &cfg.vm {
+        return managed_vm_body(cfg, vm, links);
+    }
     let mut config = Map::new();
     config.insert(TEMPLATE_KEY.to_string(), json!(cfg.template));
     config.insert(ADDRESS_KEY.to_string(), json!(cfg.ipv4));
@@ -487,8 +559,19 @@ impl Plugin for Service {
         if cfg.adopted {
             return Ok(());
         }
-        if let Some(vm) = &cfg.vm {
+        if let Some(vm) = &cfg.vm
+            && cfg.on_host_bridge()
+        {
             return apply_vm(ctx, cfg, vm);
+        }
+        // From here the service is on the managed network: a container, or a virtual machine with the same address plan
+        // and NIC ACL.
+        if let Some(vm) = &cfg.vm
+            && (!vm_record_ok(cfg, vm) || vm.mac.is_some() || cfg.data.is_some())
+        {
+            return Err(PluginError::Config(
+                "invalid virtual machine pool, limits or disk size".into(),
+            ));
         }
         if cfg.project != PROJECT || cfg.bridge != BRIDGE {
             return Err(PluginError::Config(
@@ -614,8 +697,14 @@ impl Plugin for Service {
             ctx,
             format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
         )?;
+        let kind = if cfg.vm.is_some() {
+            VM_KIND
+        } else {
+            "container"
+        };
         if let Some(instance) = &instance
-            && (instance["config"][TEMPLATE_KEY].as_str() != Some(cfg.template.as_str())
+            && (instance["type"].as_str().is_some_and(|found| found != kind)
+                || instance["config"][TEMPLATE_KEY].as_str() != Some(cfg.template.as_str())
                 || instance["config"][ADDRESS_KEY].as_str() != Some(cfg.ipv4.as_str())
                 || instance["devices"]["eth0"]["ipv4.address"].as_str() != Some(cfg.ipv4.as_str())
                 || instance["devices"]["eth0"]["security.acls"].as_str() != Some(acl.as_str()))
@@ -929,9 +1018,10 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     Ok(())
 }
 
-/// A virtual-machine template: a system image, both limits, a root disk size, and nothing that needs the service
-/// network. Ports, links, a lan proxy, a tailnet dash, environment and secrets all depend on the managed bridge, its ACL
-/// or a container's environment, and a bridged virtual machine has none of them.
+/// A virtual-machine template: a system image, both limits and a root disk size. It may declare `ports` and `provides`,
+/// which a link from a container opens in the NIC ACL of the managed service network; a create on a host bridge refuses
+/// such a template. A lan proxy, a tailnet dash, environment and secrets depend on a container's devices, image or
+/// environment, and no virtual machine has them.
 fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     let name = &template.name;
     let refused = |why: &str| Err(TemplateError::refused(format!("template {name}: {why}")));
@@ -943,11 +1033,23 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     if !template.root_size.as_deref().is_some_and(size_ok) {
         return refused("a virtual machine needs a rootSize such as 20GiB");
     }
-    if !template.ports.is_empty()
-        || !template.env.is_empty()
+    if template.ports.len() > 16 {
+        return refused("at most 16 ports");
+    }
+    let mut seen = BTreeSet::new();
+    if !template
+        .ports
+        .iter()
+        .all(|port| *port != 0 && seen.insert(*port))
+    {
+        return refused("ports are distinct and 1..65535");
+    }
+    if template.provides.is_some() && template.ports.is_empty() {
+        return refused("provides needs a port to offer");
+    }
+    if !template.env.is_empty()
         || !template.secrets.is_empty()
         || !template.generate.is_empty()
-        || template.provides.is_some()
         || template.entrypoint.is_some()
         || template.publishable
         || template.dash_port.is_some()
@@ -956,7 +1058,7 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         || template.lan.is_some()
     {
         return refused(
-            "a virtual machine is on a host bridge Arca does not manage, so it has no ports, env, secrets, generate, provides, entrypoint, publishable, dashPort, droiddPort, data or lan",
+            "a virtual machine has no env, secrets, generate, entrypoint, publishable, dashPort, droiddPort, data or lan: they need a container's environment, image or devices",
         );
     }
     if let Some(description) = &template.description

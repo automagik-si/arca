@@ -4133,12 +4133,6 @@ fn the_host_bridge_nic_allowance_is_scoped_to_the_bridged_project_entry_and_to_a
             "restricted.devices.disk",
             "allow",
         ),
-        (
-            "bridged-arcak-svc",
-            "arcak-svc",
-            "restricted.devices.proxy",
-            "allow",
-        ),
         ("bridged-arcak-svc", "arcak-svc", "restricted", "false"),
     ] {
         assert!(
@@ -4175,6 +4169,85 @@ fn the_host_bridge_nic_allowance_is_scoped_to_the_bridged_project_entry_and_to_a
             "{value:?}"
         );
     }
+}
+
+/// Rule 55: whichever entry made the service project widens it when the node gains the other network, and nothing else
+/// passes the guard.
+#[test]
+fn the_service_project_owners_may_widen_it_and_no_other_entry_or_key_may() {
+    let (scratch, fake) = start("service-project-widening");
+    let mut family = family();
+    family.projects.push("arcak-svc".into());
+    let mut provider = IncusProvider::new(
+        fake.socket().into(),
+        family,
+        secrets_dir(&scratch),
+        RetainedSet::empty(),
+    )
+    .unwrap();
+    let widen = |keys: &[(&str, Option<&str>)]| {
+        patch(
+            object(IncusKind::Project, "arcak-svc", None, "arcak-svc"),
+            keys,
+        )
+    };
+    for (owner, key, value) in [
+        ("toy", "restricted.devices.nic", Some("allow")),
+        ("toy", "restricted.networks.access", None),
+        ("toy", "restricted.devices.proxy", Some("allow")),
+        // The bridged entry sets the NIC allowance at its create only, and has no grant to drop.
+        ("bridged-arcak-svc", "restricted.devices.nic", Some("allow")),
+        ("bridged-arcak-svc", "restricted.networks.access", None),
+        ("net-arcak-svc", "restricted.devices.nic", Some("managed")),
+        ("net-arcak-svc", "restricted.devices.nic", None),
+        ("net-arcak-svc", "restricted.networks.access", Some("br0")),
+        ("net-arcak-svc", "restricted.networks.access", Some("")),
+        ("net-arcak-svc", "restricted.devices.disk", Some("allow")),
+        ("net-arcak-svc", "restricted", None),
+    ] {
+        assert!(
+            matches!(
+                provider.plan(&entry(owner), &widen(&[(key, value)])),
+                Err(EffectRefusal::Provider(_))
+            ),
+            "{owner}: {key}={value:?}"
+        );
+    }
+    assert!(fake.requests().is_empty(), "refused before any request");
+
+    // The bridged entry's project gains the managed network: the container cap and the aggregate caps go, proxies come.
+    let owner = entry("bridged-arcak-svc");
+    let op = create(
+        IncusKind::Project,
+        "arcak-svc",
+        None,
+        "arcak-svc",
+        json!({"config":{"restricted.devices.nic":"allow","limits.containers":"0","limits.cpu":"8"}}),
+    );
+    let plan = provider.plan(&owner, &op).expect("the create is planned");
+    provider.effect(&owner, &op, &plan).expect("created");
+    let op = widen(&[
+        ("limits.containers", None),
+        ("limits.cpu", None),
+        ("restricted.devices.proxy", Some("allow")),
+    ]);
+    let plan = provider.plan(&owner, &op).expect("the widening is planned");
+    provider.effect(&owner, &op, &plan).expect("widened");
+    let read = arca_incus::UnixIncus::new(fake.socket().into());
+    let made = read
+        .get("/1.0/projects/arcak-svc?project=arcak-svc")
+        .expect("the project");
+    assert_eq!(made["config"]["restricted"], "true");
+    assert_eq!(made["config"]["restricted.devices.nic"], "allow");
+    assert_eq!(made["config"]["restricted.devices.proxy"], "allow");
+    assert!(made["config"].get("limits.containers").is_none());
+    assert!(made["config"].get("limits.cpu").is_none());
+    assert!(
+        fake.requests().iter().all(
+            |request| !(request.method == "PATCH" && request.path.starts_with("/1.0/projects"))
+        ),
+        "a project is written with a PUT (Rule 43)"
+    );
 }
 
 #[test]

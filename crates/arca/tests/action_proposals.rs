@@ -789,7 +789,7 @@ fn a_valid_owner_approval_runs_once_and_a_replay_does_not_run_again() {
     rig.kernel
         .lock()
         .expect("lock")
-        .journal_action_result(&approved, true, None);
+        .journal_action_result(&approved, true, None, None);
     let journal = std::fs::read_to_string(rig._scratch.path(ACTION_PROPOSALS_FILE))
         .expect("the proposals journal");
     let events: Vec<Value> = journal

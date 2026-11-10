@@ -1645,16 +1645,35 @@ pub fn run_approved_action(
         let mut kernel = lock(kernel)?;
         approve_action(&mut kernel, args, now)?
     };
-    let outcome = actions.run(&approved.action, &approved.args, &approved.grant);
-    let code = match &outcome {
-        Ok(_) => None,
-        Err(CallError::Refused { code, .. }) => Some(code.as_str()),
-        Err(CallError::Invalid(_)) => Some("Invalid"),
-        Err(_) => Some("Internal"),
+    // From here the approval is spent. A failure is the action's own, and it is told as one: the caller, the approval page
+    // and the journal all get the handler's refusal message, never a bare code.
+    let outcome = actions
+        .run(&approved.action, &approved.args, &approved.grant)
+        .map_err(|error| {
+            let (code, why) = match error {
+                CallError::Refused { code, message }
+                | CallError::UntrustedRefused { code, message } => (code, message),
+                CallError::Invalid(message) => ("Invalid".to_string(), message),
+                _ => (
+                    "Internal".to_string(),
+                    "Arca hit an internal error while running it".to_string(),
+                ),
+            };
+            CallError::Refused {
+                code,
+                message: format!(
+                    "{APPROVED_BUT_FAILED} {} did not complete: {why}",
+                    approved.action
+                ),
+            }
+        });
+    let (code, message) = match &outcome {
+        Err(CallError::Refused { code, message }) => (Some(code.as_str()), Some(message.as_str())),
+        _ => (None, None),
     };
     if let Ok(mut kernel) = kernel.lock() {
         kernel.revoke_action_grant(&approved.grant);
-        kernel.journal_action_result(&approved, outcome.is_ok(), code);
+        kernel.journal_action_result(&approved, outcome.is_ok(), code, message);
     }
     outcome.map(|result| {
         json!({
@@ -1665,6 +1684,10 @@ pub fn run_approved_action(
         })
     })
 }
+
+/// How the message of an approved action that failed begins. The approval page shows a message that begins so in full,
+/// since the approval itself was accepted and spent.
+pub const APPROVED_BUT_FAILED: &str = "The approval was accepted, but";
 
 /// Checks and spends an owner's approval for one action proposal, retires it and arms exactly one execution grant. The
 /// caller runs the action outside the kernel lock, then journals its result.
@@ -2471,77 +2494,219 @@ pub fn service_pool(cfg: &NodeConfig) -> Result<String, CallError> {
         .ok_or_else(|| pg_invalid("default profile must name a valid devices.root.pool"))
 }
 
+/// The entry that owns the service project when the node's first service used the managed network.
+const NET_ENTRY: &str = "net-arcak-svc";
+
+/// What a create needs of the service project and its networks.
+#[derive(Clone, Copy, Default)]
+pub struct ProjectNeeds {
+    /// The managed service network: a container, a database, a consumer, or a virtual machine with no host bridge.
+    pub managed: bool,
+    /// Room for a virtual machine.
+    pub vm: bool,
+    /// A NIC on a host bridge.
+    pub host_bridge: bool,
+}
+
 /// The shared network is the first change when absent, in the caller's one document.
 pub fn ensure_netproject(
     entries: &[arca_kernel::desired::Entry],
     cfg: &NodeConfig,
 ) -> Result<Vec<crate::desired_store::EntryChange>, CallError> {
-    let cidr = cfg
-        .kernel
-        .service_cidr
-        .as_deref()
-        .ok_or_else(|| CallError::Invalid("kernel.serviceCidr is required".into()))?;
-    arca_netproject::check_cidr(cidr, &cfg.kernel.reserved_cidrs)
-        .map_err(|e| CallError::Invalid(e.into()))?;
-    if !cfg
-        .kernel
-        .projects
-        .iter()
-        .any(|p| p == arca_netproject::PROJECT)
-    {
-        return Err(CallError::Invalid(
-            "kernel.projects must include the service project".into(),
-        ));
-    }
-    if cfg
-        .kernel
-        .droidd_projects
-        .iter()
-        .any(|p| p == arca_netproject::PROJECT)
-        || cfg.kernel.scratch
-    {
-        return Err(CallError::Invalid(
-            "the service project is excluded by kernel configuration".into(),
-        ));
-    }
-    if entries.iter().any(|e| e.id.0 == "net-arcak-svc") {
-        return Ok(vec![]);
-    }
-    Ok(vec![crate::desired_store::EntryChange::Put(service_entry(
-        "net-arcak-svc",
-        "arca.netproject",
-        json!({"project":arca_netproject::PROJECT,"bridge":arca_netproject::BRIDGE,"cidr":cidr,"virtualMachines":0}),
-    ))])
+    project_changes(
+        entries,
+        cfg,
+        ProjectNeeds {
+            managed: true,
+            ..ProjectNeeds::default()
+        },
+    )
 }
 
-/// On a bridged node the service project is the first change when absent: the project alone, with no network. Its caps are
-/// the config's at that moment; an entry that exists is never rewritten.
-fn ensure_bridged_project(
+/// The entry that owns the service project, or `None` while the node has none: the bridged entry on a node whose first
+/// service was a virtual machine on a host bridge, the network entry otherwise. The owner never changes.
+fn project_owner(entries: &[arca_kernel::desired::Entry]) -> Option<&'static str> {
+    [arca_netproject::BRIDGED_ENTRY, NET_ENTRY]
+        .into_iter()
+        .find(|id| entries.iter().any(|entry| entry.id.0 == *id))
+}
+
+/// The changes that give the service project and its networks what a create needs, first in the caller's one document.
+/// The project is made by the entry that first needs it and widened by that same entry when the node gains the other
+/// network (Rules 54 and 55 of the ownership document). A virtual-machine create also brings the caps the owner's entry
+/// holds, and so the project's `limits.*`, to the node's configured caps. An entry that already holds what is needed is
+/// not rewritten.
+pub fn project_changes(
     entries: &[arca_kernel::desired::Entry],
-    bridged: &crate::config::BridgedConfig,
-) -> Vec<crate::desired_store::EntryChange> {
-    if entries
-        .iter()
-        .any(|e| e.id.0 == arca_netproject::BRIDGED_ENTRY)
-    {
-        return vec![];
+    cfg: &NodeConfig,
+    needs: ProjectNeeds,
+) -> Result<Vec<crate::desired_store::EntryChange>, CallError> {
+    let cidr = if needs.managed {
+        let cidr = cfg
+            .kernel
+            .service_cidr
+            .as_deref()
+            .ok_or_else(|| CallError::Invalid("kernel.serviceCidr is required".into()))?;
+        arca_netproject::check_cidr(cidr, &cfg.kernel.reserved_cidrs)
+            .map_err(|e| CallError::Invalid(e.into()))?;
+        if !cfg
+            .kernel
+            .projects
+            .iter()
+            .any(|p| p == arca_netproject::PROJECT)
+        {
+            return Err(CallError::Invalid(
+                "kernel.projects must include the service project".into(),
+            ));
+        }
+        if cfg
+            .kernel
+            .droidd_projects
+            .iter()
+            .any(|p| p == arca_netproject::PROJECT)
+            || cfg.kernel.scratch
+        {
+            return Err(CallError::Invalid(
+                "the service project is excluded by kernel configuration".into(),
+            ));
+        }
+        cidr
+    } else {
+        ""
+    };
+    let find = |id: &str| entries.iter().find(|entry| entry.id.0 == id);
+    let net = find(NET_ENTRY);
+    let bridged = find(arca_netproject::BRIDGED_ENTRY);
+    let caps = cfg.kernel.vm_caps();
+    let put = |id: &str, plugin: &str, config: Value| {
+        crate::desired_store::EntryChange::Put(service_entry(id, plugin, config))
+    };
+    let mut changes = Vec::new();
+    if bridged.is_some() || (net.is_none() && !needs.managed) {
+        match bridged {
+            None => {
+                let caps = caps.ok_or_else(internal)?;
+                changes.push(put(
+                    arca_netproject::BRIDGED_ENTRY,
+                    "arca.bridgedproject",
+                    json!({
+                        "project": arca_netproject::PROJECT,
+                        "virtualMachines": caps.virtual_machines,
+                        "cpu": caps.cpu,
+                        "memory": caps.memory,
+                        "disk": caps.disk
+                    }),
+                ));
+            }
+            Some(entry) => {
+                let mut config = entry.config.clone();
+                if needs.managed {
+                    config["managed"] = json!(true);
+                }
+                // The caps Incus holds follow the node's config: whenever the owner's entry is written, for a virtual
+                // machine or for the widening alike, it carries the configured caps, never the ones it held. The
+                // plugin writes the count on every apply, so an entry whose caps were stale (one an earlier release
+                // wrote, with the project raised by hand since) would otherwise set the project below what it holds.
+                if (needs.vm || config != entry.config)
+                    && let Some(caps) = caps
+                {
+                    config["virtualMachines"] = json!(caps.virtual_machines);
+                    config["cpu"] = json!(caps.cpu);
+                    config["memory"] = json!(caps.memory);
+                    config["disk"] = json!(caps.disk);
+                }
+                if config != entry.config {
+                    count_fits(cfg, entries)?;
+                    changes.push(put(
+                        arca_netproject::BRIDGED_ENTRY,
+                        "arca.bridgedproject",
+                        config,
+                    ));
+                }
+            }
+        }
+        if needs.managed && net.is_none() {
+            changes.push(put(
+                NET_ENTRY,
+                "arca.netproject",
+                json!({"project":arca_netproject::PROJECT,"bridge":arca_netproject::BRIDGE,"cidr":cidr,"virtualMachines":0,"sharedProject":true}),
+            ));
+        }
+        return Ok(changes);
     }
-    vec![crate::desired_store::EntryChange::Put(service_entry(
-        arca_netproject::BRIDGED_ENTRY,
-        "arca.bridgedproject",
-        json!({
-            "project": arca_netproject::PROJECT,
-            "virtualMachines": bridged.limits.virtual_machines,
-            "cpu": bridged.limits.cpu,
-            "memory": bridged.limits.memory,
-            "disk": bridged.limits.disk
-        }),
-    ))]
+    let cap = match (needs.vm, caps) {
+        (true, Some(caps)) => caps.virtual_machines,
+        (true, None) => return Err(internal()),
+        (false, _) => 0,
+    };
+    match net {
+        None => {
+            let mut config = json!({"project":arca_netproject::PROJECT,"bridge":arca_netproject::BRIDGE,"cidr":cidr,"virtualMachines":cap});
+            if needs.host_bridge {
+                config["hostBridges"] = json!(true);
+            }
+            changes.push(put(NET_ENTRY, "arca.netproject", config));
+        }
+        Some(entry) => {
+            let mut config = entry.config.clone();
+            // The cap Incus holds follows the node's config, as the bridged owner's caps do: a virtual-machine create
+            // writes the configured cap into the entry when it differs, up or down.
+            if needs.vm {
+                config["virtualMachines"] = json!(cap);
+            }
+            if needs.host_bridge && config["hostBridges"] != json!(true) {
+                config["hostBridges"] = json!(true);
+            }
+            if config != entry.config {
+                if needs.vm {
+                    count_fits(cfg, entries)?;
+                }
+                changes.push(put(NET_ENTRY, "arca.netproject", config));
+            }
+        }
+    }
+    Ok(changes)
 }
 
-fn not_bridged(template: &str) -> String {
+/// Refuses, in words and before any write, a write of the project owner's entry whose configured virtual-machine count is
+/// below the number of virtual machines the node holds: Incus would refuse that count for the project, and the entry would
+/// then fail on every pass.
+fn count_fits(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -> Result<(), CallError> {
+    let Some(caps) = cfg.kernel.vm_caps() else {
+        return Ok(());
+    };
+    let held = service_entries(entries)
+        .iter()
+        .filter(|(_, record)| record.vm.is_some())
+        .count();
+    if held as u64 <= u64::from(caps.virtual_machines) {
+        return Ok(());
+    }
+    let key = if cfg.kernel.bridged.is_some() {
+        "kernel.bridged.limits.virtualMachines"
+    } else {
+        "kernel.vmLimits.virtualMachines"
+    };
+    Err(service_refused(format!(
+        "this node holds {held} virtual machines, but {key} is {}: raise it to at least {held}, or remove virtual machines first. Nothing was written",
+        caps.virtual_machines
+    )))
+}
+
+/// Why a create has no service project to go into, in the words of the check that failed: only a missing
+/// `kernel.serviceCidr` is called one.
+fn no_service_project(error: CallError) -> CallError {
+    match error {
+        CallError::Invalid(why) => service_refused(format!("no service project: {why}")),
+        // A refusal in words is the reason itself.
+        refused @ CallError::Refused { .. } => refused,
+        _ => internal(),
+    }
+}
+
+fn no_vm_caps(template: &str) -> String {
     format!(
-        "template {template} is a virtual machine, and this node is not a bridged node (kernel.bridged is not set)"
+        "template {template} is a virtual machine, and this node sets no virtual-machine caps (kernel.vmLimits, or kernel.bridged with its limits)"
     )
 }
 
@@ -2551,34 +2716,67 @@ fn bridged_only(template: &str) -> String {
     )
 }
 
-/// Why the node's mode and its desired state disagree, in plain words, or `None` when they agree. A bridged node holds no
-/// managed service network and nothing that lives on it; a node that is not bridged holds no bridged project and no
-/// virtual machine. `arca serve` refuses to start on a disagreement, before the kernel reconciles anything, and a
-/// virtual-machine create checks it again before its first write.
+/// Why the node's config and its desired state disagree, in plain words, or `None` when they agree. Holding containers
+/// and virtual machines together is never the reason: what is refused is a config that would leave a half-state (Rule 57
+/// of the ownership document). A config without the managed network is refused while anything lives on that network, a
+/// config without `kernel.bridged` while a virtual machine is on a host bridge or the project is still a bridged-only
+/// one, and a config without caps while any virtual machine exists. `arca serve` refuses to start on a disagreement,
+/// before the kernel reconciles anything, and a virtual-machine create checks it again before its first write.
 pub fn mode_refusal(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -> Option<String> {
     let is_vm = |entry: &arca_kernel::desired::Entry| {
-        entry.config.get("vm").is_some_and(|vm| !vm.is_null())
+        entry.plugin.0 == "arca.service" && entry.config.get("vm").is_some_and(|vm| !vm.is_null())
     };
-    if cfg.kernel.bridged.is_some() {
+    let on_host_bridge = |entry: &arca_kernel::desired::Entry| {
+        is_vm(entry) && entry.config["bridge"].as_str() != Some(arca_netproject::BRIDGE)
+    };
+    let kernel = &cfg.kernel;
+    if kernel.bridged.is_some() && kernel.service_cidr.is_none() {
         let managed = entries.iter().find(|entry| {
             matches!(
                 entry.plugin.0.as_str(),
                 "arca.netproject" | "arca.postgres" | "arca.consumer"
-            ) || (entry.plugin.0 == "arca.service" && !is_vm(entry))
+            ) || (entry.plugin.0 == "arca.service" && !on_host_bridge(entry))
         })?;
         return Some(format!(
             "kernel.bridged is set, but this node already holds {} from the managed service network. A node is bridged from its first service or not at all: remove kernel.bridged, or remove those services first",
             managed.id.0
         ));
     }
-    let bridged = entries.iter().find(|entry| {
-        entry.plugin.0 == "arca.bridgedproject"
-            || (entry.plugin.0 == "arca.service" && is_vm(entry))
-    })?;
-    Some(format!(
-        "kernel.bridged is not set, but this node already holds {} from bridged mode. Put kernel.bridged back, or remove its virtual machines first",
-        bridged.id.0
-    ))
+    if kernel.bridged.is_none() {
+        let unwidened = entries.iter().find(|entry| {
+            entry.plugin.0 == "arca.bridgedproject" && entry.config["managed"] != json!(true)
+        });
+        if let Some(vm) = entries.iter().find(|entry| on_host_bridge(entry)) {
+            // Removing the machines helps only where the project is not a bridged-only one.
+            return Some(match unwidened {
+                Some(_) => format!(
+                    "kernel.bridged is not set, but this node already holds {} from bridged mode, in a service project created in bridged mode. Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one",
+                    vm.id.0
+                ),
+                None => format!(
+                    "kernel.bridged is not set, but this node already holds {} from bridged mode. Put kernel.bridged back, or remove its virtual machines first",
+                    vm.id.0
+                ),
+            });
+        }
+        // The project is still a bridged-only one, and nothing the owner can remove changes that: the way to the
+        // managed network is to add it beside kernel.bridged, which widens the project.
+        if let Some(project) = unwidened {
+            return Some(format!(
+                "kernel.bridged is not set, but this node's service project was created in bridged mode ({}). Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one",
+                project.id.0
+            ));
+        }
+    }
+    if kernel.vm_caps().is_none()
+        && let Some(vm) = entries.iter().find(|entry| is_vm(entry))
+    {
+        return Some(format!(
+            "this node already holds the virtual machine {}, but its config sets no virtual-machine caps. Put kernel.vmLimits back, or remove its virtual machines first",
+            vm.id.0
+        ));
+    }
+    None
 }
 
 /// The configured bridges that are not bridges on this host: `<sys>/<name>/bridge` is a directory only for a bridge
@@ -2620,6 +2818,36 @@ fn vm_bridge(bridged: &crate::config::BridgedConfig, args: &Value) -> Result<Str
     Ok(bridge.to_string())
 }
 
+/// Where a virtual machine's NIC goes.
+enum VmNetwork {
+    /// The managed service network, with an address of Arca's plan.
+    Managed,
+    /// One of the node's allowed host bridges.
+    Host(String),
+}
+
+/// The network a virtual-machine create joins. A named `bridge` is a host bridge and must be one the node allows. With no
+/// `bridge`, a node that has the managed service network uses it, and a bridged node uses its only bridge.
+fn vm_network(cfg: &NodeConfig, args: &Value) -> Result<VmNetwork, CallError> {
+    match (&cfg.kernel.bridged, args.get("bridge")) {
+        (_, None) if cfg.kernel.service_cidr.is_some() => Ok(VmNetwork::Managed),
+        (Some(bridged), _) => vm_bridge(bridged, args).map(VmNetwork::Host),
+        (None, _) => Err(service_refused(
+            "bridge: this node allows no host bridge (kernel.bridged is not set); leave bridge out to join the managed service network",
+        )),
+    }
+}
+
+/// Why a virtual-machine template cannot go on a host bridge, or `None`.
+fn host_bridge_refusal(template: &crate::service::Template) -> Option<String> {
+    (!template.ports.is_empty() || template.provides.is_some()).then(|| {
+        format!(
+            "template {} declares ports, which a link opens in the managed service network's firewall rules: a host bridge has none, so leave bridge out or use a template without ports",
+            template.name
+        )
+    })
+}
+
 /// Whether an Incus instance row holds `mac` (lowercase): on a device of its own, on a device a profile gives it, as the
 /// address Incus assigned (`volatile.<device>.hwaddr`), or on a live interface. Devices on the bridge that Incus does not
 /// run cannot be seen from here.
@@ -2650,9 +2878,11 @@ fn instance_holds_mac(row: &Value, mac: &str) -> bool {
 }
 
 /// Why creating `name` from `template` would exceed one of the node's caps, or `None`. The use counted is that of the
-/// virtual-machine records Arca holds, whether or not their machines run.
+/// virtual-machine records Arca holds, on the managed network and on host bridges alike, whether or not their machines
+/// run. No container counts.
 fn caps_refusal(
-    bridged: &crate::config::BridgedConfig,
+    cfg: &NodeConfig,
+    caps: &crate::config::BridgedLimits,
     entries: &[arca_kernel::desired::Entry],
     name: &str,
     template: &crate::service::Template,
@@ -2675,7 +2905,11 @@ fn caps_refusal(
         ram = ram.saturating_add(memory(&record.limits).unwrap_or(u128::MAX));
         disk = disk.saturating_add(crate::service::size_bytes(&vm.root_size).unwrap_or(u128::MAX));
     }
-    let caps = &bridged.limits;
+    let source = if cfg.kernel.bridged.is_some() {
+        "kernel.bridged.limits"
+    } else {
+        "kernel.vmLimits"
+    };
     let gib = |bytes: u128| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
     let plain = |n: u128| n.to_string();
     // What is capped, its config key, the use, the amount asked, the cap, and how an amount is shown.
@@ -2730,7 +2964,7 @@ fn caps_refusal(
         let cap = cap.unwrap_or(0);
         if used.saturating_add(asked) > cap {
             return Some(format!(
-                "creating {name} would exceed this node's cap on {what} (kernel.bridged.limits.{key}): {} in use, {} asked, {} allowed",
+                "creating {name} would exceed this node's cap on {what} ({source}.{key}): {} in use, {} asked, {} allowed",
                 show(used),
                 if asked == u128::MAX {
                     "an unreadable amount".to_string()
@@ -2745,8 +2979,8 @@ fn caps_refusal(
 }
 
 /// The checks a proposed `service_create` must pass on this node before the owner is asked: the template's kind fits the
-/// node's mode, the mode fits the desired state, and a virtual machine's bridge is an allowed one. An omitted bridge is
-/// filled in, so the owner's card names it. A template that does not load is left for the create itself to refuse.
+/// node's networks, the config fits the desired state, and a virtual machine's bridge is an allowed one. On a bridged
+/// node an omitted bridge is filled in, so the owner's card names it; a virtual machine for the managed network names none. A template that does not load is left for the create itself to refuse.
 fn enrich_service_create(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
@@ -2757,9 +2991,8 @@ fn enrich_service_create(
     }) else {
         return Ok(payload.clone());
     };
-    let bridged = cfg.kernel.bridged.as_ref();
     if !template.is_vm() {
-        if bridged.is_some() {
+        if cfg.kernel.bridged.is_some() && cfg.kernel.service_cidr.is_none() {
             return Err(service_refused(bridged_only(&template.name)));
         }
         if payload.get("bridge").is_some() || payload.get("mac").is_some() {
@@ -2769,19 +3002,33 @@ fn enrich_service_create(
         }
         return Ok(payload.clone());
     }
-    let Some(bridged) = bridged else {
-        return Err(service_refused(not_bridged(&template.name)));
-    };
+    if cfg.kernel.vm_caps().is_none() {
+        return Err(service_refused(no_vm_caps(&template.name)));
+    }
     if let Some(why) = mode_refusal(cfg, entries) {
         return Err(service_refused(why));
     }
-    let bridge = vm_bridge(bridged, payload)?;
     let mut payload = payload.clone();
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("bridge".to_string(), Value::String(bridge));
+    match vm_network(cfg, &payload)? {
+        VmNetwork::Managed => {
+            if payload.get("mac").is_some() {
+                return Err(service_refused(MANAGED_MAC));
+            }
+        }
+        VmNetwork::Host(bridge) => {
+            if let Some(why) = host_bridge_refusal(&template) {
+                return Err(service_refused(why));
+            }
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("bridge".to_string(), Value::String(bridge));
+            }
+        }
     }
     Ok(payload)
 }
+
+/// Why a fixed MAC is refused on the managed service network.
+const MANAGED_MAC: &str = "mac: a virtual machine on the managed service network has its address reserved by Arca, so it takes no fixed MAC; mac is for a host bridge";
 
 pub fn postgres_handlers(
     kernel: Arc<Mutex<Kernel>>,
@@ -3379,6 +3626,11 @@ fn bridged_refusal(name: &str, what: &str) -> CallError {
     ))
 }
 
+/// Why a verb refuses a virtual machine on the managed service network.
+fn vm_refusal(name: &str, what: &str) -> CallError {
+    service_refused(format!("service {name} is a virtual machine: {what}"))
+}
+
 fn service_listing(read: &UnixIncus, project: Option<&str>) -> Result<Vec<Value>, CallError> {
     let path = project
         .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
@@ -3530,6 +3782,10 @@ pub(crate) fn adopted_config(
 ) -> Option<crate::service::ServiceConfig> {
     let name = row["name"].as_str()?;
     if !crate::service::service_name_ok(name) {
+        return None;
+    }
+    // A virtual machine is never adopted from its marks: its record alone says what it is.
+    if row["type"].as_str() == Some(crate::service::VM_KIND) {
         return None;
     }
     let project = row["project"].as_str()?;
@@ -3732,7 +3988,8 @@ fn service_removal_refused(
         ),
         "instance",
     );
-    if config.vm.is_some() {
+    // A virtual machine on a host bridge has no ACL. One on the managed network has its own, as a container does.
+    if config.on_host_bridge() {
         return service_refused(format!(
             "remove service {}: partial removal ({instance}); the owner's approval is spent, so another try needs a new one",
             config.name
@@ -3791,23 +4048,41 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
     })
 }
 
-/// The record of a virtual machine on a host bridge. It has no address, gateway, port, environment or secret.
+/// Where a new virtual machine goes, with what only that place records.
+enum VmPlace {
+    /// A host bridge, and the fixed MAC the request gave, if any.
+    Host { bridge: String, mac: Option<String> },
+    /// The managed service network, with the address Arca's plan gave it.
+    Managed { ipv4: String, gateway: String },
+}
+
+/// The record of a virtual machine. On a host bridge it has no address, gateway or port; on the managed service network
+/// it has those of a container. Neither has an environment or a secret.
 fn vm_service_config(
     name: &str,
     template: &crate::service::Template,
-    bridge: String,
-    mac: Option<String>,
+    place: VmPlace,
     pool: String,
     now: u64,
 ) -> Result<crate::service::ServiceConfig, CallError> {
     let source = crate::service::source(template).map_err(service_template_error)?;
     let root_size = template.root_size.clone().ok_or_else(internal)?;
+    let (bridge, mac, ipv4, gateway, ports) = match place {
+        VmPlace::Host { bridge, mac } => (bridge, mac, String::new(), String::new(), Vec::new()),
+        VmPlace::Managed { ipv4, gateway } => (
+            arca_netproject::BRIDGE.to_string(),
+            None,
+            ipv4,
+            gateway,
+            template.ports.clone(),
+        ),
+    };
     Ok(crate::service::ServiceConfig {
         name: name.to_string(),
         template: template.name.clone(),
         instance: name.to_string(),
-        ipv4: String::new(),
-        ports: Vec::new(),
+        ipv4,
+        ports,
         links: Vec::new(),
         incoming: Vec::new(),
         secret_refs: BTreeMap::new(),
@@ -3818,7 +4093,7 @@ fn vm_service_config(
         pool,
         project: arca_netproject::PROJECT.into(),
         bridge,
-        gateway: String::new(),
+        gateway,
         entrypoint: None,
         environment: BTreeMap::new(),
         droidd_port: None,
@@ -3869,9 +4144,27 @@ impl ServiceHandler {
                 "/1.0/instances/{name}?project={}",
                 arca_netproject::PROJECT
             )) {
-                Ok(_) => {
+                Ok(found) => {
+                    // The instance exists, so its record stays: the effect journal holds the create as applied, never
+                    // as an open intent, and the owner is told what is there and what to do next.
+                    let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
+                        .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+                    let why = crate::service::redact_log(
+                        &why,
+                        &service_secret_values(&self.cfg.state_dir.join("secrets")),
+                    );
+                    // Only a state that was read is stated.
+                    let left = match found["status"].as_str() {
+                        Some("Stopped") => {
+                            "Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it".to_string()
+                        }
+                        Some(status) if status.len() <= 32 && status.is_ascii() => format!(
+                            "Its instance exists, and Incus reports it as {status}: service_status shows it, and service_remove removes it"
+                        ),
+                        _ => "Its instance exists, in a state Incus did not report: service_status shows it, and service_remove removes it".to_string(),
+                    };
                     return Err(service_refused(format!(
-                        "start service {name} (created and stopped; service_remove removes it)"
+                        "start service {name}: {why}. {left}"
                     )));
                 }
                 Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
@@ -3889,8 +4182,13 @@ impl ServiceHandler {
             if let Some((service_secrets, seeded)) = made {
                 cleanup_service_secrets(service_secrets, seeded);
             }
+            // Incus's own reason for refusing the create is part of this text: it is redacted as a start failure's is.
             let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
                 .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+            let why = crate::service::redact_log(
+                &why,
+                &service_secret_values(&self.cfg.state_dir.join("secrets")),
+            );
             let left = service_wiring::left_behind(removal.ok().as_deref(), &id);
             return Err(service_refused(format!(
                 "create service {name} from template {template_name}: {why}; {left}"
@@ -4004,14 +4302,16 @@ impl ToolHandler for ServiceHandler {
             None
         };
         let now = (self.clock)();
-        // A bridged node has no service /24: nothing on it is adopted from an address, and no gateway exists.
+        // A bridged node has no service /24: nothing on it is adopted from an address, and no gateway exists. A node with
+        // the managed network has both, whether or not it also allows host bridges.
         let bridged = self.cfg.kernel.bridged.as_ref();
+        let managed = self.cfg.kernel.service_cidr.is_some();
         let (cidr, gateway) = match bridged {
-            Some(_) => {
+            Some(_) if !managed => {
                 bridged_project(&self.cfg)?;
                 (String::new(), String::new())
             }
-            None => service_project(&self.cfg)?,
+            _ => service_project(&self.cfg)?,
         };
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let rows = service_listing(&read, None)?;
@@ -4019,7 +4319,7 @@ impl ToolHandler for ServiceHandler {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
         };
-        if bridged.is_none() {
+        if managed {
             adopt_services(
                 &self.kernel,
                 &self.cfg,
@@ -4345,14 +4645,14 @@ impl ToolHandler for ServiceHandler {
                 let template = crate::service::load_template(&templates_dir, template_name)
                     .map_err(service_template_error)?;
                 if template.is_vm() {
-                    let Some(bridged) = bridged else {
-                        return Err(service_refused(not_bridged(template_name)));
+                    let Some(caps) = self.cfg.kernel.vm_caps() else {
+                        return Err(service_refused(no_vm_caps(template_name)));
                     };
                     // Every refusal below comes before any write, so a refused create leaves nothing behind.
                     if let Some(why) = mode_refusal(&self.cfg, &entries) {
                         return Err(service_refused(why));
                     }
-                    let bridge = vm_bridge(bridged, &args)?;
+                    let network = vm_network(&self.cfg, &args)?;
                     let mac = match args.get("mac") {
                         Some(value) => Some(
                             value
@@ -4367,6 +4667,17 @@ impl ToolHandler for ServiceHandler {
                         ),
                         None => None,
                     };
+                    match &network {
+                        VmNetwork::Managed if mac.is_some() => {
+                            return Err(service_refused(MANAGED_MAC));
+                        }
+                        VmNetwork::Host(_) => {
+                            if let Some(why) = host_bridge_refusal(&template) {
+                                return Err(service_refused(why));
+                            }
+                        }
+                        VmNetwork::Managed => {}
+                    }
                     if let Some(mac) = &mac
                         && (service_entries(&entries).iter().any(|(_, other)| {
                             other.vm.as_ref().and_then(|vm| vm.mac.as_ref()) == Some(mac)
@@ -4376,36 +4687,69 @@ impl ToolHandler for ServiceHandler {
                             "the MAC {mac} is already held by another instance"
                         )));
                     }
-                    if let Some(why) = caps_refusal(bridged, &entries, &name, &template) {
+                    if let Some(why) = caps_refusal(&self.cfg, caps, &entries, &name, &template) {
                         return Err(service_refused(why));
                     }
-                    // A project that exists must be the bridged entry's own. One made by hand, or by the managed service
-                    // network, is left alone.
+                    // A project that exists must be the one its owning entry made: the bridged entry's on a node whose
+                    // first service was a virtual machine on a host bridge, the network entry's otherwise. One made by
+                    // hand, or one whose owner this node does not hold, is left alone.
+                    let owner = project_owner(&entries).unwrap_or(match &network {
+                        VmNetwork::Managed => NET_ENTRY,
+                        VmNetwork::Host(_) => arca_netproject::BRIDGED_ENTRY,
+                    });
                     let project =
                         format!("/1.0/projects/{0}?project={0}", arca_netproject::PROJECT);
                     match read.get(&project) {
                         Ok(found)
                             if found["config"][arca_kernel::ownership::KERNEL_ENTRY_KEY]
                                 .as_str()
-                                == Some(arca_netproject::BRIDGED_ENTRY) => {}
+                                == Some(owner) => {}
                         Ok(_) => {
                             return Err(service_refused(format!(
-                                "the Incus project {} already exists and this bridged node did not create it; Arca leaves it alone, so no virtual machine can be created until it is removed",
-                                arca_netproject::PROJECT
+                                "the Incus project {} already exists and this {} did not create it; Arca leaves it alone, so no virtual machine can be created until it is removed",
+                                arca_netproject::PROJECT,
+                                if managed { "node" } else { "bridged node" }
                             )));
                         }
                         Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
                         Err(_) => return Err(internal()),
                     }
-                    let mut changes = ensure_bridged_project(&entries, bridged);
-                    let config = vm_service_config(
-                        &name,
-                        &template,
-                        bridge,
-                        mac,
-                        bridged.pool.clone(),
-                        now,
-                    )?;
+                    let needs = ProjectNeeds {
+                        managed: matches!(network, VmNetwork::Managed),
+                        vm: true,
+                        host_bridge: matches!(network, VmNetwork::Host(_)),
+                    };
+                    let pool = match bridged {
+                        Some(bridged) => bridged.pool.clone(),
+                        None => service_pool(&self.cfg).map_err(|_| {
+                            service_refused("the default profile does not name a storage pool")
+                        })?,
+                    };
+                    let place = match network {
+                        VmNetwork::Host(bridge) => VmPlace::Host { bridge, mac },
+                        VmNetwork::Managed => {
+                            let candidates = crate::service::candidates(&cidr)
+                                .map_err(service_template_error)?;
+                            let leases = service_leases(&read)?;
+                            let used = service_used(&rows, &leases, &entries);
+                            let ipv4 = candidates
+                                .iter()
+                                .find(|ip| !used.contains(ip))
+                                .ok_or_else(|| {
+                                    service_refused(format!(
+                                        "the service subnet {cidr} has no free address (.10-.239)"
+                                    ))
+                                })?
+                                .to_string();
+                            VmPlace::Managed {
+                                ipv4,
+                                gateway: gateway.clone(),
+                            }
+                        }
+                    };
+                    let mut changes =
+                        project_changes(&entries, &self.cfg, needs).map_err(no_service_project)?;
+                    let config = vm_service_config(&name, &template, place, pool, now)?;
                     changes.push(crate::desired_store::EntryChange::Put(service_entry(
                         &id,
                         "arca.service",
@@ -4421,7 +4765,7 @@ impl ToolHandler for ServiceHandler {
                         now,
                     );
                 }
-                if bridged.is_some() {
+                if bridged.is_some() && !managed {
                     return Err(service_refused(bridged_only(template_name)));
                 }
                 if args.get("bridge").is_some() || args.get("mac").is_some() {
@@ -4446,9 +4790,8 @@ impl ToolHandler for ServiceHandler {
                 let pool = service_pool(&self.cfg).map_err(|_| {
                     service_refused("the default profile does not name a storage pool")
                 })?;
-                let mut changes = ensure_netproject(&entries, &self.cfg).map_err(|_| {
-                    service_refused("no service project: kernel.serviceCidr is required")
-                })?;
+                let mut changes =
+                    ensure_netproject(&entries, &self.cfg).map_err(no_service_project)?;
                 let secrets_dir = self.cfg.state_dir.join("secrets");
                 let service_secrets = secrets_dir.join(format!("service-{name}"));
                 let seeded = service_secret_names(&service_secrets).map_err(|_| internal())?;

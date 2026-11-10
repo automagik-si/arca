@@ -41,6 +41,8 @@ fn network_home_and_project_are_owned_and_retry_skips_existing_objects() {
         bridge: BRIDGE.into(),
         cidr: "192.0.2.0/24".into(),
         virtual_machines: 0,
+        shared_project: false,
+        host_bridges: false,
     };
     let error = NetProject::apply(
         &mut Ctx::new(
@@ -198,6 +200,7 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
         cpu: 8,
         memory: "64GiB".into(),
         disk: "1TiB".into(),
+        managed: false,
     };
     let cfg = caps(PROJECT);
     // Another entry id, or another project, is refused before any request.
@@ -259,5 +262,182 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
                 && !request.path.contains("/1.0/profiles")),
         "no network and no profile is read or written"
     );
+
+    // The node gains the managed service network (Rule 55): the owner drops the container cap and the aggregate caps,
+    // which would count containers, and allows proxy devices. The project stays restricted, with its mark and its
+    // virtual-machine cap, and a second pass writes nothing.
+    let widened = BridgedProjectConfig {
+        managed: true,
+        ..cfg.clone()
+    };
+    for _ in 0..2 {
+        BridgedProject::apply(
+            &mut Ctx::new(
+                EntryId(BRIDGED_ENTRY.into()),
+                &manifest,
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            &widened,
+        )
+        .unwrap();
+    }
+    let project = read
+        .get(&format!("/1.0/projects/{PROJECT}?project={PROJECT}"))
+        .unwrap();
+    for gone in [
+        "limits.containers",
+        "limits.cpu",
+        "limits.memory",
+        "limits.disk",
+    ] {
+        assert!(project["config"].get(gone).is_none(), "{gone} is unset");
+    }
+    assert_eq!(project["config"]["user.arcakernel.entry"], BRIDGED_ENTRY);
+    assert_eq!(project["config"]["restricted"], "true");
+    assert_eq!(project["config"]["restricted.devices.nic"], "allow");
+    assert_eq!(project["config"]["restricted.devices.proxy"], "allow");
+    assert_eq!(project["config"]["limits.virtual-machines"], "4");
+    let writes = fake.writes();
+    assert_eq!(writes.len(), 2, "one create and one widening");
+    assert_eq!(writes[1].method, "PUT", "a project is written with a PUT");
+
+    // The network entry then shares the project: it makes its bridge and its profile, and never writes the project
+    // another entry owns.
+    fake.add_profile(
+        "default",
+        json!({"name":"default","config":{},"devices":{"root":{"pool":"pool1"}}}),
+    );
+    let net = NetProjectConfig {
+        project: PROJECT.into(),
+        bridge: BRIDGE.into(),
+        cidr: "192.0.2.0/24".into(),
+        virtual_machines: 0,
+        shared_project: true,
+        host_bridges: false,
+    };
+    let before = fake.requests().len();
+    for _ in 0..2 {
+        NetProject::apply(
+            &mut Ctx::new(
+                EntryId("net-arcak-svc".into()),
+                &NetProject::manifest(),
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            &net,
+        )
+        .unwrap();
+    }
+    assert!(
+        fake.requests()[before..]
+            .iter()
+            .all(|request| request.method == "GET" || !request.path.starts_with("/1.0/projects")),
+        "the shared project is never written"
+    );
+    assert!(
+        read.get(&format!("/1.0/networks/{BRIDGE}?project=default"))
+            .is_ok()
+    );
+    assert!(
+        read.get(&format!("/1.0/profiles/{PROFILE}?project={PROJECT}"))
+            .is_ok()
+    );
+    let after = read
+        .get(&format!("/1.0/projects/{PROJECT}?project={PROJECT}"))
+        .unwrap();
+    assert_eq!(after["config"], project["config"]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Rule 55: a project the network entry owns gains virtual machines, and then host bridges, by its own journaled writes.
+#[test]
+fn the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges() {
+    let dir = std::env::temp_dir().join(format!("arca-netproject-widen-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let fake = FakeIncus::start(
+        &dir,
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            pools: vec![],
+            networks: vec![],
+        },
+    )
+    .unwrap();
+    fake.add_profile(
+        "default",
+        json!({"name":"default","config":{},"devices":{"root":{"pool":"pool1"}}}),
+    );
+    let mut provider = IncusProvider::new(
+        fake.socket().into(),
+        Family {
+            projects: vec![PROJECT.into()],
+            scratch: false,
+            droidd_projects: vec!["other".into()],
+            reserved_cidrs: vec![],
+        },
+        dir.join("secrets"),
+        RetainedSet::empty(),
+    )
+    .unwrap();
+    let mut journal = Journal::open(MemJournal::default()).unwrap();
+    let manifest = NetProject::manifest();
+    let mut cfg = NetProjectConfig {
+        project: PROJECT.into(),
+        bridge: BRIDGE.into(),
+        cidr: "192.0.2.0/24".into(),
+        virtual_machines: 0,
+        shared_project: false,
+        host_bridges: false,
+    };
+    let mut apply = |cfg: &NetProjectConfig| {
+        NetProject::apply(
+            &mut Ctx::new(
+                EntryId("net-arcak-svc".into()),
+                &manifest,
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            cfg,
+        )
+        .unwrap();
+    };
+    let read = UnixIncus::new(fake.socket().into());
+    let project = || {
+        read.get(&format!("/1.0/projects/{PROJECT}?project={PROJECT}"))
+            .unwrap()["config"]
+            .clone()
+    };
+    apply(&cfg);
+    assert_eq!(project()["limits.virtual-machines"], "0");
+    assert_eq!(project()["restricted.networks.access"], BRIDGE);
+    // An entry an earlier kernel wrote reads as it did, and writes back without the new keys.
+    let old = json!({"project":PROJECT,"bridge":BRIDGE,"cidr":"192.0.2.0/24","virtualMachines":0});
+    let parsed: NetProjectConfig = serde_json::from_value(old.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), old);
+
+    cfg.virtual_machines = 4;
+    let writes = fake.writes().len();
+    apply(&cfg);
+    apply(&cfg);
+    assert_eq!(project()["limits.virtual-machines"], "4");
+    assert_eq!(project()["restricted.networks.access"], BRIDGE);
+    assert!(project().get("restricted.devices.nic").is_none());
+    assert_eq!(fake.writes().len(), writes + 1, "one write, and none again");
+
+    cfg.host_bridges = true;
+    apply(&cfg);
+    apply(&cfg);
+    assert_eq!(project()["restricted.devices.nic"], "allow");
+    assert!(project().get("restricted.networks.access").is_none());
+    assert_eq!(project()["restricted"], "true");
+    assert_eq!(project()["restricted.devices.proxy"], "allow");
+    assert_eq!(project()["user.arcakernel.entry"], "net-arcak-svc");
+    assert_eq!(fake.writes().len(), writes + 2);
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -427,6 +427,9 @@ const KINDS = {
   bucket: "Storage bucket",
 };
 
+// How Arca begins the message of an approved action that then failed (`APPROVED_BUT_FAILED` in handlers.rs).
+const APPROVED_BUT_FAILED = "The approval was accepted, but";
+
 const REFUSALS = {
   Expired: "This approval ran out of time. Reload the page and try again.",
   Replayed: "This approval was already used. Reload the page to see what is still waiting.",
@@ -1006,10 +1009,13 @@ async function loadPasskeys() {
 async function approve(plan, button) {
   button.disabled = true;
   status("Confirm with your passkey…", "wait");
+  let slow;
   try {
     const proof = await trustedProof(plan.statement);
     const approval = b64(enc.encode(plan.statement)) + "." + b64(enc.encode(JSON.stringify(proof)));
     const id = plan.id || plan.plan;
+    // The answer comes when the action has finished, which can take minutes for a new virtual machine.
+    slow = setTimeout(() => status("Approved. Arca is still working on it. This can take a few minutes…", "wait"), 15000);
     const answer = await fetch("/approve/approve", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1017,10 +1023,20 @@ async function approve(plan, button) {
     });
     const body = await answer.json().catch(() => ({}));
     if (!answer.ok) {
+      // An approval Arca accepted whose action then failed: the approval is spent and the card is gone, so the page says
+      // what happened in Arca's own words and reloads what is waiting.
+      if (typeof body.message === "string" && body.message.startsWith(APPROVED_BUT_FAILED)) {
+        clearTimeout(slow);
+        status(body.message, "bad");
+        await loadPlans();
+        await loadPasskeys();
+        return;
+      }
       const refused = new Error(body.refusal || ("the approval answered " + answer.status));
       refused.refusal = body.refusal;
       throw refused;
     }
+    clearTimeout(slow);
     if (plan.kind === "action") {
       status("Approved. " + plan.action + " ran.", "ok");
     } else {
@@ -1030,6 +1046,7 @@ async function approve(plan, button) {
     await loadPlans();
     await loadPasskeys();
   } catch (error) {
+    clearTimeout(slow);
     fail(error);
     button.disabled = false;
   }
