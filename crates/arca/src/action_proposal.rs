@@ -313,6 +313,13 @@ impl ActionKind {
                 .to_string()
         };
         match self {
+            // Only a virtual machine on a bridged node names a bridge; a proposal made on one always does.
+            Self::ServiceCreate if args.get("bridge").is_some() => format!(
+                "Create the virtual machine {} from template {} on the host bridge {}",
+                text("name"),
+                text("template"),
+                text("bridge")
+            ),
             Self::ServiceCreate => format!(
                 "Create the service {} from template {}",
                 text("name"),

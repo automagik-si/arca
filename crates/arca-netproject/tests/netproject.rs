@@ -192,18 +192,18 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
     .unwrap();
     let mut journal = Journal::open(MemJournal::default()).unwrap();
     let manifest = BridgedProject::manifest();
-    let cfg = BridgedProjectConfig {
-        project: PROJECT.into(),
+    let caps = |project: &str| BridgedProjectConfig {
+        project: project.into(),
+        virtual_machines: 4,
+        cpu: 8,
+        memory: "64GiB".into(),
+        disk: "1TiB".into(),
     };
+    let cfg = caps(PROJECT);
     // Another entry id, or another project, is refused before any request.
     for (entry, cfg) in [
         ("net-arcak-svc", cfg.clone()),
-        (
-            BRIDGED_ENTRY,
-            BridgedProjectConfig {
-                project: "other".into(),
-            },
-        ),
+        (BRIDGED_ENTRY, caps("other")),
     ] {
         let error = BridgedProject::apply(
             &mut Ctx::new(
@@ -239,6 +239,11 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
     assert_eq!(project["config"]["user.arcakernel.entry"], BRIDGED_ENTRY);
     assert_eq!(project["config"]["restricted"], "true");
     assert_eq!(project["config"]["restricted.devices.nic"], "allow");
+    assert_eq!(project["config"]["limits.containers"], "0");
+    assert_eq!(project["config"]["limits.virtual-machines"], "4");
+    assert_eq!(project["config"]["limits.cpu"], "8");
+    assert_eq!(project["config"]["limits.memory"], "64GiB");
+    assert_eq!(project["config"]["limits.disk"], "1TiB");
     assert!(
         project["config"]
             .get("restricted.networks.access")

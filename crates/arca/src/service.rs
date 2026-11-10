@@ -980,12 +980,39 @@ fn decimal(value: &str) -> bool {
         && bytes.all(|b| b.is_ascii_digit())
 }
 
-fn size_ok(value: &str) -> bool {
+pub fn size_ok(value: &str) -> bool {
     [
         "B", "kB", "MB", "GB", "TB", "PB", "EB", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB",
     ]
     .iter()
     .any(|unit| value.strip_suffix(unit).is_some_and(decimal))
+}
+
+/// The bytes a size string names, as Incus reads its units: `kB` to `EB` are powers of 1000, `KiB` to `EiB` powers of
+/// 1024. `None` for a string [`size_ok`] refuses, or a number too large to hold.
+pub fn size_bytes(value: &str) -> Option<u128> {
+    const UNITS: [(&str, u128); 13] = [
+        ("KiB", 1 << 10),
+        ("MiB", 1 << 20),
+        ("GiB", 1 << 30),
+        ("TiB", 1 << 40),
+        ("PiB", 1 << 50),
+        ("EiB", 1 << 60),
+        ("kB", 1_000),
+        ("MB", 1_000_000),
+        ("GB", 1_000_000_000),
+        ("TB", 1_000_000_000_000),
+        ("PB", 1_000_000_000_000_000),
+        ("EB", 1_000_000_000_000_000_000),
+        ("B", 1),
+    ];
+    let (number, scale) = UNITS
+        .iter()
+        .find_map(|(unit, scale)| Some((value.strip_suffix(unit)?, *scale)))?;
+    if !decimal(number) {
+        return None;
+    }
+    number.parse::<u128>().ok()?.checked_mul(scale)
 }
 
 fn env_name_ok(name: &str) -> bool {

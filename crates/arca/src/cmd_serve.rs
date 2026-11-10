@@ -43,7 +43,7 @@ use crate::handlers::{
     ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
     Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, Published,
     SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers_full, spawn_watcher,
+    plan_handlers_node, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -106,6 +106,34 @@ pub fn watch_kernel_handler(cfg: &NodeConfig, kernel: Arc<Mutex<Kernel>>) -> Wat
     })
 }
 
+/// Refuses a start whose mode and desired state disagree, and a bridged start that names a bridge this host does not
+/// have. The desired document is read under the state directory's lock, which is released before the kernel takes it.
+pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> {
+    if let Some(bridged) = &cfg.kernel.bridged {
+        let missing = crate::handlers::missing_bridges(bridged, sys);
+        if !missing.is_empty() {
+            return Err(Failure::Config(format!(
+                "kernel.bridged.bridges names {}, which is not a bridge on this host: Arca does not create bridges, so create it or take it off the list",
+                missing.join(", ")
+            )));
+        }
+    }
+    let entries = {
+        let key = NodeKey::load_or_create(&cfg.state_dir.join(NODE_KEY_FILE))
+            .map_err(|e| Failure::Runtime(e.to_string()))?;
+        let store = crate::desired_store::DesiredStore::open(&cfg.state_dir, key)
+            .map_err(kernel_failure)?;
+        store
+            .current()
+            .map(|signed| signed.document.entries.clone())
+            .unwrap_or_default()
+    };
+    match crate::handlers::mode_refusal(cfg, &entries) {
+        Some(why) => Err(Failure::Config(why)),
+        None => Ok(()),
+    }
+}
+
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     let cfg = config::load(Path::new(flags.required("config")?))?;
     if !cfg.kernel.adopt.is_empty() {
@@ -157,6 +185,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .add::<arca_postgres::consumer::Consumer>()
         .map_err(kernel_failure)?;
     let kernel_mode = !cfg.kernel.projects.is_empty();
+    // Both checks come before the kernel opens, because opening it reconciles the desired state: a node whose mode was
+    // switched must not create or repair anything of the other mode first.
+    check_bridged_start(&cfg, std::path::Path::new("/sys/class/net"))?;
     let kernel = Kernel::open(
         &cfg.state_dir,
         key,
@@ -344,13 +375,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             }),
         );
     let action_slot = ActionSlot::default();
-    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers_full(
+    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers_node(
         Arc::clone(&kernel),
         clock.clone(),
         cfg.kernel.postgres_image.clone(),
         gpu,
         Some(storage),
         Arc::clone(&action_slot),
+        Some(Arc::new(cfg.clone())),
     )
     .into_iter()
     .chain(crate::handlers::postgres_handlers(

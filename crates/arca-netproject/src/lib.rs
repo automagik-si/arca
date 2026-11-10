@@ -108,10 +108,16 @@ pub const BRIDGED_ENTRY: &str = "bridged-arcak-svc";
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BridgedProjectConfig {
     pub project: String,
+    /// The caps on everything in the project together, set as its `limits.*` keys when it is created.
+    pub virtual_machines: u32,
+    pub cpu: u32,
+    pub memory: String,
+    pub disk: String,
 }
 
 /// The service project of a bridged node. It creates the project and nothing else: no Incus network, no profile. The
-/// project lets a NIC name a host bridge (`restricted.devices.nic=allow`), which the provider grants to this entry alone.
+/// project lets a NIC name a host bridge (`restricted.devices.nic=allow`), which the provider grants to this entry alone,
+/// and carries the node's caps as `limits.*`. Nothing changes the project after its create: new caps are set by hand.
 pub struct BridgedProject;
 
 impl Plugin for BridgedProject {
@@ -146,7 +152,14 @@ impl Plugin for BridgedProject {
                 IncusKind::Project,
                 &cfg.project,
                 &cfg.project,
-                json!({"name": cfg.project, "config": {"restricted.devices.nic": "allow"}}),
+                json!({"name": cfg.project, "config": {
+                    "restricted.devices.nic": "allow",
+                    "limits.containers": "0",
+                    "limits.virtual-machines": cfg.virtual_machines.to_string(),
+                    "limits.cpu": cfg.cpu.to_string(),
+                    "limits.memory": cfg.memory,
+                    "limits.disk": cfg.disk
+                }}),
             )?;
         }
         Ok(())

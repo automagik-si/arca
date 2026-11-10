@@ -39,34 +39,21 @@ struct Rig {
     fake: FakeIncus,
     kernel: Arc<Mutex<Kernel>>,
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
+    cfg: Arc<NodeConfig>,
 }
 
 impl Rig {
-    /// A bridged node that allows `bridges` and keeps root disks on `vmpool`.
+    /// A bridged node that allows `bridges` and keeps root disks on `vmpool`, with room for four of the test template.
     fn bridged(bridges: &[&str], key: Option<&common::SkKey>) -> Self {
-        Self::with(
-            json!({
-                "projects": [PROJECT],
-                "droiddProjects": ["other"],
-                "bridged": { "bridges": bridges, "pool": "vmpool" }
-            }),
-            key,
-        )
+        Self::with(bridged_kernel(bridges, roomy()), key, vec![])
     }
 
     /// A node with the managed service network, as every node before bridged mode.
     fn managed() -> Self {
-        Self::with(
-            json!({
-                "projects": [PROJECT],
-                "droiddProjects": ["other"],
-                "serviceCidr": "192.0.2.0/24"
-            }),
-            None,
-        )
+        Self::with(managed_kernel(), None, vec![])
     }
 
-    fn with(kernel_config: Value, key: Option<&common::SkKey>) -> Self {
+    fn with(kernel_config: Value, key: Option<&common::SkKey>, instances: Vec<Value>) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-bridged-{}-{}",
             std::process::id(),
@@ -79,7 +66,7 @@ impl Rig {
             FakeState {
                 server: json!({}),
                 projects: vec![],
-                instances: vec![],
+                instances,
                 networks: vec![],
                 pools: vec![],
             },
@@ -89,15 +76,7 @@ impl Rig {
             "default",
             json!({"name":"default","config":{},"devices":{"root":{"type":"disk","pool":"pool1","path":"/"}}}),
         );
-        let cfg: NodeConfig = serde_json::from_value(json!({
-            "stateDir": dir,
-            "incus": {"socket": fake.socket()},
-            "listen": {"unix": dir.join("arca.sock")},
-            "tokens": {"hashDir": dir.join("tokens")},
-            "kernel": kernel_config
-        }))
-        .expect("config");
-        arca::config::check(&cfg).expect("the config passes its rules");
+        let cfg = node_config(&dir, &fake, kernel_config);
         let verifier = match key {
             Some(key) => {
                 let scratch = common::Scratch::new("bridged-owner");
@@ -148,7 +127,8 @@ impl Rig {
             )
             .expect("kernel"),
         ));
-        let handlers = service_handlers(kernel.clone(), Arc::new(|| NOW), Arc::new(cfg))
+        let cfg = Arc::new(cfg);
+        let handlers = service_handlers(kernel.clone(), Arc::new(|| NOW), cfg.clone())
             .into_iter()
             .collect();
         let rig = Self {
@@ -156,6 +136,7 @@ impl Rig {
             fake,
             kernel,
             handlers,
+            cfg,
         };
         rig.template("ws", vm_template());
         rig.template("nats", nats_template());
@@ -171,6 +152,22 @@ impl Rig {
                 tools: None,
             },
         )
+    }
+
+    /// The same node after its config was edited to `kernel_config`: the service handlers over the same kernel and Incus.
+    fn switched(
+        &self,
+        kernel_config: Value,
+    ) -> (Arc<NodeConfig>, HashMap<&'static str, Arc<dyn ToolHandler>>) {
+        let cfg = Arc::new(node_config(&self.dir, &self.fake, kernel_config));
+        let handlers = service_handlers(self.kernel.clone(), Arc::new(|| NOW), cfg.clone())
+            .into_iter()
+            .collect();
+        (cfg, handlers)
+    }
+
+    fn entries(&self) -> Vec<arca_kernel::desired::Entry> {
+        self.kernel.lock().expect("kernel").entries().to_vec()
     }
 
     fn template(&self, name: &str, value: Value) {
@@ -208,6 +205,47 @@ impl Rig {
 impl Drop for Rig {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn node_config(dir: &std::path::Path, fake: &FakeIncus, kernel_config: Value) -> NodeConfig {
+    let cfg: NodeConfig = serde_json::from_value(json!({
+        "stateDir": dir,
+        "incus": {"socket": fake.socket()},
+        "listen": {"unix": dir.join("arca.sock")},
+        "tokens": {"hashDir": dir.join("tokens")},
+        "kernel": kernel_config
+    }))
+    .expect("config");
+    arca::config::check(&cfg).expect("the config passes its rules");
+    cfg
+}
+
+fn roomy() -> Value {
+    json!({ "virtualMachines": 4, "cpu": 8, "memory": "16GiB", "disk": "80GiB" })
+}
+
+fn bridged_kernel(bridges: &[&str], limits: Value) -> Value {
+    json!({
+        "projects": [PROJECT],
+        "droiddProjects": ["other"],
+        "bridged": { "bridges": bridges, "pool": "vmpool", "limits": limits }
+    })
+}
+
+fn managed_kernel() -> Value {
+    json!({
+        "projects": [PROJECT],
+        "droiddProjects": ["other"],
+        "serviceCidr": "192.0.2.0/24"
+    })
+}
+
+fn doctor() -> Caller {
+    Caller {
+        token_id: "doctor".into(),
+        scope: Scope::Doctor,
+        tools: None,
     }
 }
 
@@ -315,6 +353,11 @@ fn a_vm_is_created_with_its_type_devices_and_limits_and_no_network_is_created_or
     assert_eq!(project["config"][KERNEL_ENTRY_KEY], BRIDGED_ENTRY);
     assert_eq!(project["config"]["restricted"], "true");
     assert_eq!(project["config"]["restricted.devices.nic"], "allow");
+    assert_eq!(project["config"]["limits.containers"], "0");
+    assert_eq!(project["config"]["limits.virtual-machines"], "4");
+    assert_eq!(project["config"]["limits.cpu"], "8");
+    assert_eq!(project["config"]["limits.memory"], "16GiB");
+    assert_eq!(project["config"]["limits.disk"], "80GiB");
     assert!(
         project["config"]
             .get("restricted.networks.access")
@@ -770,4 +813,267 @@ fn the_shipped_workspace_vm_template_loads_as_a_virtual_machine() {
     let limits = template.limits.expect("limits");
     assert_eq!(limits.cpu.as_deref(), Some("2"));
     assert_eq!(limits.memory.as_deref(), Some("4GiB"));
+}
+
+#[test]
+fn a_create_that_would_exceed_a_cap_is_refused_in_plain_words_before_any_write() {
+    // Each cap in turn is the one the second machine of the test template (2 CPUs, 4GiB, 20GiB) does not fit under.
+    for (limits, refused) in [
+        (
+            json!({ "virtualMachines": 1, "cpu": 8, "memory": "16GiB", "disk": "80GiB" }),
+            "creating ws2 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 1 in use, 1 asked, 1 allowed",
+        ),
+        (
+            json!({ "virtualMachines": 4, "cpu": 3, "memory": "16GiB", "disk": "80GiB" }),
+            "creating ws2 would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 2 in use, 2 asked, 3 allowed",
+        ),
+        (
+            json!({ "virtualMachines": 4, "cpu": 8, "memory": "6GiB", "disk": "80GiB" }),
+            "creating ws2 would exceed this node's cap on memory (kernel.bridged.limits.memory): 4.0 GiB in use, 4.0 GiB asked, 6.0 GiB allowed",
+        ),
+        (
+            json!({ "virtualMachines": 4, "cpu": 8, "memory": "16GiB", "disk": "30GiB" }),
+            "creating ws2 would exceed this node's cap on disk (kernel.bridged.limits.disk): 20.0 GiB in use, 20.0 GiB asked, 30.0 GiB allowed",
+        ),
+    ] {
+        let rig = Rig::with(bridged_kernel(&["br0"], limits), None, vec![]);
+        rig.call("service_create", json!({"name":"ws1","template":"ws"}))
+            .expect("the first machine fits");
+        let writes = rig.fake.writes().len();
+        assert_eq!(
+            refusal(rig.call("service_create", json!({"name":"ws2","template":"ws"}))),
+            refused
+        );
+        assert_eq!(rig.fake.writes().len(), writes, "nothing was written");
+        let mut ids = rig.entry_ids();
+        ids.sort();
+        assert_eq!(ids, [BRIDGED_ENTRY, "service-ws1"], "nothing was recorded");
+    }
+    // A template larger than the whole node is refused on an empty node too.
+    let rig = Rig::with(
+        bridged_kernel(
+            &["br0"],
+            json!({ "virtualMachines": 4, "cpu": 8, "memory": "2GiB", "disk": "80GiB" }),
+        ),
+        None,
+        vec![],
+    );
+    assert_eq!(
+        refusal(rig.call("service_create", json!({"name":"ws1","template":"ws"}))),
+        "creating ws1 would exceed this node's cap on memory (kernel.bridged.limits.memory): 0.0 GiB in use, 4.0 GiB asked, 2.0 GiB allowed"
+    );
+    assert!(rig.fake.writes().is_empty() && rig.entry_ids().is_empty());
+}
+
+fn other_instance(name: &str, config: Value, extra: Value) -> Value {
+    let mut row = json!({
+        "name": name, "project": "elsewhere", "type": "virtual-machine", "status": "Running",
+        "config": config, "devices": {}
+    });
+    row.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    row
+}
+
+#[test]
+fn a_mac_incus_assigned_or_a_profile_gave_another_instance_is_refused() {
+    let rig = Rig::with(
+        bridged_kernel(&["br0"], roomy()),
+        None,
+        vec![
+            other_instance(
+                "assigned",
+                json!({"volatile.eth0.hwaddr": "10:66:6A:00:00:01"}),
+                json!({}),
+            ),
+            other_instance(
+                "profiled",
+                json!({}),
+                json!({"expanded_devices": {"eth0": {"type": "nic", "hwaddr": "10:66:6a:00:00:02"}}}),
+            ),
+            other_instance(
+                "own",
+                json!({}),
+                json!({"devices": {"eth0": {"type": "nic", "hwaddr": "10:66:6a:00:00:03"}}}),
+            ),
+        ],
+    );
+    for mac in [
+        "10:66:6a:00:00:01",
+        "10:66:6A:00:00:02",
+        "10:66:6a:00:00:03",
+    ] {
+        assert_eq!(
+            refusal(rig.call(
+                "service_create",
+                json!({"name":"ws1","template":"ws","mac":mac})
+            )),
+            format!(
+                "the MAC {} is already held by another instance",
+                mac.to_ascii_lowercase()
+            )
+        );
+    }
+    assert!(rig.fake.writes().is_empty() && rig.entry_ids().is_empty());
+    rig.call(
+        "service_create",
+        json!({"name":"ws1","template":"ws","mac":"10:66:6a:00:00:04"}),
+    )
+    .expect("a free MAC is taken");
+}
+
+#[test]
+fn a_managed_node_switched_to_bridged_is_refused_at_start_and_at_create_and_nothing_is_left_behind()
+{
+    let rig = Rig::managed();
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("a container on the managed network");
+    let before = rig.entries();
+    let writes = rig.fake.writes().len();
+    let (cfg, handlers) = rig.switched(bridged_kernel(&["br0"], roomy()));
+
+    let why = "kernel.bridged is set, but this node already holds net-arcak-svc from the managed service network. A node is bridged from its first service or not at all: remove kernel.bridged, or remove those services first";
+    assert_eq!(
+        arca::handlers::mode_refusal(&cfg, &before).as_deref(),
+        Some(why),
+        "serve refuses to start"
+    );
+    assert_eq!(
+        refusal(handlers["service_create"].call(json!({"name":"ws1","template":"ws"}), &doctor())),
+        why,
+        "the create names the reason"
+    );
+    assert_eq!(rig.fake.writes().len(), writes, "nothing was written");
+    let after: Vec<String> = rig.entries().iter().map(|e| e.id.0.clone()).collect();
+    let was: Vec<String> = before.iter().map(|e| e.id.0.clone()).collect();
+    assert_eq!(after, was, "no bridged entry is left to fail every pass");
+    // The node's own config still agrees with its state.
+    assert_eq!(arca::handlers::mode_refusal(&rig.cfg, &before), None);
+}
+
+#[test]
+fn a_bridged_node_switched_to_managed_is_refused_at_start() {
+    let rig = Rig::bridged(&["br0"], None);
+    rig.call("service_create", json!({"name":"ws1","template":"ws"}))
+        .expect("create");
+    let entries = rig.entries();
+    assert_eq!(arca::handlers::mode_refusal(&rig.cfg, &entries), None);
+    let (cfg, _) = rig.switched(managed_kernel());
+    let why = arca::handlers::mode_refusal(&cfg, &entries).expect("serve refuses to start");
+    assert!(
+        why.starts_with("kernel.bridged is not set, but this node already holds ")
+            && why.ends_with(
+                "from bridged mode. Put kernel.bridged back, or remove its virtual machines first"
+            ),
+        "{why}"
+    );
+    // The project entry alone, with every machine removed, still marks the node as bridged.
+    let project_only: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.id.0 == BRIDGED_ENTRY)
+        .cloned()
+        .collect();
+    assert!(arca::handlers::mode_refusal(&cfg, &project_only).is_some());
+    assert_eq!(arca::handlers::mode_refusal(&cfg, &[]), None);
+}
+
+#[test]
+fn an_existing_project_this_node_did_not_create_refuses_the_create_and_leaves_no_entry() {
+    for config in [json!({}), json!({KERNEL_ENTRY_KEY: "net-arcak-svc"})] {
+        let rig = Rig::bridged(&["br0"], None);
+        // A project made by hand, or left by the managed service network, outside the kernel's writer.
+        use std::io::{Read, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(rig.fake.socket()).unwrap();
+        let body = json!({"name": PROJECT, "config": config}).to_string();
+        write!(stream, "POST /1.0/projects HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 20"), "{response}");
+        let writes = rig.fake.writes().len();
+
+        assert_eq!(
+            refusal(rig.call("service_create", json!({"name":"ws1","template":"ws"}))),
+            format!(
+                "the Incus project {PROJECT} already exists and this bridged node did not create it; Arca leaves it alone, so no virtual machine can be created until it is removed"
+            )
+        );
+        assert_eq!(rig.fake.writes().len(), writes, "nothing was written");
+        assert!(
+            rig.entry_ids().is_empty(),
+            "no entry is left to fail every pass"
+        );
+    }
+}
+
+#[test]
+fn a_bridge_this_host_does_not_have_is_named_at_start_without_asking_incus() {
+    let rig = Rig::bridged(&["br0", "br1"], None);
+    let sys = rig.dir.join("sys-class-net");
+    fs::create_dir_all(sys.join("br0/bridge")).unwrap();
+    // An interface that exists but is not a bridge has no `bridge` directory.
+    fs::create_dir_all(sys.join("br1")).unwrap();
+    let bridged = rig.cfg.kernel.bridged.as_ref().expect("bridged");
+    let requests = rig.fake.requests().len();
+    assert_eq!(arca::handlers::missing_bridges(bridged, &sys), ["br1"]);
+    fs::create_dir_all(sys.join("br1/bridge")).unwrap();
+    assert!(arca::handlers::missing_bridges(bridged, &sys).is_empty());
+    assert_eq!(rig.fake.requests().len(), requests, "Incus is not asked");
+}
+
+#[test]
+fn a_proposal_this_node_is_sure_to_refuse_is_refused_when_proposed_and_an_omitted_bridge_is_shown()
+{
+    let propose = |rig: &Rig, args: Value| {
+        let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> =
+            arca::handlers::plan_handlers_node(
+                rig.kernel.clone(),
+                Arc::new(|| NOW),
+                None,
+                None,
+                None,
+                arca::handlers::ActionSlot::default(),
+                Some(rig.cfg.clone()),
+            )
+            .into_iter()
+            .collect();
+        handlers["action_propose"].call(json!({"action":"service_create","args":args}), &doctor())
+    };
+    let rig = Rig::bridged(&["br0"], None);
+    let proposed =
+        propose(&rig, json!({"name":"ws1","template":"ws"})).expect("the proposal is recorded");
+    assert_eq!(
+        proposed["summary"],
+        "Create the virtual machine ws1 from template ws on the host bridge br0"
+    );
+    assert!(
+        proposed["details"]
+            .as_array()
+            .expect("details")
+            .contains(&json!({"label":"Host bridge","value":"br0"})),
+        "{proposed}"
+    );
+    assert_eq!(
+        refusal(propose(
+            &rig,
+            json!({"name":"ws2","template":"ws","bridge":"br9"})
+        )),
+        "bridge br9 is not one of the bridges this node allows (kernel.bridged.bridges)"
+    );
+    assert_eq!(
+        refusal(propose(&rig, json!({"name":"nats","template":"nats"}))),
+        "this node is a bridged node: it runs virtual-machine templates only, and template nats is not one"
+    );
+    let managed = Rig::managed();
+    assert_eq!(
+        refusal(propose(&managed, json!({"name":"ws1","template":"ws"}))),
+        "template ws is a virtual machine, and this node is not a bridged node (kernel.bridged is not set)"
+    );
+    let container = propose(&managed, json!({"name":"nats","template":"nats"}))
+        .expect("a container proposal is as before");
+    assert_eq!(
+        container["summary"],
+        "Create the service nats from template nats"
+    );
+    assert!(rig.fake.writes().is_empty() && managed.fake.writes().is_empty());
 }
