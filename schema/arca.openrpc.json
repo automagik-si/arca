@@ -1892,6 +1892,14 @@
             "minLength": 64,
             "type": "string"
           }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
         }
       ],
       "result": {
@@ -2022,6 +2030,14 @@
             "minLength": 16,
             "pattern": "^act-[0-9a-f]{12}$",
             "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
           }
         }
       ],
@@ -2685,6 +2701,14 @@
           "schema": {
             "maxLength": 31,
             "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
           }
         }
       ],
@@ -3435,6 +3459,14 @@
             "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
             "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
             "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
           }
         }
       ],
@@ -4495,6 +4527,14 @@
           }
         },
         {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
           "name": "kind",
           "required": false,
           "schema": {
@@ -4793,6 +4833,14 @@
             "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
             "pattern": "^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
             "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
           }
         },
         {
@@ -5338,6 +5386,14 @@
             "minLength": 1,
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
             "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
           }
         },
         {
