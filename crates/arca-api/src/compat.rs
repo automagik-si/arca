@@ -10,7 +10,7 @@
 //! admitted by the released one. A result may therefore gain fields and admit less; it may not admit more.
 //!
 //! The schema subset is the one `check.rs` reads: type, enum, bounds, properties, required, items, additionalProperties and
-//! anyOf. Where two schemas differ in a way this module cannot relate, it reports a break (fail closed). That covers an
+//! anyOf. `propertyNames`, and an `additionalProperties` that is a schema, are read by `check.rs` but not modelled here. Where two schemas differ in a way this module cannot relate, it reports a break (fail closed). That covers an
 //! `anyOf` that changes as a value, a keyword outside the subset (annotations and `x-` extensions aside) that differs, and
 //! a schema that is not an object. The minimum scope is ranked in the order of [`crate::Scope`].
 //!
@@ -474,17 +474,27 @@ fn names_new_property(old: &Value, new: &Value) -> bool {
     })
 }
 
-/// The first keyword outside the subset, in name order, on which two schema objects differ. The checker does not model
-/// such a keyword, so a difference in it cannot be related and is a break.
+/// The first keyword this checker does not model, in name order, on which two schema objects differ: one outside the
+/// subset, `propertyNames`, or an `additionalProperties` that is a schema on either side (only `false` is modelled). Such
+/// a difference cannot be related and is a break.
 fn unmodelled_difference<'a>(
     wide: &'a Map<String, Value>,
     narrow: &'a Map<String, Value>,
 ) -> Option<&'a str> {
+    let unmodelled = |key: &str| {
+        outside_subset(key)
+            || key == "propertyNames"
+            || (key == "additionalProperties"
+                && [wide.get(key), narrow.get(key)]
+                    .into_iter()
+                    .flatten()
+                    .any(|value| !value.is_boolean()))
+    };
     let keys: BTreeSet<&str> = wide
         .keys()
         .chain(narrow.keys())
         .map(String::as_str)
-        .filter(|key| outside_subset(key))
+        .filter(|key| unmodelled(key))
         .collect();
     keys.into_iter()
         .find(|key| wide.get(*key) != narrow.get(*key))

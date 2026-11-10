@@ -361,6 +361,24 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         Arc::new(cfg.clone()),
     ))
     .collect();
+    // The owner approval requests: the three verbs and the approval page share one store in the state directory.
+    let dashboard = cfg
+        .approval_origin
+        .as_ref()
+        .map(|origin| format!("{origin}/approve"));
+    let approval_requests = Arc::new(
+        crate::approval_requests::ApprovalRequests::open(&cfg.state_dir, dashboard, now_ms())
+            .map_err(|e| {
+                Failure::Runtime(format!("the approval requests cannot be opened: {e}"))
+            })?,
+    );
+    for (verb, handler) in crate::approval_requests::handlers(
+        Arc::clone(&kernel),
+        clock.clone(),
+        Arc::clone(&approval_requests),
+    ) {
+        server = server.handle(verb, handler);
+    }
     for (verb, handler) in &action_handlers {
         if (*verb == "action_approve" && !relayed)
             || (*verb == "peer_keys_sync" && !keeps_peer_keys)
@@ -397,6 +415,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .with_canvas_origin(&cfg.canvas_origin)
         .with_actions(actions)
+        .with_approval_requests(Arc::clone(&approval_requests))
         .with_linked_hosts(linked_hosts.clone());
         match &peer_sync {
             Some(syncer) => page.with_peer_sync(syncer.clone()),

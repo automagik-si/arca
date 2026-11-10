@@ -1910,3 +1910,28 @@ The exec audit is local, private and separate from `journal_list`. A crash can l
 until unpublish or instance stop, and can leave recordings until the next startup sweep. A crash before the operation id is
 synced leaves a recording the sweep cannot name; deleting the instance removes it. A real tailnet join requires the owner's
 key and is a deployment acceptance check, not a hermetic test.
+
+### Owner approval requests
+
+An assistant that needs the owner's approval for a call (a `service_remove`, say) asks for it with
+`owner_approval_request`: `kind` `arca`, the `action` (`delete`, `publish` or `spend`), the call's `target`, and its `args`
+without `approval`. Arca checks the fields as the statement will carry them and refuses, in plain words, a request no
+statement can carry: a missing action ("an arca request needs action"), a bad target, args that are not an object, args
+over 4096 bytes or nested more than 8 levels, a control or bidi character, or an argument that reads as an approval string.
+Kind `upgrade` is an identity phone's step: it is refused with `upgrade_not_here` and approved through droidd's MCP.
+A token keeps at most 5 pending requests and Arca at most 20; an identical pending request from the same token is the same
+request. The request names the passkey page in `dashboard`. Requests and statuses are a doctor's or an operator's, and
+`owner_approval_list` is a viewer's too. The list's arguments and fields are untrusted, because the assistant wrote them.
+
+The request waits on the passkey page under "Asked by your assistant", drawn as text. One tap on Approve asks Arca for the
+statement (this host, the request's action, target and argument digest, a fresh nonce, valid 15 minutes), the passkey signs
+it, and Arca checks the proof as the call will, spending nothing. The owner has 120 seconds from the tap. Decline needs no
+passkey and is final. Only passkeys made for the page's address are offered; a passkey made for an earlier address is
+refused with `passkey_rp_changed`, and the owner adds it again on the page. Approval is the owner's built-in passkey only.
+
+`owner_approval_status` (with `waitMs` up to 30000 to wait for the decision) answers the state. The approval string goes
+to the token that asked, never to another token or to the page, and the assistant passes it to its call, which spends it
+once. A pending request expires after 60 minutes; an approved one's string is dropped once its nonce is spent or its
+statement expires. The requests live in `approval-requests.json` in the state directory (mode 0600). Each request, approval
+and decline is a line in `approval-requests-audit.jsonl` naming the request, its digest and the requester, never an
+approval string, a credential or a challenge.

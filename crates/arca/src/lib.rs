@@ -9,6 +9,7 @@
 
 pub mod action_proposal;
 pub mod adoptions;
+pub mod approval_requests;
 pub mod approve_page;
 pub mod canvas;
 pub mod cmd_adopt;

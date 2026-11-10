@@ -17,6 +17,17 @@ pub trait SignatureVerifier: Send + Sync {
         statement: &[u8],
         signature: &[u8],
     ) -> Result<String, ApprovalRefusal>;
+
+    /// [`SignatureVerifier::verify`] without its side effects: the same refusals, but no sign count is advanced. A verifier
+    /// with no state keeps the default, which is `verify` itself. A page uses this to check a proof that a later call spends.
+    fn peek(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        self.verify(namespace, statement, signature)
+    }
 }
 
 /// The verifier until one is installed: every well-formed approval is refused with [`ApprovalRefusal::NoVerifier`].
@@ -109,6 +120,49 @@ impl<V: SignatureVerifier, N: NonceStore> ApprovalVerifier<V, N> {
         approval: &str,
         now_ms: u64,
     ) -> Result<Spent, ApprovalRefusal> {
+        let (parsed, key) = self.checked(action, target, args, approval, now_ms, false)?;
+        self.nonces.spend(&parsed.nonce, now_ms)?;
+        Ok(Spent {
+            nonce: parsed.nonce,
+            key,
+        })
+    }
+
+    /// Everything [`ApprovalVerifier::check`] checks, in its order, with nothing spent: no nonce is spent and no sign count is
+    /// advanced ([`SignatureVerifier::peek`]). An approval that passes here passes `check` for the same call until its window
+    /// closes, its nonce is spent or its passkey counts past it. The owner approval page uses it to approve a request whose
+    /// approval the requester spends later.
+    pub fn preview(
+        &self,
+        action: ArcaAction,
+        target: &str,
+        args: &Value,
+        approval: &str,
+        now_ms: u64,
+    ) -> Result<Spent, ApprovalRefusal> {
+        let (parsed, key) = self.checked(action, target, args, approval, now_ms, true)?;
+        Ok(Spent {
+            nonce: parsed.nonce,
+            key,
+        })
+    }
+
+    /// Whether `nonce` is spent in this verifier's store.
+    pub fn nonce_spent(&self, nonce: &str) -> bool {
+        self.nonces.spent(nonce)
+    }
+
+    /// The shared checks of `check` and `preview`, ending with the nonce's read; `peek` keeps the signature check free of
+    /// side effects.
+    fn checked(
+        &self,
+        action: ArcaAction,
+        target: &str,
+        args: &Value,
+        approval: &str,
+        now_ms: u64,
+        peek: bool,
+    ) -> Result<(crate::statement::OwnerApproval, String), ApprovalRefusal> {
         // No approval can name a target the grammar refuses, so such a call is refused as the wrong target.
         if !valid_target(target) {
             return Err(ApprovalRefusal::WrongTarget);
@@ -118,9 +172,12 @@ impl<V: SignatureVerifier, N: NonceStore> ApprovalVerifier<V, N> {
         })?;
         let (statement, signature) = split_approval(approval)?;
         let parsed = parse_statement(&statement)?;
-        let key = self
-            .verifier
-            .verify(ARCA_NAMESPACE, &statement, &signature)?;
+        let key = if peek {
+            self.verifier.peek(ARCA_NAMESPACE, &statement, &signature)?
+        } else {
+            self.verifier
+                .verify(ARCA_NAMESPACE, &statement, &signature)?
+        };
 
         if parsed.host != self.host {
             return Err(ApprovalRefusal::WrongHost);
@@ -156,11 +213,7 @@ impl<V: SignatureVerifier, N: NonceStore> ApprovalVerifier<V, N> {
         if self.nonces.spent(&parsed.nonce) {
             return Err(ApprovalRefusal::Replayed);
         }
-        self.nonces.spend(&parsed.nonce, now_ms)?;
-        Ok(Spent {
-            nonce: parsed.nonce,
-            key,
-        })
+        Ok((parsed, key))
     }
 }
 

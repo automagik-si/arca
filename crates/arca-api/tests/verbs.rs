@@ -63,6 +63,9 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "omni_instance_create",
             "omni_pair",
             "omni_status",
+            "owner_approval_request",
+            "owner_approval_status",
+            "owner_approval_list",
             "gpu_attach",
             "gpu_detach",
             "storage_list",
@@ -1130,4 +1133,48 @@ fn omni_schemas_equal_the_golden_and_every_omni_verb_is_untrusted() {
         assert_eq!(v.min_scope, Scope::Doctor, "{}", v.name);
         assert_eq!(v.read_only_hint(), v.name == "omni_status", "{}", v.name);
     }
+}
+
+#[test]
+fn owner_approval_schemas_equal_the_golden_with_list_untrusted_and_status_not_read_only() {
+    let rows: Value = serde_json::from_str(include_str!("fixtures/owner-approval.json")).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let v = verb(row["name"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            parity_shape(&(v.params)()),
+            parity_shape(&row["inputSchema"]),
+            "{}",
+            v.name
+        );
+        assert_eq!(
+            parity_shape(&(v.result)()),
+            parity_shape(&row["outputSchema"]),
+            "{}",
+            v.name
+        );
+        assert!(!v.destructive, "{}", v.name);
+        // The golden's flags: only the list is readOnly and untrusted.
+        assert_eq!(
+            v.read_only_hint(),
+            v.name == "owner_approval_list",
+            "{}",
+            v.name
+        );
+        assert_eq!(v.untrusted, v.name == "owner_approval_list", "{}", v.name);
+    }
+    // The request and the status are a doctor's at least (the status hands out an approval); the list is a viewer read.
+    assert_eq!(
+        verb("owner_approval_request").unwrap().min_scope,
+        Scope::Doctor
+    );
+    assert_eq!(
+        verb("owner_approval_status").unwrap().min_scope,
+        Scope::Doctor
+    );
+    assert_eq!(
+        verb("owner_approval_list").unwrap().min_scope,
+        Scope::Viewer
+    );
 }

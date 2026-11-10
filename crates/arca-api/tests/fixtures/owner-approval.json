@@ -1,0 +1,298 @@
+[
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "delete",
+            "publish",
+            "spend"
+          ]
+        },
+        "args": {
+          "type": "object"
+        },
+        "confirmSnapshotLoss": {
+          "type": "boolean"
+        },
+        "droid": {
+          "pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "type": "string"
+        },
+        "droidd": {
+          "pattern": "^droid[a-z0-9]{0,7}$",
+          "type": "string"
+        },
+        "eyes": {
+          "enum": [
+            "enable",
+            "skip"
+          ]
+        },
+        "fromFp": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "arca",
+            "upgrade"
+          ]
+        },
+        "look": {
+          "enum": [
+            "apply",
+            "skip"
+          ]
+        },
+        "openWhatsApp": {
+          "type": "boolean"
+        },
+        "step": {
+          "enum": [
+            "split",
+            "upgrade",
+            "split_rollback",
+            "upgrade_rollback",
+            "retired_delete"
+          ]
+        },
+        "target": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+          "type": "string"
+        },
+        "toFp": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "name": "owner_approval_request",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "dashboard": {
+          "anyOf": [
+            {
+              "maxLength": 300,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "expiresAt": {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^ar_[0-9a-f]{16}$",
+          "type": "string"
+        },
+        "state": {
+          "const": "pending",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dashboard",
+        "expiresAt",
+        "id",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "pattern": "^ar_[0-9a-f]{16}$",
+          "type": "string"
+        },
+        "waitMs": {
+          "maximum": 30000,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "owner_approval_status",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "approval": {
+          "maxLength": 16384,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}\\.[A-Za-z0-9+/]+={0,2}$",
+          "type": "string"
+        },
+        "approvalExpiresAt": {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+          "type": "string"
+        },
+        "expiresAt": {
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^ar_[0-9a-f]{16}$",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "pending",
+            "approved",
+            "denied",
+            "expired"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "expiresAt",
+        "id",
+        "state"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "owner_approval_list",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "approvalExpiresAt": {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                "type": "string"
+              },
+              "args": {
+                "additionalProperties": {},
+                "propertyNames": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "createdAt": {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                "type": "string"
+              },
+              "droidd": {
+                "maxLength": 16,
+                "type": "string"
+              },
+              "expiresAt": {
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                "type": "string"
+              },
+              "fields": {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "maxLength": 200,
+                      "type": "string"
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "propertyNames": {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              "host": {
+                "maxLength": 253,
+                "type": "string"
+              },
+              "id": {
+                "pattern": "^ar_[0-9a-f]{16}$",
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "arca",
+                  "upgrade"
+                ],
+                "type": "string"
+              },
+              "requester": {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "maxLength": 16,
+                    "type": "string"
+                  },
+                  "name": {
+                    "maxLength": 200,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name"
+                ],
+                "type": "object"
+              },
+              "state": {
+                "enum": [
+                  "pending",
+                  "approved",
+                  "denied",
+                  "expired"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "createdAt",
+              "droidd",
+              "expiresAt",
+              "fields",
+              "host",
+              "id",
+              "kind",
+              "requester",
+              "state"
+            ],
+            "type": "object"
+          },
+          "maxItems": 50,
+          "type": "array"
+        }
+      },
+      "required": [
+        "requests"
+      ],
+      "type": "object"
+    }
+  }
+]

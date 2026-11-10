@@ -354,6 +354,11 @@
     <div id="plans" class="plans"><div class="card loading">Loading…</div></div>
   </section>
 
+  <section id="requests-section" aria-labelledby="requests-title" hidden>
+    <h2 id="requests-title">Asked by your assistant</h2>
+    <div id="requests" class="plans"></div>
+  </section>
+
   <section class="setup" aria-labelledby="setup-title">
     <h2 id="setup-title">Your passkeys</h2>
     <div id="passkeys" class="plans"></div>
@@ -672,6 +677,108 @@ async function trustPeerKeys(card, button) {
   }
 }
 
+const REQUEST_WORDS = { delete: "Delete", publish: "Publish", spend: "Spend on" };
+
+// A request an agent made with owner_approval_request. Everything in it is the agent's words, so every part is set as text.
+function requestCard(request) {
+  const fields = request.fields || {};
+  const card = el("article", "card plan action");
+  const meta = el("div", "plan-meta");
+  const expiresAt = Date.parse(request.expiresAt);
+  const expiry = el("time", "expiry");
+  expiry.dateTime = request.expiresAt;
+  if (expiresAt - Date.now() < 5 * 60000) expiry.classList.add("soon");
+  expiry.append(icon("clock"), expiryText(expiresAt));
+  meta.append(el("span", "badge", "Request"), expiry);
+
+  const title = (REQUEST_WORDS[fields.action] || String(fields.action)) + " " + String(fields.target);
+  const heading = el("h3", "", title);
+  const facts = el("dl", "action-facts");
+  const fact = (label, value, code) => {
+    const row = el("div", "action-fact");
+    row.append(el("dt", "", label));
+    const detail = el("dd");
+    detail.append(code ? el("code", "", value) : document.createTextNode(value));
+    row.append(detail);
+    facts.append(row);
+  };
+  const requester = request.requester || {};
+  fact("Asked by", String(requester.name) + " (" + String(requester.kind) + ")", false);
+  const args = request.args && typeof request.args === "object" ? request.args : {};
+  for (const [key, value] of Object.entries(args)) {
+    fact(key, typeof value === "string" ? value : JSON.stringify(value), true);
+  }
+  const digest = String(fields.paramsDigest || "");
+  fact("Fingerprint", digest.slice(0, 8) + "…" + digest.slice(-4), true);
+
+  const buttons = el("div", "actions");
+  const approveButton = el("button", "btn btn-primary btn-big approve");
+  approveButton.type = "button";
+  approveButton.setAttribute("aria-label", "Approve: " + title);
+  approveButton.append(icon("key"), "Approve");
+  approveButton.addEventListener("click", () => approveRequest(request, approveButton));
+  const denyButton = el("button", "btn btn-secondary", "Decline");
+  denyButton.type = "button";
+  denyButton.addEventListener("click", () => denyRequest(request, denyButton));
+  buttons.append(approveButton, denyButton);
+
+  card.append(meta, heading, facts, buttons);
+  return card;
+}
+
+async function requestPost(path, body) {
+  const answer = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const result = await answer.json().catch(() => ({}));
+  if (!answer.ok) {
+    const refused = new Error(result.message || result.refusal || ("the request answered " + answer.status));
+    refused.refusal = REFUSALS[result.refusal] ? result.refusal : undefined;
+    throw refused;
+  }
+  return result;
+}
+
+// One tap: Arca mints the statement for this request, the passkey signs it, and the approval is bound to the request id
+// and that statement.
+async function approveRequest(request, button) {
+  button.disabled = true;
+  status("Confirm with your passkey…", "wait");
+  try {
+    const begun = await requestPost("/approve/requests/begin", { id: request.id });
+    const proof = await trustedProof(begun.statement);
+    await requestPost("/approve/requests/approve", { id: request.id, statement: begun.statement, proof });
+    status("Approved. Your assistant can go ahead now.", "ok");
+    await loadPlans();
+  } catch (error) {
+    fail(error);
+    button.disabled = false;
+  }
+}
+
+async function denyRequest(request, button) {
+  button.disabled = true;
+  status("Declining…", "wait");
+  try {
+    await requestPost("/approve/requests/deny", { id: request.id });
+    status("Declined. Nothing changed.", "ok");
+    await loadPlans();
+  } catch (error) {
+    fail(error);
+    button.disabled = false;
+  }
+}
+
+function showRequests(requests) {
+  const section = document.getElementById("requests-section");
+  const target = document.getElementById("requests");
+  const pending = (Array.isArray(requests) ? requests : []).filter((request) => request.state === "pending");
+  target.replaceChildren(...pending.map(requestCard));
+  section.hidden = pending.length === 0;
+}
+
 function showTrusted(count) {
   document.getElementById("trusted").textContent = String(count);
   document.body.dataset.trusted = count > 0 ? "yes" : "no";
@@ -688,6 +795,7 @@ async function loadPlans() {
     if (!response.ok) throw new Error("the plan list answered " + response.status);
     const body = await response.json();
     showTrusted(body.passkeysTrusted || 0);
+    showRequests(body.approvalRequests);
     target.replaceChildren();
     const peerKeys = Array.isArray(body.peerKeys) ? body.peerKeys : [];
     if (!body.plans.length && !peerKeys.length) {

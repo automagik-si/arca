@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use arca::approval_requests::{self, ApprovalRequests};
 use arca::approve_page::{self, SetupCodeDisplay};
 use arca::canvas::{
     CHAT_BODY_MAX, CHAT_CONCURRENCY, CHAT_HISTORY_PATH, CHAT_PATH, CHAT_STREAM_MAX, Canvas,
@@ -371,6 +372,7 @@ struct Rig {
     canvas: Canvas,
     upstream: Arc<TestUpstream>,
     action_runs: Arc<AtomicU64>,
+    requests: Arc<ApprovalRequests>,
     _runtime: Runtime,
 }
 
@@ -473,6 +475,10 @@ impl Rig {
         fs::create_dir(&state_dir).expect("the state directory");
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
         let clock = Arc::new(AtomicU64::new(NOW));
+        let requests = Arc::new(
+            ApprovalRequests::open(&state_dir, Some(format!("{ORIGIN}/approve")), NOW)
+                .expect("the approval requests open"),
+        );
         let display = Arc::new(FakeDisplay::default());
         let action_runs = Arc::new(AtomicU64::new(0));
         let actions = ActionExecutor::new([(
@@ -495,6 +501,7 @@ impl Rig {
         .with_canvas_origin(&format!("http://{}", upstream.addr))
         .with_chat_timeouts(chat_idle, chat_total)
         .with_actions(actions)
+        .with_approval_requests(Arc::clone(&requests))
         .with_log(Arc::new(move |line| {
             captured_logs
                 .lock()
@@ -541,6 +548,7 @@ impl Rig {
             canvas,
             upstream,
             action_runs,
+            requests,
             _runtime: runtime,
         };
         (rig, key)
@@ -3704,4 +3712,141 @@ fn passkey_change_preserves_the_trusted_keys_sign_count_across_reload() {
         200
     );
     assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 3);
+}
+
+#[test]
+fn g7_a_kind_arca_request_is_approved_by_one_tap_on_the_page_and_kind_upgrade_is_refused() {
+    let (rig, key) = Rig::new("page-g7-tap", true);
+    let read = Arc::clone(&rig.clock);
+    let clock: Clock = Arc::new(move || read.load(Ordering::SeqCst));
+    let verbs: std::collections::HashMap<_, _> =
+        approval_requests::handlers(Arc::clone(&rig.kernel), clock, Arc::clone(&rig.requests))
+            .into_iter()
+            .collect();
+    let doctor = Caller {
+        token_id: "doctor".to_string(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    match verbs["owner_approval_request"].call(
+        json!({ "kind": "upgrade", "droid": "phone1", "step": "eyes" }),
+        &doctor,
+    ) {
+        Err(CallError::Refused { code, message }) => {
+            assert_eq!(code, "upgrade_not_here");
+            assert!(message.contains("droidd's MCP"), "{message}");
+        }
+        other => panic!("kind upgrade is refused, got {other:?}"),
+    }
+    let args = json!({ "name": "nats" });
+    let ask = |target: &str, args: &Value| {
+        let created = verbs["owner_approval_request"]
+            .call(
+                json!({ "kind": "arca", "action": "delete", "target": target, "args": args }),
+                &doctor,
+            )
+            .expect("the request is made");
+        created["id"].as_str().expect("an id").to_string()
+    };
+    let id = ask("nats", &args);
+
+    let (status, body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
+    assert_eq!(listed["approvalRequests"][0]["id"], json!(id));
+    assert_eq!(listed["approvalRequests"][0]["state"], "pending");
+    assert_eq!(listed["approvalRequests"][0]["args"], args);
+    assert!(listed["approvalRequests"][0].get("approval").is_none());
+    assert_eq!(listed["approvalPasskeys"]["forThisAddress"], 1);
+
+    for origin in [None, Some("https://box1.example.com:9443")] {
+        assert!(
+            refusal(
+                rig.post("/approve/requests/begin", origin, json!({ "id": id }))
+                    .0
+            ),
+            "begin needs the page's exact origin: {origin:?}"
+        );
+    }
+
+    // One tap: begin mints the statement, the software authenticator signs it, approve takes id, statement and proof.
+    let (status, begun) = rig.post("/approve/requests/begin", Some(ORIGIN), json!({ "id": id }));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&begun));
+    let begun: Value = serde_json::from_slice(&begun).expect("begin JSON");
+    let statement = begun["statement"].as_str().expect("a statement");
+    let proof = key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+    let wrong = key.proof_value(&Assert::over(NAMESPACE, b"another statement"));
+    let (status, _) = rig.post(
+        "/approve/requests/approve",
+        Some(ORIGIN),
+        json!({ "id": id, "statement": statement, "proof": wrong }),
+    );
+    assert_eq!(status, 403, "a proof over another statement is refused");
+    let body = json!({ "id": id, "statement": statement, "proof": proof });
+    for origin in [None, Some("https://box1.example.com:9443")] {
+        assert!(
+            refusal(
+                rig.post("/approve/requests/approve", origin, body.clone())
+                    .0
+            ),
+            "approve needs the page's exact origin: {origin:?}"
+        );
+    }
+    let (status, answer) = rig.post("/approve/requests/approve", Some(ORIGIN), body.clone());
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let answer: Value = serde_json::from_slice(&answer).expect("approve JSON");
+    assert_eq!(answer["state"], "approved");
+    assert!(
+        answer.get("approval").is_none(),
+        "the page gets the state only"
+    );
+    let (status, _) = rig.post("/approve/requests/approve", Some(ORIGIN), body);
+    assert_eq!(
+        status, 409,
+        "a second tap on an approved request is refused"
+    );
+
+    let status = verbs["owner_approval_status"]
+        .call(json!({ "id": id }), &doctor)
+        .expect("the requester reads its status");
+    assert_eq!(status["state"], "approved");
+    let approval = status["approval"].as_str().expect("the approval string");
+    let spend = |approval: &str| {
+        rig.kernel.lock().expect("kernel").check_approval(
+            ArcaAction::Delete,
+            "nats",
+            &args,
+            approval,
+            NOW,
+        )
+    };
+    spend(approval).expect("the kernel spends the tapped approval");
+    assert_eq!(
+        spend(approval),
+        Err(arca_approval::ApprovalRefusal::Replayed),
+        "once"
+    );
+
+    let other = ask("svc2", &json!({ "name": "svc2" }));
+    let (status, denied) = rig.post(
+        "/approve/requests/deny",
+        Some(ORIGIN),
+        json!({ "id": other }),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&denied));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&denied).expect("deny JSON"),
+        json!({ "state": "denied" })
+    );
+
+    let (status, page) = rig.get("/approve", None);
+    assert_eq!(status, 200);
+    let page = String::from_utf8_lossy(&page);
+    assert!(
+        page.contains("id=\"requests-section\""),
+        "the requests section"
+    );
+    for unsafe_sink in ["innerHTML", "outerHTML", "insertAdjacentHTML"] {
+        assert!(!page.contains(unsafe_sink), "text only: {unsafe_sink}");
+    }
 }

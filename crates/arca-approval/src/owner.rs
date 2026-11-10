@@ -31,6 +31,11 @@ impl OwnerKeys {
         self.passkeys.lines()
     }
 
+    /// Why every passkey proof is refused, when the passkeys file could not be trusted or read.
+    pub fn passkey_refusal(&self) -> Option<&ApprovalRefusal> {
+        self.passkeys.refusal()
+    }
+
     /// Replaces the passkey lines while keeping their sign-count store. The SSH keys are untouched.
     pub fn replace_passkey_lines(&mut self, lines: Vec<PasskeyLine>) {
         self.passkeys.replace_lines(lines);
@@ -68,6 +73,19 @@ impl SignatureVerifier for OwnerKeys {
     ) -> Result<String, ApprovalRefusal> {
         if signature.first() == Some(&PASSKEY_PROOF_OPEN) {
             self.passkeys.verify(namespace, statement, signature)
+        } else {
+            self.ssh.verify(namespace, statement, signature)
+        }
+    }
+
+    fn peek(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        if signature.first() == Some(&PASSKEY_PROOF_OPEN) {
+            self.passkeys.peek(namespace, statement, signature)
         } else {
             self.ssh.verify(namespace, statement, signature)
         }

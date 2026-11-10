@@ -701,21 +701,7 @@ impl FileSignCounts {
     /// written, as a synced passkey always reports 0. Else [`ApprovalRefusal::SignCountRegressed`]. A count is kept only once
     /// its record is written and fsynced. A failed write or fsync leaves the store failed.
     pub fn advance(&mut self, fingerprint: &str, count: u32) -> Result<(), ApprovalRefusal> {
-        if !valid_hex(fingerprint, 64, 64) {
-            return Err(malformed(
-                "the passkey's fingerprint is not 64 lowercase hex digits",
-            ));
-        }
-        if self.failed {
-            return Err(ApprovalRefusal::Storage(
-                "an earlier write failed, so this store advances nothing more; restart the kernel"
-                    .to_string(),
-            ));
-        }
-        let last = self.counts.get(fingerprint).copied().unwrap_or(0);
-        if (count > 0 && count <= last) || (count == 0 && last != 0) {
-            return Err(ApprovalRefusal::SignCountRegressed);
-        }
+        self.check(fingerprint, count)?;
         if count == 0 {
             return Ok(());
         }
@@ -732,6 +718,26 @@ impl FileSignCounts {
             )));
         }
         self.counts.insert(fingerprint.to_string(), count);
+        Ok(())
+    }
+
+    /// The refusals of [`FileSignCounts::advance`] for `count`, with nothing written or kept.
+    pub fn check(&self, fingerprint: &str, count: u32) -> Result<(), ApprovalRefusal> {
+        if !valid_hex(fingerprint, 64, 64) {
+            return Err(malformed(
+                "the passkey's fingerprint is not 64 lowercase hex digits",
+            ));
+        }
+        if self.failed {
+            return Err(ApprovalRefusal::Storage(
+                "an earlier write failed, so this store advances nothing more; restart the kernel"
+                    .to_string(),
+            ));
+        }
+        let last = self.counts.get(fingerprint).copied().unwrap_or(0);
+        if (count > 0 && count <= last) || (count == 0 && last != 0) {
+            return Err(ApprovalRefusal::SignCountRegressed);
+        }
         Ok(())
     }
 }
@@ -835,6 +841,14 @@ impl PasskeyVerifier {
         }
     }
 
+    /// Why this verifier refuses every passkey proof, when its passkeys file could not be trusted or read.
+    pub fn refusal(&self) -> Option<&ApprovalRefusal> {
+        match &self.keys {
+            Keys::Kept { .. } => None,
+            Keys::Refused(refusal) => Some(refusal),
+        }
+    }
+
     /// The passkey lines this verifier trusts. A refusing verifier trusts none.
     pub fn lines(&self) -> &[PasskeyLine] {
         match &self.keys {
@@ -865,19 +879,22 @@ impl PasskeyVerifier {
         statement: &[u8],
         signature: &[u8],
     ) -> Result<String, ApprovalRefusal> {
-        self.verify_with(namespace, statement, signature, false)
+        self.verify_with(namespace, statement, signature, false, true)
     }
 
     /// Refuses in this order: a passkeys file that could not be trusted; a namespace other than Arca's; a proof that is not
     /// one strict proof; every check of [`verify_assertion`]; a sign count that does not advance, or a count that cannot be
     /// made durable. With `foreign`, the lines of the trusted foreign files and the peer file are read now and added after the
     /// kernel's own; such a line never replaces an own line, or an earlier trusted one, with the same credential or key.
+    ///
+    /// Without `advance`, the count is checked as `advance` would check it and nothing is written: [`SignatureVerifier::peek`].
     fn verify_with(
         &self,
         namespace: &str,
         statement: &[u8],
         signature: &[u8],
         foreign: bool,
+        advance: bool,
     ) -> Result<String, ApprovalRefusal> {
         let (lines, counts) = match &self.keys {
             Keys::Kept { lines, counts } => (lines, counts),
@@ -906,10 +923,14 @@ impl PasskeyVerifier {
         } else {
             verify_assertion(namespace, statement, &proof, lines)?
         };
-        counts
-            .lock()
-            .map_err(|_| ApprovalRefusal::Storage("the sign-count store is poisoned".to_string()))?
-            .advance(&asserted.fingerprint, asserted.sign_count)?;
+        let mut counts = counts.lock().map_err(|_| {
+            ApprovalRefusal::Storage("the sign-count store is poisoned".to_string())
+        })?;
+        if advance {
+            counts.advance(&asserted.fingerprint, asserted.sign_count)?;
+        } else {
+            counts.check(&asserted.fingerprint, asserted.sign_count)?;
+        }
         Ok(format!("passkey:{}", asserted.fingerprint))
     }
 }
@@ -923,6 +944,16 @@ impl SignatureVerifier for PasskeyVerifier {
         statement: &[u8],
         signature: &[u8],
     ) -> Result<String, ApprovalRefusal> {
-        self.verify_with(namespace, statement, signature, true)
+        self.verify_with(namespace, statement, signature, true, true)
+    }
+
+    /// The approval check of `verify`, over the same lines, with the sign count checked and not advanced.
+    fn peek(
+        &self,
+        namespace: &str,
+        statement: &[u8],
+        signature: &[u8],
+    ) -> Result<String, ApprovalRefusal> {
+        self.verify_with(namespace, statement, signature, true, false)
     }
 }

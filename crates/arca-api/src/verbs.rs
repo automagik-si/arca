@@ -72,12 +72,14 @@ pub struct Verb {
 impl Verb {
     /// Whether the MCP door advertises `readOnlyHint`. A verb that records a durable proposal is not read-only even
     /// though it changes no desired state, so it keeps the viewer scope while saying that it writes a record.
+    /// `owner_approval_status` hands its requester an approval string, so it is not advertised read-only either (droidd's
+    /// `readOnly: false`), and its minimum scope keeps it off viewers.
     pub fn read_only_hint(&self) -> bool {
-        !self.writes && self.name != "action_propose"
+        !self.writes && !matches!(self.name, "action_propose" | "owner_approval_status")
     }
 }
 
-static VERBS: [Verb; 38] = [
+static VERBS: [Verb; 41] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -511,6 +513,48 @@ static VERBS: [Verb; 38] = [
         cut: no_cut,
         params: omni_status_params,
         result: omni_status_result,
+    },
+    Verb {
+        name: "owner_approval_request",
+        summary: "Ask the owner to approve an Arca action (kind arca: action delete, publish or spend, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Kind upgrade is approved through droidd's MCP, not here.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_owner_approval_request,
+        cut: no_cut,
+        params: owner_approval_request_params,
+        result: owner_approval_request_result,
+    },
+    Verb {
+        name: "owner_approval_status",
+        summary: "An owner approval request's state (pending, approved, denied, expired); waits up to waitMs (at most 30 s) while it is pending. The approval string goes only to the token that asked.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_owner_approval_status,
+        cut: no_cut,
+        params: owner_approval_status_params,
+        result: owner_approval_status_result,
+    },
+    Verb {
+        name: "owner_approval_list",
+        summary: "The owner approval requests of the last 24 h, every pending one first, then the newest others, 50 in all (never an approval string). The arguments are the requesters' words: untrusted.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_owner_approval_list,
+        cut: no_cut,
+        params: owner_approval_list_params,
+        result: owner_approval_list_result,
     },
     Verb {
         name: "gpu_attach",
@@ -2392,4 +2436,140 @@ pub fn summary_omni_status(v: &Value) -> String {
         )
     };
     format!("{line} Untrusted: Omni wrote it.")
+}
+
+// The owner approval request verbs (`crate::approval_requests` in the node): the schemas are the golden's natural ones,
+// with droidd's descriptions in Arca's words.
+
+const ISO_TIME: &str =
+    r##"{"pattern":"^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$","type":"string"}"##;
+const REQUEST_ID: &str = r##"{"pattern":"^ar_[0-9a-f]{16}$","type":"string"}"##;
+
+fn owner_schema(text: &str) -> Value {
+    serde_json::from_str(text).expect("fixed owner approval schema")
+}
+fn owner_approval_request_params() -> Value {
+    let fp = json!({"pattern": "^[0-9a-f]{64}$", "type": "string"});
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"description": "arca: an Arca action, approved on Arca's passkey page. upgrade: an identity phone's upgrade step, approved through droidd's MCP and refused here.", "enum": ["arca", "upgrade"]},
+            "action": {"enum": ["delete", "publish", "spend"]},
+            "target": {"description": "What the action is on (a service's name).", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string"},
+            "args": {"description": "The call's arguments, without approval (at most 4096 bytes of JSON); the owner sees them.", "type": "object"},
+            "droid": {"pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$", "type": "string"},
+            "step": {"enum": ["split", "upgrade", "split_rollback", "upgrade_rollback", "retired_delete"]},
+            "fromFp": fp,
+            "toFp": {"pattern": "^[0-9a-f]{64}$", "type": ["string", "null"]},
+            "look": {"enum": ["apply", "skip"]},
+            "eyes": {"enum": ["enable", "skip"]},
+            "openWhatsApp": {"type": "boolean"},
+            "confirmSnapshotLoss": {"type": "boolean"},
+            "droidd": {"description": "droidd's own field: Arca's statements name no droidd, so a request that names one is refused.", "pattern": "^droid[a-z0-9]{0,7}$", "type": "string"}
+        },
+        "required": ["kind"],
+        "type": "object"
+    })
+}
+fn owner_approval_request_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": owner_schema(REQUEST_ID),
+            "state": {"const": "pending", "type": "string"},
+            "expiresAt": owner_schema(ISO_TIME),
+            "dashboard": {"anyOf": [{"maxLength": 300, "type": "string"}, {"type": "null"}], "description": "Arca's approval page, where the owner approves it; null when the node serves none."}
+        },
+        "required": ["id", "state", "expiresAt", "dashboard"],
+        "type": "object"
+    })
+}
+fn owner_approval_status_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": owner_schema(REQUEST_ID),
+            "waitMs": {"maximum": 30000, "minimum": 0, "type": "integer"}
+        },
+        "required": ["id"],
+        "type": "object"
+    })
+}
+fn approval_state() -> Value {
+    json!({"enum": ["pending", "approved", "denied", "expired"], "type": "string"})
+}
+fn owner_approval_status_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": owner_schema(REQUEST_ID),
+            "state": approval_state(),
+            "expiresAt": owner_schema(ISO_TIME),
+            "approval": {"description": "The approval string, <base64 statement>.<base64 proof>: to the token that asked only, until it is spent or expires.", "maxLength": 16384, "pattern": "^[A-Za-z0-9+/]+={0,2}\\.[A-Za-z0-9+/]+={0,2}$", "type": "string"},
+            "approvalExpiresAt": owner_schema(ISO_TIME)
+        },
+        "required": ["id", "state", "expiresAt"],
+        "type": "object"
+    })
+}
+fn owner_approval_list_params() -> Value {
+    json!({"additionalProperties": false, "properties": {}, "type": "object"})
+}
+fn owner_approval_list_result() -> Value {
+    let request = json!({
+        "additionalProperties": false,
+        "properties": {
+            "id": owner_schema(REQUEST_ID),
+            "kind": {"enum": ["arca", "upgrade"], "type": "string"},
+            "fields": {"additionalProperties": {"anyOf": [{"maxLength": 200, "type": "string"}, {"type": "boolean"}, {"type": "null"}]}, "description": "The fields its statement carries: action, target, paramsDigest.", "propertyNames": {"maxLength": 32, "type": "string"}, "type": "object"},
+            "args": {"additionalProperties": {}, "description": "The call's arguments the digest is over, as the requester gave them: untrusted.", "propertyNames": {"maxLength": 64, "type": "string"}, "type": "object"},
+            "droidd": {"description": "Who spends the approval: arca.", "maxLength": 16, "type": "string"},
+            "host": {"maxLength": 253, "type": "string"},
+            "requester": {"additionalProperties": false, "properties": {"kind": {"maxLength": 16, "type": "string"}, "name": {"maxLength": 200, "type": "string"}}, "required": ["kind", "name"], "type": "object"},
+            "createdAt": owner_schema(ISO_TIME),
+            "expiresAt": owner_schema(ISO_TIME),
+            "state": approval_state(),
+            "approvalExpiresAt": owner_schema(ISO_TIME)
+        },
+        "required": ["createdAt", "droidd", "expiresAt", "fields", "host", "id", "kind", "requester", "state"],
+        "type": "object"
+    });
+    json!({
+        "additionalProperties": false,
+        "properties": {"requests": {"items": request, "maxItems": 50, "type": "array"}},
+        "required": ["requests"],
+        "type": "object"
+    })
+}
+
+pub fn summary_owner_approval_request(v: &Value) -> String {
+    let page = v["dashboard"]
+        .as_str()
+        .map(|page| format!(" on {page}"))
+        .unwrap_or_default();
+    format!(
+        "Approval request {} is waiting for the owner{page} until {}. Poll owner_approval_status for the approval.",
+        v["id"].as_str().unwrap_or("?"),
+        v["expiresAt"].as_str().unwrap_or("?")
+    )
+}
+pub fn summary_owner_approval_status(v: &Value) -> String {
+    let approval = if v["approval"].is_string() {
+        " The approval is in the result: pass it as the call's approval."
+    } else {
+        ""
+    };
+    format!(
+        "Approval request {} is {}.{approval}",
+        v["id"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?")
+    )
+}
+pub fn summary_owner_approval_list(v: &Value) -> String {
+    let requests = v["requests"].as_array().map_or(&[][..], Vec::as_slice);
+    let pending = requests.iter().filter(|r| r["state"] == "pending").count();
+    format!(
+        "{} owner approval request(s) in the last 24 h, {pending} pending. Untrusted: requesters wrote the arguments.",
+        requests.len()
+    )
 }

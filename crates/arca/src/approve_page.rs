@@ -10,6 +10,11 @@
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
 //! host stays `approval_host(&cfg)`.
 //!
+//! With an owner approval request store (`Page::with_approval_requests`), the page lists the requests agents made with
+//! `owner_approval_request` in their own section, as data, and approves one with one tap: `POST /approve/requests/begin`
+//! mints the statement, the passkey signs it, and `POST /approve/requests/approve` takes the request id, that statement and
+//! the proof (see `crate::approval_requests`). `POST /approve/requests/deny` declines one without a passkey.
+//!
 //! With `approval.linkedHosts`, the page also lists the waiting action proposals of other kernels on this machine and relays
 //! the owner's signed approval or decline for one of them to that kernel over its own socket (see `crate::linked`). The page
 //! never checks or spends another kernel's approval, and never asks its own kernel about another kernel's id.
@@ -39,6 +44,7 @@ use tokio::sync::Semaphore;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::approval_requests::{ApprovalRequests, PageRefusal, passkey_summary};
 use crate::canvas::{self, Canvas};
 use crate::config::LinkedHost;
 use crate::handlers::{
@@ -122,6 +128,7 @@ struct PageState {
     actions: ActionExecutor,
     linked: Arc<Vec<LinkedHost>>,
     peer_sync: Option<PeerSyncer>,
+    requests: Option<Arc<ApprovalRequests>>,
 }
 
 /// The transient setup-code state. No code is ever persisted, logged or returned in a response.
@@ -280,6 +287,7 @@ impl Page {
                 actions: ActionExecutor::default(),
                 linked: Arc::new(Vec::new()),
                 peer_sync: None,
+                requests: None,
             },
         }
     }
@@ -302,6 +310,13 @@ impl Page {
     /// the owner approves (see `crate::peer_sync`).
     pub fn with_peer_sync(mut self, syncer: PeerSyncer) -> Self {
         self.state.peer_sync = Some(syncer);
+        self
+    }
+
+    /// Lists the owner approval requests agents make with `owner_approval_request`, and approves or declines one. The same
+    /// store serves the three verbs.
+    pub fn with_approval_requests(mut self, requests: Arc<ApprovalRequests>) -> Self {
+        self.state.requests = Some(requests);
         self
     }
 
@@ -348,6 +363,9 @@ impl Page {
             .route("/approve/plans", get(plans))
             .route("/approve/approve", post(approve))
             .route("/approve/decline", post(decline))
+            .route("/approve/requests/begin", post(request_begin))
+            .route("/approve/requests/approve", post(request_approve))
+            .route("/approve/requests/deny", post(request_deny))
             .route("/approve/peer-keys", post(peer_keys_trust))
             .route("/approve/peer-keys/sync", post(peer_keys_sync))
             .route("/approve/setup-code", post(setup_code))
@@ -755,6 +773,13 @@ async fn plans(State(state): State<Arc<PageState>>) -> Response {
         match list_plans(&kernel, now, true) {
             Ok(mut body) => {
                 body["passkeysTrusted"] = json!(kernel.owner_passkey_count());
+                if let Some(requests) = &state.requests {
+                    match requests.list(&kernel, now) {
+                        Ok(listed) => body["approvalRequests"] = json!(listed),
+                        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                    body["approvalPasskeys"] = passkey_summary(&kernel, &state.rp_id);
+                }
                 body
             }
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1084,6 +1109,98 @@ async fn decline(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
         Ok(result) => Json(result).into_response(),
         Err(error) => call_error_response(error),
     }
+}
+
+/// Which step of an owner approval request a page POST takes.
+#[derive(Clone, Copy)]
+enum RequestStep {
+    Begin,
+    Approve,
+    Deny,
+}
+
+async fn request_begin(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    request_step(state, body, RequestStep::Begin).await
+}
+
+async fn request_approve(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    request_step(state, body, RequestStep::Approve).await
+}
+
+async fn request_deny(State(state): State<Arc<PageState>>, body: Bytes) -> Response {
+    request_step(state, body, RequestStep::Deny).await
+}
+
+/// One step of an owner approval request: `{id}` to begin or deny, `{id, statement, proof}` to approve. Nothing the body
+/// holds is echoed back.
+async fn request_step(state: Arc<PageState>, body: Bytes, step: RequestStep) -> Response {
+    let Some(requests) = state.requests.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let invalid = || {
+        page_refusal(PageRefusal {
+            status: 400,
+            code: "invalid",
+            message: "the body must be a JSON object naming the request's id".to_string(),
+            extra: serde_json::Map::new(),
+        })
+    };
+    let args: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(_) => return invalid(),
+        }
+    };
+    let Some(id) = args.get("id").and_then(Value::as_str).map(str::to_string) else {
+        return invalid();
+    };
+    let now = (state.clock)();
+    let kernel = Arc::clone(&state.kernel);
+    let rp_id = state.rp_id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let kernel = kernel.lock().map_err(|_| PageRefusal {
+            status: 500,
+            code: "internal",
+            message: "the kernel could not be read".to_string(),
+            extra: serde_json::Map::new(),
+        })?;
+        match step {
+            RequestStep::Begin => requests.begin(&kernel, &id, &rp_id, now),
+            RequestStep::Deny => requests.deny(&kernel, &id, now),
+            RequestStep::Approve => {
+                let (Some(statement), Some(proof)) = (
+                    args.get("statement").and_then(Value::as_str),
+                    args.get("proof"),
+                ) else {
+                    return Err(PageRefusal {
+                        status: 400,
+                        code: "invalid",
+                        message: "the body is {id, statement, proof}".to_string(),
+                        extra: serde_json::Map::new(),
+                    });
+                };
+                requests.approve(&kernel, &id, statement, proof, now)
+            }
+        }
+    })
+    .await;
+    match outcome {
+        Ok(Ok(value)) => canvas_json(StatusCode::OK, value),
+        Ok(Err(refusal)) => page_refusal(refusal),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// A request step's refusal: `{refusal, message}` and any extra fields, at its own status.
+fn page_refusal(refusal: PageRefusal) -> Response {
+    let mut body = serde_json::Map::new();
+    body.insert("refusal".to_string(), json!(refusal.code));
+    body.insert("message".to_string(), json!(refusal.message));
+    body.extend(refusal.extra);
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    canvas_json(status, Value::Object(body))
 }
 
 fn call_error_response(error: CallError) -> Response {

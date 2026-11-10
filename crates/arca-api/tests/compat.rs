@@ -375,6 +375,21 @@ fn a_pattern_added_is_one_parameter_narrowing() {
     assert_eq!(got, [minutes_narrowed("pattern changed")]);
 }
 
+/// `propertyNames` and an `additionalProperties` schema are checked by `check.rs` but not modelled here: a change is a break.
+#[test]
+fn a_property_names_or_additional_properties_schema_added_is_one_parameter_narrowing() {
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["propertyNames"] =
+            json!({ "maxLength": 4 })
+    });
+    assert_eq!(got, [minutes_narrowed("propertyNames changed")]);
+    let got = breaks_after(|doc| {
+        param_mut(doc, "node_metrics", "minutes")["schema"]["additionalProperties"] =
+            json!({ "type": "integer" })
+    });
+    assert_eq!(got, [minutes_narrowed("additionalProperties changed")]);
+}
+
 /// The released result admits any array length. A `maxItems` the module cannot relate is refused, even though it narrows.
 #[test]
 fn a_result_keyword_outside_the_subset_is_one_type_break() {

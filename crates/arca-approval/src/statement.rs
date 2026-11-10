@@ -354,7 +354,7 @@ pub(crate) fn valid_hex(text: &str, min: usize, max: usize) -> bool {
 
 /// The epoch milliseconds of a time written as `toISOString` writes it, or `None` when it is not that exact form: the shape
 /// `YYYY-MM-DDTHH:MM:SS.sssZ`, a real calendar date and a real clock time.
-pub(crate) fn iso_ms(text: &str) -> Option<i64> {
+pub fn iso_ms(text: &str) -> Option<i64> {
     const SHAPE: &[u8; 24] = b"dddd-dd-ddTdd:dd:dd.dddZ";
     let bytes = text.as_bytes();
     if bytes.len() != SHAPE.len() {
