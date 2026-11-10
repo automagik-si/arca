@@ -1604,6 +1604,20 @@ fn the_page_host_does_not_sync_to_a_host_that_keeps_another_page_hosts_keys() {
 }
 
 #[test]
+fn the_page_host_syncs_to_a_host_that_names_it_in_another_letter_case() {
+    let (remote, _owner) = Remote::keeping("pk-case", &HOST.to_ascii_uppercase());
+    assert_ne!(HOST, HOST.to_ascii_uppercase());
+    assert_eq!(
+        remote.syncer.sync_all(),
+        vec![(
+            "gamma".to_string(),
+            SyncOutcome::Synced("trusted".to_string())
+        )]
+    );
+    assert!(remote.gamma.file.exists(), "the list was sent and kept");
+}
+
+#[test]
 fn the_approval_page_renders_the_passkey_list_card_and_posts_a_linked_rows_host() {
     let html = include_str!("../src/approve_page.html");
     assert!(html.contains("for (const card of peerKeys) target.append(peerKeysCard(card));"));

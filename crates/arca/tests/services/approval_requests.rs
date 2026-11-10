@@ -1857,7 +1857,9 @@ fn enroll_confirm_confirms_a_valid_approval_once_and_changes_nothing_else() {
         "{audit}"
     );
     assert!(
-        audit.contains("confirmed:arca:enroll:ABC123:params=") && !audit.contains(&approval),
+        audit.contains(&format!("confirmed:{id}:arca:enroll:ABC123:params="))
+            && audit.contains(":requester=doctor\"")
+            && !audit.contains(&approval),
         "{audit}"
     );
     assert!(!g.logs().contains(&approval));
@@ -1959,6 +1961,92 @@ fn an_approval_for_another_action_is_not_an_enroll_and_an_enroll_is_no_other_act
     );
     assert!(spent.is_err(), "{spent:?}");
     assert!(spent_nonces(&g).is_empty());
+}
+
+#[test]
+fn enroll_confirm_is_spent_only_by_the_token_that_asked() {
+    let g = G7::new();
+    let id = g.asked(enroll("ABC123", "cloud"));
+    g.tap(&id);
+    let approval = g.approval(&id);
+    // Another doctor token holding the approval string confirms nothing and spends nothing.
+    let other = g.verbs["enroll_confirm"].call(
+        json!({ "target": "ABC123", "args": { "service": "cloud" }, "approval": approval }),
+        &caller("other-doctor", Scope::Doctor),
+    );
+    let why = owner_refusal(other);
+    assert!(why.contains("asked by another token"), "{why}");
+    assert!(!why.contains(&approval));
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+    assert!(!g.audit().contains("owner_enroll_confirmed"));
+    // The requester still spends it, and the audit line names the requester and the request.
+    assert_eq!(
+        confirm(&g, "ABC123", json!({ "service": "cloud" }), &approval).expect("the requester"),
+        json!({ "confirmed": true })
+    );
+    let audit = g.audit();
+    let line = audit
+        .lines()
+        .find(|line| line.contains("owner_enroll_confirmed"))
+        .expect("the confirmation's line");
+    let line: Value = serde_json::from_str(line).expect("an audit line");
+    assert_eq!(line["principal"], "doctor:doctor");
+    let outcome = text(&line, "outcome");
+    assert!(
+        outcome.starts_with(&format!("confirmed:{id}:arca:enroll:ABC123:params="))
+            && outcome.ends_with(":requester=doctor"),
+        "{outcome}"
+    );
+    assert!(
+        !audit.contains("other-doctor"),
+        "the refused token is no requester"
+    );
+}
+
+#[test]
+fn enroll_confirm_refuses_an_approval_that_came_from_no_request() {
+    let g = G7::new();
+    let host = g.rig.kernel.lock().expect("kernel").host().to_string();
+    let args = json!({ "service": "cloud" });
+    // A statement the owner's passkey signed outside any request: the verifier itself would accept it.
+    let statement = canonical_json(&json!({
+        "host": host,
+        "action": "enroll",
+        "target": "ABC123",
+        "paramsDigest": params_digest(&args).expect("digest"),
+        "issuedAt": iso_utc(NOW),
+        "expiresAt": iso_utc(NOW + 5 * MINUTE),
+        "nonce": "ab".repeat(16),
+    }))
+    .expect("canonical");
+    let built = passkey_approval(
+        &statement,
+        &g.key
+            .assert(&Assert::over(ARCA_NAMESPACE, statement.as_bytes())),
+    );
+    assert!(
+        g.rig
+            .kernel
+            .lock()
+            .expect("kernel")
+            .preview_approval(ArcaAction::Enroll, "ABC123", &args, &built, NOW)
+            .is_ok(),
+        "the statement and its proof are good in themselves"
+    );
+    let why = owner_refusal(confirm(&g, "ABC123", args.clone(), &built));
+    assert!(why.contains("came from no request"), "{why}");
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+
+    // Nor while a request for the same code and service waits, or is approved with another statement.
+    let id = g.asked(enroll("ABC123", "cloud"));
+    owner_refusal(confirm(&g, "ABC123", args.clone(), &built));
+    g.tap(&id);
+    owner_refusal(confirm(&g, "ABC123", args.clone(), &built));
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+    assert_eq!(
+        confirm(&g, "ABC123", args, &g.approval(&id)).expect("the request's own approval"),
+        json!({ "confirmed": true })
+    );
 }
 
 #[test]

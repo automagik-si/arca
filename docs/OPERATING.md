@@ -1283,13 +1283,23 @@ in the list moves it to another file, so its next sync is a first sync, as a cha
 
 `peer_keys_sync` takes an optional `from`, the source whose list is sent. Absent, it is the first source, so a page host
 that is the first source calls as it always has; a page host that is a further source finds itself in the target's
-`arca_status` and names itself in `from`. A `from` no source names is refused. The sources are apart in every way that
-matters: a changed list is kept only with an approval by a passkey already kept for that same source, verified with that
-source's own key, so a key of one source cannot change another's list, even when it was sent under the same credential id.
+`arca_status` and names itself in `from`, matched without regard to letter case. A `from` no source names is refused. A
+changed list is kept only with an approval by a passkey already kept for that same source, verified with that source's
+own key, so a key of one source cannot change another's list, even when it was sent under the same credential id. The
+sources are not wholly apart, though: Arca reads its own passkeys first, then each source in the config's order, and a
+line whose credential id or key fingerprint an earlier one already holds is skipped. So an earlier source can shadow a
+later source's line by sending one under the same credential id or key. That gives the earlier source nothing (the
+shadowed key approves nothing, and cannot approve a change to its own source's list until the earlier line is gone), but
+it can take the later key out of use. List the owner's own approval page first, and sources you trust less after it.
 A further source's statement binds `{ "sha256": "<sha256>", "from": "<from>" }`; the first source's binds
 `{ "sha256": "<sha256>" }` as before. A key is trusted only for its own source's origins: an assertion by one source's key
 from another source's origin is refused, and a line a source sends for an origin that is not its own is kept in its file
-and trusted for nothing. As before, every kept key approves actions only. With a list, `arca_status` reports
+and trusted for nothing. As before, every kept key approves actions only: never a sign-in, never a change to this node's
+own passkeys. Action approvals include owner approval requests, and so `enroll`. Once a service's own passkeys are a
+source here, the people who hold them can approve an `enroll` request for that service (or any other request) with their
+own passkey, without the node owner's tap. That is intended: a service's existing owners add its next owners. The first
+enroll of a service happens before any such source exists, so it is always the node owner's own tap. With a list,
+`arca_status` reports
 `approval.peerKeys` for the first source, as it does for the single object, and `approval.peerKeySources`, one
 `{ "from", "keys", "since", "reason" }` per source in the config's order, the first included.
 
@@ -2421,10 +2431,13 @@ otherwise) and the `args` are `{service: <name>}` and nothing else. The passkey 
 front of them before they tap. An `enroll` approval changes nothing in Arca. The token that asked reads it from
 `owner_approval_status` and spends it with `enroll_confirm {target, args, approval}` (a doctor's or an operator's verb, as
 the request is). Arca checks the approval with its own verifier against `enroll`, that code and those args, spends its
-nonce once and answers `{confirmed: true}`; the service then makes the owner. A second spend, another code, other args,
-an approval for another action, or one past its 15 minutes is refused with `owner_approval`, and an `enroll` approval is
-refused by every other call. Each confirmation is a line in `approval-requests-audit.jsonl` (`owner_enroll_confirmed`,
-naming the code, the args' digest and the token, never the approval).
+nonce once and answers `{confirmed: true}`; the service then makes the owner. Only the token whose request the owner
+approved can spend the approval, and only an approval a request holds: another token's call, or a statement built and
+signed outside a request, is refused and spends nothing. A second spend, another code, other args, an approval for
+another action, or one past its 15 minutes is refused with `owner_approval`, and an `enroll` approval is refused by every
+other call. Each confirmation is a line in `approval-requests-audit.jsonl` (`owner_enroll_confirmed`, naming the request,
+the code, the args' digest and the token that asked, never the approval). The passkeys that can approve a request are
+this node's own and those of its `approval.peerKeys` sources; see "More than one page host".
 
 A pending request expires after 60 minutes. The requests live in `approval-requests.json` in the state directory (mode
 0600), which every request verb, the page's list and each page step reads and, when anything changed, rewrites whole (a

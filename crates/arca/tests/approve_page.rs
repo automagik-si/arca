@@ -3306,29 +3306,70 @@ fn action_cards_render_every_kernel_detail_row_as_text() {
 }
 
 #[test]
-fn an_enroll_request_card_shows_the_code_large_and_names_the_service() {
-    let html = include_str!("../src/approve_page.html");
-    assert!(
-        html.contains(r#"const enroll = fields.action === "enroll";"#)
-            && html.contains(
-                r#""Approve " + String(args.service) + " to make the person showing code " + String(fields.target) + " an owner""#
-            ),
-        "the card says what the owner approves, with the service and the code"
+fn the_page_is_served_an_enroll_request_with_its_code_and_service_and_approves_it() {
+    let (rig, key) = Rig::new("page-enroll", true);
+    let read = Arc::clone(&rig.clock);
+    let clock: Clock = Arc::new(move || read.load(Ordering::SeqCst));
+    let verbs: std::collections::HashMap<_, _> =
+        approval_requests::handlers(Arc::clone(&rig.kernel), clock, Arc::clone(&rig.requests))
+            .into_iter()
+            .collect();
+    let doctor = Caller {
+        token_id: "doctor".to_string(),
+        scope: Scope::Doctor,
+        tools: None,
+    };
+    let created = verbs["owner_approval_request"]
+        .call(
+            json!({ "kind": "arca", "action": "enroll", "target": "K7QX2M", "args": { "service": "cloud" } }),
+            &doctor,
+        )
+        .expect("the request is made");
+    let id = created["id"].as_str().expect("an id").to_string();
+
+    // What the page's request card is drawn from: the action that picks the enroll card, the code it shows large, and
+    // the service its sentence names.
+    let (status, body) = rig.get("/approve/plans", None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_slice(&body).expect("plans JSON");
+    let request = &listed["approvalRequests"][0];
+    assert_eq!(request["id"], json!(id));
+    assert_eq!(request["state"], "pending");
+    assert_eq!(request["fields"]["action"], "enroll");
+    assert_eq!(request["fields"]["target"], "K7QX2M");
+    assert_eq!(request["args"], json!({ "service": "cloud" }));
+    assert_eq!(request["requester"]["name"], "doctor");
+    assert!(request.get("approval").is_none());
+
+    // One tap on that card: the statement the passkey signs names enroll and the code, and the request is approved.
+    let (status, begun) = rig.post("/approve/requests/begin", Some(ORIGIN), json!({ "id": id }));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&begun));
+    let begun: Value = serde_json::from_slice(&begun).expect("begin JSON");
+    let statement = begun["statement"].as_str().expect("a statement");
+    let signed: Value = serde_json::from_str(statement).expect("the statement");
+    assert_eq!(signed["action"], "enroll");
+    assert_eq!(signed["target"], "K7QX2M");
+    let proof = key.proof_value(&Assert::over(NAMESPACE, statement.as_bytes()));
+    let (status, answer) = rig.post(
+        "/approve/requests/approve",
+        Some(ORIGIN),
+        json!({ "id": id, "statement": statement, "proof": proof }),
     );
-    assert!(
-        html.contains(r#"el("p", "enroll-code", String(fields.target))"#)
-            && html
-                .contains("card.append(meta, heading, ...(code ? [code] : []), facts, buttons);"),
-        "the code is its own element, set as text, on the card"
-    );
-    let rule = html
-        .split(".enroll-code {")
-        .nth(1)
-        .and_then(|rest| rest.split('}').next())
-        .expect("the code's style");
-    assert!(
-        rule.contains("font-size: 2.25rem"),
-        "the code is large: {rule}"
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let approval = verbs["owner_approval_status"]
+        .call(json!({ "id": id }), &doctor)
+        .expect("the status")["approval"]
+        .as_str()
+        .expect("the approval")
+        .to_string();
+    assert_eq!(
+        verbs["enroll_confirm"]
+            .call(
+                json!({ "target": "K7QX2M", "args": { "service": "cloud" }, "approval": approval }),
+                &doctor
+            )
+            .expect("confirmed"),
+        json!({ "confirmed": true })
     );
 }
 

@@ -14,7 +14,8 @@
 //!   target is that code (6 to 12 uppercase letters and digits) and the args are `{service: <name>}`, nothing else.
 //! - `enroll_confirm {target, args, approval}` (doctor scope): spends an `enroll` approval. The kernel checks it with its
 //!   own verifier against `enroll`, the code and the args' digest, spends its nonce once and answers `{confirmed: true}`,
-//!   or refuses with `owner_approval`. An `enroll` approval changes nothing in the kernel: the service that asked acts on
+//!   or refuses with `owner_approval`. Only the token whose request the owner approved spends it, and only an approval
+//!   a request holds: a statement built and signed outside a request confirms nothing, whoever signed it. An `enroll` approval changes nothing in the kernel: the service that asked acts on
 //!   the answer.
 //! - `owner_approval_status {id, waitMs?}` (doctor scope, not read-only): the request's state, waiting up to 30 s while it is
 //!   pending. The approval string goes to the token that asked, and to no other.
@@ -498,7 +499,9 @@ impl ApprovalRequests {
     }
 
     /// `enroll_confirm`: checks an `enroll` approval against the code and the args the caller names, with the kernel's own
-    /// verifier, and spends its nonce. Nothing else in the kernel changes. A confirmation that cannot be audited is not
+    /// verifier, and spends its nonce. Nothing else in the kernel changes. The approval must be the one an approved
+    /// `enroll` request of this same token holds, unspent and unexpired: another token's, or one that came from no
+    /// request, is refused before the verifier is asked and spends nothing. A confirmation that cannot be audited is not
     /// given: the approval is spent and the owner approves again.
     pub fn enroll_confirm(
         &self,
@@ -524,7 +527,29 @@ impl ApprovalRequests {
             .get("approval")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("approval: expected a string"))?;
-        let digest = params_digest(call_args).map_err(|_| invalid("args have no digest"))?;
+        let mut inner = self.lock()?;
+        self.sweep(&mut inner, kernel, now);
+        let Some(row) = inner
+            .rows
+            .iter()
+            .find(|row| {
+                row.state == RequestState::Approved
+                    && row.kind == "arca"
+                    && row.field("action") == ENROLL
+                    && row.requester == caller.token_id
+                    && row.approval.as_deref() == Some(approval)
+            })
+            .cloned()
+        else {
+            (self.log)(&format!(
+                "arca: enroll_confirm by {} was refused: no approved enroll request of this token holds that approval",
+                caller.token_id
+            ));
+            return Err(refused(
+                "owner_approval",
+                "this is not the approval of an enroll request this token made and the owner approved: it was asked by another token, came from no request, is spent or has expired",
+            ));
+        };
         kernel
             .check_approval(ArcaAction::Enroll, target, call_args, approval, now)
             .map_err(|refusal| {
@@ -535,14 +560,11 @@ impl ApprovalRequests {
                 ));
                 refused("owner_approval", refusal.to_string())
             })?;
-        let mut inner = self.lock()?;
         // The spent approval's request loses its approval string now.
         self.sweep(&mut inner, kernel, now);
         let principal = format!("{}:{}", caller.scope.as_str(), caller.token_id);
-        let outcome = format!(
-            "confirmed:arca:{ENROLL}:{target}:params={digest}:requester={}",
-            caller.token_id
-        );
+        // The request's own subject and requester, as its other audit lines name them.
+        let outcome = format!("confirmed:{}:{}", row.id, row.outcome());
         audit(&mut inner.audit, now, &principal, ENROLLED_AUDIT, &outcome)
             .map_err(|_| internal())?;
         (self.log)(&format!(

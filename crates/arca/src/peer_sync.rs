@@ -132,18 +132,18 @@ impl PeerSyncer {
         // (asked by name).
         let asked = match linked::call(host, "arca_status", json!({})) {
             Ok(status) => {
+                // A page host's name is matched without regard to letter case, as the target matches `from`.
+                let names_me = |from: &Value| {
+                    from.as_str()
+                        .is_some_and(|from| from.eq_ignore_ascii_case(&me))
+                };
                 let first = status
                     .pointer("/approval/peerKeys/from")
-                    .and_then(Value::as_str)
-                    == Some(&me);
+                    .is_some_and(names_me);
                 let further = status
                     .pointer("/approval/peerKeySources")
                     .and_then(Value::as_array)
-                    .is_some_and(|sources| {
-                        sources
-                            .iter()
-                            .any(|source| source["from"].as_str() == Some(&me))
-                    });
+                    .is_some_and(|sources| sources.iter().any(|source| names_me(&source["from"])));
                 if first {
                     Some(false)
                 } else {
