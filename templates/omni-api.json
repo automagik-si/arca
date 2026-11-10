@@ -2,7 +2,7 @@
   "name": "omni-api",
   "description": "Omni's API (its public image at release v2.261024.2 by digest), wired by DATABASE_URL and NATS_URL: link it to postgres-autopg and to nats. Its OMNI_API_KEY is made by Arca at create (Omni takes it at its first start with a database and keeps it); telegram_bot_token and whatsapp_phone_number are the owner's, for Arca's omni tools only, never its environment. A link to it gives OMNI_API_URL.",
   "kind": "oci",
-  "image": "ghcr.io/automagik-dev/omni-api",
+  "image": "ghcr.io/automagik-si/omni-api",
   "digest": "sha256:9fd753e29af5fc6b3d0967322e6679b794641fbfb7cee2167f8cdd198b36457d",
   "ports": [8882],
   "env": { "OMNI_API_KEY": "{{secret:OMNI_API_KEY}}" },

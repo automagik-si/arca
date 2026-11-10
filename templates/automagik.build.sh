@@ -107,9 +107,9 @@ useradd --create-home --shell /bin/bash automagik
 cd /home/automagik
 as_user() { runuser -u automagik -- env HOME=/home/automagik DSH_TELEMETRY_DISABLED=1 "$@"; }
 as_user dsh plugin --profile web add -w --ignore-scripts \
-  "git+https://github.com/automagik-dev/automagik.git#$AUTOMAGIK_COMMIT&path:/apps/bots-dsh" \
-  "git+https://github.com/automagik-dev/automagik.git#$AUTOMAGIK_COMMIT&path:/apps/welcome-dsh" \
-  'git+https://github.com/automagik-dev/omni.git#45a6832d8117efd8fc07b434722d55ea7f034902&path:/apps/omni-channels-dsh'
+  "git+https://github.com/automagik-si/automagik.git#$AUTOMAGIK_COMMIT&path:/apps/bots-dsh" \
+  "git+https://github.com/automagik-si/automagik.git#$AUTOMAGIK_COMMIT&path:/apps/welcome-dsh" \
+  'git+https://github.com/automagik-si/omni.git#45a6832d8117efd8fc07b434722d55ea7f034902&path:/apps/omni-channels-dsh'
 # Refuse dependency drift, including a plugin gaining a new transitive dependency.
 node <<'JS'
 const fs = require('node:fs');
