@@ -180,7 +180,8 @@ impl Rig {
         let devices = Arc::new(FixedBlockDevices::new(host_disks()));
         let storage = Arc::new(
             Storage::new(incus.socket().to_path_buf(), devices.clone(), writes)
-                .with_wait(Duration::from_secs(1)),
+                .with_wait(Duration::from_secs(1))
+                .with_helper_pools(vec!["missing".to_string(), "default".to_string()]),
         );
         let verifier = verifier_for(&scratch, &[key], tag);
         let kernel = Arc::new(Mutex::new(
@@ -2113,6 +2114,11 @@ fn a_folder_snapshot_copies_through_a_read_only_offline_helper_that_is_then_dele
     assert_eq!(helper["config"]["limits.memory"], json!("1GiB"));
     let devices = helper["devices"].as_object().expect("devices");
     assert_eq!(
+        devices["root"]["pool"],
+        json!("default"),
+        "the helper's root is on the machine's first existing regular pool, never on snapshot storage"
+    );
+    assert_eq!(
         devices.keys().map(String::as_str).collect::<Vec<_>>(),
         ["dst", "root", "src"]
     );
@@ -2662,4 +2668,110 @@ fn the_owners_digest_binds_the_folder_and_a_changed_folder_is_refused_at_run() {
         "FolderTooBig"
     );
     assert!(rig.incus.writes().is_empty(), "nothing was written");
+}
+
+#[test]
+fn a_helper_that_fails_to_start_is_still_stopped_and_deleted() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-start-delete", &key);
+    rig.add_snapshot_pool("usb1");
+    let folder = SourceFolder::new("start-delete");
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": folder.text(), "pool": "usb1" }),
+        )
+        .expect("a proposal");
+    // As on a real host: the failed start leaves the helper reading back as stopped while Incus still holds it, so a
+    // delete without a stop first is refused ("Instance is running").
+    rig.incus
+        .fail_next_start("Failed to run: Permission denied - Failed to mount \"credentials\"");
+    let message = match rig.approve_and_run(&key, &proposed) {
+        Err(CallError::Refused { code, message }) => {
+            assert_eq!(code, "SnapshotIncomplete");
+            message
+        }
+        other => panic!("expected an incomplete copy, got {other:?}"),
+    };
+    assert!(message.contains("did not start"), "{message}");
+    assert!(!message.contains("could not be deleted"), "{message}");
+    let helper = arca::storage::helper_name(&folder_name(&folder));
+    assert!(
+        rig.incus.instance(SNAPSHOT_PROJECT, &helper).is_none(),
+        "the helper is gone"
+    );
+    let steps: Vec<(String, String)> = rig
+        .incus
+        .writes()
+        .into_iter()
+        .filter(|write| write.target.contains(&helper))
+        .map(|write| {
+            (
+                write.method,
+                write.body["action"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            ("PUT".to_string(), "start".to_string()),
+            ("PUT".to_string(), "stop".to_string()),
+            ("DELETE".to_string(), String::new()),
+        ],
+        "stopped before it is deleted"
+    );
+    assert_write_family(&rig.incus);
+}
+
+#[test]
+fn the_helpers_root_disk_is_on_a_regular_pool_and_never_on_snapshot_storage() {
+    let key = SkKey::from_seed(1);
+    let folder = SourceFolder::new("root-pool");
+    // No configured pool is regular and the default profile has no root disk: refused before anything is written.
+    let rig = Rig::new("folder-no-root-pool", &key);
+    rig.add_snapshot_pool("usb1");
+    let storage = Arc::new(
+        Storage::new(rig.incus.socket().to_path_buf(), rig.devices.clone(), true)
+            .with_wait(Duration::from_secs(1))
+            .with_helper_pools(vec!["usb1".to_string()]),
+    );
+    let handler = |storage: &Arc<Storage>| {
+        let clock = Arc::new(|| NOW);
+        plan_handlers_full(
+            Arc::clone(&rig.kernel),
+            clock,
+            None,
+            None,
+            Some(Arc::clone(storage)),
+            ActionSlot::default(),
+        )
+        .into_iter()
+        .find(|(name, _)| *name == "action_propose")
+        .map(|(_, handler)| handler)
+        .expect("action_propose")
+    };
+    let propose = |storage: &Arc<Storage>| {
+        handler(storage).call(
+            json!({ "action": "snapshot_create", "args": { "folder": folder.text(), "pool": "usb1" } }),
+            &caller(arca_api::Scope::Doctor),
+        )
+    };
+    assert_eq!(refused_code(propose(&storage)), "HelperPoolMissing");
+    // The default profile's root pool is used when no configured pool is regular.
+    rig.incus.add_profile(
+        "default",
+        json!({ "name": "default", "devices": { "root": { "type": "disk", "path": "/", "pool": "fast" } } }),
+    );
+    assert!(propose(&storage).is_ok(), "the default profile's root pool");
+    // A default profile whose root is on snapshot storage is never used.
+    rig.incus.add_profile(
+        "default",
+        json!({ "name": "default", "devices": { "root": { "type": "disk", "path": "/", "pool": "usb1" } } }),
+    );
+    assert_eq!(refused_code(propose(&storage)), "HelperPoolMissing");
+    assert!(rig.incus.writes().is_empty());
 }

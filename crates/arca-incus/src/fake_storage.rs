@@ -17,7 +17,10 @@
 //! an instance `POST` from a local image alias, `PUT .../state` (start and stop; a start can be failed with
 //! [`FakeStorageIncus::fail_next_start`]), `POST .../exec` on a running instance (answered with the exit code and output
 //! set by [`FakeStorageIncus::set_exec`], or failed with [`FakeStorageIncus::fail_next_exec`]), the recorded output as raw
-//! text, a `POST` of a new empty volume and a volume `PUT`. A running instance cannot be deleted, as in Incus.
+//! text, a `POST` of a new empty volume, a volume `PUT` and `GET /1.0/profiles/<p>`. A running instance cannot be
+//! deleted, and a stopped one cannot be stopped again, as in Incus. As on a real host, a failed start leaves the instance
+//! reading back as stopped while Incus still holds it, so a delete is refused until it is stopped; and an instance whose
+//! root disk is on a snapshot pool fails to start, since its unprivileged root cannot walk that pool's folder.
 //!
 //! An instance copy behaves as Incus's own does (`createFromCopy`): every local config key and local device of the source
 //! that the request leaves unset is carried into the copy (volatile keys aside), an empty config value is not stored, the
@@ -65,6 +68,8 @@ struct State {
     fail_start: Option<String>,
     fail_exec: Option<String>,
     logs: BTreeMap<String, String>,
+    profiles: BTreeMap<(String, String), Value>,
+    half_started: std::collections::BTreeSet<(String, String)>,
 }
 
 /// The running fake. Dropping it stops it.
@@ -213,6 +218,14 @@ impl FakeStorageIncus {
     /// Fails the next exec operation with Incus's message.
     pub fn fail_next_exec(&self, message: &str) {
         lock(&self.state).fail_exec = Some(message.to_string());
+    }
+
+    /// Adds a profile in `project` as Incus answers it.
+    pub fn add_profile(&self, project: &str, profile: Value) {
+        let name = profile["name"].as_str().unwrap_or_default().to_string();
+        lock(&self.state)
+            .profiles
+            .insert((project.to_string(), name), profile);
     }
 
     /// Adds a local image alias in `project`.
@@ -612,7 +625,9 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             let key = (project, (*name).to_string());
             match state.instances.get(&key) {
                 None => return error(404, "Instance not found"),
-                Some(found) if found["status"] == json!("Running") => {
+                Some(found)
+                    if found["status"] == json!("Running") || state.half_started.contains(&key) =>
+                {
                     return error(400, "The instance is currently running, stop it first");
                 }
                 Some(_) => {}
@@ -625,14 +640,36 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             if !state.instances.contains_key(&key) {
                 return error(404, "Instance not found");
             }
+            let root_pool = state.instances[&key]["expanded_devices"]["root"]["pool"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let root_on_snapshots = state.pools.get(&root_pool).is_some_and(|pool| {
+                pool["config"].get("user.arcasnapshot.storage") == Some(&pool["name"])
+            });
             let status = match body["action"].as_str() {
                 Some("start") => {
-                    if let Some(message) = state.fail_start.take() {
+                    let failure = state.fail_start.take().or_else(|| {
+                        root_on_snapshots.then(|| {
+                            "Failed to run: Permission denied - Failed to mount \"credentials\" onto \"/dev/.incus-systemd-credentials\"".to_string()
+                        })
+                    });
+                    if let Some(message) = failure {
+                        state.half_started.insert(key);
                         return operation(state, Some(message));
                     }
                     "Running"
                 }
-                Some("stop") => "Stopped",
+                Some("stop") => {
+                    let held = state.half_started.remove(&key);
+                    if !held && state.instances[&key]["status"] == json!("Stopped") {
+                        return operation(
+                            state,
+                            Some("The instance is already stopped".to_string()),
+                        );
+                    }
+                    "Stopped"
+                }
                 _ => return error(400, "Unknown action"),
             };
             if let Some(row) = state.instances.get_mut(&key) {
@@ -668,6 +705,10 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
                 None => error(404, "not found"),
             }
         }
+        ("GET", ["profiles", name]) => match state.profiles.get(&(project, (*name).to_string())) {
+            Some(found) => sync(found.clone()),
+            None => error(404, "Profile not found"),
+        },
         ("GET", ["images", "aliases", alias]) => {
             if state.aliases.contains(&(project, (*alias).to_string())) {
                 sync(json!({ "name": alias, "target": "f00d" }))

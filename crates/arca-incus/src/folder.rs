@@ -7,7 +7,9 @@
 //!    the folder's measured size (at least 1 GiB), with `security.shifted=true` so the files keep their real owners on
 //!    disk, and with the usual `user.arcasnapshot.*` marks (source kind `folder`, the source path, the file system UUID it
 //!    lives on, when it was made).
-//! 2. A short-lived copy helper container is made in [`SNAPSHOT_PROJECT`] from a small cached image
+//! 2. A short-lived copy helper container is made in [`SNAPSHOT_PROJECT`] from a small cached image, with its root disk on
+//!    a regular pool of the machine and never on the snapshot pool (an unprivileged container cannot walk a snapshot
+//!    pool's folder, so it would not start),
 //!    ([`HELPER_IMAGE_ALIAS`]) and started ([`helper_body`]): the host folder is a read-only disk at `/src` (`shift=true`,
 //!    so owners are kept), the volume is at `/dst`, it has no network device and no profile, it never starts on its own,
 //!    it is unprivileged, and it gets 2 CPUs, 1 GiB of memory and the read/write caps the hosts use for heavy work. It is
@@ -112,8 +114,10 @@ pub struct FolderCopy {
     pub name: String,
     /// The copy helper's instance name.
     pub helper: String,
-    /// The snapshot pool.
+    /// The snapshot pool: only the copy's volume is on it.
     pub pool: String,
+    /// The regular (not snapshot) pool the helper's root disk is on.
+    pub root_pool: String,
     /// The folder, as the host resolved it (absolute, no links).
     pub folder: String,
     /// The UUID of the file system the folder is on (empty when the host shows none).
@@ -216,7 +220,7 @@ pub fn helper_body(copy: &FolderCopy, io_caps: bool) -> Value {
             HELPER_POOL_KEY: copy.pool,
         },
         "devices": {
-            "root": { "type": "disk", "path": "/", "pool": copy.pool },
+            "root": { "type": "disk", "path": "/", "pool": copy.root_pool },
             "src": { "type": "disk", "source": copy.folder, "path": "/src", "readonly": "true", "shift": "true" },
             "dst": dst,
         },
@@ -278,7 +282,9 @@ pub fn helper_problems(row: &Value, copy: &FolderCopy) -> Vec<String> {
         let field = |key: &str| device.get(key).and_then(Value::as_str);
         match (name.as_str(), field("type")) {
             (_, Some("nic")) => problems.push(format!("the helper has the network device {name}")),
-            ("root", Some("disk")) if field("path") == Some("/") => {}
+            ("root", Some("disk"))
+                if field("path") == Some("/") && field("pool") == Some(copy.root_pool.as_str()) => {
+            }
             ("src", Some("disk"))
                 if field("source") == Some(copy.folder.as_str())
                     && field("path") == Some("/src")
@@ -464,6 +470,15 @@ impl SnapshotWriter {
     }
 
     fn try_helper(&self, copy: &FolderCopy, io_caps: bool) -> Result<(), IncusError> {
+        if !plain_name(&copy.root_pool) || copy.root_pool == copy.pool {
+            return Err(refused("the helper's root disk must be on a regular pool"));
+        }
+        let root_pool = self.get(&format!("/1.0/storage-pools/{}", copy.root_pool))?;
+        if is_snapshot_pool(&root_pool) {
+            return Err(refused(
+                "the helper's root disk must be on a regular pool, not on snapshot storage",
+            ));
+        }
         self.run_operation(
             "POST",
             &snapshot_path("/1.0/instances"),
@@ -549,18 +564,49 @@ impl SnapshotWriter {
         if !helper {
             return Err(refused("the instance is not a copy helper"));
         }
-        if row.get("status").and_then(Value::as_str) != Some("Stopped") {
-            self.run_operation(
-                "PUT",
-                &snapshot_path(&format!("/1.0/instances/{name}/state")),
-                Some(&json!({ "action": "stop", "force": true, "timeout": 30 })),
-                STEP_WAIT,
-            )?;
-        }
+        // A helper whose start failed can read back as stopped while Incus still holds it running, so it is always
+        // stopped first; a stop of one already stopped is fine.
+        self.force_stop(name)?;
         match self.run_operation("DELETE", &path, None, STEP_WAIT) {
             Ok(_) | Err(IncusError::Status { code: 404, .. }) => Ok(()),
+            Err(error) if error.to_string().to_ascii_lowercase().contains("running") => {
+                self.force_stop(name)?;
+                match self.run_operation("DELETE", &path, None, STEP_WAIT) {
+                    Ok(_) | Err(IncusError::Status { code: 404, .. }) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
             Err(error) => Err(error),
         }
+    }
+
+    /// Stops a helper forcibly and waits until it reads back as stopped (at most a minute).
+    fn force_stop(&self, name: &str) -> Result<(), IncusError> {
+        let state = snapshot_path(&format!("/1.0/instances/{name}/state"));
+        match self.run_operation(
+            "PUT",
+            &state,
+            Some(&json!({ "action": "stop", "force": true, "timeout": 30 })),
+            STEP_WAIT,
+        ) {
+            Ok(_) | Err(IncusError::Status { code: 404, .. }) => {}
+            Err(error)
+                if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("already stopped") => {}
+            Err(error) => return Err(error),
+        }
+        for _ in 0..60 {
+            match self.get(&state) {
+                Ok(found) if found.get("status").and_then(Value::as_str) != Some("Stopped") => {
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Ok(_) | Err(IncusError::Status { code: 404, .. }) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(decode("the copy helper did not stop within a minute"))
     }
 
     /// Writes a folder volume's outcome: [`VERIFIED_KEY`] and the counts when it is verified, [`INCOMPLETE_KEY`] with the
@@ -702,6 +748,7 @@ mod tests {
             name: "folder--home--20261109T1405".to_string(),
             helper: "arca-copy-0123456789abcdef".to_string(),
             pool: "usb1".to_string(),
+            root_pool: "default".to_string(),
             folder: "/home".to_string(),
             fs_uuid: "uuid-home".to_string(),
             size: 10 * GIB,
@@ -743,9 +790,17 @@ mod tests {
                 .as_object()
                 .is_some_and(|devices| devices.values().all(|d| d["type"] != json!("nic")))
         );
+        assert_eq!(
+            body["devices"]["root"]["pool"],
+            json!("default"),
+            "never the snapshot pool"
+        );
         let mut row = body.clone();
         row["expanded_devices"] = body["devices"].clone();
         assert!(helper_problems(&row, &copy).is_empty());
+        let mut on_snapshots = row.clone();
+        on_snapshots["expanded_devices"]["root"]["pool"] = json!("usb1");
+        assert!(!helper_problems(&on_snapshots, &copy).is_empty());
         row["expanded_devices"]["eth0"] = json!({ "type": "nic", "network": "incusbr0" });
         row["expanded_devices"]["src"]["readonly"] = json!("false");
         let problems = helper_problems(&row, &copy);
@@ -779,6 +834,74 @@ mod tests {
         assert!(!judge(21, &line((3, 10), (3, 10)), true).verified);
         assert!(!judge(0, "not json", true).verified);
         assert!(!judge(7, "", true).verified);
+    }
+
+    /// A helper whose root disk is on snapshot storage is refused before it is made, and the fake, like a real host,
+    /// fails to start one; a failed start that leaves the helper held is still stopped and deleted.
+    #[test]
+    fn a_helper_never_has_its_root_on_snapshot_storage_and_a_failed_start_is_cleaned_up() {
+        use crate::fake_storage::FakeStorageIncus;
+        let dir = std::env::temp_dir().join(format!("arca-folder-fake-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a dir");
+        let incus = FakeStorageIncus::start(&dir).expect("the fake");
+        let marker = json!({ "user.arcasnapshot.storage": "usb1", "source": "/x" });
+        incus.add_pool("usb1", "dir", "", marker, 0, 1 << 40);
+        incus.add_pool("default", "dir", "", json!({ "source": "/y" }), 0, 1 << 40);
+        incus.add_project(SNAPSHOT_PROJECT, json!({}));
+        incus.add_image_alias(SNAPSHOT_PROJECT, HELPER_IMAGE_ALIAS);
+        let writer =
+            SnapshotWriter::new(incus.socket().to_path_buf()).with_wait(Duration::from_secs(1));
+        let mut copy = plan();
+        copy.root_pool = "usb1".to_string();
+        writer.create_folder_volume(&copy).expect("the volume");
+        let outcome = writer.run_folder_copy(&copy);
+        assert!(!outcome.verified);
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("regular pool")),
+            "{outcome:?}"
+        );
+        assert!(
+            incus.instance(SNAPSHOT_PROJECT, &copy.helper).is_none(),
+            "nothing was made"
+        );
+
+        // The fake's own refusal, reached without the writer's check.
+        let body = helper_body(&copy, false);
+        writer
+            .run_operation(
+                "POST",
+                &snapshot_path("/1.0/instances"),
+                Some(&body),
+                STEP_WAIT,
+            )
+            .expect("made");
+        let start = writer.run_operation(
+            "PUT",
+            &snapshot_path(&format!("/1.0/instances/{}/state", copy.helper)),
+            Some(&json!({ "action": "start" })),
+            STEP_WAIT,
+        );
+        assert!(
+            start
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("Permission denied")),
+            "{start:?}"
+        );
+        // It reads back as stopped, a bare delete is refused as running, and removal stops it first.
+        let path = snapshot_path(&format!("/1.0/instances/{}", copy.helper));
+        assert!(
+            writer
+                .run_operation("DELETE", &path, None, STEP_WAIT)
+                .is_err()
+        );
+        assert_eq!(writer.remove_helper(&copy.helper), Ok(()));
+        assert!(incus.instance(SNAPSHOT_PROJECT, &copy.helper).is_none());
+        drop(incus);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The copy command itself, run on this host between two scratch folders: owners, modes, times, symlinks, hard links

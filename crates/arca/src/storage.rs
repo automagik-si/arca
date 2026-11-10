@@ -1148,6 +1148,9 @@ pub struct Storage {
     wait: Duration,
     /// The folder snapshots this process is copying now. After a restart it is empty: a copy is never resumed.
     copies: Arc<Mutex<BTreeSet<String>>>,
+    /// The machine's own pools, in the configured order (`incus.pools`): the first regular one holds a copy helper's
+    /// root disk.
+    helper_pools: Vec<String>,
 }
 
 impl std::fmt::Debug for Storage {
@@ -1199,7 +1202,48 @@ impl Storage {
             writer: writes.then(|| SnapshotWriter::new(socket)),
             wait: Duration::from_secs(20),
             copies: Arc::new(Mutex::new(BTreeSet::new())),
+            helper_pools: Vec::new(),
         }
+    }
+
+    /// The same storage, with the machine's own pools (`incus.pools`) a copy helper's root disk may go on, in order.
+    pub fn with_helper_pools(mut self, pools: Vec<String>) -> Storage {
+        self.helper_pools = pools;
+        self
+    }
+
+    /// The regular pool a folder copy helper's root disk goes on: the first configured pool (`incus.pools`) that exists
+    /// and is not snapshot storage, else the default profile's root pool when it is regular. Never a snapshot pool: an
+    /// unprivileged container cannot walk a snapshot pool's folder, so it would not start.
+    fn helper_root_pool(&self) -> Result<String, StorageRefusal> {
+        let pools = self.pools()?;
+        let regular = |name: &str| {
+            plain_name(name)
+                && pools
+                    .iter()
+                    .any(|pool| pool.name == name && !pool.snapshots)
+        };
+        if let Some(name) = self.helper_pools.iter().find(|name| regular(name)) {
+            return Ok(name.clone());
+        }
+        if let Some(pool) = self
+            .read
+            .get("/1.0/profiles/default?project=default")
+            .ok()
+            .and_then(|profile| {
+                profile
+                    .pointer("/devices/root/pool")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|pool| regular(pool))
+        {
+            return Ok(pool);
+        }
+        Err(StorageRefusal::new(
+            "HelperPoolMissing",
+            "this machine has no regular storage pool for the short-lived copy helper (its default profile has no root disk), and the helper never runs on snapshot storage",
+        ))
     }
 
     /// The same storage, waiting at most `wait` for a copy or delete before reporting it as still running.
@@ -2330,6 +2374,7 @@ fn folder_target(storage: &Storage, args: &Value, created: String) -> Result<Tar
         .into());
     }
     let size = args["size"].as_u64().unwrap_or(u64::MAX);
+    let root_pool = storage.helper_root_pool()?;
     let free = storage.pool_free(pool)?;
     if !fits(size, free) {
         return Err(StorageRefusal::new(
@@ -2346,6 +2391,7 @@ fn folder_target(storage: &Storage, args: &Value, created: String) -> Result<Tar
         name: name.to_string(),
         helper: helper_name(name),
         pool: pool.to_string(),
+        root_pool,
         folder: folder.to_string(),
         fs_uuid,
         size,

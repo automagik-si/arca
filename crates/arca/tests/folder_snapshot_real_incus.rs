@@ -7,6 +7,8 @@
 //! - `ARCA_PROOF_FOLDER`: a scratch folder the snapshot pool is made in (Arca makes `<folder>/arca-pool`, as `storage_add`
 //!   does). An existing snapshot pool of that name is reused.
 //! - `ARCA_PROOF_POOL`: the snapshot pool's name (default `arcaproof`).
+//! - `ARCA_PROOF_ROOT_POOL`: the machine's regular pool the helper's root disk goes on (default: the default profile's
+//!   root pool), as `incus.pools` names it for the kernel.
 //! - `ARCA_PROOF_SOURCE`: a scratch folder that does not exist yet. The test fills it with files of several modes, a
 //!   folder, a symlink, a hard link and an extended attribute, copies it, and removes it.
 //!
@@ -137,6 +139,15 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         Err(error) => panic!("the pool: {error}"),
     }
     writer.ensure_project().expect("the snapshot project");
+    let root_pool = env("ARCA_PROOF_ROOT_POOL").unwrap_or_else(|| {
+        writer
+            .get("/1.0/profiles/default?project=default")
+            .expect("the default profile")
+            .pointer("/devices/root/pool")
+            .and_then(Value::as_str)
+            .expect("the default profile's root pool; set ARCA_PROOF_ROOT_POOL")
+            .to_string()
+    });
 
     let xattr = build_source(&source);
     let source_text = source.to_str().expect("a UTF-8 path").to_string();
@@ -153,6 +164,7 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         helper: helper_name(&name),
         name: name.clone(),
         pool: pool.clone(),
+        root_pool: root_pool.clone(),
         folder: source_text.clone(),
         fs_uuid: "proof".to_string(),
         size: measured.bytes,

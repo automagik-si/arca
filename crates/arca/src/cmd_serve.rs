@@ -303,11 +303,14 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     };
     // Snapshot storage reads the disks and pools on every node; only a kernel-mode node gets the snapshot writer, and it
     // writes only snapshot pools and the arcak-snapshots project.
-    let storage = Arc::new(crate::storage::Storage::new(
-        cfg.incus.socket.clone(),
-        Arc::new(crate::storage::Lsblk),
-        kernel_mode,
-    ));
+    let storage = Arc::new(
+        crate::storage::Storage::new(
+            cfg.incus.socket.clone(),
+            Arc::new(crate::storage::Lsblk),
+            kernel_mode,
+        )
+        .with_helper_pools(cfg.incus.pools.clone()),
+    );
     // A folder copy is never resumed: a copy helper a stopped process left behind is deleted, and its copy marked
     // incomplete, before any call is taken.
     if kernel_mode {

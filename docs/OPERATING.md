@@ -611,7 +611,7 @@ Refused at proposal and again at run, with a plain reason: a path that is not ab
 (`FolderLink`: name the real folder); a folder inside a folder snapshot pool, or one that holds the target pool, so the
 copy would copy itself (`FolderInSnapshotStorage`); a folder on no disk `lsblk` lists (`FolderNotOnDisk`); a folder whose
 measured size plus 10% does not fit the pool's free space (`FolderTooBig`; `SpaceUnknown` when Incus does not report the
-pool's space); and, at run, a folder now on another file system than the one approved (`FolderChanged`).
+pool's space); no regular pool for the copy helper (`HelperPoolMissing`); and, at run, a folder now on another file system than the one approved (`FolderChanged`).
 
 The kernel runs as an unprivileged user and never copies the bytes. Incus does, in the project `arcak-snapshots`:
 
@@ -620,7 +620,11 @@ The kernel runs as an unprivileged user and never copies the bytes. Incus does, 
    `source-path`, `source-name` (the path), `fs-uuid` and `created`.
 2. A copy helper container `arca-copy-<16 hex>` is made from a small image Incus fetches once into `arcak-snapshots` and
    keeps under the alias `arca-folder-copy` (`debian/13` from `images.linuxcontainers.org`: BusyBox `tar` in Alpine keeps
-   no extended attributes or ACLs, and the Debian image has GNU `tar`, `find` and `awk` without needing a network). The
+   no extended attributes or ACLs, and the Debian image has GNU `tar`, `find` and `awk` without needing a network). Its
+   root disk is on a regular pool of the machine, never on snapshot storage (an unprivileged container cannot walk a
+   snapshot pool's folder, so it would not start): the first pool in `incus.pools` that exists and is not snapshot
+   storage, else the default profile's root pool; with neither, the snapshot is refused (`HelperPoolMissing`). Only the
+   volume is on the snapshot pool. The
    folder is a read-only disk at `/src` with `shift=true` (owners kept), the volume is at `/dst` with `limits.read=150MB`
    and `limits.write=80MB` (made again without the caps when Incus refuses them on that pool), and it has no NIC, no
    profile, `boot.autostart=false`, `security.privileged=false`, `limits.cpu=2` and `limits.memory=1GiB`. It carries
@@ -631,7 +635,8 @@ The kernel runs as an unprivileged user and never copies the bytes. Incus does, 
    extended attributes. Both sides are then counted (every path, and the bytes of regular files; a top-level `lost+found`
    and the manifest left out), and `/dst/.arca-manifest.json` is written: `{version, snapshot, sourcePath, fsUuid,
    started, finished, source: {paths, bytes}, copy: {paths, bytes}, tar: {read, write}}`.
-4. The helper is stopped and deleted on every exit path. Only when both sides counted the same does the volume get
+4. The helper is stopped (forcibly, waiting until it reads back stopped, since a failed start can leave it held) and
+   deleted on every exit path; a delete refused as running is stopped and retried once. Only when both sides counted the same does the volume get
    `user.arcasnapshot.verified=true` with `user.arcasnapshot.paths` and `bytes`; otherwise it is kept with
    `user.arcasnapshot.incomplete=<reason>` (the counts differ, reading or writing failed, the helper did not start, the
    copy did not run to its end).
