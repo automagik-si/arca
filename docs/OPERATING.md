@@ -626,7 +626,10 @@ The kernel runs as an unprivileged user and never copies the bytes. Incus does, 
    storage, else the default profile's root pool; with neither, the snapshot is refused (`HelperPoolMissing`). Only the
    volume is on the snapshot pool. The
    folder is a read-only disk at `/src` with `shift=true` (owners kept), the volume is at `/dst` with `limits.read=150MB`
-   and `limits.write=80MB` (made again without the caps when Incus refuses them on that pool), and it has no NIC, no
+   and `limits.write=80MB`. Incus's refusal of the caps does not name them (with a host folder attached it answers
+   `Invalid block device "tmpfs"`), so any refusal of the helper's create or start with the caps on is logged and the
+   helper is made once more without them; the answer's `ioCaps` and a verified volume's `user.arcasnapshot.io-caps` say
+   which way it ran, and it has no NIC, no
    profile, `boot.autostart=false`, `security.privileged=false`, `limits.cpu=2` and `limits.memory=1GiB`. It carries
    `user.arcasnapshot.copy-helper-for=<snapshot>`. It is read back before it starts; one that is not exactly that is
    deleted.

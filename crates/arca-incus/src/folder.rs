@@ -46,6 +46,8 @@ pub const INCOMPLETE_KEY: &str = "user.arcasnapshot.incomplete";
 pub const PATHS_KEY: &str = "user.arcasnapshot.paths";
 /// The bytes of regular files a verified folder snapshot holds.
 pub const BYTES_KEY: &str = "user.arcasnapshot.bytes";
+/// On a verified folder snapshot: whether the copy ran with the read/write caps (`true` or `false`).
+pub const IO_CAPS_KEY: &str = "user.arcasnapshot.io-caps";
 /// The manifest at the top of a folder snapshot's volume.
 pub const MANIFEST_NAME: &str = ".arca-manifest.json";
 /// The local alias of the copy helper's image in [`SNAPSHOT_PROJECT`]. It is fetched once and kept.
@@ -343,22 +345,6 @@ pub fn judge(code: i64, stdout: &str, io_caps: bool) -> FolderOutcome {
     outcome
 }
 
-/// Whether Incus refused a helper because of its read/write caps, so it is made again without them.
-fn caps_refused(error: &IncusError) -> bool {
-    let text = error.to_string().to_ascii_lowercase();
-    [
-        "limits.read",
-        "limits.write",
-        "i/o limit",
-        "io limit",
-        "blkio",
-        "io.max",
-        "block i/o",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
-}
-
 fn snapshot_path(path: &str) -> String {
     format!("{path}?project={SNAPSHOT_PROJECT}")
 }
@@ -456,17 +442,31 @@ impl SnapshotWriter {
     }
 
     /// Makes, checks and starts the helper, with the read/write caps when Incus takes them. Returns whether it has them.
+    /// Incus's refusal of the caps does not name them (with a host folder attached it answers `Invalid block device
+    /// "tmpfs"`), so any refusal of the create or the start with the caps on makes the helper once more without them. Only
+    /// the writer's own refusals, made before anything is sent, are not retried.
     fn start_helper(&self, copy: &FolderCopy) -> Result<bool, String> {
-        match self.try_helper(copy, true) {
-            Ok(()) => Ok(true),
-            Err(error) if caps_refused(&error) => {
-                let _ = self.remove_helper(&copy.helper);
-                self.try_helper(copy, false)
-                    .map(|()| false)
-                    .map_err(|error| format!("the copy helper did not start: {error}"))
+        let with_caps = match self.try_helper(copy, true) {
+            Ok(()) => return Ok(true),
+            Err(error @ IncusError::Refused(_)) => {
+                return Err(format!("the copy helper did not start: {error}"));
             }
-            Err(error) => Err(format!("the copy helper did not start: {error}")),
+            Err(error) => error,
+        };
+        eprintln!(
+            "arca: the copy helper {} did not start with the read/write caps ({with_caps}); making it again without them",
+            copy.helper
+        );
+        if let Err(error) = self.remove_helper(&copy.helper) {
+            return Err(format!(
+                "the copy helper did not start ({with_caps}) and could not be removed before a retry: {error}"
+            ));
         }
+        self.try_helper(copy, false).map(|()| false).map_err(|error| {
+            format!(
+                "the copy helper did not start: {error} (with the read/write caps it answered: {with_caps})"
+            )
+        })
     }
 
     fn try_helper(&self, copy: &FolderCopy, io_caps: bool) -> Result<(), IncusError> {
@@ -631,11 +631,18 @@ impl SnapshotWriter {
         if config.get(SOURCE_KIND_KEY).and_then(Value::as_str) != Some("folder") {
             return Err(refused("the volume is not a folder snapshot"));
         }
-        for key in [VERIFIED_KEY, INCOMPLETE_KEY, PATHS_KEY, BYTES_KEY] {
+        for key in [
+            VERIFIED_KEY,
+            INCOMPLETE_KEY,
+            PATHS_KEY,
+            BYTES_KEY,
+            IO_CAPS_KEY,
+        ] {
             config.remove(key);
         }
         if outcome.verified {
             config.insert(VERIFIED_KEY.to_string(), json!("true"));
+            config.insert(IO_CAPS_KEY.to_string(), json!(outcome.io_caps.to_string()));
             if let Some(copy) = outcome.copy {
                 config.insert(PATHS_KEY.to_string(), json!(copy.paths.to_string()));
                 config.insert(BYTES_KEY.to_string(), json!(copy.bytes.to_string()));

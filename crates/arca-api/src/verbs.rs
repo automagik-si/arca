@@ -2133,6 +2133,7 @@ fn snapshot_change_result() -> Value {
         ("folder", false, string()),
         ("files", false, int()),
         ("bytes", false, int()),
+        ("ioCaps", false, boolean()),
     ])
 }
 

@@ -20,7 +20,9 @@
 //! text, a `POST` of a new empty volume, a volume `PUT` and `GET /1.0/profiles/<p>`. A running instance cannot be
 //! deleted, and a stopped one cannot be stopped again, as in Incus. As on a real host, a failed start leaves the instance
 //! reading back as stopped while Incus still holds it, so a delete is refused until it is stopped; and an instance whose
-//! root disk is on a snapshot pool fails to start, since its unprivileged root cannot walk that pool's folder.
+//! root disk is on a snapshot pool fails to start, since its unprivileged root cannot walk that pool's folder; and one with
+//! `limits.read`/`limits.write` on a disk while a host folder disk is attached fails to start with `Invalid block device
+//! "tmpfs"`.
 //!
 //! An instance copy behaves as Incus's own does (`createFromCopy`): every local config key and local device of the source
 //! that the request leaves unset is carried into the copy (volatile keys aside), an empty config value is not stored, the
@@ -65,7 +67,7 @@ struct State {
     ignore_puts: bool,
     aliases: std::collections::BTreeSet<(String, String)>,
     exec: (i64, String),
-    fail_start: Option<String>,
+    fail_start: std::collections::VecDeque<String>,
     fail_exec: Option<String>,
     logs: BTreeMap<String, String>,
     profiles: BTreeMap<(String, String), Value>,
@@ -210,9 +212,9 @@ impl FakeStorageIncus {
         lock(&self.state).exec = (code, stdout.to_string());
     }
 
-    /// Fails the next instance start with Incus's message.
+    /// Fails the next instance start with Incus's message. Called again, it fails the start after that too.
     pub fn fail_next_start(&self, message: &str) {
-        lock(&self.state).fail_start = Some(message.to_string());
+        lock(&self.state).fail_start.push_back(message.to_string());
     }
 
     /// Fails the next exec operation with Incus's message.
@@ -647,13 +649,32 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             let root_on_snapshots = state.pools.get(&root_pool).is_some_and(|pool| {
                 pool["config"].get("user.arcasnapshot.storage") == Some(&pool["name"])
             });
+            // As on a real host: read/write caps on a disk while a host folder is attached refuse the start.
+            let disks: Vec<&Value> = state.instances[&key]["expanded_devices"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(_, device)| device)
+                .filter(|device| device["type"] == json!("disk"))
+                .collect();
+            let caps_with_folder = disks.iter().any(|disk| {
+                disk.get("limits.read").is_some() || disk.get("limits.write").is_some()
+            }) && disks.iter().any(|disk| {
+                disk["source"]
+                    .as_str()
+                    .is_some_and(|source| source.starts_with('/'))
+            });
             let status = match body["action"].as_str() {
                 Some("start") => {
-                    let failure = state.fail_start.take().or_else(|| {
-                        root_on_snapshots.then(|| {
-                            "Failed to run: Permission denied - Failed to mount \"credentials\" onto \"/dev/.incus-systemd-credentials\"".to_string()
+                    let failure = state
+                        .fail_start
+                        .pop_front()
+                        .or_else(|| {
+                            root_on_snapshots.then(|| {
+                                "Failed to run: Permission denied - Failed to mount \"credentials\" onto \"/dev/.incus-systemd-credentials\"".to_string()
+                            })
                         })
-                    });
+                        .or_else(|| caps_with_folder.then(|| "Invalid block device \"tmpfs\"".to_string()));
                     if let Some(message) = failure {
                         state.half_started.insert(key);
                         return operation(state, Some(message));

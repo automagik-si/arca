@@ -4412,6 +4412,9 @@
             "folder": {
               "type": "string"
             },
+            "ioCaps": {
+              "type": "boolean"
+            },
             "kind": {
               "type": "string"
             },
@@ -4619,6 +4622,9 @@
             },
             "folder": {
               "type": "string"
+            },
+            "ioCaps": {
+              "type": "boolean"
             },
             "kind": {
               "type": "string"

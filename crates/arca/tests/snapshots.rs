@@ -2100,8 +2100,16 @@ fn a_folder_snapshot_copies_through_a_read_only_offline_helper_that_is_then_dele
     assert_eq!(config["user.arcasnapshot.bytes"], json!("1005"));
 
     // The helper: from the cached image, the folder read-only and shifted, no NIC, no profile, unprivileged, capped.
+    // This fake, like the host it was checked on, refuses the caps while a host folder is attached, so the helper is
+    // made once with them and once more without them.
     let creates = helper_create(&rig);
-    assert_eq!(creates.len(), 1);
+    assert_eq!(creates.len(), 2);
+    assert!(
+        creates[1].body["devices"]["dst"]
+            .get("limits.read")
+            .is_none()
+    );
+    assert_eq!(result["ioCaps"], json!(false));
     let helper = &creates[0].body;
     let helper_name = arca::storage::helper_name(&name);
     assert_eq!(helper["name"], json!(helper_name));
@@ -2164,13 +2172,17 @@ fn a_folder_snapshot_copies_through_a_read_only_offline_helper_that_is_then_dele
             )
         })
         .collect();
+    let delete = format!("DELETE {helper_name}");
     assert_eq!(
         steps,
         [
             "PUT start",
+            "PUT stop",
+            delete.as_str(),
+            "PUT start",
             "POST exec",
             "PUT stop",
-            format!("DELETE {helper_name}").as_str()
+            delete.as_str()
         ]
     );
     let exec = rig
@@ -2259,9 +2271,12 @@ fn a_folder_copy_that_fails_or_miscounts_is_kept_incomplete_and_the_helper_is_al
         (
             "start-fails",
             |incus| {
-                incus.fail_next_start(
-                    "Failed to setup device mount \"src\": idmapping abilities are required",
-                )
+                // Refused with the caps and again without them.
+                for _ in 0..2 {
+                    incus.fail_next_start(
+                        "Failed to setup device mount \"src\": idmapping abilities are required",
+                    );
+                }
             },
             "idmapping",
         ),
@@ -2331,11 +2346,20 @@ fn a_helper_incus_refuses_the_io_caps_for_is_made_again_without_them() {
         )
         .expect("a proposal");
     rig.incus.set_exec(0, &manifest((5, 1005), (5, 1005)));
-    rig.incus.fail_next_start(
-        "Failed to start device \"dst\": Block I/O limits aren't supported by this pool",
-    );
+    // Incus's refusal does not name the caps (the exact answer a real host gave): any refusal with the caps on is
+    // retried once without them.
+    rig.incus.fail_next_start("Invalid block device \"tmpfs\"");
     let result = rig.approve_and_run(&key, &proposed).expect("the copy runs");
     assert_eq!(result["state"], json!("copied"));
+    assert_eq!(result["ioCaps"], json!(false));
+    let volume = rig
+        .incus
+        .volume("usb1", SNAPSHOT_PROJECT, &folder_name(&folder))
+        .expect("the volume");
+    assert_eq!(
+        volume["config"]["user.arcasnapshot.io-caps"],
+        json!("false")
+    );
     let creates = helper_create(&rig);
     assert_eq!(creates.len(), 2, "made again once");
     assert!(
@@ -2684,8 +2708,10 @@ fn a_helper_that_fails_to_start_is_still_stopped_and_deleted() {
         .expect("a proposal");
     // As on a real host: the failed start leaves the helper reading back as stopped while Incus still holds it, so a
     // delete without a stop first is refused ("Instance is running").
-    rig.incus
-        .fail_next_start("Failed to run: Permission denied - Failed to mount \"credentials\"");
+    for _ in 0..2 {
+        rig.incus
+            .fail_next_start("Failed to run: Permission denied - Failed to mount \"credentials\"");
+    }
     let message = match rig.approve_and_run(&key, &proposed) {
         Err(CallError::Refused { code, message }) => {
             assert_eq!(code, "SnapshotIncomplete");
@@ -2721,8 +2747,11 @@ fn a_helper_that_fails_to_start_is_still_stopped_and_deleted() {
             ("PUT".to_string(), "start".to_string()),
             ("PUT".to_string(), "stop".to_string()),
             ("DELETE".to_string(), String::new()),
+            ("PUT".to_string(), "start".to_string()),
+            ("PUT".to_string(), "stop".to_string()),
+            ("DELETE".to_string(), String::new()),
         ],
-        "stopped before it is deleted"
+        "stopped before it is deleted, with and without the caps"
     );
     assert_write_family(&rig.incus);
 }

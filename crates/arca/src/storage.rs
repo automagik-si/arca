@@ -3503,6 +3503,7 @@ impl StorageActionHandler {
             }
             Some(Ok(outcome)) if outcome.verified => {
                 let mut done = answer("copied");
+                done["ioCaps"] = json!(outcome.io_caps);
                 if let Some(copied) = outcome.copy {
                     done["files"] = json!(copied.paths);
                     done["bytes"] = json!(copied.bytes);
