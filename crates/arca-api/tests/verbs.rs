@@ -1,7 +1,7 @@
 //! The verb table, the OpenRPC document and the released 0.1.0 schema. Each expected schema below is written out by hand from
 //! the table, so a typo in the constructors fails here.
 
-use arca_api::openrpc::{check_document, openrpc};
+use arca_api::openrpc::{check_document, check_released_document, openrpc};
 use arca_api::{API_VERSION, Scope, VerbClass, conforms, may_call, verb, verbs};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -696,6 +696,22 @@ fn the_document_passes_its_check_and_every_method_is_classed() {
             m["x-arca-writes"].is_boolean(),
             "every method has a writes flag"
         );
+        let v = verbs()
+            .iter()
+            .find(|v| m["name"] == v.name)
+            .expect("every method is a verb");
+        assert_eq!(
+            m["x-arca-writes"],
+            json!(v.writes),
+            "{}: writes is the table's",
+            v.name
+        );
+        assert_eq!(
+            m["x-arca-read-only-hint"],
+            json!(v.read_only_hint()),
+            "{}: the hint is the served one",
+            v.name
+        );
         assert_eq!(
             m["x-arca-additional-properties"],
             json!(true),
@@ -763,7 +779,7 @@ fn the_released_0_1_0_document_holds_exactly_the_four_initial_verbs() {
         "the released 0.1.0 file is byte-pinned"
     );
     let doc: Value = serde_json::from_slice(&bytes).expect("the released schema is JSON");
-    assert_eq!(check_document(&doc), Ok(()));
+    assert_eq!(check_released_document(&doc), Ok(()));
     assert_eq!(doc["info"]["version"], json!("0.1.0"));
     let released: Vec<&str> = doc["methods"]
         .as_array()

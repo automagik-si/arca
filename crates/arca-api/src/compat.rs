@@ -1,7 +1,7 @@
 //! The OpenRPC compatibility checker. A released document is frozen, so this module lists every change in a current document
 //! that would break a client built against the released one. An empty list is the only passing answer.
 //!
-//! The breaks are the eleven the API contract names. Methods, parameters and result fields are matched by name. A result
+//! The breaks are the eleven the API contract names, plus a changed read-only hint. Methods, parameters and result fields are matched by name. A result
 //! break names its path in the result schema: `$` is the root, `.field` a field and `[]` the items of an array, so
 //! `$.projects[].instances[].name` is the name of one instance.
 //!
@@ -13,6 +13,10 @@
 //! anyOf. `propertyNames`, and an `additionalProperties` that is a schema, are read by `check.rs` but not modelled here. Where two schemas differ in a way this module cannot relate, it reports a break (fail closed). That covers an
 //! `anyOf` that changes as a value, a keyword outside the subset (annotations and `x-` extensions aside) that differs, and
 //! a schema that is not an object. The minimum scope is ranked in the order of [`crate::Scope`].
+//!
+//! The method's `x-arca-read-only-hint` is compared in both directions, since a client may skip a confirmation for a
+//! read-only tool, or ask for one it no longer needs. A released document from before the hint has no claim to compare,
+//! so only its other flags are.
 //!
 //! The method's `x-arca-additional-properties` flag is not compared: the released document is closed by construction, and
 //! opening a params object only admits more arguments.
@@ -54,6 +58,8 @@ pub enum Break {
     ScopeRaised { method: String },
     /// The method writes now, and did not before.
     WritesTurnedOn { method: String },
+    /// The method's read-only hint differs from the released one, either way, or is gone.
+    ReadOnlyHintChanged { method: String },
 }
 
 impl fmt::Display for Break {
@@ -84,6 +90,7 @@ impl fmt::Display for Break {
             Self::ClassChanged { method } => write!(f, "{method}: class changed"),
             Self::ScopeRaised { method } => write!(f, "{method}: minimum scope raised"),
             Self::WritesTurnedOn { method } => write!(f, "{method}: writes turned on"),
+            Self::ReadOnlyHintChanged { method } => write!(f, "{method}: read-only hint changed"),
         }
     }
 }
@@ -91,9 +98,10 @@ impl fmt::Display for Break {
 const CLASS: &str = "x-arca-class";
 const SCOPE: &str = "x-arca-scope";
 const WRITES: &str = "x-arca-writes";
+const READ_ONLY_HINT: &str = "x-arca-read-only-hint";
 
 /// Every break a current document makes against a released one, in the released document's method order. Both documents
-/// should pass `openrpc::check_document`. A released method without a name is skipped, since nothing can match it.
+/// should pass `openrpc::check_document` (a released one `openrpc::check_released_document`). A released method without a name is skipped, since nothing can match it.
 pub fn compatible(released: &Value, current: &Value) -> Vec<Break> {
     let mut out = Vec::new();
     let current_methods = methods(current);
@@ -116,6 +124,13 @@ pub fn compatible(released: &Value, current: &Value) -> Vec<Break> {
         }
         if flag(new, WRITES) && !flag(old, WRITES) {
             out.push(Break::WritesTurnedOn {
+                method: method.clone(),
+            });
+        }
+        if let Some(old_hint) = old.get(READ_ONLY_HINT)
+            && new.get(READ_ONLY_HINT) != Some(old_hint)
+        {
+            out.push(Break::ReadOnlyHintChanged {
                 method: method.clone(),
             });
         }

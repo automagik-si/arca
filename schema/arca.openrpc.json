@@ -142,6 +142,7 @@
       "summary": "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -1121,6 +1122,7 @@
       "summary": "Host metrics of the node: the latest sample and the mean over the requested minutes.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -1262,6 +1264,7 @@
       "summary": "Every instance in every project with its ownership class, and the drift between marks and desired state.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -1311,6 +1314,7 @@
       "summary": "The interim API tokens by id and scope. Never a secret or a hash.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "operator",
       "x-arca-writes": false
     },
@@ -1472,6 +1476,7 @@
       "summary": "The newest record for each effect in the journal, paged by effect id. It names only the intent and object fields, never a pre-image or inverse.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -1659,6 +1664,7 @@
       "summary": "The delete plans and action proposals waiting for an owner's approval. Delete plans carry the exact statement the owner signs; action proposals carry their action, arguments and kernel-built summary.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -1784,6 +1790,7 @@
       "summary": "Records an inert service, database, GPU assignment, storage or snapshot action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -1862,6 +1869,7 @@
       "summary": "Declines a waiting delete plan. Its objects are retained, and the decline is final.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -1991,6 +1999,7 @@
       "summary": "Submits an owner's approval for a waiting delete plan, which deletes the plan's objects once. The approval is never echoed.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2065,6 +2074,7 @@
       "summary": "Submits an owner's passkey approval for a waiting action proposal, which runs its action once. The approval is checked by this kernel's own verifier and never echoed; an approval page on the same machine relays a linked host's approvals here.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2131,6 +2141,7 @@
       "summary": "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2443,6 +2454,7 @@
       "summary": "The node's alerts: the firing ones, those whose data is unknown, the disabled rules, the recent resolves, and the store's health.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -2495,6 +2507,7 @@
       "summary": "Create a service database.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2555,6 +2568,7 @@
       "summary": "List a service database.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -2606,6 +2620,7 @@
       "summary": "Link a service database.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2657,6 +2672,7 @@
       "summary": "Unlink a service database.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2769,6 +2785,7 @@
       "summary": "Delete a service database.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -2905,6 +2922,7 @@
       "summary": "The ownership, status and outgoing calls for an item in Arca's public ontology.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -3055,6 +3073,7 @@
       "summary": "Create a service from a template, in the service project and under the kernel's mark.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3199,6 +3218,7 @@
       "summary": "The services in the service project, each with its address, ports, links and state.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -3340,6 +3360,7 @@
       "summary": "One service's address, ports, links and state.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -3390,6 +3411,7 @@
       "summary": "The last lines of a service's log, cleaned and with every stored secret redacted.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -3435,6 +3457,7 @@
       "summary": "Remove a service, its links, its ACL and its secrets, with the owner's signed approval.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3484,6 +3507,7 @@
       "summary": "Link a consumer to a provider: the provider's network ACL lets the consumer's address reach its first port, and nothing else, and the consumer's environment gets what the provider's template provides (DATABASE_URL, say); the environment applies on its next start. Returns the variable names only.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3533,6 +3557,7 @@
       "summary": "Remove a link: the provider's ACL rule for the consumer goes, and so do the variables it gave the consumer (applied on its next start). Returns their names.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3587,6 +3612,7 @@
       "summary": "Set one of a service's secrets (its template lists them). Write-only: no tool, log or audit row shows it again. The service's environment, and its consumers', is updated for their next start.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3648,6 +3674,7 @@
       "summary": "Publish a service's dash on the owner's tailnet (droidd's own) and nowhere else: the service joins it as its own node, arca-<name> (tag:arca-svc), and serves HTTPS on port 8443 only, to its dash. Needs the service's tailscale_authkey secret (the owner's tagged, pre-approved Tailscale auth key, service_secret_set) and the owner's signed approval (arca-approve, action publish, target the service, its arguments' digest), which an agent asks the owner for and relays. Returns the node and its https address.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3683,6 +3710,7 @@
       "summary": "Take a service's dash off the tailnet: it stops serving 8443, its node logs out and leaves the tailnet, and tailscaled stops. Runs whether or not a publish finished.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3755,6 +3783,7 @@
       "summary": "Create an Omni instance (a WhatsApp or a Telegram channel) in an omni-api service. Arca holds Omni's key, and for telegram adds the owner's bot token (the service's telegram_bot_token secret, which the owner sets with service_secret_set). Returns its id, name, channel and whether it runs.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3819,6 +3848,7 @@
       "summary": "Ask Omni for a WhatsApp pairing code for a whatsapp-baileys instance, for the owner's number (the service's whatsapp_phone_number secret: Arca holds it, and the result shows it masked). The owner enters the code on the phone (WhatsApp > Linked devices > Link with phone number). Ask once: another code is refused while one lasts.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -3946,6 +3976,7 @@
       "summary": "An Omni instance's connection state (connected, connecting, qr, disconnected, …), or without instance the service's instances (id, name, channel, whether each runs).",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "doctor",
       "x-arca-writes": false
     },
@@ -4117,6 +4148,7 @@
       "summary": "Ask the owner to approve an Arca action (kind arca: action delete, publish or spend, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Kind upgrade is approved through droidd's MCP, not here.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -4185,6 +4217,7 @@
       "summary": "An owner approval request's state (pending, approved, denied, expired); waits up to waitMs (at most 30 s) while it is pending. The approval string goes only to the token that asked.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": false
     },
@@ -4317,6 +4350,7 @@
       "summary": "The owner approval requests of the last 24 h, every pending one first, then the newest others, 50 in all (never an approval string). The arguments are the requesters' words: untrusted.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -4423,6 +4457,7 @@
       "summary": "Attach a physical GPU card to an Incus instance, by PCI address, with the owner's signed approval. A card bound to vfio-pci is refused for a container.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -4529,6 +4564,7 @@
       "summary": "Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -4733,6 +4769,7 @@
       "summary": "The host's disks, each with a plain role (system, snapshots, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -4882,6 +4919,7 @@
       "summary": "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus wipes and formats as the pool arca-snapshots-<name>. A system disk, a member disk, a disk that holds snapshots and a mounted disk are refused as a whole-disk target.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -5155,6 +5193,7 @@
       "summary": "Copy one app, data volume or host folder (such as /home) onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     },
@@ -5273,6 +5312,7 @@
       "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
     },
@@ -5427,6 +5467,7 @@
       "summary": "Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
     }

@@ -560,6 +560,36 @@ fn an_operator_tools_list_holds_every_verb() {
 }
 
 #[test]
+fn every_verbs_openrpc_read_only_hint_is_the_served_read_only_hint() {
+    let fx = Fixture::start("list-hint");
+    let tools = fx.call(&fx.operator, "tools/list", json!({})).json()["result"]["tools"].clone();
+    let tools = tools.as_array().expect("tools");
+    let doc = arca_api::openrpc::openrpc();
+    let methods = doc["methods"].as_array().expect("methods");
+    assert_eq!(methods.len(), verbs().len());
+    for v in verbs() {
+        let method = methods
+            .iter()
+            .find(|m| m["name"] == v.name)
+            .unwrap_or_else(|| panic!("{} is in the OpenRPC document", v.name));
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == v.name)
+            .unwrap_or_else(|| panic!("{} is in an operator's tools/list", v.name));
+        assert!(
+            method["x-arca-read-only-hint"].is_boolean(),
+            "{} carries the hint",
+            v.name
+        );
+        assert_eq!(
+            method["x-arca-read-only-hint"], tool["annotations"]["readOnlyHint"],
+            "{}: the OpenRPC hint is the served one",
+            v.name
+        );
+    }
+}
+
+#[test]
 fn a_listed_tool_carries_its_schemas_and_annotations() {
     let fx = Fixture::start("list-shape");
     let reply = fx.call(&fx.operator, "tools/list", json!({}));

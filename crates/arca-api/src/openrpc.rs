@@ -2,9 +2,12 @@
 //! newline-terminated.
 //!
 //! Each method lists its named parameters as Content Descriptors, required ones first, then the optional ones, each in name
-//! order. The one result is a Content Descriptor named `result`. Every method carries three extensions: `x-arca-class`,
-//! `x-arca-scope` and `x-arca-writes`. `x-arca-additional-properties` records whether the params object is closed, which the
-//! table makes true for every verb.
+//! order. The one result is a Content Descriptor named `result`. Every method carries four extensions: `x-arca-class`,
+//! `x-arca-scope`, `x-arca-writes` and `x-arca-read-only-hint`. `x-arca-writes` says whether the verb changes desired
+//! state; `x-arca-read-only-hint` is the `readOnlyHint` the MCP door serves for it ([`Verb::read_only_hint`]). The two are
+//! separate because a verb can change no desired state and still not be read-only. docs/OPERATING.md ("The OpenRPC
+//! method flags") says what each means to a client. `x-arca-additional-properties` records whether the params object is
+//! closed, which the table makes true for every verb.
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -41,6 +44,7 @@ fn method(v: &Verb) -> Value {
         "x-arca-class": v.class.as_str(),
         "x-arca-scope": v.min_scope.as_str(),
         "x-arca-writes": v.writes,
+        "x-arca-read-only-hint": v.read_only_hint(),
         "x-arca-additional-properties": closed
     })
 }
@@ -68,13 +72,23 @@ fn descriptors(params: &Value) -> Vec<Value> {
 }
 
 /// Whether a document has the shape the verb table promises: the version, the info version, and for every method a name,
-/// a params list, a result, and the three extensions with a legal value. A method without a class is refused, so a verb
-/// cannot reach the document unclassed. Method names are unique, and so are the parameter names of a method, and every
+/// a params list, a result, and the four extensions with a legal value. A method without a class is refused, so a verb
+/// cannot reach the document unclassed. A method that writes and also claims to be read-only is refused. Method names are unique, and so are the parameter names of a method, and every
 /// parameter is named: the compatibility checker compares one entry per name, so a repeat would go unread. Every
 /// parameter has a schema, and every parameter and result schema is well formed in the subset `check::conforms` reads.
 /// The compatibility checker reads a keyword only where both sides hold a value of its type, so a malformed one would
 /// pass unread.
 pub fn check_document(doc: &Value) -> Result<(), String> {
+    check(doc, true)
+}
+
+/// [`check_document`] for a released document. A document released before `x-arca-read-only-hint` existed does not
+/// carry it and is frozen, so the key may be absent here. Where it is present it must be legal.
+pub fn check_released_document(doc: &Value) -> Result<(), String> {
+    check(doc, false)
+}
+
+fn check(doc: &Value, hint_required: bool) -> Result<(), String> {
     if doc.get("openrpc").and_then(Value::as_str) != Some(OPENRPC_VERSION) {
         return Err(format!("openrpc must be {OPENRPC_VERSION}"));
     }
@@ -103,8 +117,18 @@ pub fn check_document(doc: &Value) -> Result<(), String> {
         if !matches!(scope, Some("viewer" | "doctor" | "operator")) {
             return Err(format!("method {name} has no legal x-arca-scope"));
         }
-        if m.get("x-arca-writes").and_then(Value::as_bool).is_none() {
+        let Some(writes) = m.get("x-arca-writes").and_then(Value::as_bool) else {
             return Err(format!("method {name} has no x-arca-writes flag"));
+        };
+        match m.get("x-arca-read-only-hint") {
+            None if !hint_required => {}
+            Some(Value::Bool(true)) if writes => {
+                return Err(format!(
+                    "method {name} writes, so x-arca-read-only-hint must be false"
+                ));
+            }
+            Some(Value::Bool(_)) => {}
+            _ => return Err(format!("method {name} has no x-arca-read-only-hint flag")),
         }
         // The flag records that the params object is closed: `true` is the only legal value.
         if m.get("x-arca-additional-properties") != Some(&Value::Bool(true)) {
@@ -172,5 +196,30 @@ mod tests {
             .expect("a method is an object")
             .remove("x-arca-class");
         assert!(check_document(&doc).is_err());
+    }
+
+    #[test]
+    fn a_method_without_a_read_only_hint_is_refused_unless_it_was_released_before_the_hint() {
+        let mut doc = openrpc();
+        doc["methods"][0]
+            .as_object_mut()
+            .expect("a method is an object")
+            .remove("x-arca-read-only-hint");
+        assert!(check_document(&doc).is_err());
+        assert_eq!(check_released_document(&doc), Ok(()));
+        doc["methods"][0]["x-arca-read-only-hint"] = json!("yes");
+        assert!(
+            check_released_document(&doc).is_err(),
+            "a present hint is a boolean"
+        );
+    }
+
+    #[test]
+    fn a_writing_method_that_claims_read_only_is_refused() {
+        let mut doc = openrpc();
+        doc["methods"][0]["x-arca-writes"] = json!(true);
+        doc["methods"][0]["x-arca-read-only-hint"] = json!(true);
+        assert!(check_document(&doc).is_err());
+        assert!(check_released_document(&doc).is_err());
     }
 }
