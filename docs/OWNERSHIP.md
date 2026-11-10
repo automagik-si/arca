@@ -910,9 +910,15 @@ The caps Incus holds follow the node's configured caps, for both owners alike, a
 virtual-machine create that has passed Arca's own cap check (Rule 58) writes the configured caps into the owner's entry when
 they differ, up or down, in the same document as the new service and ahead of it, so the project is written before the
 instance is sent. Because that check has passed, a lowered cap is never below what the node holds; a cap lowered further
-refuses the create in words before any write and leaves the entry and the project as they were. The network entry
-re-applies on every pass and writes its entry's value back over a value set by hand; the entry's `0`, which it holds until
-the first virtual machine, is never written. A pass over an unchanged desired state writes nothing.
+refuses the create in words before any write and leaves the entry and the project as they were. The owner's
+entry carries the configured caps whenever it is written at all, the widening of Rule 55's table included: the bridged
+plugin writes the count on every apply, so an entry left with a stale count (one an earlier release wrote, its project
+raised by hand since) would otherwise set the project below what it holds, which Incus refuses. Before any such write,
+a configured count below the number of virtual machines the node holds refuses the create in words, naming both numbers
+and the config key. A value set by hand on the project is replaced differently by the two owners: the network entry
+re-applies on every pass and writes its entry's value back (its `0`, held until the first virtual machine, is never
+written); the bridged entry is applied only when it changes, so a hand-set value stays until its next write. A pass over
+an unchanged desired state writes nothing.
 
 On a project the bridged entry owns, `net-arcak-svc` is written with `sharedProject: true`: it creates the managed bridge and the
 service profile, and it never writes the project. The bridged project never had a bridge grant, so the managed bridge
@@ -933,8 +939,11 @@ Source: `BridgedProject::apply` and `NetProject::apply` in `crates/arca-netproje
 `the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_skips_it` and
 `the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges` in
 `crates/arca-netproject/tests/netproject.rs`, the two tests of Rule 54, and for the caps
-`the_cap_incus_holds_follows_the_configured_cap_up_and_down` and `the_bridged_owners_caps_follow_the_config_too` in
-`crates/arca/tests/services/mixed.rs`.
+`the_cap_incus_holds_follows_the_configured_cap_up_and_down`, `the_bridged_owners_caps_follow_the_config_too`,
+`a_widening_writes_the_configured_caps_over_a_stale_entry_and_the_first_container_is_created`,
+`a_widening_with_a_count_below_the_machines_held_is_refused_in_words_before_any_write` and
+`a_bridged_nodes_lowered_caps_are_refused_below_use_and_followed_above_it` in `crates/arca/tests/services/mixed.rs`. The
+fake refuses a project write whose `limits.virtual-machines` is below the virtual machines the project holds, as Incus does.
 
 **Rule 56.** A virtual machine on the managed network is a service like a container. `service_create` with no `bridge`, on a node
 with `kernel.serviceCidr`, gives it the next free address of the same plan (`.10` to `.239`, shared with containers and

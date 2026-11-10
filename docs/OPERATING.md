@@ -2119,7 +2119,13 @@ with the next virtual-machine create: once that create has passed Arca's check, 
 the entry that owns the project and, by a journaled project config write, into the project, before the instance is
 sent. This works both ways. A cap lowered below what the node already holds changes nothing: every create is refused,
 naming the cap, what is in use and what is allowed, until the cap is raised or virtual machines are removed. Nothing
-is to be set by hand, and a value set by hand on the project is written back to the entry's on the next pass.
+is to be set by hand. A value set by hand on the project is replaced by the entry's the next time Arca writes the
+project: on the next pass where the managed network's entry owns the project, and at the next write of the entry
+(a virtual-machine create that finds the caps changed, or the widening) where the bridged entry owns it. Whenever
+Arca writes the owner's entry, for a virtual machine or to widen the project for the managed network, the entry takes
+the configured caps, so a node whose project was raised by hand under an earlier Arca needs only its config to state
+the same caps. A configured count below the number of virtual machines the node holds refuses that create, naming
+both numbers and the config key, before anything is written.
 
 **A network is never dropped from under what lives on it.** A node may gain the other network at any time (see "Mixed
 nodes"). What `arca serve` refuses, at its start and naming the entry, is a config that would leave a half-state:

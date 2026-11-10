@@ -1916,6 +1916,28 @@ fn write_project(
             }
         }
     }
+    // Incus refuses a limit below what the project already holds (`checkRestrictionsAndAggregateLimits`). The fake
+    // models the one count the kernel writes: virtual machines.
+    if let Some(limit) = config
+        .get("limits.virtual-machines")
+        .and_then(Value::as_str)
+        .and_then(|limit| limit.parse::<usize>().ok())
+    {
+        let held = store
+            .objects
+            .iter()
+            .filter(|object| {
+                object.kind == "instance"
+                    && object.project == name
+                    && object.body.get("type").and_then(Value::as_str) == Some("virtual-machine")
+            })
+            .count();
+        if limit < held {
+            return bad(&format!(
+                "\"limits.virtual-machines\" is too low: there currently are {held} total instances of type virtual-machine in project \"{name}\""
+            ));
+        }
+    }
     let Some(object) = store.objects[index].body.as_object_mut() else {
         return (
             500,

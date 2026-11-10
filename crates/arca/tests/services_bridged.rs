@@ -166,6 +166,27 @@ impl Rig {
         (cfg, handlers)
     }
 
+    /// A write made by hand on the host, outside Arca.
+    fn edit(&self, method: &str, path: &str, body: Value) {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(self.fake.socket()).expect("the fake");
+        let body = body.to_string();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .expect("the request");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("the answer");
+        assert!(
+            response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 202"),
+            "an edit by hand failed: {}",
+            response.lines().next().unwrap_or("")
+        );
+    }
+
     fn entries(&self) -> Vec<arca_kernel::desired::Entry> {
         self.kernel.lock().expect("kernel").entries().to_vec()
     }
@@ -968,12 +989,10 @@ fn a_bridged_node_switched_to_managed_is_refused_at_start() {
     assert_eq!(arca::handlers::mode_refusal(&rig.cfg, &entries), None);
     let (cfg, _) = rig.switched(managed_kernel());
     let why = arca::handlers::mode_refusal(&cfg, &entries).expect("serve refuses to start");
-    assert!(
-        why.starts_with("kernel.bridged is not set, but this node already holds ")
-            && why.ends_with(
-                "from bridged mode. Put kernel.bridged back, or remove its virtual machines first"
-            ),
-        "{why}"
+    // Removing the machine would not help: the project stays a bridged-only one. The advice is one that can be followed.
+    assert_eq!(
+        why,
+        "kernel.bridged is not set, but this node already holds service-ws1 from bridged mode, in a service project created in bridged mode. Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one"
     );
     // The project entry alone, with every machine removed, still marks the node as bridged.
     let project_only: Vec<_> = entries

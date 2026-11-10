@@ -133,9 +133,7 @@ fn a_bridged_node_that_gains_the_service_network_becomes_mixed_in_place_and_its_
     assert!(
         serve_start(&rig, managed_vm_kernel(roomy()))
             .expect_err("dropping kernel.bridged under the machine is still refused")
-            .ends_with(
-                "from bridged mode. Put kernel.bridged back, or remove its virtual machines first"
-            )
+            .ends_with("the node then becomes a mixed node, never a managed-only one")
     );
     assert_eq!(
         rig.fake.writes().len(),
@@ -933,4 +931,133 @@ fn a_partial_removal_names_the_acl_and_a_missing_service_project_names_its_reaso
         );
     }
     assert!(fresh.fake.writes().is_empty());
+}
+
+/// A bridged node as the previous release left it: its entry holds the count it was created with (4), the operator
+/// raised the config to 8 and the project by hand, as the old documentation said, and six machines run.
+fn old_release_bridged_node() -> Rig {
+    let caps = |count: u32| json!({ "virtualMachines": count, "cpu": 64, "memory": "256GiB", "disk": "2TiB" });
+    let rig = Rig::with(bridged_kernel(&["br0"], caps(8)), None, vec![]);
+    for name in ["ws1", "ws2", "ws3", "ws4", "ws5", "ws6"] {
+        rig.call("service_create", json!({"name":name,"template":"ws"}))
+            .expect("a machine");
+    }
+    // The entry is put back to what the old release wrote and never changed. The fake refuses the count below the six
+    // machines, as Incus does, so the project keeps the value set by hand.
+    let mut stale = entry(&rig, BRIDGED_ENTRY).config;
+    stale["virtualMachines"] = json!(4);
+    let _ = rig.kernel.lock().expect("kernel").propose(
+        vec![arca::desired_store::EntryChange::Put(
+            arca::handlers::service_entry(BRIDGED_ENTRY, "arca.bridgedproject", stale),
+        )],
+        NOW,
+    );
+    assert_eq!(entry(&rig, BRIDGED_ENTRY).config["virtualMachines"], 4);
+    assert_eq!(project(&rig)["limits.virtual-machines"], "8");
+    assert_eq!(project(&rig)["limits.containers"], "0");
+    rig
+}
+
+/// Review N1: the widening carries the configured caps, never the entry's own. A container create on such a node widens
+/// the project with the count 8 and succeeds; before the fix it sent the stale 4, below the six machines.
+#[test]
+fn a_widening_writes_the_configured_caps_over_a_stale_entry_and_the_first_container_is_created() {
+    let caps = |count: u32| json!({ "virtualMachines": count, "cpu": 64, "memory": "256GiB", "disk": "2TiB" });
+    let rig = old_release_bridged_node();
+    let (_, handlers) = rig.switched(mixed_kernel(&["br0"], caps(8)));
+    let nats = create(&handlers, json!({"name":"nats","template":"nats"}))
+        .expect("the first container widens the project and is created");
+    assert_eq!(nats["state"], "running");
+    assert_eq!(instance(&rig, "nats")["type"], "container");
+    let config = project(&rig);
+    assert_eq!(config["limits.virtual-machines"], "8");
+    assert!(config.get("limits.containers").is_none());
+    assert_eq!(config["restricted.devices.proxy"], "allow");
+    assert_eq!(
+        entry(&rig, BRIDGED_ENTRY).config,
+        json!({"project":PROJECT,"virtualMachines":8,"cpu":64,"memory":"256GiB","disk":"2TiB","managed":true})
+    );
+    no_open_intent(&rig);
+}
+
+/// The variant where the config is stale too: the configured count is below the machines the node holds, so the create
+/// is refused in words, naming both numbers and the key, before any write.
+#[test]
+fn a_widening_with_a_count_below_the_machines_held_is_refused_in_words_before_any_write() {
+    let caps = |count: u32| json!({ "virtualMachines": count, "cpu": 64, "memory": "256GiB", "disk": "2TiB" });
+    let rig = old_release_bridged_node();
+    let (_, handlers) = rig.switched(mixed_kernel(&["br0"], caps(4)));
+    let writes = rig.fake.writes().len();
+    let entries = rig.entries();
+    assert_eq!(
+        refusal(create(&handlers, json!({"name":"nats","template":"nats"}))),
+        "this node holds 6 virtual machines, but kernel.bridged.limits.virtualMachines is 4: raise it to at least 6, or remove virtual machines first. Nothing was written"
+    );
+    assert_eq!(rig.fake.writes().len(), writes, "no write");
+    assert_eq!(rig.entries(), entries, "no entry changed");
+    assert!(
+        rig.get(&format!("/1.0/instances/nats?project={PROJECT}"))
+            .is_none()
+    );
+    assert_eq!(project(&rig)["limits.containers"], "0");
+}
+
+/// A bridged node's caps lowered in the config: below what the node holds, every create is refused with no write; down
+/// to what still fits, the project's four caps follow. A value set on the project by hand stays until then.
+#[test]
+fn a_bridged_nodes_lowered_caps_are_refused_below_use_and_followed_above_it() {
+    let rig = Rig::bridged(&["br0"], None);
+    for name in ["ws1", "ws2"] {
+        rig.call("service_create", json!({"name":name,"template":"ws"}))
+            .expect("a machine");
+    }
+    let lowered = |count: u32, cpu: u32| {
+        bridged_kernel(
+            &["br0"],
+            json!({ "virtualMachines": count, "cpu": cpu, "memory": "12GiB", "disk": "60GiB" }),
+        )
+    };
+    let (_, handlers) = rig.switched(lowered(1, 6));
+    let writes = rig.fake.writes().len();
+    assert_eq!(
+        refusal(create(&handlers, json!({"name":"ws3","template":"ws"}))),
+        "creating ws3 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 2 in use, 1 asked, 1 allowed"
+    );
+    let (_, handlers) = rig.switched(lowered(3, 4));
+    assert_eq!(
+        refusal(create(&handlers, json!({"name":"ws3","template":"ws"}))),
+        "creating ws3 would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 4 in use, 2 asked, 4 allowed"
+    );
+    assert_eq!(
+        rig.fake.writes().len(),
+        writes,
+        "a refused create writes nothing"
+    );
+    assert_eq!(project(&rig)["limits.virtual-machines"], "4");
+
+    // A value set on the project by hand is not written back by a pass: the bridged entry is applied when it changes.
+    let mut by_hand = rig
+        .get(&format!("/1.0/projects/{PROJECT}?project={PROJECT}"))
+        .expect("the project");
+    by_hand["config"]["limits.memory"] = json!("15GiB");
+    rig.edit(
+        "PUT",
+        &format!("/1.0/projects/{PROJECT}?project={PROJECT}"),
+        json!({"config": by_hand["config"], "description": ""}),
+    );
+    rig.kernel
+        .lock()
+        .expect("kernel")
+        .propose(vec![], NOW)
+        .expect("a pass");
+    assert_eq!(project(&rig)["limits.memory"], "15GiB");
+
+    let (_, handlers) = rig.switched(lowered(3, 6));
+    create(&handlers, json!({"name":"ws3","template":"ws"})).expect("the third machine fits");
+    let config = project(&rig);
+    assert_eq!(config["limits.virtual-machines"], "3");
+    assert_eq!(config["limits.cpu"], "6");
+    assert_eq!(config["limits.memory"], "12GiB");
+    assert_eq!(config["limits.disk"], "60GiB");
+    no_open_intent(&rig);
 }

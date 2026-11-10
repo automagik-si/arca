@@ -2603,10 +2603,11 @@ pub fn project_changes(
                 if needs.managed {
                     config["managed"] = json!(true);
                 }
-                // The caps Incus holds follow the node's config: a virtual-machine create writes the configured caps
-                // into the owner's entry when they differ, up or down. The create's own cap check has passed by now,
-                // so a lowered cap is never below what the node already uses.
-                if needs.vm
+                // The caps Incus holds follow the node's config: whenever the owner's entry is written, for a virtual
+                // machine or for the widening alike, it carries the configured caps, never the ones it held. The
+                // plugin writes the count on every apply, so an entry whose caps were stale (one an earlier release
+                // wrote, with the project raised by hand since) would otherwise set the project below what it holds.
+                if (needs.vm || config != entry.config)
                     && let Some(caps) = caps
                 {
                     config["virtualMachines"] = json!(caps.virtual_machines);
@@ -2615,6 +2616,7 @@ pub fn project_changes(
                     config["disk"] = json!(caps.disk);
                 }
                 if config != entry.config {
+                    count_fits(cfg, entries)?;
                     changes.push(put(
                         arca_netproject::BRIDGED_ENTRY,
                         "arca.bridgedproject",
@@ -2656,6 +2658,9 @@ pub fn project_changes(
                 config["hostBridges"] = json!(true);
             }
             if config != entry.config {
+                if needs.vm {
+                    count_fits(cfg, entries)?;
+                }
                 changes.push(put(NET_ENTRY, "arca.netproject", config));
             }
         }
@@ -2663,11 +2668,38 @@ pub fn project_changes(
     Ok(changes)
 }
 
+/// Refuses, in words and before any write, a write of the project owner's entry whose configured virtual-machine count is
+/// below the number of virtual machines the node holds: Incus would refuse that count for the project, and the entry would
+/// then fail on every pass.
+fn count_fits(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -> Result<(), CallError> {
+    let Some(caps) = cfg.kernel.vm_caps() else {
+        return Ok(());
+    };
+    let held = service_entries(entries)
+        .iter()
+        .filter(|(_, record)| record.vm.is_some())
+        .count();
+    if held as u64 <= u64::from(caps.virtual_machines) {
+        return Ok(());
+    }
+    let key = if cfg.kernel.bridged.is_some() {
+        "kernel.bridged.limits.virtualMachines"
+    } else {
+        "kernel.vmLimits.virtualMachines"
+    };
+    Err(service_refused(format!(
+        "this node holds {held} virtual machines, but {key} is {}: raise it to at least {held}, or remove virtual machines first. Nothing was written",
+        caps.virtual_machines
+    )))
+}
+
 /// Why a create has no service project to go into, in the words of the check that failed: only a missing
 /// `kernel.serviceCidr` is called one.
 fn no_service_project(error: CallError) -> CallError {
     match error {
         CallError::Invalid(why) => service_refused(format!("no service project: {why}")),
+        // A refusal in words is the reason itself.
+        refused @ CallError::Refused { .. } => refused,
         _ => internal(),
     }
 }
@@ -2711,17 +2743,25 @@ pub fn mode_refusal(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -
         ));
     }
     if kernel.bridged.is_none() {
+        let unwidened = entries.iter().find(|entry| {
+            entry.plugin.0 == "arca.bridgedproject" && entry.config["managed"] != json!(true)
+        });
         if let Some(vm) = entries.iter().find(|entry| on_host_bridge(entry)) {
-            return Some(format!(
-                "kernel.bridged is not set, but this node already holds {} from bridged mode. Put kernel.bridged back, or remove its virtual machines first",
-                vm.id.0
-            ));
+            // Removing the machines helps only where the project is not a bridged-only one.
+            return Some(match unwidened {
+                Some(_) => format!(
+                    "kernel.bridged is not set, but this node already holds {} from bridged mode, in a service project created in bridged mode. Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one",
+                    vm.id.0
+                ),
+                None => format!(
+                    "kernel.bridged is not set, but this node already holds {} from bridged mode. Put kernel.bridged back, or remove its virtual machines first",
+                    vm.id.0
+                ),
+            });
         }
         // The project is still a bridged-only one, and nothing the owner can remove changes that: the way to the
         // managed network is to add it beside kernel.bridged, which widens the project.
-        if let Some(project) = entries.iter().find(|entry| {
-            entry.plugin.0 == "arca.bridgedproject" && entry.config["managed"] != json!(true)
-        }) {
+        if let Some(project) = unwidened {
             return Some(format!(
                 "kernel.bridged is not set, but this node's service project was created in bridged mode ({}). Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one",
                 project.id.0
