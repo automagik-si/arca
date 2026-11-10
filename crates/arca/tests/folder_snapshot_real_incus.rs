@@ -13,17 +13,20 @@
 //!   folder, a symlink, a hard link and an extended attribute, copies it, and removes it.
 //!
 //! It runs the same calls the approved `snapshot_create` makes after its checks: the volume, the helper (read-only folder,
-//! no NIC), the copy, the counts and the helper's removal. The copy is then read on the host, through the pool's folder:
-//! owners, modes, times, links and the attribute must match the source.
+//! no NIC), the copy, the counts and the helper's removal. The copy is then read back through a short-lived checker
+//! container in the snapshot project (the folder read-only at `/src`, the copy's volume read-only at `/dst`, no NIC,
+//! deleted afterwards), since the pool's files are root's and this test runs unprivileged: `find -printf '%M %U:%G %n
+//! %T@ %p %l'` and each path's extended attributes (from a `tar --xattrs` header) must match on both sides.
 
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arca::storage::{folder_snapshot_name, helper_name, make_pool_folder, measure_folder};
-use arca_incus::folder::{FolderCopy, MANIFEST_NAME};
-use arca_incus::{IncusError, PoolSource, SNAPSHOT_PROJECT, SnapshotWriter};
-use serde_json::Value;
+use arca_incus::folder::{FolderCopy, HELPER_IMAGE_ALIAS, HELPER_KEY, HELPER_POOL_KEY};
+use arca_incus::{IncusError, IncusRead, PoolSource, SNAPSHOT_PROJECT, SnapshotWriter, UnixIncus};
+use serde_json::{Value, json};
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -65,44 +68,167 @@ fn build_source(source: &Path) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Every path under `root`, with what a restore needs to match.
-fn listing(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)
-            .expect("a readable folder")
-            .flatten()
-        {
-            let path = entry.path();
-            let relative = path
-                .strip_prefix(root)
-                .expect("under the root")
-                .display()
-                .to_string();
-            if relative == MANIFEST_NAME {
-                continue;
+/// What the checker prints for one side: every path below it (the manifest left out) with its type and mode, owner,
+/// link count (`-` for a folder, whose count depends on the file system), whole-second time, path and link target; then
+/// each path's extended attributes with their values, read from a `tar --xattrs` header; then one file's bytes.
+const CHECK_SCRIPT: &str = r#"list() {
+  cd "$1" || exit 9
+  find . -mindepth 1 ! -path ./.arca-manifest.json \( -type d -printf '%M %U:%G - %T@ %p\n' -o -printf '%M %U:%G %n %T@ %p %l\n' \) \
+    | sed -E 's/ ([0-9]+)\.[0-9]+ / \1 /' | LC_ALL=C sort
+  echo '--- xattrs'
+  find . -mindepth 1 ! -path ./.arca-manifest.json | LC_ALL=C sort | while IFS= read -r f; do
+    x=$(tar --format=posix --xattrs --xattrs-include='*' --no-recursion -cf - "$f" \
+      | grep -ao 'SCHILY\.xattr\.[^=]*=[^[:cntrl:]]*' | LC_ALL=C sort | tr '\n' ';')
+    if [ -n "$x" ]; then printf '%s %s\n' "$f" "$x"; fi
+  done
+  echo '--- secret'
+  cat ./docs/private/secret
+}
+list /src
+echo '=== copy'
+list /dst
+"#;
+
+/// One write to Incus, sent by hand: the checker is test machinery, not part of Arca's narrow writer. The answer is
+/// waited on when it is an operation, and a failed one panics with Incus's message.
+fn incus(socket: &str, method: &str, path: &str, body: &Value) -> Value {
+    let bytes = serde_json::to_vec(body).expect("a body");
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).expect("the Incus socket");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: incus\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bytes.len()
+    )
+    .and_then(|()| stream.write_all(&bytes))
+    .expect("the request is sent");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("the answer");
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("an HTTP answer");
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    let mut body = raw[split + 4..].to_vec();
+    if head.contains("transfer-encoding: chunked") {
+        let (mut out, mut rest) = (Vec::new(), body.as_slice());
+        while let Some(end) = rest.windows(2).position(|window| window == b"\r\n") {
+            let size = usize::from_str_radix(String::from_utf8_lossy(&rest[..end]).trim(), 16)
+                .unwrap_or(0);
+            if size == 0 || rest.len() < end + 2 + size {
+                break;
             }
-            let meta = std::fs::symlink_metadata(&path).expect("meta");
-            let link = std::fs::read_link(&path)
-                .map(|target| target.display().to_string())
-                .unwrap_or_default();
-            let mtime = if meta.is_dir() { 0 } else { meta.mtime() };
-            out.push(format!(
-                "{relative} uid={} gid={} mode={:o} size={} links={} mtime={mtime} -> {link}",
-                meta.uid(),
-                meta.gid(),
-                meta.mode(),
-                if meta.is_dir() { 0 } else { meta.len() },
-                meta.nlink()
-            ));
-            if meta.is_dir() {
-                stack.push(path);
-            }
+            out.extend_from_slice(&rest[end + 2..end + 2 + size]);
+            rest = &rest[(end + 4 + size).min(rest.len())..];
+        }
+        body = out;
+    }
+    let envelope: Value = serde_json::from_slice(&body).expect("a JSON answer");
+    assert_ne!(
+        envelope["type"],
+        json!("error"),
+        "{method} {path}: {envelope}"
+    );
+    if envelope["type"] != json!("async") {
+        return envelope["metadata"].clone();
+    }
+    let id = envelope["operation"]
+        .as_str()
+        .and_then(|url| url.rsplit('/').next())
+        .expect("an operation");
+    let done = UnixIncus::new(PathBuf::from(socket))
+        .with_timeout(Duration::from_secs(700))
+        .get(&format!("/1.0/operations/{id}/wait?timeout=600"))
+        .expect("the operation ends");
+    assert_eq!(done["status_code"], json!(200), "{method} {path}: {done}");
+    done
+}
+
+/// Deletes the checker however the test ends: it carries the copy-helper mark, so the writer's own removal takes it.
+struct Checker<'a> {
+    writer: &'a SnapshotWriter,
+    name: String,
+}
+
+impl Drop for Checker<'_> {
+    fn drop(&mut self) {
+        match self.writer.remove_helper(&self.name) {
+            Ok(()) => println!("CHECKER {} deleted", self.name),
+            Err(error) => eprintln!("CHECKER {} NOT deleted: {error}", self.name),
         }
     }
-    out.sort();
-    out
+}
+
+/// Reads the source and the copy side by side in a short-lived checker container: the folder read-only at `/src`, the
+/// copy's volume read-only at `/dst`, root on the regular pool, no NIC, no profile. Returns the two listings.
+fn check_through_container(
+    socket: &str,
+    writer: &SnapshotWriter,
+    copy: &FolderCopy,
+) -> (String, String) {
+    let checker = Checker {
+        writer,
+        name: format!("arca-check-{}", &copy.helper["arca-copy-".len()..]),
+    };
+    let project = format!("?project={SNAPSHOT_PROJECT}");
+    incus(
+        socket,
+        "POST",
+        &format!("/1.0/instances{project}"),
+        &json!({
+            "name": checker.name, "type": "container",
+            "source": { "type": "image", "alias": HELPER_IMAGE_ALIAS },
+            "profiles": [], "ephemeral": false,
+            "config": {
+                "boot.autostart": "false", "security.privileged": "false",
+                "limits.cpu": "1", "limits.memory": "512MiB",
+                HELPER_KEY: format!("check of {}", copy.name), HELPER_POOL_KEY: copy.pool,
+            },
+            "devices": {
+                "root": { "type": "disk", "path": "/", "pool": copy.root_pool },
+                "src": { "type": "disk", "source": copy.folder, "path": "/src", "readonly": "true", "shift": "true" },
+                "dst": { "type": "disk", "pool": copy.pool, "source": copy.name, "path": "/dst", "readonly": "true" },
+            },
+        }),
+    );
+    let row = writer
+        .get(&format!("/1.0/instances/{}{project}", checker.name))
+        .expect("the checker");
+    for (name, device) in row["expanded_devices"].as_object().expect("devices") {
+        assert_ne!(
+            device["type"],
+            json!("nic"),
+            "the checker has no NIC: {name}"
+        );
+    }
+    incus(
+        socket,
+        "PUT",
+        &format!("/1.0/instances/{}/state{project}", checker.name),
+        &json!({ "action": "start" }),
+    );
+    let done = incus(
+        socket,
+        "POST",
+        &format!("/1.0/instances/{}/exec{project}", checker.name),
+        &json!({
+            "command": ["/bin/bash", "-c", CHECK_SCRIPT],
+            "environment": { "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C" },
+            "wait-for-websocket": false, "interactive": false, "record-output": true,
+        }),
+    );
+    assert_eq!(
+        done["metadata"]["return"],
+        json!(0),
+        "the check ran: {done}"
+    );
+    let stdout = done["metadata"]["output"]["1"]
+        .as_str()
+        .expect("its output");
+    let text = UnixIncus::new(PathBuf::from(socket))
+        .get_text(&format!("{stdout}{project}"))
+        .expect("the checker's output");
+    let (source, copied) = text.split_once("=== copy\n").expect("both sides");
+    (source.to_string(), copied.to_string())
 }
 
 #[test]
@@ -121,7 +247,7 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         "ARCA_PROOF_SOURCE must not exist yet"
     );
 
-    let writer = SnapshotWriter::new(socket.into()).with_wait(Duration::from_secs(600));
+    let writer = SnapshotWriter::new(socket.clone().into()).with_wait(Duration::from_secs(600));
     match writer.snapshot_pool(&pool) {
         Ok(_) => println!("REUSING POOL {pool}"),
         Err(IncusError::Status { code: 404, .. }) => {
@@ -201,42 +327,36 @@ fn a_real_incus_folder_copy_keeps_owners_modes_and_links() {
         Value::from("true")
     );
 
-    // The copy, read on the host through the pool's folder.
-    let pool_row = writer
-        .get(&format!("/1.0/storage-pools/{pool}"))
-        .expect("the pool");
-    let pool_dir = pool_row["config"]["source"]
-        .as_str()
-        .expect("a folder pool")
-        .to_string();
-    let copied = PathBuf::from(format!("{pool_dir}/custom/{SNAPSHOT_PROJECT}_{name}"));
-    let manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(copied.join(MANIFEST_NAME)).expect("the manifest"),
-    )
-    .expect("json");
-    println!("MANIFEST {manifest}");
-    assert_eq!(manifest["sourcePath"], Value::from(source_text.clone()));
-    let (want, got) = (listing(&source), listing(&copied));
-    for line in &got {
-        println!("COPIED {line}");
+    // The copy, read back beside its source in a short-lived checker container.
+    let (want, got) = check_through_container(&socket, &writer, &copy);
+    println!("SOURCE\n{want}COPY\n{got}");
+    assert_eq!(
+        got, want,
+        "owners, modes, link counts, times, links, attributes and bytes match"
+    );
+    let uid_gid = {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(source.join("readme.txt")).expect("the source");
+        format!("{}:{}", meta.uid(), meta.gid())
+    };
+    for expected in [
+        format!("-rw------- {uid_gid} 1 "),
+        format!("-rw-r----- {uid_gid} 1 "),
+        format!("drwx------ {uid_gid} - "),
+        format!("drwxr-x--- {uid_gid} - "),
+        format!("-rwxr-xr-x {uid_gid} 1 "),
+        format!("-rw-r--r-- {uid_gid} 2 1600000000 ./readme.txt"),
+        "./report-link docs/report.bin".to_string(),
+        "only me".to_string(),
+    ] {
+        assert!(got.contains(&expected), "the copy shows {expected:?}");
     }
-    assert_eq!(got, want, "owners, modes, sizes, times and links match");
     if xattr {
-        let read = std::process::Command::new("getfattr")
-            .args(["--only-values", "-n", "user.arca.proof"])
-            .arg(copied.join("run.sh"))
-            .output()
-            .expect("getfattr");
-        assert_eq!(
-            String::from_utf8_lossy(&read.stdout),
-            "kept",
+        assert!(
+            got.contains("SCHILY.xattr.user.arca.proof=kept"),
             "the attribute is kept"
         );
     }
-    assert_eq!(
-        std::fs::read(copied.join("docs/private/secret")).expect("the copy"),
-        b"only me\n"
-    );
 
     writer
         .delete_volume(&pool, &name)
