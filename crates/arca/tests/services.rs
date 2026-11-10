@@ -1752,7 +1752,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_six_templates_and_nothing_else_load_and_are_pinned() {
+fn the_seven_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -1767,6 +1767,7 @@ fn the_six_templates_and_nothing_else_load_and_are_pinned() {
         vec![
             "automagik",
             "automagik-server",
+            "cloudflare-tunnel",
             "nats",
             "omni-api",
             "postgres-autopg",
@@ -2380,6 +2381,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 mod approval_requests;
 #[path = "services/omni.rs"]
 mod omni;
+#[path = "services/tunnel.rs"]
+mod tunnel;
 #[path = "services/wiring.rs"]
 mod wiring;
 
@@ -2784,7 +2787,7 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         let loaded = service::load_template(&dir, template).expect("the installed template loads");
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
     }
-    assert_eq!(templates, 6);
+    assert_eq!(templates, 7);
     assert!(installed.contains(&"postgres-autopg.sh"));
     assert_eq!(
         fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,

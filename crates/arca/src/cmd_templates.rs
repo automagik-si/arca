@@ -25,6 +25,7 @@ macro_rules! shipped {
 pub const SHIPPED: &[(&str, &str)] = shipped![
     "automagik-server.json",
     "automagik.json",
+    "cloudflare-tunnel.json",
     "nats.json",
     "omni-api.json",
     "postgres-autopg.json",
