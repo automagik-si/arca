@@ -8,7 +8,7 @@
 //! - `ARCA_PROOF_INSTANCE`: the source instance in it (default `src`): a stopped container with local devices (a proxy, a
 //!   disk on a custom volume, a host folder) and live ownership marks.
 //! - `ARCA_PROOF_VOLUME`: `<pool>/<volume>` of a custom volume in the project with a live mark.
-//! - `ARCA_PROOF_FOLDER`: an existing folder the snapshot pool is made in (as `<folder>/arca-pool`).
+//! - `ARCA_PROOF_FOLDER`: a folder the snapshot pool is made in: Arca makes `<folder>/arca-pool`, as `storage_add` does.
 //! - `ARCA_PROOF_POOL`: the snapshot pool's name (default `arcaproof`).
 //!
 //! It runs the same calls the approved `snapshot_create` makes after its checks: the copy body, the copy, the clean-up and
@@ -16,7 +16,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arca::storage::snapshot_name;
+use arca::storage::{make_pool_folder, snapshot_name};
 use arca_incus::snapshot::{
     MARK_PREFIX, clean_parts, copy_problems, instance_copy_body, ownership_key, volume_copy_body,
     volume_problems,
@@ -56,6 +56,8 @@ fn a_real_incus_copy_is_clean_and_never_started() {
     );
 
     let writer = SnapshotWriter::new(socket.into()).with_wait(Duration::from_secs(300));
+    // As the approved storage_add does: Arca makes <folder>/arca-pool, then Incus makes the pool in it.
+    make_pool_folder(&folder).expect("the pool folder");
     writer
         .create_pool(&pool, &PoolSource::Folder(folder))
         .expect("the snapshot pool is added");

@@ -8,8 +8,9 @@
 //! instance or a volume with a `copy` source, `PUT` of an instance, and `DELETE` of either. An instance or volume create or
 //! delete is answered with an operation that has already ended, unless the test holds operations
 //! ([`FakeStorageIncus::hold_operations`]) or fails the next copy ([`FakeStorageIncus::fail_next_copy`]). A created instance
-//! is `Stopped` unless its body says `start: true`. Any other request is 404 for a GET and 405 otherwise. Nothing here touches
-//! a disk.
+//! is `Stopped` unless its body says `start: true`. Any other request is 404 for a GET and 405 otherwise. Nothing here writes
+//! a disk; a `dir` pool's source folder is only looked at, and the create fails as Incus's dir driver does when it is
+//! missing (`Source path '<p>' doesn't exist`) or has anything in it (`Source path '<p>' isn't empty`).
 //!
 //! An instance copy behaves as Incus's own does (`createFromCopy`): every local config key and local device of the source
 //! that the request leaves unset is carried into the copy (volatile keys aside), an empty config value is not stored, the
@@ -402,6 +403,19 @@ fn handle(state: &mut State, method: &str, target: &str, body: &Value) -> (u16, 
             let name = body["name"].as_str().unwrap_or_default().to_string();
             if state.pools.contains_key(&name) {
                 return error(409, "Storage pool already exists");
+            }
+            // As Incus's dir driver: the source folder must already be there, and be empty.
+            if body["driver"] == json!("dir") {
+                let source = body["config"]["source"].as_str().unwrap_or_default();
+                if std::fs::symlink_metadata(source).is_err() {
+                    return error(500, &format!("Source path '{source}' doesn't exist"));
+                }
+                let empty = std::fs::read_dir(source)
+                    .map(|mut entries| entries.next().is_none())
+                    .unwrap_or(false);
+                if !empty {
+                    return error(500, &format!("Source path '{source}' isn't empty"));
+                }
             }
             let mut pool = body.clone();
             pool["status"] = json!("Created");

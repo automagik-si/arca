@@ -502,9 +502,14 @@ passkey, and it runs once. The arguments are `{name, device}` or `{name, path}`:
   whole device, mounted with `compress=zstd`. The request sets `source.wipe=true`: Incus wipes the old partition table and
   file system signatures (a backup GPT at the end of the disk included) and then formats the disk, since `mkfs.btrfs`
   refuses a disk that still has a partition table. Incus labels the new file system with the pool's name, so the disk
-  shows as `snapshots` on any machine. The kernel process never formats, mounts or writes a disk.
-- `{name, path}` (a folder on an `in use` disk) creates an Incus `dir` pool at `<path>/arca-pool`. Incus creates the
-  folder; nothing else on the disk changes. The folder is judged by where it really is: every link in its path is
+  shows as `snapshots` on any machine. The kernel process never formats, mounts or writes a disk device.
+- `{name, path}` (a folder on an `in use` disk) creates an Incus `dir` pool at `<path>/arca-pool`. Incus makes a
+  folder pool only in a folder that is already there and empty, so when the approved add runs the kernel makes
+  `<path>/arca-pool` first (mode 0700; any missing part of `<path>` with 0755), one part at a time and never through a
+  link, then asks Incus for the pool; if Incus refuses, the empty folder it just made is removed again. That folder is
+  the only thing the kernel ever writes on a disk, and nothing else on the disk changes. The proposal itself writes
+  nothing: it refuses a folder the kernel may not write in (`FolderNotWritable`) and an `arca-pool` that is already
+  there but is a link, a file or a folder with files in it (`PoolFolderInUse`). The folder is judged by where it really is: every link in its path is
   followed when the proposal is made, the resolved path is what the owner approves, and a folder that leads onto a system
   disk is refused. A folder that leads elsewhere by the time it runs is `DiskChanged`.
 
@@ -517,7 +522,8 @@ anything that changed (`DiskChanged`), so a different disk plugged in under the 
 Refusals: a system disk, a member disk or a disk holding a pool (`SystemDisk`); a disk that holds snapshots, as a whole
 disk or as a folder (`SnapshotDisk`); a mounted disk as a whole-disk target
 (`DiskMounted`); a partition instead of the whole disk (`NotWholeDisk`); a device or folder not in `storage_list`
-(`DiskNotListed`); a pool name or folder already in use (`PoolExists`); and every storage action on a watch-only node
+(`DiskNotListed`); a pool name or folder already in use (`PoolExists`); a folder the kernel may not write in
+(`FolderNotWritable`); an `arca-pool` that is not an empty plain folder (`PoolFolderInUse`); and every storage action on a watch-only node
 (`StorageDisabled`). Snapshots are written only to a pool that carries the `user.arcasnapshot.storage` marker.
 
 ### Taking snapshots: `snapshot_create`

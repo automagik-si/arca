@@ -1152,6 +1152,164 @@ pub fn resolved_folder(path: &str) -> String {
     }
 }
 
+/// Whether this process may make entries in the folder `dir` (write and search), judged from its owner, group and mode
+/// bits the way the host does (an ACL or a read-only mount is not seen here; the folder write itself reports those).
+fn may_write_in(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return false;
+    };
+    if !meta.is_dir() {
+        return false;
+    }
+    // `/proc/self` belongs to the process's effective user; its status lists the effective group and the others.
+    let Ok(uid) = std::fs::metadata("/proc/self").map(|me| me.uid()) else {
+        return false;
+    };
+    if uid == 0 {
+        return true;
+    }
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut groups = Vec::new();
+    for line in status.lines() {
+        if let Some(gids) = line.strip_prefix("Gid:") {
+            groups.extend(
+                gids.split_whitespace()
+                    .nth(1)
+                    .and_then(|g| g.parse::<u32>().ok()),
+            );
+        } else if let Some(gids) = line.strip_prefix("Groups:") {
+            groups.extend(
+                gids.split_whitespace()
+                    .filter_map(|g| g.parse::<u32>().ok()),
+            );
+        }
+    }
+    let bits = if meta.uid() == uid {
+        meta.mode() >> 6
+    } else if groups.contains(&meta.gid()) {
+        meta.mode() >> 3
+    } else {
+        meta.mode()
+    };
+    bits & 0o3 == 0o3
+}
+
+/// The plain-folder test for `<folder>/arca-pool` when it is already there: a real folder (not a link) with nothing in it,
+/// which is what Incus needs to make a pool in it.
+fn pool_folder_usable(pool_dir: &std::path::Path) -> Result<(), StorageRefusal> {
+    let shown = pool_dir.display();
+    let meta = std::fs::symlink_metadata(pool_dir).map_err(|error| {
+        StorageRefusal::new(
+            "PoolFolderInUse",
+            format!("{shown} cannot be read: {error}"),
+        )
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(StorageRefusal::new(
+            "PoolFolderInUse",
+            format!("{shown} is already there and is not a plain folder; choose another folder"),
+        ));
+    }
+    let empty = std::fs::read_dir(pool_dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if !empty {
+        return Err(StorageRefusal::new(
+            "PoolFolderInUse",
+            format!("{shown} is already there and has files in it; choose another folder"),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks that Arca can make the folder Incus keeps a folder pool in, `<folder>/arca-pool`, without writing anything:
+/// either it is already there as an empty plain folder, or the nearest part of its path that exists is a folder this
+/// process may write in.
+fn check_pool_folder(folder: &str) -> Result<(), StorageRefusal> {
+    let pool_dir = std::path::PathBuf::from(folder_pool_path(folder));
+    if std::fs::symlink_metadata(&pool_dir).is_ok() {
+        return pool_folder_usable(&pool_dir);
+    }
+    let mut existing = std::path::Path::new(folder);
+    while std::fs::symlink_metadata(existing).is_err() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => break,
+        }
+    }
+    if may_write_in(existing) {
+        Ok(())
+    } else {
+        Err(StorageRefusal::new(
+            "FolderNotWritable",
+            format!(
+                "Arca may not create folders in {}, so it cannot keep the snapshot storage there; choose a folder Arca can write in",
+                existing.display()
+            ),
+        ))
+    }
+}
+
+/// Makes `<folder>/arca-pool` for a folder pool, as Incus needs it to exist and be empty: each missing part of the folder
+/// one at a time (0755), then `arca-pool` itself (0700). No step follows a link: a part that is a link or not a folder,
+/// or an `arca-pool` that is not an empty plain folder, is refused, and the result is checked to be where it was asked
+/// for. Returns whether `arca-pool` was made here, so a pool create that then fails can remove it again.
+pub fn make_pool_folder(folder: &str) -> Result<bool, StorageRefusal> {
+    use std::os::unix::fs::DirBuilderExt;
+    check_pool_folder(folder)?;
+    let changed = || {
+        StorageRefusal::new(
+            "DiskChanged",
+            "the folder now leads somewhere else through a link; propose it again",
+        )
+    };
+    let mut path = std::path::PathBuf::new();
+    for part in std::path::Path::new(folder).components() {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => return Err(changed()),
+            Err(_) => match std::fs::DirBuilder::new().mode(0o755).create(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir()) {
+                        return Err(changed());
+                    }
+                }
+                Err(error) => {
+                    return Err(StorageRefusal::new(
+                        "FolderNotWritable",
+                        format!("Arca could not create {}: {error}", path.display()),
+                    ));
+                }
+            },
+        }
+    }
+    let pool_dir = std::path::PathBuf::from(folder_pool_path(folder));
+    let made = match std::fs::DirBuilder::new().mode(0o700).create(&pool_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            pool_folder_usable(&pool_dir)?;
+            false
+        }
+        Err(error) => {
+            return Err(StorageRefusal::new(
+                "FolderNotWritable",
+                format!("Arca could not create {}: {error}", pool_dir.display()),
+            ));
+        }
+    };
+    // A part swapped for a link while the folders were made shows here: the folder is not where it was asked for.
+    if std::fs::canonicalize(&pool_dir).ok().as_deref() != Some(pool_dir.as_path()) {
+        if made && let Ok(real) = std::fs::canonicalize(&pool_dir) {
+            let _ = std::fs::remove_dir(real);
+        }
+        return Err(changed());
+    }
+    Ok(made)
+}
+
 /// A folder target's path, checked: absolute, without `.` or `..` parts, doubled or trailing slashes, or control
 /// characters.
 fn clean_folder(path: &str) -> Result<String, String> {
@@ -1674,6 +1832,9 @@ fn check(
                 )
                 .into());
             }
+            if let PoolSource::Folder(folder) = &source {
+                check_pool_folder(folder)?;
+            }
             Ok(Target::Pool(name.to_string(), source))
         }
         ActionKind::SnapshotCreate => {
@@ -1822,7 +1983,18 @@ impl ToolHandler for StorageActionHandler {
         };
         match target {
             Target::Pool(name, source) => {
-                writer.create_pool(&name, &source).map_err(write_failed)?;
+                // Incus makes a folder pool only in a folder that is already there and empty, so Arca makes it first.
+                let made = match &source {
+                    PoolSource::Folder(folder) => make_pool_folder(folder)?,
+                    PoolSource::Device(_) => false,
+                };
+                if let Err(error) = writer.create_pool(&name, &source) {
+                    if let (true, PoolSource::Folder(folder)) = (made, &source) {
+                        // Only the empty folder made just now goes; anything Incus left in it keeps it.
+                        let _ = std::fs::remove_dir(folder_pool_path(folder));
+                    }
+                    return Err(write_failed(error));
+                }
                 let (driver, path) = match &source {
                     PoolSource::Folder(folder) => ("dir", folder_pool_path(folder)),
                     PoolSource::Device(device) => ("btrfs", device.clone()),

@@ -529,24 +529,55 @@ fn a_whole_disk_plan_says_everything_will_be_erased_and_incus_formats_it() {
     assert_write_family(&rig.incus);
 }
 
+/// A real folder stands in for the stick's mount point (sdc1), so links and folder rights in it are real.
+fn stick_mount(rig: &Rig) -> String {
+    let path = rig._scratch.path("stick");
+    std::fs::create_dir(&path).expect("the mount folder");
+    let mount = std::fs::canonicalize(path).expect("a real path");
+    let mount = mount.to_str().expect("utf-8").to_string();
+    let mut disks = host_disks();
+    disks["blockdevices"][2]["children"][0]["mountpoints"] = json!([mount]);
+    rig.devices.set(Ok(disks));
+    mount
+}
+
+fn mode_of(path: &str) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .expect("there")
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+fn running_as_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").is_ok_and(|me| me.uid() == 0)
+}
+
 #[test]
 fn a_folder_plan_keeps_the_rest_of_the_disk() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("storage-add-folder", &key);
+    let mount = stick_mount(&rig);
     let proposed = rig
         .propose(
             "storage_add",
-            json!({ "name": "stick", "path": "/media/owner/BACKUP/" }),
+            json!({ "name": "stick", "path": format!("{mount}/") }),
         )
         .expect("a folder on a mounted disk may be proposed");
     let details = &proposed["details"];
     assert_eq!(row(details, "Disk"), "Acme Stick 64G (64.0 GB, USB)");
     assert_eq!(row(details, "On it now"), "sdc1 exfat \"BACKUP\" 64.0 GB");
-    assert_eq!(row(details, "Folder"), "/media/owner/BACKUP/arca-pool");
-    assert_eq!(row(details, "Mounted at"), "/media/owner/BACKUP");
+    assert_eq!(row(details, "Folder"), format!("{mount}/arca-pool"));
+    assert_eq!(row(details, "Mounted at"), mount);
     assert!(
         !details.to_string().contains(ERASE_SENTENCE),
         "a folder target erases nothing"
+    );
+    assert!(
+        std::fs::symlink_metadata(format!("{mount}/arca-pool")).is_err(),
+        "a proposal writes nothing"
     );
     let result = rig
         .approve_and_run(&key, &proposed)
@@ -555,30 +586,141 @@ fn a_folder_plan_keeps_the_rest_of_the_disk() {
     let pool = rig.incus.pool("stick").expect("Incus created the pool");
     assert_eq!(
         pool["config"]["source"],
-        json!("/media/owner/BACKUP/arca-pool")
+        json!(format!("{mount}/arca-pool"))
     );
     assert_eq!(pool["config"][SNAPSHOT_STORAGE_KEY], json!("stick"));
     assert!(pool["config"].get("source.wipe").is_none());
+    // Incus makes a folder pool only in a folder that is there and empty: Arca made it, for Incus alone.
+    assert_eq!(mode_of(&format!("{mount}/arca-pool")), 0o700);
     assert_write_family(&rig.incus);
+}
+
+#[test]
+fn incus_refuses_a_folder_pool_whose_folder_is_missing() {
+    // The fake answers as Incus's dir driver does, so a create without the folder fails as it does on a real host.
+    let scratch = Scratch::new("storage-fake-dir-source");
+    let dir = scratch.path("incus");
+    std::fs::create_dir(&dir).expect("the fake's directory");
+    let incus = FakeStorageIncus::start(&dir).expect("the storage fake serves");
+    let writer = arca_incus::SnapshotWriter::new(incus.socket().to_path_buf());
+    let folder = scratch.path("stick");
+    std::fs::create_dir(&folder).expect("a folder");
+    let folder = folder.to_str().expect("utf-8").to_string();
+    let missing = writer
+        .create_pool("a", &arca_incus::PoolSource::Folder(folder.clone()))
+        .expect_err("no arca-pool folder");
+    assert!(missing.to_string().contains("doesn't exist"), "{missing}");
+    std::fs::create_dir(format!("{folder}/arca-pool")).expect("arca-pool");
+    std::fs::write(format!("{folder}/arca-pool/old"), "x").expect("a file");
+    let full = writer
+        .create_pool("a", &arca_incus::PoolSource::Folder(folder.clone()))
+        .expect_err("arca-pool has a file in it");
+    assert!(full.to_string().contains("isn't empty"), "{full}");
+    std::fs::remove_file(format!("{folder}/arca-pool/old")).expect("remove");
+    writer
+        .create_pool("a", &arca_incus::PoolSource::Folder(folder))
+        .expect("an empty arca-pool folder is fine");
+}
+
+#[test]
+fn arca_makes_the_pool_folder_and_refuses_one_it_cannot_use() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-add-pool-folder", &key);
+    let mount = stick_mount(&rig);
+
+    // An arca-pool that is not an empty plain folder is never used.
+    std::fs::create_dir_all(format!("{mount}/full/arca-pool")).expect("a folder");
+    std::fs::write(format!("{mount}/full/arca-pool/photo.jpg"), "x").expect("a file");
+    std::fs::create_dir(format!("{mount}/file")).expect("a folder");
+    std::fs::write(format!("{mount}/file/arca-pool"), "x").expect("a file");
+    std::fs::create_dir(format!("{mount}/link")).expect("a folder");
+    std::fs::create_dir(format!("{mount}/elsewhere")).expect("a folder");
+    std::os::unix::fs::symlink(
+        format!("{mount}/elsewhere"),
+        format!("{mount}/link/arca-pool"),
+    )
+    .expect("a link");
+    for folder in ["full", "file", "link"] {
+        assert_eq!(
+            refused_code(rig.propose(
+                "storage_add",
+                json!({ "name": folder, "path": format!("{mount}/{folder}") })
+            )),
+            "PoolFolderInUse",
+            "{folder}"
+        );
+    }
+
+    // A folder whose arca-pool becomes unusable after the proposal is refused when it runs, before Incus is asked.
+    std::fs::create_dir(format!("{mount}/later")).expect("a folder");
+    let proposed = rig
+        .propose(
+            "storage_add",
+            json!({ "name": "later", "path": format!("{mount}/later") }),
+        )
+        .expect("fine when proposed");
+    std::fs::create_dir(format!("{mount}/later/arca-pool")).expect("made by someone else");
+    std::fs::write(format!("{mount}/later/arca-pool/x"), "x").expect("a file");
+    let writes = rig.incus.writes().len();
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &proposed)),
+        "PoolFolderInUse"
+    );
+    assert_eq!(rig.incus.writes().len(), writes, "Incus was not asked");
+
+    // A folder Arca may not write in is refused when it is proposed, with a plain reason.
+    if !running_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = format!("{mount}/locked");
+        std::fs::create_dir(&locked).expect("a folder");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("lock");
+        for path in [locked.clone(), format!("{locked}/inside")] {
+            match rig.propose("storage_add", json!({ "name": "locked", "path": path })) {
+                Err(CallError::Refused { code, message }) => {
+                    assert_eq!(code, "FolderNotWritable");
+                    assert!(message.contains(&locked), "{message}");
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+    }
+    assert!(rig.incus.writes().is_empty(), "nothing was asked of Incus");
+
+    // A folder that is not there yet is made, with every missing part, when the approved add runs.
+    let proposed = rig
+        .propose(
+            "storage_add",
+            json!({ "name": "deep", "path": format!("{mount}/snaps/arca") }),
+        )
+        .expect("a new folder on the stick");
+    assert!(std::fs::symlink_metadata(format!("{mount}/snaps")).is_err());
+    rig.approve_and_run(&key, &proposed).expect("the add runs");
+    assert_eq!(mode_of(&format!("{mount}/snaps/arca/arca-pool")), 0o700);
+    assert!(rig.incus.pool("deep").is_some());
+    assert_write_family(&rig.incus);
+
+    // An empty arca-pool folder already there is used as it is (on a fresh stick: the one above now holds snapshots).
+    let rig = Rig::new("storage-add-pool-folder-empty", &key);
+    let mount = stick_mount(&rig);
+    std::fs::create_dir_all(format!("{mount}/empty/arca-pool")).expect("an empty one");
+    let proposed = rig
+        .propose(
+            "storage_add",
+            json!({ "name": "empty", "path": format!("{mount}/empty") }),
+        )
+        .expect("an empty arca-pool");
+    rig.approve_and_run(&key, &proposed).expect("the add runs");
+    assert!(rig.incus.pool("empty").is_some());
 }
 
 #[test]
 fn a_folder_is_judged_by_where_its_links_lead() {
     let key = SkKey::from_seed(1);
     let rig = Rig::new("storage-add-link", &key);
-    // A real folder stands in for the stick's mount point, so links in it are followed for real.
-    let mount = std::fs::canonicalize({
-        let path = rig._scratch.path("stick");
-        std::fs::create_dir(&path).expect("the mount folder");
-        path
-    })
-    .expect("a real path");
-    let mount = mount.to_str().expect("utf-8").to_string();
+    let mount = stick_mount(&rig);
     std::fs::create_dir(format!("{mount}/photos")).expect("a folder on the stick");
     std::os::unix::fs::symlink("/etc", format!("{mount}/escape")).expect("a link");
-    let mut disks = host_disks();
-    disks["blockdevices"][2]["children"][0]["mountpoints"] = json!([mount]);
-    rig.devices.set(Ok(disks));
 
     assert_eq!(
         refused_code(rig.propose(

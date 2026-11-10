@@ -2015,7 +2015,7 @@ fn storage_add_params() -> Value {
             "path",
             false,
             json!({
-                "description": "A folder on a mounted disk that is not a system disk. The pool lives in <path>/arca-pool.",
+                "description": "A folder on a mounted disk that is not a system disk. The pool lives in <path>/arca-pool, which Arca makes (empty, 0700) when the approved add runs; Arca must be able to write in the folder.",
                 "maxLength": 1024,
                 "minLength": 1,
                 "pattern": "^/",
