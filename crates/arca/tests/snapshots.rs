@@ -1868,3 +1868,78 @@ fn a_disk_arca_may_not_open_is_checked_through_the_system_lists() {
     );
     assert!(rig.incus.writes().is_empty(), "nothing was wiped");
 }
+
+#[test]
+fn firmware_raid_and_other_member_disks_are_never_free() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-firmware-raid", &key);
+    let whole = |name: &str, fstype: &str| {
+        disk(
+            name,
+            "Fakedisk SATA 1T",
+            "sata",
+            false,
+            1000 * GB,
+            json!({ "fstype": fstype }),
+        )
+    };
+    // Members of an Intel firmware RAID that is not assembled: lsblk shows the signature and nothing on it.
+    rig.devices.set(Ok(host_with(vec![
+        whole("sdb", "isw_raid_member"),
+        whole("sdc", "ddf_raid_member"),
+        whole("sdd", "drbd"),
+        whole("sde", "swsuspend"),
+        whole("sdf", "ceph_bluestore"),
+    ])));
+    for device in ["sdb", "sdc", "sdd", "sde", "sdf"] {
+        let (role, reason) = role_and_reason(&rig, device);
+        assert_eq!(role, "system", "{device}: {reason}");
+        assert_eq!(
+            refused_code(rig.propose("storage_add", json!({ "name": "x", "device": device }))),
+            "SystemDisk",
+            "{device}"
+        );
+    }
+    // Through the system-lists path as well: the disk is refused before anything is written.
+    rig.devices.set_open(
+        "/dev/sdb",
+        ExclusiveOpen::Denied("Permission denied".into()),
+    );
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "x", "device": "sdb" }))),
+        "SystemDisk"
+    );
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn a_disk_whose_in_use_check_changes_after_the_proposal_is_refused() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-check-changed", &key);
+    rig.devices.set_lists(Ok(lists(ROOT_MOUNT, NO_SWAP)));
+    let proposed = rig
+        .propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))
+        .expect("checked by the exclusive open");
+    assert_eq!(proposed["args"]["inUseCheck"], json!("exclusive open"));
+    // By the time it runs, the open is refused: the lists would pass, but the owner approved another check.
+    denied_disk(&rig);
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &proposed)),
+        "DiskChanged"
+    );
+    assert!(rig.incus.writes().is_empty());
+}
+
+#[test]
+fn a_list_check_that_cannot_read_the_kernels_links_is_refused() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("storage-links-unreadable", &key);
+    denied_disk(&rig);
+    rig.devices.set_lists(Ok(lists(ROOT_MOUNT, NO_SWAP)));
+    rig.devices
+        .set_links_error("/sys/class/block could not be read");
+    assert_eq!(
+        refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
+        "DiskUncheckable"
+    );
+}

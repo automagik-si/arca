@@ -44,15 +44,23 @@ const LSBLK_COLUMNS: &str =
     "NAME,PATH,SIZE,MODEL,SERIAL,TRAN,RM,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINTS";
 /// How long one `lsblk` run may take.
 const LSBLK_TIMEOUT: Duration = Duration::from_secs(5);
-/// File systems that make a device part of something larger.
+/// Signatures that make a device part of something larger, besides any signature ending in `_member` (`linux_raid_member`,
+/// firmware RAID such as `isw_raid_member` or `ddf_raid_member`, `LVM2_member`, `zfs_member` and the like). Swap is judged
+/// on its own.
 const MEMBER_FSTYPES: [&str; 6] = [
-    "linux_raid_member",
-    "LVM2_member",
     "crypto_LUKS",
-    "zfs_member",
     "bcache",
     "ceph",
+    "ceph_bluestore",
+    "drbd",
+    "swsuspend",
 ];
+
+/// Whether a signature makes the device a member of something larger: a RAID (Linux or firmware), LVM, ZFS, encrypted,
+/// bcache, Ceph, DRBD or hibernation device. Such a device is never free, assembled or not.
+fn member_fstype(fstype: &str) -> bool {
+    fstype.ends_with("_member") || MEMBER_FSTYPES.contains(&fstype)
+}
 /// The longest snapshot name Incus accepts for an instance.
 const MAX_SNAPSHOT_NAME: usize = 63;
 
@@ -64,6 +72,11 @@ pub trait BlockDevices: Send + Sync {
     /// The members of mounted multi-device file systems and every device's holders, as the kernel lists them in `/sys`.
     fn links(&self) -> DeviceLinks {
         DeviceLinks::from_sysfs(Path::new("/sys"))
+    }
+
+    /// The same links for the in-use check before an erase, where a part that cannot be read is an error.
+    fn checked_links(&self) -> Result<DeviceLinks, String> {
+        DeviceLinks::try_from_sysfs(Path::new("/sys"))
     }
 
     /// Opens the block device at `path` read-only and exclusively, and closes it again.
@@ -213,8 +226,76 @@ pub struct DeviceLinks {
 }
 
 impl DeviceLinks {
+    /// [`DeviceLinks::from_sysfs`], failing on any part that cannot be read. `/sys/fs/btrfs` and `/sys/fs/bcachefs` may be
+    /// absent (no such file system is loaded); `/sys/class/block` and every listed directory under them must read.
+    pub fn try_from_sysfs(root: &Path) -> Result<DeviceLinks, String> {
+        let names = |dir: &Path, may_be_absent: bool| -> Result<Vec<String>, String> {
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(error) if may_be_absent && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(format!("{} could not be read: {error}", dir.display())),
+            };
+            let mut out = Vec::new();
+            for entry in entries {
+                let entry = entry
+                    .map_err(|error| format!("{} could not be read: {error}", dir.display()))?;
+                out.push(entry.file_name().to_string_lossy().into_owned());
+            }
+            out.sort();
+            Ok(out)
+        };
+        let mut links = DeviceLinks::default();
+        let btrfs = root.join("fs/btrfs");
+        for uuid in names(&btrfs, true)? {
+            let devices = btrfs.join(&uuid).join("devices");
+            if !devices.is_dir() {
+                continue;
+            }
+            let devices = names(&devices, false)?;
+            if !devices.is_empty() {
+                links.members.push(("btrfs".to_string(), uuid, devices));
+            }
+        }
+        let bcachefs = root.join("fs/bcachefs");
+        for uuid in names(&bcachefs, true)? {
+            let dir = bcachefs.join(&uuid);
+            if !dir.is_dir() {
+                continue;
+            }
+            let mut devices = Vec::new();
+            for entry in names(&dir, false)?
+                .into_iter()
+                .filter(|entry| entry.starts_with("dev-"))
+            {
+                let link = std::fs::read_link(dir.join(&entry).join("block")).map_err(|error| {
+                    format!("{}/{entry}/block could not be read: {error}", dir.display())
+                })?;
+                devices.extend(
+                    link.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_string),
+                );
+            }
+            if !devices.is_empty() {
+                links.members.push(("bcachefs".to_string(), uuid, devices));
+            }
+        }
+        let block = root.join("class/block");
+        for device in names(&block, false)? {
+            let holders = names(&block.join(&device).join("holders"), false)?;
+            if !holders.is_empty() {
+                links.holders.insert(device, holders);
+            }
+        }
+        Ok(links)
+    }
+
     /// Reads `/sys/fs/btrfs/<uuid>/devices/`, `/sys/fs/bcachefs/<uuid>/dev-*/block` and `/sys/class/block/*/holders/`
-    /// under `root`. A part that cannot be read adds nothing; the exclusive open still guards every erase.
+    /// under `root`, for the roles `storage_list` shows. A part that cannot be read adds nothing here; an erase never rests on
+    /// this read alone, since the in-use check opens the disk exclusively or reads the links with
+    /// [`DeviceLinks::try_from_sysfs`], where an unreadable part refuses.
     pub fn from_sysfs(root: &Path) -> DeviceLinks {
         let names = |dir: &Path| -> Vec<String> {
             let mut out: Vec<String> = std::fs::read_dir(dir)
@@ -310,6 +391,7 @@ pub struct FixedBlockDevices {
     opens: Mutex<std::collections::BTreeMap<String, ExclusiveOpen>>,
     opened: Mutex<Vec<String>>,
     lists: Mutex<Result<SystemLists, String>>,
+    links_error: Mutex<Option<String>>,
 }
 
 fn held<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -325,7 +407,13 @@ impl FixedBlockDevices {
             opens: Mutex::new(std::collections::BTreeMap::new()),
             opened: Mutex::new(Vec::new()),
             lists: Mutex::new(Ok(SystemLists::default())),
+            links_error: Mutex::new(None),
         }
+    }
+
+    /// Makes the checked read of the device links fail from now on.
+    pub fn set_links_error(&self, why: &str) {
+        *held(&self.links_error) = Some(why.to_string());
     }
 
     /// What the system's own lists say from now on.
@@ -371,6 +459,13 @@ impl BlockDevices for FixedBlockDevices {
 
     fn system_lists(&self) -> Result<SystemLists, String> {
         held(&self.lists).clone()
+    }
+
+    fn checked_links(&self) -> Result<DeviceLinks, String> {
+        match held(&self.links_error).clone() {
+            Some(why) => Err(why),
+            None => Ok(self.links()),
+        }
     }
 }
 
@@ -882,10 +977,7 @@ fn role_of(
                 format!("holds swap ({}); it is never offered", node.name),
             );
         }
-        if node
-            .fstype
-            .as_deref()
-            .is_some_and(|fstype| MEMBER_FSTYPES.contains(&fstype))
+        if node.fstype.as_deref().is_some_and(member_fstype)
             || ["lvm", "crypt", "dm", "mpath"].contains(&node.kind.as_str())
             || node.kind.starts_with("raid")
         {
@@ -2404,11 +2496,30 @@ fn listed_unused(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusa
             ),
         )
     })?;
-    let links = storage.devices.links();
+    let uncheckable = |why: String| {
+        StorageRefusal::new(
+            "DiskUncheckable",
+            format!(
+                "Arca could not check that {} is unused: {why}",
+                view.disk.name
+            ),
+        )
+    };
+    let links = storage.devices.checked_links().map_err(uncheckable)?;
     for node in view.disk.walk() {
         let mut paths = vec![node.path.clone(), resolved_device(&node.path)];
         paths.dedup();
-        let number = lists.numbers.get(&node.name).map(String::as_str);
+        let number = lists
+            .numbers
+            .get(&node.name)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                uncheckable(format!(
+                    "the system does not list {}'s device number",
+                    node.name
+                ))
+            })?;
+        let number = Some(number);
         if let Some(mount) = lists.mount_of(number, &paths) {
             return Err(disk_busy(&node.name, &format!("it is mounted at {mount}")));
         }
@@ -2434,7 +2545,7 @@ fn listed_unused(storage: &Storage, view: &DiskView) -> Result<(), StorageRefusa
         if let Some(fstype) = node
             .fstype
             .as_deref()
-            .filter(|fstype| MEMBER_FSTYPES.contains(fstype) || *fstype == "swap")
+            .filter(|fstype| member_fstype(fstype) || *fstype == "swap")
         {
             return Err(disk_busy(&node.name, &format!("it is a {fstype} member")));
         }
@@ -2617,7 +2728,14 @@ fn check(
                 PoolSource::Folder { path, .. } => check_pool_folder(path)?,
                 // Last, on the disk the owner approved: the kernel itself says whether anything holds it now.
                 PoolSource::Device(_) => {
-                    nothing_holds(storage, view)?;
+                    let how = nothing_holds(storage, view)?;
+                    if text(args, "inUseCheck") != how.as_str() {
+                        return Err(StorageRefusal::new(
+                            "DiskChanged",
+                            "the disk's in-use check changed after the proposal; propose it again",
+                        )
+                        .into());
+                    }
                 }
             }
             Ok(Target::Pool(name.to_string(), source))
@@ -2901,6 +3019,11 @@ mod tests {
         link("../../dm-0", "class/block/sdd1/holders/md127");
         let links = DeviceLinks::from_sysfs(&root);
         assert_eq!(
+            DeviceLinks::try_from_sysfs(&root),
+            Ok(links.clone()),
+            "the checked read agrees"
+        );
+        assert_eq!(
             links.members,
             vec![
                 (
@@ -2927,6 +3050,114 @@ mod tests {
             DeviceLinks::default(),
             "no sysfs, no links"
         );
+        assert!(
+            DeviceLinks::try_from_sysfs(&root).is_err(),
+            "but the checked read refuses a missing /sys/class/block"
+        );
+    }
+
+    fn device(
+        name: &str,
+        kind: &str,
+        fstype: Option<&str>,
+        children: Vec<BlockDevice>,
+    ) -> BlockDevice {
+        BlockDevice {
+            name: name.into(),
+            path: format!("/dev/{name}"),
+            size: 1,
+            model: String::new(),
+            serial: String::new(),
+            transport: String::new(),
+            removable: false,
+            kind: kind.into(),
+            fstype: fstype.map(str::to_string),
+            label: None,
+            uuid: None,
+            mountpoints: Vec::new(),
+            children,
+        }
+    }
+
+    /// A disk the classifier called free, with one partition carrying `fstype`.
+    fn free_view(fstype: Option<&str>) -> DiskView {
+        DiskView {
+            disk: device(
+                "sdb",
+                "disk",
+                None,
+                vec![device("sdb1", "part", fstype, Vec::new())],
+            ),
+            role: DiskRole::Free,
+            reason: String::new(),
+        }
+    }
+
+    fn numbered(names: &[(&str, &str)]) -> SystemLists {
+        SystemLists {
+            numbers: names
+                .iter()
+                .map(|(name, number)| (name.to_string(), number.to_string()))
+                .collect(),
+            ..SystemLists::default()
+        }
+    }
+
+    #[test]
+    fn the_list_check_refuses_members_and_anything_it_cannot_read() {
+        let devices = Arc::new(FixedBlockDevices::new(json!({ "blockdevices": [] })));
+        let storage = Storage::new(
+            PathBuf::from("/nonexistent/incus.sock"),
+            devices.clone(),
+            false,
+        );
+        devices.set_lists(Ok(numbered(&[("sdb", "8:16"), ("sdb1", "8:17")])));
+        assert_eq!(listed_unused(&storage, &free_view(Some("ext4"))), Ok(()));
+        // A signature the lists know as a member refuses, even when the classifier somehow said free.
+        for fstype in [
+            "isw_raid_member",
+            "ddf_raid_member",
+            "linux_raid_member",
+            "drbd",
+            "swsuspend",
+            "swap",
+        ] {
+            let refused = listed_unused(&storage, &free_view(Some(fstype))).expect_err(fstype);
+            assert_eq!(refused.code, "DiskBusy", "{fstype}");
+        }
+        // A partition the system lists no device number for cannot be checked.
+        devices.set_lists(Ok(numbered(&[("sdb", "8:16")])));
+        let refused = listed_unused(&storage, &free_view(Some("ext4"))).expect_err("no number");
+        assert_eq!(refused.code, "DiskUncheckable");
+        assert!(refused.message.contains("sdb1"), "{}", refused.message);
+        // Links that cannot be read cannot be checked either.
+        devices.set_lists(Ok(numbered(&[("sdb", "8:16"), ("sdb1", "8:17")])));
+        devices.set_links_error("/sys/class/block could not be read");
+        let refused = listed_unused(&storage, &free_view(Some("ext4"))).expect_err("no links");
+        assert_eq!(refused.code, "DiskUncheckable");
+    }
+
+    #[test]
+    fn every_member_signature_is_a_member() {
+        for fstype in [
+            "linux_raid_member",
+            "isw_raid_member",
+            "ddf_raid_member",
+            "via_raid_member",
+            "LVM2_member",
+            "zfs_member",
+            "crypto_LUKS",
+            "bcache",
+            "ceph",
+            "ceph_bluestore",
+            "drbd",
+            "swsuspend",
+        ] {
+            assert!(member_fstype(fstype), "{fstype}");
+        }
+        for fstype in ["ext4", "btrfs", "vfat", "exfat", "swap"] {
+            assert!(!member_fstype(fstype), "{fstype}");
+        }
     }
 
     #[test]

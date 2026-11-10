@@ -483,7 +483,7 @@ and total space. Loop, optical and zram devices are not listed. Each disk gets o
 
 | Role | When | Offered as |
 |---|---|---|
-| `system` | something on it is mounted at `/`, `/boot` or as swap, holds swap, is a RAID, LVM, LUKS, ZFS or bcache member (mounted or not, so one half of a failing RAID1 is never offered), is held by another device (its `/sys/class/block/<dev>/holders` is not empty), is a member of a multi-device file system that holds `/` or that the kernel lists as mounted, is given to an app (a `unix-block` device, or a `disk` device whose source is under `/dev/`, in any project), or the disk holds an Incus pool (by device, UUID, label, or a pool folder on its file system; a pool whose name Arca would never write is still counted) | never |
+| `system` | something on it is mounted at `/`, `/boot` or as swap, holds swap, carries a member signature (any signature ending in `_member`, such as `linux_raid_member`, firmware RAID's `isw_raid_member` or `ddf_raid_member`, `LVM2_member` and `zfs_member`, or `crypto_LUKS`, `bcache`, `ceph`, `ceph_bluestore`, `drbd` or `swsuspend`), mounted or assembled or not, so one half of a failing RAID1 is never offered, is held by another device (its `/sys/class/block/<dev>/holders` is not empty), is a member of a multi-device file system that holds `/` or that the kernel lists as mounted, is given to an app (a `unix-block` device, or a `disk` device whose source is under `/dev/`, in any project), or the disk holds an Incus pool (by device, UUID, label, or a pool folder on its file system; a pool whose name Arca would never write is still counted) | never |
 | `snapshots` | the disk holds a snapshot pool of this machine (a folder pool is matched by the file system UUID it recorded, so its disk is known even while it is not mounted), or a file system labelled `arca-snapshots-<name>` (a whole disk another machine made snapshot storage) | never: it is not erased |
 | `in use` | something on it is mounted elsewhere | `folder`: a pool in a folder on it |
 | `free` | nothing on it is mounted or a member of anything | `whole disk`: Incus erases and formats it |
@@ -532,8 +532,10 @@ and only then, the kernel checks through the system's own lists instead, and eve
 partition: no mount in `/proc/self/mountinfo` (by device number or by source), no active swap in `/proc/swaps`, no holders,
 no membership of a mounted btrfs or bcachefs (`/sys/fs/btrfs`, `/sys/fs/bcachefs`), no RAID, LVM, ZFS, LUKS or swap
 signature, and the classifier's own rules (the file system siblings of a mount, devices given to apps) still find the disk
-`free`. A disk in use by any of them is `DiskBusy`; lists that cannot be read are `DiskUncheckable`. Which check was used
-is bound into the arguments (`inUseCheck`: `exclusive open` or `system lists`), and a card checked through the lists says
+`free`. A disk in use by any of them is `DiskBusy`; lists or kernel links that cannot be read, or a disk or partition the
+system lists no device number for, are `DiskUncheckable`. Which check was used
+is bound into the arguments (`inUseCheck`: `exclusive open` or `system lists`; a run that would use the other one is
+`DiskChanged`), and a card checked through the lists says
 **"In-use check through system lists (Arca can't open the disk directly)."** Any other failure to open the disk (it is
 gone, or is not a block device) is `DiskUncheckable`. Folder targets are not opened. While any folder snapshot pool cannot be reached (its folder is missing or its recorded file system is not mounted),
 every whole-disk erase is refused (`SnapshotStorageUnreachable`: "plug it in or remove it first"), since the disk about to
