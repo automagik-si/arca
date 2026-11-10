@@ -618,7 +618,7 @@ fn an_approved_create_that_fails_at_start_reports_its_message_and_leaves_a_defin
             .iter()
             .map(|(verb, handler)| (*verb, Arc::clone(handler))),
     );
-    let message = "The approval was accepted, but service_create did not complete: start service ws1: the instance was created, and Incus did not start it: Failed starting instance. Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it";
+    let message = "The approval was accepted, but service_create did not complete: start service ws1: the instance was created, and Incus did not start it: Incus said \"Failed starting instance\". Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it";
     match arca::handlers::run_approved_action(
         &rig.kernel,
         &executor,
@@ -696,4 +696,241 @@ fn a_virtual_machine_on_the_managed_network_is_removed_with_its_acl_on_the_owner
     // The address is the plan's next one: a lease Incus still holds for the removed machine keeps its old address out.
     assert!(again["ipv4"] == "192.0.2.10" || again["ipv4"] == "192.0.2.11");
     no_open_intent(&rig);
+}
+
+/// The cap Incus holds follows the node's config (review M1). A raised cap reaches the owner's entry and the project with
+/// the next create, before the instance is sent; a cap lowered below what the node holds is refused in words before any
+/// write; and a later pass writes nothing more.
+#[test]
+fn the_cap_incus_holds_follows_the_configured_cap_up_and_down() {
+    let caps = |count: u32| json!({ "virtualMachines": count, "cpu": 64, "memory": "256GiB", "disk": "2TiB" });
+    let rig = Rig::with(managed_vm_kernel(caps(4)), None, vec![]);
+    for name in ["ws1", "ws2", "ws3", "ws4"] {
+        rig.call("service_create", json!({"name":name,"template":"ws"}))
+            .expect("a machine under the cap");
+    }
+    assert_eq!(project(&rig)["limits.virtual-machines"], "4");
+    assert_eq!(
+        refusal(rig.call("service_create", json!({"name":"ws5","template":"ws"}))),
+        "creating ws5 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 4 in use, 1 asked, 4 allowed"
+    );
+
+    // The operator raises the cap. The fifth create writes it to the entry and the project, and only then the instance.
+    let (_, handlers) = rig.switched(managed_vm_kernel(caps(8)));
+    let before = rig.fake.writes().len();
+    create(&handlers, json!({"name":"ws5","template":"ws"})).expect("the fifth machine");
+    assert_eq!(entry(&rig, NET_ENTRY).config["virtualMachines"], 8);
+    assert_eq!(project(&rig)["limits.virtual-machines"], "8");
+    let since: Vec<String> = rig.fake.writes()[before..]
+        .iter()
+        .map(|write| {
+            format!(
+                "{} {}",
+                write.method,
+                write.path.split('?').next().unwrap_or("")
+            )
+        })
+        .collect();
+    let put = since
+        .iter()
+        .position(|write| write == &format!("PUT /1.0/projects/{PROJECT}"))
+        .expect("the project's cap is written");
+    let post = since
+        .iter()
+        .position(|write| write == "POST /1.0/instances")
+        .expect("the instance is created");
+    assert!(
+        put < post,
+        "the cap is raised before the instance is sent: {since:?}"
+    );
+
+    // A later pass over the same desired state, as a restart makes, writes nothing more.
+    let settled = rig.fake.writes().len();
+    for _ in 0..2 {
+        rig.kernel
+            .lock()
+            .expect("kernel")
+            .propose(vec![], NOW)
+            .expect("a pass");
+    }
+    assert_eq!(rig.fake.writes().len(), settled, "nothing is re-applied");
+    assert_eq!(project(&rig)["limits.virtual-machines"], "8");
+
+    // A cap lowered below the five machines the node holds is refused in words, and nothing is written.
+    let (_, handlers) = rig.switched(managed_vm_kernel(caps(3)));
+    assert_eq!(
+        refusal(create(&handlers, json!({"name":"ws6","template":"ws"}))),
+        "creating ws6 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 5 in use, 1 asked, 3 allowed"
+    );
+    assert_eq!(rig.fake.writes().len(), settled);
+    assert_eq!(entry(&rig, NET_ENTRY).config["virtualMachines"], 8);
+    assert_eq!(project(&rig)["limits.virtual-machines"], "8");
+
+    // A cap lowered to what still fits follows too.
+    let (_, handlers) = rig.switched(managed_vm_kernel(caps(6)));
+    create(&handlers, json!({"name":"ws6","template":"ws"})).expect("the sixth machine");
+    assert_eq!(entry(&rig, NET_ENTRY).config["virtualMachines"], 6);
+    assert_eq!(project(&rig)["limits.virtual-machines"], "6");
+    no_open_intent(&rig);
+}
+
+/// The bridged owner behaves alike: its project's four caps follow the config with the next create, while the project
+/// holds virtual machines only, and its count alone once the project is widened.
+#[test]
+fn the_bridged_owners_caps_follow_the_config_too() {
+    let rig = Rig::bridged(&["br0"], None);
+    for name in ["ws1", "ws2", "ws3", "ws4"] {
+        rig.call("service_create", json!({"name":name,"template":"ws"}))
+            .expect("a machine under the caps");
+    }
+    assert_eq!(
+        refusal(rig.call("service_create", json!({"name":"ws5","template":"ws"}))),
+        "creating ws5 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 4 in use, 1 asked, 4 allowed"
+    );
+    let wider = json!({ "virtualMachines": 8, "cpu": 16, "memory": "32GiB", "disk": "200GiB" });
+    let (_, handlers) = rig.switched(bridged_kernel(&["br0"], wider.clone()));
+    let before = rig.fake.writes().len();
+    create(&handlers, json!({"name":"ws5","template":"ws"})).expect("the fifth machine");
+    let config = project(&rig);
+    assert_eq!(config["limits.virtual-machines"], "8");
+    assert_eq!(config["limits.cpu"], "16");
+    assert_eq!(config["limits.memory"], "32GiB");
+    assert_eq!(config["limits.disk"], "200GiB");
+    assert_eq!(config["limits.containers"], "0");
+    assert_eq!(
+        entry(&rig, BRIDGED_ENTRY).config,
+        json!({"project":PROJECT,"virtualMachines":8,"cpu":16,"memory":"32GiB","disk":"200GiB"})
+    );
+    assert_eq!(
+        rig.fake.writes()[before..]
+            .iter()
+            .filter(|write| write.path.starts_with("/1.0/projects"))
+            .map(|write| write.method.as_str())
+            .collect::<Vec<_>>(),
+        ["PUT"],
+        "one journaled write of the project"
+    );
+    let settled = rig.fake.writes().len();
+    rig.kernel
+        .lock()
+        .expect("kernel")
+        .propose(vec![], NOW)
+        .expect("a pass");
+    assert_eq!(rig.fake.writes().len(), settled, "nothing is re-applied");
+
+    // Widened for the managed network, the project holds the count alone, and the count still follows.
+    let (_, handlers) = rig.switched(mixed_kernel(&["br0"], wider));
+    create(&handlers, json!({"name":"nats","template":"nats"})).expect("a container");
+    let more = json!({ "virtualMachines": 9, "cpu": 32, "memory": "64GiB", "disk": "400GiB" });
+    let (_, handlers) = rig.switched(mixed_kernel(&["br0"], more));
+    create(&handlers, json!({"name":"ws6","template":"ws"})).expect("the sixth machine");
+    let config = project(&rig);
+    assert_eq!(config["limits.virtual-machines"], "9");
+    for absent in [
+        "limits.cpu",
+        "limits.memory",
+        "limits.disk",
+        "limits.containers",
+    ] {
+        assert!(config.get(absent).is_none(), "{absent}");
+    }
+    no_open_intent(&rig);
+}
+
+/// After a create that landed and did not start, both ways forward the message names work: `instance_start` starts the
+/// instance, and `service_remove` removes it with its record (review L7).
+#[test]
+fn after_a_create_that_did_not_start_instance_start_retries_it_and_service_remove_removes_it() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.fake.fail_instance_start_on_create();
+    for name in ["ws1", "ws2"] {
+        assert!(
+            refusal(rig.call("service_create", json!({"name":name,"template":"ws"})))
+                .ends_with("Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it")
+        );
+        assert_eq!(instance(&rig, name)["status"], "Stopped");
+    }
+    let kernel = Arc::clone(&rig.kernel);
+    let lifecycle = Arc::new(arca::lifecycle::InstanceLifecycle::new(
+        rig.fake.socket().to_path_buf(),
+        arca_incus::ProjectFamily::new([PROJECT], ["other"]).expect("the family"),
+        move || {
+            kernel
+                .lock()
+                .map_err(|_| "kernel".to_string())?
+                .retained_entries()
+                .map_err(|error| error.to_string())
+        },
+        &rig.dir,
+    ));
+    let life: HashMap<&'static str, Arc<dyn ToolHandler>> =
+        arca::lifecycle::handlers(Arc::clone(&rig.kernel), Arc::new(|| NOW), Some(lifecycle))
+            .into_iter()
+            .collect();
+    life["instance_start"]
+        .call(json!({"project":PROJECT,"instance":"ws1"}), &doctor())
+        .expect("the retry starts it");
+    assert_eq!(instance(&rig, "ws1")["status"], "Running");
+    assert_eq!(
+        rig.call("service_status", json!({"name":"ws1"}))
+            .expect("status")["state"],
+        "running"
+    );
+
+    let removed = rig
+        .call(
+            "service_remove",
+            json!({"name":"ws2","approval":owner_approval(&key, "ws2")}),
+        )
+        .expect("the stopped instance is removed");
+    assert_eq!(removed, json!({"removed": true}));
+    assert!(
+        rig.get(&format!("/1.0/instances/ws2?project={PROJECT}"))
+            .is_none()
+    );
+    assert!(
+        rig.get("/1.0/network-acls/arcak-svc-svc-ws2?project=default")
+            .is_none()
+    );
+    assert!(rig.entry_ids().iter().all(|id| id != "service-ws2"));
+    no_open_intent(&rig);
+}
+
+/// A removal that could not finish says what is left of a machine on the managed network: its instance and its ACL
+/// (review L4). A create with no service project says why in the words of the check that failed (review L6).
+#[test]
+fn a_partial_removal_names_the_acl_and_a_missing_service_project_names_its_reason() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
+    rig.call("service_create", json!({"name":"ws1","template":"ws"}))
+        .expect("a machine on the managed network");
+    rig.fake.set_reject_delete("ws1");
+    let why = refusal(rig.call(
+        "service_remove",
+        json!({"name":"ws1","approval":owner_approval(&key, "ws1")}),
+    ));
+    assert!(
+        why.starts_with("remove service ws1: partial removal (instance remains; ACL "),
+        "{why}"
+    );
+
+    // A config whose service subnet a reserved range covers passes no create: the reason is that, not a missing subnet.
+    let fresh = Rig::with(mixed_kernel(&["br0"], roomy()), None, vec![]);
+    let mut cfg = (*fresh.cfg).clone();
+    cfg.kernel.reserved_cidrs.push("192.0.2.0/24".into());
+    let fresh_handlers: HashMap<&'static str, Arc<dyn ToolHandler>> =
+        service_handlers(fresh.kernel.clone(), Arc::new(|| NOW), Arc::new(cfg))
+            .into_iter()
+            .collect();
+    for args in [
+        json!({"name":"ws9","template":"ws"}),
+        json!({"name":"nats","template":"nats"}),
+    ] {
+        assert_eq!(
+            refusal(create(&fresh_handlers, args)),
+            "no service project: service CIDR overlaps a reserved CIDR"
+        );
+    }
+    assert!(fresh.fake.writes().is_empty());
 }

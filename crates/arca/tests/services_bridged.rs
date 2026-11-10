@@ -981,7 +981,13 @@ fn a_bridged_node_switched_to_managed_is_refused_at_start() {
         .filter(|entry| entry.id.0 == BRIDGED_ENTRY)
         .cloned()
         .collect();
-    assert!(arca::handlers::mode_refusal(&cfg, &project_only).is_some());
+    // No machine is left to remove, so the advice names what can be done: the node becomes mixed, never managed-only.
+    assert_eq!(
+        arca::handlers::mode_refusal(&cfg, &project_only).as_deref(),
+        Some(
+            "kernel.bridged is not set, but this node's service project was created in bridged mode (bridged-arcak-svc). Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one"
+        )
+    );
     assert_eq!(arca::handlers::mode_refusal(&cfg, &[]), None);
 }
 

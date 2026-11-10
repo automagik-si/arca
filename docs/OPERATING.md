@@ -2103,7 +2103,7 @@ project `arcak-svc` and nothing else. That project is restricted like every kern
 | Project key | Value | Why |
 |-------------|-------|-----|
 | `restricted.devices.nic` | `allow` | Incus needs it before a NIC may name a bridge it does not manage. The provider grants the key in this project alone: to this entry when it creates the project, and to the managed network's entry when a managed node gains host bridges (see "Mixed nodes"). |
-| `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk` | the caps of `kernel.bridged.limits` | Incus itself refuses an instance that would exceed them. |
+| `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk` | the caps of `kernel.bridged.limits`, as of the last virtual-machine create | Incus itself refuses an instance that would exceed them. |
 | `limits.containers` | `0` | The project holds virtual machines only. |
 
 `restricted.devices.nic=allow` is wider than the one NIC Arca creates: Incus has no per-bridge allowlist for a bridge
@@ -2114,10 +2114,12 @@ Incus admin on the host) is not bound by the list.
 
 **The caps.** `service_create` adds up the CPUs, memory and root disks of the virtual-machine records it holds, running
 or not, and refuses a create that would pass a cap, before it writes anything, naming the cap and the amounts. Arca's
-own check follows the config as soon as `arca serve` is restarted with new caps. The project's `limits.*` keys do not:
-they are set once, when the project is created, and no Arca path changes them afterwards. After changing
-`kernel.bridged.limits`, set the same values by hand, for example
-`incus project set arcak-svc limits.memory=96GiB`. Until then the lower of the two applies.
+own check follows the config as soon as `arca serve` is restarted with new caps. The project's `limits.*` keys follow
+with the next virtual-machine create: once that create has passed Arca's check, the configured caps are written into
+the entry that owns the project and, by a journaled project config write, into the project, before the instance is
+sent. This works both ways. A cap lowered below what the node already holds changes nothing: every create is refused,
+naming the cap, what is in use and what is allowed, until the cap is raised or virtual machines are removed. Nothing
+is to be set by hand, and a value set by hand on the project is written back to the entry's on the next pass.
 
 **A network is never dropped from under what lives on it.** A node may gain the other network at any time (see "Mixed
 nodes"). What `arca serve` refuses, at its start and naming the entry, is a config that would leave a half-state:
@@ -2258,7 +2260,7 @@ and widens it, by a journaled project config write, the first time the node uses
 | The node was | First use of | What changes on the project |
 |--------------|--------------|-----------------------------|
 | bridged (`bridged-arcak-svc` owns the project) | the managed network | `limits.containers`, `limits.cpu`, `limits.memory` and `limits.disk` are unset and `restricted.devices.proxy` becomes `allow`. The entry `net-arcak-svc` is added and creates the bridge `arcak-svcbr` and the profile `arca-service`. |
-| managed (`net-arcak-svc` owns the project) | a virtual machine | `limits.virtual-machines` becomes the cap. |
+| managed (`net-arcak-svc` owns the project) | a virtual machine | `limits.virtual-machines` becomes the configured cap, and follows it at every later virtual-machine create. |
 | managed | a virtual machine on a host bridge | `restricted.devices.nic` becomes `allow` and `restricted.networks.access` is unset. From then on the only guard on which bridge a NIC joins is Arca's own, as on a bridged node. |
 
 **Turning a bridged node into a mixed one.** Add `kernel.serviceCidr` to the config, keep `kernel.bridged` as it is, and
@@ -2287,7 +2289,9 @@ working: a new virtual machine can take minutes.
 
 A `service_create` whose instance was created and then failed to start is a defined state, not a half-done one. The
 message carries Incus's reason and says so: the instance exists and is stopped, `instance_start` starts it once the
-cause is fixed, and `service_remove` removes it. The service's record stays, `service_status` shows it `stopped`, and
+cause is fixed, and `service_remove` removes it. It says "stopped" only when that state was read; otherwise it says
+what Incus reported. A create that Incus refused outright, leaving nothing, carries Incus's reason too. Secret file
+contents are replaced in both. The service's record stays, `service_status` shows it `stopped`, and
 the effect journal holds the instance's create as applied with its delete as the inverse, so no intent is left open and
 later writes are not held up.
 

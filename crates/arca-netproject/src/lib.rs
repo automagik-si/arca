@@ -22,7 +22,8 @@ pub struct NetProjectConfig {
     pub project: String,
     pub bridge: String,
     pub cidr: String,
-    /// The project's `limits.virtual-machines`: `0` until the node's first virtual machine, then the node's cap.
+    /// The project's `limits.virtual-machines`: `0` until the node's first virtual machine, then the node's configured cap
+    /// as of the last virtual-machine create.
     pub virtual_machines: u32,
     /// The project is the bridged entry's ([`BridgedProject`]): this entry makes the bridge and the profile, and never
     /// writes the project. An entry an earlier kernel wrote has no such key and owns its project.
@@ -119,7 +120,8 @@ pub const BRIDGED_ENTRY: &str = "bridged-arcak-svc";
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BridgedProjectConfig {
     pub project: String,
-    /// The caps on everything in the project together, set as its `limits.*` keys when it is created.
+    /// The caps on everything in the project together, set as its `limits.*` keys. They are the node's configured caps as
+    /// of the last virtual-machine create.
     pub virtual_machines: u32,
     pub cpu: u32,
     pub memory: String,
@@ -151,9 +153,10 @@ fn project_ref(project: &str) -> arca_kernel::ownership::ObjectRef {
 
 /// The service project of a node whose first service was a virtual machine on a host bridge. It creates the project and
 /// nothing else: no Incus network, no profile. The project lets a NIC name a host bridge
-/// (`restricted.devices.nic=allow`) and carries the node's caps as `limits.*`. While `managed` is unset nothing changes
-/// the project after its create: new caps are set by hand. With `managed` the project is widened once, by a journaled
-/// config write, so the managed service network's containers fit in it.
+/// (`restricted.devices.nic=allow`) and carries the node's caps as `limits.*`. The caps follow the entry: when a
+/// virtual-machine create finds the node's configured caps changed, the entry is rewritten and this plugin writes the new
+/// values, by a journaled config write. With `managed` the project is widened the same way, once, so the managed service
+/// network's containers fit in it.
 pub struct BridgedProject;
 
 impl Plugin for BridgedProject {
@@ -202,17 +205,28 @@ impl Plugin for BridgedProject {
                 json!({"name": cfg.project, "config": config}),
             );
         };
-        if !cfg.managed {
-            return Ok(());
-        }
+        // The caps follow the entry, which follows the node's config: the count always, and the aggregate caps while the
+        // project holds virtual machines only.
         let mut changes = std::collections::BTreeMap::new();
-        for key in BRIDGED_ONLY_LIMITS {
-            if current["config"].get(key).is_some() {
-                changes.insert(key.to_string(), None);
+        let mut follow = |key: &str, value: String| {
+            if current["config"][key].as_str() != Some(value.as_str()) {
+                changes.insert(key.to_string(), Some(value));
             }
-        }
-        if current["config"]["restricted.devices.proxy"].as_str() != Some("allow") {
-            changes.insert("restricted.devices.proxy".into(), Some("allow".into()));
+        };
+        follow("limits.virtual-machines", cfg.virtual_machines.to_string());
+        if cfg.managed {
+            for key in BRIDGED_ONLY_LIMITS {
+                if current["config"].get(key).is_some() {
+                    changes.insert(key.to_string(), None);
+                }
+            }
+            if current["config"]["restricted.devices.proxy"].as_str() != Some("allow") {
+                changes.insert("restricted.devices.proxy".into(), Some("allow".into()));
+            }
+        } else {
+            follow("limits.cpu", cfg.cpu.to_string());
+            follow("limits.memory", cfg.memory.clone());
+            follow("limits.disk", cfg.disk.clone());
         }
         if !changes.is_empty() {
             ctx.effect(EffectOp::IncusPatchConfig {
@@ -283,8 +297,9 @@ impl Plugin for NetProject {
             if config["restricted.devices.proxy"].as_str() != Some("allow") {
                 changes.insert("restricted.devices.proxy".into(), Some("allow".into()));
             }
-            // `0` is what every project was created with before a node could hold both kinds: it is never written back
-            // over a value set by hand.
+            // `0` is what every project was created with before a node could hold virtual machines, and what an entry
+            // holds until its first one: it is never written over the project's own value. From the first virtual
+            // machine on, the entry holds the node's configured cap and the project follows it on every pass.
             if cfg.virtual_machines != 0
                 && config["limits.virtual-machines"].as_str() != Some(virtual_machines.as_str())
             {

@@ -866,6 +866,7 @@ impl IncusProvider {
     /// whether the create landed.
     fn settle_create(
         &self,
+        entry: &EntryId,
         writer: &UnixIncusWriter,
         target: &ObjectRef,
         sent: &Value,
@@ -874,9 +875,10 @@ impl IncusProvider {
         match error {
             IncusError::Refused(reason) => EffectRefusal::Provider(reason),
             IncusError::Status { message, .. } => match writer.get_etag(target) {
-                Err(IncusError::Status { code: 404, .. }) => {
-                    EffectRefusal::Provider("the create did not land".to_string())
-                }
+                Err(IncusError::Status { code: 404, .. }) => EffectRefusal::Provider(format!(
+                    "the create did not land: {}",
+                    self.incus_reason(entry, &message)
+                )),
                 Ok((found, _))
                     if target.kind == IncusKind::Instance
                         && sent.get("start") != Some(&Value::Bool(false))
@@ -898,7 +900,7 @@ impl IncusProvider {
                                 object,
                                 why: format!(
                                     "the instance was created, and Incus did not start it: {}",
-                                    message.trim()
+                                    self.incus_reason(entry, &message)
                                 ),
                             }))
                         }
@@ -912,6 +914,28 @@ impl IncusProvider {
             | IncusError::Timeout
             | IncusError::TooLarge
             | IncusError::AppliedUnconfirmed(_) => EffectRefusal::Unresolved,
+        }
+    }
+
+    /// Incus's own reason for refusing a request, as it may be told and journalled: every secret file's content, this
+    /// entry's or another's, is replaced, since a create's body carries resolved secrets and Incus may quote it.
+    fn incus_reason(&self, entry: &EntryId, message: &str) -> String {
+        let mut values: Vec<String> = self
+            .secrets_by_value(entry)
+            .into_iter()
+            .chain(self.foreign_secrets_by_value(entry))
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty())
+            .collect();
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        let mut reason = message.trim().to_string();
+        for value in values {
+            reason = reason.replace(&value, "[secret]");
+        }
+        if reason.is_empty() {
+            "Incus gave no reason".to_string()
+        } else {
+            format!("Incus said \"{reason}\"")
         }
     }
 
@@ -1258,7 +1282,7 @@ impl Provider for IncusProvider {
                         };
                         Ok((object.clone(), Inverse::IncusDelete { object }))
                     }
-                    Err(error) => Err(self.settle_create(&writer, &target, &sent, error)),
+                    Err(error) => Err(self.settle_create(entry, &writer, &target, &sent, error)),
                 }
             }
             EffectOp::IncusPatchConfig { object, config } => {

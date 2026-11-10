@@ -397,7 +397,7 @@ impl ToolHandler for CountingAction {
 }
 
 /// What the stand-in create answers for the service `stuck`: the words a real create whose start failed uses.
-const STUCK: &str = "start service stuck: the instance was created, and Incus did not start it: Failed starting instance. Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it";
+const STUCK: &str = "start service stuck: the instance was created, and Incus did not start it: Incus said \"Failed starting instance\". Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it";
 
 const TEST_CHAT_IDLE: Duration = Duration::from_millis(600);
 const TEST_CHAT_TOTAL: Duration = Duration::from_secs(3);

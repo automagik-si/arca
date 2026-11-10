@@ -2533,7 +2533,9 @@ fn project_owner(entries: &[arca_kernel::desired::Entry]) -> Option<&'static str
 
 /// The changes that give the service project and its networks what a create needs, first in the caller's one document.
 /// The project is made by the entry that first needs it and widened by that same entry when the node gains the other
-/// network (Rules 54 and 55 of the ownership document): an entry that already holds what is needed is not rewritten.
+/// network (Rules 54 and 55 of the ownership document). A virtual-machine create also brings the caps the owner's entry
+/// holds, and so the project's `limits.*`, to the node's configured caps. An entry that already holds what is needed is
+/// not rewritten.
 pub fn project_changes(
     entries: &[arca_kernel::desired::Entry],
     cfg: &NodeConfig,
@@ -2596,16 +2598,30 @@ pub fn project_changes(
                     }),
                 ));
             }
-            Some(entry) if needs.managed && entry.config["managed"] != json!(true) => {
+            Some(entry) => {
                 let mut config = entry.config.clone();
-                config["managed"] = json!(true);
-                changes.push(put(
-                    arca_netproject::BRIDGED_ENTRY,
-                    "arca.bridgedproject",
-                    config,
-                ));
+                if needs.managed {
+                    config["managed"] = json!(true);
+                }
+                // The caps Incus holds follow the node's config: a virtual-machine create writes the configured caps
+                // into the owner's entry when they differ, up or down. The create's own cap check has passed by now,
+                // so a lowered cap is never below what the node already uses.
+                if needs.vm
+                    && let Some(caps) = caps
+                {
+                    config["virtualMachines"] = json!(caps.virtual_machines);
+                    config["cpu"] = json!(caps.cpu);
+                    config["memory"] = json!(caps.memory);
+                    config["disk"] = json!(caps.disk);
+                }
+                if config != entry.config {
+                    changes.push(put(
+                        arca_netproject::BRIDGED_ENTRY,
+                        "arca.bridgedproject",
+                        config,
+                    ));
+                }
             }
-            Some(_) => {}
         }
         if needs.managed && net.is_none() {
             changes.push(put(
@@ -2631,8 +2647,9 @@ pub fn project_changes(
         }
         Some(entry) => {
             let mut config = entry.config.clone();
-            // A cap already written is left alone, as the bridged project's is: a new cap is set by hand.
-            if needs.vm && config["virtualMachines"] == json!(0) {
+            // The cap Incus holds follows the node's config, as the bridged owner's caps do: a virtual-machine create
+            // writes the configured cap into the entry when it differs, up or down.
+            if needs.vm {
                 config["virtualMachines"] = json!(cap);
             }
             if needs.host_bridge && config["hostBridges"] != json!(true) {
@@ -2644,6 +2661,15 @@ pub fn project_changes(
         }
     }
     Ok(changes)
+}
+
+/// Why a create has no service project to go into, in the words of the check that failed: only a missing
+/// `kernel.serviceCidr` is called one.
+fn no_service_project(error: CallError) -> CallError {
+    match error {
+        CallError::Invalid(why) => service_refused(format!("no service project: {why}")),
+        _ => internal(),
+    }
 }
 
 fn no_vm_caps(template: &str) -> String {
@@ -2684,17 +2710,23 @@ pub fn mode_refusal(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -
             managed.id.0
         ));
     }
-    if kernel.bridged.is_none()
-        && let Some(bridged) = entries.iter().find(|entry| {
-            on_host_bridge(entry)
-                || (entry.plugin.0 == "arca.bridgedproject"
-                    && entry.config["managed"] != json!(true))
-        })
-    {
-        return Some(format!(
-            "kernel.bridged is not set, but this node already holds {} from bridged mode. Put kernel.bridged back, or remove its virtual machines first",
-            bridged.id.0
-        ));
+    if kernel.bridged.is_none() {
+        if let Some(vm) = entries.iter().find(|entry| on_host_bridge(entry)) {
+            return Some(format!(
+                "kernel.bridged is not set, but this node already holds {} from bridged mode. Put kernel.bridged back, or remove its virtual machines first",
+                vm.id.0
+            ));
+        }
+        // The project is still a bridged-only one, and nothing the owner can remove changes that: the way to the
+        // managed network is to add it beside kernel.bridged, which widens the project.
+        if let Some(project) = entries.iter().find(|entry| {
+            entry.plugin.0 == "arca.bridgedproject" && entry.config["managed"] != json!(true)
+        }) {
+            return Some(format!(
+                "kernel.bridged is not set, but this node's service project was created in bridged mode ({}). Put kernel.bridged back. To use the managed service network, set kernel.serviceCidr beside kernel.bridged: the node then becomes a mixed node, never a managed-only one",
+                project.id.0
+            ));
+        }
     }
     if kernel.vm_caps().is_none()
         && let Some(vm) = entries.iter().find(|entry| is_vm(entry))
@@ -3916,7 +3948,8 @@ fn service_removal_refused(
         ),
         "instance",
     );
-    if config.vm.is_some() {
+    // A virtual machine on a host bridge has no ACL. One on the managed network has its own, as a container does.
+    if config.on_host_bridge() {
         return service_refused(format!(
             "remove service {}: partial removal ({instance}); the owner's approval is spent, so another try needs a new one",
             config.name
@@ -4071,7 +4104,7 @@ impl ServiceHandler {
                 "/1.0/instances/{name}?project={}",
                 arca_netproject::PROJECT
             )) {
-                Ok(_) => {
+                Ok(found) => {
                     // The instance exists, so its record stays: the effect journal holds the create as applied, never
                     // as an open intent, and the owner is told what is there and what to do next.
                     let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
@@ -4080,8 +4113,18 @@ impl ServiceHandler {
                         &why,
                         &service_secret_values(&self.cfg.state_dir.join("secrets")),
                     );
+                    // Only a state that was read is stated.
+                    let left = match found["status"].as_str() {
+                        Some("Stopped") => {
+                            "Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it".to_string()
+                        }
+                        Some(status) if status.len() <= 32 && status.is_ascii() => format!(
+                            "Its instance exists, and Incus reports it as {status}: service_status shows it, and service_remove removes it"
+                        ),
+                        _ => "Its instance exists, in a state Incus did not report: service_status shows it, and service_remove removes it".to_string(),
+                    };
                     return Err(service_refused(format!(
-                        "start service {name}: {why}. Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it"
+                        "start service {name}: {why}. {left}"
                     )));
                 }
                 Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
@@ -4099,8 +4142,13 @@ impl ServiceHandler {
             if let Some((service_secrets, seeded)) = made {
                 cleanup_service_secrets(service_secrets, seeded);
             }
+            // Incus's own reason for refusing the create is part of this text: it is redacted as a start failure's is.
             let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
                 .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+            let why = crate::service::redact_log(
+                &why,
+                &service_secret_values(&self.cfg.state_dir.join("secrets")),
+            );
             let left = service_wiring::left_behind(removal.ok().as_deref(), &id);
             return Err(service_refused(format!(
                 "create service {name} from template {template_name}: {why}; {left}"
@@ -4660,9 +4708,7 @@ impl ToolHandler for ServiceHandler {
                         }
                     };
                     let mut changes =
-                        project_changes(&entries, &self.cfg, needs).map_err(|_| {
-                            service_refused("no service project: kernel.serviceCidr is required")
-                        })?;
+                        project_changes(&entries, &self.cfg, needs).map_err(no_service_project)?;
                     let config = vm_service_config(&name, &template, place, pool, now)?;
                     changes.push(crate::desired_store::EntryChange::Put(service_entry(
                         &id,
@@ -4704,9 +4750,8 @@ impl ToolHandler for ServiceHandler {
                 let pool = service_pool(&self.cfg).map_err(|_| {
                     service_refused("the default profile does not name a storage pool")
                 })?;
-                let mut changes = ensure_netproject(&entries, &self.cfg).map_err(|_| {
-                    service_refused("no service project: kernel.serviceCidr is required")
-                })?;
+                let mut changes =
+                    ensure_netproject(&entries, &self.cfg).map_err(no_service_project)?;
                 let secrets_dir = self.cfg.state_dir.join("secrets");
                 let service_secrets = secrets_dir.join(format!("service-{name}"));
                 let seeded = service_secret_names(&service_secrets).map_err(|_| internal())?;

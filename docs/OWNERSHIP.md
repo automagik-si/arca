@@ -902,8 +902,17 @@ is exactly the entry an earlier kernel wrote.
 | Owner | Field | Written when | The write |
 | --- | --- | --- | --- |
 | `bridged-arcak-svc` | `managed: true` | the first service on the managed network | unsets `limits.containers`, `limits.cpu`, `limits.memory` and `limits.disk`; sets `restricted.devices.proxy` to `allow` |
-| `net-arcak-svc` | `virtualMachines: <cap>` | the first virtual machine | sets `limits.virtual-machines` to the cap |
+| `net-arcak-svc` | `virtualMachines: <cap>` | the first virtual machine, and any later virtual-machine create that finds the configured cap changed | sets `limits.virtual-machines` to the cap |
+| `bridged-arcak-svc` | `virtualMachines`, `cpu`, `memory`, `disk` | a virtual-machine create that finds the configured caps changed | sets `limits.virtual-machines`, and while `managed` is unset `limits.cpu`, `limits.memory` and `limits.disk`, to the caps |
 | `net-arcak-svc` | `hostBridges: true` | the first virtual machine on a host bridge | sets `restricted.devices.nic` to `allow`; unsets `restricted.networks.access` |
+
+The caps Incus holds follow the node's configured caps, for both owners alike, and nothing is set by hand. A
+virtual-machine create that has passed Arca's own cap check (Rule 58) writes the configured caps into the owner's entry when
+they differ, up or down, in the same document as the new service and ahead of it, so the project is written before the
+instance is sent. Because that check has passed, a lowered cap is never below what the node holds; a cap lowered further
+refuses the create in words before any write and leaves the entry and the project as they were. The network entry
+re-applies on every pass and writes its entry's value back over a value set by hand; the entry's `0`, which it holds until
+the first virtual machine, is never written. A pass over an unchanged desired state writes nothing.
 
 On a project the bridged entry owns, `net-arcak-svc` is written with `sharedProject: true`: it creates the managed bridge and the
 service profile, and it never writes the project. The bridged project never had a bridge grant, so the managed bridge
@@ -923,7 +932,9 @@ Source: `BridgedProject::apply` and `NetProject::apply` in `crates/arca-netproje
 `crates/arca-providers/tests/incus_provider.rs`,
 `the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_skips_it` and
 `the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges` in
-`crates/arca-netproject/tests/netproject.rs`, and the two tests of Rule 54.
+`crates/arca-netproject/tests/netproject.rs`, the two tests of Rule 54, and for the caps
+`the_cap_incus_holds_follows_the_configured_cap_up_and_down` and `the_bridged_owners_caps_follow_the_config_too` in
+`crates/arca/tests/services/mixed.rs`.
 
 **Rule 56.** A virtual machine on the managed network is a service like a container. `service_create` with no `bridge`, on a node
 with `kernel.serviceCidr`, gives it the next free address of the same plan (`.10` to `.239`, shared with containers and
@@ -955,7 +966,8 @@ start before anything is reconciled, and again before a virtual-machine create w
   or a virtual machine on the managed network: the managed network would be dropped under them.
 - no `kernel.bridged`, on a node that holds a virtual machine on a host bridge: its bridge would no longer be an allowed one.
 - no `kernel.bridged`, on a node that holds the bridged project entry before it was widened (`managed` unset): the project
-  is still a bridged-only one, so this is the bridged node's own refusal, unchanged.
+  is still a bridged-only one. The refusal says what can be done: put `kernel.bridged` back, and add `kernel.serviceCidr`
+  beside it to make the node mixed; it cannot become a managed-only node.
 - no caps (Rule 58), on a node that holds any virtual machine.
 
 A mixed node may list `kernel.importServices` (Rules 52 and 53): an import needs the node's own service network, which a
@@ -1005,12 +1017,15 @@ provider settles it only when all of this holds: the create asked for a start, I
 now reads as stopped, no operation Incus still runs names it (Rule 44), and it reads as the entry's own with a uuid and no
 tombstone. The effect is then journalled as applied, with the instance's delete as its inverse, and the plugin's apply
 fails with Incus's reason, so the entry is reported failed and a removal deletes the instance through the usual plan.
+Incus's reason is carried the same way when the create did not land at all. In both, every secret file's content is
+replaced in the text before it is returned or journalled, since a create's body carries resolved secrets.
 Every other failed create is settled as before: failed when the name answers 404, and otherwise left open. Before this
 rule the intent stayed open, which blocks every later effect until a restart.
 Source: `IncusProvider::settle_create` in `crates/arca-providers/src/incus.rs`; `EffectRefusal::Landed` and `Ctx::effect`
 in `crates/arca-kernel/src/plugin.rs`; `ServiceHandler::settle_create` in `crates/arca/src/handlers.rs`; tests
 `a_failed_start_keeps_the_created_instance_record_and_secrets` in `crates/arca/tests/services.rs`,
-`an_approved_create_that_fails_at_start_reports_its_message_and_leaves_a_defined_state` in
+`an_approved_create_that_fails_at_start_reports_its_message_and_leaves_a_defined_state` and
+`after_a_create_that_did_not_start_instance_start_retries_it_and_service_remove_removes_it` in
 `crates/arca/tests/services/mixed.rs` and, for the cases that stay open,
 `a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` in `crates/arca-providers/tests/incus_provider.rs`.
 
