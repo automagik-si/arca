@@ -8,7 +8,8 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 const APPROVAL_NAMESPACE = 'arca-kernel-approve';
 const APPROVAL_DOMAIN = 'arca-kernel-approval/v1';
 const PROPOSE_ACTIONS = new Set([
-  'service_create', 'service_remove', 'service_publish', 'service_unpublish',
+  'service_create', 'service_remove', 'service_import', 'service_release',
+  'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   'storage_add', 'snapshot_create', 'snapshot_delete',
   'instance_start', 'instance_stop', 'instance_restart',
@@ -160,6 +161,8 @@ function plainResult(action, result) {
     return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
   }
   if (value.removed === true) return 'The service was removed.';
+  if (value.imported === true) return 'The service was imported. Arca lists it now and changes nothing on it.';
+  if (value.released === true) return 'The service was released back to the manager that created it.';
   if (value.unpublished === true) return 'The service is no longer published.';
   if (typeof value.url === 'string' && value.url) return `The change is live at ${value.url}.`;
   if (Array.isArray(value.env)) return `The link is set up; ${count(value.env.length, 'environment variable')} updated.`;

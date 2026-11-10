@@ -291,12 +291,14 @@ The Doctor has the ten read-only Arca tools (`arca_status`, `watch_report`,
 `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`, `journal_list`,
 `service_list`, `storage_list`, `snapshot_list`) plus one non-read tool,
 `arca_propose`. `arca_propose` calls the kernel's `action_propose` viewer verb and
-records an inert proposal for one of fifteen actions (`service_create`,
-`service_remove`, `service_publish`, `service_unpublish`, `service_connect`,
-`service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`,
+records an inert proposal for one of seventeen actions (`service_create`,
+`service_remove`, `service_import`, `service_release`, `service_publish`,
+`service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`,
 `storage_add`, `snapshot_create`, `snapshot_delete`, `instance_start`,
 `instance_stop`, `instance_restart`); it changes nothing and a
-database delete cannot be proposed. The three instance actions take
+database delete cannot be proposed. `service_import` and `service_release` take
+`{name}`: an import takes over, where it stands, a service another manager
+created, and a release gives it back. The three instance actions take
 `{project, instance}` and only for an instance Arca owns or has adopted; a stop
 and a restart are graceful, and their cards wait up to 180 seconds for the
 kernel's answer. A `storage_add` card for a whole disk always
