@@ -4274,13 +4274,35 @@
           }
         },
         {
-          "name": "project",
-          "required": true,
+          "name": "allocated",
+          "required": false,
           "schema": {
-            "description": "The source's Incus project.",
-            "maxLength": 128,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "files",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "folder",
+          "required": false,
+          "schema": {
+            "description": "A host folder to copy, such as /home: absolute, with no link in its path, and not /, /proc, /sys, /dev, /run, /boot, /tmp or /var/lib/incus. Incus copies it read-only through a short-lived helper container.",
+            "maxLength": 1024,
             "minLength": 1,
-            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "pattern": "^/",
+            "type": "string"
+          }
+        },
+        {
+          "name": "fsUuid",
+          "required": false,
+          "schema": {
+            "maxLength": 128,
             "type": "string"
           }
         },
@@ -4302,7 +4324,8 @@
             "enum": [
               "container",
               "virtual-machine",
-              "volume"
+              "volume",
+              "folder"
             ],
             "type": "string"
           }
@@ -4319,6 +4342,50 @@
           }
         },
         {
+          "name": "poolFree",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "description": "The source's Incus project (an app or a data volume).",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "separate",
+          "required": false,
+          "schema": {
+            "items": {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "type": "array"
+          }
+        },
+        {
+          "name": "separateCount",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "size",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
           "name": "sourcePool",
           "required": false,
           "schema": {
@@ -4327,6 +4394,13 @@
             "minLength": 1,
             "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
             "type": "string"
+          }
+        },
+        {
+          "name": "unreadable",
+          "required": false,
+          "schema": {
+            "type": "integer"
           }
         },
         {
@@ -4355,14 +4429,75 @@
         "name": "result",
         "schema": {
           "properties": {
+            "bytes": {
+              "type": "integer"
+            },
+            "changedDuringCopy": {
+              "type": "integer"
+            },
+            "changedFiles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "files": {
+              "type": "integer"
+            },
+            "folder": {
+              "type": "string"
+            },
+            "io": {
+              "enum": [
+                "incus-caps",
+                "throttled-by-tar"
+              ],
+              "type": "string"
+            },
+            "ioCaps": {
+              "type": "boolean"
+            },
             "kind": {
               "type": "string"
+            },
+            "notes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "pool": {
               "type": "string"
             },
+            "separate": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "separateCount": {
+              "type": "integer"
+            },
+            "skipped": {
+              "properties": {
+                "devices": {
+                  "type": "integer"
+                },
+                "sockets": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "sockets",
+                "devices"
+              ],
+              "type": "object"
+            },
             "snapshot": {
               "type": "string"
+            },
+            "sparse": {
+              "type": "boolean"
             },
             "state": {
               "enum": [
@@ -4383,7 +4518,7 @@
           "type": "object"
         }
       },
-      "summary": "Copy one app or data volume onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
+      "summary": "Copy one app, data volume or host folder (such as /home) onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "doctor",
@@ -4399,6 +4534,12 @@
             "snapshots": {
               "items": {
                 "properties": {
+                  "changedDuringCopy": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
                   "created": {
                     "type": "string"
                   },
@@ -4412,18 +4553,31 @@
                     "enum": [
                       "container",
                       "virtual-machine",
-                      "volume"
+                      "volume",
+                      "folder"
                     ],
                     "type": "string"
                   },
                   "name": {
                     "type": "string"
                   },
+                  "note": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "pool": {
                     "type": "string"
                   },
                   "project": {
                     "type": "string"
+                  },
+                  "reason": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "size": {
                     "type": [
@@ -4433,6 +4587,12 @@
                   },
                   "sourceName": {
                     "type": "string"
+                  },
+                  "sourcePath": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
                   },
                   "sourcePool": {
                     "type": [
@@ -4476,7 +4636,7 @@
           "type": "object"
         }
       },
-      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished is incomplete.",
+      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
@@ -4541,14 +4701,75 @@
         "name": "result",
         "schema": {
           "properties": {
+            "bytes": {
+              "type": "integer"
+            },
+            "changedDuringCopy": {
+              "type": "integer"
+            },
+            "changedFiles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "files": {
+              "type": "integer"
+            },
+            "folder": {
+              "type": "string"
+            },
+            "io": {
+              "enum": [
+                "incus-caps",
+                "throttled-by-tar"
+              ],
+              "type": "string"
+            },
+            "ioCaps": {
+              "type": "boolean"
+            },
             "kind": {
               "type": "string"
+            },
+            "notes": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             },
             "pool": {
               "type": "string"
             },
+            "separate": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "separateCount": {
+              "type": "integer"
+            },
+            "skipped": {
+              "properties": {
+                "devices": {
+                  "type": "integer"
+                },
+                "sockets": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "sockets",
+                "devices"
+              ],
+              "type": "object"
+            },
             "snapshot": {
               "type": "string"
+            },
+            "sparse": {
+              "type": "boolean"
             },
             "state": {
               "enum": [

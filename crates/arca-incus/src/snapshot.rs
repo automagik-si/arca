@@ -9,9 +9,12 @@
 //! - `POST /1.0/projects` creates [`SNAPSHOT_PROJECT`], and only that project.
 //! - `POST` of an instance or a custom volume, and `DELETE` of one, only in [`SNAPSHOT_PROJECT`].
 //! - One `PUT` of a new instance copy in [`SNAPSHOT_PROJECT`], which rewrites it to its clean config and devices.
+//! - For a folder snapshot ([`crate::folder`]), all in [`SNAPSHOT_PROJECT`]: `POST /1.0/images` of the copy helper's image,
+//!   a `PUT` of the folder volume's marks, and `PUT .../state` and `POST .../exec` of the copy helper. The writer sends
+//!   those two only to an instance that reads back as a copy helper ([`crate::folder::HELPER_KEY`]).
 //!
-//! Nothing else is ever written: no `PATCH` of any kind, no instance state change (so a copy is never started), and no
-//! request that names another project except as the read-only source of a copy. A copy's target pool must carry
+//! Nothing else is ever written: no `PATCH` of any kind, no state change of a snapshot copy (so a copy is never started),
+//! and no request that names another project except as the read-only source of a copy. A copy's target pool must carry
 //! [`SNAPSHOT_STORAGE_KEY`] in its config, which only a pool this module created has.
 //!
 //! A copy is made self-contained, so it can be restored from the disk alone after the machine is reinstalled: it uses no
@@ -511,6 +514,11 @@ pub fn write_allowed(method: &str, target: &str) -> bool {
         ("DELETE", ["instances", _]) => snapshot_query,
         ("POST", ["storage-pools", _, "volumes", "custom"]) => snapshot_query,
         ("DELETE", ["storage-pools", _, "volumes", "custom", _]) => snapshot_query,
+        // A folder snapshot: its volume's marks, the helper image, and the helper's start, stop and one copy command.
+        ("PUT", ["storage-pools", _, "volumes", "custom", _]) => snapshot_query,
+        ("POST", ["images"]) => snapshot_query,
+        ("PUT", ["instances", _, "state"]) => snapshot_query,
+        ("POST", ["instances", _, "exec"]) => snapshot_query,
         _ => false,
     }
 }
@@ -551,7 +559,7 @@ impl SnapshotWriter {
         self
     }
 
-    fn reader(&self) -> UnixIncus {
+    pub(crate) fn reader(&self) -> UnixIncus {
         UnixIncus::new(self.socket.clone()).with_timeout(self.timeout)
     }
 
@@ -795,7 +803,7 @@ impl SnapshotWriter {
         self.write_and_wait("DELETE", &path, None)
     }
 
-    fn write_and_wait(
+    pub(crate) fn write_and_wait(
         &self,
         method: &str,
         path: &str,
@@ -818,6 +826,15 @@ impl SnapshotWriter {
     /// Waits on one operation for at most the writer's wait, in short steps. A failed operation is a status error with
     /// Incus's own message.
     fn wait_for(&self, operation: &str) -> Result<Progress, IncusError> {
+        Ok(match self.wait_answer(operation)? {
+            Some(_) => Progress::Done,
+            None => Progress::Running(operation.to_string()),
+        })
+    }
+
+    /// Waits on one operation like [`Self::wait_for`], and returns the finished operation as Incus answered it (empty when
+    /// Incus no longer knows it), or `None` while it still runs.
+    pub(crate) fn wait_answer(&self, operation: &str) -> Result<Option<Value>, IncusError> {
         let until = Instant::now() + self.wait;
         let reader = self.reader();
         loop {
@@ -827,11 +844,11 @@ impl SnapshotWriter {
             let path = format!("/1.0/operations/{operation}/wait?timeout={seconds}");
             let answer = match reader.get_within(&path, step + TIMEOUT) {
                 Ok(answer) => answer,
-                Err(IncusError::Status { code: 404, .. }) => return Ok(Progress::Done),
+                Err(IncusError::Status { code: 404, .. }) => return Ok(Some(Value::Null)),
                 Err(error) => return Err(error),
             };
             match answer.get("status_code").and_then(Value::as_u64) {
-                Some(200) => return Ok(Progress::Done),
+                Some(200) => return Ok(Some(answer)),
                 Some(code) if code >= 400 => {
                     let message = answer
                         .get("err")
@@ -846,7 +863,7 @@ impl SnapshotWriter {
                 _ => {}
             }
             if left.is_zero() || seconds == 0 {
-                return Ok(Progress::Running(operation.to_string()));
+                return Ok(None);
             }
         }
     }
@@ -855,7 +872,12 @@ impl SnapshotWriter {
         self.send(method, path, Some(body)).map(|_| ())
     }
 
-    fn send(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, IncusError> {
+    pub(crate) fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, IncusError> {
         if !write_allowed(method, path) {
             return Err(refused("the request is outside the snapshot family"));
         }
@@ -903,11 +925,11 @@ pub fn plain_name(text: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn refused(reason: &str) -> IncusError {
+pub(crate) fn refused(reason: &str) -> IncusError {
     IncusError::Refused(reason.to_string())
 }
 
-fn decode(reason: &str) -> IncusError {
+pub(crate) fn decode(reason: &str) -> IncusError {
     IncusError::Decode(reason.to_string())
 }
 
@@ -1222,6 +1244,19 @@ mod tests {
                 format!("/1.0/instances/a--b--20261109T1405?project={p}"),
             ),
             ("GET", "/1.0/instances/web?project=shop".to_string()),
+            (
+                "PUT",
+                format!("/1.0/instances/arca-copy-1/state?project={p}"),
+            ),
+            (
+                "POST",
+                format!("/1.0/instances/arca-copy-1/exec?project={p}"),
+            ),
+            ("POST", format!("/1.0/images?project={p}")),
+            (
+                "PUT",
+                format!("/1.0/storage-pools/usb1/volumes/custom/x?project={p}"),
+            ),
         ] {
             assert!(write_allowed(method, &target), "{method} {target}");
         }
@@ -1232,9 +1267,16 @@ mod tests {
             ("DELETE", "/1.0/instances/web"),
             ("PUT", "/1.0/instances/web?project=shop"),
             ("PUT", "/1.0/instances/web"),
-            ("PUT", "/1.0/instances/a/state?project=arcak-snapshots"),
+            ("PUT", "/1.0/instances/a/state?project=shop"),
+            ("POST", "/1.0/instances/a/exec?project=shop"),
+            ("POST", "/1.0/images"),
+            ("POST", "/1.0/images?project=shop"),
             (
                 "PUT",
+                "/1.0/storage-pools/usb1/volumes/custom/x?project=shop",
+            ),
+            (
+                "PATCH",
                 "/1.0/storage-pools/usb1/volumes/custom/x?project=arcak-snapshots",
             ),
             ("PATCH", "/1.0/instances/a?project=arcak-snapshots"),

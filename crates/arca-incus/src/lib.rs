@@ -2,7 +2,8 @@
 //! checks. The adoption writer has its separate closed migration table. The device assigner changes only one existing
 //! instance's `devices` map, only for a kernel-family instance after the owner approved an action proposal; it is not part
 //! of the desired-state journal. The snapshot writer adds snapshot pools and copies apps and data volumes into its own
-//! `arcak-snapshots` project after the owner approved it, and writes nowhere else. The
+//! `arcak-snapshots` project after the owner approved it (a host folder through a short-lived copy helper container
+//! there), and writes nowhere else. The
 //! service exec module adds only closed commands, fixed file destinations and exact recording cleanup; it is called by
 //! serve's audited seam, never by Provider or plugins.
 //! The recording shim refuses every method except GET. The fake serves fixtures and accepts writes only in memory.
@@ -15,6 +16,8 @@ pub mod assign;
 pub mod exec;
 pub mod fake;
 pub mod fake_storage;
+#[cfg(feature = "write")]
+pub mod folder;
 pub mod read;
 pub mod shim;
 #[cfg(feature = "write")]
