@@ -1298,8 +1298,10 @@ and trusted for nothing. As before, every kept key approves actions only: never 
 own passkeys. Action approvals include owner approval requests, and so `enroll`. Once a service's own passkeys are a
 source here, the people who hold them can approve an `enroll` request for that service (or any other request) with their
 own passkey, without the node owner's tap. That is intended: a service's existing owners add its next owners. The first
-enroll of a service happens before any such source exists, so it is always the node owner's own tap. With a list,
-`arca_status` reports
+enroll of a service is the node owner's own tap only when the service's source is added to `approval.peerKeys` after
+that first enroll. A source that is in the config before it gets its first list on trust on first use, from whichever
+doctor token sends it first, and the keys in that list can then approve the first enroll themselves. So add a service's
+source after its first enroll, not before. With a list, `arca_status` reports
 `approval.peerKeys` for the first source, as it does for the single object, and `approval.peerKeySources`, one
 `{ "from", "keys", "since", "reason" }` per source in the config's order, the first included.
 

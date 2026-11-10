@@ -3373,6 +3373,35 @@ fn the_page_is_served_an_enroll_request_with_its_code_and_service_and_approves_i
     );
 }
 
+/// The enroll branch of the request card: the sentence the owner reads and the code as its own large element. The route
+/// test above covers the data the card is drawn from; this fails when the card's own markup is taken out of the page.
+#[test]
+fn the_request_card_keeps_its_enroll_sentence_and_its_large_code_element() {
+    let html = include_str!("../src/approve_page.html");
+    assert!(
+        html.contains(r#"const enroll = fields.action === "enroll";"#)
+            && html.contains(
+                r#""Approve " + String(args.service) + " to make the person showing code " + String(fields.target) + " an owner""#
+            ),
+        "the card says what the owner approves, with the service and the code"
+    );
+    assert!(
+        html.contains(r#"el("p", "enroll-code", String(fields.target))"#)
+            && html
+                .contains("card.append(meta, heading, ...(code ? [code] : []), facts, buttons);"),
+        "the code is its own element, set as text, on the card"
+    );
+    let rule = html
+        .split(".enroll-code {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("the code's style");
+    assert!(
+        rule.contains("font-size: 2.25rem"),
+        "the code is large: {rule}"
+    );
+}
+
 #[test]
 fn credential_placeholder_is_only_in_the_body_attribute() {
     for (label, html) in [
