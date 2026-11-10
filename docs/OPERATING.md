@@ -259,7 +259,7 @@ needs is available. `service_list` and `service_status` derive state from Incus 
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
 listener. `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The six shipped templates live in `templates/`, with their pinned
+secrets redacted and a capped, truncated result. The seven shipped templates live in `templates/`, with their pinned
 images and vendored npm lockfile. One of them, `workspace-vm`, is a virtual machine (see
 "Bridged nodes and virtual machines" and "Mixed nodes").
 
@@ -2328,6 +2328,67 @@ that accepts them, so a new service gets no address. This is the operator's step
 managed network has created the bridge:
 `firewall-cmd --zone=trusted --change-interface=arcak-svcbr --permanent` and `firewall-cmd --reload`. Arca cannot do
 it: it holds no rights over the host firewall.
+
+## Publishing a service through a Cloudflare Tunnel
+
+A Cloudflare Tunnel puts one of your services on the public internet under your own domain, for example
+`https://app.example.com`, without opening a port on your router or installing anything on the machine itself. Arca runs
+Cloudflare's connector (`cloudflared`) as one more service, from the shipped `cloudflare-tunnel` template. The connector
+calls out to Cloudflare; nothing calls in. It can reach only the services you link it to.
+
+You need a Cloudflare account with your domain already added to it, and a service in Arca that you want to publish (here
+it is called `app`). The steps name each screen. The Arca steps are Arca's own verbs: ask the assistant you use with Arca
+to run them. An assistant that may only propose a change (the canvas Doctor) has Arca show `service_create`,
+`instance_start` and `service_connect` on the approval page, and each runs when you approve it there. Step 3 is the
+exception: `service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope token.
+
+1. **Cloudflare dashboard, "Networking" > "Tunnels".** Select "Create a tunnel", enter a name (for example `home`) and
+   select "Create Tunnel". The next screen shows an installation command. Do not run it anywhere. Copy only the long
+   text at its end, which begins with `eyJ`: that is the tunnel's token. Treat it like a password. Leave this screen open.
+2. **Arca: `service_create`** with `{"name": "tunnel", "template": "cloudflare-tunnel"}`. The service is created and
+   stays `stopped`, because it has no token yet.
+3. **Arca: `service_secret_set`** with `{"name": "tunnel", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The key is
+   exactly `TUNNEL_TOKEN`. This step cannot go through the approval page: the assistant that runs it must hold a
+   `doctor`-scope token, and you give it the tunnel token, so the token passes through that assistant's conversation.
+   Because the verb is never a proposal, the token is never written to Arca's record of proposals
+   (`action-proposals.jsonl`). Arca keeps the token in a private file and answers `{"ok": true}`; no answer, list or log
+   shows it again.
+4. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "tunnel"}`. The connector starts and calls
+   Cloudflare. Back on the Cloudflare screen from step 1 the tunnel connects within about a minute; select "Continue".
+5. **Arca: `service_connect`** with `{"from": "tunnel", "to": "app"}`. This is what lets the tunnel reach `app`, on
+   `app`'s port and nothing else.
+6. **Arca: `service_status`** with `{"name": "app"}`. Note its `ipv4` and its first `ports` entry, for example `192.0.2.11`
+   and `8080`. This is the address Cloudflare will send visitors to.
+7. **Cloudflare dashboard, "Networking" > "Tunnels", your tunnel, the "Routes" tab.** Select "Add route", then "Published
+   application". Enter the subdomain (for example `app`), choose your domain (`example.com`) in "Domain", and in "Service
+   URL" enter the address from step 6, for example `http://192.0.2.11:8080`. Select "Add route".
+8. **Check.** The "Tunnels" page lists your tunnel as `Healthy`, and `https://app.example.com` opens your service.
+
+To publish a second service through the same tunnel, repeat steps 5 to 7 for it. To stop publishing a service, delete its
+route in the Cloudflare dashboard and run `service_disconnect` with `{"from": "tunnel", "to": "app"}`. To take the tunnel
+away altogether, run `service_remove` for `tunnel` and delete the tunnel in the Cloudflare dashboard, which also makes its
+token worthless.
+
+What to know:
+
+- **Where to look when it does not connect.** `service_status` shows whether the connector is `running`; it does not show
+  whether Cloudflare accepted it. The Cloudflare "Tunnels" page does (`Healthy`, or `Inactive`, `Down`, `Degraded`), and
+  `service_logs` with `{"name": "tunnel"}` shows the connector's own lines: `Registered tunnel connection` four times
+  when all is well, or the reason when the token was refused.
+- **A new token.** If you replace the token (`service_secret_set` again), the connector reads it at its next start:
+  `instance_restart` for `tunnel`, which you approve.
+- **After a restart of the machine** the tunnel starts by itself (the template sets `autostart`).
+- **Only linked services.** Every service refuses connections it has no rule for. A route in Cloudflare that points at a
+  service the tunnel is not linked to shows an error page to visitors and reaches nothing. The tunnel has no port, so no
+  service can connect to it either.
+- **What the tunnel needs from your network.** Outgoing connections to Cloudflare on port 7844 (TCP and UDP), which
+  Arca's service network allows like any other internet traffic. No incoming port is opened.
+- **Where the token lives.** In a private file in Arca's `secrets/` directory, and in the connector container's
+  environment in Incus (`environment.TUNNEL_TOKEN`), which is how `cloudflared` reads it, as for every template secret.
+  It is not in the template, in Arca's desired state or journal, or on the connector's command line, and `service_logs`
+  replaces it with `[secret]`. Someone who can read the instance's config in Incus on that machine can read it.
+- **The image.** The template pins `docker.io/cloudflare/cloudflared` release 2026.10.7 by digest, so it never updates
+  by itself. A later Arca release moves the pin.
 
 ## When an approved action fails
 
