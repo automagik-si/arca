@@ -558,6 +558,12 @@ pub trait Plugin {
     fn reconciles_when_unchanged() -> bool {
         false
     }
+    /// The class-A kinds this plugin's class-B objects use, such as the ACL an instance's NIC names. Incus refuses to delete
+    /// such an object while its user exists, so a removal retires it only after an approved plan has deleted every class-B
+    /// object of the entry and each has read back absent. The default is none: every class-A effect reverts at once.
+    fn retired_after_plan() -> &'static [IncusKind] {
+        &[]
+    }
 }
 
 /// A plugin with its config type erased, so the reconciler can hold any plugin in one collection.
@@ -569,6 +575,11 @@ pub trait ErasedPlugin: Send + Sync {
     /// Whether a converged, unchanged entry is applied again. A plugin that does not opt in keeps the reconciler's skip.
     fn reconciles_when_unchanged(&self) -> bool {
         false
+    }
+    /// The class-A kinds whose objects wait for the entry's class-B objects to be deleted (see
+    /// [`Plugin::retired_after_plan`]).
+    fn retired_after_plan(&self) -> &'static [IncusKind] {
+        &[]
     }
 }
 
@@ -610,6 +621,10 @@ impl<P: Plugin> ErasedPlugin for Erased<P> {
 
     fn reconciles_when_unchanged(&self) -> bool {
         P::reconciles_when_unchanged()
+    }
+
+    fn retired_after_plan(&self) -> &'static [IncusKind] {
+        P::retired_after_plan()
     }
 }
 

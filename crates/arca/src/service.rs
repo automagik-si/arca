@@ -554,6 +554,11 @@ impl Plugin for Service {
         manifest_for()
     }
 
+    /// The service's NIC names its ACL, and Incus refuses to delete an ACL in use: the ACL is retired after the instance.
+    fn retired_after_plan() -> &'static [IncusKind] {
+        &[IncusKind::Acl]
+    }
+
     fn apply(ctx: &mut Ctx<'_>, cfg: &ServiceConfig) -> Result<(), PluginError> {
         // An adopted instance is owned through its adopt entry. The service record never writes it.
         if cfg.adopted {
