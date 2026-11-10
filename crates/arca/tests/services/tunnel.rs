@@ -276,3 +276,45 @@ fn a_link_from_the_tunnel_opens_the_linked_services_port_to_it_and_nothing_else(
         json!([])
     );
 }
+
+#[test]
+fn a_link_from_the_tunnel_to_a_service_with_several_ports_opens_its_first_port_alone() {
+    let rig = tunnel_rig();
+    rig.template(
+        "multi",
+        json!({"name":"multi","kind":"oci","image":"docker.io/library/example","digest":DIGEST,"ports":[8080, 9000, 9443],"env":{}}),
+    );
+    rig.call("service_create", json!({"name":"multi","template":"multi"}))
+        .expect("create");
+    op(
+        &rig,
+        "service_connect",
+        json!({"from":"tunnel","to":"multi"}),
+    )
+    .expect("connect");
+    let tunnel = instance(&rig, "tunnel")["config"][service::ADDRESS_KEY]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // One rule, for the first port. The service's other ports stay closed to the tunnel.
+    let ingress = acl(&rig, "multi")["ingress"].clone();
+    let rules = ingress.as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["action"], "allow");
+    assert_eq!(rules[0]["source"], format!("{tunnel}/32"));
+    assert_eq!(rules[0]["protocol"], "tcp");
+    assert_eq!(rules[0]["destination_port"], "8080");
+    for port in ["9000", "9443"] {
+        assert!(!ingress.to_string().contains(port), "{port}");
+    }
+    // The status names that port for the link, and the service still lists all three.
+    assert_eq!(
+        rig.call("service_status", json!({"name":"tunnel"}))
+            .unwrap()["links"],
+        json!([{"to":"multi","port":8080}])
+    );
+    assert_eq!(
+        rig.call("service_status", json!({"name":"multi"})).unwrap()["ports"],
+        json!([8080, 9000, 9443])
+    );
+}

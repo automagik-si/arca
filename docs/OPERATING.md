@@ -2338,8 +2338,9 @@ calls out to Cloudflare; nothing calls in. It can reach only the services you li
 
 You need a Cloudflare account with your domain already added to it, and a service in Arca that you want to publish (here
 it is called `app`). The steps name each screen. The Arca steps are Arca's own verbs: ask the assistant you use with Arca
-to run them. An assistant that may only propose a change (the canvas Doctor) has Arca show it on the approval page, and
-it runs when you approve it there.
+to run them. An assistant that may only propose a change (the canvas Doctor) has Arca show `service_create`,
+`instance_start` and `service_connect` on the approval page, and each runs when you approve it there. Step 3 is the
+exception: `service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope token.
 
 1. **Cloudflare dashboard, "Networking" > "Tunnels".** Select "Create a tunnel", enter a name (for example `home`) and
    select "Create Tunnel". The next screen shows an installation command. Do not run it anywhere. Copy only the long
@@ -2347,8 +2348,11 @@ it runs when you approve it there.
 2. **Arca: `service_create`** with `{"name": "tunnel", "template": "cloudflare-tunnel"}`. The service is created and
    stays `stopped`, because it has no token yet.
 3. **Arca: `service_secret_set`** with `{"name": "tunnel", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The key is
-   exactly `TUNNEL_TOKEN`. Arca keeps the token in a private file and answers `{"ok": true}`; no answer, list or log shows
-   it again.
+   exactly `TUNNEL_TOKEN`. This step cannot go through the approval page: the assistant that runs it must hold a
+   `doctor`-scope token, and you give it the tunnel token, so the token passes through that assistant's conversation.
+   Because the verb is never a proposal, the token is never written to Arca's record of proposals
+   (`action-proposals.jsonl`). Arca keeps the token in a private file and answers `{"ok": true}`; no answer, list or log
+   shows it again.
 4. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "tunnel"}`. The connector starts and calls
    Cloudflare. Back on the Cloudflare screen from step 1 the tunnel connects within about a minute; select "Continue".
 5. **Arca: `service_connect`** with `{"from": "tunnel", "to": "app"}`. This is what lets the tunnel reach `app`, on
