@@ -68,6 +68,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "owner_approval_request",
             "owner_approval_status",
             "owner_approval_list",
+            "enroll_confirm",
             "gpu_attach",
             "gpu_detach",
             "storage_list",
@@ -120,6 +121,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("instance_start", VerbClass::L, Scope::Doctor, true, false),
         ("instance_stop", VerbClass::L, Scope::Doctor, true, true),
         ("instance_restart", VerbClass::L, Scope::Doctor, true, true),
+        ("enroll_confirm", VerbClass::L, Scope::Doctor, true, false),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -1183,8 +1185,16 @@ fn owner_approval_schemas_equal_the_golden_with_list_untrusted_and_status_not_re
     assert_eq!(rows.len(), 3);
     for row in rows {
         let v = verb(row["name"].as_str().unwrap()).unwrap();
+        // Arca's own action beside the golden's three: `enroll`, spent with `enroll_confirm`.
+        let mut params = (v.params)();
+        if v.name == "owner_approval_request" {
+            let actions = params["properties"]["action"]["enum"]
+                .as_array_mut()
+                .unwrap();
+            assert_eq!(actions.pop(), Some(json!("enroll")));
+        }
         assert_eq!(
-            parity_shape(&(v.params)()),
+            parity_shape(&params),
             parity_shape(&row["inputSchema"]),
             "{}",
             v.name

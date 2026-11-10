@@ -3306,6 +3306,33 @@ fn action_cards_render_every_kernel_detail_row_as_text() {
 }
 
 #[test]
+fn an_enroll_request_card_shows_the_code_large_and_names_the_service() {
+    let html = include_str!("../src/approve_page.html");
+    assert!(
+        html.contains(r#"const enroll = fields.action === "enroll";"#)
+            && html.contains(
+                r#""Approve " + String(args.service) + " to make the person showing code " + String(fields.target) + " an owner""#
+            ),
+        "the card says what the owner approves, with the service and the code"
+    );
+    assert!(
+        html.contains(r#"el("p", "enroll-code", String(fields.target))"#)
+            && html
+                .contains("card.append(meta, heading, ...(code ? [code] : []), facts, buttons);"),
+        "the code is its own element, set as text, on the card"
+    );
+    let rule = html
+        .split(".enroll-code {")
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("the code's style");
+    assert!(
+        rule.contains("font-size: 2.25rem"),
+        "the code is large: {rule}"
+    );
+}
+
+#[test]
 fn credential_placeholder_is_only_in_the_body_attribute() {
     for (label, html) in [
         ("approval", include_str!("../src/approve_page.html")),

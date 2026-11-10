@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 46] = [
+static VERBS: [Verb; 47] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -544,7 +544,7 @@ static VERBS: [Verb; 46] = [
     },
     Verb {
         name: "owner_approval_request",
-        summary: "Ask the owner to approve an Arca action (kind arca: action delete, publish or spend, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Kind upgrade is approved through droidd's MCP, not here.",
+        summary: "Ask the owner to approve an Arca action (kind arca: action delete, publish, spend or enroll, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Action enroll lets a service on this node make the person showing a code one of its owners: target is the code (6 to 12 uppercase letters and digits), args are {service: <name>}, and the approval is spent with enroll_confirm. Kind upgrade is approved through droidd's MCP, not here.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -583,6 +583,20 @@ static VERBS: [Verb; 46] = [
         cut: no_cut,
         params: owner_approval_list_params,
         result: owner_approval_list_result,
+    },
+    Verb {
+        name: "enroll_confirm",
+        summary: "Spend an enroll approval: the owner approved, on this node's approval page, that the named service may make the person showing the code an owner. target is the code, args are {service: <name>} as the request gave them, approval is the string owner_approval_status handed out. Arca checks the approval itself, spends it once and answers confirmed: true; it changes nothing else.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_enroll_confirm,
+        cut: no_cut,
+        params: enroll_confirm_params,
+        result: enroll_confirm_result,
     },
     Verb {
         name: "gpu_attach",
@@ -2711,8 +2725,8 @@ fn owner_approval_request_params() -> Value {
         "additionalProperties": false,
         "properties": {
             "kind": {"description": "arca: an Arca action, approved on Arca's passkey page. upgrade: an identity phone's upgrade step, approved through droidd's MCP and refused here.", "enum": ["arca", "upgrade"]},
-            "action": {"enum": ["delete", "publish", "spend"]},
-            "target": {"description": "What the action is on (a service's name).", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string"},
+            "action": {"description": "enroll: a service on this node may make the person showing the code in target an owner; its approval is spent with enroll_confirm.", "enum": ["delete", "publish", "spend", "enroll"]},
+            "target": {"description": "What the action is on (a service's name). For enroll, the code the person shows: 6 to 12 uppercase letters and digits.", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string"},
             "args": {"description": "The call's arguments, without approval (at most 4096 bytes of JSON); the owner sees them.", "type": "object"},
             "droid": {"pattern": "^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$", "type": "string"},
             "step": {"enum": ["split", "upgrade", "split_rollback", "upgrade_rollback", "retired_delete"]},
@@ -2738,6 +2752,32 @@ fn owner_approval_request_result() -> Value {
             "dashboard": {"anyOf": [{"maxLength": 300, "type": "string"}, {"type": "null"}], "description": "Arca's approval page, where the owner approves it; null when the node serves none."}
         },
         "required": ["id", "state", "expiresAt", "dashboard"],
+        "type": "object"
+    })
+}
+fn enroll_confirm_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "target": {"description": "The code the person shows, as the request named it.", "pattern": "^[A-Z0-9]{6,12}$", "type": "string"},
+            "args": {
+                "additionalProperties": false,
+                "description": "The request's args: the service that makes the owner.",
+                "properties": {"service": {"pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "type": "string"}},
+                "required": ["service"],
+                "type": "object"
+            },
+            "approval": {"description": "The approval string owner_approval_status handed to the token that asked.", "maxLength": 16384, "type": "string"}
+        },
+        "required": ["target", "args", "approval"],
+        "type": "object"
+    })
+}
+fn enroll_confirm_result() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {"confirmed": {"const": true, "type": "boolean"}},
+        "required": ["confirmed"],
         "type": "object"
     })
 }
@@ -2821,6 +2861,10 @@ pub fn summary_owner_approval_status(v: &Value) -> String {
         v["id"].as_str().unwrap_or("?"),
         v["state"].as_str().unwrap_or("?")
     )
+}
+pub fn summary_enroll_confirm(_: &Value) -> String {
+    "The owner's enroll approval is confirmed and spent: the service may make the person showing the code an owner."
+        .to_string()
 }
 pub fn summary_owner_approval_list(v: &Value) -> String {
     let requests = v["requests"].as_array().map_or(&[][..], Vec::as_slice);

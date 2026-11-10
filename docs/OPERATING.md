@@ -2354,7 +2354,7 @@ key and is a deployment acceptance check, not a hermetic test.
 ### Owner approval requests
 
 An assistant that needs the owner's approval for a call (a `service_remove`, say) asks for it with
-`owner_approval_request`: `kind` `arca`, the `action` (`delete`, `publish` or `spend`), the call's `target`, and its `args`
+`owner_approval_request`: `kind` `arca`, the `action` (`delete`, `publish`, `spend` or `enroll`), the call's `target`, and its `args`
 without `approval`. Arca checks the fields as the statement will carry them and refuses, in plain words, a request no
 statement can carry: a missing action ("an arca request needs action"), a bad target, args that are not an object, args
 over 4096 bytes or nested more than 8 levels, an args key longer than 64 characters, a control or bidi character, or an
@@ -2380,6 +2380,19 @@ once. With a device-bound passkey that counts its signatures (synced passkeys re
 the order they were tapped: once a later approval is spent, an earlier one is refused as `SignCountRegressed`. A spend that
 is refused after the signature has verified (for another host, action, target, arguments or time) also uses up that
 approval's count, so the owner taps again.
+
+**Enroll.** A service that runs on the node can ask the node's owner to let it make someone an owner of that service,
+which is how the service's first owner is made without a terminal. The service shows the person a code and asks with
+`owner_approval_request`, `action` `enroll`: the `target` is the code (6 to 12 uppercase letters and digits, refused
+otherwise) and the `args` are `{service: <name>}` and nothing else. The passkey page shows the request as "Approve
+<service> to make the person showing code <CODE> an owner", with the code large, so the owner compares it with the code in
+front of them before they tap. An `enroll` approval changes nothing in Arca. The token that asked reads it from
+`owner_approval_status` and spends it with `enroll_confirm {target, args, approval}` (a doctor's or an operator's verb, as
+the request is). Arca checks the approval with its own verifier against `enroll`, that code and those args, spends its
+nonce once and answers `{confirmed: true}`; the service then makes the owner. A second spend, another code, other args,
+an approval for another action, or one past its 15 minutes is refused with `owner_approval`, and an `enroll` approval is
+refused by every other call. Each confirmation is a line in `approval-requests-audit.jsonl` (`owner_enroll_confirmed`,
+naming the code, the args' digest and the token, never the approval).
 
 A pending request expires after 60 minutes. The requests live in `approval-requests.json` in the state directory (mode
 0600), which every request verb, the page's list and each page step reads and, when anything changed, rewrites whole (a

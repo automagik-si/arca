@@ -206,6 +206,37 @@ fn the_droidd_vector_statement_parses_to_its_fields() {
 }
 
 #[test]
+fn an_enroll_statement_carries_a_code_of_6_to_12_uppercase_letters_and_digits() {
+    for code in ["ABC123", "A1B2C3D4E5F6", "000000"] {
+        assert!(arca_approval::valid_enroll_code(code), "{code}");
+        let text = text_of(&fields(json!({ "action": "enroll", "target": code })));
+        let parsed = parse_statement(text.as_bytes()).expect("an enroll statement");
+        assert_eq!(parsed.action, ArcaAction::Enroll);
+        assert_eq!(parsed.action.as_str(), "enroll");
+        assert_eq!(ArcaAction::from_name("enroll"), Some(ArcaAction::Enroll));
+        assert_eq!(parsed.target, code);
+    }
+    for code in [
+        "ABC12",
+        "A1B2C3D4E5F6G",
+        "abc123",
+        "ABC-123",
+        "ABC.123",
+        "ABC 123",
+        "ÀBCDEF",
+    ] {
+        assert!(!arca_approval::valid_enroll_code(code), "{code}");
+        let text = text_of(&fields(json!({ "action": "enroll", "target": code })));
+        assert_malformed(&statement_refusal(&text));
+        // The same target under another action is that action's own business.
+        if code.is_ascii() && !code.contains(' ') {
+            let text = text_of(&fields(json!({ "action": "delete", "target": code })));
+            assert!(parse_statement(text.as_bytes()).is_ok(), "{code}");
+        }
+    }
+}
+
+#[test]
 fn a_nonce_of_32_or_64_lowercase_hex_digits_parses() {
     for nonce in ["0".repeat(32), "f".repeat(64)] {
         let text = text_of(&fields(json!({ "nonce": nonce })));
