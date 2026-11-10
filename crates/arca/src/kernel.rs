@@ -355,8 +355,14 @@ impl Kernel {
     /// Journals that an approved action which had already answered failed later, in work it left running (a snapshot copy
     /// finished in the background). The newest result for the id is this failure.
     pub fn journal_late_failure(&mut self, id: &str, code: &str) {
-        if let Err(error) = self.action_proposals.journal_result(id, false, Some(code)) {
-            eprintln!("arca: the late failure of action proposal {id} was not journalled: {error}");
+        self.journal_late_result(id, false, code);
+    }
+
+    /// Journals how work an approved action left running ended (a folder snapshot copied in the background): `ok` with
+    /// `SnapshotCopied`, or a failure code. The newest result for the id is this one.
+    pub fn journal_late_result(&mut self, id: &str, ok: bool, code: &str) {
+        if let Err(error) = self.action_proposals.journal_result(id, ok, Some(code)) {
+            eprintln!("arca: the late result of action proposal {id} was not journalled: {error}");
         }
     }
 

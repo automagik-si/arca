@@ -553,7 +553,8 @@ the moment of erase (`DiskBusy`) or one that cannot be checked (`DiskUncheckable
 
 ### Taking snapshots: `snapshot_create`
 
-`snapshot_create` (gated) takes `{project, instance, pool}` or `{project, volume, pool}`, for any project. The copy goes into
+`snapshot_create` (gated) takes `{project, instance, pool}` or `{project, volume, pool}`, for any project, or
+`{folder, pool}` for a host folder (see [Folder snapshots](#folder-snapshots)). The copy goes into
 the project `arcak-snapshots` on the chosen snapshot pool, named `<project>--<name>--<UTC yyyymmddThhmm>` (each part shortened
 when needed so the name fits 63 characters). The kernel creates `arcak-snapshots` the first time, with
 `features.networks=false` so a copy's network resolves the default project's, and its own profiles, images and volumes.
@@ -586,20 +587,83 @@ on its own and `snapshot_list` shows it. A copy Incus refuses (for example a run
 `StorageWriteFailed` with Incus's own message. A pool not added by `storage_add` is `NotSnapshotStorage`; a source that is
 not there is `SourceUnknown`; a name already taken (two snapshots of one app in the same minute) is `SnapshotExists`.
 
+### Folder snapshots
+
+Before a machine is reformatted, everything on it must be copied off, including big host folders that are not Incus
+instances or volumes, such as `/home` or `/mnt/ai`. `snapshot_create` with `{folder, pool}` copies one such folder into
+snapshot storage. It is gated like every snapshot: the owner approves it with the passkey and it runs once.
+
+When the proposal is made the kernel resolves the folder and binds into the owner's digest: the folder's path (absolute,
+trailing `/` dropped), the UUID of the file system it is on (`fsUuid`, from `lsblk`), its size in bytes of regular files
+(`size`), its number of files and folders (`files`), the folders it could not open (`unreadable`), the target pool, and the
+pool's free space (`poolFree`, shown only). The measurement only reads names and sizes: it does not follow links, stays on
+the folder's own file system (a disk mounted inside it counts as one empty folder) and leaves out a top-level
+`lost+found`. The snapshot is named `folder--<path>--<UTC yyyymmddThhmm>` (`folder--home--20261109T1405`); a path too long
+for the name keeps its end and gains 8 hex digits of its SHA-256.
+
+The card says: "Copy the folder /home (177 GB, 1.2 M files) into snapshot storage usb1", with rows for the folder, its
+size (marked "at least" when some folders could not be opened, with a "Not measured" row), its files, the target, the free
+space after, the snapshot name, and "Read-only: The folder is not changed".
+
+Refused at proposal and again at run, with a plain reason: a path that is not absolute or has `.`/`..` parts (invalid);
+`/` itself, or `/proc`, `/sys`, `/dev`, `/run`, `/boot`, `/tmp`, `/var/lib/incus` or anything under them
+(`FolderRefused`); a path that does not exist or is not a folder (`FolderNotFound`); a link anywhere in the path
+(`FolderLink`: name the real folder); a folder inside a folder snapshot pool, or one that holds the target pool, so the
+copy would copy itself (`FolderInSnapshotStorage`); a folder on no disk `lsblk` lists (`FolderNotOnDisk`); a folder whose
+measured size plus 10% does not fit the pool's free space (`FolderTooBig`; `SpaceUnknown` when Incus does not report the
+pool's space); and, at run, a folder now on another file system than the one approved (`FolderChanged`).
+
+The kernel runs as an unprivileged user and never copies the bytes. Incus does, in the project `arcak-snapshots`:
+
+1. A custom volume named after the snapshot is made on the pool, sized 1.2 times the measured size (at least 1 GiB), with
+   `security.shifted=true` so files keep their real owners on disk, and the marks `user.arcasnapshot.source-kind=folder`,
+   `source-path`, `source-name` (the path), `fs-uuid` and `created`.
+2. A copy helper container `arca-copy-<16 hex>` is made from a small image Incus fetches once into `arcak-snapshots` and
+   keeps under the alias `arca-folder-copy` (`debian/13` from `images.linuxcontainers.org`: BusyBox `tar` in Alpine keeps
+   no extended attributes or ACLs, and the Debian image has GNU `tar`, `find` and `awk` without needing a network). The
+   folder is a read-only disk at `/src` with `shift=true` (owners kept), the volume is at `/dst` with `limits.read=150MB`
+   and `limits.write=80MB` (made again without the caps when Incus refuses them on that pool), and it has no NIC, no
+   profile, `boot.autostart=false`, `security.privileged=false`, `limits.cpu=2` and `limits.memory=1GiB`. It carries
+   `user.arcasnapshot.copy-helper-for=<snapshot>`. It is read back before it starts; one that is not exactly that is
+   deleted.
+3. One command runs in it: `tar -C /src --one-file-system --numeric-owner --acls --xattrs -cpf - . | tar -C /dst
+   --numeric-owner --same-owner --acls --xattrs -xpf -`, which keeps owners, modes, times, symlinks, hard links, ACLs and
+   extended attributes. Both sides are then counted (every path, and the bytes of regular files; a top-level `lost+found`
+   and the manifest left out), and `/dst/.arca-manifest.json` is written: `{version, snapshot, sourcePath, fsUuid,
+   started, finished, source: {paths, bytes}, copy: {paths, bytes}, tar: {read, write}}`.
+4. The helper is stopped and deleted on every exit path. Only when both sides counted the same does the volume get
+   `user.arcasnapshot.verified=true` with `user.arcasnapshot.paths` and `bytes`; otherwise it is kept with
+   `user.arcasnapshot.incomplete=<reason>` (the counts differ, reading or writing failed, the helper did not start, the
+   copy did not run to its end).
+
+A copy that ends within twenty seconds answers `copied` (with `files` and `bytes`), or `SnapshotIncomplete` with the reason.
+A longer one answers `copying`; `snapshot_list` shows it as `copying` while this process runs it, and when it ends its
+outcome is journalled against the approved proposal (`SnapshotCopied`, `SnapshotIncomplete` or `StorageWriteFailed`) and
+logged. A copying folder snapshot cannot be deleted (`SnapshotBusy`). A copy is never resumed: when the kernel starts, it
+deletes every copy helper left in `arcak-snapshots` and marks each unfinished folder volume incomplete ("the copy stopped
+when Arca restarted"). A folder that changes while it is copied can count differently and is then incomplete; stop what
+writes to it first.
+
+The volume and its manifest hold what a restore needs: the source path, the file system UUID, the counts and the files with
+their owners, modes, times, links and attributes. Restoring a folder snapshot is not part of Arca yet.
+
 ### Listing and deleting: `snapshot_list`, `snapshot_delete`
 
 `snapshot_list` (viewer) lists every copy in `arcak-snapshots`: its name, kind, source project and name (and a volume's
-source pool), pool, size, when it was made, its state, and the devices the copy left out. The state is `copying` while
-Incus makes it, `ready` once done, and `incomplete` for an app copy without `user.arcasnapshot.verified` (its clean-up never
-ran: the process stopped first, or it failed and the copy could not be deleted); delete an incomplete copy and take it
-again. A volume copy is made with its final config in one request, needs no clean-up and is `ready` once done. `snapshot_delete`
+source pool, or a folder's `sourcePath`), pool, size, when it was made, its state, and the devices the copy left out. The
+state is `copying` while Incus makes it, `ready` once done, and `incomplete` for an app copy without
+`user.arcasnapshot.verified` (its clean-up never ran: the process stopped first, or it failed and the copy could not be
+deleted) or a folder copy whose counts did not match (its `reason` says why); delete an incomplete copy and take it
+again. A copy helper is never listed. A volume copy is made with its final config in one request, needs no clean-up and is `ready` once done. `snapshot_delete`
 (gated) takes `{name}` and deletes that one copy; only names in `arcak-snapshots` are found, so nothing outside it can be
 deleted.
 
 The snapshot writer (`arca_incus::SnapshotWriter`) sends only these writes, and refuses anything else before the socket is
 touched: `POST /1.0/storage-pools`, `POST /1.0/projects` (for `arcak-snapshots` only), `POST` and `DELETE` of an
-instance or a custom volume with `?project=arcak-snapshots`, and the one clean-up `PUT` of a new instance copy there. No
-`PATCH`, no other `PUT`, and no instance state change.
+instance or a custom volume with `?project=arcak-snapshots`, and the one clean-up `PUT` of a new instance copy there. For a
+folder snapshot, also in `arcak-snapshots` only: `POST /1.0/images` (the helper image), the `PUT` of the folder volume's
+marks, and `PUT .../state` and `POST .../exec` of the copy helper, which the writer sends only to an instance that reads
+back as a copy helper. No `PATCH`, and a snapshot copy is never started.
 
 ### Restoring from the disk alone
 

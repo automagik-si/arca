@@ -326,10 +326,15 @@ fn assert_write_family(incus: &FakeStorageIncus) {
             write.method,
             write.target
         );
-        assert!(
-            !write.target.contains("/state"),
-            "nothing is ever started or stopped"
-        );
+        // Only a folder copy helper is ever started, stopped or given a command; a snapshot copy never is.
+        if write.target.contains("/state") || write.target.contains("/exec") {
+            assert!(
+                write.target.starts_with("/1.0/instances/arca-copy-"),
+                "{} {}: only a copy helper is started, stopped or run",
+                write.method,
+                write.target
+            );
+        }
         if write.target == "/1.0/projects" {
             assert_eq!(write.body["name"], json!(SNAPSHOT_PROJECT));
         }
@@ -1942,4 +1947,719 @@ fn a_list_check_that_cannot_read_the_kernels_links_is_refused() {
         refused_code(rig.propose("storage_add", json!({ "name": "usb1", "device": "sdb" }))),
         "DiskUncheckable"
     );
+}
+
+// ---- Folder snapshots ----
+
+/// A scratch folder to snapshot, removed when dropped. It lives under the build's own scratch folder, since `/tmp` is a
+/// system folder a folder snapshot never copies: `a.txt` (5 bytes), `docs/`, `docs/deep/`, `docs/b.txt` (1000 bytes)
+/// and the link `link`, so 5 paths and 1005 bytes.
+struct SourceFolder {
+    path: std::path::PathBuf,
+}
+
+impl SourceFolder {
+    fn new(tag: &str) -> SourceFolder {
+        let base =
+            std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR")).expect("the build's scratch folder");
+        let path = base.join(format!(
+            "folder-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(path.join("docs/deep")).expect("the source folder");
+        std::fs::write(path.join("a.txt"), b"hello").expect("a file");
+        std::fs::write(path.join("docs/b.txt"), vec![1u8; 1000]).expect("a file");
+        std::os::unix::fs::symlink("a.txt", path.join("link")).expect("a link");
+        SourceFolder { path }
+    }
+
+    fn text(&self) -> String {
+        self.path.to_str().expect("a UTF-8 path").to_string()
+    }
+}
+
+impl Drop for SourceFolder {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// The copy command's manifest line, as the helper prints it.
+fn manifest(source: (u64, u64), copy: (u64, u64)) -> String {
+    format!(
+        "{{\"version\":1,\"source\":{{\"paths\":{},\"bytes\":{}}},\"copy\":{{\"paths\":{},\"bytes\":{}}},\"tar\":{{\"read\":0,\"write\":0}}}}\n",
+        source.0, source.1, copy.0, copy.1
+    )
+}
+
+fn folder_name(folder: &SourceFolder) -> String {
+    arca::storage::folder_snapshot_name(&folder.text(), NOW).expect("a name")
+}
+
+fn helper_create(rig: &Rig) -> Vec<arca_incus::fake_storage::StorageRequest> {
+    rig.incus
+        .writes()
+        .into_iter()
+        .filter(|write| {
+            write.method == "POST"
+                && write.target == format!("/1.0/instances?project={SNAPSHOT_PROJECT}")
+        })
+        .collect()
+}
+
+fn listed<'a>(list: &'a Value, name: &str) -> &'a Value {
+    list["snapshots"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|row| row["name"] == json!(name))
+        .unwrap_or_else(|| panic!("{name} is not listed in {list}"))
+}
+
+#[test]
+fn a_folder_snapshot_copies_through_a_read_only_offline_helper_that_is_then_deleted() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-snapshot", &key);
+    rig.add_snapshot_pool("usb1");
+    let folder = SourceFolder::new("copy");
+    rig.incus.set_exec(0, &manifest((5, 1005), (5, 1005)));
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": format!("{}/", folder.text()), "pool": "usb1" }),
+        )
+        .expect("a folder snapshot may be proposed");
+    let args = &proposed["args"];
+    assert_eq!(
+        args["folder"],
+        json!(folder.text()),
+        "the trailing slash is dropped"
+    );
+    assert_eq!(args["kind"], json!("folder"));
+    assert_eq!(
+        args["fsUuid"],
+        json!("uuid-nvme0n1p2"),
+        "the file system it is on"
+    );
+    assert_eq!(
+        (args["size"].clone(), args["files"].clone()),
+        (json!(1005), json!(5))
+    );
+    assert_eq!(args["unreadable"], json!(0));
+    assert_eq!(args["poolFree"], json!(1000 * GB));
+    let name = folder_name(&folder);
+    assert_eq!(args["name"], json!(name));
+    assert_eq!(
+        proposed["summary"],
+        json!(format!(
+            "Copy the folder {} (1.0 kB, 5 files) into snapshot storage usb1",
+            folder.text()
+        ))
+    );
+    let details = &proposed["details"];
+    assert_eq!(row(details, "Folder"), folder.text());
+    assert_eq!(row(details, "Size"), "1.0 kB");
+    assert_eq!(row(details, "Files"), "5 files and folders");
+    assert_eq!(row(details, "Target"), "Snapshot storage usb1");
+    assert_eq!(row(details, "Free space after"), "about 1000 GB");
+    assert_eq!(row(details, "Read-only"), "The folder is not changed");
+    assert!(rig.incus.writes().is_empty(), "a proposal writes nothing");
+
+    let result = rig
+        .approve_and_run(&key, &proposed)
+        .expect("the approved copy runs");
+    assert_eq!(result["state"], json!("copied"));
+    assert_eq!(result["kind"], json!("folder"));
+    assert_eq!(result["files"], json!(5));
+
+    // The volume: sized with room, shifted, with the marks a restore reads, and verified.
+    let volume = rig
+        .incus
+        .volume("usb1", SNAPSHOT_PROJECT, &name)
+        .expect("the folder's volume");
+    let config = &volume["config"];
+    assert_eq!(
+        config["size"],
+        json!(format!("{}B", 1u64 << 30)),
+        "at least 1 GiB"
+    );
+    assert_eq!(config["security.shifted"], json!("true"));
+    assert_eq!(config["user.arcasnapshot.source-kind"], json!("folder"));
+    assert_eq!(
+        config["user.arcasnapshot.source-path"],
+        json!(folder.text())
+    );
+    assert_eq!(config["user.arcasnapshot.fs-uuid"], json!("uuid-nvme0n1p2"));
+    assert_eq!(config["user.arcasnapshot.verified"], json!("true"));
+    assert_eq!(config["user.arcasnapshot.paths"], json!("5"));
+    assert_eq!(config["user.arcasnapshot.bytes"], json!("1005"));
+
+    // The helper: from the cached image, the folder read-only and shifted, no NIC, no profile, unprivileged, capped.
+    let creates = helper_create(&rig);
+    assert_eq!(creates.len(), 1);
+    let helper = &creates[0].body;
+    let helper_name = arca::storage::helper_name(&name);
+    assert_eq!(helper["name"], json!(helper_name));
+    assert_eq!(helper["source"]["alias"], json!("arca-folder-copy"));
+    assert_eq!(helper["profiles"], json!([]));
+    assert!(helper.get("start").is_none());
+    assert_eq!(helper["config"]["boot.autostart"], json!("false"));
+    assert_eq!(helper["config"]["security.privileged"], json!("false"));
+    assert_eq!(helper["config"]["limits.cpu"], json!("2"));
+    assert_eq!(helper["config"]["limits.memory"], json!("1GiB"));
+    let devices = helper["devices"].as_object().expect("devices");
+    assert_eq!(
+        devices.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["dst", "root", "src"]
+    );
+    assert!(
+        devices
+            .values()
+            .all(|device| device["type"] != json!("nic"))
+    );
+    assert_eq!(
+        devices["src"],
+        json!({ "type": "disk", "source": folder.text(), "path": "/src", "readonly": "true", "shift": "true" })
+    );
+    assert_eq!(devices["dst"]["source"], json!(name));
+    assert_eq!(devices["dst"]["limits.read"], json!("150MB"));
+    assert_eq!(devices["dst"]["limits.write"], json!("80MB"));
+    // Started, run once, stopped and deleted.
+    assert!(
+        rig.incus.instance(SNAPSHOT_PROJECT, &helper_name).is_none(),
+        "the helper is gone"
+    );
+    let steps: Vec<String> = rig
+        .incus
+        .writes()
+        .iter()
+        .filter(|write| write.target.contains(&helper_name))
+        .map(|write| {
+            let what = write.body["action"].as_str().unwrap_or_default();
+            format!(
+                "{} {}",
+                write.method,
+                if what.is_empty() {
+                    write
+                        .target
+                        .split('?')
+                        .next()
+                        .unwrap_or_default()
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                } else {
+                    what
+                }
+            )
+        })
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "PUT start",
+            "POST exec",
+            "PUT stop",
+            format!("DELETE {helper_name}").as_str()
+        ]
+    );
+    let exec = rig
+        .incus
+        .writes()
+        .into_iter()
+        .find(|write| write.target.contains("/exec"))
+        .expect("the copy command");
+    assert_eq!(
+        exec.body["environment"]["ARCA_SOURCE"],
+        json!(format!("\"{}\"", folder.text()))
+    );
+    assert!(
+        exec.body["command"][2]
+            .as_str()
+            .is_some_and(|script| script.contains("--xattrs") && script.contains("--numeric-owner"))
+    );
+    assert_write_family(&rig.incus);
+
+    let list = rig.snapshot_list();
+    let entry = listed(&list, &name);
+    assert_eq!(entry["kind"], json!("folder"));
+    assert_eq!(entry["state"], json!("ready"));
+    assert_eq!(entry["sourcePath"], json!(folder.text()));
+    assert!(
+        list["snapshots"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .all(|row| !row["name"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("arca-copy-")),
+        "a helper is never listed"
+    );
+
+    // The image is fetched once and kept.
+    let other = SourceFolder::new("again");
+    let again = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": other.text(), "pool": "usb1" }),
+        )
+        .expect("a second folder snapshot");
+    rig.approve_and_run(&key, &again).expect("it runs");
+    let pulls = rig
+        .incus
+        .writes()
+        .into_iter()
+        .filter(|write| write.target.starts_with("/1.0/images"))
+        .count();
+    assert_eq!(pulls, 1, "the helper image is cached");
+
+    // Deleting it names the folder it came from.
+    let delete = rig
+        .propose("snapshot_delete", json!({ "name": name }))
+        .expect("a delete may be proposed");
+    assert_eq!(
+        row(&delete["details"], "Copied from"),
+        format!("folder {}", folder.text())
+    );
+    rig.approve_and_run(&key, &delete).expect("the delete runs");
+    assert!(rig.incus.volume("usb1", SNAPSHOT_PROJECT, &name).is_none());
+}
+
+#[test]
+fn a_folder_copy_that_fails_or_miscounts_is_kept_incomplete_and_the_helper_is_always_deleted() {
+    let key = SkKey::from_seed(1);
+    type Arrange = fn(&FakeStorageIncus);
+    let cases: [(&str, Arrange, &str); 4] = [
+        (
+            "copy-fails",
+            |incus| incus.set_exec(21, &manifest((5, 1005), (3, 600))),
+            "writing the copy failed",
+        ),
+        (
+            "miscount",
+            |incus| incus.set_exec(0, &manifest((5, 1005), (4, 1005))),
+            "the counts differ",
+        ),
+        (
+            "wait-error",
+            |incus| incus.fail_next_exec("websocket: close 1006 (abnormal closure)"),
+            "abnormal closure",
+        ),
+        (
+            "start-fails",
+            |incus| {
+                incus.fail_next_start(
+                    "Failed to setup device mount \"src\": idmapping abilities are required",
+                )
+            },
+            "idmapping",
+        ),
+    ];
+    for (tag, arrange, words) in cases {
+        let rig = Rig::new(&format!("folder-{tag}"), &key);
+        rig.add_snapshot_pool("usb1");
+        let folder = SourceFolder::new(tag);
+        let proposed = rig
+            .propose(
+                "snapshot_create",
+                json!({ "folder": folder.text(), "pool": "usb1" }),
+            )
+            .expect("a proposal");
+        arrange(&rig.incus);
+        let message = match rig.approve_and_run(&key, &proposed) {
+            Err(CallError::Refused { code, message }) => {
+                assert_eq!(code, "SnapshotIncomplete", "{tag}: {message}");
+                message
+            }
+            other => panic!("{tag}: expected an incomplete copy, got {other:?}"),
+        };
+        assert!(message.contains(words), "{tag}: {message}");
+        let name = folder_name(&folder);
+        let helper = arca::storage::helper_name(&name);
+        assert!(
+            rig.incus.instance(SNAPSHOT_PROJECT, &helper).is_none(),
+            "{tag}: the helper is deleted"
+        );
+        let volume = rig
+            .incus
+            .volume("usb1", SNAPSHOT_PROJECT, &name)
+            .expect("the volume is kept");
+        assert!(
+            volume["config"].get("user.arcasnapshot.verified").is_none(),
+            "{tag}"
+        );
+        assert!(
+            volume["config"]["user.arcasnapshot.incomplete"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(words)),
+            "{tag}: {volume}"
+        );
+        let list = rig.snapshot_list();
+        let entry = listed(&list, &name);
+        assert_eq!(entry["state"], json!("incomplete"), "{tag}");
+        assert!(
+            entry["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(words)),
+            "{tag}"
+        );
+        assert_write_family(&rig.incus);
+    }
+}
+
+#[test]
+fn a_helper_incus_refuses_the_io_caps_for_is_made_again_without_them() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-caps", &key);
+    rig.add_snapshot_pool("usb1");
+    let folder = SourceFolder::new("caps");
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": folder.text(), "pool": "usb1" }),
+        )
+        .expect("a proposal");
+    rig.incus.set_exec(0, &manifest((5, 1005), (5, 1005)));
+    rig.incus.fail_next_start(
+        "Failed to start device \"dst\": Block I/O limits aren't supported by this pool",
+    );
+    let result = rig.approve_and_run(&key, &proposed).expect("the copy runs");
+    assert_eq!(result["state"], json!("copied"));
+    let creates = helper_create(&rig);
+    assert_eq!(creates.len(), 2, "made again once");
+    assert!(
+        creates[1].body["devices"]["dst"]
+            .get("limits.write")
+            .is_none()
+    );
+    assert_write_family(&rig.incus);
+}
+
+#[test]
+fn a_long_folder_copy_answers_copying_and_journals_how_it_ended() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-long", &key);
+    rig.add_snapshot_pool("usb1");
+    let folder = SourceFolder::new("long");
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": folder.text(), "pool": "usb1" }),
+        )
+        .expect("a proposal");
+    let id = proposed["id"].as_str().expect("an id").to_string();
+    rig.incus.set_exec(0, &manifest((5, 1005), (5, 1005)));
+    rig.incus.hold_operations();
+    let result = rig
+        .approve_and_run(&key, &proposed)
+        .expect("a long copy keeps going");
+    assert_eq!(result["state"], json!("copying"));
+    let name = folder_name(&folder);
+    assert_eq!(
+        listed(&rig.snapshot_list(), &name)["state"],
+        json!("copying")
+    );
+    // A copy still running is not deleted from under its helper.
+    assert_eq!(
+        refused_code(rig.propose("snapshot_delete", json!({ "name": name }))),
+        "SnapshotBusy"
+    );
+
+    rig.incus.release_operations();
+    let journal = (0..400).find_map(|_| {
+        std::thread::sleep(Duration::from_millis(25));
+        let text = find_file(rig._scratch.dir.as_path(), "action-proposals.jsonl")
+            .and_then(|path| std::fs::read_to_string(path).ok())?;
+        text.contains("SnapshotCopied").then_some(text)
+    });
+    let journal = journal.expect("the end of the copy is journalled");
+    let event: Value = serde_json::from_str(
+        journal
+            .lines()
+            .find(|line| line.contains("SnapshotCopied"))
+            .expect("a line"),
+    )
+    .expect("json");
+    assert_eq!(
+        (event["id"].clone(), event["ok"].clone()),
+        (json!(id), json!(true))
+    );
+    let row = listed(&rig.snapshot_list(), &name).clone();
+    assert_eq!(row["state"], json!("ready"));
+    assert!(
+        rig.incus
+            .instance(SNAPSHOT_PROJECT, &arca::storage::helper_name(&name))
+            .is_none(),
+        "the helper is gone"
+    );
+}
+
+#[test]
+fn a_restarted_kernel_deletes_leftover_helpers_and_marks_their_copies_incomplete() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-sweep", &key);
+    rig.add_snapshot_pool("usb1");
+    rig.incus.add_project(SNAPSHOT_PROJECT, json!({}));
+    let folder_volume = |name: &str, extra: Value| {
+        let mut config = json!({
+            "user.arcasnapshot.source-kind": "folder",
+            "user.arcasnapshot.source-path": "/home",
+            "user.arcasnapshot.source-name": "/home",
+        });
+        for (key, value) in extra.as_object().into_iter().flatten() {
+            config[key] = value.clone();
+        }
+        json!({ "name": name, "project": SNAPSHOT_PROJECT, "type": "custom", "config": config })
+    };
+    rig.incus.add_volume(
+        "usb1",
+        folder_volume("folder--home--20261109T0900", json!({})),
+    );
+    rig.incus.add_volume(
+        "usb1",
+        folder_volume(
+            "folder--home--20261108T0900",
+            json!({ "user.arcasnapshot.verified": "true" }),
+        ),
+    );
+    // A crash before the helper was made leaves a volume and no helper.
+    rig.incus.add_volume(
+        "usb1",
+        folder_volume("folder--srv--20261109T0800", json!({})),
+    );
+    rig.incus.add_instance(json!({
+        "name": "arca-copy-00112233aabbccdd", "project": SNAPSHOT_PROJECT, "type": "container",
+        "status": "Running", "profiles": [],
+        "config": {
+            "user.arcasnapshot.copy-helper-for": "folder--home--20261109T0900",
+            "user.arcasnapshot.copy-helper-pool": "usb1",
+        },
+        "devices": {},
+    }));
+    rig.incus.add_instance(json!({
+        "name": "shop--web--20261108T0900", "project": SNAPSHOT_PROJECT, "type": "container",
+        "status": "Stopped", "profiles": [], "config": {}, "devices": {},
+    }));
+    let removed = rig.storage.sweep_copy_helpers().expect("the sweep runs");
+    assert_eq!(removed, ["arca-copy-00112233aabbccdd"]);
+    assert!(
+        rig.incus
+            .instance(SNAPSHOT_PROJECT, "arca-copy-00112233aabbccdd")
+            .is_none()
+    );
+    assert!(
+        rig.incus
+            .instance(SNAPSHOT_PROJECT, "shop--web--20261108T0900")
+            .is_some(),
+        "a snapshot copy is never touched"
+    );
+    let list = rig.snapshot_list();
+    for name in ["folder--home--20261109T0900", "folder--srv--20261109T0800"] {
+        let row = listed(&list, name);
+        assert_eq!(row["state"], json!("incomplete"), "{name}");
+        assert!(
+            row["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("restarted")),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        listed(&list, "folder--home--20261108T0900")["state"],
+        json!("ready")
+    );
+    assert_write_family(&rig.incus);
+    // A second sweep finds nothing to do.
+    let before = rig.incus.writes().len();
+    assert!(rig.storage.sweep_copy_helpers().expect("again").is_empty());
+    assert_eq!(rig.incus.writes().len(), before);
+}
+
+#[test]
+fn folders_that_are_not_plain_existing_user_folders_are_refused_at_proposal() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-refusals", &key);
+    rig.add_snapshot_pool("usb1");
+    let folder = SourceFolder::new("refusals");
+    let base = folder.text();
+    std::os::unix::fs::symlink(folder.path.join("docs"), folder.path.join("via")).expect("a link");
+    // A folder snapshot pool inside the source folder.
+    std::fs::create_dir_all(folder.path.join("store/arca-pool/inside")).expect("a pool folder");
+    rig.incus.add_pool(
+        "usbdir",
+        "dir",
+        SNAPSHOT_POOL_DESCRIPTION,
+        json!({ "source": format!("{base}/store/arca-pool"), SNAPSHOT_STORAGE_KEY: "usbdir" }),
+        0,
+        1000 * GB,
+    );
+    rig.incus.add_pool(
+        "tiny",
+        "btrfs",
+        SNAPSHOT_POOL_DESCRIPTION,
+        json!({ "source": "uuid-tiny", SNAPSHOT_STORAGE_KEY: "tiny" }),
+        0,
+        1100,
+    );
+    let cases = [
+        ("/".to_string(), "usb1", "FolderRefused"),
+        ("/proc".to_string(), "usb1", "FolderRefused"),
+        ("/sys/fs".to_string(), "usb1", "FolderRefused"),
+        ("/dev".to_string(), "usb1", "FolderRefused"),
+        ("/run/user".to_string(), "usb1", "FolderRefused"),
+        ("/boot".to_string(), "usb1", "FolderRefused"),
+        ("/tmp/work".to_string(), "usb1", "FolderRefused"),
+        (
+            "/var/lib/incus/storage-pools".to_string(),
+            "usb1",
+            "FolderRefused",
+        ),
+        (format!("{base}/missing"), "usb1", "FolderNotFound"),
+        (format!("{base}/a.txt"), "usb1", "FolderNotFound"),
+        (format!("{base}/via"), "usb1", "FolderLink"),
+        (format!("{base}/via/deep"), "usb1", "FolderLink"),
+        (
+            format!("{base}/store/arca-pool/inside"),
+            "usb1",
+            "FolderInSnapshotStorage",
+        ),
+        (base.clone(), "usbdir", "FolderInSnapshotStorage"),
+        // 1005 bytes and 10% more do not fit in 1100.
+        (base.clone(), "tiny", "FolderTooBig"),
+        (base.clone(), "fast", "NotSnapshotStorage"),
+    ];
+    for (path, pool, code) in cases {
+        assert_eq!(
+            refused_code(rig.propose("snapshot_create", json!({ "folder": path, "pool": pool }))),
+            code,
+            "{path} onto {pool}"
+        );
+    }
+    // A folder on no listed disk.
+    let mut unlisted = host_disks();
+    unlisted["blockdevices"][0]["children"][1]["mountpoints"] = json!(["/srv-nothing"]);
+    rig.devices.set(Ok(unlisted));
+    assert_eq!(
+        refused_code(rig.propose("snapshot_create", json!({ "folder": base, "pool": "usb1" }))),
+        "FolderNotOnDisk"
+    );
+    rig.devices.set(Ok(host_disks()));
+    for args in [
+        json!({ "folder": "home", "pool": "usb1" }),
+        json!({ "folder": format!("{base}/../x"), "pool": "usb1" }),
+        json!({ "folder": base, "project": "shop", "instance": "web", "pool": "usb1" }),
+        json!({ "folder": base, "project": "shop", "pool": "usb1" }),
+    ] {
+        assert!(
+            matches!(
+                rig.propose("snapshot_create", args.clone()),
+                Err(CallError::Invalid(_))
+            ),
+            "{args}"
+        );
+    }
+    assert!(rig.incus.writes().is_empty(), "no refusal wrote anything");
+}
+
+#[test]
+fn the_owners_digest_binds_the_folder_and_a_changed_folder_is_refused_at_run() {
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("folder-binding", &key);
+    rig.add_snapshot_pool("usb1");
+    let folder = SourceFolder::new("binding");
+    let proposed = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": folder.text(), "pool": "usb1" }),
+        )
+        .expect("a proposal");
+    let args = proposed["args"].clone();
+    let digest = |args: &Value| {
+        arca::action_proposal::action_args_digest("snapshot_create", args).expect("a digest")
+    };
+    assert_eq!(
+        digest(&args),
+        proposed["argsDigest"].as_str().expect("a digest")
+    );
+    for (key, value) in [
+        ("folder", json!("/srv")),
+        ("fsUuid", json!("uuid-other")),
+        ("size", json!(1)),
+        ("files", json!(1)),
+        ("pool", json!("usb2")),
+    ] {
+        let mut changed = args.clone();
+        changed[key] = value;
+        assert_ne!(digest(&changed), digest(&args), "{key} is bound");
+    }
+
+    // The approved grant runs only the exact approved arguments.
+    let id = proposed["id"].as_str().expect("an id");
+    let statement = arca::handlers::action_statement(
+        HOST,
+        id,
+        "snapshot_create",
+        proposed["argsDigest"].as_str().expect("a digest"),
+        NOW,
+        &format!("{:032x}", 99),
+    )
+    .expect("a statement");
+    let approved = {
+        let mut kernel = rig.kernel.lock().expect("the kernel lock");
+        arca::handlers::approve_action(
+            &mut kernel,
+            &json!({ "plan": id, "approval": approve_statement(&key, &statement) }),
+            NOW,
+        )
+        .expect("the approval verifies")
+    };
+    let mut bigger = approved.args.clone();
+    bigger["size"] = json!(10);
+    assert_eq!(
+        refused_code(
+            rig.executor
+                .run("snapshot_create", &bigger, &approved.grant)
+        ),
+        "NotApproved"
+    );
+    assert!(rig.incus.writes().is_empty());
+
+    // The folder's file system changed between the proposal and the run.
+    let mut moved = host_disks();
+    moved["blockdevices"][0]["children"][1]["uuid"] = json!("uuid-new-system");
+    rig.devices.set(Ok(moved));
+    assert_eq!(
+        refused_code(
+            rig.executor
+                .run("snapshot_create", &approved.args, &approved.grant)
+        ),
+        "FolderChanged"
+    );
+    rig.devices.set(Ok(host_disks()));
+
+    // The pool filled up between the proposal and the run.
+    let again = rig
+        .propose(
+            "snapshot_create",
+            json!({ "folder": folder.text(), "pool": "usb1" }),
+        )
+        .expect("a fresh proposal");
+    rig.incus.add_pool(
+        "usb1",
+        "btrfs",
+        SNAPSHOT_POOL_DESCRIPTION,
+        json!({ "source": "uuid-usb1", SNAPSHOT_STORAGE_KEY: "usb1" }),
+        1000 * GB - 1000,
+        1000 * GB,
+    );
+    assert_eq!(
+        refused_code(rig.approve_and_run(&key, &again)),
+        "FolderTooBig"
+    );
+    assert!(rig.incus.writes().is_empty(), "nothing was written");
 }

@@ -308,6 +308,22 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         Arc::new(crate::storage::Lsblk),
         kernel_mode,
     ));
+    // A folder copy is never resumed: a copy helper a stopped process left behind is deleted, and its copy marked
+    // incomplete, before any call is taken.
+    if kernel_mode {
+        match storage.sweep_copy_helpers() {
+            Ok(removed) if !removed.is_empty() => eprintln!(
+                "arca: removed {} folder copy helper(s) left by a stopped copy: {}",
+                removed.len(),
+                removed.join(", ")
+            ),
+            Ok(_) => {}
+            Err(refusal) => eprintln!(
+                "arca: the folder copy helper sweep did not finish: {}",
+                refusal.message
+            ),
+        }
+    }
     server = server
         .handle(
             "storage_list",

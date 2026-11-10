@@ -528,7 +528,7 @@ static VERBS: [Verb; 35] = [
     },
     Verb {
         name: "snapshot_create",
-        summary: "Copy one app or data volume onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
+        summary: "Copy one app, data volume or host folder (such as /home) onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -542,7 +542,7 @@ static VERBS: [Verb; 35] = [
     },
     Verb {
         name: "snapshot_list",
-        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished is incomplete.",
+        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -2056,15 +2056,32 @@ fn storage_add_result() -> Value {
     ])
 }
 
-/// `snapshot_create`: exactly one of `instance` and `volume`. The snapshot's name, the source's kind and identity, and a
-/// volume's pool are resolved by the kernel when the proposal is made.
+/// `snapshot_create`: exactly one of `instance` and `volume` (with `project`), or `folder`. The snapshot's name, the
+/// source's kind and identity, a volume's pool, and a folder's file system, size, file count and the pool's free space are
+/// resolved by the kernel when the proposal is made.
 fn snapshot_create_params() -> Value {
     params(vec![
         (
             "project",
-            true,
-            plain_name_schema("The source's Incus project."),
+            false,
+            plain_name_schema("The source's Incus project (an app or a data volume)."),
         ),
+        (
+            "folder",
+            false,
+            json!({
+                "description": "A host folder to copy, such as /home: absolute, with no link in its path, and not /, /proc, /sys, /dev, /run, /boot, /tmp or /var/lib/incus. Incus copies it read-only through a short-lived helper container.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "pattern": "^/",
+                "type": "string"
+            }),
+        ),
+        ("fsUuid", false, string_max(128)),
+        ("size", false, int()),
+        ("files", false, int()),
+        ("unreadable", false, int()),
+        ("poolFree", false, int()),
         ("instance", false, instance_name_schema()),
         (
             "volume",
@@ -2080,7 +2097,7 @@ fn snapshot_create_params() -> Value {
         (
             "kind",
             false,
-            one_of(&["container", "virtual-machine", "volume"]),
+            one_of(&["container", "virtual-machine", "volume", "folder"]),
         ),
         (
             "sourcePool",
@@ -2113,6 +2130,9 @@ fn snapshot_change_result() -> Value {
             true,
             one_of(&["copied", "copying", "deleted", "deleting"]),
         ),
+        ("folder", false, string()),
+        ("files", false, int()),
+        ("bytes", false, int()),
     ])
 }
 
@@ -2167,12 +2187,14 @@ fn snapshot_list_result() -> Value {
         (
             "kind",
             true,
-            one_of(&["container", "virtual-machine", "volume"]),
+            one_of(&["container", "virtual-machine", "volume", "folder"]),
         ),
         ("project", true, string()),
         ("sourceProject", true, string()),
         ("sourceName", true, string()),
         ("sourcePool", true, nullable(string())),
+        ("sourcePath", false, nullable(string())),
+        ("reason", false, nullable(string())),
         ("pool", true, string()),
         ("size", true, nullable(int())),
         ("created", true, string()),
