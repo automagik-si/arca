@@ -1936,7 +1936,7 @@ because declining only takes away. The page's request posts need the page's exac
 
 `owner_approval_status` (with `waitMs` up to 30000 to wait for the decision) answers the state. The approval string goes
 to the token that asked, never to another token or to the page, and the assistant passes it to its call, which spends it
-once. With a passkey that counts its signatures (most hardware keys; synced passkeys report 0), approvals must be spent in
+once. With a device-bound passkey that counts its signatures (synced passkeys report 0), approvals must be spent in
 the order they were tapped: once a later approval is spent, an earlier one is refused as `SignCountRegressed`. A spend that
 is refused after the signature has verified (for another host, action, target, arguments or time) also uses up that
 approval's count, so the owner taps again.
