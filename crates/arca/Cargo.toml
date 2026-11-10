@@ -29,6 +29,7 @@ arca-reconcile.workspace = true
 arca-store.workspace = true
 arca-watch.workspace = true
 regex.workspace = true
+rustix.workspace = true
 axum.workspace = true
 base64.workspace = true
 getrandom.workspace = true

@@ -263,7 +263,9 @@ fn a_viewer_on_the_loopback_listener_lists_only_its_tools() {
             "ontology_query",
             "service_list",
             "service_status",
-            "service_logs"
+            "service_logs",
+            "storage_list",
+            "snapshot_list"
         ]
     );
 }

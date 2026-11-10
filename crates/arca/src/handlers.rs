@@ -934,7 +934,7 @@ impl ToolHandler for TokenListHandler {
     }
 }
 
-/// The plan, proposal and GPU action handlers, keyed by verb name, over one kernel and one clock.
+/// The plan, proposal, GPU and storage action handlers, keyed by verb name, over one kernel and one clock.
 pub fn plan_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -953,7 +953,31 @@ pub fn plan_handlers_with(
     gpu: Option<Arc<dyn GpuBackend>>,
     actions: ActionSlot,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    plan_handlers_full(kernel, clock, postgres_image, gpu, None, actions)
+}
+
+/// The plan handlers with the snapshot storage backend too. `storage` is `None` only where no Incus is wired; a watch-only
+/// node passes a [`Storage`](crate::storage::Storage) with no writer, which refuses every storage action.
+pub fn plan_handlers_full(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    postgres_image: Option<String>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    storage: Option<Arc<crate::storage::Storage>>,
+    actions: ActionSlot,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let rate = Arc::new(ProposalRateLimiter::default());
+    let storage_handler = |action: ActionKind| -> Arc<dyn ToolHandler> {
+        Arc::new(crate::storage::StorageActionHandler {
+            action,
+            kernel: Arc::clone(&kernel),
+            storage: storage.clone(),
+            clock: Arc::clone(&clock),
+        })
+    };
+    let storage_add = storage_handler(ActionKind::StorageAdd);
+    let snapshot_create = storage_handler(ActionKind::SnapshotCreate);
+    let snapshot_delete = storage_handler(ActionKind::SnapshotDelete);
     vec![
         (
             "plan_list",
@@ -970,8 +994,12 @@ pub fn plan_handlers_with(
                 postgres_image,
                 rate,
                 gpu: gpu.clone(),
+                storage: storage.clone(),
             }) as Arc<dyn ToolHandler>,
         ),
+        ("storage_add", storage_add),
+        ("snapshot_create", snapshot_create),
+        ("snapshot_delete", snapshot_delete),
         (
             "gpu_attach",
             Arc::new(GpuActionHandler {
@@ -1143,6 +1171,7 @@ struct ActionPropose {
     postgres_image: Option<String>,
     rate: Arc<ProposalRateLimiter>,
     gpu: Option<Arc<dyn GpuBackend>>,
+    storage: Option<Arc<crate::storage::Storage>>,
 }
 
 impl ToolHandler for ActionPropose {
@@ -1158,17 +1187,31 @@ impl ToolHandler for ActionPropose {
             .cloned()
             .ok_or_else(|| CallError::Invalid("args is required".to_string()))?;
         let is_gpu = matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach);
+        let now = (self.clock)();
+        let storage = if action.is_storage() {
+            Some(self.storage.as_deref().ok_or_else(|| CallError::Refused {
+                code: "StorageDisabled".to_string(),
+                message: "snapshot storage is not available on this node".to_string(),
+            })?)
+        } else {
+            None
+        };
         let payload = if is_gpu {
             let Some(gpu) = &self.gpu else {
                 return Err(gpu_refusal(GpuRefusal::Disabled));
             };
             enrich_gpu(gpu.as_ref(), &payload)?
+        } else if let Some(storage) = storage {
+            crate::storage::enrich(storage, action, &payload, now)?
         } else {
             payload
         };
         let payload = action
             .prepare(&payload, self.postgres_image.as_deref())
             .map_err(CallError::Invalid)?;
+        if let Some(storage) = storage {
+            crate::storage::check_proposal(storage, action, &payload, now)?;
+        }
         let gpu_product = match action {
             ActionKind::GpuAttach => prepare_attach(
                 self.gpu.as_deref().expect("a GPU action has a backend"),
@@ -1184,7 +1227,6 @@ impl ToolHandler for ActionPropose {
             .map(|card| card.product),
             _ => None,
         };
-        let now = (self.clock)();
         let mut kernel = lock(&self.kernel)?;
         // A proposal whose digest already waits is a deduplicated request: it returns that record and records nothing, so it
         // never consumes the token's window and a full window does not refuse it.
@@ -1585,9 +1627,9 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
     }
 }
 
-/// Runs one already approved action through the same handler its gated verb uses. Only `service_remove` and
-/// `service_publish` take an inline approval; the random grant is passed in that field and consumed by the handler, so the
-/// owner's real approval is never stored or replayed.
+/// Runs one already approved action through the same handler its gated verb uses. The verbs that take an inline approval
+/// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs) get the random grant in that field, and the
+/// handler consumes it, so the owner's real approval is never stored or replayed.
 #[derive(Clone, Default)]
 pub struct ActionExecutor {
     handlers: Arc<HashMap<&'static str, Arc<dyn ToolHandler>>>,
@@ -1608,7 +1650,13 @@ impl ActionExecutor {
         let mut call = args.clone();
         if matches!(
             action,
-            "service_remove" | "service_publish" | "gpu_attach" | "gpu_detach"
+            "service_remove"
+                | "service_publish"
+                | "gpu_attach"
+                | "gpu_detach"
+                | "storage_add"
+                | "snapshot_create"
+                | "snapshot_delete"
         ) {
             call["approval"] = json!(grant);
         }

@@ -29,6 +29,7 @@ mod passkey_change;
 pub mod peer_sync;
 pub mod service;
 pub mod service_exec;
+pub mod storage;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;

@@ -1,4 +1,5 @@
-//! Inert action proposals: a viewer may ask the owner to approve one of a closed set of service, database or GPU actions.
+//! Inert action proposals: a viewer may ask the owner to approve one of a closed set of service, database, GPU, storage
+//! and snapshot actions.
 //!
 //! A proposal changes nothing. It carries the action's own arguments, a digest over the canonical `{action, args}`, the
 //! exact arguments the owner is shown as `details`, and a plain-language summary built here from the validated arguments.
@@ -56,11 +57,14 @@ pub enum ActionKind {
     PostgresCreate,
     GpuAttach,
     GpuDetach,
+    StorageAdd,
+    SnapshotCreate,
+    SnapshotDelete,
 }
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 9] = [
+    pub const ALL: [ActionKind; 12] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServicePublish,
@@ -70,6 +74,9 @@ impl ActionKind {
         Self::PostgresCreate,
         Self::GpuAttach,
         Self::GpuDetach,
+        Self::StorageAdd,
+        Self::SnapshotCreate,
+        Self::SnapshotDelete,
     ];
 
     /// The verb name this action runs.
@@ -84,7 +91,18 @@ impl ActionKind {
             Self::PostgresCreate => "postgres_create",
             Self::GpuAttach => "gpu_attach",
             Self::GpuDetach => "gpu_detach",
+            Self::StorageAdd => "storage_add",
+            Self::SnapshotCreate => "snapshot_create",
+            Self::SnapshotDelete => "snapshot_delete",
         }
+    }
+
+    /// Whether the action adds snapshot storage or makes or deletes a snapshot.
+    pub fn is_storage(self) -> bool {
+        matches!(
+            self,
+            Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete
+        )
     }
 
     /// The action for a verb name, or `None` when it is not on the list.
@@ -171,6 +189,9 @@ impl ActionKind {
                 };
                 object.insert("pci".to_string(), Value::String(normalized));
             }
+            Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete => {
+                args = crate::storage::prepare(self, args)?;
+            }
             _ => {}
         }
         Ok(args)
@@ -238,6 +259,9 @@ impl ActionKind {
                     row("Effect", &effect),
                 ]
             }
+            Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete => {
+                crate::storage::details(self, args)
+            }
         }
     }
 
@@ -300,6 +324,9 @@ impl ActionKind {
                 text("pci"),
                 text("instance")
             ),
+            Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete => {
+                crate::storage::summary(self, args)
+            }
         }
     }
 }

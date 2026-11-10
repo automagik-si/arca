@@ -1573,7 +1573,10 @@
                           "service_disconnect",
                           "postgres_create",
                           "gpu_attach",
-                          "gpu_detach"
+                          "gpu_detach",
+                          "storage_add",
+                          "snapshot_create",
+                          "snapshot_delete"
                         ],
                         "type": "string"
                       },
@@ -1675,7 +1678,10 @@
               "service_disconnect",
               "postgres_create",
               "gpu_attach",
-              "gpu_detach"
+              "gpu_detach",
+              "storage_add",
+              "snapshot_create",
+              "snapshot_delete"
             ],
             "type": "string"
           }
@@ -1702,7 +1708,10 @@
                 "service_disconnect",
                 "postgres_create",
                 "gpu_attach",
-                "gpu_detach"
+                "gpu_detach",
+                "storage_add",
+                "snapshot_create",
+                "snapshot_delete"
               ],
               "type": "string"
             },
@@ -1772,7 +1781,7 @@
           "type": "object"
         }
       },
-      "summary": "Records an inert service, database or GPU assignment action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+      "summary": "Records an inert service, database, GPU assignment, storage or snapshot action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "viewer",
@@ -2021,7 +2030,10 @@
                 "service_disconnect",
                 "postgres_create",
                 "gpu_attach",
-                "gpu_detach"
+                "gpu_detach",
+                "storage_add",
+                "snapshot_create",
+                "snapshot_delete"
               ],
               "type": "string"
             },
@@ -3881,6 +3893,683 @@
         }
       },
       "summary": "Detach a physical GPU card from an Incus instance, by PCI address, with the owner's signed approval.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "storage_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "disks": {
+              "items": {
+                "properties": {
+                  "children": {
+                    "items": {
+                      "properties": {
+                        "fstype": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "label": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "mountpoints": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "name": {
+                          "type": "string"
+                        },
+                        "path": {
+                          "type": "string"
+                        },
+                        "size": {
+                          "type": "integer"
+                        },
+                        "type": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "path",
+                        "size",
+                        "type",
+                        "fstype",
+                        "label",
+                        "mountpoints"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "folders": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "fstype": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "label": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "mountpoints": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "offer": {
+                    "anyOf": [
+                      {
+                        "enum": [
+                          "folder",
+                          "whole disk"
+                        ],
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "reason": {
+                    "type": "string"
+                  },
+                  "removable": {
+                    "type": "boolean"
+                  },
+                  "role": {
+                    "enum": [
+                      "system",
+                      "snapshots",
+                      "in use",
+                      "free"
+                    ],
+                    "type": "string"
+                  },
+                  "serial": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "transport": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "path",
+                  "size",
+                  "model",
+                  "serial",
+                  "transport",
+                  "removable",
+                  "fstype",
+                  "label",
+                  "mountpoints",
+                  "children",
+                  "role",
+                  "reason",
+                  "offer",
+                  "folders"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "pools": {
+              "items": {
+                "properties": {
+                  "driver": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "snapshots": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "type": "string"
+                  },
+                  "total": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "used": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "driver",
+                  "source",
+                  "used",
+                  "total",
+                  "snapshots"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "disks",
+            "pools"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The host's disks, each with a plain role (system, snapshots, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "storage_add",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "contents",
+          "required": false,
+          "schema": {
+            "maxLength": 4096,
+            "type": "string"
+          }
+        },
+        {
+          "name": "device",
+          "required": false,
+          "schema": {
+            "description": "A whole free disk, such as sdb or /dev/sdb. Incus wipes and formats it as btrfs; the pool is named arca-snapshots-<name> (at most 32 characters).",
+            "pattern": "^(?:/dev/)?[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "disk",
+          "required": false,
+          "schema": {
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        {
+          "name": "fsUuid",
+          "required": false,
+          "schema": {
+            "maxLength": 128,
+            "type": "string"
+          }
+        },
+        {
+          "name": "inUseCheck",
+          "required": false,
+          "schema": {
+            "enum": [
+              "exclusive open",
+              "system lists"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        {
+          "name": "mount",
+          "required": false,
+          "schema": {
+            "maxLength": 1024,
+            "type": "string"
+          }
+        },
+        {
+          "name": "path",
+          "required": false,
+          "schema": {
+            "description": "A folder on a mounted disk that is not a system disk. The pool lives in <path>/arca-pool, which Arca makes (empty, 0700) when the approved add runs; Arca must be able to write in the folder.",
+            "maxLength": 1024,
+            "minLength": 1,
+            "pattern": "^/",
+            "type": "string"
+          }
+        },
+        {
+          "name": "serial",
+          "required": false,
+          "schema": {
+            "maxLength": 256,
+            "type": "string"
+          }
+        },
+        {
+          "name": "size",
+          "required": false,
+          "schema": {
+            "type": "integer"
+          }
+        },
+        {
+          "name": "transport",
+          "required": false,
+          "schema": {
+            "maxLength": 32,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "driver": {
+              "enum": [
+                "dir",
+                "btrfs"
+              ],
+              "type": "string"
+            },
+            "pool": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pool",
+            "driver",
+            "source"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus wipes and formats as the pool arca-snapshots-<name>. A system disk, a member disk, a disk that holds snapshots and a mounted disk are refused as a whole-disk target.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "snapshot_create",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "pool",
+          "required": true,
+          "schema": {
+            "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": true,
+          "schema": {
+            "description": "The source's Incus project.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": false,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "enum": [
+              "container",
+              "virtual-machine",
+              "volume"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": false,
+          "schema": {
+            "description": "The snapshot's name, set by the kernel.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "sourcePool",
+          "required": false,
+          "schema": {
+            "description": "A source volume's pool.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "uuid",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "volume",
+          "required": false,
+          "schema": {
+            "description": "The source custom volume.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "pool": {
+              "type": "string"
+            },
+            "snapshot": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "copied",
+                "copying",
+                "deleted",
+                "deleting"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "pool",
+            "kind",
+            "state"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Copy one app or data volume onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "snapshot_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "snapshots": {
+              "items": {
+                "properties": {
+                  "created": {
+                    "type": "string"
+                  },
+                  "droppedDevices": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container",
+                      "virtual-machine",
+                      "volume"
+                    ],
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "pool": {
+                    "type": "string"
+                  },
+                  "project": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "sourceName": {
+                    "type": "string"
+                  },
+                  "sourcePool": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "sourceProject": {
+                    "type": "string"
+                  },
+                  "state": {
+                    "enum": [
+                      "ready",
+                      "copying",
+                      "incomplete"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "project",
+                  "sourceProject",
+                  "sourceName",
+                  "sourcePool",
+                  "pool",
+                  "size",
+                  "created",
+                  "state",
+                  "droppedDevices"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "snapshots"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished is incomplete.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "snapshot_delete",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The snapshot's name.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "enum": [
+              "instance",
+              "volume"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "pool",
+          "required": false,
+          "schema": {
+            "description": "The snapshot's pool.",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "source",
+          "required": false,
+          "schema": {
+            "maxLength": 512,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "pool": {
+              "type": "string"
+            },
+            "snapshot": {
+              "type": "string"
+            },
+            "state": {
+              "enum": [
+                "copied",
+                "copying",
+                "deleted",
+                "deleting"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "snapshot",
+            "pool",
+            "kind",
+            "state"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-scope": "doctor",

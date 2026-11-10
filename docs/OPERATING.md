@@ -305,7 +305,8 @@ record is refused.
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
 `action_propose`, `plan_decline`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
-`service_status`, and `gpu_attach` and `gpu_detach`.
+`service_status`, `gpu_attach` and `gpu_detach`, and `storage_list`, `storage_add`, `snapshot_create`, `snapshot_list` and
+`snapshot_delete`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -469,6 +470,159 @@ the failure reason. The failure and provenance fields are additions: `cpu.coresK
 `load.reason` and `memory.reason`. Every field the earlier schema carried keeps its name and meaning, and a local node's
 figures do not change.
 
+## Snapshot storage and snapshots
+
+The owner plugs a disk (normally USB) into any Arca machine, picks it as snapshot storage, and copies every app and data
+volume onto it. The disk alone is then enough to bring the apps back after the machine is reinstalled with Arca OS.
+
+### Disks and their roles: `storage_list`
+
+`storage_list` (viewer) reads the host's disks with `lsblk --json --bytes --tree` (name, size, model, serial, transport,
+removable, type, file system, label, UUID, mount points and the devices on each disk) and the Incus pools with their used
+and total space. Loop, optical and zram devices are not listed. Each disk gets one plain role:
+
+| Role | When | Offered as |
+|---|---|---|
+| `system` | something on it is mounted at `/`, `/boot` or as swap, holds swap, carries a member signature (any signature ending in `_member`, such as `linux_raid_member`, firmware RAID's `isw_raid_member` or `ddf_raid_member`, `LVM2_member` and `zfs_member`, or `crypto_LUKS`, `bcache`, `ceph`, `ceph_bluestore`, `drbd` or `swsuspend`), mounted or assembled or not, so one half of a failing RAID1 is never offered, is held by another device (its `/sys/class/block/<dev>/holders` is not empty), is a member of a multi-device file system that holds `/` or that the kernel lists as mounted, is given to an app (a `unix-block` device, or a `disk` device whose source is under `/dev/`, in any project), or the disk holds an Incus pool (by device, UUID, label, or a pool folder on its file system; a pool whose name Arca would never write is still counted) | never |
+| `snapshots` | the disk holds a snapshot pool of this machine (a folder pool is matched by the file system UUID it recorded, so its disk is known even while it is not mounted), or a file system labelled `arca-snapshots-<name>` (a whole disk another machine made snapshot storage) | never: it is not erased |
+| `in use` | something on it is mounted elsewhere | `folder`: a pool in a folder on it |
+| `free` | nothing on it is mounted or a member of anything | `whole disk`: Incus erases and formats it |
+
+`lsblk` lists a multi-device btrfs or bcachefs mount on one member only, so every device with the same file system type and
+UUID, and every device the kernel lists under `/sys/fs/btrfs/<uuid>/devices/` or `/sys/fs/bcachefs/<uuid>/dev-*/block`, is
+given the mount points of all of them before roles are decided: a second disk of the root btrfs is `system`.
+
+Each disk carries a `reason` in plain words, and an `in use` disk lists its `folders` (its mount points). A pool has
+`snapshots: true` when its config carries `user.arcasnapshot.storage=<its own name>`, which `storage_add` sets when it
+creates the pool. The pool's description (`Arca snapshot storage`) is only for people; anyone can edit it, so it is not the
+marker.
+
+### Adding storage: `storage_add`
+
+`storage_add` is gated like every action proposal: the Doctor (or any viewer) proposes it, the owner approves it with the
+passkey, and it runs once. The arguments are `{name, device}` or `{name, path}`:
+
+- `{name, device}` (a `free` disk, such as `sdb`) creates an Incus `btrfs` pool named `arca-snapshots-<name>` on the
+  whole device, mounted with `compress=zstd`. The request sets `source.wipe=true`: Incus wipes the old partition table and
+  file system signatures (a backup GPT at the end of the disk included) and then formats the disk, since `mkfs.btrfs`
+  refuses a disk that still has a partition table. Incus labels the new file system with the pool's name, so the disk
+  shows as `snapshots` on any machine. The kernel process never formats, mounts or writes a disk device.
+- `{name, path}` (a folder on an `in use` disk) creates an Incus `dir` pool at `<path>/arca-pool`. Incus makes a
+  folder pool only in a folder that is already there and empty, so when the approved add runs the kernel makes
+  `<path>/arca-pool` first (mode 0700; any missing part of `<path>` with 0755), walking from `/` one part at a time with
+  `openat`/`mkdirat` relative to the part before it and never through a link, then asks Incus for the pool; if Incus refuses, the empty folder it just made is removed again. That folder is
+  the only thing the kernel ever writes on a disk, and nothing else on the disk changes. The proposal itself writes
+  nothing: it refuses a folder the kernel may not write in (`FolderNotWritable`) and an `arca-pool` that is already
+  there but is a link, a file or a folder with files in it (`PoolFolderInUse`). The folder is judged by where it really is: every link in its path is
+  followed when the proposal is made, the resolved path is what the owner approves, and a folder that leads onto a system
+  disk is refused. A folder that leads elsewhere by the time it runs is `DiskChanged`.
+
+When the proposal is made the kernel reads the disk again and binds its device name, model, serial, transport, size and
+current contents (and, for a folder, its mount point and the UUID of that file system, `fsUuid`) into the arguments, so the
+owner's digest covers them. The folder pool records that UUID as `user.arcasnapshot.fs-uuid`. The approval card says
+in plain words the disk model, size and transport, what is on it now (each partition with its file system and label, for
+a folder target too), the pool name, and for a whole disk: **"Everything on this disk will be erased."** The run reads the disk again and refuses
+anything that changed (`DiskChanged`), so a different disk plugged in under the same name is never formatted.
+
+Before a whole disk is erased, when the proposal is made and again when it runs, the kernel opens the disk and every
+partition on it read-only with `O_EXCL` and closes them at once. The kernel refuses that while a mounted file system (in any
+mount namespace), a RAID, a volume group, an encrypted mapping or swap holds the device, whatever `lsblk` showed: that is
+`DiskBusy`. When the open is refused for permission (`EACCES` or `EPERM`, as for a service user outside the `disk` group),
+and only then, the kernel checks through the system's own lists instead, and every check must pass for the disk and each
+partition: no mount in `/proc/self/mountinfo` (by device number or by source), no active swap in `/proc/swaps`, no holders,
+no membership of a mounted btrfs or bcachefs (`/sys/fs/btrfs`, `/sys/fs/bcachefs`), no RAID, LVM, ZFS, LUKS or swap
+signature, and the classifier's own rules (the file system siblings of a mount, devices given to apps) still find the disk
+`free`. A disk in use by any of them is `DiskBusy`; lists or kernel links that cannot be read, or a disk or partition the
+system lists no device number for, are `DiskUncheckable`. Which check was used
+is bound into the arguments (`inUseCheck`: `exclusive open` or `system lists`; a run that would use the other one is
+`DiskChanged`), and a card checked through the lists says
+**"In-use check through system lists (Arca can't open the disk directly)."** Any other failure to open the disk (it is
+gone, or is not a block device) is `DiskUncheckable`. Folder targets are not opened. While any folder snapshot pool cannot be reached (its folder is missing or its recorded file system is not mounted),
+every whole-disk erase is refused (`SnapshotStorageUnreachable`: "plug it in or remove it first"), since the disk about to
+be erased could be that one.
+
+Refusals: a system disk, a member disk or a disk holding a pool (`SystemDisk`); a disk that holds snapshots, as a whole
+disk or as a folder (`SnapshotDisk`); a mounted disk as a whole-disk target
+(`DiskMounted`); a partition instead of the whole disk (`NotWholeDisk`); a device or folder not in `storage_list`
+(`DiskNotListed`); a pool name or folder already in use (`PoolExists`); a folder the kernel may not write in
+(`FolderNotWritable`); an `arca-pool` that is not an empty plain folder (`PoolFolderInUse`); a folder on a vfat, exFAT or
+NTFS file system, which has no Linux owners or permissions and cannot keep app copies (`FolderFileSystem`); a disk held at
+the moment of erase (`DiskBusy`) or one that cannot be checked (`DiskUncheckable`); an unreachable folder snapshot pool
+(`SnapshotStorageUnreachable`); and every storage action on a watch-only node
+(`StorageDisabled`). Snapshots are written only to a pool that carries the `user.arcasnapshot.storage` marker.
+
+### Taking snapshots: `snapshot_create`
+
+`snapshot_create` (gated) takes `{project, instance, pool}` or `{project, volume, pool}`, for any project. The copy goes into
+the project `arcak-snapshots` on the chosen snapshot pool, named `<project>--<name>--<UTC yyyymmddThhmm>` (each part shortened
+when needed so the name fits 63 characters). The kernel creates `arcak-snapshots` the first time, with
+`features.networks=false` so a copy's network resolves the default project's, and its own profiles, images and volumes.
+
+- An instance is copied stateless and alone (`instance_only`, not its own snapshots), with `boot.autostart=false`, and is
+  never started: the request carries no `start` and the writer has no way to start anything. The copy uses no profile:
+  the source's expanded config and its root disk (moved to the snapshot pool) and NICs are written into the copy itself.
+  Incus fills every key and device a copy request leaves unset from the source's own (`createFromCopy`), so leaving
+  something out does not drop it. The create request masks each of the source's own keys it drops with an empty value
+  (Incus does not store one) and each of its own devices it drops with a `none` device; once Incus has made the copy, one
+  `PUT` of the copy writes its clean config and devices (keeping the volatile keys Incus gave it) and
+  `user.arcasnapshot.verified=true`, and the copy is read back. A copy that still runs, may start, uses a profile, carries a live ownership mark, any device of its source, a mask
+  or a root disk off the snapshot pool is deleted, and the snapshot is `StorageWriteFailed`. A copy Incus is still making
+  when the verb answers is finished the same way in the background once Incus is done; until then it already carries no
+  live mark and only `none` devices. A background failure goes to the service log and to the action journal against the
+  approved proposal (`SnapshotCleanupFailed`).
+  Devices that would tie the copy to the source project or to this host (custom volumes, host folders, GPUs, proxies, USB
+  and the like, and a NIC on a network the source project owns) are left out and named in
+  `user.arcasnapshot.dropped-devices`. NICs lose their fixed MAC and IP addresses, so the copy never claims its source's.
+- A custom volume is copied alone (`volume_only`) into `arcak-snapshots` on the snapshot pool, keeping its config except
+  the source pool's driver keys. It is read back too: a volume copy that carries a live ownership mark is deleted and
+  refused.
+
+Sources are only read: they are never stopped, changed or deleted, a running app keeps running, and no write ever names the
+source's project. Every copy records its source in `user.arcasnapshot.source-project`, `source-name`, `source-kind`,
+`source-pool` (volumes) and `created`. A copy carries no live ownership mark: the kernel's `user.arcakernel.*` keys and
+droidd's `user.droid.*`, `user.tactu.*` and `user.arca.*` keys are moved under `user.arcasnapshot.mark.<key>`, so neither
+owner ever takes a copy for its own, and a restore can still see who owned the source. A copy still running after twenty seconds is reported as `copying`; Incus finishes it
+on its own and `snapshot_list` shows it. A copy Incus refuses (for example a running virtual machine, or a full disk) is
+`StorageWriteFailed` with Incus's own message. A pool not added by `storage_add` is `NotSnapshotStorage`; a source that is
+not there is `SourceUnknown`; a name already taken (two snapshots of one app in the same minute) is `SnapshotExists`.
+
+### Listing and deleting: `snapshot_list`, `snapshot_delete`
+
+`snapshot_list` (viewer) lists every copy in `arcak-snapshots`: its name, kind, source project and name (and a volume's
+source pool), pool, size, when it was made, its state, and the devices the copy left out. The state is `copying` while
+Incus makes it, `ready` once done, and `incomplete` for an app copy without `user.arcasnapshot.verified` (its clean-up never
+ran: the process stopped first, or it failed and the copy could not be deleted); delete an incomplete copy and take it
+again. A volume copy is made with its final config in one request, needs no clean-up and is `ready` once done. `snapshot_delete`
+(gated) takes `{name}` and deletes that one copy; only names in `arcak-snapshots` are found, so nothing outside it can be
+deleted.
+
+The snapshot writer (`arca_incus::SnapshotWriter`) sends only these writes, and refuses anything else before the socket is
+touched: `POST /1.0/storage-pools`, `POST /1.0/projects` (for `arcak-snapshots` only), `POST` and `DELETE` of an
+instance or a custom volume with `?project=arcak-snapshots`, and the one clean-up `PUT` of a new instance copy there. No
+`PATCH`, no other `PUT`, and no instance state change.
+
+### Restoring from the disk alone
+
+After the machine is reinstalled (Arca OS), plug the snapshot disk in and:
+
+1. Initialize Incus as usual, with the default bridge (`incusbr0`) the copies' NICs name.
+2. Create the snapshot project with the same features, so the recovery finds it:
+   `incus project create arcak-snapshots -c features.networks=false -c features.profiles=true -c features.images=true -c features.storage.volumes=true`.
+3. Run `incus admin recover`. Name the pool as it was (for a whole disk, the file system label `arca-snapshots-<name>`
+   that `lsblk -o NAME,LABEL` shows), its driver (`btrfs` for a whole disk, `dir` for a folder) and its source (the disk's device, such as `/dev/sdb`, or the folder
+   `<path>/arca-pool`). Incus scans the pool and lists the copies and volumes in `arcak-snapshots`; confirm to import them.
+4. Copy each app back into its project and onto the machine's own pool, then start it:
+   `incus copy <snapshot> <name> --project arcak-snapshots --target-project <project> --storage default`, then
+   `incus config unset <name> boot.autostart --project <project>` (the copy kept `false`) and
+   `incus start <name> --project <project>`. A data volume comes back with
+   `incus storage volume copy <pool>/<snapshot> default/<name> --project arcak-snapshots --target-project <project>`.
+5. Add back anything the copy left out (its `user.arcasnapshot.dropped-devices`), such as a data volume's disk device or a
+   proxy. The restored app is not owned by the kernel or droidd until it is adopted again; its old marks are readable
+   under `user.arcasnapshot.mark.*`.
+
+A copy needs nothing from its source project: no profile, no volume and no project network. The tests check this on every
+copy they make.
+
 ## Calling the server
 
 `arca call <verb>` makes one call and prints its result. The token is read from `--token-file`, which must be a regular file
@@ -534,9 +688,10 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of nine gated service, database or GPU verbs:
-`service_create`, `service_remove`, `service_publish`, `service_unpublish`, `service_connect`, `service_disconnect`,
-`postgres_create`, `gpu_attach` or `gpu_detach`. `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twelve gated service,
+database, GPU, storage or snapshot verbs: `service_create`, `service_remove`, `service_publish`, `service_unpublish`,
+`service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create` or
+`snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)). `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
 differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains.

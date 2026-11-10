@@ -31,6 +31,9 @@ pub enum ArcaAction {
     PostgresDelete,
     GpuAttach,
     GpuDetach,
+    StorageAdd,
+    SnapshotCreate,
+    SnapshotDelete,
 }
 
 impl ArcaAction {
@@ -53,6 +56,9 @@ impl ArcaAction {
             Self::PostgresDelete => "postgres_delete",
             Self::GpuAttach => "gpu_attach",
             Self::GpuDetach => "gpu_detach",
+            Self::StorageAdd => "storage_add",
+            Self::SnapshotCreate => "snapshot_create",
+            Self::SnapshotDelete => "snapshot_delete",
         }
     }
 
@@ -75,6 +81,9 @@ impl ArcaAction {
             "postgres_delete" => Some(Self::PostgresDelete),
             "gpu_attach" => Some(Self::GpuAttach),
             "gpu_detach" => Some(Self::GpuDetach),
+            "storage_add" => Some(Self::StorageAdd),
+            "snapshot_create" => Some(Self::SnapshotCreate),
+            "snapshot_delete" => Some(Self::SnapshotDelete),
             _ => None,
         }
     }
@@ -257,7 +266,7 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
         bad(
             "action",
-            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach or gpu_detach",
+            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create or snapshot_delete",
         )
     })?;
     let target = field("target");

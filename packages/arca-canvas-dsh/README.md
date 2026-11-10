@@ -287,14 +287,17 @@ the Doctor message that proposed it. A delete plan keeps the count-and-link card
 to the configured `approvalUrl`. When `journal_list` is unavailable Steps says so
 without fabricating activity.
 
-The Doctor has the eight read-only Arca tools (`arca_status`, `watch_report`,
+The Doctor has the ten read-only Arca tools (`arca_status`, `watch_report`,
 `postgres_list`, `node_metrics`, `alerts_list`, `plan_list`, `journal_list`,
-`service_list`) plus one non-read tool, `arca_propose`. `arca_propose` calls the
-kernel's `action_propose` viewer verb and records an inert proposal for one of
-nine actions (`service_create`, `service_remove`, `service_publish`,
-`service_unpublish`, `service_connect`, `service_disconnect`, `postgres_create`,
-`gpu_attach`, `gpu_detach`); it changes nothing and a database delete cannot be
-proposed. `arca_propose` may
+`service_list`, `storage_list`, `snapshot_list`) plus one non-read tool,
+`arca_propose`. `arca_propose` calls the kernel's `action_propose` viewer verb and
+records an inert proposal for one of twelve actions (`service_create`,
+`service_remove`, `service_publish`, `service_unpublish`, `service_connect`,
+`service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`,
+`storage_add`, `snapshot_create`, `snapshot_delete`); it changes nothing and a
+database delete cannot be proposed. A `storage_add` card for a whole disk always
+says "Everything on this disk will be erased." The `storage_list` and
+`snapshot_list` sizes reach the model as decimal GB. `arca_propose` may
 target `pageHost`, the host whose kernel serves this canvas and its approval
 page, and any configured reader whose name the page host's `arca_status` lists in
 `approval.linkedHosts` (another kernel whose approvals the page host relays, on

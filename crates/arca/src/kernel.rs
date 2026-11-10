@@ -63,6 +63,8 @@ pub struct Kernel {
 /// A one-shot permission to run an already approved action through its gated verb. The token is random, not the owner's
 /// approval, and the handler consumes it before doing any work.
 struct ActionGrant {
+    /// The approved proposal's id, so a result that arrives later can be journalled against it.
+    id: String,
     action: String,
     args_digest: String,
     token: String,
@@ -310,6 +312,7 @@ impl Kernel {
             })?
             .ok_or(ActionApprovalError::NoSuch)?;
         self.action_grants.push(ActionGrant {
+            id: proposal.id.clone(),
             action: action.as_str().to_string(),
             args_digest: digest,
             token: grant.clone(),
@@ -339,6 +342,22 @@ impl Kernel {
         };
         self.action_grants.remove(index);
         true
+    }
+
+    /// The approved proposal a live grant belongs to.
+    pub fn action_grant_id(&self, token: &str) -> Option<String> {
+        self.action_grants
+            .iter()
+            .find(|grant| grant.token == token)
+            .map(|grant| grant.id.clone())
+    }
+
+    /// Journals that an approved action which had already answered failed later, in work it left running (a snapshot copy
+    /// finished in the background). The newest result for the id is this failure.
+    pub fn journal_late_failure(&mut self, id: &str, code: &str) {
+        if let Err(error) = self.action_proposals.journal_result(id, false, Some(code)) {
+            eprintln!("arca: the late failure of action proposal {id} was not journalled: {error}");
+        }
     }
 
     /// Drops a grant that was never consumed, so no later call can use it.

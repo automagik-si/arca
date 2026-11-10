@@ -77,7 +77,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 30] = [
+static VERBS: [Verb; 35] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -164,7 +164,7 @@ static VERBS: [Verb; 30] = [
     },
     Verb {
         name: "action_propose",
-        summary: "Records an inert service, database or GPU assignment action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+        summary: "Records an inert service, database, GPU assignment, storage or snapshot action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -497,6 +497,76 @@ static VERBS: [Verb; 30] = [
         cut: no_cut,
         params: gpu_detach_params,
         result: gpu_change_result,
+    },
+    Verb {
+        name: "storage_list",
+        summary: "The host's disks, each with a plain role (system, snapshots, in use or free) and what it may be offered as, and the Incus storage pools with their used and total space.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_storage_list,
+        cut: no_cut,
+        params: empty_params,
+        result: storage_list_result,
+    },
+    Verb {
+        name: "storage_add",
+        summary: "Add snapshot storage, with the owner's signed approval: a folder on a mounted disk, or a whole free disk that Incus wipes and formats as the pool arca-snapshots-<name>. A system disk, a member disk, a disk that holds snapshots and a mounted disk are refused as a whole-disk target.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_storage_add,
+        cut: no_cut,
+        params: storage_add_params,
+        result: storage_add_result,
+    },
+    Verb {
+        name: "snapshot_create",
+        summary: "Copy one app or data volume onto snapshot storage, with the owner's signed approval. The copy lives in the arcak-snapshots project, never starts on its own, and the source is never changed.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_snapshot_change,
+        cut: no_cut,
+        params: snapshot_create_params,
+        result: snapshot_change_result,
+    },
+    Verb {
+        name: "snapshot_list",
+        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished is incomplete.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_snapshot_list,
+        cut: no_cut,
+        params: empty_params,
+        result: snapshot_list_result,
+    },
+    Verb {
+        name: "snapshot_delete",
+        summary: "Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_snapshot_change,
+        cut: no_cut,
+        params: snapshot_delete_params,
+        result: snapshot_change_result,
     },
 ];
 
@@ -1089,8 +1159,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The nine verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 9] = [
+/// The twelve verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 12] = [
     "service_create",
     "service_remove",
     "service_publish",
@@ -1100,6 +1170,9 @@ const ACTION_NAMES: [&str; 9] = [
     "postgres_create",
     "gpu_attach",
     "gpu_detach",
+    "storage_add",
+    "snapshot_create",
+    "snapshot_delete",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -1865,4 +1938,246 @@ fn service_unpublish_result() -> Value {
 }
 fn summary_service_unpublish(_: &Value) -> String {
     "service_unpublish: complete".into()
+}
+
+/// A params object with no fields.
+fn empty_params() -> Value {
+    params(vec![])
+}
+
+/// A short line for a successful `storage_list`.
+pub fn summary_storage_list(v: &Value) -> String {
+    let disks = v["disks"].as_array().map_or(0, Vec::len);
+    let free = v["disks"].as_array().map_or(0, |disks| {
+        disks
+            .iter()
+            .filter(|disk| disk["offer"].as_str().is_some())
+            .count()
+    });
+    format!(
+        "{disks} disk(s), {free} offered for snapshots, {} pool(s)",
+        v["pools"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `storage_add`.
+pub fn summary_storage_add(v: &Value) -> String {
+    format!(
+        "snapshot storage {} added ({})",
+        v["pool"].as_str().unwrap_or("?"),
+        v["driver"].as_str().unwrap_or("?")
+    )
+}
+
+/// A short line for a successful `snapshot_list`.
+pub fn summary_snapshot_list(v: &Value) -> String {
+    format!(
+        "{} snapshot(s)",
+        v["snapshots"].as_array().map_or(0, Vec::len)
+    )
+}
+
+/// A short line for a successful `snapshot_create` or `snapshot_delete`.
+pub fn summary_snapshot_change(v: &Value) -> String {
+    format!(
+        "snapshot {} {}",
+        v["snapshot"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?")
+    )
+}
+
+/// An Incus storage pool name, as `storage_add` creates one.
+fn pool_name_schema() -> Value {
+    json!({
+        "description": "The storage pool name (1-32 of a-z, 0-9 and inner \"-\", starting with a letter).",
+        "pattern": "^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$",
+        "type": "string"
+    })
+}
+
+/// A plain Incus name: letters, digits, `-`, `_` and `.`.
+fn plain_name_schema(description: &'static str) -> Value {
+    json!({
+        "description": description,
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        "type": "string"
+    })
+}
+
+/// `storage_add`: exactly one of `path` and `device`. The disk's facts are read by the kernel when the proposal is made and
+/// are part of the approved arguments, so a disk swapped in afterwards is refused.
+fn storage_add_params() -> Value {
+    params(vec![
+        ("name", true, pool_name_schema()),
+        (
+            "path",
+            false,
+            json!({
+                "description": "A folder on a mounted disk that is not a system disk. The pool lives in <path>/arca-pool, which Arca makes (empty, 0700) when the approved add runs; Arca must be able to write in the folder.",
+                "maxLength": 1024,
+                "minLength": 1,
+                "pattern": "^/",
+                "type": "string"
+            }),
+        ),
+        (
+            "device",
+            false,
+            json!({
+                "description": "A whole free disk, such as sdb or /dev/sdb. Incus wipes and formats it as btrfs; the pool is named arca-snapshots-<name> (at most 32 characters).",
+                "pattern": "^(?:/dev/)?[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$",
+                "type": "string"
+            }),
+        ),
+        ("disk", false, string_max(64)),
+        ("fsUuid", false, string_max(128)),
+        (
+            "inUseCheck",
+            false,
+            one_of(&["exclusive open", "system lists"]),
+        ),
+        ("model", false, string_max(256)),
+        ("serial", false, string_max(256)),
+        ("transport", false, string_max(32)),
+        ("size", false, int()),
+        ("contents", false, string_max(4096)),
+        ("mount", false, string_max(1024)),
+        ("approval", true, approval_schema()),
+    ])
+}
+
+fn storage_add_result() -> Value {
+    result(vec![
+        ("pool", true, string()),
+        ("driver", true, one_of(&["dir", "btrfs"])),
+        ("source", true, string()),
+    ])
+}
+
+/// `snapshot_create`: exactly one of `instance` and `volume`. The snapshot's name, the source's kind and identity, and a
+/// volume's pool are resolved by the kernel when the proposal is made.
+fn snapshot_create_params() -> Value {
+    params(vec![
+        (
+            "project",
+            true,
+            plain_name_schema("The source's Incus project."),
+        ),
+        ("instance", false, instance_name_schema()),
+        (
+            "volume",
+            false,
+            plain_name_schema("The source custom volume."),
+        ),
+        ("pool", true, pool_name_schema()),
+        (
+            "name",
+            false,
+            plain_name_schema("The snapshot's name, set by the kernel."),
+        ),
+        (
+            "kind",
+            false,
+            one_of(&["container", "virtual-machine", "volume"]),
+        ),
+        (
+            "sourcePool",
+            false,
+            plain_name_schema("A source volume's pool."),
+        ),
+        ("uuid", false, nullable(string())),
+        ("approval", true, approval_schema()),
+    ])
+}
+
+/// `snapshot_delete`: the snapshot's name. Its kind, pool and source are resolved by the kernel when the proposal is made.
+fn snapshot_delete_params() -> Value {
+    params(vec![
+        ("name", true, plain_name_schema("The snapshot's name.")),
+        ("kind", false, one_of(&["instance", "volume"])),
+        ("pool", false, plain_name_schema("The snapshot's pool.")),
+        ("source", false, string_max(512)),
+        ("approval", true, approval_schema()),
+    ])
+}
+
+fn snapshot_change_result() -> Value {
+    result(vec![
+        ("snapshot", true, string()),
+        ("pool", true, string()),
+        ("kind", true, string()),
+        (
+            "state",
+            true,
+            one_of(&["copied", "copying", "deleted", "deleting"]),
+        ),
+    ])
+}
+
+fn storage_list_result() -> Value {
+    let partition = result(vec![
+        ("name", true, string()),
+        ("path", true, string()),
+        ("size", true, int()),
+        ("type", true, string()),
+        ("fstype", true, nullable(string())),
+        ("label", true, nullable(string())),
+        ("mountpoints", true, array(string())),
+    ]);
+    let disk = result(vec![
+        ("name", true, string()),
+        ("path", true, string()),
+        ("size", true, int()),
+        ("model", true, string()),
+        ("serial", true, string()),
+        ("transport", true, string()),
+        ("removable", true, boolean()),
+        ("fstype", true, nullable(string())),
+        ("label", true, nullable(string())),
+        ("mountpoints", true, array(string())),
+        ("children", true, array(partition)),
+        (
+            "role",
+            true,
+            one_of(&["system", "snapshots", "in use", "free"]),
+        ),
+        ("reason", true, string()),
+        ("offer", true, nullable_enum(&["folder", "whole disk"])),
+        ("folders", true, array(string())),
+    ]);
+    let pool = result(vec![
+        ("name", true, string()),
+        ("driver", true, string()),
+        ("source", true, string()),
+        ("used", true, nullable(int())),
+        ("total", true, nullable(int())),
+        ("snapshots", true, boolean()),
+    ]);
+    result(vec![
+        ("disks", true, array(disk)),
+        ("pools", true, array(pool)),
+    ])
+}
+
+fn snapshot_list_result() -> Value {
+    let snapshot = result(vec![
+        ("name", true, string()),
+        (
+            "kind",
+            true,
+            one_of(&["container", "virtual-machine", "volume"]),
+        ),
+        ("project", true, string()),
+        ("sourceProject", true, string()),
+        ("sourceName", true, string()),
+        ("sourcePool", true, nullable(string())),
+        ("pool", true, string()),
+        ("size", true, nullable(int())),
+        ("created", true, string()),
+        ("state", true, one_of(&["ready", "copying", "incomplete"])),
+        ("droppedDevices", true, array(string())),
+    ]);
+    result(vec![("snapshots", true, array(snapshot))])
 }
