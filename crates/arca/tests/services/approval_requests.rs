@@ -326,7 +326,7 @@ fn g7_owner_approval_request_checks_its_fields_as_the_statement_will_carry_them(
         ),
         (
             json!({ "kind": "arca", "action": "install", "target": "pg", "args": {} }),
-            "action must be delete, publish or spend",
+            "action must be delete, publish, spend or enroll",
         ),
         (
             json!({ "kind": "arca", "action": "delete", "target": "-pg", "args": {} }),
@@ -1727,5 +1727,357 @@ fn g7_an_ssh_approval_cannot_approve_a_request_it_goes_to_the_call_itself_and_ev
                 g.key.fingerprint()
             )),
         "the passkey's request"
+    );
+}
+
+/// A kind `arca` request to let `service` make the person showing `code` an owner.
+fn enroll(code: &str, service: &str) -> Value {
+    json!({ "kind": "arca", "action": "enroll", "target": code, "args": { "service": service } })
+}
+
+fn confirm(g: &G7, code: &str, args: Value, approval: &str) -> Result<Value, CallError> {
+    g.verbs["enroll_confirm"].call(
+        json!({ "target": code, "args": args, "approval": approval }),
+        &caller("doctor", Scope::Doctor),
+    )
+}
+
+/// The approval of a tapped `enroll` request for `code` and the service `cloud`.
+fn enroll_approval(g: &G7, code: &str) -> String {
+    let id = g.asked(enroll(code, "cloud"));
+    g.tap(&id);
+    g.approval(&id)
+}
+
+fn owner_refusal(result: Result<Value, CallError>) -> String {
+    match result {
+        Err(CallError::Refused { code, message }) if code == "owner_approval" => message,
+        other => panic!("an owner_approval refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_enroll_request_takes_a_code_of_6_to_12_uppercase_letters_and_digits_and_the_service_alone() {
+    let g = G7::new();
+    for code in ["ABC123", "A1B2C3D4E5F6", "000000", "ZZZZZZZ"] {
+        let id = g.asked(enroll(code, "cloud"));
+        let listed = g.list();
+        let row = listed.iter().find(|row| row["id"] == id).expect("listed");
+        assert_eq!(row["fields"]["action"], "enroll");
+        assert_eq!(row["fields"]["target"], code, "the page reads the code");
+        assert_eq!(row["args"], json!({ "service": "cloud" }));
+        g.deny(&id).expect("declined");
+    }
+    for code in [
+        "ABC12",
+        "A1B2C3D4E5F6G",
+        "abc123",
+        "ABC-123",
+        "ABC 123",
+        "ABC_123",
+        "ÀBC1234",
+        "",
+    ] {
+        let why = invalid(g.ask("doctor", Scope::Doctor, enroll(code, "cloud")));
+        assert!(
+            why.contains("6 to 12 uppercase letters and digits")
+                || why.contains("target must match"),
+            "{code}: {why}"
+        );
+    }
+    for args in [
+        json!({}),
+        json!({ "service": 7 }),
+        json!({ "service": "" }),
+        json!({ "service": "has space" }),
+        json!({ "service": "cloud", "role": "owner" }),
+        json!({ "name": "cloud" }),
+    ] {
+        let why = invalid(g.ask(
+            "doctor",
+            Scope::Doctor,
+            json!({ "kind": "arca", "action": "enroll", "target": "ABC123", "args": args }),
+        ));
+        assert!(why.contains("enroll args are {service: <name>}"), "{why}");
+    }
+    assert!(g.list().iter().all(|row| row["state"] != "pending"));
+    // The other actions keep their own targets and args.
+    let id = g.asked(delete("abc"));
+    assert_eq!(g.mine(&id)["state"], "pending");
+}
+
+#[test]
+fn enroll_confirm_confirms_a_valid_approval_once_and_changes_nothing_else() {
+    let g = G7::new();
+    let id = g.asked(enroll("ABC123", "cloud"));
+    let statement = g.statement(&id);
+    let parsed = parse_statement(statement.as_bytes()).expect("the enroll statement parses");
+    assert_eq!(parsed.action, ArcaAction::Enroll);
+    assert_eq!(parsed.target, "ABC123");
+    assert_eq!(
+        parsed.params_digest,
+        params_digest(&json!({ "service": "cloud" })).expect("a digest")
+    );
+    g.approve(&id, &statement, &g.proof(&statement, |_| {}))
+        .expect("the owner approves");
+    let approval = g.approval(&id);
+    assert!(spent_nonces(&g).is_empty(), "the tap spends nothing");
+
+    // Only a doctor's or an operator's token confirms.
+    assert!(matches!(
+        g.verbs["enroll_confirm"].call(
+            json!({ "target": "ABC123", "args": { "service": "cloud" }, "approval": approval }),
+            &caller("phone", Scope::Viewer),
+        ),
+        Err(CallError::Forbidden { .. })
+    ));
+    assert_eq!(
+        confirm(&g, "ABC123", json!({ "service": "cloud" }), &approval).expect("confirmed"),
+        json!({ "confirmed": true })
+    );
+    assert_eq!(spent_nonces(&g), vec![parsed.nonce.clone()], "one nonce");
+    let again = owner_refusal(confirm(
+        &g,
+        "ABC123",
+        json!({ "service": "cloud" }),
+        &approval,
+    ));
+    assert!(!again.contains(&approval), "{again}");
+    assert_eq!(spent_nonces(&g).len(), 1, "a second spend spends nothing");
+    let after = g.mine(&id);
+    assert_eq!(after["state"], "approved");
+    assert!(
+        after.get("approval").is_none(),
+        "a spent approval is no longer handed out"
+    );
+    let audit = g.audit();
+    assert_eq!(
+        audit.matches("owner_enroll_confirmed").count(),
+        1,
+        "{audit}"
+    );
+    assert!(
+        audit.contains(&format!("confirmed:{id}:arca:enroll:ABC123:params="))
+            && audit.contains(":requester=doctor\"")
+            && !audit.contains(&approval),
+        "{audit}"
+    );
+    assert!(!g.logs().contains(&approval));
+}
+
+#[test]
+fn enroll_confirm_refuses_a_wrong_target_wrong_args_an_expired_approval_and_a_bad_shape() {
+    let other_code = G7::new();
+    let approval = enroll_approval(&other_code, "ABC123");
+    owner_refusal(confirm(
+        &other_code,
+        "ABC124",
+        json!({ "service": "cloud" }),
+        &approval,
+    ));
+    assert!(spent_nonces(&other_code).is_empty());
+
+    let other_args = G7::new();
+    let approval = enroll_approval(&other_args, "ABC123");
+    owner_refusal(confirm(
+        &other_args,
+        "ABC123",
+        json!({ "service": "other" }),
+        &approval,
+    ));
+    assert!(spent_nonces(&other_args).is_empty());
+
+    let late = G7::new();
+    let approval = enroll_approval(&late, "ABC123");
+    late.at(NOW + 15 * MINUTE + 1);
+    owner_refusal(confirm(
+        &late,
+        "ABC123",
+        json!({ "service": "cloud" }),
+        &approval,
+    ));
+    assert!(spent_nonces(&late).is_empty());
+    assert_eq!(
+        late.mine(&late.list()[0]["id"].as_str().unwrap().to_string())["state"],
+        "expired"
+    );
+
+    let g = G7::new();
+    let approval = enroll_approval(&g, "ABC123");
+    for (code, args) in [
+        ("abc123", json!({ "service": "cloud" })),
+        ("ABC12", json!({ "service": "cloud" })),
+        ("ABC123", json!({ "service": "cloud", "more": 1 })),
+        ("ABC123", json!("cloud")),
+    ] {
+        assert!(
+            matches!(
+                confirm(&g, code, args, &approval),
+                Err(CallError::Invalid(_))
+            ),
+            "{code}"
+        );
+    }
+    assert!(matches!(
+        g.verbs["enroll_confirm"].call(
+            json!({ "target": "ABC123", "args": { "service": "cloud" } }),
+            &caller("doctor", Scope::Doctor),
+        ),
+        Err(CallError::Invalid(_))
+    ));
+    assert!(spent_nonces(&g).is_empty(), "a bad shape spends nothing");
+    assert_eq!(
+        confirm(&g, "ABC123", json!({ "service": "cloud" }), &approval).expect("still good"),
+        json!({ "confirmed": true })
+    );
+}
+
+#[test]
+fn an_approval_for_another_action_is_not_an_enroll_and_an_enroll_is_no_other_action() {
+    // A delete approval over the same target and args confirms nothing.
+    let g = G7::new();
+    let id = g.asked(
+        json!({ "kind": "arca", "action": "delete", "target": "ABC123", "args": { "service": "cloud" } }),
+    );
+    g.tap(&id);
+    let approval = g.approval(&id);
+    owner_refusal(confirm(
+        &g,
+        "ABC123",
+        json!({ "service": "cloud" }),
+        &approval,
+    ));
+    assert!(spent_nonces(&g).is_empty());
+
+    // An enroll approval deletes nothing.
+    let g = G7::new();
+    let approval = enroll_approval(&g, "ABC123");
+    let spent = g.rig.kernel.lock().expect("kernel").check_approval(
+        ArcaAction::Delete,
+        "ABC123",
+        &json!({ "service": "cloud" }),
+        &approval,
+        NOW,
+    );
+    assert!(spent.is_err(), "{spent:?}");
+    assert!(spent_nonces(&g).is_empty());
+}
+
+#[test]
+fn enroll_confirm_is_spent_only_by_the_token_that_asked() {
+    let g = G7::new();
+    let id = g.asked(enroll("ABC123", "cloud"));
+    g.tap(&id);
+    let approval = g.approval(&id);
+    // Another doctor token holding the approval string confirms nothing and spends nothing.
+    let other = g.verbs["enroll_confirm"].call(
+        json!({ "target": "ABC123", "args": { "service": "cloud" }, "approval": approval }),
+        &caller("other-doctor", Scope::Doctor),
+    );
+    let why = owner_refusal(other);
+    assert!(why.contains("asked by another token"), "{why}");
+    assert!(!why.contains(&approval));
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+    assert!(!g.audit().contains("owner_enroll_confirmed"));
+    // The requester still spends it, and the audit line names the requester and the request.
+    assert_eq!(
+        confirm(&g, "ABC123", json!({ "service": "cloud" }), &approval).expect("the requester"),
+        json!({ "confirmed": true })
+    );
+    let audit = g.audit();
+    let line = audit
+        .lines()
+        .find(|line| line.contains("owner_enroll_confirmed"))
+        .expect("the confirmation's line");
+    let line: Value = serde_json::from_str(line).expect("an audit line");
+    assert_eq!(line["principal"], "doctor:doctor");
+    let outcome = text(&line, "outcome");
+    assert!(
+        outcome.starts_with(&format!("confirmed:{id}:arca:enroll:ABC123:params="))
+            && outcome.ends_with(":requester=doctor"),
+        "{outcome}"
+    );
+    assert!(
+        !audit.contains("other-doctor"),
+        "the refused token is no requester"
+    );
+}
+
+#[test]
+fn enroll_confirm_refuses_an_approval_that_came_from_no_request() {
+    let g = G7::new();
+    let host = g.rig.kernel.lock().expect("kernel").host().to_string();
+    let args = json!({ "service": "cloud" });
+    // A statement the owner's passkey signed outside any request: the verifier itself would accept it.
+    let statement = canonical_json(&json!({
+        "host": host,
+        "action": "enroll",
+        "target": "ABC123",
+        "paramsDigest": params_digest(&args).expect("digest"),
+        "issuedAt": iso_utc(NOW),
+        "expiresAt": iso_utc(NOW + 5 * MINUTE),
+        "nonce": "ab".repeat(16),
+    }))
+    .expect("canonical");
+    let built = passkey_approval(
+        &statement,
+        &g.key
+            .assert(&Assert::over(ARCA_NAMESPACE, statement.as_bytes())),
+    );
+    assert!(
+        g.rig
+            .kernel
+            .lock()
+            .expect("kernel")
+            .preview_approval(ArcaAction::Enroll, "ABC123", &args, &built, NOW)
+            .is_ok(),
+        "the statement and its proof are good in themselves"
+    );
+    let why = owner_refusal(confirm(&g, "ABC123", args.clone(), &built));
+    assert!(why.contains("came from no request"), "{why}");
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+
+    // Nor while a request for the same code and service waits, or is approved with another statement.
+    let id = g.asked(enroll("ABC123", "cloud"));
+    owner_refusal(confirm(&g, "ABC123", args.clone(), &built));
+    g.tap(&id);
+    owner_refusal(confirm(&g, "ABC123", args.clone(), &built));
+    assert!(spent_nonces(&g).is_empty(), "nothing spent");
+    assert_eq!(
+        confirm(&g, "ABC123", args, &g.approval(&id)).expect("the request's own approval"),
+        json!({ "confirmed": true })
+    );
+}
+
+#[test]
+fn through_the_door_enroll_confirm_answers_confirmed_once() {
+    let g = G7::new();
+    let door = Door::over(&g);
+    let created = door.ok(
+        &door.doctor,
+        "owner_approval_request",
+        enroll("QRS789", "cloud"),
+    );
+    let id = id_of(&created);
+    g.tap(&id);
+    let approval = text(
+        &door.ok(&door.doctor, "owner_approval_status", json!({ "id": id })),
+        "approval",
+    );
+    let call = json!({ "target": "QRS789", "args": { "service": "cloud" }, "approval": approval });
+    assert_eq!(
+        door.ok(&door.doctor, "enroll_confirm", call.clone()),
+        json!({ "confirmed": true })
+    );
+    let (code, _) = door_refusal(&door.call(&door.doctor, "enroll_confirm", call));
+    assert_eq!(code, "owner_approval");
+    let lowered = door.call(
+        &door.doctor,
+        "enroll_confirm",
+        json!({ "target": "qrs789", "args": { "service": "cloud" }, "approval": "x" }),
+    );
+    assert!(
+        lowered["error"].is_object() || lowered["result"]["isError"] == json!(true),
+        "{lowered}"
     );
 }

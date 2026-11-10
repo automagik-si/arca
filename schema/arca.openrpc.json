@@ -28,6 +28,36 @@
                   },
                   "type": "array"
                 },
+                "peerKeySources": {
+                  "items": {
+                    "properties": {
+                      "from": {
+                        "type": "string"
+                      },
+                      "keys": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "reason": {
+                        "type": "string"
+                      },
+                      "since": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "keys",
+                      "since",
+                      "reason"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
                 "peerKeys": {
                   "properties": {
                     "from": {
@@ -2138,6 +2168,15 @@
           }
         },
         {
+          "name": "from",
+          "required": false,
+          "schema": {
+            "maxLength": 253,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "statement",
           "required": false,
           "schema": {
@@ -2174,7 +2213,7 @@
           "type": "object"
         }
       },
-      "summary": "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed.",
+      "summary": "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed. When `approval.peerKeys` lists several sources, `from` names the page host whose set this is (absent: the first source), and a change needs a key already kept for that same source.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -4316,10 +4355,12 @@
           "name": "action",
           "required": false,
           "schema": {
+            "description": "enroll: a service on this node may make the person showing the code in target an owner; its approval is spent with enroll_confirm.",
             "enum": [
               "delete",
               "publish",
-              "spend"
+              "spend",
+              "enroll"
             ]
           }
         },
@@ -4407,7 +4448,7 @@
           "name": "target",
           "required": false,
           "schema": {
-            "description": "What the action is on (a service's name).",
+            "description": "What the action is on (a service's name). For enroll, the code the person shows: 6 to 12 uppercase letters and digits.",
             "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
             "type": "string"
           }
@@ -4463,7 +4504,7 @@
           "type": "object"
         }
       },
-      "summary": "Ask the owner to approve an Arca action (kind arca: action delete, publish or spend, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Kind upgrade is approved through droidd's MCP, not here.",
+      "summary": "Ask the owner to approve an Arca action (kind arca: action delete, publish, spend or enroll, target, and args: the call's arguments without approval) with their passkey on Arca's approval page. Returns the request id; poll owner_approval_status (waitMs up to 30 s) for the approval, then pass it as the call's approval. An identical pending request returns the same id. Action enroll lets a service on this node make the person showing a code one of its owners: target is the code (6 to 12 uppercase letters and digits), args are {service: <name>}, and the approval is spent with enroll_confirm. Kind upgrade is approved through droidd's MCP, not here.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -4671,6 +4712,69 @@
       "x-arca-read-only-hint": true,
       "x-arca-scope": "viewer",
       "x-arca-writes": false
+    },
+    {
+      "name": "enroll_confirm",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The approval string owner_approval_status handed to the token that asked.",
+            "maxLength": 16384,
+            "type": "string"
+          }
+        },
+        {
+          "name": "args",
+          "required": true,
+          "schema": {
+            "additionalProperties": false,
+            "description": "The request's args: the service that makes the owner.",
+            "properties": {
+              "service": {
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "service"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "The code the person shows, as the request named it.",
+            "pattern": "^[A-Z0-9]{6,12}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "confirmed": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "confirmed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Spend an enroll approval: the owner approved, on this node's approval page, that the named service may make the person showing the code an owner. target is the code, args are {service: <name>} as the request gave them, approval is the string owner_approval_status handed out. Arca checks the approval itself, spends it once and answers confirmed: true; it changes nothing else.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
     },
     {
       "name": "gpu_attach",

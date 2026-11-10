@@ -36,12 +36,14 @@ pub use passkey::{
     parse_proof, passkeys_trust, verify_assertion,
 };
 pub use peer::{
-    PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set, peer_target,
-    set_digest,
+    PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set,
+    peer_file_name, peer_target, set_digest,
 };
 pub use signers::{SignerLine, TrustRoot, effective_uid, load_signers, signers_trust};
 pub use sshsig::SshSigVerifier;
-pub use statement::{ArcaAction, OwnerApproval, iso_ms, parse_statement, split_approval};
+pub use statement::{
+    ArcaAction, OwnerApproval, iso_ms, parse_statement, split_approval, valid_enroll_code,
+};
 pub use verifier::{ApprovalVerifier, MemNonces, NonceStore, RefuseAll, SignatureVerifier, Spent};
 
 /// The namespace an Arca owner signs an approval in (`ssh-keygen -Y sign -n`), and the namespace a signers-file key line

@@ -10,6 +10,13 @@
 //!   action is refused as droidd refuses it: `an arca request needs action`. An identical pending request of the same token
 //!   is the same request; beyond 5 pending per token or 20 in all the call is refused (`refused`, "429" in its message).
 //!   Kind `upgrade` is refused with `upgrade_not_here`: an identity phone's upgrade step is approved through droidd's MCP.
+//!   Action `enroll` asks the owner to let a service on this node make the person showing a code one of its owners: the
+//!   target is that code (6 to 12 uppercase letters and digits) and the args are `{service: <name>}`, nothing else.
+//! - `enroll_confirm {target, args, approval}` (doctor scope): spends an `enroll` approval. The kernel checks it with its
+//!   own verifier against `enroll`, the code and the args' digest, spends its nonce once and answers `{confirmed: true}`,
+//!   or refuses with `owner_approval`. Only the token whose request the owner approved spends it, and only an approval
+//!   a request holds: a statement built and signed outside a request confirms nothing, whoever signed it. An `enroll` approval changes nothing in the kernel: the service that asked acts on
+//!   the answer.
 //! - `owner_approval_status {id, waitMs?}` (doctor scope, not read-only): the request's state, waiting up to 30 s while it is
 //!   pending. The approval string goes to the token that asked, and to no other.
 //! - `owner_approval_list` (viewer scope, read-only, untrusted): the last 24 h of requests, every pending one first, then the
@@ -39,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use arca_approval::{
     ARCA_NAMESPACE, ArcaAction, ISSUE_SKEW_MS, TTL_MAX_MS, challenge_for, iso_ms, parse_proof,
-    parse_statement, split_approval,
+    parse_statement, split_approval, valid_enroll_code,
 };
 use arca_kernel::canon::{canonical_json, params_digest};
 use arca_mcp::{CallError, Caller};
@@ -77,10 +84,14 @@ pub const WAIT_MAX_MS: u64 = 30_000;
 pub const REQUESTED_AUDIT: &str = "owner_approval_requested";
 pub const APPROVED_AUDIT: &str = "owner_approval_approved";
 pub const DENIED_AUDIT: &str = "owner_approval_denied";
+/// The audit tool of an `enroll` approval spent through `enroll_confirm`.
+pub const ENROLLED_AUDIT: &str = "owner_enroll_confirmed";
+/// The action whose approval changes nothing in the kernel: `enroll_confirm` spends it for the service that asked.
+pub const ENROLL: &str = "enroll";
 /// The principal the page's decisions are audited as: the owner, proved by the passkey for an approval.
 pub const PAGE_PRINCIPAL: &str = "page:owner";
-/// The actions a request may ask for, droidd's `ARCA_ACTIONS`.
-const ACTIONS: [&str; 3] = ["delete", "publish", "spend"];
+/// The actions a request may ask for: droidd's `ARCA_ACTIONS`, and `enroll`.
+const ACTIONS: [&str; 4] = ["delete", "publish", "spend", ENROLL];
 /// The keys of an upgrade request, which a kind `arca` request never takes.
 const UPGRADE_KEYS: [&str; 8] = [
     "droid",
@@ -485,6 +496,82 @@ impl ApprovalRequests {
             out["approval"] = json!(approval);
         }
         Ok(out)
+    }
+
+    /// `enroll_confirm`: checks an `enroll` approval against the code and the args the caller names, with the kernel's own
+    /// verifier, and spends its nonce. Nothing else in the kernel changes. The approval must be the one an approved
+    /// `enroll` request of this same token holds, unspent and unexpired: another token's, or one that came from no
+    /// request, is refused before the verifier is asked and spends nothing. A confirmation that cannot be audited is not
+    /// given: the approval is spent and the owner approves again.
+    pub fn enroll_confirm(
+        &self,
+        kernel: &mut Kernel,
+        args: &Value,
+        caller: &Caller,
+        now: u64,
+    ) -> Result<Value, CallError> {
+        let Some(input) = args.as_object() else {
+            return Err(invalid("the arguments are not a JSON object"));
+        };
+        if let Some(key) = input
+            .keys()
+            .find(|key| !["target", "args", "approval"].contains(&key.as_str()))
+        {
+            let key = clean_key(key);
+            return Err(invalid(format!("enroll_confirm takes no {key}")));
+        }
+        let target = input.get("target").and_then(Value::as_str).unwrap_or("");
+        let call_args = input.get("args").unwrap_or(&Value::Null);
+        check_enroll(target, call_args)?;
+        let approval = input
+            .get("approval")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid("approval: expected a string"))?;
+        let mut inner = self.lock()?;
+        self.sweep(&mut inner, kernel, now);
+        let Some(row) = inner
+            .rows
+            .iter()
+            .find(|row| {
+                row.state == RequestState::Approved
+                    && row.kind == "arca"
+                    && row.field("action") == ENROLL
+                    && row.requester == caller.token_id
+                    && row.approval.as_deref() == Some(approval)
+            })
+            .cloned()
+        else {
+            (self.log)(&format!(
+                "arca: enroll_confirm by {} was refused: no approved enroll request of this token holds that approval",
+                caller.token_id
+            ));
+            return Err(refused(
+                "owner_approval",
+                "this is not the approval of an enroll request this token made and the owner approved: it was asked by another token, came from no request, is spent or has expired",
+            ));
+        };
+        kernel
+            .check_approval(ArcaAction::Enroll, target, call_args, approval, now)
+            .map_err(|refusal| {
+                (self.log)(&format!(
+                    "arca: enroll_confirm by {} was refused: {}",
+                    caller.token_id,
+                    crate::handlers::refusal_code(&refusal)
+                ));
+                refused("owner_approval", refusal.to_string())
+            })?;
+        // The spent approval's request loses its approval string now.
+        self.sweep(&mut inner, kernel, now);
+        let principal = format!("{}:{}", caller.scope.as_str(), caller.token_id);
+        // The request's own subject and requester, as its other audit lines name them.
+        let outcome = format!("confirmed:{}:{}", row.id, row.outcome());
+        audit(&mut inner.audit, now, &principal, ENROLLED_AUDIT, &outcome)
+            .map_err(|_| internal())?;
+        (self.log)(&format!(
+            "arca: enroll {target} confirmed for {}",
+            caller.token_id
+        ));
+        Ok(json!({ "confirmed": true }))
     }
 
     /// The page's `begin`: mints the statement the passkey signs for request `id` and keeps it on the request, replacing
@@ -957,7 +1044,7 @@ fn fields_of(
     let action = input["action"]
         .as_str()
         .filter(|action| ACTIONS.contains(action))
-        .ok_or_else(|| invalid("action must be delete, publish or spend"))?;
+        .ok_or_else(|| invalid("action must be delete, publish, spend or enroll"))?;
     let target = input["target"]
         .as_str()
         .filter(|target| valid_target(target))
@@ -966,6 +1053,9 @@ fn fields_of(
         return Err(invalid(
             "the target names a delete plan: a plan is approved through its own card on the passkey page, not through a request",
         ));
+    }
+    if action == ENROLL {
+        check_enroll(target, &input["args"])?;
     }
     let mut owned_args = input["args"].clone();
     let Some(object) = owned_args.as_object_mut() else {
@@ -1028,6 +1118,27 @@ fn fields_of(
         )));
     }
     Ok((subject, call_args.clone(), digest))
+}
+
+/// An `enroll` request's target and args: the code the person shows, and `{service: <name>}` alone.
+fn check_enroll(target: &str, args: &Value) -> Result<(), CallError> {
+    if !valid_enroll_code(target) {
+        return Err(invalid(
+            "an enroll target is the code the person shows: 6 to 12 uppercase letters and digits (^[A-Z0-9]{6,12}$)",
+        ));
+    }
+    let service = args
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("service"))
+        .and_then(Value::as_str)
+        .filter(|service| valid_target(service));
+    if service.is_none() {
+        return Err(invalid(
+            "enroll args are {service: <name>} and nothing else: the name of the service that makes the owner (^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$)",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `target` is a delete plan's: `plan-` and its 64-digit digest.
@@ -1324,7 +1435,7 @@ fn internal() -> CallError {
     CallError::Internal("the approval requests could not be read or saved".to_string())
 }
 
-/// The three verbs over the requests.
+/// The verbs over the requests, and `enroll_confirm`.
 pub struct ApprovalRequestHandler {
     pub verb: &'static str,
     pub kernel: Arc<Mutex<Kernel>>,
@@ -1363,6 +1474,11 @@ impl arca_mcp::ToolHandler for ApprovalRequestHandler {
                 self.requests
                     .status(&self.kernel, id, wait, caller, self.clock.as_ref())
             }
+            "enroll_confirm" => {
+                let mut kernel = self.kernel.lock().map_err(|_| internal())?;
+                self.requests
+                    .enroll_confirm(&mut kernel, &args, caller, (self.clock)())
+            }
             "owner_approval_list" => {
                 let kernel = self.kernel.lock().map_err(|_| internal())?;
                 let requests = self.requests.list(&kernel, (self.clock)())?;
@@ -1373,7 +1489,7 @@ impl arca_mcp::ToolHandler for ApprovalRequestHandler {
     }
 }
 
-/// The handlers of the three verbs, keyed by verb name.
+/// The handlers of the request verbs and `enroll_confirm`, keyed by verb name.
 pub fn handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: crate::handlers::Clock,
@@ -1383,6 +1499,7 @@ pub fn handlers(
         "owner_approval_request",
         "owner_approval_status",
         "owner_approval_list",
+        "enroll_confirm",
     ]
     .into_iter()
     .map(|verb| {

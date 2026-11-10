@@ -845,6 +845,55 @@ fn peer_keys_sync_is_served_only_to_a_node_that_keeps_another_machines_passkeys(
         !text.contains(&*scratch.0.display().to_string()),
         "no path reaches a status reader"
     );
+    // The single object's status is what it has always been: no list of sources beside it.
+    assert_eq!(
+        status["approval"],
+        json!({
+            "linkedHosts": [],
+            "trustedKeyFiles": [],
+            "peerKeys": { "from": "alpha", "keys": 0, "since": null, "reason": "no passkey has been synced from alpha yet" },
+        })
+    );
+    assert_eq!(serve.terminate().code(), Some(0));
+
+    // peerKeys as a list: the first source is still `peerKeys`, and `peerKeySources` reports every source.
+    let scratch = Scratch::new("peer-list");
+    let listed_rig = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let config = write_config(&scratch, listed_rig.shim.socket(), &hash_dir);
+    let mut cfg: Value =
+        serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+    cfg["approval"] = json!({ "peerKeys": [
+        { "from": "alpha", "origins": ["https://alpha.example.com:8443"] },
+        { "from": "cloud.example", "origins": ["https://cloud.example.com"] },
+    ] });
+    fs::write(&config, cfg.to_string()).expect("write the config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let doctor = secret_of(&secrets, "doctor-1");
+    let (listed, _) = doctor_sees_peer_keys_sync(&socket, doctor);
+    assert!(listed, "peer_keys_sync is listed");
+    let (_, text) = post(
+        &socket,
+        &[bearer(doctor)],
+        &call(3, "arca_status", json!({})),
+    );
+    let status = tool_result(&text);
+    conforming("arca_status", &status);
+    let first = json!({ "from": "alpha", "keys": 0, "since": null, "reason": "no passkey has been synced from alpha yet" });
+    assert_eq!(
+        status["approval"],
+        json!({
+            "linkedHosts": [],
+            "trustedKeyFiles": [],
+            "peerKeys": first,
+            "peerKeySources": [
+                first,
+                { "from": "cloud.example", "keys": 0, "since": null, "reason": "no passkey has been synced from cloud.example yet" },
+            ],
+        })
+    );
     assert_eq!(serve.terminate().code(), Some(0));
 }
 

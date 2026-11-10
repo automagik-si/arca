@@ -39,6 +39,9 @@ pub enum ArcaAction {
     InstanceStart,
     InstanceStop,
     InstanceRestart,
+    /// A service on this node may make the person showing a code one of its owners. The target is the code
+    /// ([`valid_enroll_code`]); the approval changes nothing in the kernel and is spent with `enroll_confirm`.
+    Enroll,
 }
 
 impl ArcaAction {
@@ -69,6 +72,7 @@ impl ArcaAction {
             Self::InstanceStart => "instance_start",
             Self::InstanceStop => "instance_stop",
             Self::InstanceRestart => "instance_restart",
+            Self::Enroll => "enroll",
         }
     }
 
@@ -99,6 +103,7 @@ impl ArcaAction {
             "instance_start" => Some(Self::InstanceStart),
             "instance_stop" => Some(Self::InstanceStop),
             "instance_restart" => Some(Self::InstanceRestart),
+            "enroll" => Some(Self::Enroll),
             _ => None,
         }
     }
@@ -281,7 +286,7 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
         bad(
             "action",
-            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_import, service_release, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop or instance_restart",
+            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_import, service_release, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop, instance_restart or enroll",
         )
     })?;
     let target = field("target");
@@ -289,6 +294,12 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
         return Err(bad(
             "target",
             "a name of 1 to 128 letters, digits, dots, dashes or underscores",
+        ));
+    }
+    if action == ArcaAction::Enroll && !valid_enroll_code(target) {
+        return Err(bad(
+            "target",
+            "an enroll code of 6 to 12 uppercase letters and digits",
         ));
     }
     let params_digest = field("paramsDigest");
@@ -357,6 +368,14 @@ pub(crate) fn valid_target(text: &str) -> bool {
         && bytes[1..]
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'_' || *b == b'-')
+}
+
+/// Whether `text` is an `enroll` approval's target, the code the person to be made an owner shows: `^[A-Z0-9]{6,12}$`.
+pub fn valid_enroll_code(text: &str) -> bool {
+    (6..=12).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 /// Whether `text` is between `min` and `max` lowercase hex digits.

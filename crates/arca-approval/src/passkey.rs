@@ -773,8 +773,9 @@ pub struct PasskeyVerifier {
     keys: Keys,
     /// Other kernels' passkeys files this one also trusts for approvals, read at each check. Empty by default.
     foreign: ForeignPasskeys,
-    /// Another machine's page host's passkeys kept in sync here, trusted for approvals and read at each check. None by default.
-    peer: Option<PeerPasskeys>,
+    /// Other machines' page hosts' passkeys kept in sync here, one value per source in the config's order, trusted for
+    /// approvals and read at each check. None by default.
+    peers: Vec<PeerPasskeys>,
 }
 
 enum Keys {
@@ -794,7 +795,7 @@ impl PasskeyVerifier {
                 counts: Mutex::new(counts),
             },
             foreign: ForeignPasskeys::default(),
-            peer: None,
+            peers: Vec::new(),
         }
     }
 
@@ -812,15 +813,21 @@ impl PasskeyVerifier {
 
     /// Also trusts, for approvals, the passkeys another machine's page host keeps in sync in `peer`. Like the foreign files,
     /// the sign-in route and the passkey list never see them. A refusing verifier keeps the value (so a sync can still be
-    /// answered) and still refuses every proof.
+    /// answered) and still refuses every proof. Called once per source, in the config's order: the first call names the
+    /// first source.
     pub fn with_peer(mut self, peer: PeerPasskeys) -> Self {
-        self.peer = Some(peer);
+        self.peers.push(peer);
         self
     }
 
-    /// The peer passkeys this verifier trusts, when the config keeps them.
+    /// The first source's peer passkeys, when the config keeps any.
     pub fn peer(&self) -> Option<&PeerPasskeys> {
-        self.peer.as_ref()
+        self.peers.first()
+    }
+
+    /// Every source's peer passkeys, in the config's order.
+    pub fn peers(&self) -> &[PeerPasskeys] {
+        &self.peers
     }
 
     /// A verifier for a passkeys file that could not be trusted or read: every passkey proof is refused with `refusal`, which
@@ -829,7 +836,7 @@ impl PasskeyVerifier {
         Self {
             keys: Keys::Refused(refusal),
             foreign: ForeignPasskeys::default(),
-            peer: None,
+            peers: Vec::new(),
         }
     }
 
@@ -884,7 +891,7 @@ impl PasskeyVerifier {
 
     /// Refuses in this order: a passkeys file that could not be trusted; a namespace other than Arca's; a proof that is not
     /// one strict proof; every check of [`verify_assertion`]; a sign count that does not advance, or a count that cannot be
-    /// made durable. With `foreign`, the lines of the trusted foreign files and the peer file are read now and added after the
+    /// made durable. With `foreign`, the lines of the trusted foreign files and the peer files are read now and added after the
     /// kernel's own; such a line never replaces an own line, or an earlier trusted one, with the same credential or key.
     ///
     /// Without `advance`, the count is checked as `advance` would check it and nothing is written: [`SignatureVerifier::peek`].
@@ -904,14 +911,14 @@ impl PasskeyVerifier {
             return Err(ApprovalRefusal::WrongNamespace);
         }
         let proof = parse_proof(signature)?;
-        let asserted = if foreign && (!self.foreign.is_empty() || self.peer.is_some()) {
+        let asserted = if foreign && (!self.foreign.is_empty() || !self.peers.is_empty()) {
             let mut all = lines.clone();
             let trusted = self
                 .foreign
                 .load()
                 .0
                 .into_iter()
-                .chain(self.peer.iter().flat_map(|peer| peer.load().0.into_iter()));
+                .chain(self.peers.iter().flat_map(|peer| peer.load().0.into_iter()));
             for line in trusted {
                 if !all.iter().any(|own| {
                     own.credential_id == line.credential_id || own.fingerprint == line.fingerprint

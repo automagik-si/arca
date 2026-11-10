@@ -237,6 +237,11 @@
   .action-fact dt { flex: none; width: 6.5rem; color: var(--arca-muted); font-size: var(--arca-text-sm); }
   .action-fact dd { min-width: 0; margin: 0; font-weight: 550; overflow-wrap: anywhere; }
   .action-fact code { font-size: var(--arca-text-sm); }
+  .enroll-code {
+    margin: 0 0 var(--arca-space-4); padding: var(--arca-space-3); border: 1px solid var(--arca-line);
+    border-radius: var(--arca-radius, 8px); text-align: center; font-family: ui-monospace, monospace;
+    font-size: 2.25rem; font-weight: 700; letter-spacing: 0.18em; overflow-wrap: anywhere;
+  }
   .actions { display: flex; gap: var(--arca-space-2); }
   .actions .approve { flex: 1; }
 
@@ -694,8 +699,15 @@ function requestCard(request) {
   expiry.append(icon("clock"), expiryText(expiresAt));
   meta.append(el("span", "badge", "Request"), expiry);
 
-  const title = (REQUEST_WORDS[fields.action] || String(fields.action)) + " " + String(fields.target);
+  const args = request.args && typeof request.args === "object" ? request.args : {};
+  // An enroll request: the owner compares the code, shown large, with the one the person in front of them shows.
+  const enroll = fields.action === "enroll";
+  const title = enroll
+    ? "Approve " + String(args.service) + " to make the person showing code " + String(fields.target) + " an owner"
+    : (REQUEST_WORDS[fields.action] || String(fields.action)) + " " + String(fields.target);
   const heading = el("h3", "", title);
+  const code = enroll ? el("p", "enroll-code", String(fields.target)) : null;
+  if (code) code.setAttribute("aria-label", "Code " + String(fields.target).split("").join(" "));
   const facts = el("dl", "action-facts");
   const fact = (label, value, code) => {
     const row = el("div", "action-fact");
@@ -707,7 +719,6 @@ function requestCard(request) {
   };
   const requester = request.requester || {};
   fact("Asked by", String(requester.name) + " (" + String(requester.kind) + ")", false);
-  const args = request.args && typeof request.args === "object" ? request.args : {};
   for (const [key, value] of Object.entries(args)) {
     fact(key, typeof value === "string" ? value : JSON.stringify(value), true);
   }
@@ -725,7 +736,7 @@ function requestCard(request) {
   denyButton.addEventListener("click", () => denyRequest(request, denyButton));
   buttons.append(approveButton, denyButton);
 
-  card.append(meta, heading, facts, buttons);
+  card.append(meta, heading, ...(code ? [code] : []), facts, buttons);
   return card;
 }
 
