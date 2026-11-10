@@ -595,7 +595,8 @@ snapshot storage. It is gated like every snapshot: the owner approves it with th
 
 When the proposal is made the kernel resolves the folder and binds into the owner's digest: the folder's path (absolute,
 trailing `/` dropped), the UUID of the file system it is on (`fsUuid`, from `lsblk`), its size in bytes of regular files
-(`size`), the bytes its paths take on disk (`allocated`: their blocks, so a sparse file counts only what is written), its
+(`size`), the space its paths take (`allocated`: each file's size or its blocks, whichever is larger, so a compressed
+source is not undercounted; the blocks of everything else), its
 number of files and folders (`files`), the folders it could not open (`unreadable`), the separate file systems inside it
 (`separate`, up to 100 paths, and `separateCount`), the target pool, and the pool's free space (`poolFree`, shown only).
 The measurement only reads names and sizes: it does not follow links, stays on the folder's own file system (a disk
@@ -642,8 +643,8 @@ The kernel runs as an unprivileged user and never copies the bytes. Incus does, 
    storage, else the default profile's root pool; with neither, the snapshot is refused (`HelperPoolMissing`). Only the
    volume is on the snapshot pool. The
    folder is a read-only disk at `/src` with `shift=true` (owners kept), the volume is at `/dst` with `limits.read=150MB`
-   and `limits.write=80MB`. Incus needs a block device under the volume's pool to apply the caps. It refuses them without
-   naming them: on a host whose pool sat on a tmpfs it answered `Invalid block device "tmpfs"`. So any refusal of the
+   and `limits.write=80MB`. Incus refuses the caps on some pools, without naming them: one host answered `Invalid block
+   device "tmpfs"`, and they were refused on an ext4-backed pool too. So any refusal of the
    helper's create or start with the caps on is logged, and the helper is made once more without them. The copy is then
    not left unthrottled: `tar` pauses one second after every 7800 records (about 80 MB), so it reads at most about
    80 MB/s. The answer's `ioCaps` and `io` (`incus-caps` or `throttled-by-tar`), the manifest's `io`, and a verified
@@ -658,15 +659,25 @@ The kernel runs as an unprivileged user and never copies the bytes. Incus does, 
    - **The copy.** `tar -C /src --null --no-recursion --sparse --ignore-failed-read --numeric-owner --acls --xattrs -T -`
      copies exactly that list (and `/src` itself) into `tar -C /dst --numeric-owner --same-owner --acls --xattrs -xpf -`.
      This keeps owners, modes, times, symlinks, hard links, fifos, sparse files, ACLs and extended attributes.
+   - **No `--sparse` when a file takes no blocks.** If any regular file with bytes in it takes no blocks (inline data,
+     a FUSE folder), `--sparse` would copy it as zeros. The copy then runs without `--sparse`, and the manifest says
+     `sparse: false`. The answer gets `sparse: false` and a note: sparse files take their full size.
    - **Skipped.** Sockets cannot be copied (apps make them again), and an unprivileged helper cannot make device nodes.
      Both are left out of the copy and of both counts, and counted as skipped.
    - **Separate file systems** inside the folder are not copied (`-xdev`). The kernel's list of them is recorded.
-   - **Changes.** A file that changed, shrank or vanished while `tar` read it (`tar` exit 1, or its warnings) is a change,
-     not a failure.
+   - **Changes and read errors.** With `--ignore-failed-read`, `tar`'s exit code does not tell a vanished file from a
+     failing disk, so its messages and the listing's decide.
+     - These messages are changes, not failures: `file changed as we read it`, `File removed before we read it`,
+       `Cannot stat/open: No such file or directory`, `File shrank by N bytes; padding with zeros`, and `find`'s
+       `No such file or directory`. They are matched against an anchored allow-list.
+     - Any other message is a read error: for example `Read error at byte ...` (EIO), or `Permission denied`.
+     - A failed listing with no vanished folder to explain it is also a read error.
+     - A read error makes the copy incomplete, and the reason quotes the first message.
    - **Counts.** Both sides are then counted: every path, and the bytes of regular files.
-   - **The manifest.** `/dst/.arca-manifest.json` is written: `{version: 2, snapshot, sourcePath, fsUuid, started,
+   - **The manifest.** `/dst/.arca-manifest.json` is written: `{version: 3, snapshot, sourcePath, fsUuid, started,
      finished, source: {paths, bytes}, copy: {paths, bytes}, skipped: {sockets, devices}, changed: {files, head},
-     separate: {count, paths}, io, tar: {list, read, write}}`. `head` holds the first ten change messages.
+     readErrors: {lines, head}, separate: {count, paths}, io, sparse, tar: {list, read, write}}`. Each `head` holds the
+     first ten messages.
 4. The helper is stopped (forcibly, waiting until it reads back stopped, since a failed start can leave it held) and
    deleted on every exit path; a delete refused as running is stopped and retried once.
    - **Verified.** Only when both sides counted the same does the volume get `user.arcasnapshot.verified=true`, with

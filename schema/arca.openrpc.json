@@ -4496,6 +4496,9 @@
             "snapshot": {
               "type": "string"
             },
+            "sparse": {
+              "type": "boolean"
+            },
             "state": {
               "enum": [
                 "copied",
@@ -4764,6 +4767,9 @@
             },
             "snapshot": {
               "type": "string"
+            },
+            "sparse": {
+              "type": "boolean"
             },
             "state": {
               "enum": [

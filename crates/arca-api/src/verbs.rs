@@ -2151,6 +2151,7 @@ fn snapshot_change_result() -> Value {
         ),
         ("separate", false, array(string())),
         ("separateCount", false, int()),
+        ("sparse", false, boolean()),
         ("notes", false, array(string())),
     ])
 }

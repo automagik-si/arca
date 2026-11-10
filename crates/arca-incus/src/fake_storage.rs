@@ -21,8 +21,8 @@
 //! deleted, and a stopped one cannot be stopped again, as in Incus. As on a real host, a failed start leaves the instance
 //! reading back as stopped while Incus still holds it, so a delete is refused until it is stopped; and an instance whose
 //! root disk is on a snapshot pool fails to start, since its unprivileged root cannot walk that pool's folder; and one with
-//! `limits.read`/`limits.write` on a disk on a `dir` pool fails to start with `Invalid block device "tmpfs"` (Incus finds
-//! no block device under the pool's folder to cap; a real host answered that with the pool on a tmpfs). A fetch of an
+//! `limits.read`/`limits.write` on a disk on a `dir` pool fails to start with `Invalid block device "tmpfs"` (Incus
+//! refuses the caps on some pools; this is one answer a real host gave). A fetch of an
 //! image can be made to lose a race with another ([`FakeStorageIncus::race_next_image`]), and an instance delete can be
 //! failed ([`FakeStorageIncus::fail_next_delete`]).
 //!

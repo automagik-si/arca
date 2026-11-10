@@ -2282,7 +2282,8 @@ const FOLDER_KEYS: [&str; 8] = [
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FolderMeasure {
     pub bytes: u64,
-    /// The blocks the measured paths take, in bytes (sparse files count only what is written).
+    /// The space the measured paths take, in bytes: each file's size or its blocks, whichever is larger (a compressed
+    /// source takes fewer blocks than its copy), and the blocks of everything else.
     pub allocated: u64,
     pub paths: u64,
     pub unreadable: u64,
@@ -2327,12 +2328,15 @@ pub fn measure_folder(folder: &str) -> FolderMeasure {
                 out.separate.push(path.to_string_lossy().into_owned());
                 continue;
             }
-            out.allocated = out
-                .allocated
-                .saturating_add(meta.blocks().saturating_mul(512));
+            let blocks = meta.blocks().saturating_mul(512);
             if meta.is_file() {
                 out.bytes = out.bytes.saturating_add(meta.len());
-            } else if meta.is_dir() {
+                // The larger of the two: a compressed source (ZFS, btrfs) takes fewer blocks than its copy will.
+                out.allocated = out.allocated.saturating_add(blocks.max(meta.len()));
+            } else {
+                out.allocated = out.allocated.saturating_add(blocks);
+            }
+            if meta.is_dir() {
                 stack.push(path);
             }
         }
@@ -2489,6 +2493,11 @@ fn copy_notes(outcome: &FolderOutcome, copy: &FolderCopy) -> Vec<String> {
             "{} separate file system(s) inside the folder were not copied; snapshot them separately",
             copy.separate_count
         ));
+    }
+    if outcome.without_sparse {
+        notes.push(
+            "some files with data take no blocks on disk (inline data or a FUSE folder), so the copy ran without sparse-file handling and sparse files take their full size".to_string(),
+        );
     }
     if let Some(reason) = &outcome.reason {
         notes.push(reason.clone());
@@ -3666,6 +3675,7 @@ impl StorageActionHandler {
                     "sockets": outcome.skipped_sockets,
                     "devices": outcome.skipped_devices,
                 });
+                done["sparse"] = json!(!outcome.without_sparse);
                 done["separate"] = json!(copy.separate);
                 done["separateCount"] = json!(copy.separate_count);
                 let notes = copy_notes(&outcome, &copy);
@@ -4178,8 +4188,8 @@ mod tests {
         assert_eq!(measured.paths, if running_as_root { 7 } else { 6 });
         assert_eq!(measured.unreadable, u64::from(!running_as_root));
         assert!(
-            measured.allocated > 0 && measured.allocated < holes,
-            "a sparse file counts its blocks, not its length: {measured:?}"
+            measured.allocated >= measured.bytes,
+            "each file counts at least its size, so a compressed source is not undercounted: {measured:?}"
         );
         assert!(measured.separate.is_empty());
         std::fs::set_permissions(root.join("closed"), std::fs::Permissions::from_mode(0o755))

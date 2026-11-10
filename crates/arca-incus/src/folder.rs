@@ -4,7 +4,7 @@
 //! The kernel runs as an unprivileged user and never copies bytes itself. Incus does the work, in four steps:
 //!
 //! 1. A custom volume named after the snapshot is made on the snapshot pool ([`folder_volume_body`]), sized at 1.2 times
-//!    the folder's space estimate ([`space_estimate`]: the blocks its files take on disk plus 4 KiB per path; at least
+//!    the folder's space estimate ([`space_estimate`]: each file's size or blocks, whichever is larger, plus 4 KiB per path; at least
 //!    1 GiB), or with no size limit when some folders could not be measured, with `security.shifted=true` so the files keep
 //!    their real owners on disk, and with the usual `user.arcasnapshot.*` marks (source kind `folder`, the source path,
 //!    the file system UUID it lives on, when it was made).
@@ -60,7 +60,7 @@ pub const CHANGED_KEY: &str = "user.arcasnapshot.changed-during-copy";
 pub const SKIPPED_SOCKETS_KEY: &str = "user.arcasnapshot.skipped-sockets";
 /// On a verified folder snapshot: the device nodes left out of the copy (an unprivileged helper cannot make them).
 pub const SKIPPED_DEVICES_KEY: &str = "user.arcasnapshot.skipped-devices";
-/// The space each path is allowed on top of its blocks in [`space_estimate`] (its inode and folder entry).
+/// The space each path is allowed on top of its measured space in [`space_estimate`] (its inode and folder entry).
 pub const PATH_ALLOWANCE: u64 = 4096;
 /// The manifest at the top of a folder snapshot's volume.
 pub const MANIFEST_NAME: &str = ".arca-manifest.json";
@@ -91,10 +91,17 @@ const COPY_WAIT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub const RESTART_REASON: &str =
     "the copy stopped when Arca restarted; delete it and take the snapshot again";
 
+/// The messages of the listing and of `tar` that mean a file changed, shrank or vanished while it was read: anchored, so
+/// that any other message (a read error such as `Read error at byte ...`) is a failure. [`COPY_SCRIPT`] holds the same
+/// pattern; a test keeps the two equal.
+pub const CHANGE_MESSAGES: &str = "^tar: .*: (file changed as we read it|File removed before we read it|(Warning: )?Cannot (stat|open): No such file or directory|File shrank by [0-9]+ bytes; padding with zeros)$|^find: .*: No such file or directory$";
+
 /// The shell functions [`COPY_SCRIPT`] is built on, apart so a test can run them alone. `listed DIR [find actions]` walks
 /// what is copied: every path on the folder's own file system below `DIR`, without a top-level `lost+found`, the manifest,
 /// sockets and device nodes. `count DIR` prints its paths and the bytes of its regular files; `skipped DIR` prints the
-/// sockets and device nodes left out.
+/// sockets and device nodes left out; `zero_blocks DIR` succeeds when a regular file with bytes in it takes no blocks
+/// (inline data, FUSE, sysfs), which `tar --sparse` would copy as zeros. `classify FILE` reads the listing's and
+/// `tar`'s messages: the ones on [`CHANGE_MESSAGES`] are changes, every other line is a read error.
 macro_rules! copy_functions {
     () => {
         r#"listed() {
@@ -104,6 +111,22 @@ macro_rules! copy_functions {
 count() {
   listed "$1" -printf '%y %s\n' \
     | awk 'BEGIN { n = 0; b = 0 } { n++ } $1 == "f" { b += $2 } END { printf "%.0f %.0f\n", n, b }'
+}
+zero_blocks() {
+  listed "$1" -type f -size +0c -printf '%b\n' | awk '$1 == 0 { z = 1 } END { exit !z }'
+}
+json_lines() {
+  head -n 10 | LC_ALL=C awk 'BEGIN { printf "[" }
+    { sub(/^(tar|find): /, ""); gsub(/[^ -~]|["\\]/, "?"); printf "%s\"%s\"", (NR > 1 ? "," : ""), $0 }
+    END { printf "]" }'
+}
+changes='^tar: .*: (file changed as we read it|File removed before we read it|(Warning: )?Cannot (stat|open): No such file or directory|File shrank by [0-9]+ bytes; padding with zeros)$|^find: .*: No such file or directory$'
+classify() {
+  changed=$(grep -cE "$changes" "$1" || true)
+  changed_head=$(grep -E "$changes" "$1" | json_lines)
+  errors=$(grep -vE "$changes" "$1" | grep -c . || true)
+  errors_head=$(grep -vE "$changes" "$1" | grep . | json_lines)
+  vanished=$(grep -cE '^find: .*: No such file or directory$' "$1" || true)
 }
 skipped() {
   find "$1" -mindepth 1 -xdev \( -path "$1/lost+found" -o -path "$1/.arca-manifest.json" \) -prune \
@@ -121,14 +144,18 @@ skipped() {
 ///
 /// `find` lists what is copied ([`copy_functions`]) and `tar` copies exactly that list (`--sparse`, owners, modes, times,
 /// links, ACLs and extended attributes), so sockets and device nodes are left out of the copy and of both counts alike,
-/// and counted as skipped. A file that changed or vanished while it was read is a change, not a failure: the count of
-/// them and the first ten messages go in the manifest. The manifest is printed as the last line. Exit 0, 20 when reading
-/// the folder failed, 21 when writing the copy failed, 22 when the command could not start.
+/// and counted as skipped. Without `--sparse` when a file with bytes takes no blocks.
+///
+/// `tar` runs with `--ignore-failed-read`, so its exit code does not tell a failing read from a vanished file; its
+/// messages do. A message on the anchored allow-list [`CHANGE_MESSAGES`] (a file changed, shrank or vanished while it
+/// was read) is a change, not a failure: the count of them and the first ten go in the manifest. Any other message of the
+/// listing or of `tar` (`Read error at byte ...`, a permission refusal) is a read error, and so is a listing that failed
+/// without a vanished folder to explain it. The manifest is printed as the last line. Exit 0, 20 when reading the folder
+/// failed, 21 when writing the copy failed, 22 when the command could not start.
 pub const COPY_SCRIPT: &str = concat!(
     "set -u -o pipefail\nsrc=\"${ARCA_SRC:-/src}\"\ndst=\"${ARCA_DST:-/dst}\"\n",
     copy_functions!(),
-    r#"changes='file changed as we read it|File removed before we read it|No such file or directory|File shrank by'
-throttle=()
+    r#"throttle=()
 io=incus-caps
 if [ "${ARCA_THROTTLE:-0}" = 1 ]; then
   throttle=(--checkpoint="${ARCA_THROTTLE_RECORDS:-7800}" --checkpoint-action=sleep=1)
@@ -138,11 +165,17 @@ separate="${ARCA_SEPARATE:-}"
 if [ -z "$separate" ]; then separate='{"count":0,"paths":[]}'; fi
 errs=$(mktemp) || exit 22
 started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+sparse=(--sparse)
+sparse_used=true
+if zero_blocks "$src"; then
+  sparse=()
+  sparse_used=false
+fi
 set -- $(skipped "$src")
 skipped_sockets=${1:-0}
 skipped_devices=${2:-0}
 { printf '.\0'; listed "$src" -printf '%P\0'; } 2>>"$errs" \
-  | tar -cf - -C "$src" --null --no-recursion --sparse --ignore-failed-read --numeric-owner --acls --xattrs \
+  | tar -cf - -C "$src" --null --no-recursion "${sparse[@]}" --ignore-failed-read --numeric-owner --acls --xattrs \
       --xattrs-include='*' "${throttle[@]}" -T - 2>>"$errs" \
   | tar -C "$dst" --numeric-owner --same-owner --acls --xattrs --xattrs-include='*' -xpf -
 codes=("${PIPESTATUS[@]}")
@@ -150,15 +183,12 @@ list_code=${codes[0]}
 read_code=${codes[1]:-2}
 write_code=${codes[2]:-1}
 cat "$errs" >&2
-changed=$(grep -cE "$changes" "$errs" || true)
-changed_head=$(grep -E "$changes" "$errs" | head -n 10 | LC_ALL=C awk 'BEGIN { printf "[" }
-  { sub(/^(tar|find): /, ""); gsub(/[^ -~]|["\\]/, "?"); printf "%s\"%s\"", (NR > 1 ? "," : ""), $0 }
-  END { printf "]" }')
+classify "$errs"
 rm -f "$errs"
 if [ "$read_code" -eq 1 ] && [ "${changed:-0}" -eq 0 ]; then changed=1; fi
 read_failed=0
-if [ "$read_code" -gt 1 ]; then read_failed=1; fi
-if [ "$list_code" -ne 0 ] && [ "${changed:-0}" -eq 0 ]; then read_failed=1; fi
+if [ "$read_code" -gt 1 ] || [ "${errors:-0}" -gt 0 ]; then read_failed=1; fi
+if [ "$list_code" -ne 0 ] && [ "${vanished:-0}" -eq 0 ]; then read_failed=1; fi
 set -- $(count "$src")
 src_paths=${1:-0}
 src_bytes=${2:-0}
@@ -166,10 +196,11 @@ set -- $(count "$dst")
 dst_paths=${1:-0}
 dst_bytes=${2:-0}
 finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-manifest=$(printf '{"version":2,"snapshot":"%s","sourcePath":%s,"fsUuid":%s,"started":"%s","finished":"%s","source":{"paths":%s,"bytes":%s},"copy":{"paths":%s,"bytes":%s},"skipped":{"sockets":%s,"devices":%s},"changed":{"files":%s,"head":%s},"separate":%s,"io":"%s","tar":{"list":%s,"read":%s,"write":%s}}' \
+manifest=$(printf '{"version":3,"snapshot":"%s","sourcePath":%s,"fsUuid":%s,"started":"%s","finished":"%s","source":{"paths":%s,"bytes":%s},"copy":{"paths":%s,"bytes":%s},"skipped":{"sockets":%s,"devices":%s},"changed":{"files":%s,"head":%s},"readErrors":{"lines":%s,"head":%s},"separate":%s,"io":"%s","sparse":%s,"tar":{"list":%s,"read":%s,"write":%s}}' \
   "$ARCA_SNAPSHOT" "$ARCA_SOURCE" "$ARCA_FS_UUID" "$started" "$finished" \
   "$src_paths" "$src_bytes" "$dst_paths" "$dst_bytes" "$skipped_sockets" "$skipped_devices" \
-  "${changed:-0}" "${changed_head:-[]}" "$separate" "$io" "$list_code" "$read_code" "$write_code")
+  "${changed:-0}" "${changed_head:-[]}" "${errors:-0}" "${errors_head:-[]}" "$separate" "$io" "$sparse_used" \
+  "$list_code" "$read_code" "$write_code")
 printf '%s\n' "$manifest" > "$dst/.arca-manifest.json" && chmod 0644 "$dst/.arca-manifest.json"
 printf '%s\n' "$manifest"
 if [ "$read_failed" -eq 1 ]; then exit 20; fi
@@ -197,7 +228,7 @@ pub struct FolderCopy {
     pub size: u64,
     /// The paths measured when the proposal was made.
     pub paths: u64,
-    /// The bytes the measured paths take on disk (their blocks), when the proposal was made.
+    /// The space the measured paths take (each file's size or blocks, whichever is larger), when the proposal was made.
     pub allocated: u64,
     /// The folders that could not be opened when the proposal was made; with any, the volume gets no size limit.
     pub unreadable: u64,
@@ -213,8 +244,8 @@ pub struct FolderCopy {
 /// How many separate file systems a folder snapshot names (the card shows the first ten).
 pub const SEPARATE_SHOWN: usize = 100;
 
-/// The space a folder's copy may take: the blocks its paths take on disk plus [`PATH_ALLOWANCE`] for each path. Sparse
-/// files count only their written blocks, as `tar --sparse` writes them; a hard link counts once per name.
+/// The space a folder's copy may take: the measured space of its paths (each file's size or blocks, whichever is larger)
+/// plus [`PATH_ALLOWANCE`] for each path. A hard link counts once per name.
 pub fn space_estimate(allocated: u64, paths: u64) -> u64 {
     allocated.saturating_add(paths.saturating_mul(PATH_ALLOWANCE))
 }
@@ -271,6 +302,10 @@ pub struct FolderOutcome {
     pub skipped_sockets: u64,
     /// The device nodes left out of the copy.
     pub skipped_devices: u64,
+    /// The first messages that made reading the folder fail (anything not on [`CHANGE_MESSAGES`]).
+    pub read_errors: Vec<String>,
+    /// The copy ran without `--sparse`, since some file with bytes took no blocks.
+    pub without_sparse: bool,
 }
 
 impl FolderOutcome {
@@ -448,26 +483,37 @@ pub fn judge(code: i64, stdout: &str, io_caps: bool) -> FolderOutcome {
             .and_then(Value::as_u64)
             .unwrap_or(0)
     };
-    let mut outcome = FolderOutcome {
-        source: counts.map(|(source, _)| source),
-        copy: counts.map(|(_, copy)| copy),
-        io_caps,
-        changed: number("/changed/files"),
-        changed_head: manifest
-            .pointer("/changed/head")
+    let lines = |pointer: &str| -> Vec<String> {
+        manifest
+            .pointer(pointer)
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .take(10)
             .map(|line| line.chars().take(300).collect())
-            .collect(),
+            .collect()
+    };
+    let mut outcome = FolderOutcome {
+        source: counts.map(|(source, _)| source),
+        copy: counts.map(|(_, copy)| copy),
+        io_caps,
+        changed: number("/changed/files"),
+        changed_head: lines("/changed/head"),
         skipped_sockets: number("/skipped/sockets"),
         skipped_devices: number("/skipped/devices"),
+        read_errors: lines("/readErrors/head"),
+        without_sparse: manifest.pointer("/sparse") == Some(&Value::Bool(false)),
         ..FolderOutcome::default()
     };
     let reason = match (code, counts) {
-        (20, _) => Some("reading the folder failed".to_string()),
+        (20, _) => Some(match outcome.read_errors.first() {
+            Some(first) => format!(
+                "reading the folder failed ({} message(s); the first: {first})",
+                number("/readErrors/lines").max(1)
+            ),
+            None => "reading the folder failed".to_string(),
+        }),
         (21, _) => Some("writing the copy failed (is the snapshot storage full?)".to_string()),
         (22, _) => Some("the copy command could not start".to_string()),
         (0, Some((source, copy))) if source == copy => None,
@@ -607,8 +653,8 @@ impl SnapshotWriter {
     }
 
     /// Makes, checks and starts the helper, with the read/write caps when Incus takes them. Returns whether it has them.
-    /// Incus's refusal of the caps does not name them (on a pool whose backing file system is not a block device it
-    /// answered `Invalid block device "tmpfs"`), so any refusal of the create or the start with the caps on makes the
+    /// Incus refuses the caps on some pools, without naming them (one host answered `Invalid block device "tmpfs"`, and
+    /// they were refused on an ext4-backed pool too), so any refusal of the create or the start with the caps on makes the
     /// helper once more without them, and `tar` then throttles itself. Only the writer's own refusals, made before
     /// anything is sent, are not retried.
     fn start_helper(&self, copy: &FolderCopy) -> Result<bool, String> {
@@ -1240,7 +1286,9 @@ mod tests {
             .arg(src.join("sub/pipe"))
             .status()
             .is_ok_and(|status| status.success());
-        std::fs::File::create(src.join("holes"))
+        // Some data and then a hole: a file with bytes but no blocks would turn --sparse off (see zero_blocks).
+        std::fs::write(src.join("holes"), vec![9u8; 4096])
+            .and_then(|()| std::fs::File::options().write(true).open(src.join("holes")))
             .and_then(|file| file.set_len(64 << 20))
             .expect("a sparse file");
         let xattr = std::process::Command::new("setfattr")
@@ -1326,7 +1374,159 @@ mod tests {
         assert_eq!(manifest["skipped"], json!({ "sockets": 1, "devices": 0 }));
         assert_eq!(manifest["separate"]["paths"], json!(["/x/mnt"]));
         assert_eq!(manifest["io"], json!("throttled-by-tar"));
+        assert_eq!(
+            manifest["sparse"],
+            json!(true),
+            "every file with bytes takes blocks"
+        );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The real program `name` on `PATH`, for a stub to hand over to.
+    fn real_program(name: &str) -> Option<std::path::PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    /// Runs [`COPY_SCRIPT`] from a small scratch tree into an empty folder, with `stubs` (name, shell body) put first on
+    /// `PATH`. A stub's body gets `$REAL`, the real program. Returns the exit code and the outcome as judged.
+    fn copy_with_stubs(tag: &str, stubs: &[(&str, &str)]) -> Option<(i32, FolderOutcome)> {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("arca-folder-stub-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (src, dst, bin) = (root.join("src"), root.join("dst"), root.join("bin"));
+        for dir in [&src.join("sub"), &dst, &bin] {
+            std::fs::create_dir_all(dir).expect("a folder");
+        }
+        std::fs::write(src.join("a.txt"), b"hello").expect("a file");
+        std::fs::write(src.join("sub/b.txt"), b"world").expect("a file");
+        for (name, body) in stubs {
+            let real = real_program(name)?;
+            let path = bin.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nREAL='{}'\n{body}\n", real.display()),
+            )
+            .expect("a stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("bash")
+            .args(["-c", COPY_SCRIPT])
+            .env("PATH", path)
+            .env("LC_ALL", "C")
+            .env("ARCA_SRC", &src)
+            .env("ARCA_DST", &dst)
+            .env("ARCA_SNAPSHOT", "folder--x--20261109T1405")
+            .env("ARCA_SOURCE", "\"/x\"")
+            .env("ARCA_FS_UUID", "\"u\"")
+            .output()
+            .expect("bash runs");
+        let code = out.status.code().unwrap_or(-1);
+        let outcome = judge(i64::from(code), &String::from_utf8_lossy(&out.stdout), true);
+        let _ = std::fs::remove_dir_all(&root);
+        Some((code, outcome))
+    }
+
+    /// `--ignore-failed-read` lets `tar` zero-fill a file it could not read and exit 0. Only the anchored change messages
+    /// are changes: a read error (EIO) from `tar`, or any `find` error other than a vanished path, makes the copy
+    /// incomplete and the reason quotes it. A vanished path or a changed file is a change on a verified copy.
+    #[test]
+    fn a_read_error_tar_or_find_survives_is_a_failure_and_only_changes_are_allowed() {
+        if real_program("tar").is_none() || real_program("find").is_none() {
+            eprintln!("tar or find is not on PATH here; nothing to check");
+            return;
+        }
+        let creating = r#"case " $* " in *" -cf "*) "$REAL" "$@"; code=$?; MESSAGE; exit $code;; esac
+exec "$REAL" "$@""#;
+        let eio = creating.replace(
+            "MESSAGE",
+            "echo 'tar: sub/b.txt: Read error at byte 0, while reading 5 bytes: Input/output error' >&2",
+        );
+        let (code, outcome) = copy_with_stubs("eio", &[("tar", &eio)]).expect("ran");
+        assert_eq!(code, 20, "{outcome:?}");
+        assert!(!outcome.verified);
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Read error at byte 0")),
+            "{outcome:?}"
+        );
+
+        let denied = r#""$REAL" "$@"; echo "find: '$1/locked': Permission denied" >&2; exit 1"#;
+        let (code, outcome) = copy_with_stubs("denied", &[("find", denied)]).expect("ran");
+        assert_eq!(code, 20, "{outcome:?}");
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Permission denied")),
+            "{outcome:?}"
+        );
+
+        let vanished =
+            r#""$REAL" "$@"; echo "find: '$1/gone': No such file or directory" >&2; exit 1"#;
+        let (code, outcome) = copy_with_stubs("vanished", &[("find", vanished)]).expect("ran");
+        assert_eq!(code, 0, "{outcome:?}");
+        assert!(outcome.verified, "{outcome:?}");
+        assert_eq!(outcome.changed, 1);
+
+        let changed = creating
+            .replace(
+                "MESSAGE",
+                "echo 'tar: sub/b.txt: file changed as we read it' >&2",
+            )
+            .replace("exit $code", "exit 1");
+        let (code, outcome) = copy_with_stubs("changed", &[("tar", &changed)]).expect("ran");
+        assert_eq!(code, 0, "{outcome:?}");
+        assert!(outcome.verified, "{outcome:?}");
+        assert_eq!(outcome.changed, 1);
+        assert_eq!(
+            outcome.changed_head,
+            vec!["sub/b.txt: file changed as we read it"]
+        );
+
+        // A listing that failed with nothing to say is a failure too.
+        let silent = r#""$REAL" "$@"; exit 1"#;
+        let (code, _) = copy_with_stubs("silent", &[("find", silent)]).expect("ran");
+        assert_eq!(code, 20);
+    }
+
+    /// The allow-list in the script is the documented one, and a file with bytes but no blocks (sysfs here; inline data
+    /// or FUSE on a real folder) is found, so the copy runs without `--sparse` rather than copying zeros.
+    #[test]
+    fn the_change_allow_list_is_one_and_files_without_blocks_turn_sparse_off() {
+        assert!(COPY_SCRIPT.contains(&format!("changes='{CHANGE_MESSAGES}'")));
+        let sysfs = "/sys/kernel/mm";
+        if std::fs::read_dir(sysfs).is_err() {
+            eprintln!("{sysfs} is not here; nothing to check");
+            return;
+        }
+        let script = concat!(
+            copy_functions!(),
+            "zero_blocks \"$1\" && echo none || echo all\n"
+        );
+        let run = |dir: &str| {
+            let out = std::process::Command::new("bash")
+                .args(["-c", script, "zero_blocks", dir])
+                .output()
+                .expect("bash runs");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run(sysfs), "none", "sysfs files report bytes but no blocks");
+        let judged = judge(
+            0,
+            r#"{"source":{"paths":1,"bytes":1},"copy":{"paths":1,"bytes":1},"sparse":false}"#,
+            true,
+        );
+        assert!(judged.verified && judged.without_sparse, "{judged:?}");
     }
 
     /// Device nodes cannot be made here without privilege, so the walk is checked on the host's own `/dev`: they are left

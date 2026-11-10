@@ -2385,7 +2385,7 @@ fn a_helper_incus_refuses_the_io_caps_for_is_made_again_without_them() {
 /// out.
 fn manifest_with_changes(paths: u64, bytes: u64) -> String {
     format!(
-        "{{\"version\":2,\"source\":{{\"paths\":{paths},\"bytes\":{bytes}}},\"copy\":{{\"paths\":{paths},\"bytes\":{bytes}}},\"skipped\":{{\"sockets\":2,\"devices\":1}},\"changed\":{{\"files\":3,\"head\":[\"./a.txt: file changed as we read it\"]}},\"io\":\"incus-caps\",\"tar\":{{\"list\":0,\"read\":1,\"write\":0}}}}\n"
+        "{{\"version\":2,\"source\":{{\"paths\":{paths},\"bytes\":{bytes}}},\"copy\":{{\"paths\":{paths},\"bytes\":{bytes}}},\"skipped\":{{\"sockets\":2,\"devices\":1}},\"changed\":{{\"files\":3,\"head\":[\"./a.txt: file changed as we read it\"]}},\"io\":\"incus-caps\",\"sparse\":false,\"tar\":{{\"list\":0,\"read\":1,\"write\":0}}}}\n"
     )
 }
 
@@ -2426,6 +2426,12 @@ fn a_copy_whose_files_changed_while_read_is_ready_and_says_so() {
         notes
             .iter()
             .any(|note| note.contains("2 socket(s) and 1 device node(s)"))
+    );
+    assert_eq!(result["sparse"], json!(false));
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("without sparse-file handling"))
     );
 
     let name = folder_name(&folder);

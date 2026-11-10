@@ -54,7 +54,12 @@ fn build_source(source: &Path) -> bool {
     }
     std::os::unix::fs::symlink("docs/report.bin", source.join("report-link")).expect("a link");
     drop(std::os::unix::net::UnixListener::bind(source.join("app.sock")).expect("a socket"));
-    std::fs::File::create(source.join("docs/holes"))
+    std::fs::write(source.join("docs/holes"), vec![9u8; 4096])
+        .and_then(|()| {
+            std::fs::File::options()
+                .write(true)
+                .open(source.join("docs/holes"))
+        })
         .and_then(|file| file.set_len(64 << 20))
         .expect("a sparse file");
     std::fs::hard_link(
