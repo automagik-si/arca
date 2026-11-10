@@ -1,6 +1,6 @@
 {
   "name": "workspace-vm",
-  "description": "A plain Debian 13 workspace virtual machine from the public images server (images.linuxcontainers.org), for a bridged node: 2 CPUs, 4GiB of memory and a 20GiB root disk on the node's configured pool, with one NIC on an existing host bridge. It gets its address from that bridge's own network.",
+  "description": "A plain Debian 13 workspace virtual machine from the public images server (images.linuxcontainers.org): 2 CPUs, 4GiB of memory and a 20GiB root disk on the node's pool, with one NIC. On a node with the managed service network it gets an address from Arca's network; with a bridge named, it joins that host bridge and gets its address from the bridge's own network.",
   "kind": "virtual-machine",
   "image": "images:debian/13",
   "limits": { "cpu": "2", "memory": "4GiB" },

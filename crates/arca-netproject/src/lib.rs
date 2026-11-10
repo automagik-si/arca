@@ -1,5 +1,7 @@
-//! The shared service project and its bridge, owned by one desired-state entry. On a bridged node the project is made
-//! alone, by [`BridgedProject`]: no network, no profile.
+//! The shared service project and its bridge. The project is owned by the entry that first needed it: [`NetProject`] when
+//! the node's first service used the managed network, [`BridgedProject`] when it was a virtual machine on a host bridge.
+//! A node that later gains the other network keeps the one project, and its owner widens it (Rules 52 and 53 of the
+//! ownership document).
 use arca_kernel::{
     desired::PluginId,
     journal::EffectClass,
@@ -20,7 +22,16 @@ pub struct NetProjectConfig {
     pub project: String,
     pub bridge: String,
     pub cidr: String,
+    /// The project's `limits.virtual-machines`: `0` until the node's first virtual machine, then the node's cap.
     pub virtual_machines: u32,
+    /// The project is the bridged entry's ([`BridgedProject`]): this entry makes the bridge and the profile, and never
+    /// writes the project. An entry an earlier kernel wrote has no such key and owns its project.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shared_project: bool,
+    /// The project's NICs may name a host bridge: `restricted.devices.nic` is `allow` and the bridge grant is gone. Set
+    /// with the node's first virtual machine on a host bridge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_bridges: bool,
 }
 pub struct NetProject;
 
@@ -113,11 +124,36 @@ pub struct BridgedProjectConfig {
     pub cpu: u32,
     pub memory: String,
     pub disk: String,
+    /// The node also has the managed service network, so the project holds containers too: no container cap, no
+    /// aggregate CPU, memory or disk cap (Incus would count the containers against them), and proxy devices allowed. Set
+    /// with the node's first service on the managed network. An entry an earlier kernel wrote has no such key.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
 }
 
-/// The service project of a bridged node. It creates the project and nothing else: no Incus network, no profile. The
-/// project lets a NIC name a host bridge (`restricted.devices.nic=allow`), which the provider grants to this entry alone,
-/// and carries the node's caps as `limits.*`. Nothing changes the project after its create: new caps are set by hand.
+/// The `limits.*` keys a bridged-only project carries and a project that also holds containers does not.
+const BRIDGED_ONLY_LIMITS: [&str; 4] = [
+    "limits.containers",
+    "limits.cpu",
+    "limits.memory",
+    "limits.disk",
+];
+
+fn project_ref(project: &str) -> arca_kernel::ownership::ObjectRef {
+    arca_kernel::ownership::ObjectRef {
+        kind: IncusKind::Project,
+        project: project.into(),
+        parent: None,
+        name: project.into(),
+        uuid: None,
+    }
+}
+
+/// The service project of a node whose first service was a virtual machine on a host bridge. It creates the project and
+/// nothing else: no Incus network, no profile. The project lets a NIC name a host bridge
+/// (`restricted.devices.nic=allow`) and carries the node's caps as `limits.*`. While `managed` is unset nothing changes
+/// the project after its create: new caps are set by hand. With `managed` the project is widened once, by a journaled
+/// config write, so the managed service network's containers fit in it.
 pub struct BridgedProject;
 
 impl Plugin for BridgedProject {
@@ -139,28 +175,50 @@ impl Plugin for BridgedProject {
                 "the bridged entry owns the service project".into(),
             ));
         }
-        // `observed` refuses a project another entry made, so a node that already has the managed service network is
-        // never turned into a bridged one.
-        if observed(
+        // `observed` refuses a project another entry made: a project the managed network's entry owns is widened by that
+        // entry, never by this one.
+        let current = observed(
             ctx,
             format!("/1.0/projects/{}?project={}", cfg.project, cfg.project),
-        )?
-        .is_none()
-        {
-            create(
+        )?;
+        let Some(current) = current else {
+            let mut config = json!({
+                "restricted.devices.nic": "allow",
+                "limits.virtual-machines": cfg.virtual_machines.to_string()
+            });
+            if cfg.managed {
+                config["restricted.devices.proxy"] = json!("allow");
+            } else {
+                config["limits.containers"] = json!("0");
+                config["limits.cpu"] = json!(cfg.cpu.to_string());
+                config["limits.memory"] = json!(cfg.memory);
+                config["limits.disk"] = json!(cfg.disk);
+            }
+            return create(
                 ctx,
                 IncusKind::Project,
                 &cfg.project,
                 &cfg.project,
-                json!({"name": cfg.project, "config": {
-                    "restricted.devices.nic": "allow",
-                    "limits.containers": "0",
-                    "limits.virtual-machines": cfg.virtual_machines.to_string(),
-                    "limits.cpu": cfg.cpu.to_string(),
-                    "limits.memory": cfg.memory,
-                    "limits.disk": cfg.disk
-                }}),
-            )?;
+                json!({"name": cfg.project, "config": config}),
+            );
+        };
+        if !cfg.managed {
+            return Ok(());
+        }
+        let mut changes = std::collections::BTreeMap::new();
+        for key in BRIDGED_ONLY_LIMITS {
+            if current["config"].get(key).is_some() {
+                changes.insert(key.to_string(), None);
+            }
+        }
+        if current["config"]["restricted.devices.proxy"].as_str() != Some("allow") {
+            changes.insert("restricted.devices.proxy".into(), Some("allow".into()));
+        }
+        if !changes.is_empty() {
+            ctx.effect(EffectOp::IncusPatchConfig {
+                object: project_ref(&cfg.project),
+                config: changes,
+            })?;
         }
         Ok(())
     }
@@ -201,31 +259,51 @@ impl Plugin for NetProject {
                 json!({"name":cfg.bridge,"type":"bridge","config":{"ipv4.address":format!("{gateway}/24"),"ipv4.nat":"true","ipv6.address":"none"}}),
             )?;
         }
-        let project = observed(
-            ctx,
-            format!("/1.0/projects/{}?project={}", cfg.project, cfg.project),
-        )?;
-        if let Some(project) = project {
-            if project["config"]["restricted.devices.proxy"].as_str() != Some("allow") {
+        if !cfg.shared_project {
+            let project = observed(
+                ctx,
+                format!("/1.0/projects/{}?project={}", cfg.project, cfg.project),
+            )?;
+            let virtual_machines = cfg.virtual_machines.to_string();
+            let config = match project {
+                Some(project) => project["config"].clone(),
+                None => {
+                    let config = json!({"limits.virtual-machines":virtual_machines,"restricted.networks.access":cfg.bridge,"restricted.devices.proxy":"allow"});
+                    create(
+                        ctx,
+                        IncusKind::Project,
+                        &cfg.project,
+                        &cfg.project,
+                        json!({"name":cfg.project,"config":config}),
+                    )?;
+                    config
+                }
+            };
+            let mut changes = std::collections::BTreeMap::new();
+            if config["restricted.devices.proxy"].as_str() != Some("allow") {
+                changes.insert("restricted.devices.proxy".into(), Some("allow".into()));
+            }
+            // `0` is what every project was created with before a node could hold both kinds: it is never written back
+            // over a value set by hand.
+            if cfg.virtual_machines != 0
+                && config["limits.virtual-machines"].as_str() != Some(virtual_machines.as_str())
+            {
+                changes.insert("limits.virtual-machines".into(), Some(virtual_machines));
+            }
+            if cfg.host_bridges {
+                if config["restricted.devices.nic"].as_str() != Some("allow") {
+                    changes.insert("restricted.devices.nic".into(), Some("allow".into()));
+                }
+                if config.get("restricted.networks.access").is_some() {
+                    changes.insert("restricted.networks.access".into(), None);
+                }
+            }
+            if !changes.is_empty() {
                 ctx.effect(EffectOp::IncusPatchConfig {
-                    object: arca_kernel::ownership::ObjectRef {
-                        kind: IncusKind::Project,
-                        project: cfg.project.clone(),
-                        parent: None,
-                        name: cfg.project.clone(),
-                        uuid: None,
-                    },
-                    config: [("restricted.devices.proxy".into(), Some("allow".into()))].into(),
+                    object: project_ref(&cfg.project),
+                    config: changes,
                 })?;
             }
-        } else {
-            create(
-                ctx,
-                IncusKind::Project,
-                &cfg.project,
-                &cfg.project,
-                json!({"name":cfg.project,"config":{"limits.virtual-machines":cfg.virtual_machines.to_string(),"restricted.networks.access":cfg.bridge,"restricted.devices.proxy":"allow"}}),
-            )?;
         }
         if observed(
             ctx,

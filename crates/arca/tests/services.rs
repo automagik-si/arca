@@ -1249,10 +1249,41 @@ fn a_failed_start_keeps_the_created_instance_record_and_secrets() {
     template["env"] = json!({"TOKEN":"{{secret:TOKEN}}"});
     rig.template("nats", template);
     rig.fake.fail_instance_start_on_create();
+    // The refusal carries Incus's own reason, says what is left on the node, and names the way forward both ways.
+    match rig.call("service_create", json!({"name":"nats","template":"nats"})) {
+        Err(CallError::Refused { message, .. }) => assert_eq!(
+            message,
+            "start service nats: the instance was created, and Incus did not start it: Failed starting instance. Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it"
+        ),
+        other => panic!("{other:?}"),
+    }
+    // The effect journal holds the create as applied, with the instance's delete as its inverse: no intent is left open
+    // to block the next effect or to be guessed at after a restart.
+    let (records, torn) =
+        arca_kernel::journal::read_journal(&rig.dir.join(arca::kernel::JOURNAL_FILE)).unwrap();
+    assert!(torn.is_none());
+    let mut last = std::collections::BTreeMap::new();
+    for record in &records {
+        last.insert(record.id, record);
+    }
     assert!(
-        matches!(rig.call("service_create", json!({"name":"nats","template":"nats"})),
-        Err(CallError::Refused { message, .. }) if message == "start service nats (created and stopped; service_remove removes it)")
+        last.values()
+            .all(|record| record.state != arca_kernel::journal::EffectState::Intent),
+        "no dangling intent"
     );
+    let created = last
+        .values()
+        .find(|record| {
+            record.object.as_ref().is_some_and(|object| {
+                object.kind == arca_kernel::ownership::IncusKind::Instance && object.name == "nats"
+            })
+        })
+        .expect("the instance's create");
+    assert_eq!(created.state, arca_kernel::journal::EffectState::Applied);
+    assert!(matches!(
+        created.inverse,
+        Some(arca_kernel::journal::Inverse::IncusDelete { .. })
+    ));
     assert!(
         rig.entries()
             .iter()

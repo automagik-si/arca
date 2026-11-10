@@ -38,7 +38,7 @@ use arca_kernel::ownership::{
 };
 pub use arca_kernel::plugin::Retirement;
 use arca_kernel::plugin::{
-    EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, op_digest,
+    EffectOp, EffectRefusal, Landed, Observe, Planned, Provider, ReadBack, op_digest,
 };
 use serde_json::{Map, Value, json};
 
@@ -87,21 +87,42 @@ pub const NETWORK_ACCESS_KEY: &str = "restricted.networks.access";
 /// a `raw.*` key, DNS and every other key is refused.
 const BRIDGE_KEYS: [&str; 3] = ["ipv4.address", "ipv4.nat", "ipv6.address"];
 
-// Only the service network entry may grant proxy devices, and only in its own project.
+/// The two entries that may own the service project: the managed network's and the bridged project's. Whichever made the
+/// project widens it when the node gains the other network (Rules 52 and 53 of the ownership document).
+const SERVICE_PROJECT: &str = "arcak-svc";
+const NET_ENTRY: &str = "net-arcak-svc";
+const BRIDGED_ENTRY: &str = "bridged-arcak-svc";
+
+// Only an entry that may own the service project may grant proxy devices, and only in that project.
 fn service_proxy_allowance(entry: &EntryId, project: &str, key: &str, value: Option<&str>) -> bool {
-    entry.0 == "net-arcak-svc"
-        && project == "arcak-svc"
+    (entry.0 == NET_ENTRY || entry.0 == BRIDGED_ENTRY)
+        && project == SERVICE_PROJECT
         && key == "restricted.devices.proxy"
         && value == Some("allow")
 }
 
-// Only the bridged project entry may let a NIC name a host bridge Incus does not manage, only in its own project, and only
-// when that project is created. No patch sets the key.
-fn bridged_nic_allowance(entry: &EntryId, project: &str, key: &str, value: Option<&str>) -> bool {
-    entry.0 == "bridged-arcak-svc"
-        && project == "arcak-svc"
+// Only an entry that may own the service project may let a NIC name a host bridge Incus does not manage, and only in that
+// project: the bridged entry when it creates the project, the network entry by a patch when its node gains host bridges.
+fn host_nic_allowance(
+    entry: &EntryId,
+    project: &str,
+    key: &str,
+    value: Option<&str>,
+    create: bool,
+) -> bool {
+    entry.0 == if create { BRIDGED_ENTRY } else { NET_ENTRY }
+        && project == SERVICE_PROJECT
         && key == "restricted.devices.nic"
         && value == Some("allow")
+}
+
+// Only the network entry may drop the service project's bridge grant, with the patch that allows host-bridge NICs: Incus
+// checks a host bridge against the grant, and the grant may list only bridges the entry made.
+fn bridge_grant_removal(entry: &EntryId, project: &str, key: &str, value: Option<&str>) -> bool {
+    entry.0 == NET_ENTRY
+        && project == SERVICE_PROJECT
+        && key == NETWORK_ACCESS_KEY
+        && value.is_none()
 }
 
 /// Whether a project key is guarded: `restricted`, any `restricted.*` key, and any `features.*` key.
@@ -469,8 +490,8 @@ impl IncusProvider {
                 .collect();
             // A plugin may set a guarded key only to the value the kernel pins it at. Any other guarded key, pinned or not,
             // would loosen the project, so it is refused before any request. Bridge grants are checked name by name;
-            // the service network entry alone may also allow proxy devices in its own project, and the bridged project
-            // entry alone may allow NICs on a host bridge in its own project.
+            // an entry that may own the service project may also allow proxy devices there, and the bridged project
+            // entry may allow NICs on a host bridge there.
             for (key, set) in &config {
                 if key == NETWORK_ACCESS_KEY {
                     let list = set.as_str().ok_or_else(|| {
@@ -482,7 +503,7 @@ impl IncusProvider {
                 if service_proxy_allowance(entry, project, key, set.as_str()) {
                     continue;
                 }
-                if bridged_nic_allowance(entry, project, key, set.as_str()) {
+                if host_nic_allowance(entry, project, key, set.as_str(), true) {
                     continue;
                 }
                 if !guarded_project_key(key) {
@@ -835,6 +856,65 @@ impl IncusProvider {
         })
     }
 
+    /// The settled refusal for a create whose request failed. A refusal before the write is final. A failed create is
+    /// recorded as failed only when Incus answered with a status error and a GET of the name then answers 404. One case
+    /// more is settled, as [`EffectRefusal::Landed`]: an instance whose create asked for a start, that Incus answered a
+    /// status error for, and that now reads as stopped and as the entry's own, with no operation still at work on it.
+    /// Incus creates and then starts, and a failed start leaves the instance stopped, so the create landed and the start
+    /// did not: the effect is journalled as applied and the plugin is told Incus's reason. Any other failure, including a
+    /// transport, decode, timeout or wait failure, leaves the outcome unknown, since the answer says nothing about
+    /// whether the create landed.
+    fn settle_create(
+        &self,
+        writer: &UnixIncusWriter,
+        target: &ObjectRef,
+        sent: &Value,
+        error: IncusError,
+    ) -> EffectRefusal {
+        match error {
+            IncusError::Refused(reason) => EffectRefusal::Provider(reason),
+            IncusError::Status { message, .. } => match writer.get_etag(target) {
+                Err(IncusError::Status { code: 404, .. }) => {
+                    EffectRefusal::Provider("the create did not land".to_string())
+                }
+                Ok((found, _))
+                    if target.kind == IncusKind::Instance
+                        && sent.get("start") != Some(&Value::Bool(false))
+                        && found["status"].as_str() == Some("Stopped") =>
+                {
+                    if self.settle_operations(target).is_err() {
+                        return EffectRefusal::Unresolved;
+                    }
+                    match writer.read_owned(target) {
+                        Ok(owned) if owned.uuid().is_some() && owned.tombstone().is_none() => {
+                            let object = ObjectRef {
+                                uuid: owned.uuid().map(str::to_string),
+                                ..target.clone()
+                            };
+                            EffectRefusal::Landed(Box::new(Landed {
+                                inverse: Inverse::IncusDelete {
+                                    object: object.clone(),
+                                },
+                                object,
+                                why: format!(
+                                    "the instance was created, and Incus did not start it: {}",
+                                    message.trim()
+                                ),
+                            }))
+                        }
+                        _ => EffectRefusal::Unresolved,
+                    }
+                }
+                _ => EffectRefusal::Unresolved,
+            },
+            IncusError::Io(_)
+            | IncusError::Decode(_)
+            | IncusError::Timeout
+            | IncusError::TooLarge
+            | IncusError::AppliedUnconfirmed(_) => EffectRefusal::Unresolved,
+        }
+    }
+
     /// The settled outcome of a patch whose request failed. A refusal before the write is final. A 412 is a stale plan, and changes
     /// nothing. An answer that could not be read, an unconfirmed write and a timeout are unresolved with no read-back: an operation
     /// still running can apply after a read that shows the pre-image. Any other error is settled by a read-back. A patch the
@@ -1178,7 +1258,7 @@ impl Provider for IncusProvider {
                         };
                         Ok((object.clone(), Inverse::IncusDelete { object }))
                     }
-                    Err(error) => Err(settle_create(&writer, &target, error)),
+                    Err(error) => Err(self.settle_create(&writer, &target, &sent, error)),
                 }
             }
             EffectOp::IncusPatchConfig { object, config } => {
@@ -1467,27 +1547,6 @@ pub fn host_addresses(read: &dyn IncusRead) -> Result<Vec<IpAddr>, EffectRefusal
     Ok(found)
 }
 
-/// The settled refusal for a create whose request failed. A refusal before the write is final. A failed create is recorded as
-/// failed only when Incus answered with a status error and a GET of the name then answers 404. Any other failure, including a
-/// transport, decode, timeout or wait failure, leaves the outcome unknown, since the answer says nothing about whether the create
-/// landed.
-fn settle_create(writer: &UnixIncusWriter, target: &ObjectRef, error: IncusError) -> EffectRefusal {
-    match error {
-        IncusError::Refused(reason) => EffectRefusal::Provider(reason),
-        IncusError::Status { .. } => match writer.get_etag(target) {
-            Err(IncusError::Status { code: 404, .. }) => {
-                EffectRefusal::Provider("the create did not land".to_string())
-            }
-            _ => EffectRefusal::Unresolved,
-        },
-        IncusError::Io(_)
-        | IncusError::Decode(_)
-        | IncusError::Timeout
-        | IncusError::TooLarge
-        | IncusError::AppliedUnconfirmed(_) => EffectRefusal::Unresolved,
-    }
-}
-
 /// The settled outcome of a tombstone Incus refused with a 4xx other than 412. A 4xx is Incus's refusal of the request, so the
 /// object is read back to see it. One that shows no tombstone of this plan, or is gone, was not tombstoned, so no delete followed
 /// and the retirement is a settled [`Retirement::Drift`]: the delete's intent is failed, not left open, and a later removal tries
@@ -1541,8 +1600,9 @@ fn apply_changes(
 }
 
 /// The keys a change may name: plain, and never the kernel's tombstone or Incus's own `volatile` namespace. On a project, no
-/// guarded key except the service project's proxy allowance. The plan refuses them before any read, so a refused change
-/// sends no request.
+/// guarded key except the widening of the service project by an entry that may own it: its proxy allowance, and for the
+/// network entry the host-bridge NIC allowance with the removal of the bridge grant. The plan refuses them before any
+/// read, so a refused change sends no request.
 fn check_patch_keys(
     entry: &EntryId,
     object: &ObjectRef,
@@ -1552,6 +1612,8 @@ fn check_patch_keys(
         if object.kind == IncusKind::Project
             && guarded_project_key(key)
             && !service_proxy_allowance(entry, &object.project, key, value.as_deref())
+            && !host_nic_allowance(entry, &object.project, key, value.as_deref(), false)
+            && !bridge_grant_removal(entry, &object.project, key, value.as_deref())
         {
             return Err(EffectRefusal::Provider(
                 "a plugin may not change a restricted or features key on a project".to_string(),

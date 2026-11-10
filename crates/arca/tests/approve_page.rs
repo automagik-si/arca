@@ -382,11 +382,22 @@ struct CountingAction {
 }
 
 impl ToolHandler for CountingAction {
-    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
         self.runs.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({ "created": true }))
+        // Two names stand for a create that fails after the approval: one refused in words, one that breaks inside.
+        match args["name"].as_str() {
+            Some("stuck") => Err(CallError::Refused {
+                code: "refused".to_string(),
+                message: STUCK.to_string(),
+            }),
+            Some("broken") => Err(CallError::Internal("a detail nobody is shown".to_string())),
+            _ => Ok(json!({ "created": true })),
+        }
     }
 }
+
+/// What the stand-in create answers for the service `stuck`: the words a real create whose start failed uses.
+const STUCK: &str = "start service stuck: the instance was created, and Incus did not start it: Failed starting instance. Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it";
 
 const TEST_CHAT_IDLE: Duration = Duration::from_millis(600);
 const TEST_CHAT_TOTAL: Duration = Duration::from_secs(3);
@@ -591,12 +602,16 @@ impl Rig {
     }
 
     fn waiting_action(&self) -> Value {
+        self.waiting_action_named("nats")
+    }
+
+    fn waiting_action_named(&self, name: &str) -> Value {
         let now = self.clock.load(Ordering::SeqCst);
         let mut kernel = self.kernel.lock().expect("the kernel lock");
         let proposal = kernel
             .propose_action(
                 arca::action_proposal::ActionKind::ServiceCreate,
-                json!({ "name": "nats", "template": "nats" }),
+                json!({ "name": name, "template": "nats" }),
                 now,
                 None,
             )
@@ -1222,6 +1237,69 @@ fn a_passkey_approval_runs_an_action_proposal_exactly_once() {
         1,
         "the action did not run again"
     );
+}
+
+/// F4: an approval that Arca accepted, for an action that then failed, answers with the action's own message, keeps it
+/// in the proposals journal and retires the card, so the page has words to show in place of its spinner.
+#[test]
+fn an_approved_action_that_fails_answers_its_message_and_journals_it() {
+    let (rig, key) = Rig::new("page-action-failed", true);
+    for (name, code, message) in [
+        (
+            "stuck",
+            "refused",
+            format!("The approval was accepted, but service_create did not complete: {STUCK}"),
+        ),
+        (
+            "broken",
+            "Internal",
+            "The approval was accepted, but service_create did not complete: Arca hit an internal error while running it".to_string(),
+        ),
+    ] {
+        rig.waiting_action_named(name);
+        let action = rig.action_from_page();
+        let id = action["id"].as_str().expect("an id").to_string();
+        let statement = action["statement"].as_str().expect("a statement");
+        let body = json!({ "plan": id, "approval": approval(&key, statement) });
+        let (status, answer) = rig.post("/approve/approve", Some(ORIGIN), body);
+        assert_eq!(status, 403, "{name}");
+        let answer: Value = serde_json::from_slice(&answer).expect("a JSON answer, never an empty one");
+        assert_eq!(answer, json!({ "refusal": code, "message": message }), "{name}");
+        assert!(message.starts_with(arca::handlers::APPROVED_BUT_FAILED));
+
+        // The kernel's own state directory is the scratch root, one level above the page's.
+        let journal = fs::read_to_string(
+            rig.state_dir
+                .parent()
+                .expect("the scratch root")
+                .join("action-proposals.jsonl"),
+        )
+        .expect("the proposals journal");
+        let result: Value = journal
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .rfind(|event| event["event"] == "result" && event["id"] == json!(id))
+            .expect("a result event");
+        assert_eq!(
+            result,
+            json!({ "event": "result", "proposal": null, "id": id, "ok": false, "code": code, "message": message }),
+            "{name}"
+        );
+        let (_, listed) = rig.get("/approve/plans", None);
+        let listed: Value = serde_json::from_slice(&listed).expect("plans JSON");
+        assert_eq!(listed["plans"], json!([]), "the spent proposal is gone: {name}");
+    }
+    assert_eq!(rig.action_runs.load(Ordering::SeqCst), 2);
+
+    // The page shows a message that begins this way in full. Its script and the handler share the words.
+    let (status, page) = rig.get("/approve", None);
+    assert_eq!(status, 200);
+    let page = String::from_utf8(page).expect("the page is text");
+    assert!(page.contains(&format!(
+        "const APPROVED_BUT_FAILED = \"{}\";",
+        arca::handlers::APPROVED_BUT_FAILED
+    )));
+    assert!(page.contains("body.message.startsWith(APPROVED_BUT_FAILED)"));
 }
 
 #[test]

@@ -361,7 +361,10 @@ impl Kernel {
     /// Journals how work an approved action left running ended (a folder snapshot copied in the background): `ok` with
     /// `SnapshotCopied`, or a failure code. The newest result for the id is this one.
     pub fn journal_late_result(&mut self, id: &str, ok: bool, code: &str) {
-        if let Err(error) = self.action_proposals.journal_result(id, ok, Some(code)) {
+        if let Err(error) = self
+            .action_proposals
+            .journal_result(id, ok, Some(code), None)
+        {
             eprintln!("arca: the late result of action proposal {id} was not journalled: {error}");
         }
     }
@@ -377,8 +380,12 @@ impl Kernel {
         approved: &ApprovedAction,
         ok: bool,
         code: Option<&str>,
+        message: Option<&str>,
     ) {
-        if let Err(error) = self.action_proposals.journal_result(&approved.id, ok, code) {
+        if let Err(error) = self
+            .action_proposals
+            .journal_result(&approved.id, ok, code, message)
+        {
             eprintln!(
                 "arca: the result of action proposal {} was not journalled: {error}",
                 approved.id

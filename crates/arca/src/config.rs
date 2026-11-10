@@ -185,10 +185,23 @@ pub struct KernelConfig {
     /// writes them.
     #[serde(default)]
     pub attach_networks: Vec<String>,
-    /// Bridged mode: this node runs virtual-machine services on host bridges that already exist, and Arca creates no
-    /// Incus network on it. It excludes `serviceCidr`.
+    /// The host bridges, which already exist, that a virtual machine's NIC may name. Without `serviceCidr` the node is
+    /// bridged: it runs virtual machines only and Arca creates no Incus network on it. With `serviceCidr` it is mixed.
     #[serde(default)]
     pub bridged: Option<BridgedConfig>,
+    /// The virtual-machine caps of a node with `serviceCidr` and no `bridged`. A node with `bridged` states them there.
+    #[serde(default)]
+    pub vm_limits: Option<BridgedLimits>,
+}
+
+impl KernelConfig {
+    /// The caps on all of Arca's virtual machines on this node, or `None` on a node that may create none.
+    pub fn vm_caps(&self) -> Option<&BridgedLimits> {
+        match &self.bridged {
+            Some(bridged) => Some(&bridged.limits),
+            None => self.vm_limits.as_ref(),
+        }
+    }
 }
 
 /// The `kernel.bridged` key: the host bridges a virtual machine's NIC may name, and the storage pool its root disk is on.
@@ -202,8 +215,8 @@ pub struct BridgedConfig {
     pub limits: BridgedLimits,
 }
 
-/// The `kernel.bridged.limits` key: what all of Arca's virtual machines on this node may use together. Every cap is
-/// required. They are set on the project when it is created, and Arca checks them before every create.
+/// The `kernel.bridged.limits` and `kernel.vmLimits` keys: what all of Arca's virtual machines on this node may use
+/// together. Every cap is required. Arca checks them before every create.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BridgedLimits {
@@ -484,17 +497,45 @@ fn dns_name_ok(name: &str) -> bool {
         })
 }
 
+/// The caps rule: `virtualMachines` and `cpu` of at least 1, `memory` and `disk` as sizes.
+fn limits_ok(limits: &BridgedLimits) -> bool {
+    limits.virtual_machines != 0
+        && limits.cpu != 0
+        && crate::service::size_bytes(&limits.memory).is_some()
+        && crate::service::size_bytes(&limits.disk).is_some()
+}
+
+/// The `kernel.vmLimits` rules: it states the caps of a node that has the managed service network and no
+/// `kernel.bridged`, so the caps are stated once.
+fn check_vm_limits(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    let Some(limits) = &kernel.vm_limits else {
+        return Ok(());
+    };
+    if kernel.bridged.is_some() {
+        return Err(ConfigError::Bridged(
+            "kernel.vmLimits and kernel.bridged.limits are the same caps: a node with kernel.bridged states them there only",
+        ));
+    }
+    if kernel.service_cidr.is_none() {
+        return Err(ConfigError::Bridged(
+            "kernel.vmLimits needs kernel.serviceCidr: a virtual machine joins the managed network or a bridge of kernel.bridged",
+        ));
+    }
+    if !limits_ok(limits) {
+        return Err(ConfigError::Bridged(
+            "vmLimits must set virtualMachines and cpu of at least 1, and memory and disk as sizes such as 64GiB",
+        ));
+    }
+    Ok(())
+}
+
 /// The bridged rules: at least one bridge, each a host interface name listed once and never the service bridge Arca
-/// manages; a plain pool name; no service /24 and no scratch run.
+/// manages; a plain pool name; every cap; no scratch run. `kernel.serviceCidr` may be set beside it: the node is then mixed.
 fn check_bridged(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    check_vm_limits(kernel)?;
     let Some(bridged) = &kernel.bridged else {
         return Ok(());
     };
-    if kernel.service_cidr.is_some() {
-        return Err(ConfigError::Bridged(
-            "a bridged node has no kernel.serviceCidr: Arca creates no network on it",
-        ));
-    }
     if kernel.scratch {
         return Err(ConfigError::Bridged(
             "kernel.scratch must be false on a bridged node",
@@ -517,12 +558,7 @@ fn check_bridged(kernel: &KernelConfig) -> Result<(), ConfigError> {
             "pool must be the name of an Incus storage pool",
         ));
     }
-    let limits = &bridged.limits;
-    if limits.virtual_machines == 0
-        || limits.cpu == 0
-        || crate::service::size_bytes(&limits.memory).is_none()
-        || crate::service::size_bytes(&limits.disk).is_none()
-    {
+    if !limits_ok(&bridged.limits) {
         return Err(ConfigError::Bridged(
             "limits must set virtualMachines and cpu of at least 1, and memory and disk as sizes such as 64GiB",
         ));
@@ -788,6 +824,51 @@ mod tests {
     }
 
     #[test]
+    fn vm_limits_are_the_caps_of_a_managed_node_without_host_bridges() {
+        use serde_json::json;
+        let managed = |extra: serde_json::Value| {
+            let mut kernel = json!({ "bridged": null, "serviceCidr": "192.0.2.0/24" });
+            kernel
+                .as_object_mut()
+                .expect("kernel")
+                .extend(extra.as_object().expect("extra").clone());
+            bridged(kernel)
+        };
+        assert_eq!(managed(json!({})), Ok(()));
+        assert_eq!(managed(json!({ "vmLimits": LIMITS.clone() })), Ok(()));
+        // Without the managed network a virtual machine has nowhere to go but a bridge of kernel.bridged.
+        assert!(matches!(
+            managed(json!({ "vmLimits": LIMITS.clone(), "serviceCidr": null })),
+            Err(ConfigError::Bridged(_))
+        ));
+        assert!(matches!(
+            managed(
+                json!({ "vmLimits": { "virtualMachines": 0, "cpu": 8, "memory": "64GiB", "disk": "1TiB" } })
+            ),
+            Err(ConfigError::Bridged(_))
+        ));
+        assert!(matches!(
+            managed(json!({ "vmLimits": { "virtualMachines": 1, "cpu": 8, "memory": "64GiB" } })),
+            Err(ConfigError::Parse(_))
+        ));
+        let config = |kernel: serde_json::Value| -> KernelConfig {
+            serde_json::from_value(kernel).expect("kernel")
+        };
+        let caps = |kernel: serde_json::Value| config(kernel).vm_caps().map(|caps| caps.cpu);
+        assert_eq!(caps(json!({ "droiddProjects": [] })), None);
+        assert_eq!(
+            caps(json!({ "droiddProjects": [], "vmLimits": LIMITS.clone() })),
+            Some(8)
+        );
+        assert_eq!(
+            caps(
+                json!({ "droiddProjects": [], "bridged": { "bridges": ["br0"], "pool": "p", "limits": LIMITS.clone() } })
+            ),
+            Some(8)
+        );
+    }
+
+    #[test]
     fn a_bridged_node_is_refused_unless_every_rule_holds() {
         use serde_json::json;
         let limits = LIMITS.clone();
@@ -825,8 +906,11 @@ mod tests {
             Err(ConfigError::Parse(_))
         ));
         assert_eq!(bridged(json!({})), Ok(()));
+        // The managed network beside the host bridges is a mixed node. Its caps are the bridged ones, stated once.
+        assert_eq!(bridged(json!({ "serviceCidr": "192.0.2.0/24" })), Ok(()));
         let refused = [
-            json!({ "serviceCidr": "192.0.2.0/24" }),
+            json!({ "serviceCidr": "192.0.2.0/24", "vmLimits": limits }),
+            json!({ "scratch": true }),
             json!({ "bridged": { "bridges": [], "pool": "vmpool", "limits": limits } }),
             json!({ "bridged": { "bridges": ["br0", "br0"], "pool": "vmpool", "limits": limits } }),
             json!({ "bridged": { "bridges": ["br0,br1"], "pool": "vmpool", "limits": limits } }),

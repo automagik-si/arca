@@ -131,6 +131,19 @@ pub enum EffectRefusal {
     Provider(String),
     /// The provider cannot tell whether its write landed. The intent stays open and is not journalled as failed.
     Unresolved,
+    /// The write landed and the object is the entry's own, but the request did not finish: an instance that was created
+    /// and then failed to start. [`Ctx::effect`] journals the effect as applied, so no intent stays open and a removal
+    /// deletes the object, and hands the plugin `why` as a [`EffectRefusal::Provider`] refusal. No plugin ever sees this
+    /// variant.
+    Landed(Box<Landed>),
+}
+
+/// A write that landed without finishing: the object it made, the inverse that undoes it, and why it did not finish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Landed {
+    pub object: ObjectRef,
+    pub inverse: Inverse,
+    pub why: String,
 }
 
 impl fmt::Display for EffectRefusal {
@@ -143,6 +156,7 @@ impl fmt::Display for EffectRefusal {
             Self::Stale => f.write_str("the object changed after it was planned"),
             Self::Provider(why) => f.write_str(why),
             Self::Unresolved => f.write_str("the outcome is not known; the intent stays open"),
+            Self::Landed(landed) => f.write_str(&landed.why),
         }
     }
 }
@@ -409,24 +423,33 @@ impl<'a> Ctx<'a> {
             )
         }
         .map_err(journal_refusal)?;
+        // Journals an effect that landed. An answer for another object, or with another inverse, leaves the intent open.
+        let mut landed = |object: &ObjectRef, inverse: Inverse| {
+            if !same_place(object, &target) {
+                return Err(EffectRefusal::Provider(
+                    "the provider answered for another object; the intent stays open".to_string(),
+                ));
+            }
+            if required_inverse(&op, object, &planned).as_ref() != Some(&inverse) {
+                return Err(EffectRefusal::Provider(
+                    "the provider's inverse is not the one the op requires; the intent stays open"
+                        .to_string(),
+                ));
+            }
+            self.journal
+                .applied(id, object.clone(), inverse)
+                .map_err(journal_refusal)
+        };
         match self.provider.effect(&self.entry, &op, &planned) {
             Ok((object, inverse)) => {
-                if !same_place(&object, &target) {
-                    return Err(EffectRefusal::Provider(
-                        "the provider answered for another object; the intent stays open"
-                            .to_string(),
-                    ));
-                }
-                if required_inverse(&op, &object, &planned).as_ref() != Some(&inverse) {
-                    return Err(EffectRefusal::Provider(
-                        "the provider's inverse is not the one the op requires; the intent stays open"
-                            .to_string(),
-                    ));
-                }
-                self.journal
-                    .applied(id, object.clone(), inverse)
-                    .map_err(journal_refusal)?;
+                landed(&object, inverse)?;
                 Ok(object)
+            }
+            // The object exists and is the entry's own, so the effect is recorded as applied; the plugin is told why the
+            // request did not finish.
+            Err(EffectRefusal::Landed(unfinished)) => {
+                landed(&unfinished.object, unfinished.inverse)?;
+                Err(EffectRefusal::Provider(unfinished.why))
             }
             Err(refusal) => {
                 // A refusal that says the outcome is not known leaves the intent open: the write may have landed, and a

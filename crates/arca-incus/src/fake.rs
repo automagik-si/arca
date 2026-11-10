@@ -1375,20 +1375,21 @@ impl Store {
             .and_then(Value::as_object)
     }
 
-    /// The reason an instance body is refused by its project's restriction: a NIC names a network the project does not
-    /// list in `restricted.networks.access`, or names no managed network while `restricted.devices.nic` is not `allow`.
+    /// The reason an instance body is refused by its project's restriction: a NIC names a network the project's
+    /// `restricted.networks.access` does not list (an unset grant lists every network), or names no managed network
+    /// while `restricted.devices.nic` is not `allow`.
     /// A project that is not restricted lists nothing and refuses nothing.
     fn restricted_nic(&self, project: &str, body: &Map<String, Value>) -> Option<&'static str> {
         let config = self.project_config(project)?;
         if config.get("restricted").and_then(Value::as_str) != Some("true") {
             return None;
         }
-        let granted: Vec<&str> = config
+        // An unset or empty grant admits every network, as Incus's `NetworkAllowed` does.
+        let granted: Option<Vec<&str>> = config
             .get("restricted.networks.access")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .split(',')
-            .collect();
+            .filter(|grant| !grant.is_empty())
+            .map(|grant| grant.split(',').map(str::trim).collect());
         let devices = body.get("devices").and_then(Value::as_object)?;
         let nics = || {
             devices
@@ -1406,7 +1407,11 @@ impl Store {
             device
                 .get("network")
                 .and_then(Value::as_str)
-                .is_some_and(|network| !granted.contains(&network))
+                .is_some_and(|network| {
+                    granted
+                        .as_ref()
+                        .is_some_and(|granted| !granted.contains(&network))
+                })
         });
         refused.then_some("the project may not use the network")
     }
@@ -2390,6 +2395,13 @@ impl Store {
                     }
                 }
                 "disk" if field("path") == "/" && !field("pool").is_empty() => {}
+                // Incus always admits the agent and cloud-init config drives (`checkRestrictions`).
+                "disk"
+                    if field("path").is_empty()
+                        && matches!(
+                            field("source").as_str(),
+                            "agent:config" | "cloud-init:config"
+                        ) => {}
                 "disk" if field("pool").is_empty() => {
                     let paths = restriction("restricted.devices.disk.paths");
                     let source = format!("{}/", field("source").trim_end_matches('/'));

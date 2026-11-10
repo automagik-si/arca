@@ -334,7 +334,7 @@ static VERBS: [Verb; 44] = [
     },
     Verb {
         name: "service_create",
-        summary: "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or on a bridged node a virtual machine on an existing host bridge.",
+        summary: "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -1953,12 +1953,12 @@ fn service_create_params() -> Value {
                 "type": "string"
             },
             "bridge": {
-                "description": "For a virtual-machine template on a bridged node: the existing host bridge its NIC joins, one of the node's allowed bridges. It may be left out when the node allows exactly one.",
+                "description": "For a virtual-machine template: the existing host bridge its NIC joins, one of the node's allowed bridges. Left out, the virtual machine joins the managed service network when the node has one, and otherwise the node's only allowed bridge.",
                 "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,14}$",
                 "type": "string"
             },
             "mac": {
-                "description": "For a virtual-machine template: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one.",
+                "description": "For a virtual-machine template on a host bridge: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one. Refused on the managed service network.",
                 "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
                 "type": "string"
             }
