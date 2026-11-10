@@ -35,4 +35,6 @@ pub use read::{
 };
 pub use shim::{RecordingShim, ShimHandle, ShimSummary};
 #[cfg(feature = "write")]
-pub use write::{Owned, ProjectFamily, Reading, UnixIncusWriter};
+pub use write::{
+    Owned, ProjectFamily, Reading, UnixIncusWriter, acl_rules_match, canonical_acl_rules,
+};

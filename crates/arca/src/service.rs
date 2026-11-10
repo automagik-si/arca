@@ -427,7 +427,10 @@ impl Plugin for Service {
                     (arca_kernel::journal::AclField::Ingress, "ingress", rules),
                     (arca_kernel::journal::AclField::Egress, "egress", outgoing),
                 ] {
-                    if current[key].as_array() != Some(&desired) {
+                    if !current[key]
+                        .as_array()
+                        .is_some_and(|rules| arca_incus::acl_rules_match(rules, &desired))
+                    {
                         ctx.effect(EffectOp::IncusPatchAclField {
                             object: arca_kernel::ownership::ObjectRef {
                                 kind: IncusKind::Acl,

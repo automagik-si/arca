@@ -414,7 +414,9 @@ impl UnixIncusWriter {
             Some(&body),
         )?;
         self.confirm(&owned.target, |fresh| {
-            if fresh.acl_rules(field).map(Vec::as_slice) == Some(rules)
+            if fresh
+                .acl_rules(field)
+                .is_some_and(|fresh| acl_rules_match(fresh, rules))
                 && fresh.acl_rules(other_acl_field(field))
                     == owned.acl_rules(other_acl_field(field))
                 && fresh.description == owned.description
@@ -918,6 +920,29 @@ fn other_acl_field(field: AclField) -> AclField {
         AclField::Ingress => AclField::Egress,
         AclField::Egress => AclField::Ingress,
     }
+}
+
+/// Rules in the shape Incus 7.x answers with: a field that is "" or null is left out. Older servers list every field, empty
+/// ones as "", so two rule arrays are compared in this shape.
+pub fn canonical_acl_rules(rules: &[Value]) -> Vec<Value> {
+    rules
+        .iter()
+        .map(|rule| match rule {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter(|(_, value)| !value.is_null() && value.as_str() != Some(""))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Whether two rule arrays hold the same rules once empty fields are left out.
+pub fn acl_rules_match(left: &[Value], right: &[Value]) -> bool {
+    canonical_acl_rules(left) == canonical_acl_rules(right)
 }
 
 // Incus v7.5.1/v7.6.0 networkACLPut merges only config on PATCH. It
