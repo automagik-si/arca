@@ -44,4 +44,6 @@ pub use snapshot::{
     SNAPSHOT_STORAGE_KEY, SnapshotWriter, VERIFIED_KEY,
 };
 #[cfg(feature = "write")]
-pub use write::{Owned, ProjectFamily, Reading, UnixIncusWriter};
+pub use write::{
+    Owned, ProjectFamily, Reading, UnixIncusWriter, acl_rules_match, canonical_acl_rules,
+};

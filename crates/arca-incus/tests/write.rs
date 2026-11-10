@@ -2649,3 +2649,15 @@ fn acl_patch_sends_source_supported_body_and_accepts_canonical_read_back() {
     assert_eq!(*sent.lock().unwrap(), Some(expected));
     assert_eq!(server.count("PATCH"), 1);
 }
+
+#[test]
+fn acl_rules_match_across_servers_that_list_or_omit_empty_fields() {
+    let complete = vec![
+        json!({"action":"allow", "source":"", "destination":"", "protocol":"", "source_port":"", "destination_port":"", "icmp_type":"", "icmp_code":"", "description":"internet", "state":"enabled"}),
+    ];
+    let omitted = vec![json!({"action":"allow", "description":"internet", "state":"enabled"})];
+    assert!(arca_incus::acl_rules_match(&complete, &omitted));
+    assert_eq!(arca_incus::canonical_acl_rules(&complete), omitted);
+    let other = vec![json!({"action":"reject", "description":"internet", "state":"enabled"})];
+    assert!(!arca_incus::acl_rules_match(&complete, &other));
+}

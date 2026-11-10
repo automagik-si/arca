@@ -1339,7 +1339,9 @@ impl Provider for IncusProvider {
         let current = owned
             .acl_rules(patch.field)
             .ok_or(EffectRefusal::Unresolved)?;
-        if current != &patch.previous && current != &patch.rules {
+        let is_previous = arca_incus::acl_rules_match(current, &patch.previous);
+        let is_wanted = arca_incus::acl_rules_match(current, &patch.rules);
+        if !is_previous && !is_wanted {
             return Err(EffectRefusal::Unresolved);
         }
         Ok(ReadBack::Present {
@@ -1347,7 +1349,7 @@ impl Provider for IncusProvider {
             owned: true,
             // A no-op satisfies the wanted state even though it also holds the
             // pre-image. Live effects and restart settlement must agree on this.
-            holds_pre_image: current == &patch.previous && current != &patch.rules,
+            holds_pre_image: is_previous && !is_wanted,
         })
     }
 
