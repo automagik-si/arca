@@ -43,6 +43,41 @@ pub(super) fn failed_for(outcomes: &[Outcome], entries: &[&str]) -> bool {
     })
 }
 
+/// The reference to service `cfg`'s secret `key`: one `service_secret_set` stored, or the file `service_create` made.
+pub(super) fn secret_reference_in(
+    node: &NodeConfig,
+    cfg: &ServiceConfig,
+    key: &str,
+) -> Option<String> {
+    cfg.secret_refs.get(key).cloned().or_else(|| {
+        service::secret_file(&node.state_dir.join("secrets"), &cfg.name, key)
+            .filter(|f| f.is_file())
+            .map(|_| service::secret_reference(&cfg.name, key))
+    })
+}
+/// The value a secret reference names: a private regular file under the secrets directory, never a link.
+pub(super) fn read_reference_in(node: &NodeConfig, reference: &str) -> Result<String, CallError> {
+    let name = reference
+        .strip_prefix(arca_providers::incus::SECRET_PREFIX)
+        .ok_or_else(internal)?;
+    if name.split('/').any(|part| {
+        part.is_empty()
+            || !part
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    }) {
+        return Err(internal());
+    }
+    let path = node.state_dir.join("secrets").join(name);
+    let meta =
+        std::fs::symlink_metadata(&path).map_err(|_| service_refused("secret unavailable"))?;
+    use std::os::unix::fs::PermissionsExt;
+    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 65536 {
+        return Err(service_refused("secret unavailable"));
+    }
+    std::fs::read_to_string(path).map_err(|_| service_refused("secret unavailable"))
+}
+
 impl ServiceHandler {
     pub(super) fn exec_target(
         &self,
@@ -109,32 +144,10 @@ impl ServiceHandler {
         Ok(owned)
     }
     fn secret_reference(&self, cfg: &ServiceConfig, key: &str) -> Option<String> {
-        cfg.secret_refs.get(key).cloned().or_else(|| {
-            service::secret_file(&self.cfg.state_dir.join("secrets"), &cfg.name, key)
-                .filter(|f| f.is_file())
-                .map(|_| service::secret_reference(&cfg.name, key))
-        })
+        secret_reference_in(&self.cfg, cfg, key)
     }
     fn read_reference(&self, reference: &str) -> Result<String, CallError> {
-        let name = reference
-            .strip_prefix(arca_providers::incus::SECRET_PREFIX)
-            .ok_or_else(internal)?;
-        if name.split('/').any(|part| {
-            part.is_empty()
-                || !part
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        }) {
-            return Err(internal());
-        }
-        let path = self.cfg.state_dir.join("secrets").join(name);
-        let meta =
-            std::fs::symlink_metadata(&path).map_err(|_| service_refused("secret unavailable"))?;
-        use std::os::unix::fs::PermissionsExt;
-        if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > 65536 {
-            return Err(service_refused("secret unavailable"));
-        }
-        std::fs::read_to_string(path).map_err(|_| service_refused("secret unavailable"))
+        read_reference_in(&self.cfg, reference)
     }
     fn values(
         &self,

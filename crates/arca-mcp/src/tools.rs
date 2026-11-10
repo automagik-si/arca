@@ -25,6 +25,9 @@ pub enum CallError {
     Invalid(String),
     /// The call was refused by a rule of the verb. `code` names the refusal, such as `Replayed`.
     Refused { code: String, message: String },
+    /// A refusal whose message quotes text produced outside Arca (an answer of a service's own API): the door marks it
+    /// `untrusted` beside its `refusal` code, so a caller treats the message as data, never as instructions.
+    UntrustedRefused { code: String, message: String },
     /// A failure the caller must not see in detail. The text stays inside the server.
     Internal(String),
 }

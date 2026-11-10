@@ -91,6 +91,10 @@ impl ToolHandler for WriteProbe {
                 code: "Replayed".into(),
                 message: "this approval was already spent".into(),
             }),
+            "quoted" => Err(CallError::UntrustedRefused {
+                code: "refused".into(),
+                message: "a service answered 500: text it wrote".into(),
+            }),
             "forbid" => Err(CallError::Forbidden {
                 verb: "write_probe".into(),
             }),
@@ -462,6 +466,45 @@ fn a_doctor_tools_list_adds_the_write_verb_but_not_token_list() {
 }
 
 #[test]
+fn a_doctor_tools_list_shows_the_three_omni_tools_and_a_viewer_does_not() {
+    let fx = Fixture::start("list-omni");
+    let omni = ["omni_instance_create", "omni_pair", "omni_status"];
+    let listed = |token: &str| -> Vec<String> {
+        names_of(&fx.call(token, "tools/list", json!({})))
+            .into_iter()
+            .filter(|n| n.starts_with("omni_"))
+            .collect()
+    };
+    assert_eq!(listed(&fx.doctor), omni);
+    assert_eq!(listed(&fx.operator), omni);
+    assert!(listed(&fx.viewer).is_empty(), "a viewer token");
+    assert!(
+        listed(&fx.viewer_tools).is_empty(),
+        "a viewer token with a list"
+    );
+    // A viewer's call is refused before any handler runs; every advertised omni tool is untrusted.
+    let reply = fx.tool_call(&fx.viewer, "omni_status", json!({ "name": "omni" }));
+    assert_eq!(reply.status, 403);
+    let tools = fx.call(&fx.doctor, "tools/list", json!({})).json()["result"]["tools"].clone();
+    for tool in tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| omni.contains(&t["name"].as_str().unwrap()))
+    {
+        assert_eq!(
+            tool["outputSchema"]["properties"]["untrusted"]["type"], "string",
+            "{tool}"
+        );
+        assert_eq!(tool["annotations"]["destructiveHint"], false);
+        assert_eq!(
+            tool["annotations"]["readOnlyHint"],
+            tool["name"] == "omni_status"
+        );
+    }
+}
+
+#[test]
 fn an_operator_tools_list_holds_every_verb() {
     let fx = Fixture::start("list-operator");
     let reply = fx.call(&fx.operator, "tools/list", json!({}));
@@ -591,6 +634,29 @@ fn a_refusal_is_a_json_rpc_error_that_names_its_code() {
     assert_eq!(body["error"]["code"], -32000);
     assert_eq!(body["error"]["data"]["refusal"], "Replayed");
     assert_eq!(body["error"]["message"], "this approval was already spent");
+}
+
+#[test]
+fn a_refusal_that_quotes_a_service_is_marked_untrusted_beside_its_code() {
+    let fx = Fixture::start("refusal-untrusted");
+    let reply = fx.tool_call(&fx.doctor, "write_probe", json!({ "name": "quoted" }));
+    assert_eq!(reply.status, 200);
+    let body = reply.json();
+    assert_eq!(body["error"]["code"], -32000);
+    assert_eq!(
+        body["error"]["data"],
+        json!({ "refusal": "refused", "untrusted": true })
+    );
+    assert_eq!(
+        body["error"]["message"],
+        "a service answered 500: text it wrote"
+    );
+    // A plain refusal carries no mark.
+    let plain = fx.tool_call(&fx.doctor, "write_probe", json!({ "name": "replayed" }));
+    assert_eq!(
+        plain.json()["error"]["data"],
+        json!({ "refusal": "Replayed" })
+    );
 }
 
 #[test]

@@ -2830,6 +2830,8 @@ impl ToolHandler for PostgresHandler {
     }
 }
 
+#[path = "service_omni.rs"]
+mod service_omni;
 #[path = "service_wiring.rs"]
 mod service_wiring;
 
@@ -2868,7 +2870,40 @@ pub fn service_handlers(
             }) as Arc<dyn ToolHandler>,
         )
     })
+    .chain(omni_handlers(
+        kernel.clone(),
+        clock.clone(),
+        cfg.clone(),
+        crate::omni::OmniOptions::default(),
+    ))
     .collect()
+}
+
+/// The three Omni verbs over the service model (`crate::omni`). `options` is the default in a served node; a test
+/// points it at a fake Omni.
+pub fn omni_handlers(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    cfg: Arc<NodeConfig>,
+    options: crate::omni::OmniOptions,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    let pairing = Arc::new(Mutex::new(HashMap::new()));
+    ["omni_instance_create", "omni_pair", "omni_status"]
+        .into_iter()
+        .map(|verb| {
+            (
+                verb,
+                Arc::new(service_omni::OmniHandler {
+                    verb,
+                    kernel: kernel.clone(),
+                    clock: clock.clone(),
+                    cfg: cfg.clone(),
+                    options: options.clone(),
+                    pairing: pairing.clone(),
+                }) as Arc<dyn ToolHandler>,
+            )
+        })
+        .collect()
 }
 
 struct ServiceHandler {

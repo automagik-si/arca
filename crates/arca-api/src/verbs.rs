@@ -77,7 +77,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 35] = [
+static VERBS: [Verb; 38] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -469,6 +469,48 @@ static VERBS: [Verb; 35] = [
         cut: no_cut,
         params: service_unpublish_params,
         result: service_unpublish_result,
+    },
+    Verb {
+        name: "omni_instance_create",
+        summary: "Create an Omni instance (a WhatsApp or a Telegram channel) in an omni-api service. Arca holds Omni's key, and for telegram adds the owner's bot token (the service's telegram_bot_token secret, which the owner sets with service_secret_set). Returns its id, name, channel and whether it runs.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_omni_instance_create,
+        cut: no_cut,
+        params: omni_instance_create_params,
+        result: omni_instance_result,
+    },
+    Verb {
+        name: "omni_pair",
+        summary: "Ask Omni for a WhatsApp pairing code for a whatsapp-baileys instance, for the owner's number (the service's whatsapp_phone_number secret: Arca holds it, and the result shows it masked). The owner enters the code on the phone (WhatsApp > Linked devices > Link with phone number). Ask once: another code is refused while one lasts.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_omni_pair,
+        cut: no_cut,
+        params: omni_pair_params,
+        result: omni_pair_result,
+    },
+    Verb {
+        name: "omni_status",
+        summary: "An Omni instance's connection state (connected, connecting, qr, disconnected, …), or without instance the service's instances (id, name, channel, whether each runs).",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: false,
+        destructive: false,
+        untrusted: true,
+        output_key: None,
+        summary_text: summary_omni_status,
+        cut: no_cut,
+        params: omni_status_params,
+        result: omni_status_result,
     },
     Verb {
         name: "gpu_attach",
@@ -2224,4 +2266,130 @@ fn snapshot_list_result() -> Value {
         ("droppedDevices", true, array(string())),
     ]);
     result(vec![("snapshots", true, array(snapshot))])
+}
+
+// The Omni verbs: a narrow reach into an omni-api service's API, every result untrusted (Omni and the people on its
+// channels wrote it). The schemas are the golden's natural ones.
+
+const OMNI_SERVICE_ARG: &str = r##"{"description":"The omni-api service's name (service_create, template omni-api).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}"##;
+const OMNI_INSTANCE_ARG: &str = r##"{"description":"The instance's id (from omni_instance_create or omni_status), or its name.","maxLength":63,"minLength":1,"type":"string"}"##;
+const OMNI_INSTANCE_VIEW: &str = r##"{"additionalProperties":false,"properties":{"channel":{"maxLength":32,"type":"string"},"id":{"description":"The instance id: what omni_pair and omni_status take.","maxLength":36,"type":"string"},"isActive":{"description":"Whether Omni runs its connection.","type":"boolean"},"name":{"maxLength":64,"type":"string"}},"required":["id","name","channel","isActive"],"type":"object"}"##;
+
+fn omni_schema(text: &str) -> Value {
+    serde_json::from_str(text).expect("fixed omni schema")
+}
+fn omni_instance_create_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {
+            "name": omni_schema(OMNI_SERVICE_ARG),
+            "instance": {"description": "The new instance's name (a-z, 0-9, _ and -, at most 63).", "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$", "type": "string"},
+            "channel": {"description": "whatsapp-baileys (paired with omni_pair) or telegram (the owner's bot).", "enum": ["whatsapp-baileys", "telegram"], "type": "string"}
+        },
+        "required": ["name", "instance", "channel"],
+        "type": "object"
+    })
+}
+fn omni_instance_result() -> Value {
+    omni_schema(OMNI_INSTANCE_VIEW)
+}
+fn omni_pair_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {"name": omni_schema(OMNI_SERVICE_ARG), "instance": omni_schema(OMNI_INSTANCE_ARG)},
+        "required": ["name", "instance"],
+        "type": "object"
+    })
+}
+fn omni_pair_result() -> Value {
+    omni_schema(
+        r##"{"additionalProperties":false,"properties":{"code":{"description":"The pairing code to enter on the phone: WhatsApp > Linked devices > Link with phone number.","maxLength":16,"type":"string"},"expiresIn":{"description":"Seconds the code lasts.","maximum":3600,"minimum":1,"type":"integer"},"instance":{"maxLength":36,"type":"string"},"phoneNumber":{"description":"The owner's number, masked: Arca holds it, and no tool shows it.","maxLength":20,"type":"string"}},"required":["instance","code","expiresIn","phoneNumber"],"type":"object"}"##,
+    )
+}
+fn omni_status_params() -> Value {
+    json!({
+        "additionalProperties": false,
+        "properties": {"name": omni_schema(OMNI_SERVICE_ARG), "instance": omni_schema(OMNI_INSTANCE_ARG)},
+        "required": ["name"],
+        "type": "object"
+    })
+}
+fn omni_status_result() -> Value {
+    json!({
+        "anyOf": [
+            omni_schema(
+                r##"{"additionalProperties":false,"properties":{"instance":{"maxLength":36,"type":"string"},"isConnected":{"type":"boolean"},"message":{"anyOf":[{"maxLength":300,"type":"string"},{"type":"null"}],"description":"Omni's status message, untrusted."},"profileName":{"anyOf":[{"maxLength":100,"type":"string"},{"type":"null"}],"description":"The account's profile name on its channel, untrusted."},"state":{"description":"Omni's connection state (connected, connecting, qr, disconnected, error, unknown, …).","maxLength":32,"type":"string"}},"required":["instance","state","isConnected","profileName","message"],"type":"object"}"##,
+            ),
+            {
+                "additionalProperties": false,
+                "properties": {"instances": {"items": omni_schema(OMNI_INSTANCE_VIEW), "maxItems": 100, "type": "array"}},
+                "required": ["instances"],
+                "type": "object"
+            }
+        ]
+    })
+}
+
+fn omni_instance_line(v: &Value) -> String {
+    format!(
+        "{} ({}, {}{})",
+        v["name"].as_str().unwrap_or("?"),
+        v["channel"].as_str().unwrap_or("?"),
+        v["id"].as_str().unwrap_or("?"),
+        if v["isActive"] == true {
+            ""
+        } else {
+            ", inactive"
+        }
+    )
+}
+pub fn summary_omni_instance_create(v: &Value) -> String {
+    format!(
+        "Created Omni instance {}. Untrusted: Omni wrote it.",
+        omni_instance_line(v)
+    )
+}
+pub fn summary_omni_pair(v: &Value) -> String {
+    format!(
+        "Pairing code {} for {}, valid {} s: on the phone, WhatsApp > Linked devices > Link with phone number.",
+        v["code"].as_str().unwrap_or("?"),
+        v["phoneNumber"].as_str().unwrap_or("?"),
+        v["expiresIn"].as_u64().unwrap_or(0)
+    )
+}
+pub fn summary_omni_status(v: &Value) -> String {
+    let line = if let Some(instances) = v["instances"].as_array() {
+        if instances.is_empty() {
+            "No Omni instances.".to_string()
+        } else {
+            format!(
+                "{} Omni instance(s): {}.",
+                instances.len(),
+                instances
+                    .iter()
+                    .map(omni_instance_line)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        }
+    } else {
+        let text = |key: &str| v[key].as_str().filter(|s| !s.is_empty());
+        format!(
+            "Omni instance {} is {}{}{}{}.",
+            v["instance"].as_str().unwrap_or("?"),
+            v["state"].as_str().unwrap_or("?"),
+            if v["isConnected"] == true {
+                " (connected)"
+            } else {
+                ""
+            },
+            text("profileName")
+                .map(|p| format!(" as {p}"))
+                .unwrap_or_default(),
+            text("message")
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
+        )
+    };
+    format!("{line} Untrusted: Omni wrote it.")
 }

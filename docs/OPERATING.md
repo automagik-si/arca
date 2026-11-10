@@ -1884,6 +1884,28 @@ Publication needs `serveHost` (this process's serve DNS name) and `tailnet` (the
 in node config. Both must agree, for example `host.example.ts.net` and `example`. They are never discovered by a lookup.
 Adopted services support list, status and console logs. Their write verbs return an explicit `adopted` refusal.
 
+### Omni verbs
+
+`omni_instance_create`, `omni_pair` and `omni_status` reach the API of a service made from the `omni-api` template, and
+nothing else of it. Each takes the service's `name`; an `instance` is an Omni instance id (a UUID) or a plain name, never a
+path. Arca makes four fixed requests: create an instance, list the first 100, read one instance's status, and ask for a
+pairing code. It calls the service's address at its template's `droiddPort`, the one port the service's ACL opens to the
+bridge gateway. It follows no redirect, reads at most 1 MiB of an answer and waits at most 15 seconds for one.
+
+Every request sends `x-api-key` from the service's `OMNI_API_KEY` secret, which `service_create` makes. A `telegram`
+instance adds the owner's `telegram_bot_token` secret, and `omni_pair` sends the owner's `whatsapp_phone_number`. The owner
+sets both over the owner's socket (`service_secret_set`); a doctor token cannot. A verb that needs an unset secret refuses
+and names the slot, before anything is sent. The number must be `+` and 10-15 digits, because Omni echoes a number it
+refuses. A result shows the number masked (`+55*********21`).
+
+Results keep a fixed set of fields, and they are untrusted, because Omni and the people on its channels wrote them. Every
+string in a result or an error is redacted of the three secrets: the number in any formatting, without its `+`, inside a
+WhatsApp JID, and with or without a Brazilian mobile's ninth digit. Any Omni key or bot token is redacted too. A refusal
+that quotes Omni carries `untrusted: true` beside its `refusal` code. Another pairing code for the same instance is refused
+while one lasts. Any attempt that reached Omni holds the next one off for 60 seconds, even a failed one; an attempt that
+reached nothing does not. The verbs read the service record and its secrets only. They change no desired state, send
+nothing to Incus and run no process. An adopted service, or a service of another template, is refused.
+
 The exec audit is local, private and separate from `journal_list`. A crash can leave a key in the private tmpfs key directory
 until unpublish or instance stop, and can leave recordings until the next startup sweep. A crash before the operation id is
 synced leaves a recording the sweep cannot name; deleting the instance removes it. A real tailnet join requires the owner's
