@@ -29,7 +29,7 @@ use arca_api::Scope;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys,
     PEER_PASSKEYS_FILE, PasskeyVerifier, PeerPasskeys, SshSigVerifier, normal_lines,
-    parse_passkeys,
+    parse_passkeys, peer_file_name, peer_target, set_digest,
 };
 use arca_kernel::canon::{Digest, canonical_json, params_digest};
 use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_tools, serve_unix};
@@ -200,6 +200,7 @@ fn status_of(peer: Option<PeerPasskeys>) -> Value {
             linked_hosts: Vec::new(),
             foreign: ForeignPasskeys::default(),
             peer,
+            peer_sources: None,
         }),
     }
     .call(json!({}), &caller(Scope::Viewer))
@@ -660,6 +661,565 @@ fn a_peer_file_that_is_a_link_or_open_to_others_is_not_trusted_and_not_overwritt
     );
 }
 
+// ---- several sources: `approval.peerKeys` as a list ---------------------------------------------------------------------
+
+/// The second page host of the list form, and the one origin its passkeys answer from.
+const CLOUD: &str = "cloud.example";
+const CLOUD_ORIGIN: &str = "https://cloud.example.com";
+
+/// A passkey of the second page host, answering only its origin.
+fn cloud_key(seed: u8) -> SoftPasskey {
+    let mut key = SoftPasskey::from_seed(seed);
+    key.rp_id = "cloud.example.com".to_string();
+    key.origin = CLOUD_ORIGIN.to_string();
+    key
+}
+
+fn single_object() -> Value {
+    json!({ "peerKeys": { "from": HOST, "origins": [ORIGIN] } })
+}
+
+fn two_sources() -> Value {
+    json!({ "peerKeys": [
+        { "from": HOST, "origins": [ORIGIN] },
+        { "from": CLOUD, "origins": [CLOUD_ORIGIN] },
+    ] })
+}
+
+/// Gamma built from an `approval` config as `arca serve` builds it: one `PeerPasskeys` per source, in the config's order, each
+/// in the state file its place names.
+struct Sources {
+    scratch: Scratch,
+    _fake: arca_incus::FakeIncus,
+    kernel: Arc<Mutex<Kernel>>,
+    peers: Vec<PeerPasskeys>,
+    list: bool,
+}
+
+impl Sources {
+    fn new(tag: &str, approval: Value) -> Sources {
+        let approval: arca::config::ApprovalConfig =
+            serde_json::from_value(approval).expect("the approval key parses");
+        let keys = approval.peer_keys.expect("peerKeys is set");
+        let scratch = Scratch::new(tag);
+        let fake = start_fake(&scratch);
+        let peers: Vec<PeerPasskeys> = keys
+            .sources()
+            .iter()
+            .enumerate()
+            .map(|(index, source)| {
+                PeerPasskeys::new(
+                    scratch.path(&peer_file_name(index, &source.from)),
+                    source.from.clone(),
+                    source.origins.clone(),
+                )
+            })
+            .collect();
+        let own = parse_passkeys(format!("{}\n", gamma_key(2).line(NAMESPACE)).as_bytes())
+            .expect("gamma's own line parses");
+        let passkeys = peers.iter().cloned().fold(
+            PasskeyVerifier::new(
+                own,
+                FileSignCounts::open(&scratch.path("gamma-counts.jsonl")).expect("counts"),
+            ),
+            PasskeyVerifier::with_peer,
+        );
+        let verifier = ApprovalVerifier::new(
+            GAMMA_HOST.to_string(),
+            OwnerKeys::new(SshSigVerifier::new(Vec::new()), passkeys),
+            FileNonces::open(&scratch.path("gamma-nonces.jsonl")).expect("nonces"),
+        );
+        let kernel = Arc::new(Mutex::new(
+            kernel_on_host(&scratch, &fake, verifier, NOW, None, GAMMA_HOST).expect("gamma opens"),
+        ));
+        Sources {
+            scratch,
+            _fake: fake,
+            kernel,
+            peers,
+            list: keys.is_list(),
+        }
+    }
+
+    fn sync(
+        &self,
+        from: Option<&str>,
+        lines: &[String],
+        signed: Option<(&str, &[u8])>,
+    ) -> Result<PeerSync, ApprovalRefusal> {
+        self.kernel
+            .lock()
+            .expect("the kernel lock")
+            .peer_keys_sync_from(from, lines, signed, NOW)
+    }
+
+    fn statement_for(&self, from: Option<&str>, lines: &[String]) -> String {
+        match self.sync(from, lines, None).expect("the sync answers") {
+            PeerSync::NeedsApproval { statement, .. } => statement,
+            other => panic!("a changed set needs an approval, not {other:?}"),
+        }
+    }
+
+    fn signed_sync(
+        &self,
+        from: Option<&str>,
+        lines: &[String],
+        statement: &str,
+        key: &SoftPasskey,
+    ) -> Result<PeerSync, ApprovalRefusal> {
+        let proof = key.assert(&Assert::over(NAMESPACE, statement.as_bytes()));
+        self.sync(from, lines, Some((statement, &proof)))
+    }
+
+    /// `arca_status`'s `approval`, as `arca serve` fills it for this config.
+    fn approval_status(&self) -> Value {
+        let status = StatusHandler {
+            node: "c".repeat(64),
+            mode: "kernel",
+            applied_seq: AppliedSeq::default(),
+            started: Instant::now(),
+            socket: PathBuf::from("/nonexistent/incus.sock"),
+            metrics_source: Arc::new(Mutex::new(HostModeChoice {
+                mode: HostMode::Local,
+                reason: "the test names the local mode".to_string(),
+                provisional: false,
+            })),
+            approval: Some(ApprovalStatus {
+                linked_hosts: Vec::new(),
+                foreign: ForeignPasskeys::default(),
+                peer: self.peers.first().cloned(),
+                peer_sources: self.list.then(|| self.peers.clone()),
+            }),
+        }
+        .call(json!({}), &caller(Scope::Viewer))
+        .expect("arca_status answers");
+        assert!(
+            arca_api::check::conforms(
+                &(arca_api::verb("arca_status").expect("the verb").result)(),
+                &status
+            )
+            .is_ok(),
+            "the status fits its schema"
+        );
+        status["approval"].clone()
+    }
+
+    fn file(&self, name: &str) -> String {
+        fs::read_to_string(self.scratch.path(name)).expect("the file is there")
+    }
+
+    /// The peer passkeys files in the state directory, sorted.
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.scratch.dir)
+            .expect("the state directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.contains("peer-passkeys"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn approve(&self, id: &str, approval: &str) -> bool {
+        self.kernel
+            .lock()
+            .expect("the kernel lock")
+            .approve_action(id, approval, NOW)
+            .is_ok()
+    }
+}
+
+fn field(statement: &str, key: &str) -> String {
+    let value: Value = serde_json::from_str(statement).expect("a statement");
+    value[key].as_str().expect("a field").to_string()
+}
+
+#[test]
+fn the_single_object_config_keeps_the_same_file_answers_and_status_as_before() {
+    let gamma = Sources::new("pk-golden", single_object());
+    assert!(!gamma.list);
+    assert_eq!(gamma.peers.len(), 1);
+    assert_eq!(peer_file_name(0, HOST), PEER_PASSKEYS_FILE);
+    assert_eq!(
+        gamma.approval_status(),
+        json!({
+            "linkedHosts": [],
+            "trustedKeyFiles": [],
+            "peerKeys": { "from": HOST, "keys": 0, "since": null, "reason": "no passkey has been synced from node1 yet" },
+        })
+    );
+
+    let owner = SoftPasskey::from_seed(1);
+    let added = SoftPasskey::from_seed(3);
+    assert_eq!(
+        gamma.sync(None, &set_of(&[&owner]), None),
+        Ok(PeerSync::Trusted { keys: 1 })
+    );
+    assert_eq!(gamma.files(), [PEER_PASSKEYS_FILE]);
+    assert_eq!(
+        gamma.file(PEER_PASSKEYS_FILE),
+        format!(
+            "# arca peer-keys from=node1 since={NOW}\n{}\n",
+            sent(&owner)
+        )
+    );
+    assert_eq!(
+        gamma.approval_status(),
+        json!({
+            "linkedHosts": [],
+            "trustedKeyFiles": [],
+            "peerKeys": {
+                "from": HOST,
+                "keys": 1,
+                "since": "2026-10-30T12:00:00.000Z",
+                "reason": "trusting node1's passkeys since 2026-10-30T12:00:00.000Z (first sync)",
+            },
+        })
+    );
+    assert_eq!(
+        gamma.sync(None, &set_of(&[&owner]), None),
+        Ok(PeerSync::Unchanged { keys: 1 })
+    );
+    // Naming the one source is the same call.
+    assert_eq!(
+        gamma.sync(Some(HOST), &set_of(&[&owner]), None),
+        Ok(PeerSync::Unchanged { keys: 1 })
+    );
+
+    // A changed set: the statement binds the set's digest and nothing else, as it always has.
+    let mut next = set_of(&[&added, &owner]);
+    next.sort();
+    let digest = set_digest(&next);
+    let statement = gamma.statement_for(None, &next);
+    assert_eq!(field(&statement, "action"), "peer_keys_set");
+    assert_eq!(field(&statement, "host"), GAMMA_HOST);
+    assert_eq!(field(&statement, "target"), peer_target(&digest));
+    assert_eq!(
+        field(&statement, "paramsDigest"),
+        params_digest(&json!({ "sha256": digest })).expect("the digest")
+    );
+    assert_eq!(
+        gamma.signed_sync(None, &next, &statement, &owner),
+        Ok(PeerSync::Changed { keys: 2 })
+    );
+    assert_eq!(gamma.files(), [PEER_PASSKEYS_FILE]);
+    assert_eq!(
+        gamma.file(PEER_PASSKEYS_FILE),
+        format!(
+            "# arca peer-keys from=node1 since={NOW} changed={NOW}\n{}\n{}\n",
+            next[0], next[1]
+        )
+    );
+    let status = gamma.approval_status();
+    assert!(status.get("peerKeySources").is_none(), "{status}");
+    assert_eq!(status["peerKeys"]["keys"], json!(2));
+}
+
+#[test]
+fn two_sources_sync_independently_each_into_its_own_file() {
+    let gamma = Sources::new("pk-two", two_sources());
+    assert!(gamma.list);
+    let alpha = SoftPasskey::from_seed(1);
+    let cloud = cloud_key(4);
+    let second = format!("{PEER_PASSKEYS_FILE}-{CLOUD}");
+
+    assert_eq!(
+        gamma.sync(None, &set_of(&[&alpha]), None),
+        Ok(PeerSync::Trusted { keys: 1 }),
+        "no from is the first source"
+    );
+    assert_eq!(gamma.files(), [PEER_PASSKEYS_FILE]);
+    let waiting = gamma.approval_status();
+    assert_eq!(waiting["peerKeySources"][0], waiting["peerKeys"]);
+    assert_eq!(
+        waiting["peerKeySources"][1],
+        json!({ "from": CLOUD, "keys": 0, "since": null, "reason": "no passkey has been synced from cloud.example yet" })
+    );
+
+    assert_eq!(
+        gamma.sync(Some(CLOUD), &set_of(&[&cloud]), None),
+        Ok(PeerSync::Trusted { keys: 1 }),
+        "the second source's first sync is its own"
+    );
+    assert_eq!(
+        gamma.files(),
+        [PEER_PASSKEYS_FILE.to_string(), second.clone()]
+    );
+    let first_file = format!(
+        "# arca peer-keys from=node1 since={NOW}\n{}\n",
+        sent(&alpha)
+    );
+    assert_eq!(gamma.file(PEER_PASSKEYS_FILE), first_file);
+    assert_eq!(
+        gamma.file(&second),
+        format!(
+            "# arca peer-keys from={CLOUD} since={NOW}\n{}\n",
+            sent(&cloud)
+        )
+    );
+    let meta = fs::symlink_metadata(gamma.scratch.path(&second)).expect("the second file");
+    assert!(meta.file_type().is_file());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    let status = gamma.approval_status();
+    assert_eq!(status["peerKeys"]["from"], json!(HOST));
+    let sources = status["peerKeySources"].as_array().expect("each source");
+    assert_eq!(sources.len(), 2);
+    assert_eq!(sources[0], status["peerKeys"]);
+    assert_eq!(sources[1]["from"], json!(CLOUD));
+    assert_eq!(sources[1]["keys"], json!(1));
+    let text = status.to_string();
+    assert!(!text.contains(&cloud.cred_text()) && !text.contains(&cloud.key_text()));
+
+    // Each answers for its own set only.
+    assert_eq!(
+        gamma.sync(Some(HOST), &set_of(&[&alpha]), None),
+        Ok(PeerSync::Unchanged { keys: 1 })
+    );
+    assert_eq!(
+        gamma.sync(Some(CLOUD), &set_of(&[&cloud]), None),
+        Ok(PeerSync::Unchanged { keys: 1 })
+    );
+    assert!(matches!(
+        gamma.sync(Some(CLOUD), &set_of(&[&alpha]), None),
+        Ok(PeerSync::NeedsApproval { .. })
+    ));
+    match gamma.sync(Some("other.example"), &set_of(&[&alpha]), None) {
+        Err(ApprovalRefusal::Untrusted(why)) => {
+            assert!(why.contains("does not keep that page host"), "{why}")
+        }
+        other => panic!("an unknown source is refused, not {other:?}"),
+    }
+
+    // A change to the second source's set, signed by its own kept key, leaves the first source's file as it was. Its
+    // statement names its page host too.
+    let more = cloud_key(5);
+    let mut next = set_of(&[&cloud, &more]);
+    next.sort();
+    let digest = set_digest(&next);
+    let statement = gamma.statement_for(Some(CLOUD), &next);
+    assert_eq!(
+        field(&statement, "paramsDigest"),
+        params_digest(&json!({ "sha256": digest, "from": CLOUD })).expect("the digest")
+    );
+    assert_eq!(
+        gamma.signed_sync(Some(CLOUD), &next, &statement, &cloud),
+        Ok(PeerSync::Changed { keys: 2 })
+    );
+    assert_eq!(gamma.file(PEER_PASSKEYS_FILE), first_file);
+    assert_eq!(
+        gamma.approval_status()["peerKeySources"][1]["keys"],
+        json!(2)
+    );
+
+    // Both sources' keys approve gamma's actions, each from its own origin.
+    for (key, nonce) in [(&alpha, "a"), (&more, "b")] {
+        let id = propose(&gamma.kernel);
+        let statement = gamma_action_statement(&gamma.kernel, &id, &nonce.repeat(32));
+        assert!(gamma.approve(&id, &action_approval(key, &statement)));
+    }
+}
+
+#[test]
+fn a_key_of_one_source_cannot_approve_a_change_to_another_sources_set() {
+    let gamma = Sources::new("pk-cross", two_sources());
+    let alpha = SoftPasskey::from_seed(1);
+    let cloud = cloud_key(4);
+    gamma
+        .sync(None, &set_of(&[&alpha]), None)
+        .expect("the first source syncs");
+    gamma
+        .sync(Some(CLOUD), &set_of(&[&cloud]), None)
+        .expect("the second source syncs");
+    let first = gamma.file(PEER_PASSKEYS_FILE);
+    let second = gamma.file(&peer_file_name(1, CLOUD));
+
+    // The second source's key signs a change to the first source's set, in every way it can be asked.
+    let wanted = set_of(&[&alpha, &cloud_key(5)]);
+    let statement = gamma.statement_for(None, &wanted);
+    assert_eq!(
+        gamma.signed_sync(None, &wanted, &statement, &cloud),
+        Err(ApprovalRefusal::BadSignature)
+    );
+    assert_eq!(
+        gamma.signed_sync(Some(HOST), &wanted, &statement, &cloud),
+        Err(ApprovalRefusal::BadSignature)
+    );
+    // The first source's key cannot change the second's either, and a statement for one set is not one for the other.
+    let wanted_cloud = set_of(&[&cloud, &SoftPasskey::from_seed(6)]);
+    let cloud_statement = gamma.statement_for(Some(CLOUD), &wanted_cloud);
+    assert_eq!(
+        gamma.signed_sync(Some(CLOUD), &wanted_cloud, &cloud_statement, &alpha),
+        Err(ApprovalRefusal::BadSignature)
+    );
+    assert!(
+        gamma
+            .signed_sync(Some(CLOUD), &wanted, &statement, &cloud)
+            .is_err(),
+        "the first source's statement changes nothing of the second's"
+    );
+    assert_eq!(gamma.file(PEER_PASSKEYS_FILE), first);
+    assert_eq!(gamma.file(&peer_file_name(1, CLOUD)), second);
+
+    // Neither source's key changes gamma's own passkeys.
+    let line = gamma_key(6).line(NAMESPACE);
+    let change = canonical_json(&json!({
+        "action": "passkey_add",
+        "host": GAMMA_HOST,
+        "target": format!("passkey-{}", Digest::of(line.as_bytes()).to_hex()),
+        "paramsDigest": params_digest(&json!({ "line": line })).expect("the digest"),
+        "issuedAt": arca::handlers::iso_utc(NOW),
+        "expiresAt": arca::handlers::iso_utc(NOW + 600_000),
+        "nonce": "f".repeat(32),
+    }))
+    .expect("the statement");
+    let proof = cloud.assert(&Assert::over(NAMESPACE, change.as_bytes()));
+    match gamma
+        .kernel
+        .lock()
+        .expect("the kernel lock")
+        .approve_passkey_change(&gamma.scratch.dir, &line, &change, &proof, NOW)
+    {
+        Err(ApprovalRefusal::Untrusted(why)) => assert!(why.contains("another kernel"), "{why}"),
+        other => panic!("a further source's key cannot change gamma's passkeys, not {other:?}"),
+    }
+
+    // The owner of each source still changes its own set.
+    assert_eq!(
+        gamma.signed_sync(None, &wanted, &gamma.statement_for(None, &wanted), &alpha),
+        Ok(PeerSync::Changed { keys: 2 })
+    );
+}
+
+#[test]
+fn a_line_one_source_sent_under_another_sources_credential_id_never_stands_in_for_it() {
+    // The cloud service is the first source here, so its lines are read before the page host's.
+    let gamma = Sources::new(
+        "pk-forged",
+        json!({ "peerKeys": [
+            { "from": CLOUD, "origins": [CLOUD_ORIGIN] },
+            { "from": HOST, "origins": [ORIGIN] },
+        ] }),
+    );
+    let alpha = SoftPasskey::from_seed(1);
+    let mut forged = cloud_key(4);
+    forged.credential_id = alpha.credential_id.clone();
+    gamma
+        .sync(None, &set_of(&[&forged]), None)
+        .expect("the cloud source syncs");
+    gamma
+        .sync(Some(HOST), &set_of(&[&alpha]), None)
+        .expect("the page host syncs");
+    let kept = gamma.file(&peer_file_name(1, HOST));
+
+    let wanted = set_of(&[&alpha, &SoftPasskey::from_seed(6)]);
+    let statement = gamma.statement_for(Some(HOST), &wanted);
+    assert_eq!(
+        gamma.signed_sync(Some(HOST), &wanted, &statement, &forged),
+        Err(ApprovalRefusal::BadSignature),
+        "the cloud's key under the page host's credential id changes nothing of the page host's set"
+    );
+    assert_eq!(gamma.file(&peer_file_name(1, HOST)), kept);
+}
+
+#[test]
+fn a_sources_key_answers_only_from_its_own_origins() {
+    let gamma = Sources::new("pk-origins", two_sources());
+    let alpha = SoftPasskey::from_seed(1);
+    let cloud = cloud_key(4);
+    gamma
+        .sync(None, &set_of(&[&alpha]), None)
+        .expect("the first source syncs");
+    gamma
+        .sync(Some(CLOUD), &set_of(&[&cloud]), None)
+        .expect("the second source syncs");
+
+    // The second source's key, asserting from the first source's origin, approves nothing; and the other way round.
+    for (key, origin, nonce) in [(&cloud, ORIGIN, "1"), (&alpha, CLOUD_ORIGIN, "2")] {
+        let id = propose(&gamma.kernel);
+        let statement = gamma_action_statement(&gamma.kernel, &id, &nonce.repeat(32));
+        let mut assert = Assert::over(NAMESPACE, statement.as_bytes());
+        assert.origin = Some(origin.to_string());
+        assert!(
+            !gamma.approve(&id, &passkey_approval(&statement, &key.assert(&assert))),
+            "{origin}"
+        );
+        assert!(
+            gamma.approve(&id, &action_approval(key, &statement)),
+            "from its own origin it approves"
+        );
+    }
+
+    // A line the second source sends for the first source's origin is kept in its file and trusted for nothing.
+    let gamma = Sources::new("pk-claimed", two_sources());
+    let mut claimed = cloud_key(7);
+    claimed.rp_id = webauthn::RP.to_string();
+    claimed.origin = ORIGIN.to_string();
+    assert_eq!(
+        gamma.sync(Some(CLOUD), &set_of(&[&claimed]), None),
+        Ok(PeerSync::Trusted { keys: 1 })
+    );
+    let status = gamma.approval_status();
+    assert_eq!(status["peerKeySources"][1]["keys"], json!(0));
+    assert_eq!(
+        status["peerKeySources"][1]["reason"],
+        json!("no synced passkey answers a listed origin")
+    );
+    let id = propose(&gamma.kernel);
+    let statement = gamma_action_statement(&gamma.kernel, &id, &"3".repeat(32));
+    assert!(!gamma.approve(&id, &action_approval(&claimed, &statement)));
+}
+
+#[test]
+fn through_the_verb_peer_keys_sync_takes_an_optional_from() {
+    let gamma = Sources::new("pk-verb", two_sources());
+    let clock: Clock = Arc::new(|| NOW);
+    let handlers: std::collections::HashMap<_, _> = plan_handlers_with(
+        Arc::clone(&gamma.kernel),
+        clock,
+        None,
+        None,
+        ActionSlot::default(),
+    )
+    .into_iter()
+    .collect();
+    let verb = arca_api::verb("peer_keys_sync").expect("the verb");
+    let call = |args: Value| {
+        assert!(
+            arca_api::check::conforms(&(verb.params)(), &args).is_ok(),
+            "the arguments fit the schema"
+        );
+        handlers["peer_keys_sync"].call(args, &caller(Scope::Doctor))
+    };
+    let alpha = SoftPasskey::from_seed(1);
+    let cloud = cloud_key(4);
+    assert_eq!(
+        call(json!({ "lines": set_of(&[&alpha]) })).expect("the first source"),
+        json!({ "status": "trusted", "keys": 1 })
+    );
+    assert_eq!(
+        call(json!({ "lines": set_of(&[&cloud]), "from": CLOUD })).expect("the second source"),
+        json!({ "status": "trusted", "keys": 1 })
+    );
+    assert_eq!(
+        call(json!({ "lines": set_of(&[&cloud]), "from": CLOUD })).expect("again"),
+        json!({ "status": "unchanged", "keys": 1 })
+    );
+    assert!(call(json!({ "lines": set_of(&[&cloud]), "from": "other.example" })).is_err());
+    assert!(
+        arca_api::check::conforms(
+            &(verb.params)(),
+            &json!({ "lines": [], "from": "not a host" })
+        )
+        .is_err()
+    );
+}
+
 /// A forwarded unix socket: every connection to `from` is piped to `to`, as an SSH local forward of a remote socket is.
 fn forward(from: PathBuf, to: PathBuf) {
     let listener = UnixListener::bind(&from).expect("the forward listens");
@@ -769,6 +1329,7 @@ impl Remote {
                     linked_hosts: Vec::new(),
                     foreign: ForeignPasskeys::default(),
                     peer: Some(gamma.peer.clone()),
+                    peer_sources: None,
                 }),
             }),
         );

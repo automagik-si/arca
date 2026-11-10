@@ -442,7 +442,11 @@ impl Kernel {
             .any(|own| own.credential_id == assertion.credential_id)
         {
             let owner = self.verifier.verifier();
-            let peer = owner.peer().map(|peer| peer.load().0).unwrap_or_default();
+            let peer: Vec<_> = owner
+                .peers()
+                .iter()
+                .flat_map(|peer| peer.load().0)
+                .collect();
             if owner
                 .foreign()
                 .load()
@@ -541,8 +545,24 @@ impl Kernel {
     /// the new set's digest, signed by a passkey already kept in the file, checked and spent by this kernel's own verifier
     /// (nonce, window, sign count). Without them the answer is the statement to sign, and nothing is written. An empty set is
     /// refused: the last key cannot be removed. The caller holds the kernel lock across the check and the write.
+    ///
+    /// This is the first source's sync: [`Kernel::peer_keys_sync_from`] with no `from`.
     pub fn peer_keys_sync(
         &mut self,
+        lines: &[String],
+        signed: Option<(&str, &[u8])>,
+        now_ms: u64,
+    ) -> Result<PeerSync, ApprovalRefusal> {
+        self.peer_keys_sync_from(None, lines, signed, now_ms)
+    }
+
+    /// [`Kernel::peer_keys_sync`] for the source whose page host is `from`; `None` is the first source. Each source keeps
+    /// its own file and its own set: a changed set is kept only with an approval by a passkey already kept for that same
+    /// source, verified with that source's own key. A further source's statement also binds its `from`, so an approval of
+    /// one source's set is never one of another's.
+    pub fn peer_keys_sync_from(
+        &mut self,
+        from: Option<&str>,
         lines: &[String],
         signed: Option<(&str, &[u8])>,
         now_ms: u64,
@@ -550,11 +570,25 @@ impl Kernel {
         use arca_approval::{normalize_set, parse_proof, parse_statement, peer_target, set_digest};
         use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-        let Some(peer) = self.verifier.verifier().peer().cloned() else {
+        let sources = self.verifier.verifier().peers();
+        let several = sources.len() > 1;
+        if sources.is_empty() {
             return Err(ApprovalRefusal::Untrusted(
                 "this machine does not keep another machine's passkeys".into(),
             ));
+        }
+        let index = match from {
+            None => 0,
+            Some(name) => sources
+                .iter()
+                .position(|peer| peer.from().eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    ApprovalRefusal::Untrusted(
+                        "this machine does not keep that page host's passkeys".into(),
+                    )
+                })?,
         };
+        let peer = sources[index].clone();
         let next = normalize_set(lines)?;
         if next.is_empty() {
             return Err(ApprovalRefusal::Untrusted(
@@ -574,7 +608,12 @@ impl Kernel {
         }
         let digest = set_digest(&next);
         let target = peer_target(&digest);
-        let args = json!({ "sha256": digest });
+        // The first source's statement is what it has always been; a further source's names its page host too.
+        let args = if index == 0 {
+            json!({ "sha256": digest })
+        } else {
+            json!({ "sha256": digest, "from": peer.from() })
+        };
         let Some((statement, proof)) = signed else {
             return Ok(PeerSync::NeedsApproval {
                 keys,
@@ -589,13 +628,27 @@ impl Kernel {
         // files cannot, and an SSH signature is not a passkey proof.
         let assertion = parse_proof(proof)?;
         let (trusted, _) = peer.load();
-        if !trusted
+        let Some(kept_line) = trusted
             .iter()
-            .any(|line| line.credential_id == assertion.credential_id)
-        {
+            .find(|line| line.credential_id == assertion.credential_id)
+        else {
             return Err(ApprovalRefusal::BadSignature);
-        }
+        };
         let approval = format!("{}.{}", STANDARD.encode(statement), STANDARD.encode(proof));
+        // With several sources, the key that verifies must be this source's own line: a line another source sent under the
+        // same credential id never stands in for it. Checked before anything is spent.
+        if several {
+            let spent = self.verifier.preview(
+                ArcaAction::PeerKeysSet,
+                &target,
+                &args,
+                &approval,
+                now_ms,
+            )?;
+            if spent.key != format!("passkey:{}", kept_line.fingerprint) {
+                return Err(ApprovalRefusal::BadSignature);
+            }
+        }
         self.verifier
             .check(ArcaAction::PeerKeysSet, &target, &args, &approval, now_ms)?;
         peer.write(&next, kept.since.unwrap_or(now_ms), Some(now_ms))

@@ -58,9 +58,14 @@ impl OwnerKeys {
         self.passkeys.foreign()
     }
 
-    /// The passkeys another machine's page host keeps in sync here, when the config keeps them.
+    /// The passkeys the first source's page host keeps in sync here, when the config keeps any.
     pub fn peer(&self) -> Option<&crate::peer::PeerPasskeys> {
         self.passkeys.peer()
+    }
+
+    /// Every source's peer passkeys, in the config's order.
+    pub fn peers(&self) -> &[crate::peer::PeerPasskeys] {
+        self.passkeys.peers()
     }
 }
 

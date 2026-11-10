@@ -386,6 +386,7 @@ fn peer_keys_sync_takes_lines_and_an_optional_signed_statement_and_never_echoes_
         (v.params)(),
         closed_with(
             json!({
+                "from": { "type": "string", "maxLength": 253, "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$" },
                 "lines": { "type": "array", "items": { "type": "string", "maxLength": 2048 }, "maxItems": 64 },
                 "statement": { "type": "string", "maxLength": 4096 },
                 "approval": { "type": "string", "maxLength": 8192 },
@@ -447,6 +448,19 @@ fn arca_status_schemas_equal_its_table_row() {
                                 "reason": { "type": "string" },
                             },
                             "required": ["from", "keys", "since", "reason"],
+                        },
+                        "peerKeySources": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "from": { "type": "string" },
+                                    "keys": { "type": "integer", "minimum": 0 },
+                                    "since": { "type": ["string", "null"] },
+                                    "reason": { "type": "string" },
+                                },
+                                "required": ["from", "keys", "since", "reason"],
+                            },
                         },
                     },
                     "required": ["linkedHosts", "trustedKeyFiles"],

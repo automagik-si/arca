@@ -36,8 +36,8 @@ pub use passkey::{
     parse_proof, passkeys_trust, verify_assertion,
 };
 pub use peer::{
-    PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set, peer_target,
-    set_digest,
+    PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set,
+    peer_file_name, peer_target, set_digest,
 };
 pub use signers::{SignerLine, TrustRoot, effective_uid, load_signers, signers_trust};
 pub use sshsig::SshSigVerifier;

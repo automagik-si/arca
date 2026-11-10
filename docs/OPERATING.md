@@ -407,8 +407,9 @@ its request is read.
   page on the same machine relays a linked host's approvals here; see "Approving on another kernel of this machine". It is
   served only by a kernel whose `approval` key names at least one `trustOwnerKeysFrom` file or sets `peerKeys`; any other
   kernel neither lists it nor answers it (`not_found`).
-- `peer_keys_sync` takes `{lines, statement?, approval?}`: the page host's whole owner passkey list, and, for a changed
-  list, the statement this kernel issued with the owner's passkey proof over it (its JSON) in `approval`. It answers
+- `peer_keys_sync` takes `{lines, statement?, approval?, from?}`: the page host's whole owner passkey list, and, for a
+  changed list, the statement this kernel issued with the owner's passkey proof over it (its JSON) in `approval`. `from`
+  names the `approval.peerKeys` source whose list it is; absent, it is the first source. It answers
   `{status, keys, statement?}` with `status` `trusted` (first sync), `unchanged`, `needs_approval` (with the statement to
   sign; nothing written) or `changed`. No line is echoed. It is a doctor verb that writes, served only by a kernel whose
   `approval.peerKeys` is set; see "Approving on another machine".
@@ -1260,6 +1261,37 @@ no key and is never overwritten by a first sync; `arca_status` reports `approval
 `{ "from", "keys", "since", "reason" }`, with no key, credential, line or path. Alpha never logs or stores the lines it
 sends; its log names only the host, the outcome and a count, and only when something changed or failed. A link whose token
 may not call `arca_status` is taken as one that does not ask for the list.
+
+**More than one page host.** A node can trust the owner's approval page and, say, a cloud control service at the same
+time. `peerKeys` is then a list of sources, each `{from, origins}`:
+
+```json
+"approval": {
+  "peerKeys": [
+    { "from": "alpha", "origins": ["https://alpha.example.com"] },
+    { "from": "cloud.example", "origins": ["https://cloud.example.com"] }
+  ]
+}
+```
+
+The single object above stays valid and means exactly what it did: one source, the file `peer-passkeys`, the same
+answers and the same status. In a list, each `from` is named once (letter case aside) and no origin is listed by two
+sources; a list that breaks either rule, or is empty, stops `arca serve` at the config. The first source keeps
+`<stateDir>/peer-passkeys`, as the single object does. Each further source keeps its own `<stateDir>/peer-passkeys-<from>`,
+written and read under the same file rules, with its own header, first sync and changes. Moving a source to another place
+in the list moves it to another file, so its next sync is a first sync, as a changed `from` is.
+
+`peer_keys_sync` takes an optional `from`, the source whose list is sent. Absent, it is the first source, so a page host
+that is the first source calls as it always has; a page host that is a further source finds itself in the target's
+`arca_status` and names itself in `from`. A `from` no source names is refused. The sources are apart in every way that
+matters: a changed list is kept only with an approval by a passkey already kept for that same source, verified with that
+source's own key, so a key of one source cannot change another's list, even when it was sent under the same credential id.
+A further source's statement binds `{ "sha256": "<sha256>", "from": "<from>" }`; the first source's binds
+`{ "sha256": "<sha256>" }` as before. A key is trusted only for its own source's origins: an assertion by one source's key
+from another source's origin is refused, and a line a source sends for an origin that is not its own is kept in its file
+and trusted for nothing. As before, every kept key approves actions only. With a list, `arca_status` reports
+`approval.peerKeys` for the first source, as it does for the single object, and `approval.peerKeySources`, one
+`{ "from", "keys", "since", "reason" }` per source in the config's order, the first included.
 
 The page routes:
 

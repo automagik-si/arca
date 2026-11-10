@@ -83,13 +83,61 @@ pub struct ApprovalConfig {
     /// another machine whose MCP socket is forwarded to a path here.
     #[serde(default)]
     pub linked_hosts: Vec<LinkedHost>,
-    /// Another machine's page host whose owner passkeys this kernel keeps in sync (`peer_keys_sync`) and trusts for action
-    /// approvals. Absent, `peer_keys_sync` is not served and no peer passkey is trusted.
+    /// The page hosts on other machines whose owner passkeys this kernel keeps in sync (`peer_keys_sync`) and trusts for
+    /// action approvals: one source as an object, or a list of sources. Absent, `peer_keys_sync` is not served and no peer
+    /// passkey is trusted.
     #[serde(default)]
-    pub peer_keys: Option<PeerKeysConfig>,
+    pub peer_keys: Option<PeerKeys>,
 }
 
-/// The `approval.peerKeys` key: the page host's name, as its own kernel names itself (its approval host), and the page
+/// The `approval.peerKeys` key: one source as a single object, or a list of sources. The first source (or the single
+/// object) keeps the state file `peer-passkeys`; each further source keeps `peer-passkeys-<from>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerKeys {
+    One(PeerKeysConfig),
+    Many(Vec<PeerKeysConfig>),
+}
+
+impl PeerKeys {
+    /// The sources in the config's order.
+    pub fn sources(&self) -> &[PeerKeysConfig] {
+        match self {
+            Self::One(source) => std::slice::from_ref(source),
+            Self::Many(sources) => sources,
+        }
+    }
+
+    /// Whether the key was written as a list.
+    pub fn is_list(&self) -> bool {
+        matches!(self, Self::Many(_))
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+        struct Either;
+        impl<'de> serde::de::Visitor<'de> for Either {
+            type Value = PeerKeys;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("one peerKeys source {from, origins} or a list of them")
+            }
+
+            // The single object is read exactly as it was before the list form existed.
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<PeerKeys, A::Error> {
+                PeerKeysConfig::deserialize(MapAccessDeserializer::new(map)).map(PeerKeys::One)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, seq: A) -> Result<PeerKeys, A::Error> {
+                Vec::deserialize(SeqAccessDeserializer::new(seq)).map(PeerKeys::Many)
+            }
+        }
+        deserializer.deserialize_any(Either)
+    }
+}
+
+/// One `approval.peerKeys` source: the page host's name, as its own kernel names itself (its approval host), and the page
 /// origins its passkeys may answer from.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -440,7 +488,16 @@ fn check_approval(approval: &ApprovalConfig) -> Result<(), ConfigError> {
             "each origin must be https://, a lowercase host name, and at most a non-443 port, with no path",
         ));
     }
-    if let Some(peer) = &approval.peer_keys {
+    let sources = approval
+        .peer_keys
+        .as_ref()
+        .map_or(&[][..], PeerKeys::sources);
+    if approval.peer_keys.is_some() && sources.is_empty() {
+        return Err(ConfigError::Approval(
+            "peerKeys must name at least one source: {from, origins}, or a list of them",
+        ));
+    }
+    for (index, peer) in sources.iter().enumerate() {
         if !host_name_ok(&peer.from) {
             return Err(ConfigError::Approval(
                 "peerKeys.from must be the page host's name: letters, digits, dots and hyphens",
@@ -450,6 +507,24 @@ fn check_approval(approval: &ApprovalConfig) -> Result<(), ConfigError> {
         {
             return Err(ConfigError::Approval(
                 "peerKeys.origins must list at least one page origin, each https://, a lowercase host name, and at most a non-443 port",
+            ));
+        }
+        // Each source keeps its own file, named for its page host, and its keys answer only for its own origins.
+        let earlier = &sources[..index];
+        if earlier
+            .iter()
+            .any(|other| other.from.eq_ignore_ascii_case(&peer.from))
+        {
+            return Err(ConfigError::Approval(
+                "each peerKeys source needs its own from: two sources name the same page host",
+            ));
+        }
+        if earlier
+            .iter()
+            .any(|other| other.origins.iter().any(|o| peer.origins.contains(o)))
+        {
+            return Err(ConfigError::Approval(
+                "a page origin is listed by two peerKeys sources: each origin belongs to one source",
             ));
         }
     }
@@ -844,6 +919,82 @@ mod tests {
             serde_json::json!({ "peerKeys": { "from": "alpha", "origins": [], "keys": [] } }),
         );
         assert!(unknown.is_err(), "an unknown peerKeys key is refused");
+
+        // The single object and the list: the same source, read the same way.
+        let single: ApprovalConfig = parse(serde_json::json!({
+            "peerKeys": { "from": "alpha", "origins": ["https://alpha.example.com:8443"] }
+        }));
+        let source = PeerKeysConfig {
+            from: "alpha".to_string(),
+            origins: vec!["https://alpha.example.com:8443".to_string()],
+        };
+        assert_eq!(single.peer_keys, Some(PeerKeys::One(source.clone())));
+        let listed: ApprovalConfig = parse(serde_json::json!({ "peerKeys": [
+            { "from": "alpha", "origins": ["https://alpha.example.com:8443"] },
+            { "from": "cloud.example", "origins": ["https://cloud.example.com", "https://cloud2.example.com"] }
+        ] }));
+        let keys = listed.peer_keys.clone().expect("the list");
+        assert!(keys.is_list() && !single.peer_keys.as_ref().expect("one").is_list());
+        assert_eq!(keys.sources().len(), 2);
+        assert_eq!(keys.sources()[0], source);
+        assert_eq!(single.peer_keys.as_ref().expect("one").sources(), [source]);
+        config.approval = Some(listed);
+        assert_eq!(check(&config), Ok(()), "two sources with their own origins");
+        for (bad, rule) in [
+            (serde_json::json!({ "peerKeys": [] }), "at least one source"),
+            (
+                serde_json::json!({ "peerKeys": [
+                    { "from": "alpha", "origins": ["https://alpha.example.com"] },
+                    { "from": "alpha", "origins": ["https://beta.example.com"] }
+                ] }),
+                "the same page host",
+            ),
+            (
+                serde_json::json!({ "peerKeys": [
+                    { "from": "alpha", "origins": ["https://alpha.example.com"] },
+                    { "from": "ALPHA", "origins": ["https://beta.example.com"] }
+                ] }),
+                "the same page host",
+            ),
+            (
+                serde_json::json!({ "peerKeys": [
+                    { "from": "alpha", "origins": ["https://alpha.example.com", "https://shared.example.com"] },
+                    { "from": "beta", "origins": ["https://beta.example.com", "https://shared.example.com"] }
+                ] }),
+                "each origin belongs to one source",
+            ),
+            (
+                serde_json::json!({ "peerKeys": [
+                    { "from": "alpha", "origins": ["https://alpha.example.com"] },
+                    { "from": "be ta", "origins": ["https://beta.example.com"] }
+                ] }),
+                "peerKeys.from",
+            ),
+            (
+                serde_json::json!({ "peerKeys": [
+                    { "from": "alpha", "origins": ["https://alpha.example.com"] },
+                    { "from": "beta", "origins": [] }
+                ] }),
+                "peerKeys.origins",
+            ),
+        ] {
+            config.approval = Some(parse(bad));
+            let refused = check(&config).expect_err("the peerKeys list is refused");
+            assert!(matches!(refused, ConfigError::Approval(_)));
+            assert!(refused.to_string().contains(rule), "{refused}");
+            assert!(
+                !refused.to_string().contains("example.com"),
+                "no value is echoed"
+            );
+        }
+        for bad in [
+            serde_json::json!({ "peerKeys": [{ "from": "alpha", "origins": [], "keys": [] }] }),
+            serde_json::json!({ "peerKeys": "alpha" }),
+            serde_json::json!({ "peerKeys": [["alpha"]] }),
+        ] {
+            let unknown: Result<ApprovalConfig, _> = serde_json::from_value(bad);
+            assert!(unknown.is_err(), "a peerKeys of another shape is refused");
+        }
         let unknown: Result<ApprovalConfig, _> =
             serde_json::from_value(serde_json::json!({ "trustOwnerKeys": [] }));
         assert!(unknown.is_err(), "an unknown key is refused");

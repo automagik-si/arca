@@ -526,6 +526,7 @@ fn an_unreadable_trust_file_adds_no_key_and_arca_status_says_why() {
             linked_hosts: Vec::new(),
             foreign: pair.foreign.clone(),
             peer: None,
+            peer_sources: None,
         }),
     }
     .call(json!({}), &caller(Scope::Viewer))

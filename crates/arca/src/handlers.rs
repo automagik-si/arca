@@ -459,8 +459,11 @@ pub const STATUS_TRUST_WINDOW: std::time::Duration = std::time::Duration::from_s
 pub struct ApprovalStatus {
     pub linked_hosts: Vec<String>,
     pub foreign: arca_approval::ForeignPasskeys,
-    /// The passkeys another machine's page host keeps in sync here, when `approval.peerKeys` is set: the verifier's own value.
+    /// The passkeys the first `approval.peerKeys` source's page host keeps in sync here: the verifier's own value.
     pub peer: Option<arca_approval::PeerPasskeys>,
+    /// Every source, the first included, in the config's order, when `approval.peerKeys` is written as a list: the
+    /// verifier's own values. `None` for the single-object form, whose status is `peerKeys` alone.
+    pub peer_sources: Option<Vec<arca_approval::PeerPasskeys>>,
 }
 
 impl ApprovalStatus {
@@ -487,6 +490,9 @@ impl ApprovalStatus {
         let mut status = json!({ "linkedHosts": self.linked_hosts, "trustedKeyFiles": files });
         if let Some(peer) = &self.peer {
             status["peerKeys"] = peer_status(peer);
+        }
+        if let Some(sources) = &self.peer_sources {
+            status["peerKeySources"] = sources.iter().map(peer_status).collect();
         }
         status
     }
@@ -1093,8 +1099,8 @@ pub fn plan_handlers_served(
 }
 
 /// `peer_keys_sync`: keeps the page host's owner passkeys in this kernel's peer passkeys file (see
-/// [`Kernel::peer_keys_sync`]). `statement` and `approval` (the owner's passkey proof over it, as its JSON) come together or
-/// not at all. No line is echoed or logged.
+/// [`Kernel::peer_keys_sync_from`]). `from` names the source, and absent it is the first one. `statement` and `approval`
+/// (the owner's passkey proof over it, as its JSON) come together or not at all. No line is echoed or logged.
 struct PeerKeysSync {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -1121,9 +1127,17 @@ impl ToolHandler for PeerKeysSync {
                 ));
             }
         };
+        let from = match args.get("from") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| CallError::Invalid("from is a page host's name".to_string()))?,
+            ),
+        };
         let now = (self.clock)();
         let outcome = lock(&self.kernel)?
-            .peer_keys_sync(&lines, signed, now)
+            .peer_keys_sync_from(from, &lines, signed, now)
             .map_err(refusal_failure)?;
         Ok(match outcome {
             PeerSync::Trusted { keys } => json!({ "status": "trusted", "keys": keys }),

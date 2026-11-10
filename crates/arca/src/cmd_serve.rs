@@ -20,9 +20,9 @@ use arca_alerts::rules::{self, Probes, RulesError};
 use arca_api::verbs;
 use arca_approval::{
     ApprovalRefusal, ApprovalVerifier, FileNonces, FileSignCounts, ForeignPasskeys, OwnerKeys,
-    PASSKEY_COUNTS_FILE, PEER_PASSKEYS_FILE, PasskeyLine, PasskeyVerifier, PeerPasskeys,
-    STATE_PASSKEYS_FILE, SignerLine, SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys,
-    load_signers, load_state_passkeys, passkeys_trust, signers_trust,
+    PASSKEY_COUNTS_FILE, PasskeyLine, PasskeyVerifier, PeerPasskeys, STATE_PASSKEYS_FILE,
+    SignerLine, SshSigVerifier, TEST_PASSKEYS_ENV, load_passkeys, load_signers,
+    load_state_passkeys, passkeys_trust, peer_file_name, signers_trust,
 };
 use arca_incus::{ProjectFamily, UnixIncus};
 use arca_kernel::KernelError;
@@ -163,10 +163,16 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // One value for the other kernels' passkeys files: the verifier reads them at each check, and arca_status reports that
     // read (its clone shares the last one).
     let foreign = foreign_passkeys(&cfg);
-    // The passkeys another machine's page host keeps in sync here, when `approval.peerKeys` is set: one value shared by the
-    // verifier, `peer_keys_sync` and arca_status.
-    let peer = peer_passkeys(&cfg);
-    let trusted = owner_keys(&cfg, foreign.clone(), peer.clone())?;
+    // The passkeys other machines' page hosts keep in sync here, one value per `approval.peerKeys` source: each is shared by
+    // the verifier, `peer_keys_sync` and arca_status.
+    let peers = peer_passkeys(&cfg);
+    let peer_sources = cfg
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.peer_keys.as_ref())
+        .is_some_and(crate::config::PeerKeys::is_list)
+        .then(|| peers.clone());
+    let trusted = owner_keys(&cfg, foreign.clone(), peers.clone())?;
     let (signing_keys, passkeys) = trusted.key_counts();
     eprintln!("arca: {signing_keys} owner signing key(s), {passkeys} passkey(s) kept");
     let nonces = FileNonces::open(&cfg.state_dir.join(NONCE_FILE)).map_err(approval_failure)?;
@@ -247,7 +253,7 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     // not_found, exactly as before the verb existed.
     let relayed = accepts_relayed_approvals(&cfg);
     // peer_keys_sync is served only to a kernel whose config keeps another machine's page host's passkeys.
-    let keeps_peer_keys = peer.is_some();
+    let keeps_peer_keys = !peers.is_empty();
     let mut server = Server::new(served_verbs(relayed, keeps_peer_keys), tokens.clone())
         .handle(
             "arca_status",
@@ -265,7 +271,8 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                         .map(|host| host.name.clone())
                         .collect(),
                     foreign: foreign.clone(),
-                    peer: peer.clone(),
+                    peer: peers.first().cloned(),
+                    peer_sources: peer_sources.clone(),
                 }),
             }),
         )
@@ -690,7 +697,7 @@ fn check_state_dir_owned_by(dir: &Path, uid: u32) -> Result<(), Failure> {
 fn owner_keys(
     cfg: &NodeConfig,
     foreign: ForeignPasskeys,
-    peer: Option<PeerPasskeys>,
+    peers: Vec<PeerPasskeys>,
 ) -> Result<OwnerKeys, Failure> {
     let ssh = SshSigVerifier::new(owner_signers(cfg)?);
     let test: Option<PathBuf> = std::env::var_os(TEST_PASSKEYS_ENV).map(PathBuf::from);
@@ -721,10 +728,7 @@ fn owner_keys(
             PasskeyVerifier::refusing(refusal)
         }
     };
-    let passkeys = match peer {
-        Some(peer) => passkeys.with_peer(peer),
-        None => passkeys,
-    };
+    let passkeys = peers.into_iter().fold(passkeys, PasskeyVerifier::with_peer);
     Ok(OwnerKeys::new(ssh, passkeys))
 }
 
@@ -755,24 +759,41 @@ fn foreign_passkeys(cfg: &NodeConfig) -> ForeignPasskeys {
     foreign
 }
 
-/// The passkeys another machine's page host keeps in sync here, from `approval.peerKeys`, in the state directory's
-/// `peer-passkeys` file. No `peerKeys` keeps none. The file's state at start is logged by count only, never a line or a key.
-fn peer_passkeys(cfg: &NodeConfig) -> Option<PeerPasskeys> {
-    let config = cfg.approval.as_ref()?.peer_keys.as_ref()?;
-    let peer = PeerPasskeys::new(
-        cfg.state_dir.join(PEER_PASSKEYS_FILE),
-        config.from.clone(),
-        config.origins.clone(),
-    );
-    let state = peer.load().1;
-    match state.reason {
-        None => eprintln!(
-            "arca: {} passkey(s) of {} trusted for approvals",
-            state.keys, config.from
-        ),
-        Some(reason) => eprintln!("arca: no passkey of {} is trusted: {reason}", config.from),
-    }
-    Some(peer)
+/// The passkeys other machines' page hosts keep in sync here, one value per `approval.peerKeys` source in the config's
+/// order. The first source (or the single object) keeps the state directory's `peer-passkeys` file, each further one
+/// `peer-passkeys-<from>`. No `peerKeys` keeps none. Each file's state at start is logged by count only, never a line or a
+/// key.
+fn peer_passkeys(cfg: &NodeConfig) -> Vec<PeerPasskeys> {
+    let Some(config) = cfg
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.peer_keys.as_ref())
+    else {
+        return Vec::new();
+    };
+    config
+        .sources()
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let peer = PeerPasskeys::new(
+                cfg.state_dir.join(peer_file_name(index, &source.from)),
+                source.from.clone(),
+                source.origins.clone(),
+            );
+            let state = peer.load().1;
+            match state.reason {
+                None => eprintln!(
+                    "arca: {} passkey(s) of {} trusted for approvals",
+                    state.keys, source.from
+                ),
+                Some(reason) => {
+                    eprintln!("arca: no passkey of {} is trusted: {reason}", source.from)
+                }
+            }
+            peer
+        })
+        .collect()
 }
 
 /// Whether this kernel accepts approvals relayed from another kernel's page: its config has an `approval` key that names at

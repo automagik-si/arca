@@ -222,7 +222,7 @@ static VERBS: [Verb; 47] = [
     },
     Verb {
         name: "peer_keys_sync",
-        summary: "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed.",
+        summary: "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed. When `approval.peerKeys` lists several sources, `from` names the page host whose set this is (absent: the first source), and a change needs a key already kept for that same source.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -1102,16 +1102,8 @@ fn arca_status_result() -> Value {
                         ("reason", true, nullable(string())),
                     ])),
                 ),
-                (
-                    "peerKeys",
-                    false,
-                    result(vec![
-                        ("from", true, string()),
-                        ("keys", true, at_least(0)),
-                        ("since", true, nullable(string())),
-                        ("reason", true, string()),
-                    ]),
-                ),
+                ("peerKeys", false, peer_keys_status()),
+                ("peerKeySources", false, array(peer_keys_status())),
             ]),
         ),
     ])
@@ -1536,8 +1528,23 @@ fn action_approve_result() -> Value {
     ])
 }
 
+/// One `approval.peerKeys` source as `arca_status` reports it.
+fn peer_keys_status() -> Value {
+    result(vec![
+        ("from", true, string()),
+        ("keys", true, at_least(0)),
+        ("since", true, nullable(string())),
+        ("reason", true, string()),
+    ])
+}
+
 fn peer_keys_sync_params() -> Value {
     params(vec![
+        (
+            "from",
+            false,
+            json!({ "type": "string", "maxLength": 253, "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$" }),
+        ),
         (
             "lines",
             true,

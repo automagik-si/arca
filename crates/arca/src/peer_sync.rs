@@ -1,5 +1,6 @@
 //! The page host's half of approvals on another machine: it keeps its own owner passkeys in sync on each linked kernel that
-//! asks for them (`approval.peerKeys.from` names this host), so that kernel can verify the owner's approvals itself.
+//! asks for them (an `approval.peerKeys` source's `from` names this host), so that kernel can verify the owner's approvals
+//! itself.
 //!
 //! On start, every ten minutes, and when the approval page asks, the page host reads each linked kernel's `arca_status`. A
 //! kernel whose `approval.peerKeys.from` is this host's approval host is sent this kernel's own passkey lines (the root file
@@ -7,9 +8,13 @@
 //! is. A set that differs from the kept one waits as a card on the approval page ("Trust your new passkey list on <host>")
 //! until the owner signs the statement the target issued; that signed statement is relayed with the set.
 //!
+//! A kernel may keep several page hosts' passkeys (`peerKeys` as a list; its status lists them in `peerKeySources`). When
+//! this host is its first source, the calls are what they have always been. When it is a further source, each call names
+//! this host in `from`, so the target keeps the list in this host's own file.
+//!
 //! Lines are read from the kernel at each sync, sent only in the relayed call's body, and never logged, stored or returned.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -50,6 +55,8 @@ pub struct PeerSyncer {
     kernel: Arc<Mutex<Kernel>>,
     linked: Arc<Vec<LinkedHost>>,
     pending: Arc<Mutex<BTreeMap<String, PendingTrust>>>,
+    /// The linked hosts that keep this host's passkeys as a further source: calls to them name this host in `from`.
+    named: Arc<Mutex<BTreeSet<String>>>,
     log: Arc<dyn Fn(&str) + Send + Sync>,
     /// The last sync the page asked for: when it ran and what each host came to.
     on_demand: Arc<Mutex<Option<OnDemand>>>,
@@ -63,6 +70,7 @@ impl PeerSyncer {
             kernel,
             linked: Arc::new(linked),
             pending: Arc::default(),
+            named: Arc::default(),
             log: Arc::new(|line| eprintln!("{line}")),
             on_demand: Arc::default(),
         }
@@ -120,23 +128,50 @@ impl PeerSyncer {
         let Some((me, lines)) = self.own() else {
             return SyncOutcome::Failed("this host's own passkeys could not be read".to_string());
         };
+        // Whether the host keeps this host's passkeys, and whether as its first source (asked as always) or a further one
+        // (asked by name).
         let asked = match linked::call(host, "arca_status", json!({})) {
             Ok(status) => {
-                status
+                let first = status
                     .pointer("/approval/peerKeys/from")
                     .and_then(Value::as_str)
-                    == Some(&me)
+                    == Some(&me);
+                let further = status
+                    .pointer("/approval/peerKeySources")
+                    .and_then(Value::as_array)
+                    .is_some_and(|sources| {
+                        sources
+                            .iter()
+                            .any(|source| source["from"].as_str() == Some(&me))
+                    });
+                if first {
+                    Some(false)
+                } else {
+                    further.then_some(true)
+                }
             }
             // A token that may not read the status belongs to a link set up only for relaying (a kernel on this machine
             // that reads this host's passkeys file itself): that host does not ask for the list.
-            Err(RelayError::Token) => false,
+            Err(RelayError::Token) => None,
             Err(error) => return self.failed(host, &error),
         };
-        if !asked {
+        let Some(by_name) = asked else {
             self.forget(&host.name);
             return SyncOutcome::NotAsked;
+        };
+        {
+            let mut named = self.named.lock().unwrap_or_else(PoisonError::into_inner);
+            if by_name {
+                named.insert(host.name.clone());
+            } else {
+                named.remove(&host.name);
+            }
         }
-        match linked::call(host, "peer_keys_sync", json!({ "lines": lines })) {
+        let mut call = json!({ "lines": lines });
+        if by_name {
+            call["from"] = json!(me);
+        }
+        match linked::call(host, "peer_keys_sync", call) {
             Ok(answer) => self.record(host, &answer),
             Err(error) => self.failed(host, &error),
         }
@@ -150,16 +185,21 @@ impl PeerSyncer {
         statement: &str,
         proof: &str,
     ) -> Result<Value, RelayError> {
-        let Some((_, lines)) = self.own() else {
+        let Some((me, lines)) = self.own() else {
             return Err(RelayError::Failed(
                 "this host's own passkeys could not be read".to_string(),
             ));
         };
-        let answer = linked::call(
-            host,
-            "peer_keys_sync",
-            json!({ "lines": lines, "statement": statement, "approval": proof }),
-        )?;
+        let mut call = json!({ "lines": lines, "statement": statement, "approval": proof });
+        if self
+            .named
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&host.name)
+        {
+            call["from"] = json!(me);
+        }
+        let answer = linked::call(host, "peer_keys_sync", call)?;
         self.record(host, &answer);
         Ok(answer)
     }

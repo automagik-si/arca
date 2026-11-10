@@ -11,6 +11,11 @@
 //! [`parse_passkeys`]. Its first line is a header this module writes, naming the page host and the times of the first sync
 //! and of the last signed change. A file without that header, or with another page host's name, adds no key.
 //!
+//! The config may name more than one page host (a list of sources). Each source is one [`PeerPasskeys`] with its own file:
+//! the first keeps [`PEER_PASSKEYS_FILE`], each further one `peer-passkeys-<from>` ([`peer_file_name`]), under the same
+//! rules. A source's lines are trusted for that source's origins only, and the config check keeps the sources' origins
+//! apart, so a key one page host sent never answers for another's origin.
+//!
 //! Each read keeps only the file's state (a count, the times and a reason, never a key), so `arca_status` can report it
 //! without reading the file more often than its window.
 
@@ -29,8 +34,19 @@ use crate::ApprovalRefusal;
 use crate::foreign::{NOFOLLOW, read_trusted_bytes};
 use crate::passkey::{PasskeyLine, format_passkey_line, parse_passkeys};
 
-/// The peer passkeys file's name in the state directory.
+/// The peer passkeys file's name in the state directory: the first source's, or the only one's.
 pub const PEER_PASSKEYS_FILE: &str = "peer-passkeys";
+
+/// The file name of the source at `index` in the config's order, whose page host is `from`: the first keeps
+/// [`PEER_PASSKEYS_FILE`], each further one `peer-passkeys-<from>`. The config check has refused a `from` that is not a host
+/// name (letters, digits, dots and hyphens), so the name is one plain path segment.
+pub fn peer_file_name(index: usize, from: &str) -> String {
+    if index == 0 {
+        PEER_PASSKEYS_FILE.to_string()
+    } else {
+        format!("{PEER_PASSKEYS_FILE}-{from}")
+    }
+}
 /// The header's opening words. The whole header is `# arca peer-keys from=<host> since=<ms>[ changed=<ms>]`.
 const HEADER: &str = "# arca peer-keys";
 /// The most lines one set may hold.

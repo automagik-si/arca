@@ -28,6 +28,36 @@
                   },
                   "type": "array"
                 },
+                "peerKeySources": {
+                  "items": {
+                    "properties": {
+                      "from": {
+                        "type": "string"
+                      },
+                      "keys": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "reason": {
+                        "type": "string"
+                      },
+                      "since": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "from",
+                      "keys",
+                      "since",
+                      "reason"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
                 "peerKeys": {
                   "properties": {
                     "from": {
@@ -2138,6 +2168,15 @@
           }
         },
         {
+          "name": "from",
+          "required": false,
+          "schema": {
+            "maxLength": 253,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "statement",
           "required": false,
           "schema": {
@@ -2174,7 +2213,7 @@
           "type": "object"
         }
       },
-      "summary": "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed.",
+      "summary": "Keeps the owner passkeys of the page host `approval.peerKeys` names, for action approvals only. The first set is kept as is; a changed set needs a passkey approval by a key already kept, and without one the answer is the statement to sign. Lines are never echoed. When `approval.peerKeys` lists several sources, `from` names the page host whose set this is (absent: the first source), and a change needs a key already kept for that same source.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
