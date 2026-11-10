@@ -263,6 +263,28 @@ dashes and underscores, not starting with a dot, so no path. A template whose sc
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
 
+The `automagik` image is built from a checkout with `bash templates/automagik.build.sh PROJECT PROFILE
+local:BASE_FINGERPRINT`, which publishes it in `PROJECT` under the alias the template names. `PROFILE` must carry a
+root disk and a NIC with internet access and DNS, because the builder downloads Node, Tailscale and the plugins. The
+`arca-service` profile has no NIC (each service gets its own), so it cannot be the build profile: use one that adds a
+NIC on a network the project may use, and delete it afterwards if it was made for the build. The script waits up to
+60 seconds for the builder to resolve DNS and says so when it never does. The base is an amd64 Debian image already
+in the project, prepared like this (Debian 13 here), with the same `PROFILE`:
+
+```bash
+incus init images:debian/13 base-prep --project PROJECT --profile PROFILE
+incus start base-prep --project PROJECT
+incus exec base-prep --project PROJECT --env DEBIAN_FRONTEND=noninteractive -- sh -c \
+  'apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git xz-utils tar passwd \
+   util-linux systemd && apt-get clean && rm -rf /var/lib/apt/lists/*'
+incus stop base-prep --project PROJECT
+incus publish base-prep --project PROJECT   # prints the BASE_FINGERPRINT
+incus delete base-prep --project PROJECT
+```
+
+The pull also leaves a cached copy of `images:debian/13` in the project; delete it if it is not wanted. The build
+removes its own builder instance and leaves the base and the built image.
+
 When a create fails in the kernel, the refusal carries the recorded reason and says what remains: `nothing was left
 behind` only when the cleanup that follows completed and nothing waits for an approval. A template with `data`
 leaves its data volume in a delete plan for the owner's approval, and the refusal names it. When the cleanup did not
