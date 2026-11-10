@@ -60,5 +60,5 @@ cargo clippy --workspace -- -D warnings
 ```
 
 A plain `cargo build --release` needs the build machine's glibc or newer on the host that runs the binary.
-`scripts/build-portable.sh` builds `arca` against glibc 2.34 (Enterprise Linux 9 and newer) with cargo-zigbuild and zig; both are pinned, checked by SHA-256 and kept under `~/.cache/arca-portable-tools`, with no root.
-It prints the binary's path, its SHA-256 and the highest GLIBC symbol version it needs, and fails when that version is above 2.34.
+`scripts/build-portable.sh` builds `arca` against glibc 2.34 (Enterprise Linux 9 and newer) with cargo-zigbuild and zig; both are pinned, checked by SHA-256 and kept under `~/.cache/arca-portable-tools` (or `ARCA_PORTABLE_TOOLS`), with no root. It runs on x86_64 Linux and needs `curl`, `xz`, `sha256sum` and `objdump`.
+It prints the zig it used, the binary's path, its SHA-256 and the highest GLIBC symbol version the binary needs, and fails when that version is above 2.34 or cannot be read.

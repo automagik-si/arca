@@ -14,12 +14,13 @@
 #   ARCA_PORTABLE_TOOLS   where the tools are kept (default: $XDG_CACHE_HOME/arca-portable-tools,
 #                         or ~/.cache/arca-portable-tools)
 #
-# Prints the path of the binary, its SHA-256 and the highest GLIBC symbol version it needs.
-# Exits non-zero when that version is above the floor, or when any step fails.
+# Prints the zig that built the binary, the binary's path, its SHA-256 and the highest GLIBC
+# symbol version it needs. Exits non-zero when that version is above the ceiling, when no
+# such version can be read, or when any step fails.
 set -euo pipefail
 
 # The glibc the binary may need at most. 2.34 is Enterprise Linux 9.
-GLIBC_FLOOR="2.34"
+GLIBC_CEILING="2.34"
 RUST_TARGET="x86_64-unknown-linux-gnu"
 
 # Pinned tools. To move a pin, change the version and the SHA-256 together; the SHA-256 values
@@ -46,9 +47,11 @@ for tool in cargo curl sha256sum tar xz objdump; do
     command -v "$tool" >/dev/null || fail "$tool is not on PATH"
 done
 
-repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 tools="${ARCA_PORTABLE_TOOLS:-${XDG_CACHE_HOME:-$HOME/.cache}/arca-portable-tools}"
 mkdir -p "$tools"
+# Absolute, so the path still names the same directory after the cd into the repository.
+tools="$(CDPATH= cd -- "$tools" && pwd)"
 
 # fetch <url> <sha256> <directory>: download an archive, check it, unpack it into <directory>.
 # The directory is renamed into place only after the check and the unpack both succeed, so an
@@ -80,12 +83,20 @@ fetch "$ZIGBUILD_URL" "$ZIGBUILD_SHA256" "$zigbuild_dir"
 [ -x "$zigbuild_dir/cargo-zigbuild" ] ||
     fail "no cargo-zigbuild in $zigbuild_dir; remove that directory and run again"
 
-# cargo finds `cargo-zigbuild` on PATH; cargo-zigbuild is told which zig to use.
-export PATH="$zigbuild_dir:$PATH"
+# Only the pinned tools may build the binary. cargo-zigbuild takes the zig named by
+# CARGO_ZIGBUILD_ZIG_COMMAND before it looks for a Python `ziglang` package or a zig on PATH,
+# so that variable is set to the pinned zig, and the inherited values that could name another
+# zig, add arguments to it or state a version for it are dropped. The pinned cargo-zigbuild is
+# run by its full path, because `cargo zigbuild` could find another one in cargo's bin directory.
+unset CARGO_ZIGBUILD_ZIG_COMMAND_ARGS CARGO_ZIGBUILD_ZIG_VERSION
+export CARGO_ZIGBUILD_ZIG_COMMAND="$zig_dir/zig"
 export CARGO_ZIGBUILD_ZIG_PATH="$zig_dir/zig"
+zig_version="$("$CARGO_ZIGBUILD_ZIG_COMMAND" version)"
+[ "$zig_version" = "$ZIG_VERSION" ] ||
+    fail "$CARGO_ZIGBUILD_ZIG_COMMAND is zig $zig_version, not the pinned $ZIG_VERSION"
 
 cd "$repo"
-cargo zigbuild --release --locked -p arca --bin arca --target "$RUST_TARGET.$GLIBC_FLOOR"
+"$zigbuild_dir/cargo-zigbuild" zigbuild --release --locked -p arca --bin arca --target "$RUST_TARGET.$GLIBC_CEILING"
 
 target_dir="$(cargo metadata --format-version 1 --no-deps --locked |
     sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
@@ -94,16 +105,18 @@ binary="$target_dir/$RUST_TARGET/release/arca"
 [ -x "$binary" ] || fail "the build did not produce $binary"
 
 # The highest GLIBC_x.y version among the dynamic symbols is the oldest glibc that can load
-# the binary. A binary with no such symbol does not depend on glibc at all.
-glibc_max="$(objdump -T "$binary" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' |
+# the binary. objdump runs as its own command so that its failure stops the script; a binary
+# that shows no such symbol was not checked, and that is a failure too.
+symbols="$(objdump -T "$binary")" || fail "objdump could not read $binary"
+glibc_max="$(printf '%s\n' "$symbols" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' |
     sort -u -V | tail -n 1 || true)"
 sha256="$(sha256sum "$binary" | cut -d ' ' -f 1)"
 
+echo "zig:       $CARGO_ZIGBUILD_ZIG_COMMAND ($zig_version)"
 echo "binary:    $binary"
 echo "sha256:    $sha256"
-echo "max GLIBC: ${glibc_max:-none}"
+echo "max GLIBC: ${glibc_max:-none found}"
 
-if [ -n "$glibc_max" ] &&
-    [ "$(printf '%s\n%s\n' "$glibc_max" "$GLIBC_FLOOR" | sort -V | tail -n 1)" != "$GLIBC_FLOOR" ]; then
-    fail "the binary needs GLIBC $glibc_max, above the $GLIBC_FLOOR floor"
-fi
+[ -n "$glibc_max" ] || fail "no GLIBC symbol version found in $binary, so the ceiling was not checked"
+[ "$(printf '%s\n%s\n' "$glibc_max" "$GLIBC_CEILING" | sort -V | tail -n 1)" = "$GLIBC_CEILING" ] ||
+    fail "the binary needs GLIBC $glibc_max, above the $GLIBC_CEILING ceiling"
