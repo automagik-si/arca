@@ -3,6 +3,10 @@
 //! request and its outcome line after. An adoption is never a desired-state entry, and its steps are not journal effects: this
 //! record and the instance's own mark are the only places it lives.
 //!
+//! A service import (`service_import`, `service_release`) is recorded here too, as its own kind of line: the intent before
+//! the one key is written or cleared, and the outcome after, each with the instance's uuid and the digest of its pre-image.
+//! An import has no plan and no steps, so it is never an open adoption and never one of [`AdoptionRecord::adopted`]'s entries.
+//!
 //! A move that Incus ran as a copy gives the instance a new uuid. The writer confirms it by the copy rule, and a uuid line
 //! records it before the move's outcome line; every later step, and `verify`, expect the uuid the record holds last.
 //!
@@ -158,6 +162,29 @@ enum Line {
         step: AdoptStep,
         uuid: String,
     },
+    /// A service import's mark: its intent before the PATCH, its outcome after.
+    Import {
+        event: ImportEvent,
+    },
+    /// A service release's unmark: its intent before the PATCH, its outcome after.
+    Release {
+        event: ImportEvent,
+    },
+}
+
+/// One line of a service import or of its release: the service, the project its instance is in, the instance's uuid, the
+/// digest of the instance's image (for an import, before the mark; for a release, after the mark is cleared), where the
+/// write stands, and for a failure why. No config value is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImportEvent {
+    pub name: String,
+    pub project: String,
+    pub uuid: String,
+    pub pre_image: String,
+    pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// The adoption record of one state directory. The steps it is told about are the active adoption's: the one `begin` started,
@@ -417,6 +444,44 @@ impl AdoptionRecord {
             .into_iter()
             .filter(|instance| !self.released(instance))
             .filter_map(|instance| EntryId::parse(&format!("{ADOPT_ENTRY_PREFIX}{instance}")))
+            .collect()
+    }
+
+    /// Records one line of a service import.
+    pub fn import(&mut self, event: ImportEvent) -> Result<(), Failure> {
+        self.append(Line::Import { event })
+    }
+
+    /// Records one line of a service release.
+    pub fn release(&mut self, event: ImportEvent) -> Result<(), Failure> {
+        self.append(Line::Release { event })
+    }
+
+    /// The import of the service `name` that stands now: its last done import line, unless a done release follows it.
+    pub fn imported(&self, name: &str) -> Option<ImportEvent> {
+        for line in self.lines.iter().rev() {
+            match line {
+                Line::Release { event } if event.name == name && event.phase == Phase::Done => {
+                    return None;
+                }
+                Line::Import { event } if event.name == name && event.phase == Phase::Done => {
+                    return Some(event.clone());
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Every service import and release line, oldest first, with whether it is a release.
+    pub fn import_events(&self) -> Vec<(bool, ImportEvent)> {
+        self.lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Import { event } => Some((false, event.clone())),
+                Line::Release { event } => Some((true, event.clone())),
+                _ => None,
+            })
             .collect()
     }
 

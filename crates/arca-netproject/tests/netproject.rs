@@ -263,7 +263,7 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
         "no network and no profile is read or written"
     );
 
-    // The node gains the managed service network (Rule 53): the owner drops the container cap and the aggregate caps,
+    // The node gains the managed service network (Rule 55): the owner drops the container cap and the aggregate caps,
     // which would count containers, and allows proxy devices. The project stays restricted, with its mark and its
     // virtual-machine cap, and a second pass writes nothing.
     let widened = BridgedProjectConfig {
@@ -352,7 +352,7 @@ fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_s
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Rule 53: a project the network entry owns gains virtual machines, and then host bridges, by its own journaled writes.
+/// Rule 55: a project the network entry owns gains virtual machines, and then host bridges, by its own journaled writes.
 #[test]
 fn the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges() {
     let dir = std::env::temp_dir().join(format!("arca-netproject-widen-{}", std::process::id()));

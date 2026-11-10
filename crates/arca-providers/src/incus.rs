@@ -88,7 +88,7 @@ pub const NETWORK_ACCESS_KEY: &str = "restricted.networks.access";
 const BRIDGE_KEYS: [&str; 3] = ["ipv4.address", "ipv4.nat", "ipv6.address"];
 
 /// The two entries that may own the service project: the managed network's and the bridged project's. Whichever made the
-/// project widens it when the node gains the other network (Rules 52 and 53 of the ownership document).
+/// project widens it when the node gains the other network (Rules 54 and 55 of the ownership document).
 const SERVICE_PROJECT: &str = "arcak-svc";
 const NET_ENTRY: &str = "net-arcak-svc";
 const BRIDGED_ENTRY: &str = "bridged-arcak-svc";

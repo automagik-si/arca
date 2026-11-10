@@ -192,9 +192,31 @@ pub struct KernelConfig {
     /// The virtual-machine caps of a node with `serviceCidr` and no `bridged`. A node with `bridged` states them there.
     #[serde(default)]
     pub vm_limits: Option<BridgedLimits>,
+    /// The services another manager created that `service_import` may take over where they stand. Each entry names the
+    /// service, the project it is in (one of `droiddProjects`) and that project's service subnet. Empty by default: nothing
+    /// is imported, and no write reaches another manager's project.
+    #[serde(default)]
+    pub import_services: Vec<ImportService>,
+}
+
+/// One `kernel.importServices` entry: a service another manager created, by name, the project its instance is in, and the
+/// IPv4 /24 its address must be inside.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImportService {
+    pub name: String,
+    pub project: String,
+    pub cidr: String,
 }
 
 impl KernelConfig {
+    /// The import allowlist entry for the service `name` in `project`, when one is listed.
+    pub fn import_service(&self, name: &str, project: &str) -> Option<&ImportService> {
+        self.import_services
+            .iter()
+            .find(|entry| entry.name == name && entry.project == project)
+    }
+
     /// The caps on all of Arca's virtual machines on this node, or `None` on a node that may create none.
     pub fn vm_caps(&self) -> Option<&BridgedLimits> {
         match &self.bridged {
@@ -263,6 +285,8 @@ pub enum ConfigError {
     Approval(&'static str),
     /// The `kernel.bridged` key breaks a rule. The text names the rule, never a value.
     Bridged(&'static str),
+    /// The `kernel.importServices` allowlist breaks a rule. The text names the rule, never a value.
+    ImportServices(&'static str),
 }
 
 impl fmt::Display for ConfigError {
@@ -296,6 +320,7 @@ impl fmt::Display for ConfigError {
             Self::Adopt(why) => write!(f, "kernel.adopt is refused: {why}"),
             Self::Approval(why) => write!(f, "approval is refused: {why}"),
             Self::Bridged(why) => write!(f, "kernel.bridged is refused: {why}"),
+            Self::ImportServices(why) => write!(f, "kernel.importServices is refused: {why}"),
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
@@ -362,6 +387,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     }
     check_adopt(kernel)?;
     check_bridged(kernel)?;
+    check_import_services(kernel)?;
     if kernel.scratch {
         for name in &kernel.projects {
             if !name.starts_with(SCRATCH_PREFIX) {
@@ -562,6 +588,42 @@ fn check_bridged(kernel: &KernelConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Bridged(
             "limits must set virtualMachines and cpu of at least 1, and memory and disk as sizes such as 64GiB",
         ));
+    }
+    Ok(())
+}
+
+/// The import rules: each entry names a service by a service name, a project that `droiddProjects` lists, and an IPv4 /24;
+/// no name is listed twice; and the node has a service network of its own (a managed or a mixed node, never a bridged
+/// one) and is not a scratch run.
+fn check_import_services(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    if kernel.import_services.is_empty() {
+        return Ok(());
+    }
+    // An import needs the node's own service network. A bridged node has none; a mixed node, which sets
+    // kernel.bridged beside kernel.serviceCidr, has it, so the host bridges do not stand in the way.
+    if kernel.scratch || kernel.service_cidr.is_none() {
+        return Err(ConfigError::ImportServices(
+            "it needs kernel.serviceCidr and no kernel.scratch: a bridged node, which has no service network, imports nothing",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for entry in &kernel.import_services {
+        if !crate::service::service_name_ok(&entry.name) {
+            return Err(ConfigError::ImportServices(
+                "each name must be a service name",
+            ));
+        }
+        if !kernel.droidd_projects.contains(&entry.project) {
+            return Err(ConfigError::ImportServices(
+                "each project must be listed in kernel.droiddProjects",
+            ));
+        }
+        if arca_netproject::check_cidr(&entry.cidr, &[]).is_err() {
+            return Err(ConfigError::ImportServices("each cidr must be an IPv4 /24"));
+        }
+        if !names.insert(&entry.name) {
+            return Err(ConfigError::ImportServices("a name is listed twice"));
+        }
     }
     Ok(())
 }
@@ -821,6 +883,85 @@ mod tests {
         let config: NodeConfig =
             serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
         check(&config)
+    }
+
+    fn importing(kernel: serde_json::Value) -> Result<NodeConfig, ConfigError> {
+        let mut value = serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": ["app1"], "projects": ["arcak-svc"], "serviceCidr": "192.0.2.0/24" }
+        });
+        if let serde_json::Value::Object(extra) = kernel {
+            value["kernel"]
+                .as_object_mut()
+                .expect("kernel")
+                .extend(extra);
+        }
+        let config: NodeConfig =
+            serde_json::from_value(value).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        check(&config)?;
+        Ok(config)
+    }
+
+    #[test]
+    fn the_import_allowlist_is_empty_by_default_and_refused_unless_every_rule_holds() {
+        use serde_json::json;
+        let none = importing(json!({})).expect("no allowlist");
+        assert!(none.kernel.import_services.is_empty());
+        let entry = json!({ "name": "db1", "project": "app1", "cidr": "10.0.5.0/24" });
+        let listed = importing(json!({ "importServices": [entry] })).expect("one entry");
+        assert_eq!(
+            listed
+                .kernel
+                .import_service("db1", "app1")
+                .map(|e| e.cidr.as_str()),
+            Some("10.0.5.0/24")
+        );
+        assert!(listed.kernel.import_service("db1", "arcak-svc").is_none());
+        assert!(listed.kernel.import_service("db2", "app1").is_none());
+        // An unknown key is a parse refusal, never ignored.
+        assert!(matches!(
+            importing(json!({ "importServices": [
+                { "name": "db1", "project": "app1", "cidr": "10.0.5.0/24", "force": true }
+            ] })),
+            Err(ConfigError::Parse(_))
+        ));
+        for bad in [
+            // A project that is not another manager's: Arca's own, and one nobody listed.
+            json!({ "importServices": [{ "name": "db1", "project": "arcak-svc", "cidr": "10.0.5.0/24" }] }),
+            json!({ "importServices": [{ "name": "db1", "project": "elsewhere", "cidr": "10.0.5.0/24" }] }),
+            json!({ "importServices": [{ "name": "Db1", "project": "app1", "cidr": "10.0.5.0/24" }] }),
+            json!({ "importServices": [{ "name": "db1", "project": "app1", "cidr": "10.0.5.0/16" }] }),
+            json!({ "importServices": [{ "name": "db1", "project": "app1", "cidr": "nowhere" }] }),
+            json!({ "importServices": [entry, entry] }),
+            json!({ "importServices": [entry], "serviceCidr": null }),
+        ] {
+            assert!(
+                matches!(importing(bad.clone()), Err(ConfigError::ImportServices(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mixed_node_may_list_imports_and_a_bridged_node_may_not() {
+        use serde_json::json;
+        let entry = json!({ "name": "db1", "project": "app1", "cidr": "10.0.5.0/24" });
+        let host_bridges =
+            json!({ "bridges": ["br0"], "pool": "vmpool", "limits": LIMITS.clone() });
+        // The node has its own service network, so the host bridges beside it do not stand in the way.
+        let mixed = importing(json!({ "importServices": [entry], "bridged": host_bridges }))
+            .expect("a mixed node");
+        assert!(mixed.kernel.import_service("db1", "app1").is_some());
+        // A bridged node has no service network of its own.
+        assert!(matches!(
+            importing(
+                json!({ "importServices": [entry], "bridged": host_bridges, "serviceCidr": null })
+            ),
+            Err(ConfigError::ImportServices(_))
+        ));
     }
 
     #[test]

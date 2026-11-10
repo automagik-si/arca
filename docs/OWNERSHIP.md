@@ -22,7 +22,7 @@ Source: `arca_kernel::ownership::{KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY}`; test
 **Rule 3.** The other system's marks are read-only to the kernel. Any key under `user.droid.`, `user.tactu.` or `user.arca.`
 means that system owns the object. The match ignores ASCII case, and a bare namespace key counts. The kernel never writes such
 an object, and it never adds such a key to one of its own, because the writer classifies the object's config after the
-change and refuses any result that is not its entry's own.
+change and refuses any result that is not its entry's own. The one exception is the service import's single key (Rule 52).
 Source: `arca_kernel::ownership::DROIDD_MARK_PREFIXES`; `UnixIncusWriter::patch` in `crates/arca-incus/src/write.rs`; tests
 `droidd_namespace_matching_ignores_ascii_case_so_a_near_miss_only_refuses` (kernel) and
 `a_patch_that_would_leave_the_object_owned_by_another_owner_is_refused` (`crates/arca-incus/tests/write.rs`).
@@ -35,7 +35,8 @@ entry mark for an entry whose plan was declined. `Contested` has a mark from the
 Source: `arca_kernel::ownership::{OwnerClass, classify}`; `crates/arca-kernel/tests/ownership.rs`.
 
 **Rule 5.** Every class may be read, and only the writer's own entry may write an object of its own class. Foreign, droidd,
-contested and retained objects are written by nobody in this kernel.
+contested and retained objects are written by nobody in this kernel, with one exception: the service import sets or clears
+its one key on an instance the configuration allowlists (Rule 52), and nothing else.
 Source: `arca_kernel::ownership::kernel_may_write` is true only for `Kernel { entry }` with the same entry;
 `UnixIncusWriter::read_owned` and `refusal_reason` in `crates/arca-incus/src/write.rs`; test
 `a_read_is_owned_only_for_this_entrys_own_kernel_object` in `crates/arca-incus/tests/write.rs`.
@@ -282,7 +283,7 @@ on a project create only to the value the kernel pins it at, with one exception:
 bridges the project may use and is checked as Rule 41 states. Any other value is refused, and so is a key the kernel does not pin,
 whatever its value, so `restricted.containers.privilege` set to `allow`, `features.images` set to `false` and `features.networks`
 set to anything are all refused. A project patch may not change any such key, whatever its value, and the refusal is made before
-any request; the one exception is the widening of the service project by the entry that owns it (Rule 53). A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
+any request; the one exception is the widening of the service project by the entry that owns it (Rule 55). A project is named by its own name. Whatever the provider allows, no request can PATCH a project: `exchange`, the one
 function every request of the read client and the writer passes through, refuses a PATCH whose path is `/1.0/projects` or under
 it, percent-decoded, with `IncusError::Refused("a project is never sent a PATCH")`, before it connects, so no byte reaches the
 socket (Rule 43).
@@ -472,7 +473,7 @@ tests `a_marked_bridge_in_default_is_created_patched_and_removed`,
 
 **Rule 41.** A project grants its instances the bridges it may use through `restricted.networks.access`, a comma-separated list of
 plain names. The grant is set at the project's create only, since a project patch may not change it (Rule 30); the service
-project's owner may drop it when its node gains host bridges, and never rewrite it (Rule 53). Each name must be a
+project's owner may drop it when its node gains host bridges, and never rewrite it (Rule 55). Each name must be a
 bridge in `default` that carries the entry's mark, read before the create is sent; one name that is not marked refuses the whole
 list, and so does an empty or a non-plain name. `restricted` stays `"true"`. A restricted project refuses an instance whose NIC
 names a bridge its grant does not list. The one exception is an adoption project's grant (Rule 45), which names `eth0`'s
@@ -827,6 +828,50 @@ Source: `GpuBackend`, `IncusGpu`, `GpuRefusal` and `GpuActionHandler` in `crates
 `two_devices_for_one_card_do_not_leave_a_false_unconfirmed_removal`, `the_writer_itself_refuses_a_project_outside_its_family`
 and `the_backend_refuses_a_foreign_or_retained_instance_and_reads_the_mode_each_call`.
 
+## Importing a service another manager created
+
+**Rule 52.** The service import is the one write the kernel makes to an instance another manager created, in that manager's
+project, and it is one key. `ImportWriter` is the only path that sends it. It holds no project family and no classifier; it
+holds one allowance, `import_allowance`, and can build one request: a config `PATCH` of `user.arcakernel.entry`, under the
+`If-Match` of the read the caller checked. The allowance holds only when all of this is true:
+
+- the entry is `adopt-<instance>`, that instance's import entry, and no other kind of entry;
+- the object is an instance, named with no parent, and its `{project, instance}` is listed in `kernel.importServices`;
+- the change names exactly one key, `user.arcakernel.entry`, and either sets it to that entry's id (the import) or removes it
+  (the release).
+
+A second key in the same change, another key alone, another value for the mark, another instance, a project or a name the
+allowlist does not hold, another entry and an empty ETag are refused before any request, a read included. A changed ETag is
+Incus's 412 and changes nothing. The writer has no device, profile, state, ACL, PUT, POST or DELETE request to send. The
+configuration refuses an allowlist entry whose project is not one of `kernel.droiddProjects`, so the allowlist can only name
+another manager's project, and it is empty by default. Every other writer is as it was: `ProjectFamily` still refuses that
+project, so the provider answers `ProjectNotAllowed` for any effect on the instance, for the import's own entry too, before
+the mark and with it; and with the mark the instance classes `Contested` (Rule 4), which no other writer writes.
+Source: `import_allowance`, `ImportWriter::{read, patch}` in `crates/arca-incus/src/import.rs`; `check_import_services` in
+`crates/arca/src/config.rs`; tests `the_import_writer_sends_one_key_under_if_match_and_refuses_every_other_write`
+(`crates/arca/tests/service_import.rs`) and `the_import_allowlist_is_empty_by_default_and_refused_unless_every_rule_holds`
+(`crates/arca/src/config.rs`).
+
+**Rule 53.** An import and a release run only from an action proposal the owner approved (`service_import`,
+`service_release`), and each re-reads the instance before it writes. The import refuses, with no write, unless the name is
+listed, the instance is a container in the listed project, it carries the other manager's service keys (`user.arca.template`,
+`user.arca.address`, `user.arca.ports`) and no key in the kernel's namespace, its address is inside the listed cidr and is the
+one its `eth0` pins, its keys read as a service record, Arca has no service of that name, and it has a uuid. A proposal whose
+plan is not ready is refused when it is proposed. The release clears the key only when the instance still carries
+`adopt-<name>`. It refuses, with no write, when the allowlist no longer lists the instance, when the instance's uuid is not
+the one the import recorded, when it carries another key in the kernel's namespace, or when its mark names another entry. An
+instance that is gone, or whose mark is already cleared, takes no write. The record `service-<name>` is removed only after
+the key is cleared, since a marked instance gets its record again on the next call. Each write is recorded in
+`<stateDir>/adoptions.jsonl`, the intent before the request and the outcome after it, with the instance's uuid and the
+pre-image digest; no config value is recorded. A restart reads the record back and writes nothing.
+Source: `plan`, `import`, `release` and `image` in `crates/arca/src/service_import.rs`; the `service_import` and
+`service_release` arms of `ServiceHandler::call` and `adoption_subnet` in `crates/arca/src/handlers.rs`; `ImportEvent` in
+`crates/arca/src/adoptions.rs`; tests `an_approved_import_writes_one_key_and_makes_the_adopted_record`,
+`an_approval_for_another_target_and_a_replay_are_refused_and_write_nothing`,
+`an_import_that_fails_a_check_is_refused_before_any_write`, `a_release_restores_the_exact_pre_image_and_removes_the_record`,
+`a_release_refuses_in_plain_words_when_the_inverse_is_not_safe`,
+`a_restart_reads_the_imported_record_back_and_writes_nothing` and
+`every_other_writing_verb_still_refuses_an_imported_service` in `crates/arca/tests/service_import.rs`.
 ## Bridged and mixed nodes
 
 A node's config says which networks its services may use. `kernel.serviceCidr` gives it the managed service network, which
@@ -834,7 +879,7 @@ Arca creates. `kernel.bridged` gives it host bridges that already exist, which A
 managed node, a node with only the second is a bridged node, and a node with both is a mixed node. Containers, databases and
 consumers live on the managed network only. A virtual machine lives on either.
 
-**Rule 52.** A node has one service project, `arcak-svc`, whatever its networks. The entry that first needed the project
+**Rule 54.** A node has one service project, `arcak-svc`, whatever its networks. The entry that first needed the project
 owns it and carries its mark: `net-arcak-svc` (plugin `arca.netproject`) when the first service used the managed network,
 `bridged-arcak-svc` (plugin `arca.bridgedproject`) when it was a virtual machine on a host bridge. The owner never changes. When
 the node later gains the other network, the project is widened in place by its owner; no second project is made, and nothing is
@@ -850,7 +895,7 @@ Source: `project_changes` and `project_owner` in `crates/arca/src/handlers.rs`; 
 virtual machine: serve's own start check passes on the new config, the machine's record and instance read back unchanged,
 and the project is written once more, by a PUT.
 
-**Rule 53.** The project is widened only by its owner, only through the journaled project config write (Rule 43), and only by
+**Rule 55.** The project is widened only by its owner, only through the journaled project config write (Rule 43), and only by
 the steps below. Each step is a field of the owner's entry, so the desired state records it, and an entry without the field
 is exactly the entry an earlier kernel wrote.
 
@@ -863,7 +908,7 @@ is exactly the entry an earlier kernel wrote.
 On a project the bridged entry owns, `net-arcak-svc` is written with `sharedProject: true`: it creates the managed bridge and the
 service profile, and it never writes the project. The bridged project never had a bridge grant, so the managed bridge
 needs none there. `limits.cpu`, `limits.memory` and `limits.disk` go because Incus counts every instance of a project against
-them, containers included (Rule 56). `restricted.networks.access` goes because Incus checks a host bridge named as a NIC's
+them, containers included (Rule 58). `restricted.networks.access` goes because Incus checks a host bridge named as a NIC's
 `parent` against that list once NICs are allowed, and the list may name only bridges the entry made (Rule 41); a project with
 host-bridge NICs has no grant on a bridged node either. Which bridge a NIC joins is then Arca's own check, as it is on a bridged
 node: the managed bridge, or a name in `kernel.bridged.bridges`. The provider admits these guarded keys for these two entries in
@@ -878,9 +923,9 @@ Source: `BridgedProject::apply` and `NetProject::apply` in `crates/arca-netproje
 `crates/arca-providers/tests/incus_provider.rs`,
 `the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_skips_it` and
 `the_network_entry_widens_its_own_project_for_virtual_machines_and_host_bridges` in
-`crates/arca-netproject/tests/netproject.rs`, and the two tests of Rule 52.
+`crates/arca-netproject/tests/netproject.rs`, and the two tests of Rule 54.
 
-**Rule 54.** A virtual machine on the managed network is a service like a container. `service_create` with no `bridge`, on a node
+**Rule 56.** A virtual machine on the managed network is a service like a container. `service_create` with no `bridge`, on a node
 with `kernel.serviceCidr`, gives it the next free address of the same plan (`.10` to `.239`, shared with containers and
 databases), a NIC on the managed bridge with that address reserved and MAC and IPv4 filtering on, and its own NIC ACL with the
 same rules: every ingress rejected except a link's, egress to the internet only. It takes no profile (the service profile holds
@@ -903,7 +948,7 @@ of `ServiceHandler::call` and `vm_network` in `crates/arca/src/handlers.rs`; `ca
 `crates/arca/src/service_wiring.rs`; tests `a_managed_node_that_gains_virtual_machines_widens_its_own_project` (the
 machine's NIC, address and ACL) and `a_container_links_to_a_virtual_machine_and_the_other_verbs_are_refused_in_words`.
 
-**Rule 55.** Holding both kinds is never refused. What is refused is a config that would leave a half-state, at `arca serve`'s
+**Rule 57.** Holding both kinds is never refused. What is refused is a config that would leave a half-state, at `arca serve`'s
 start before anything is reconciled, and again before a virtual-machine create writes:
 
 - `kernel.bridged` without `kernel.serviceCidr`, on a node that holds the managed network, a container, a database, a consumer
@@ -911,7 +956,12 @@ start before anything is reconciled, and again before a virtual-machine create w
 - no `kernel.bridged`, on a node that holds a virtual machine on a host bridge: its bridge would no longer be an allowed one.
 - no `kernel.bridged`, on a node that holds the bridged project entry before it was widened (`managed` unset): the project
   is still a bridged-only one, so this is the bridged node's own refusal, unchanged.
-- no caps (Rule 56), on a node that holds any virtual machine.
+- no caps (Rule 58), on a node that holds any virtual machine.
+
+A mixed node may list `kernel.importServices` (Rules 52 and 53): an import needs the node's own service network, which a
+mixed node has, and an imported service is a record on the managed side, so a config that drops `kernel.serviceCidr` is
+refused while one is held. A bridged node still may not: it has no service network. Test
+`a_mixed_node_may_list_imports_and_a_bridged_node_may_not` in `crates/arca/src/config.rs`.
 
 A bridged node with no `kernel.serviceCidr` behaves exactly as before: it refuses a container template, and a virtual machine
 with no `bridge` joins its only bridge.
@@ -920,7 +970,7 @@ Source: `mode_refusal` in `crates/arca/src/handlers.rs` and `check_bridged_start
 `a_managed_node_switched_to_bridged_is_refused_at_start_and_at_create_and_nothing_is_left_behind` and
 `a_bridged_node_switched_to_managed_is_refused_at_start`, which pass unchanged.
 
-**Rule 56.** The virtual-machine caps (count, CPUs, memory, root disk) are one set per node and cover every virtual machine Arca
+**Rule 58.** The virtual-machine caps (count, CPUs, memory, root disk) are one set per node and cover every virtual machine Arca
 holds, on either network: `kernel.bridged.limits` when the node sets `kernel.bridged`, and `kernel.vmLimits` on a managed node
 that does not. A node with neither creates no virtual machine. `service_create` adds up the virtual-machine records it holds and
 refuses a create that would pass a cap, before any write. Incus enforces them too only where it can do so for virtual machines
@@ -933,7 +983,7 @@ Source: `KernelConfig::vm_caps`, `check_bridged` and `check_vm_limits` in `crate
 `crates/arca/src/handlers.rs`; tests `the_caps_count_virtual_machines_on_both_networks_and_no_container` and
 `vm_limits_are_the_caps_of_a_managed_node_without_host_bridges`.
 
-**Rule 57.** Every virtual machine Arca creates carries the device `agent` (`{"type":"disk","source":"agent:config"}`), the NIC
+**Rule 59.** Every virtual machine Arca creates carries the device `agent` (`{"type":"disk","source":"agent:config"}`), the NIC
 name `enp5s0` on its `eth0` device and `agent.nic_config` set to `true`. Incus 7.6 offers the guest its config share over 9p
 only, and a QEMU built without virtio-9p gives the guest nothing, so the agent never starts; the `agent:config` disk carries the
 same share as a drive. A restricted project always admits that disk (`checkRestrictions` in Incus's
@@ -948,7 +998,7 @@ Source: `vm_config`, `vm_devices`, `vm_body` and `managed_vm_body` in `crates/ar
 restricted project as Incus does and refuses any other disk with no pool. That the agent renames the NIC and that the guest
 then takes its address is read from Incus's source and is not yet confirmed on a live host ("Assumptions to confirm").
 
-**Rule 58.** An instance that was created and then failed to start is a settled effect, not an open intent. Incus creates
+**Rule 60.** An instance that was created and then failed to start is a settled effect, not an open intent. Incus creates
 an instance and then starts it, in one operation, and a failed start fails the operation and leaves the instance stopped
 (a live host showed it; the earlier assumption that a failed operation leaves nothing was wrong for this case). The
 provider settles it only when all of this holds: the create asked for a start, Incus answered a status error, the instance
@@ -977,6 +1027,12 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
+- An instance's config PATCH that names one `user.*` key leaves every other key, device and profile as it was, does not
+  restart the instance, and is refused with 412 under a stale `If-Match` (Rule 52). The adoption's Mark step relies on the same
+  behaviour for a stopped instance; the import sends it to a running one.
+- The other manager keeps treating an instance as its own while it also carries `user.arcakernel.entry` (Rule 53). That is
+  the other manager's behaviour, not Incus's, and only a run against it can show it.
+
 - Incus checks `If-Match` only on PUT and PATCH, so a DELETE has no compare step, and the tombstone is the only one (Rule 18).
 - A PATCH merges the `config` map, and an empty value unsets a key (Rule 16). Confirmed on Incus 7.3 for a profile, an ACL and a
   volume, whose tombstones landed beside their other keys, and for a network. A project's PATCH does not merge: it replaces the
@@ -991,7 +1047,7 @@ must run before any live write.
   PATCH. It answers an instance's or a volume's create and delete with an operation (Rule 14).
 - The wait's answer carries the operation's `id`, `status_code` and `status`, and 200 with `Success` is the only success (Rule 14).
 - A failed operation leaves the object as it was (Rule 14). One exception was seen on a live host: an instance create whose
-  start fails leaves the instance, stopped (Rule 58).
+  start fails leaves the instance, stopped (Rule 60).
 - Incus refuses the DELETE of a project that still holds an object (Rule 10).
 - A name is free when its GET answers 404 (Rule 11).
 - Incus accepts `config` on a POST for all nine kinds, and the object reads back with that config. The live create probe, one
@@ -1021,13 +1077,13 @@ must run before any live write.
 - Incus accepts `restricted` and the five `features.*` keys on a project create (Rule 30).
 - Incus lets a restricted project's own config drop `limits.containers`, `limits.cpu`, `limits.memory` and `limits.disk`,
   set `restricted.devices.nic` and `restricted.devices.proxy` to `allow` and drop `restricted.networks.access` by a PUT while
-  instances run in it, and none of those writes touches a running instance (Rule 53). Read from the Incus source
+  instances run in it, and none of those writes touches a running instance (Rule 55). Read from the Incus source
   (`NetworkAllowed`, `checkRestrictions`); the fake models it; a live write must confirm it.
 - With `agent.nic_config` set, the Incus agent renames the guest interface whose MAC is a NIC device's to that device's
-  `name` when it starts, and the guest's network setup then configures the renamed interface (Rule 57). Read from the Incus
+  `name` when it starts, and the guest's network setup then configures the renamed interface (Rule 59). Read from the Incus
   source (`writeNICDevConfig`, `osReconfigureNetworkInterfaces`); a live boot must confirm it, and that Incus 7.6 has the key.
 - Incus accepts a NIC on a managed bridge with a reserved `ipv4.address`, MAC and IPv4 filtering and ACLs for a virtual
-  machine as it does for a container, and a virtual machine with no profile (Rule 54). Not yet created on a live host.
+  machine as it does for a container, and a virtual machine with no profile (Rule 56). Not yet created on a live host.
 - Incus accepts `ipv6.address` set to `none` on a bridge create (Rule 31).
 - Incus accepts `ipv4.nat` on a bridge create, and reports a network's config with the keys that were set on it and no others.
   A key Incus adds on read would refuse a patch of that network, which fails closed (Rule 31).

@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { ArcaError } from '../src/arca-client.js';
 import {
   ChatStore, DEFAULTS, DOCTOR_TOOLS, NOT_LINKED, PROPOSE_ACTIONS, PROPOSE_TOOL, READ_TOOLS, createDoctorChat, createProposeTool,
   dayOf, doctorPrompt, formatToolResult, sseFrame, stateFilePath,
@@ -467,9 +468,10 @@ test('SSE framing keeps one JSON object per data line and cannot forge an event'
   assert.equal(frame.includes('\ndata: {"text":"hello'), true);
 });
 
-test('the proposal tool offers exactly the fifteen allowed actions, never a database delete', () => {
+test('the proposal tool offers exactly the seventeen allowed actions, never a database delete', () => {
   assert.deepEqual([...PROPOSE_ACTIONS], [
-    'service_create', 'service_remove', 'service_publish', 'service_unpublish',
+    'service_create', 'service_remove', 'service_import', 'service_release',
+    'service_publish', 'service_unpublish',
     'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
     'storage_add', 'snapshot_create', 'snapshot_delete',
     'instance_start', 'instance_stop', 'instance_restart',
@@ -666,6 +668,14 @@ test('the Doctor prompt is a snapshot for a plain-language owner conversation', 
     '  stop or a restart interrupts what the instance serves and runs only after the owner approves the card. A',
     '  stop is graceful and never forced: an instance that does not shut down in time stays running and the',
     '  change is refused; say so plainly.',
+    '- To take over a service another manager created, where it stands, propose service_import with its name;',
+    '  to hand it back, propose service_release. Both run only after the owner approves the card. A node',
+    '  imports only the services its own configuration lists, and refuses the proposal itself when the import',
+    '  cannot run. You cannot see that list or the check that failed: when a proposal is refused, say that it',
+    '  was refused, that nothing changed, and that the reason is in the node\'s own output (arca service import',
+    '  plan). Never guess a reason.',
+    '- Arca lists and reads an imported service but never changes, removes, publishes or rewires it.',
+    '  service_release hands it back to the manager that created it, and Arca stops listing it.',
     '- You can propose changes on alpha and on any machine linked to it for approvals. Another machine is',
     '  refused with "this machine is not linked for approvals yet"; say that plainly.',
     '- Do not propose a change the owner did not ask for, and never propose a database delete.',
@@ -1863,4 +1873,69 @@ test('the Doctor may propose a start, a stop and a restart of an instance, and e
   assert.match(prompt, /runs only after the owner approves the card/);
   assert.match(prompt, /graceful and never forced/);
   assert.match(prompt, /does not shut down in time stays running/);
+});
+
+test('the Doctor may propose an import and a release of a service, and each reaches action_propose', async () => {
+  const actions = ['service_import', 'service_release'];
+  // The kernel's own summaries (crates/arca/src/action_proposal.rs).
+  const summaries = {
+    service_import: 'Import the service db1, which another manager created, where it stands',
+    service_release: 'Release the imported service db1 back to the manager that created it',
+  };
+  const calls = [];
+  const proposals = [];
+  const tool = createProposeTool({
+    hosts: [{ name: 'alpha' }],
+    proposalHost: 'alpha',
+    clientFor(name) {
+      return {
+        async call(verb, args) {
+          calls.push({ host: name, verb, args });
+          if (args.args.name === 'unlisted') {
+            // What the real client throws for a kernel refusal: the code alone, never the kernel's text.
+            throw new ArcaError('rpc');
+          }
+          return {
+            id: `act-${String(actions.indexOf(args.action) + 1).repeat(12)}`,
+            action: args.action,
+            summary: summaries[args.action],
+          };
+        },
+      };
+    },
+    onProposal(proposal) { proposals.push(proposal); },
+  });
+  assert.match(tool.description, /service_remove \{name\}; service_import \{name\}; service_release \{name\}; /);
+  for (const action of actions) {
+    assert.equal(PROPOSE_ACTIONS.includes(action), true, action);
+    assert.equal(tool.parameters.properties.action.enum.includes(action), true, action);
+    const accepted = await tool.execute({ action, args: { name: 'db1' } }, { callId: `call-${action}` });
+    assert.equal(accepted.id, `act-${String(actions.indexOf(action) + 1).repeat(12)}`);
+    assert.equal(tool.output.render({}, accepted)[0].text, `${accepted.id}: ${summaries[action]}. It waits for the owner's approval.`);
+  }
+  assert.deepEqual(calls, actions.map((action) => ({
+    host: 'alpha', verb: 'action_propose', args: { action, args: { name: 'db1' } },
+  })));
+  assert.deepEqual(proposals.map(({ id }) => id), ['act-111111111111', 'act-222222222222']);
+  // The kernel refuses an import that cannot run. The tool fails with the client's fixed sentence, which names
+  // no check, and no proposal is recorded.
+  await assert.rejects(
+    tool.execute({ action: 'service_import', args: { name: 'unlisted' } }, { callId: 'c' }),
+    (error) => error.message === 'Arca could not complete the MCP request.',
+  );
+  assert.equal(proposals.length, 2);
+  // The canvas cannot ask for the direct adoption path or a forced import.
+  for (const action of ['service_adopt', 'service_import_force', 'adopt']) {
+    await assert.rejects(tool.execute({ action, args: { name: 'db1' } }, { callId: 'c' }), /That action cannot be proposed\./);
+  }
+
+  const prompt = doctorPrompt({ hosts: [{ name: 'alpha' }], approvalUrl: 'https://example.com/approve' });
+  assert.match(prompt, /propose service_import with its name/);
+  assert.match(prompt, /to hand it back, propose service_release\. Both run only after the owner approves the card\./);
+  assert.match(prompt, /imports only the services its own configuration lists, and refuses the proposal itself/);
+  assert.match(prompt, /You cannot see that list or the check that failed/);
+  assert.match(prompt, /say that it\s+was refused, that nothing changed, and that the reason is in the node's own output \(arca service import\s+plan\)\. Never guess a reason\./);
+  assert.match(prompt, /Arca lists and reads an imported service but never changes, removes, publishes or rewires it\./);
+  assert.match(prompt, /service_release hands it back to the manager that created it, and Arca stops listing it\./);
+  assert.doesNotMatch(prompt, /fully moved|until it is released/);
 });

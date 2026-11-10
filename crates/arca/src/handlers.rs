@@ -1268,6 +1268,21 @@ impl ToolHandler for ActionPropose {
         if action.is_lifecycle() {
             crate::lifecycle::check_proposal(self.lifecycle.as_deref(), &payload)?;
         }
+        // An import that could not run is refused now, with the check that failed, so the owner is never asked to approve it.
+        if let (ActionKind::ServiceImport, Some(node)) = (action, &self.node) {
+            let name = payload["name"].as_str().unwrap_or_default();
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            let plan =
+                crate::service_import::plan(node, name, Some(&entries), now).map_err(|_| {
+                    service_refused(format!("import service {name}: Incus could not be read"))
+                })?;
+            if let Some(failed) = plan.refusal() {
+                return Err(service_refused(format!(
+                    "import service {name}: {}; nothing was proposed",
+                    failed.detail
+                )));
+            }
+        }
         let gpu_product = match action {
             ActionKind::GpuAttach => prepare_attach(
                 self.gpu.as_deref().expect("a GPU action has a backend"),
@@ -1732,6 +1747,8 @@ impl ActionExecutor {
             action,
             "service_remove"
                 | "service_publish"
+                | "service_import"
+                | "service_release"
                 | "gpu_attach"
                 | "gpu_detach"
                 | "storage_add"
@@ -2516,7 +2533,7 @@ fn project_owner(entries: &[arca_kernel::desired::Entry]) -> Option<&'static str
 
 /// The changes that give the service project and its networks what a create needs, first in the caller's one document.
 /// The project is made by the entry that first needs it and widened by that same entry when the node gains the other
-/// network (Rules 52 and 53 of the ownership document): an entry that already holds what is needed is not rewritten.
+/// network (Rules 54 and 55 of the ownership document): an entry that already holds what is needed is not rewritten.
 pub fn project_changes(
     entries: &[arca_kernel::desired::Entry],
     cfg: &NodeConfig,
@@ -2642,7 +2659,7 @@ fn bridged_only(template: &str) -> String {
 }
 
 /// Why the node's config and its desired state disagree, in plain words, or `None` when they agree. Holding containers
-/// and virtual machines together is never the reason: what is refused is a config that would leave a half-state (Rule 55
+/// and virtual machines together is never the reason: what is refused is a config that would leave a half-state (Rule 57
 /// of the ownership document). A config without the managed network is refused while anything lives on that network, a
 /// config without `kernel.bridged` while a virtual machine is on a host bridge or the project is still a bridged-only
 /// one, and a config without caps while any virtual machine exists. `arca serve` refuses to start on a disagreement,
@@ -3358,6 +3375,8 @@ pub fn service_handlers(
         "service_status",
         "service_logs",
         "service_remove",
+        "service_import",
+        "service_release",
     ]
     .into_iter()
     .map(|verb| {
@@ -3656,7 +3675,7 @@ fn split_list(text: Option<&str>) -> Vec<&str> {
         .collect()
 }
 
-fn ipv4_in_cidr(ip: std::net::Ipv4Addr, cidr: &str) -> bool {
+pub(crate) fn ipv4_in_cidr(ip: std::net::Ipv4Addr, cidr: &str) -> bool {
     let Some((network, prefix)) = cidr.split_once('/') else {
         return false;
     };
@@ -3682,7 +3701,7 @@ fn node_ok(node: &str) -> bool {
 }
 
 /// One marked instance's record, from its `user.arca.*` keys and NIC, without reading or changing its environment.
-fn adopted_config(
+pub(crate) fn adopted_config(
     row: &Value,
     rows: &[Value],
     cidr: &str,
@@ -3798,9 +3817,31 @@ fn service_owned(row: &Value) -> bool {
         })
 }
 
+/// The subnet a marked instance's address must be inside, and its gateway. An instance `kernel.importServices` lists, by name
+/// and project, outside the service project, is checked against that entry's cidr: it stands in another manager's subnet.
+/// Every other instance is checked against the node's own service subnet, as before.
+fn adoption_subnet(cfg: &NodeConfig, row: &Value, cidr: &str, gateway: &str) -> (String, String) {
+    let listed = match (row["name"].as_str(), row["project"].as_str()) {
+        (Some(name), Some(project)) if project != arca_netproject::PROJECT => {
+            cfg.kernel.import_service(name, project)
+        }
+        _ => None,
+    };
+    match listed {
+        Some(listed) => (
+            listed.cidr.clone(),
+            crate::service::gateway(&listed.cidr)
+                .map(|gateway| gateway.to_string())
+                .unwrap_or_default(),
+        ),
+        None => (cidr.to_string(), gateway.to_string()),
+    }
+}
+
 /// Adds a record for every kernel-owned marked instance without one. Nothing on the instance is read into a secret or re-rendered.
 fn adopt_services(
     kernel: &Mutex<Kernel>,
+    cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
     rows: &[Value],
     cidr: &str,
@@ -3812,7 +3853,8 @@ fn adopt_services(
         if !service_owned(row) {
             continue;
         }
-        let Some(config) = adopted_config(row, rows, cidr, gateway, now) else {
+        let (cidr, gateway) = adoption_subnet(cfg, row, cidr, gateway);
+        let Some(config) = adopted_config(row, rows, &cidr, &gateway, now) else {
             continue;
         };
         let id = format!("service-{}", config.name);
@@ -4083,6 +4125,14 @@ impl ServiceHandler {
     }
 }
 
+/// `service_import` and `service_release` run only with the one-shot grant of an approved proposal.
+fn import_not_approved() -> CallError {
+    CallError::Refused {
+        code: "NotApproved".into(),
+        message: "this action runs only from an approved proposal: propose it with action_propose, and it runs once the owner approves it".into(),
+    }
+}
+
 fn service_name(args: &Value) -> Result<String, CallError> {
     args["name"]
         .as_str()
@@ -4097,7 +4147,7 @@ impl ToolHandler for ServiceHandler {
             "service_create" => &["name", "template", "bridge", "mac"],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
-            "service_remove" => &["name", "approval"],
+            "service_remove" | "service_import" | "service_release" => &["name", "approval"],
             "service_connect" | "service_disconnect" => &["from", "to"],
             "service_secret_set" => &["name", "key", "value"],
             "service_publish" => &["name", "reach", "approval"],
@@ -4112,7 +4162,11 @@ impl ToolHandler for ServiceHandler {
                 "arguments: a field the schema does not name".into(),
             ));
         }
-        if self.verb == "service_create" && caller.scope < Scope::Doctor {
+        if matches!(
+            self.verb,
+            "service_create" | "service_import" | "service_release"
+        ) && caller.scope < Scope::Doctor
+        {
             return Err(CallError::Forbidden {
                 verb: self.verb.into(),
             });
@@ -4130,15 +4184,17 @@ impl ToolHandler for ServiceHandler {
                 verb: self.verb.into(),
             });
         }
-        let preapproved = matches!(self.verb, "service_remove" | "service_publish")
-            && args
-                .get("approval")
-                .and_then(Value::as_str)
-                .is_some_and(|grant| {
-                    lock(&self.kernel)
-                        .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
-                        .unwrap_or(false)
-                });
+        let preapproved = matches!(
+            self.verb,
+            "service_remove" | "service_publish" | "service_import" | "service_release"
+        ) && args
+            .get("approval")
+            .and_then(Value::as_str)
+            .is_some_and(|grant| {
+                lock(&self.kernel)
+                    .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
+                    .unwrap_or(false)
+            });
         let _publish = matches!(
             self.verb,
             "service_publish" | "service_unpublish" | "service_remove"
@@ -4146,7 +4202,12 @@ impl ToolHandler for ServiceHandler {
         .then(|| self.exec.publish_gate.blocking_lock());
         let _write = if matches!(
             self.verb,
-            "service_create" | "service_connect" | "service_disconnect" | "service_secret_set"
+            "service_create"
+                | "service_connect"
+                | "service_disconnect"
+                | "service_secret_set"
+                | "service_import"
+                | "service_release"
         ) {
             Some(self.writes.lock().map_err(|_| internal())?)
         } else {
@@ -4171,7 +4232,15 @@ impl ToolHandler for ServiceHandler {
             kernel.entries().to_vec()
         };
         if managed {
-            adopt_services(&self.kernel, &entries, &rows, &cidr, &gateway, now)?;
+            adopt_services(
+                &self.kernel,
+                &self.cfg,
+                &entries,
+                &rows,
+                &cidr,
+                &gateway,
+                now,
+            )?;
             entries = {
                 let kernel = lock(&self.kernel)?;
                 kernel.entries().to_vec()
@@ -4390,6 +4459,76 @@ impl ToolHandler for ServiceHandler {
                 let secrets = self.cfg.state_dir.join("secrets").join(&id.0);
                 let _ = std::fs::remove_dir_all(secrets);
                 Ok(json!({ "removed": true }))
+            }
+            "service_import" => {
+                let name = service_name(&args)?;
+                if !preapproved {
+                    return Err(import_not_approved());
+                }
+                let done = crate::service_import::import(&self.cfg, &name, &entries, now)?;
+                // The mark is on the instance now. Its record is made from it, exactly as a restart reads it.
+                let rows = service_listing(&read, None)?;
+                adopt_services(
+                    &self.kernel,
+                    &self.cfg,
+                    &entries,
+                    &rows,
+                    &cidr,
+                    &gateway,
+                    now,
+                )?;
+                let entries = lock(&self.kernel)?.entries().to_vec();
+                let Some((_, config)) = service_entries(&entries)
+                    .into_iter()
+                    .find(|(_, config)| config.name == name && config.adopted)
+                else {
+                    return Err(service_refused(format!(
+                        "import service {name}: the instance is marked, but its keys no longer read as a service record; service_list shows it as failed, and service_release takes the mark off"
+                    )));
+                };
+                Ok(json!({
+                    "imported": true,
+                    "preImage": done.pre_image,
+                    "service": crate::service::view(
+                        &config,
+                        service_live_in(&rows, &config.project, &config.name),
+                    ),
+                }))
+            }
+            "service_release" => {
+                let name = service_name(&args)?;
+                if !preapproved {
+                    return Err(import_not_approved());
+                }
+                let record = service_entries(&entries)
+                    .into_iter()
+                    .find(|(_, config)| config.name == name);
+                let Some((entry, config)) = record else {
+                    return Err(service_not_found(format!("service {name}: not found")));
+                };
+                if !config.adopted {
+                    return Err(service_refused(format!(
+                        "release service {name}: Arca created this service, it did not import it; service_remove removes it. Nothing was written"
+                    )));
+                }
+                // The key goes first: while the instance carries it, the next call would make the record again.
+                let done = crate::service_import::release(&self.cfg, &name, &config.project)?;
+                let outcomes = lock(&self.kernel)?
+                    .propose(
+                        vec![crate::desired_store::EntryChange::Remove(entry.id.clone())],
+                        now,
+                    )
+                    .map_err(|_| internal())?;
+                if service_wiring::failed_for(&outcomes, &[entry.id.0.as_str()]) {
+                    return Err(service_refused(format!(
+                        "release service {name}: the instance is released, but Arca's record of it could not be removed"
+                    )));
+                }
+                Ok(json!({
+                    "released": true,
+                    "restored": done.restored,
+                    "preImage": done.image,
+                }))
             }
             "service_create" => {
                 let name = service_name(&args)?;

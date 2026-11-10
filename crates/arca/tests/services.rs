@@ -568,7 +568,7 @@ fn generate_and_droidd_port_the_key_is_made_at_create_in_its_own_form_before_the
     rig.template(
         "omni",
         json!({
-            "name":"omni","kind":"oci","image":"ghcr.io/automagik-dev/omni-api",
+            "name":"omni","kind":"oci","image":"ghcr.io/automagik-si/omni-api",
             "digest":DIGEST,"ports":[8080,8882],
             "env":{"OMNI_API_KEY":"{{secret:OMNI_API_KEY}}"},
             "secrets":["OMNI_API_KEY"],"generate":{"OMNI_API_KEY":"omni_sk_"},
@@ -615,7 +615,7 @@ fn generate_and_droidd_port_the_key_is_made_at_create_in_its_own_form_before_the
     rig.template(
         "omni",
         json!({
-            "name":"omni","kind":"oci","image":"ghcr.io/automagik-dev/omni-api",
+            "name":"omni","kind":"oci","image":"ghcr.io/automagik-si/omni-api",
             "digest":DIGEST,"ports":[8080,8882],
             "env":{"OMNI_API_KEY":"{{secret:OMNI_API_KEY}}"},
             "secrets":["OMNI_API_KEY"],"generate":{"OMNI_API_KEY":"omni_sk_"},
@@ -1670,7 +1670,7 @@ fn service_logs_redacts_stored_secrets_rendered_environment_and_credentials() {
     rig.template(
         "omni",
         json!({
-            "name":"omni","kind":"oci","image":"ghcr.io/automagik-dev/omni-api",
+            "name":"omni","kind":"oci","image":"ghcr.io/automagik-si/omni-api",
             "digest":DIGEST,"ports":[8882],
             "env":{"OMNI_API_KEY":"{{secret:OMNI_API_KEY}}"},
             "secrets":["OMNI_API_KEY"],"generate":{"OMNI_API_KEY":"omni_sk_"},
@@ -2469,7 +2469,7 @@ fn automagik_server_runtime_shape_and_owned_volume_survive_retry_and_are_removed
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let template = service::load_template(&dir, "automagik-server").unwrap();
     assert_eq!(template.kind, "oci");
-    assert_eq!(template.image, "ghcr.io/automagik-dev/automagik-server");
+    assert_eq!(template.image, "ghcr.io/automagik-si/automagik-server");
     assert_eq!(
         template.digest.as_deref(),
         Some("sha256:671cdd101bc48863974c22b8331c4e390bbfaca3de4d2cd7f51491068105e450")

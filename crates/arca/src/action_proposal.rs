@@ -50,6 +50,8 @@ const MAX_COMPACT_BYTES: u64 = 1024 * 1024;
 pub enum ActionKind {
     ServiceCreate,
     ServiceRemove,
+    ServiceImport,
+    ServiceRelease,
     ServicePublish,
     ServiceUnpublish,
     ServiceConnect,
@@ -67,9 +69,11 @@ pub enum ActionKind {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 15] = [
+    pub const ALL: [ActionKind; 17] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
+        Self::ServiceImport,
+        Self::ServiceRelease,
         Self::ServicePublish,
         Self::ServiceUnpublish,
         Self::ServiceConnect,
@@ -90,6 +94,8 @@ impl ActionKind {
         match self {
             Self::ServiceCreate => "service_create",
             Self::ServiceRemove => "service_remove",
+            Self::ServiceImport => "service_import",
+            Self::ServiceRelease => "service_release",
             Self::ServicePublish => "service_publish",
             Self::ServiceUnpublish => "service_unpublish",
             Self::ServiceConnect => "service_connect",
@@ -271,6 +277,23 @@ impl ActionKind {
                 rows
             }
             Self::ServiceRemove | Self::ServiceUnpublish => vec![row("Name", text("name"))],
+            Self::ServiceImport => vec![
+                row("Name", text("name")),
+                row(
+                    "Effect",
+                    &format!(
+                        "Arca takes over this service where it stands. It writes one key on the instance, user.arcakernel.entry = adopt-{}, and nothing else: the service is not stopped, moved or changed.",
+                        text("name")
+                    ),
+                ),
+            ],
+            Self::ServiceRelease => vec![
+                row("Name", text("name")),
+                row(
+                    "Effect",
+                    "Arca gives this service back to the manager that created it. It clears the one key the import wrote and removes its own record: the service is not stopped, moved or changed.",
+                ),
+            ],
             Self::ServicePublish => vec![row("Name", text("name")), row("Reach", text("reach"))],
             Self::ServiceConnect | Self::ServiceDisconnect => {
                 vec![row("Service", text("from")), row("To", text("to"))]
@@ -363,6 +386,14 @@ impl ActionKind {
                 text("template")
             ),
             Self::ServiceRemove => format!("Remove the service {}", text("name")),
+            Self::ServiceImport => format!(
+                "Import the service {}, which another manager created, where it stands",
+                text("name")
+            ),
+            Self::ServiceRelease => format!(
+                "Release the imported service {} back to the manager that created it",
+                text("name")
+            ),
             Self::ServicePublish => {
                 format!(
                     "Publish the service {} on the owner's tailnet",

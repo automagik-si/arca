@@ -4171,7 +4171,7 @@ fn the_host_bridge_nic_allowance_is_scoped_to_the_bridged_project_entry_and_to_a
     }
 }
 
-/// Rule 53: whichever entry made the service project widens it when the node gains the other network, and nothing else
+/// Rule 55: whichever entry made the service project widens it when the node gains the other network, and nothing else
 /// passes the guard.
 #[test]
 fn the_service_project_owners_may_widen_it_and_no_other_entry_or_key_may() {

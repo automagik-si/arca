@@ -1,6 +1,6 @@
 //! The shared service project and its bridge. The project is owned by the entry that first needed it: [`NetProject`] when
 //! the node's first service used the managed network, [`BridgedProject`] when it was a virtual machine on a host bridge.
-//! A node that later gains the other network keeps the one project, and its owner widens it (Rules 52 and 53 of the
+//! A node that later gains the other network keeps the one project, and its owner widens it (Rules 54 and 55 of the
 //! ownership document).
 use arca_kernel::{
     desired::PluginId,

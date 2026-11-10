@@ -1572,6 +1572,8 @@
                         "enum": [
                           "service_create",
                           "service_remove",
+                          "service_import",
+                          "service_release",
                           "service_publish",
                           "service_unpublish",
                           "service_connect",
@@ -1681,6 +1683,8 @@
             "enum": [
               "service_create",
               "service_remove",
+              "service_import",
+              "service_release",
               "service_publish",
               "service_unpublish",
               "service_connect",
@@ -1714,6 +1718,8 @@
               "enum": [
                 "service_create",
                 "service_remove",
+                "service_import",
+                "service_release",
                 "service_publish",
                 "service_unpublish",
                 "service_connect",
@@ -2058,6 +2064,8 @@
               "enum": [
                 "service_create",
                 "service_remove",
+                "service_import",
+                "service_release",
                 "service_publish",
                 "service_unpublish",
                 "service_connect",
@@ -3517,6 +3525,254 @@
         }
       },
       "summary": "Remove a service, its links, its ACL and its secrets, with the owner's signed approval.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "service_import",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name, as kernel.importServices lists it (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "imported": {
+              "const": true,
+              "type": "boolean"
+            },
+            "preImage": {
+              "description": "The SHA-256 of the instance's pre-image, as the adoption record holds it.",
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "service": {
+              "additionalProperties": false,
+              "properties": {
+                "ipv4": {
+                  "description": "Its fixed address on the service bridge.",
+                  "maxLength": 15,
+                  "type": "string"
+                },
+                "lanPort": {
+                  "anyOf": [
+                    {
+                      "maximum": 65535,
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Its host port when the template has a lan proxy, or null."
+                },
+                "links": {
+                  "description": "The services it is linked to, as a consumer, and the port each link opens.",
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "port": {
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "to": {
+                        "maxLength": 40,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "to",
+                      "port"
+                    ],
+                    "type": "object"
+                  },
+                  "maxItems": 64,
+                  "type": "array"
+                },
+                "name": {
+                  "maxLength": 40,
+                  "type": "string"
+                },
+                "ports": {
+                  "description": "The ports it listens on; a link opens the first.",
+                  "items": {
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "maxItems": 16,
+                  "type": "array"
+                },
+                "published": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "node": {
+                          "maxLength": 63,
+                          "type": "string"
+                        },
+                        "port": {
+                          "const": 8443,
+                          "type": "number"
+                        },
+                        "reach": {
+                          "const": "tailnet",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "reach",
+                        "node",
+                        "port"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Its dash on the tailnet (service_publish), or null."
+                },
+                "state": {
+                  "description": "failed: Incus reports an error, or its instance is gone; unknown: an instance droidd did not create, which it leaves alone.",
+                  "enum": [
+                    "creating",
+                    "running",
+                    "stopped",
+                    "failed",
+                    "unknown"
+                  ],
+                  "type": "string"
+                },
+                "template": {
+                  "description": "Its template (empty for an instance droidd did not create).",
+                  "maxLength": 40,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "template",
+                "state",
+                "ipv4",
+                "ports",
+                "links",
+                "published",
+                "lanPort"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "imported",
+            "preImage",
+            "service"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Take over a service another manager created, where it stands: write one key on its instance, the kernel's import mark, and record it as an adopted service. Only a service kernel.importServices lists, only from an approved proposal. Nothing is stopped, moved or changed otherwise.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "service_release",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The service name, as kernel.importServices lists it (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "preImage": {
+              "description": "The SHA-256 of the instance's image after the release, or null when the instance is gone.",
+              "pattern": "^[0-9a-f]{64}$",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "released": {
+              "const": true,
+              "type": "boolean"
+            },
+            "restored": {
+              "description": "Whether the instance's image is the pre-image the import recorded.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "released",
+            "restored",
+            "preImage"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Undo a service import: clear the one key the import wrote and remove Arca's record of the service, only from an approved proposal. The instance keeps running and nothing else on it changes.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

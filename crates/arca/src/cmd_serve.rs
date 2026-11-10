@@ -95,11 +95,13 @@ pub fn watch_kernel_handler(cfg: &NodeConfig, kernel: Arc<Mutex<Kernel>>) -> Wat
         let kernel = kernel
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // An imported service's record owns no object: its instance carries the import's mark beside the other manager's
+        // keys, which no entry's mark satisfies. Counting the record would report a drift that is the import itself.
         live.extend(
             kernel
                 .entries()
                 .iter()
-                .filter(|entry| entry.plugin.0 == "arca.service")
+                .filter(|entry| entry.plugin.0 == "arca.service" && entry.config["adopted"] != true)
                 .map(|entry| entry.id.clone()),
         );
         live

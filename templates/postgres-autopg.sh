@@ -1,6 +1,6 @@
 # The postgres-autopg service's entrypoint (templates/postgres-autopg.json reads it in, put on one line by services.ts
 # `scriptArg`, as `sh -ec <it> postgres-autopg`; arca-demo-automagik-omni Group 5, coordinator rulings 1 and 3). It runs
-# as the image's own user (autopg) in ghcr.io/automagik-dev/autopg, whose `autopg postmaster` alone listens on loopback
+# as the image's own user (autopg) in ghcr.io/automagik-si/autopg, whose `autopg postmaster` alone listens on loopback
 # only, with initdb's loopback-only pg_hba.conf and no database but postgres. So it:
 # - writes $AUTOPG_CONFIG_DIR/settings.json so postgres listens on every address (postgres._extra.listen_addresses:
 #   autopg reads it from that file only, no variable);

@@ -23,6 +23,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca token revoke <id>` with `--config <file>` or `--hash-dir <dir>` | the token's hash file | the id and `revoked: true` |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
+| `arca service import plan --name <service> --config <file>` | one instance `kernel.importServices` lists, and the instance listing, through Incus GET | the import's dry run as JSON: every check, the one write and the pre-image digest; see "Importing a service another manager created" |
 
 `watch` and `metrics` print the same JSON as the MCP verb of the same name, so a command's output can be compared with the
 server's answer.
@@ -77,6 +78,7 @@ refused without the value being echoed back.
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
 | `kernel.bridged` | no | Bridged mode: `{ "bridges": ["<host bridge>", ...], "pool": "<Incus storage pool>", "limits": { "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" } }`, every key required. The host bridges, which already exist, that a virtual machine's NIC may join. Without `kernel.serviceCidr` the node is bridged: it runs virtual machines only and Arca creates no Incus network on it. With `kernel.serviceCidr` the node is mixed. See "Bridged nodes and virtual machines" and "Mixed nodes". |
 | `kernel.vmLimits` | no | `{ "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" }`, every key required: the virtual-machine caps of a node that has `kernel.serviceCidr` and no `kernel.bridged`. Without it such a node creates no virtual machine. It is refused beside `kernel.bridged`, which states the same caps in its `limits`. See "Mixed nodes". |
+| `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
 | `approvalHost` | no | The host name every owner approval statement names. When it is not set, the system's host name is used. |
 | `approvalOrigin` | no | The page origin the owner approval page is served at: `https://` plus a lowercase host name and at most a non-443 port, with no path (for example `https://arca.example.com`). Its host is the WebAuthn rp id; it is not the host an approval statement names. |
@@ -104,6 +106,10 @@ The config is refused, with exit 2, when:
 - an adopted instance is not a plain name (`^[a-z][a-z0-9-]{0,56}$`), its `to` does not start with `arcak-adopt-` or is
   not in `kernel.projects`, an instance or a `to` is listed twice, an attach network is not a plain name, or
   `kernel.scratch` is `true` while `kernel.adopt` is set.
+- a `kernel.importServices` entry carries a key other than `name`, `project` and `cidr`, its name is not a service name, its
+  project is not listed in `kernel.droiddProjects`, its cidr is not an IPv4 /24, or a name is listed twice; or the list is
+  not empty on a node with no `kernel.serviceCidr` (a bridged node among them) or with `kernel.scratch`. A mixed node,
+  which sets `kernel.bridged` beside `kernel.serviceCidr`, may list imports.
 
 No command reads Incus before the config passes these checks.
 
@@ -349,7 +355,7 @@ The 0.1.0 release predates `x-arca-read-only-hint`, so its methods carry only `x
 
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
 
-Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
+Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `service_import`, `service_release`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
 
 ## The MCP server
 
@@ -919,8 +925,9 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of fifteen gated service,
-database, GPU, storage, snapshot or instance verbs: `service_create`, `service_remove`, `service_publish`, `service_unpublish`,
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of seventeen gated service,
+database, GPU, storage, snapshot or instance verbs: `service_create`, `service_remove`, `service_import`, `service_release`
+(see [Importing a service another manager created](#importing-a-service-another-manager-created)), `service_publish`, `service_unpublish`,
 `service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
 `snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
@@ -1616,6 +1623,103 @@ bad `--port`, `--http-path`, `--url` or `--wait` (or both or neither of `--port`
 adoption planned stopped). `1` for a held
 lock, a failed step (the record names it) or a failed verify.
 
+## Importing a service another manager created
+
+`service_import` takes over a service that another manager created, where it stands. It does not move, stop or restart the
+instance, and it changes no device, profile, ACL or other key. It writes one key on the instance,
+`user.arcakernel.entry = adopt-<name>`, and from then on Arca lists the service: `service_list`, `service_status` and
+`service_logs` work on it, the canvas shows it with its state, address and ports, and every verb that would write it
+(`service_remove`, `service_connect`, `service_disconnect`, `service_secret_set`, `service_publish`, `service_unpublish`)
+refuses with the code `adopted`. `service_release` is the exact inverse. The rules are Rules 52 and 53 in
+[`OWNERSHIP.md`](OWNERSHIP.md).
+
+**1. List the service.** Nothing can be imported until the node's config names it. Add it to `kernel.importServices` and
+restart the service once:
+
+```json
+"kernel": {
+  "projects": ["arcak-svc"],
+  "droiddProjects": ["app1"],
+  "serviceCidr": "192.0.2.0/24",
+  "importServices": [{ "name": "db1", "project": "app1", "cidr": "10.0.5.0/24" }]
+}
+```
+
+`project` is the other manager's project the instance is in, and it must be one of `droiddProjects`. `cidr` is that
+project's service subnet: the instance's address is checked against it, not against `kernel.serviceCidr`. An instance that
+carries the mark and has no entry is treated as before: outside `kernel.serviceCidr` it lists as `failed` and gets no record.
+
+**2. Dry run.** `arca service import plan --name db1 --config <file>` reads Incus with GET alone, never opens the state
+directory, and so runs beside the serving kernel. It prints:
+
+```json
+{
+  "name": "db1", "project": "app1", "cidr": "10.0.5.0/24", "ready": true,
+  "checks": [{ "check": "listed", "ok": true, "detail": "kernel.importServices lists it" }, "..."],
+  "uuid": "<the instance's volatile.uuid>",
+  "preImage": "<64 hex>",
+  "write": {
+    "method": "PATCH", "path": "/1.0/instances/db1?project=app1", "ifMatch": true,
+    "body": { "config": { "user.arcakernel.entry": "adopt-db1" } }
+  },
+  "wrote": false
+}
+```
+
+`write` is the one request the import would send, and `null` when `ready` is `false`. The checks are `listed`, `found`,
+`container`, `unmarked` (no key in the kernel's namespace), `serviceKeys` (the other manager's template, address and ports
+keys), `address` (inside the listed cidr, and the one `eth0` pins), `record` (the keys read as a service record),
+`nameFree` and `identity` (the instance has a uuid). `nameFree` is `null` here: only the running kernel knows Arca's own
+services, and it checks the name when the import is proposed and again when it runs. The command exits `0` whether or not
+the plan is ready; read `ready`. `preImage` is the SHA-256 of the canonical JSON of the instance's project, name, type, uuid,
+profiles, own devices, the names of its own non-volatile config keys, and the values of its `user.arca.*` and
+`user.arcakernel.*` keys. No other config value feeds it, so no secret does.
+
+**3. Import.** Propose it and have the owner approve it; the verb runs only with the one-shot grant of an approved
+proposal, never with an approval of its own:
+
+```
+action_propose { "action": "service_import", "args": { "name": "db1" } }
+```
+
+The proposal is refused, with the failed check in plain words, when the plan is not ready, so the owner is never asked to
+approve an import that cannot run. The owner approves it on the approval page with the passkey. The import then plans again,
+records its intent in `<stateDir>/adoptions.jsonl`, sends the one `PATCH` under the `If-Match` of the read it checked, reads
+the instance back and records the outcome. It answers `{ "imported": true, "preImage": "<64 hex>", "service": <the service
+row> }`. If the other manager wrote the instance between the read and the write, Incus refuses the write (412), nothing
+changes, and the answer says to propose the import again. It is never forced.
+
+**4. Restart.** A restart reads the record `service-db1` back from the desired state. It imports nothing again and sends no
+write.
+
+**Rollback.** `service_release` gives the service back:
+
+```
+action_propose { "action": "service_release", "args": { "name": "db1" } }
+```
+
+Once the owner approves it, the release clears the one key, under `If-Match`, when the instance still carries
+`adopt-db1`, then removes Arca's record of the service, and answers `{ "released": true, "restored": <bool>, "preImage":
+"<64 hex or null>" }`. `restored` is `true` when the instance's image is again the pre-image the import recorded; it is
+`false` when the other manager changed the instance in between, which the release leaves as it is. The instance is not
+stopped and nothing else on it is written. The release refuses, and writes nothing, when:
+
+- `kernel.importServices` no longer lists the service (list it again, restart, release, then take the entry out);
+- the instance of that name is not the one that was imported (its uuid differs);
+- the instance carries another key in the kernel's namespace;
+- its mark no longer names this import.
+
+An instance that is already gone, or whose mark was already cleared by hand, takes no write: only the record is removed.
+Keep the allowlist entry until the release is done. After it, remove the entry and restart; the instance then carries only
+the other manager's keys and that manager owns it alone again.
+
+`watch_report` shows an imported instance in its own project with the class `contested`, since it carries both managers'
+marks, and reports no drift for it.
+
+The import and the release are recorded in `<stateDir>/adoptions.jsonl` as lines of kind `import` and `release`. A build
+older than this one does not read those lines: before going back to an older build on a state directory that holds them,
+release every imported service, and keep the file aside.
+
 ## Alerts
 
 On every 5-second tick, `serve` reads the node, evaluates ten rules and writes the points and any alert events to
@@ -2162,6 +2266,9 @@ restart `arca serve`. The start is not refused, and the running virtual machines
 then or later. The first `service_create` of a container (or `postgres_create`) widens
 the project as the table says and creates the managed network. Removing `kernel.bridged` afterwards is refused while a
 virtual machine is on a host bridge.
+
+**Imports.** A mixed node may list `kernel.importServices` and import a service another manager created, as a
+managed node does: it has the service network an import needs. A bridged node may not.
 
 **A host that runs firewalld.** Arca creates the managed bridge through Incus and writes no host firewall rule. Where
 firewalld is active, it drops the DHCP and DNS requests the guests send to the bridge until the bridge is in a zone
