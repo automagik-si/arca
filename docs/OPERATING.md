@@ -2168,3 +2168,13 @@ Until the next read, a spent or expired string stays in the file, where it can n
 scrub the disk blocks the older file used. Each request, approval and decline is saved first, then written as a line in
 `approval-requests-audit.jsonl` (append-only, never pruned) naming the request, its digest and the requester, never an
 approval string, a credential or a challenge.
+
+**What is recorded, and no delivery.** There is no verb that delivers an approval into a request. The page's
+`POST /approve/requests/approve` is the one way a request becomes approved, and it takes the passkey's answer over the
+statement `begin` minted: an SSH signature or a whole approval string sent as `proof` is refused as `invalid`, and the
+request stays pending. An SSH approval goes to the call itself (`service_remove`, say), which spends it with no request.
+The approval's audit line names the passkey and how it signed
+(`approved:<id>:arca:<action>:<target>:params=<digest>:requester=<token>:key=passkey:<fingerprint>:via=passkey:count=<n>:synced=<0|1>`).
+A spend, by either kind of key, with or without a request, is recorded as one line in `approval-nonces.jsonl` (its
+time and nonce). The spend's line names no key and no signers file, so which key approved is read from the approval's
+audit line, and an SSH spend has none.
