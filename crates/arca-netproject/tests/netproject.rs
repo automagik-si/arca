@@ -162,3 +162,97 @@ fn service_cidr_requires_ipv4_24_and_no_reserved_overlap() {
     }
     assert!(check_cidr("192.0.2.0/24", &["198.51.100.0/24".into()]).is_ok());
 }
+
+#[test]
+fn the_bridged_project_is_created_alone_with_no_network_or_profile_and_a_retry_skips_it() {
+    let dir = std::env::temp_dir().join(format!("arca-bridgedproject-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let fake = FakeIncus::start(
+        &dir,
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            pools: vec![],
+            networks: vec![],
+        },
+    )
+    .unwrap();
+    let mut provider = IncusProvider::new(
+        fake.socket().into(),
+        Family {
+            projects: vec![PROJECT.into()],
+            scratch: false,
+            droidd_projects: vec!["other".into()],
+            reserved_cidrs: vec![],
+        },
+        dir.join("secrets"),
+        RetainedSet::empty(),
+    )
+    .unwrap();
+    let mut journal = Journal::open(MemJournal::default()).unwrap();
+    let manifest = BridgedProject::manifest();
+    let cfg = BridgedProjectConfig {
+        project: PROJECT.into(),
+    };
+    // Another entry id, or another project, is refused before any request.
+    for (entry, cfg) in [
+        ("net-arcak-svc", cfg.clone()),
+        (
+            BRIDGED_ENTRY,
+            BridgedProjectConfig {
+                project: "other".into(),
+            },
+        ),
+    ] {
+        let error = BridgedProject::apply(
+            &mut Ctx::new(
+                EntryId(entry.into()),
+                &manifest,
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(matches!(error, arca_kernel::plugin::PluginError::Config(_)));
+    }
+    assert!(fake.requests().is_empty());
+    for _ in 0..2 {
+        BridgedProject::apply(
+            &mut Ctx::new(
+                EntryId(BRIDGED_ENTRY.into()),
+                &manifest,
+                &mut provider,
+                &mut journal,
+                0,
+            ),
+            &cfg,
+        )
+        .unwrap();
+    }
+    let read = UnixIncus::new(fake.socket().into());
+    let project = read
+        .get(&format!("/1.0/projects/{PROJECT}?project={PROJECT}"))
+        .unwrap();
+    assert_eq!(project["config"]["user.arcakernel.entry"], BRIDGED_ENTRY);
+    assert_eq!(project["config"]["restricted"], "true");
+    assert_eq!(project["config"]["restricted.devices.nic"], "allow");
+    assert!(
+        project["config"]
+            .get("restricted.networks.access")
+            .is_none()
+    );
+    let writes = fake.writes();
+    assert_eq!(writes.len(), 1, "one project and nothing else");
+    assert!(writes[0].path.starts_with("/1.0/projects"));
+    assert!(
+        fake.requests()
+            .iter()
+            .all(|request| !request.path.contains("/1.0/networks")
+                && !request.path.contains("/1.0/profiles")),
+        "no network and no profile is read or written"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

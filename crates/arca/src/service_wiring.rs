@@ -235,6 +235,17 @@ impl ServiceHandler {
             }
             return Err(adopted(&name));
         }
+        if cfg.vm.is_some() {
+            return Err(bridged_refusal(
+                &name,
+                match self.verb {
+                    "service_secret_set" => {
+                        "it has no template secrets or environment for Arca to set"
+                    }
+                    _ => "it cannot be published from here; reach it on its bridge's own network",
+                },
+            ));
+        }
         if self.verb == "service_secret_set" {
             let key = args["key"]
                 .as_str()
@@ -328,6 +339,14 @@ impl ServiceHandler {
         }
         if provider.adopted {
             return Err(adopted(&to));
+        }
+        for cfg in [&consumer, &provider] {
+            if cfg.vm.is_some() {
+                return Err(bridged_refusal(
+                    &cfg.name,
+                    "links need the service network and its per-service firewall rules, which it does not have",
+                ));
+            }
         }
         let co = self.live_owned(&ce, &consumer)?;
         let po = self.live_owned(&pe, &provider)?;

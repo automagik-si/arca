@@ -145,6 +145,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         .add::<arca_netproject::NetProject>()
         .map_err(kernel_failure)?;
     plugins
+        .add::<arca_netproject::BridgedProject>()
+        .map_err(kernel_failure)?;
+    plugins
         .add::<crate::service::Service>()
         .map_err(kernel_failure)?;
     plugins

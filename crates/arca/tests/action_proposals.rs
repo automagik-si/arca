@@ -276,7 +276,9 @@ fn the_summary_is_built_by_the_kernel_and_an_extra_field_is_refused() {
 fn every_argument_of_every_allowed_verb_is_in_details() {
     fn sample(action: ActionKind) -> Value {
         match action {
-            ActionKind::ServiceCreate => json!({ "name": "nats", "template": "nats" }),
+            ActionKind::ServiceCreate => json!({
+                "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
+            }),
             ActionKind::ServiceRemove | ActionKind::ServiceUnpublish => json!({ "name": "nats" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
             ActionKind::ServiceConnect | ActionKind::ServiceDisconnect => {
@@ -378,6 +380,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (_, "from") => "Service",
                 (_, "to") => "To",
                 (_, "image") => "Image",
+                (_, "bridge") => "Host bridge",
+                (_, "mac") => "MAC address",
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details

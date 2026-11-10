@@ -1,4 +1,6 @@
-//! Services: one template-derived container in the service project, with its own NIC ACL.
+//! Services: one template-derived container in the service project, with its own NIC ACL. On a bridged node a service
+//! is one template-derived virtual machine in the same project, with a NIC on a host bridge that already exists; it
+//! has no ACL, no fixed address and no Incus-managed network.
 //!
 //! The desired-state entry is the record. Its config names the template, address, ports, links and publication; the
 //! live state comes from Incus on every read. Secret values stay in files and enter the Incus config only as references.
@@ -24,6 +26,8 @@ pub const PORTS_KEY: &str = "user.arca.ports";
 pub const PUBLISHED_KEY: &str = "user.arca.published";
 pub const LINKS_KEY: &str = "user.arca.links";
 pub const ENVKEYS_KEY: &str = "user.arca.envkeys";
+/// The template kind, and the Incus instance type, of a virtual-machine service.
+pub const VM_KIND: &str = "virtual-machine";
 /// Incus caps a disk device path at 255 bytes; "/" is the rootfs disk's path, not a data path.
 const DATA_PATH_MAX: usize = 255;
 
@@ -83,6 +87,15 @@ pub struct Lan {
     pub port: u16,
 }
 
+/// What only a virtual-machine service records: its root disk size and the fixed MAC the request gave, if any.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Vm {
+    pub root_size: String,
+    #[serde(default)]
+    pub mac: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceConfig {
@@ -130,6 +143,9 @@ pub struct ServiceConfig {
     /// A record whose create has not settled, shown as `creating` after a restart.
     #[serde(default)]
     pub creating: bool,
+    /// Present on a virtual machine on a host bridge. A container's record never carries the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<Vm>,
 }
 
 impl ServiceConfig {
@@ -161,6 +177,120 @@ pub fn service_name_ok(name: &str) -> bool {
 
 pub fn template_name_ok(name: &str) -> bool {
     name_ok(name, "template", 40)
+}
+
+/// Whether `name` can be a host bridge: a Linux interface name of 1 to 15 letters, digits, `-`, `_` and `.`, starting
+/// with a letter or digit.
+pub fn host_bridge_ok(name: &str) -> bool {
+    (1..=15).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// A fixed MAC in the one form Arca records: six lowercase hex octets joined by `:`. A group (multicast or broadcast)
+/// address and the all-zero address are refused, since a NIC cannot hold them.
+pub fn normalize_mac(text: &str) -> Option<String> {
+    let octets: Vec<&str> = text.split(':').collect();
+    if octets.len() != 6
+        || !octets
+            .iter()
+            .all(|octet| octet.len() == 2 && octet.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    let mac = text.to_ascii_lowercase();
+    let first = u8::from_str_radix(&mac[..2], 16).ok()?;
+    (first & 1 == 0 && mac != "00:00:00:00:00:00").then_some(mac)
+}
+
+/// The create body of a virtual-machine service: its own root disk on the configured pool and one NIC on the host
+/// bridge. It names no profile, no Incus network, no address and no ACL or filter, so Incus adds no firewall rule for it.
+/// Its only `user.arca.*` key is the template: the kernel's ownership rule admits no new one, and the bridge is the NIC's
+/// `parent`.
+fn vm_body(cfg: &ServiceConfig, vm: &Vm) -> Value {
+    let mut config = Map::new();
+    config.insert(TEMPLATE_KEY.to_string(), json!(cfg.template));
+    if let Some(limits) = &cfg.limits {
+        if let Some(cpu) = &limits.cpu {
+            config.insert("limits.cpu".into(), json!(cpu));
+        }
+        if let Some(memory) = &limits.memory {
+            config.insert("limits.memory".into(), json!(memory));
+        }
+    }
+    if cfg.autostart {
+        config.insert("boot.autostart".into(), json!("true"));
+    }
+    let mut nic = Map::new();
+    nic.insert("type".into(), json!("nic"));
+    nic.insert("nictype".into(), json!("bridged"));
+    nic.insert("parent".into(), json!(cfg.bridge));
+    if let Some(mac) = &vm.mac {
+        nic.insert("hwaddr".into(), json!(mac));
+    }
+    json!({
+        "name": cfg.name,
+        "type": VM_KIND,
+        "source": cfg.source,
+        "profiles": [],
+        "config": config,
+        "devices": {
+            "root": { "type": "disk", "path": "/", "pool": cfg.pool, "size": vm.root_size },
+            "eth0": nic
+        },
+        "start": cfg.start
+    })
+}
+
+/// A virtual-machine service: the instance alone. Nothing on it is changed after its create.
+fn apply_vm(ctx: &mut Ctx<'_>, cfg: &ServiceConfig, vm: &Vm) -> Result<(), PluginError> {
+    if cfg.project != PROJECT || !host_bridge_ok(&cfg.bridge) || cfg.bridge == BRIDGE {
+        return Err(PluginError::Config(
+            "a virtual machine is in the service project, on a host bridge".into(),
+        ));
+    }
+    if !service_name_ok(&cfg.name) || ctx.entry().0 != format!("service-{}", cfg.name) {
+        return Err(PluginError::Config("invalid service name".into()));
+    }
+    let limits_ok = cfg.limits.as_ref().is_some_and(|limits| {
+        limits.cpu.as_deref().is_some_and(decimal) && limits.memory.as_deref().is_some_and(size_ok)
+    });
+    if cfg.pool.is_empty()
+        || !limits_ok
+        || !size_ok(&vm.root_size)
+        || vm
+            .mac
+            .as_deref()
+            .is_some_and(|mac| normalize_mac(mac).as_deref() != Some(mac))
+    {
+        return Err(PluginError::Config(
+            "invalid virtual machine pool, limits, disk size or MAC".into(),
+        ));
+    }
+    match observed(
+        ctx,
+        format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
+    )? {
+        None => create(
+            ctx,
+            IncusKind::Instance,
+            &cfg.project,
+            &cfg.name,
+            vm_body(cfg, vm),
+        ),
+        Some(instance)
+            if instance["type"].as_str() == Some(VM_KIND)
+                && instance["config"][TEMPLATE_KEY].as_str() == Some(cfg.template.as_str())
+                && instance["devices"]["eth0"]["parent"].as_str() == Some(cfg.bridge.as_str()) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(PluginError::Config(
+            "the existing instance is not the marked virtual machine on its bridge".into(),
+        )),
+    }
 }
 
 /// The ACL's ingress rules: the bridge gateway reaches a declared management port, and each link opens its port.
@@ -356,6 +486,9 @@ impl Plugin for Service {
         // An adopted instance is owned through its adopt entry. The service record never writes it.
         if cfg.adopted {
             return Ok(());
+        }
+        if let Some(vm) = &cfg.vm {
+            return apply_vm(ctx, cfg, vm);
         }
         if cfg.project != PROJECT || cfg.bridge != BRIDGE {
             return Err(PluginError::Config(
@@ -614,6 +747,15 @@ pub struct Template {
     pub data: Option<Data>,
     #[serde(default)]
     pub lan: Option<Lan>,
+    /// The root disk size of a virtual-machine template, such as `20GiB`. No other kind sets it.
+    #[serde(default)]
+    pub root_size: Option<String>,
+}
+
+impl Template {
+    pub fn is_vm(&self) -> bool {
+        self.kind == VM_KIND
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -664,9 +806,17 @@ pub fn load_template(dir: &Path, name: &str) -> Result<Template, TemplateError> 
 
 fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateError> {
     let name = &template.name;
+    if template.is_vm() {
+        return validate_vm_template(template);
+    }
     if template.kind != "oci" && template.kind != "system" {
         return Err(TemplateError::refused(format!(
-            "template {name}: kind is oci or system"
+            "template {name}: kind is oci, system or virtual-machine"
+        )));
+    }
+    if template.root_size.is_some() {
+        return Err(TemplateError::refused(format!(
+            "template {name}: only a virtual-machine template has a rootSize"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {
@@ -777,6 +927,44 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     }
     let _ = dir;
     Ok(())
+}
+
+/// A virtual-machine template: a system image, both limits, a root disk size, and nothing that needs the service
+/// network. Ports, links, a lan proxy, a tailnet dash, environment and secrets all depend on the managed bridge, its ACL
+/// or a container's environment, and a bridged virtual machine has none of them.
+fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
+    let name = &template.name;
+    let refused = |why: &str| Err(TemplateError::refused(format!("template {name}: {why}")));
+    if !template.limits.as_ref().is_some_and(|l| {
+        l.cpu.as_deref().is_some_and(decimal) && l.memory.as_deref().is_some_and(size_ok)
+    }) {
+        return refused("a virtual machine needs limits with both cpu and memory");
+    }
+    if !template.root_size.as_deref().is_some_and(size_ok) {
+        return refused("a virtual machine needs a rootSize such as 20GiB");
+    }
+    if !template.ports.is_empty()
+        || !template.env.is_empty()
+        || !template.secrets.is_empty()
+        || !template.generate.is_empty()
+        || template.provides.is_some()
+        || template.entrypoint.is_some()
+        || template.publishable
+        || template.dash_port.is_some()
+        || template.droidd_port.is_some()
+        || template.data.is_some()
+        || template.lan.is_some()
+    {
+        return refused(
+            "a virtual machine is on a host bridge Arca does not manage, so it has no ports, env, secrets, generate, provides, entrypoint, publishable, dashPort, droiddPort, data or lan",
+        );
+    }
+    if let Some(description) = &template.description
+        && description.chars().count() > 500
+    {
+        return refused("description is at most 500 characters");
+    }
+    source(template).map(|_| ())
 }
 
 /// Whether the path is the root once repeated separators and `.` segments are dropped.

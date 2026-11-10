@@ -539,6 +539,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         autostart: false,
         data: None,
         lan: None,
+        root_size: None,
     }
 }
 
@@ -1699,7 +1700,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_five_templates_and_nothing_else_load_and_are_pinned() {
+fn the_six_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -1716,7 +1717,8 @@ fn the_five_templates_and_nothing_else_load_and_are_pinned() {
             "automagik-server",
             "nats",
             "omni-api",
-            "postgres-autopg"
+            "postgres-autopg",
+            "workspace-vm"
         ]
     );
     for name in &names {

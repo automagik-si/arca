@@ -2438,6 +2438,23 @@ pub fn ensure_netproject(
     ))])
 }
 
+/// On a bridged node the service project is the first change when absent: the project alone, with no network.
+fn ensure_bridged_project(
+    entries: &[arca_kernel::desired::Entry],
+) -> Vec<crate::desired_store::EntryChange> {
+    if entries
+        .iter()
+        .any(|e| e.id.0 == arca_netproject::BRIDGED_ENTRY)
+    {
+        return vec![];
+    }
+    vec![crate::desired_store::EntryChange::Put(service_entry(
+        arca_netproject::BRIDGED_ENTRY,
+        "arca.bridgedproject",
+        json!({"project": arca_netproject::PROJECT}),
+    ))]
+}
+
 pub fn postgres_handlers(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -2965,6 +2982,34 @@ fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
     Ok((cidr.to_string(), gateway.to_string()))
 }
 
+/// A bridged node's service project, or a refusal before any Incus read. It has no CIDR and no gateway.
+fn bridged_project(cfg: &NodeConfig) -> Result<(), CallError> {
+    if !cfg
+        .kernel
+        .projects
+        .iter()
+        .any(|project| project == arca_netproject::PROJECT)
+        || cfg
+            .kernel
+            .droidd_projects
+            .iter()
+            .any(|project| project == arca_netproject::PROJECT)
+        || cfg.kernel.scratch
+    {
+        return Err(service_refused(
+            "no service project: the service project is excluded by kernel configuration",
+        ));
+    }
+    Ok(())
+}
+
+/// Why a verb that needs the managed service network refuses a virtual machine on a host bridge.
+fn bridged_refusal(name: &str, what: &str) -> CallError {
+    service_refused(format!(
+        "service {name} is a virtual machine on a host bridge that Arca does not manage: {what}"
+    ))
+}
+
 fn service_listing(read: &UnixIncus, project: Option<&str>) -> Result<Vec<Value>, CallError> {
     let path = project
         .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
@@ -3206,6 +3251,7 @@ fn adopted_config(
         start: false,
         adopted: true,
         creating: false,
+        vm: None,
     })
 }
 
@@ -3294,6 +3340,12 @@ fn service_removal_refused(
         ),
         "instance",
     );
+    if config.vm.is_some() {
+        return service_refused(format!(
+            "remove service {}: partial removal ({instance}); the owner's approval is spent, so another try needs a new one",
+            config.name
+        ));
+    }
     let acl = state(
         format!("/1.0/network-acls/{}?project=default", config.acl()),
         "ACL",
@@ -3343,6 +3395,49 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         start,
         adopted: false,
         creating: false,
+        vm: None,
+    })
+}
+
+/// The record of a virtual machine on a host bridge. It has no address, gateway, port, environment or secret.
+fn vm_service_config(
+    name: &str,
+    template: &crate::service::Template,
+    bridge: String,
+    mac: Option<String>,
+    pool: String,
+    now: u64,
+) -> Result<crate::service::ServiceConfig, CallError> {
+    let source = crate::service::source(template).map_err(service_template_error)?;
+    let root_size = template.root_size.clone().ok_or_else(internal)?;
+    Ok(crate::service::ServiceConfig {
+        name: name.to_string(),
+        template: template.name.clone(),
+        instance: name.to_string(),
+        ipv4: String::new(),
+        ports: Vec::new(),
+        links: Vec::new(),
+        incoming: Vec::new(),
+        secret_refs: BTreeMap::new(),
+        environment_patch: None,
+        published: None,
+        created: now,
+        source,
+        pool,
+        project: arca_netproject::PROJECT.into(),
+        bridge,
+        gateway: String::new(),
+        entrypoint: None,
+        environment: BTreeMap::new(),
+        droidd_port: None,
+        limits: template.limits.clone(),
+        autostart: template.autostart,
+        data: None,
+        lan: None,
+        start: true,
+        adopted: false,
+        creating: false,
+        vm: Some(crate::service::Vm { root_size, mac }),
     })
 }
 
@@ -3357,6 +3452,74 @@ struct ServiceParts<'a> {
     templates_dir: &'a std::path::Path,
 }
 
+impl ServiceHandler {
+    /// Proposes a create's changes and answers the new service's view. A create that left no instance is undone: its
+    /// record goes and the secret files it made (`made`) are removed.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_create(
+        &self,
+        read: &UnixIncus,
+        name: &str,
+        template_name: &str,
+        changes: Vec<crate::desired_store::EntryChange>,
+        config: &crate::service::ServiceConfig,
+        made: Option<(&std::path::Path, &BTreeSet<std::ffi::OsString>)>,
+        now: u64,
+    ) -> Result<Value, CallError> {
+        let id = format!("service-{name}");
+        let outcomes = {
+            let mut kernel = lock(&self.kernel)?;
+            kernel.propose(changes, now).map_err(|_| internal())?
+        };
+        let failed = service_wiring::failed_for(&outcomes, &[id.as_str()]);
+        if failed {
+            match read.get(&format!(
+                "/1.0/instances/{name}?project={}",
+                arca_netproject::PROJECT
+            )) {
+                Ok(_) => {
+                    return Err(service_refused(format!(
+                        "start service {name} (created and stopped; service_remove removes it)"
+                    )));
+                }
+                Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
+                Err(_) => return Err(internal()),
+            }
+            let _ = {
+                let mut kernel = lock(&self.kernel)?;
+                kernel.propose(
+                    vec![crate::desired_store::EntryChange::Remove(EntryId(
+                        id.clone(),
+                    ))],
+                    now,
+                )
+            };
+            if let Some((service_secrets, seeded)) = made {
+                cleanup_service_secrets(service_secrets, seeded);
+            }
+            return Err(service_refused(format!(
+                "create service {name} from template {template_name}"
+            )));
+        }
+        let live = match read.get(&format!(
+            "/1.0/instances/{name}/state?project={}",
+            arca_netproject::PROJECT
+        )) {
+            Ok(state) => Some(state),
+            Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
+            Err(_) => return Err(internal()),
+        };
+        let live = live.map(|state| {
+            let mut row = state;
+            if row.get("status").is_none() {
+                row["status"] = json!("Unknown");
+            }
+            row
+        });
+        Ok(crate::service::view(config, live.as_ref()))
+    }
+}
+
 fn service_name(args: &Value) -> Result<String, CallError> {
     args["name"]
         .as_str()
@@ -3368,7 +3531,7 @@ fn service_name(args: &Value) -> Result<String, CallError> {
 impl ToolHandler for ServiceHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         let allowed: &[&str] = match self.verb {
-            "service_create" => &["name", "template"],
+            "service_create" => &["name", "template", "bridge", "mac"],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
             "service_remove" => &["name", "approval"],
@@ -3427,18 +3590,28 @@ impl ToolHandler for ServiceHandler {
             None
         };
         let now = (self.clock)();
-        let (cidr, gateway) = service_project(&self.cfg)?;
+        // A bridged node has no service /24: nothing on it is adopted from an address, and no gateway exists.
+        let bridged = self.cfg.kernel.bridged.as_ref();
+        let (cidr, gateway) = match bridged {
+            Some(_) => {
+                bridged_project(&self.cfg)?;
+                (String::new(), String::new())
+            }
+            None => service_project(&self.cfg)?,
+        };
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
         let rows = service_listing(&read, None)?;
         let mut entries = {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
         };
-        adopt_services(&self.kernel, &entries, &rows, &cidr, &gateway, now)?;
-        entries = {
-            let kernel = lock(&self.kernel)?;
-            kernel.entries().to_vec()
-        };
+        if bridged.is_none() {
+            adopt_services(&self.kernel, &entries, &rows, &cidr, &gateway, now)?;
+            entries = {
+                let kernel = lock(&self.kernel)?;
+                kernel.entries().to_vec()
+            };
+        }
         if matches!(
             self.verb,
             "service_connect"
@@ -3529,32 +3702,35 @@ impl ToolHandler for ServiceHandler {
                     "/1.0/instances/{name}/console?project={}&type=log",
                     config.project
                 );
-                let journal = if !config.adopted && config.source["protocol"] != "oci" {
-                    if let Some(_permit) = self.exec.journal_permit() {
-                        let target = self.exec_target(&entry, &config)?;
-                        let cmd = arca_incus::exec::ExecCommand::Journal(
-                            arca_incus::exec::JournalLines::new(lines).map_err(|_| {
-                                CallError::Invalid("lines: expected 1 to 200".into())
-                            })?,
-                        );
-                        match self.exec.run(
-                            &target,
-                            &caller.token_id,
-                            self.verb,
-                            &cmd,
-                            &service_secret_values(&self.cfg.state_dir.join("secrets")),
-                            None,
-                        ) {
-                            Ok(text) => String::from_utf8(text).ok(),
-                            Err(error) if error.ownership() => return Err(error.call_error()),
-                            Err(_) => None,
+                // A virtual machine's log is its console: an exec needs a guest agent the image may not run.
+                let journal =
+                    if !config.adopted && config.vm.is_none() && config.source["protocol"] != "oci"
+                    {
+                        if let Some(_permit) = self.exec.journal_permit() {
+                            let target = self.exec_target(&entry, &config)?;
+                            let cmd = arca_incus::exec::ExecCommand::Journal(
+                                arca_incus::exec::JournalLines::new(lines).map_err(|_| {
+                                    CallError::Invalid("lines: expected 1 to 200".into())
+                                })?,
+                            );
+                            match self.exec.run(
+                                &target,
+                                &caller.token_id,
+                                self.verb,
+                                &cmd,
+                                &service_secret_values(&self.cfg.state_dir.join("secrets")),
+                                None,
+                            ) {
+                                Ok(text) => String::from_utf8(text).ok(),
+                                Err(error) if error.ownership() => return Err(error.call_error()),
+                                Err(_) => None,
+                            }
+                        } else {
+                            None
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
                 let text = match journal {
                     Some(text) => text,
                     None => read.get_text(&path).map_err(|error| match error {
@@ -3676,6 +3852,98 @@ impl ToolHandler for ServiceHandler {
                 let templates_dir = self.cfg.state_dir.join("templates");
                 let template = crate::service::load_template(&templates_dir, template_name)
                     .map_err(service_template_error)?;
+                if template.is_vm() {
+                    let Some(bridged) = bridged else {
+                        return Err(service_refused(format!(
+                            "template {template_name} is a virtual machine, and this node is not a bridged node (kernel.bridged is not set)"
+                        )));
+                    };
+                    let bridge = match args.get("bridge") {
+                        Some(value) => value
+                            .as_str()
+                            .filter(|bridge| crate::service::host_bridge_ok(bridge))
+                            .ok_or_else(|| {
+                                CallError::Invalid("bridge: expected a host bridge name".into())
+                            })?,
+                        None => match bridged.bridges.as_slice() {
+                            [only] => only.as_str(),
+                            _ => {
+                                return Err(service_refused(
+                                    "this node allows more than one bridge: name one with bridge",
+                                ));
+                            }
+                        },
+                    };
+                    if !bridged.bridges.iter().any(|allowed| allowed == bridge) {
+                        return Err(service_refused(format!(
+                            "bridge {bridge} is not one of the bridges this node allows (kernel.bridged.bridges)"
+                        )));
+                    }
+                    let mac = match args.get("mac") {
+                        Some(value) => Some(
+                            value
+                                .as_str()
+                                .and_then(crate::service::normalize_mac)
+                                .ok_or_else(|| {
+                                    CallError::Invalid(
+                                        "mac: expected six hex octets joined by \":\", not a group or all-zero address"
+                                            .into(),
+                                    )
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    if let Some(mac) = &mac
+                        && (service_entries(&entries).iter().any(|(_, other)| {
+                            other.vm.as_ref().and_then(|vm| vm.mac.as_ref()) == Some(mac)
+                        }) || rows.iter().any(|row| {
+                            row["devices"].as_object().is_some_and(|devices| {
+                                devices.values().any(|device| {
+                                    device["hwaddr"]
+                                        .as_str()
+                                        .is_some_and(|held| held.eq_ignore_ascii_case(mac))
+                                })
+                            })
+                        }))
+                    {
+                        return Err(service_refused(format!(
+                            "the MAC {mac} is already held by another instance"
+                        )));
+                    }
+                    let mut changes = ensure_bridged_project(&entries);
+                    let config = vm_service_config(
+                        &name,
+                        &template,
+                        bridge.to_string(),
+                        mac,
+                        bridged.pool.clone(),
+                        now,
+                    )?;
+                    changes.push(crate::desired_store::EntryChange::Put(service_entry(
+                        &id,
+                        "arca.service",
+                        serde_json::to_value(&config).map_err(|_| internal())?,
+                    )));
+                    return self.settle_create(
+                        &read,
+                        &name,
+                        template_name,
+                        changes,
+                        &config,
+                        None,
+                        now,
+                    );
+                }
+                if bridged.is_some() {
+                    return Err(service_refused(format!(
+                        "this node is a bridged node: it runs virtual-machine templates only, and template {template_name} is not one"
+                    )));
+                }
+                if args.get("bridge").is_some() || args.get("mac").is_some() {
+                    return Err(CallError::Invalid(
+                        "bridge and mac: only a virtual-machine template takes them".into(),
+                    ));
+                }
                 let candidates =
                     crate::service::candidates(&cidr).map_err(service_template_error)?;
                 let leases = service_leases(&read)?;
@@ -3714,54 +3982,15 @@ impl ToolHandler for ServiceHandler {
                     "arca.service",
                     serde_json::to_value(&config).map_err(|_| internal())?,
                 )));
-                let outcomes = {
-                    let mut kernel = lock(&self.kernel)?;
-                    kernel.propose(changes, now).map_err(|_| internal())?
-                };
-                let failed = service_wiring::failed_for(&outcomes, &[id.as_str()]);
-                if failed {
-                    match read.get(&format!(
-                        "/1.0/instances/{name}?project={}",
-                        arca_netproject::PROJECT
-                    )) {
-                        Ok(_) => {
-                            return Err(service_refused(format!(
-                                "start service {name} (created and stopped; service_remove removes it)"
-                            )));
-                        }
-                        Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
-                        Err(_) => return Err(internal()),
-                    }
-                    let _ = {
-                        let mut kernel = lock(&self.kernel)?;
-                        kernel.propose(
-                            vec![crate::desired_store::EntryChange::Remove(EntryId(
-                                id.clone(),
-                            ))],
-                            now,
-                        )
-                    };
-                    cleanup_service_secrets(&service_secrets, &seeded);
-                    return Err(service_refused(format!(
-                        "create service {name} from template {template_name}"
-                    )));
-                }
-                let live = match read.get(&format!(
-                    "/1.0/instances/{name}/state?project={}",
-                    arca_netproject::PROJECT
-                )) {
-                    Ok(state) => Some(state),
-                    Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
-                    Err(_) => return Err(internal()),
-                };
-                let live = live.map(|state| {
-                    let mut row = state;
-                    if row.get("status").is_none() {
-                        row["status"] = json!("Unknown");
-                    }
-                    row
-                });
-                Ok(crate::service::view(&config, live.as_ref()))
+                self.settle_create(
+                    &read,
+                    &name,
+                    template_name,
+                    changes,
+                    &config,
+                    Some((service_secrets.as_path(), &seeded)),
+                    now,
+                )
             }
             _ => Err(service_not_found("unknown service verb")),
         }
