@@ -22,7 +22,7 @@ Source: `arca_kernel::ownership::{KERNEL_ENTRY_KEY, KERNEL_RETIRING_KEY}`; test
 **Rule 3.** The other system's marks are read-only to the kernel. Any key under `user.droid.`, `user.tactu.` or `user.arca.`
 means that system owns the object. The match ignores ASCII case, and a bare namespace key counts. The kernel never writes such
 an object, and it never adds such a key to one of its own, because the writer classifies the object's config after the
-change and refuses any result that is not its entry's own.
+change and refuses any result that is not its entry's own. The one exception is the service import's single key (Rule 52).
 Source: `arca_kernel::ownership::DROIDD_MARK_PREFIXES`; `UnixIncusWriter::patch` in `crates/arca-incus/src/write.rs`; tests
 `droidd_namespace_matching_ignores_ascii_case_so_a_near_miss_only_refuses` (kernel) and
 `a_patch_that_would_leave_the_object_owned_by_another_owner_is_refused` (`crates/arca-incus/tests/write.rs`).
@@ -35,7 +35,8 @@ entry mark for an entry whose plan was declined. `Contested` has a mark from the
 Source: `arca_kernel::ownership::{OwnerClass, classify}`; `crates/arca-kernel/tests/ownership.rs`.
 
 **Rule 5.** Every class may be read, and only the writer's own entry may write an object of its own class. Foreign, droidd,
-contested and retained objects are written by nobody in this kernel.
+contested and retained objects are written by nobody in this kernel, with one exception: the service import sets or clears
+its one key on an instance the configuration allowlists (Rule 52), and nothing else.
 Source: `arca_kernel::ownership::kernel_may_write` is true only for `Kernel { entry }` with the same entry;
 `UnixIncusWriter::read_owned` and `refusal_reason` in `crates/arca-incus/src/write.rs`; test
 `a_read_is_owned_only_for_this_entrys_own_kernel_object` in `crates/arca-incus/tests/write.rs`.
@@ -826,6 +827,51 @@ Source: `GpuBackend`, `IncusGpu`, `GpuRefusal` and `GpuActionHandler` in `crates
 `two_devices_for_one_card_do_not_leave_a_false_unconfirmed_removal`, `the_writer_itself_refuses_a_project_outside_its_family`
 and `the_backend_refuses_a_foreign_or_retained_instance_and_reads_the_mode_each_call`.
 
+## Importing a service another manager created
+
+**Rule 52.** The service import is the one write the kernel makes to an instance another manager created, in that manager's
+project, and it is one key. `ImportWriter` is the only path that sends it. It holds no project family and no classifier; it
+holds one allowance, `import_allowance`, and can build one request: a config `PATCH` of `user.arcakernel.entry`, under the
+`If-Match` of the read the caller checked. The allowance holds only when all of this is true:
+
+- the entry is `adopt-<instance>`, that instance's import entry, and no other kind of entry;
+- the object is an instance, named with no parent, and its `{project, instance}` is listed in `kernel.importServices`;
+- the change names exactly one key, `user.arcakernel.entry`, and either sets it to that entry's id (the import) or removes it
+  (the release).
+
+A second key in the same change, another key alone, another value for the mark, another instance, a project or a name the
+allowlist does not hold, another entry and an empty ETag are refused before any request, a read included. A changed ETag is
+Incus's 412 and changes nothing. The writer has no device, profile, state, ACL, PUT, POST or DELETE request to send. The
+configuration refuses an allowlist entry whose project is not one of `kernel.droiddProjects`, so the allowlist can only name
+another manager's project, and it is empty by default. Every other writer is as it was: `ProjectFamily` still refuses that
+project, so the provider answers `ProjectNotAllowed` for any effect on the instance, for the import's own entry too, before
+the mark and with it; and with the mark the instance classes `Contested` (Rule 4), which no other writer writes.
+Source: `import_allowance`, `ImportWriter::{read, patch}` in `crates/arca-incus/src/import.rs`; `check_import_services` in
+`crates/arca/src/config.rs`; tests `the_import_writer_sends_one_key_under_if_match_and_refuses_every_other_write`
+(`crates/arca/tests/service_import.rs`) and `the_import_allowlist_is_empty_by_default_and_refused_unless_every_rule_holds`
+(`crates/arca/src/config.rs`).
+
+**Rule 53.** An import and a release run only from an action proposal the owner approved (`service_import`,
+`service_release`), and each re-reads the instance before it writes. The import refuses, with no write, unless the name is
+listed, the instance is a container in the listed project, it carries the other manager's service keys (`user.arca.template`,
+`user.arca.address`, `user.arca.ports`) and no key in the kernel's namespace, its address is inside the listed cidr and is the
+one its `eth0` pins, its keys read as a service record, Arca has no service of that name, and it has a uuid. A proposal whose
+plan is not ready is refused when it is proposed. The release clears the key only when the instance still carries
+`adopt-<name>`. It refuses, with no write, when the allowlist no longer lists the instance, when the instance's uuid is not
+the one the import recorded, when it carries another key in the kernel's namespace, or when its mark names another entry. An
+instance that is gone, or whose mark is already cleared, takes no write. The record `service-<name>` is removed only after
+the key is cleared, since a marked instance gets its record again on the next call. Each write is recorded in
+`<stateDir>/adoptions.jsonl`, the intent before the request and the outcome after it, with the instance's uuid and the
+pre-image digest; no config value is recorded. A restart reads the record back and writes nothing.
+Source: `plan`, `import`, `release` and `image` in `crates/arca/src/service_import.rs`; the `service_import` and
+`service_release` arms of `ServiceHandler::call` and `adoption_subnet` in `crates/arca/src/handlers.rs`; `ImportEvent` in
+`crates/arca/src/adoptions.rs`; tests `an_approved_import_writes_one_key_and_makes_the_adopted_record`,
+`an_approval_for_another_target_and_a_replay_are_refused_and_write_nothing`,
+`an_import_that_fails_a_check_is_refused_before_any_write`, `a_release_restores_the_exact_pre_image_and_removes_the_record`,
+`a_release_refuses_in_plain_words_when_the_inverse_is_not_safe`,
+`a_restart_reads_the_imported_record_back_and_writes_nothing` and
+`every_other_writing_verb_still_refuses_an_imported_service` in `crates/arca/tests/service_import.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -838,6 +884,12 @@ possible.
 
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
+
+- An instance's config PATCH that names one `user.*` key leaves every other key, device and profile as it was, does not
+  restart the instance, and is refused with 412 under a stale `If-Match` (Rule 52). The adoption's Mark step relies on the same
+  behaviour for a stopped instance; the import sends it to a running one.
+- The other manager keeps treating an instance as its own while it also carries `user.arcakernel.entry` (Rule 53). That is
+  the other manager's behaviour, not Incus's, and only a run against it can show it.
 
 - Incus checks `If-Match` only on PUT and PATCH, so a DELETE has no compare step, and the tombstone is the only one (Rule 18).
 - A PATCH merges the `config` map, and an empty value unsets a key (Rule 16). Confirmed on Incus 7.3 for a profile, an ACL and a

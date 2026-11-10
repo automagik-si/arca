@@ -279,7 +279,10 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::ServiceCreate => json!({
                 "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
             }),
-            ActionKind::ServiceRemove | ActionKind::ServiceUnpublish => json!({ "name": "nats" }),
+            ActionKind::ServiceRemove
+            | ActionKind::ServiceUnpublish
+            | ActionKind::ServiceImport
+            | ActionKind::ServiceRelease => json!({ "name": "nats" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
             ActionKind::ServiceConnect | ActionKind::ServiceDisconnect => {
                 json!({ "from": "api", "to": "nats" })
@@ -383,6 +386,25 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     .expect("properties")
                     .keys()
                     .all(|field| ["project", "instance"].contains(&field.as_str())),
+                "{action:?} has a field the card does not show"
+            );
+            continue;
+        }
+        if matches!(
+            action,
+            ActionKind::ServiceImport | ActionKind::ServiceRelease
+        ) {
+            // The one argument, and in plain words the one key the action writes or clears.
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Name", "Effect"]);
+            assert_eq!(details[0].value, "nats");
+            assert!(details[1].value.contains("one key"), "{action:?} effect");
+            assert!(
+                action.params_schema()["properties"]
+                    .as_object()
+                    .expect("properties")
+                    .keys()
+                    .all(|field| field == "name"),
                 "{action:?} has a field the card does not show"
             );
             continue;

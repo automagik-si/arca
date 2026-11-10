@@ -33,6 +33,7 @@ mod passkey_change;
 pub mod peer_sync;
 pub mod service;
 pub mod service_exec;
+pub mod service_import;
 pub mod storage;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -62,6 +63,7 @@ const USAGE: &str = "usage: arca <command>
   token revoke <id> (--config <file> | --hash-dir <dir>)
   store check --config <file>
   templates install --config <file> [--replace]
+  service import plan --name <service> --config <file>
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
   adopt apply --instance <name> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] --config <file>
@@ -212,6 +214,7 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "link" => cmd_link::link(rest),
         "probe" => cmd_probe::probe(rest),
         "adopt" => cmd_adopt::adopt(rest),
+        "service" => service_import::command(rest),
         "store" => match rest.split_first() {
             Some((action, rest)) if action == "check" => {
                 cmd_store::check(&parse_flags(rest, &["config"], &[])?)
