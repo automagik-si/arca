@@ -73,6 +73,9 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "snapshot_create",
             "snapshot_list",
             "snapshot_delete",
+            "instance_start",
+            "instance_stop",
+            "instance_restart",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -110,6 +113,9 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("snapshot_create", VerbClass::L, Scope::Doctor, true, false),
         ("snapshot_list", VerbClass::L, Scope::Viewer, false, false),
         ("snapshot_delete", VerbClass::L, Scope::Doctor, true, true),
+        ("instance_start", VerbClass::L, Scope::Doctor, true, false),
+        ("instance_stop", VerbClass::L, Scope::Doctor, true, true),
+        ("instance_restart", VerbClass::L, Scope::Doctor, true, true),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -219,6 +225,9 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "storage_add",
         "snapshot_create",
         "snapshot_delete",
+        "instance_start",
+        "instance_stop",
+        "instance_restart",
     ];
     let action_proposal = open(
         json!({
@@ -1222,6 +1231,8 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "gpu_detach",
             "storage_add",
             "snapshot_delete",
+            "instance_stop",
+            "instance_restart",
         ]
     );
     for v in verbs() {

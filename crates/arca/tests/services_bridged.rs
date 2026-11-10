@@ -1026,9 +1026,10 @@ fn a_proposal_this_node_is_sure_to_refuse_is_refused_when_proposed_and_an_omitte
 {
     let propose = |rig: &Rig, args: Value| {
         let handlers: HashMap<&'static str, Arc<dyn ToolHandler>> =
-            arca::handlers::plan_handlers_node(
+            arca::handlers::plan_handlers_served(
                 rig.kernel.clone(),
                 Arc::new(|| NOW),
+                None,
                 None,
                 None,
                 None,

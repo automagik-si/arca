@@ -43,7 +43,7 @@ use crate::handlers::{
     ActionExecutor, ActionSlot, AlertsExport, AlertsHandler, AlertsPublished, ApprovalStatus,
     Clock, JournalListHandler, MetricsExport, MetricsHandler, OntologyQuery, Published,
     SAMPLE_INTERVAL, StatusHandler, Ticker, TokenListHandler, WatchHandler, new_sampler, now_ms,
-    plan_handlers_node, spawn_watcher,
+    plan_handlers_served, spawn_watcher,
 };
 use crate::kernel::Kernel;
 use crate::{Failure, Flags};
@@ -374,28 +374,53 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 storage: Arc::clone(&storage),
             }),
         );
+    // A watch-only node has no state writer either. A kernel-mode node starts, stops and restarts only the instances of
+    // its own project family that its mark makes its own, and journals each action in the state directory.
+    let lifecycle = if kernel_mode {
+        let family = ProjectFamily::new(
+            cfg.kernel.projects.iter().map(String::as_str),
+            cfg.kernel.droidd_projects.iter().map(String::as_str),
+        )
+        .map_err(Failure::Config)?;
+        let retained_kernel = Arc::clone(&kernel);
+        Some(Arc::new(crate::lifecycle::InstanceLifecycle::new(
+            cfg.incus.socket.clone(),
+            family,
+            move || {
+                let kernel = retained_kernel
+                    .lock()
+                    .map_err(|_| "the kernel lock is poisoned".to_string())?;
+                kernel.retained_entries().map_err(|error| error.to_string())
+            },
+            &cfg.state_dir,
+        )))
+    } else {
+        None
+    };
     let action_slot = ActionSlot::default();
-    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> = plan_handlers_node(
-        Arc::clone(&kernel),
-        clock.clone(),
-        cfg.kernel.postgres_image.clone(),
-        gpu,
-        Some(storage),
-        Arc::clone(&action_slot),
-        Some(Arc::new(cfg.clone())),
-    )
-    .into_iter()
-    .chain(crate::handlers::postgres_handlers(
-        kernel.clone(),
-        clock.clone(),
-        Arc::new(cfg.clone()),
-    ))
-    .chain(crate::handlers::service_handlers(
-        kernel.clone(),
-        clock.clone(),
-        Arc::new(cfg.clone()),
-    ))
-    .collect();
+    let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
+        plan_handlers_served(
+            Arc::clone(&kernel),
+            clock.clone(),
+            cfg.kernel.postgres_image.clone(),
+            gpu,
+            Some(storage),
+            lifecycle,
+            Arc::clone(&action_slot),
+            Some(Arc::new(cfg.clone())),
+        )
+        .into_iter()
+        .chain(crate::handlers::postgres_handlers(
+            kernel.clone(),
+            clock.clone(),
+            Arc::new(cfg.clone()),
+        ))
+        .chain(crate::handlers::service_handlers(
+            kernel.clone(),
+            clock.clone(),
+            Arc::new(cfg.clone()),
+        ))
+        .collect();
     // The owner approval requests: the three verbs and the approval page share one store in the state directory.
     let dashboard = cfg
         .approval_origin

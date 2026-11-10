@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 41] = [
+static VERBS: [Verb; 44] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -166,7 +166,7 @@ static VERBS: [Verb; 41] = [
     },
     Verb {
         name: "action_propose",
-        summary: "Records an inert service, database, GPU assignment, storage or snapshot action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+        summary: "Records an inert service, database, GPU assignment, storage, snapshot or instance start, stop or restart action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -654,6 +654,48 @@ static VERBS: [Verb; 41] = [
         params: snapshot_delete_params,
         result: snapshot_change_result,
     },
+    Verb {
+        name: "instance_start",
+        summary: "Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_instance_change,
+        cut: no_cut,
+        params: instance_start_params,
+        result: instance_change_result,
+    },
+    Verb {
+        name: "instance_stop",
+        summary: "Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_instance_change,
+        cut: no_cut,
+        params: instance_gated_params,
+        result: instance_change_result,
+    },
+    Verb {
+        name: "instance_restart",
+        summary: "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_instance_change,
+        cut: no_cut,
+        params: instance_gated_params,
+        result: instance_change_result,
+    },
 ];
 
 /// Every verb of the table, in table order.
@@ -874,6 +916,8 @@ fn not_confirmed(name: &str) -> String {
         "gpu_detach" => "nothing was detached",
         "storage_add" => "nothing was added",
         "action_approve" => "nothing was run",
+        "instance_stop" => "nothing was stopped",
+        "instance_restart" => "nothing was restarted",
         _ => "nothing was deleted",
     };
     let spent = if name == "postgres_delete" {
@@ -1301,8 +1345,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twelve verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 12] = [
+/// The fifteen verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 15] = [
     "service_create",
     "service_remove",
     "service_publish",
@@ -1315,6 +1359,9 @@ const ACTION_NAMES: [&str; 12] = [
     "storage_add",
     "snapshot_create",
     "snapshot_delete",
+    "instance_start",
+    "instance_stop",
+    "instance_restart",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -1831,6 +1878,49 @@ fn gpu_attach_params() -> Value {
 
 fn gpu_detach_params() -> Value {
     with_confirm(gpu_params())
+}
+
+/// A short line for a successful `instance_start`, `instance_stop` or `instance_restart`: the handler's own sentence.
+pub fn summary_instance_change(v: &Value) -> String {
+    v["message"].as_str().unwrap_or("done").to_string()
+}
+
+/// An Incus project name, as the kernel's project family spells one.
+fn project_name_schema() -> Value {
+    json!({
+        "description": "The Incus project the instance is in.",
+        "maxLength": 63,
+        "minLength": 1,
+        "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+        "type": "string"
+    })
+}
+
+fn instance_start_params() -> Value {
+    params(vec![
+        ("project", true, project_name_schema()),
+        ("instance", true, instance_name_schema()),
+    ])
+}
+
+/// The params of `instance_stop` and `instance_restart`: the instance, and the grant of the approved proposal.
+fn instance_gated_params() -> Value {
+    with_confirm(params(vec![
+        ("project", true, project_name_schema()),
+        ("instance", true, instance_name_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn instance_change_result() -> Value {
+    result(vec![
+        ("project", true, string()),
+        ("instance", true, string()),
+        ("action", true, one_of(&["start", "stop", "restart"])),
+        ("status", true, string()),
+        ("changed", true, boolean()),
+        ("message", true, string()),
+    ])
 }
 
 fn gpu_change_result() -> Value {

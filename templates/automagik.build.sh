@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # Usage: bash templates/automagik.build.sh PROJECT PROFILE local:BASE_FINGERPRINT
-# Run explicitly on a build host. PROJECT and PROFILE must already exist and provide
-# storage and internet access. The immutable amd64 Debian base must include bash,
-# ca-certificates, curl, git, xz-utils, tar, passwd, util-linux and systemd.
+# Run explicitly on a build host. PROJECT and PROFILE must already exist. PROFILE must
+# carry a root disk and a NIC with internet access and DNS: the builder downloads Node,
+# Tailscale and the plugins. The service profile Arca manages (arca-service) has no NIC,
+# since each service gets its own; build with a profile that adds one, and delete that
+# profile afterwards if it was made for the build.
+# The immutable amd64 Debian base must include bash, ca-certificates, curl, git,
+# xz-utils, tar, passwd, util-linux and systemd. To prepare one (Debian 13 here):
+#   incus init images:debian/13 base-prep --project PROJECT --profile PROFILE
+#   incus start base-prep --project PROJECT
+#   incus exec base-prep --project PROJECT --env DEBIAN_FRONTEND=noninteractive -- sh -c \
+#     'apt-get update && apt-get install -y --no-install-recommends bash ca-certificates \
+#      curl git xz-utils tar passwd util-linux systemd && apt-get clean && rm -rf /var/lib/apt/lists/*'
+#   incus stop base-prep --project PROJECT
+#   incus publish base-prep --project PROJECT   # prints the BASE_FINGERPRINT
+#   incus delete base-prep --project PROJECT
+# The pull also leaves a cached copy of images:debian/13 in PROJECT; delete it if unwanted.
 # Publishes only in PROJECT; no host packages, networks or units are changed.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -56,6 +69,15 @@ set -euo pipefail
 for program in curl git xz tar useradd runuser systemctl; do command -v "$program" >/dev/null; done
 # The closed service exec table uses these exact system-template paths.
 for program in /usr/bin/timeout /usr/bin/journalctl /usr/bin/systemctl /usr/bin/rm /usr/bin/mkdir; do test -x "$program"; done
+# The builder was started a moment ago: wait, bounded, for its network before the first download.
+for ((waited = 0; ; waited += 2)); do
+  getent hosts nodejs.org >/dev/null 2>&1 && break
+  if ((waited >= 60)); then
+    echo 'the builder could not resolve nodejs.org after 60 seconds: PROFILE must carry a NIC with internet access and DNS' >&2
+    exit 1
+  fi
+  sleep 2
+done
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 cd "$scratch"
@@ -65,7 +87,9 @@ printf '%s  node.tar.xz\n' '6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fc
 tar -xJf node.tar.xz -C /usr/local --strip-components=1 --no-same-owner
 cd /opt/arca-dsh
 npm ci --ignore-scripts --omit=dev --no-audit --no-fund
-chmod 0755 node_modules/node-pty/prebuilds/linux-x64/spawn-helper
+# Install scripts are skipped, so keep the helper's executable bit by hand where the pinned node-pty ships one.
+helper=node_modules/node-pty/prebuilds/linux-x64/spawn-helper
+if [[ -f $helper ]]; then chmod 0755 "$helper"; fi
 node -e 'require("./node_modules/node-pty")'
 ln -s /opt/arca-dsh/node_modules/.bin/dsh /usr/local/bin/dsh
 ln -s /opt/arca-dsh/node_modules/.bin/pnpm /usr/local/bin/pnpm

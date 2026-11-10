@@ -305,6 +305,9 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 "name": "shop--web--20261030T1200", "kind": "instance", "pool": "usb1",
                 "source": "shop/web",
             }),
+            ActionKind::InstanceStart | ActionKind::InstanceStop | ActionKind::InstanceRestart => {
+                json!({ "project": "arcak-svc", "instance": "web" })
+            }
         }
     }
 
@@ -366,6 +369,22 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     "{action:?} card lacks {value}: {shown}"
                 );
             }
+            continue;
+        }
+        if action.is_lifecycle() {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Project", "Instance", "Effect"]);
+            assert_eq!(details[0].value, "arcak-svc");
+            assert_eq!(details[1].value, "web");
+            assert!(details[2].value.contains("web"), "{action:?} effect");
+            assert!(
+                action.params_schema()["properties"]
+                    .as_object()
+                    .expect("properties")
+                    .keys()
+                    .all(|field| ["project", "instance"].contains(&field.as_str())),
+                "{action:?} has a field the card does not show"
+            );
             continue;
         }
         let schema = action.params_schema();

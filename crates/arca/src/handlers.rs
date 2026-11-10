@@ -966,21 +966,50 @@ pub fn plan_handlers_full(
     storage: Option<Arc<crate::storage::Storage>>,
     actions: ActionSlot,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
-    plan_handlers_node(kernel, clock, postgres_image, gpu, storage, actions, None)
+    plan_handlers_node(kernel, clock, postgres_image, gpu, storage, None, actions)
 }
 
-/// The plan handlers of a served node. With `node`, a proposed `service_create` is checked against the node's mode and
-/// bridges when it is proposed, so the owner is never asked to approve a create this node is sure to refuse.
+/// The plan handlers with the instance state writer too, and the three instance verbs (`instance_start`,
+/// `instance_stop`, `instance_restart`) beside the GPU and storage ones. `lifecycle` is `None` on a watch-only node,
+/// where the three verbs and their proposals are refused.
 pub fn plan_handlers_node(
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
     postgres_image: Option<String>,
     gpu: Option<Arc<dyn GpuBackend>>,
     storage: Option<Arc<crate::storage::Storage>>,
+    lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
+    actions: ActionSlot,
+) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
+    plan_handlers_served(
+        kernel,
+        clock,
+        postgres_image,
+        gpu,
+        storage,
+        lifecycle,
+        actions,
+        None,
+    )
+}
+
+/// The plan handlers of a served node: those of [`plan_handlers_node`], with the node's config. With `node`, a proposed
+/// `service_create` is checked against the node's mode and bridges when it is proposed, so the owner is never asked to
+/// approve a create this node is sure to refuse.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_handlers_served(
+    kernel: Arc<Mutex<Kernel>>,
+    clock: Clock,
+    postgres_image: Option<String>,
+    gpu: Option<Arc<dyn GpuBackend>>,
+    storage: Option<Arc<crate::storage::Storage>>,
+    lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
     actions: ActionSlot,
     node: Option<Arc<NodeConfig>>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     let rate = Arc::new(ProposalRateLimiter::default());
+    let instance_handlers =
+        crate::lifecycle::handlers(Arc::clone(&kernel), Arc::clone(&clock), lifecycle.clone());
     let storage_handler = |action: ActionKind| -> Arc<dyn ToolHandler> {
         Arc::new(crate::storage::StorageActionHandler {
             action,
@@ -1010,6 +1039,7 @@ pub fn plan_handlers_node(
                 gpu: gpu.clone(),
                 storage: storage.clone(),
                 node,
+                lifecycle,
             }) as Arc<dyn ToolHandler>,
         ),
         ("storage_add", storage_add),
@@ -1057,6 +1087,9 @@ pub fn plan_handlers_node(
             Arc::new(PeerKeysSync { kernel, clock }) as Arc<dyn ToolHandler>,
         ),
     ]
+    .into_iter()
+    .chain(instance_handlers)
+    .collect()
 }
 
 /// `peer_keys_sync`: keeps the page host's owner passkeys in this kernel's peer passkeys file (see
@@ -1178,8 +1211,8 @@ fn action_json(
     Ok(value)
 }
 
-/// `action_propose`: validates one allowed action's arguments, resolves a GPU action's project, type and identity, and
-/// records an inert proposal. A disallowed action is an invalid call and leaves no record.
+/// `action_propose`: validates one allowed action's arguments, resolves a GPU action's project, type and identity, checks
+/// that an instance start, stop or restart names an instance of Arca's, and records an inert proposal. A disallowed action is an invalid call and leaves no record.
 struct ActionPropose {
     kernel: Arc<Mutex<Kernel>>,
     clock: Clock,
@@ -1188,6 +1221,7 @@ struct ActionPropose {
     gpu: Option<Arc<dyn GpuBackend>>,
     storage: Option<Arc<crate::storage::Storage>>,
     node: Option<Arc<NodeConfig>>,
+    lifecycle: Option<Arc<crate::lifecycle::InstanceLifecycle>>,
 }
 
 impl ToolHandler for ActionPropose {
@@ -1230,6 +1264,9 @@ impl ToolHandler for ActionPropose {
             .map_err(CallError::Invalid)?;
         if let Some(storage) = storage {
             crate::storage::check_proposal(storage, action, &payload, now)?;
+        }
+        if action.is_lifecycle() {
+            crate::lifecycle::check_proposal(self.lifecycle.as_deref(), &payload)?;
         }
         let gpu_product = match action {
             ActionKind::GpuAttach => prepare_attach(
@@ -1647,7 +1684,8 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
 }
 
 /// Runs one already approved action through the same handler its gated verb uses. The verbs that take an inline approval
-/// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs) get the random grant in that field, and the
+/// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs, `instance_stop` and `instance_restart`) get
+/// the random grant in that field, and the
 /// handler consumes it, so the owner's real approval is never stored or replayed.
 #[derive(Clone, Default)]
 pub struct ActionExecutor {
@@ -1676,6 +1714,8 @@ impl ActionExecutor {
                 | "storage_add"
                 | "snapshot_create"
                 | "snapshot_delete"
+                | "instance_stop"
+                | "instance_restart"
         ) {
             call["approval"] = json!(grant);
         }
@@ -3225,6 +3265,45 @@ fn service_template_error(error: crate::service::TemplateError) -> CallError {
     }
 }
 
+/// Refuses a template whose image is a local alias that no image in the service project's image store carries, before
+/// anything is created: such an image is built or copied in by hand, and Incus's own answer to the create names no reason.
+/// Only a listing that answers and lacks the alias refuses. A listing that cannot be read (the project is not made yet, or
+/// the read fails) decides nothing, and the create goes on.
+fn local_image_present(
+    read: &UnixIncus,
+    template: &crate::service::Template,
+) -> Result<(), CallError> {
+    let Some(alias) = (template.kind == "system")
+        .then(|| template.image.strip_prefix("local:"))
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let Ok(images) = read.get(&format!(
+        "/1.0/images?project={}&recursion=1",
+        arca_netproject::PROJECT
+    )) else {
+        return Ok(());
+    };
+    let Some(images) = images.as_array() else {
+        return Ok(());
+    };
+    let held = images.iter().any(|image| {
+        image["aliases"]
+            .as_array()
+            .is_some_and(|aliases| aliases.iter().any(|a| a["name"].as_str() == Some(alias)))
+    });
+    if held {
+        return Ok(());
+    }
+    Err(service_refused(format!(
+        "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
+         A local image is built or copied into that project before the service is created; the template's description says how",
+        template.name,
+        arca_netproject::PROJECT
+    )))
+}
+
 /// The service project's CIDR and gateway, or a refusal before any Incus read.
 fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
     let cidr = cfg
@@ -3756,7 +3835,7 @@ impl ServiceHandler {
                 Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
                 Err(_) => return Err(internal()),
             }
-            let _ = {
+            let removal = {
                 let mut kernel = lock(&self.kernel)?;
                 kernel.propose(
                     vec![crate::desired_store::EntryChange::Remove(EntryId(
@@ -3768,8 +3847,11 @@ impl ServiceHandler {
             if let Some((service_secrets, seeded)) = made {
                 cleanup_service_secrets(service_secrets, seeded);
             }
+            let why = service_wiring::failure_reason(&outcomes, &[id.as_str()])
+                .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+            let left = service_wiring::left_behind(removal.ok().as_deref(), &id);
             return Err(service_refused(format!(
-                "create service {name} from template {template_name}"
+                "create service {name} from template {template_name}: {why}; {left}"
             )));
         }
         let live = match read.get(&format!(
@@ -4208,6 +4290,7 @@ impl ToolHandler for ServiceHandler {
                         "bridge and mac: only a virtual-machine template takes them".into(),
                     ));
                 }
+                local_image_present(&read, &template)?;
                 let candidates =
                     crate::service::candidates(&cidr).map_err(service_template_error)?;
                 let leases = service_leases(&read)?;

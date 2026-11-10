@@ -1581,7 +1581,10 @@
                           "gpu_detach",
                           "storage_add",
                           "snapshot_create",
-                          "snapshot_delete"
+                          "snapshot_delete",
+                          "instance_start",
+                          "instance_stop",
+                          "instance_restart"
                         ],
                         "type": "string"
                       },
@@ -1687,7 +1690,10 @@
               "gpu_detach",
               "storage_add",
               "snapshot_create",
-              "snapshot_delete"
+              "snapshot_delete",
+              "instance_start",
+              "instance_stop",
+              "instance_restart"
             ],
             "type": "string"
           }
@@ -1717,7 +1723,10 @@
                 "gpu_detach",
                 "storage_add",
                 "snapshot_create",
-                "snapshot_delete"
+                "snapshot_delete",
+                "instance_start",
+                "instance_stop",
+                "instance_restart"
               ],
               "type": "string"
             },
@@ -1787,7 +1796,7 @@
           "type": "object"
         }
       },
-      "summary": "Records an inert service, database, GPU assignment, storage or snapshot action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
+      "summary": "Records an inert service, database, GPU assignment, storage, snapshot or instance start, stop or restart action proposal for the owner to approve with a passkey. Nothing changes until the owner approves it.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -2058,7 +2067,10 @@
                 "gpu_detach",
                 "storage_add",
                 "snapshot_create",
-                "snapshot_delete"
+                "snapshot_delete",
+                "instance_start",
+                "instance_stop",
+                "instance_restart"
               ],
               "type": "string"
             },
@@ -5539,6 +5551,258 @@
         }
       },
       "summary": "Delete one snapshot copy from the arcak-snapshots project, with the owner's signed approval. Nothing outside that project is touched.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "instance_start",
+      "params": [
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": true,
+          "schema": {
+            "description": "The Incus project the instance is in.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "action": {
+              "enum": [
+                "start",
+                "stop",
+                "restart"
+              ],
+              "type": "string"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "instance",
+            "action",
+            "status",
+            "changed",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "instance_stop",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": true,
+          "schema": {
+            "description": "The Incus project the instance is in.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "action": {
+              "enum": [
+                "start",
+                "stop",
+                "restart"
+              ],
+              "type": "string"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "instance",
+            "action",
+            "status",
+            "changed",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "instance_restart",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "instance",
+          "required": true,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": true,
+          "schema": {
+            "description": "The Incus project the instance is in.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "action": {
+              "enum": [
+                "start",
+                "stop",
+                "restart"
+              ],
+              "type": "string"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "instance",
+            "action",
+            "status",
+            "changed",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

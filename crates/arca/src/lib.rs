@@ -18,6 +18,7 @@ pub mod cmd_link;
 pub mod cmd_probe;
 pub mod cmd_serve;
 pub mod cmd_store;
+pub mod cmd_templates;
 pub mod cmd_token;
 pub mod cmd_watch;
 pub mod config;
@@ -25,6 +26,7 @@ pub mod desired_store;
 pub mod gpu;
 pub mod handlers;
 pub mod kernel;
+pub mod lifecycle;
 pub mod linked;
 pub mod omni;
 mod passkey_change;
@@ -59,6 +61,7 @@ const USAGE: &str = "usage: arca <command>
   token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)
   token revoke <id> (--config <file> | --hash-dir <dir>)
   store check --config <file>
+  templates install --config <file> [--replace]
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
   adopt apply --instance <name> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] --config <file>
@@ -212,6 +215,12 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         "store" => match rest.split_first() {
             Some((action, rest)) if action == "check" => {
                 cmd_store::check(&parse_flags(rest, &["config"], &[])?)
+            }
+            _ => Err(usage_failure()),
+        },
+        "templates" => match rest.split_first() {
+            Some((action, rest)) if action == "install" => {
+                cmd_templates::install(&parse_flags(rest, &["config"], &["replace"])?)
             }
             _ => Err(usage_failure()),
         },

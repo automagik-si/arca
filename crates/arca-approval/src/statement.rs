@@ -34,6 +34,9 @@ pub enum ArcaAction {
     StorageAdd,
     SnapshotCreate,
     SnapshotDelete,
+    InstanceStart,
+    InstanceStop,
+    InstanceRestart,
 }
 
 impl ArcaAction {
@@ -59,6 +62,9 @@ impl ArcaAction {
             Self::StorageAdd => "storage_add",
             Self::SnapshotCreate => "snapshot_create",
             Self::SnapshotDelete => "snapshot_delete",
+            Self::InstanceStart => "instance_start",
+            Self::InstanceStop => "instance_stop",
+            Self::InstanceRestart => "instance_restart",
         }
     }
 
@@ -84,6 +90,9 @@ impl ArcaAction {
             "storage_add" => Some(Self::StorageAdd),
             "snapshot_create" => Some(Self::SnapshotCreate),
             "snapshot_delete" => Some(Self::SnapshotDelete),
+            "instance_start" => Some(Self::InstanceStart),
+            "instance_stop" => Some(Self::InstanceStop),
+            "instance_restart" => Some(Self::InstanceRestart),
             _ => None,
         }
     }
@@ -266,7 +275,7 @@ pub fn parse_statement(bytes: &[u8]) -> Result<OwnerApproval, ApprovalRefusal> {
     let action = ArcaAction::from_statement(field("action")).ok_or_else(|| {
         bad(
             "action",
-            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create or snapshot_delete",
+            "delete, publish, spend, passkey_add, passkey_remove, service_create, service_remove, service_publish, service_unpublish, service_connect, service_disconnect, postgres_create, postgres_delete, gpu_attach, gpu_detach, storage_add, snapshot_create, snapshot_delete, instance_start, instance_stop or instance_restart",
         )
     })?;
     let target = field("target");

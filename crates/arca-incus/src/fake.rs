@@ -47,8 +47,8 @@
 //! Instances for adoption: an instance that names its `profiles` has its `expanded_devices` and `expanded_config` worked out
 //! from those profiles and its own keys, as Incus expands them. A project reads its own profiles when its config sets
 //! `features.profiles` to `"true"`, and the default project's otherwise; its `default` profile is empty until a test adds one
-//! ([`FakeIncus::add_profile`]). `/1.0/instances/<i>/state` serves the status and each NIC's MAC and IPv4, and a PUT there starts
-//! or stops the instance as an operation. An instance create with `start: true` starts it too. A graceful stop can be made to
+//! ([`FakeIncus::add_profile`]). `/1.0/instances/<i>/state` serves the status and each NIC's MAC and IPv4, and a PUT there starts,
+//! stops or restarts the instance as an operation. An instance create with `start: true` starts it too. A graceful stop can be made to
 //! outlast its timeout ([`FakeIncus::hang_stop`]), and then only `force: true` stops it. A NIC's MAC is its device's `hwaddr`,
 //! else its `volatile.<dev>.hwaddr`, else one the start
 //! generates and keeps there. Its IPv4 is its device's `ipv4.address`, else the lease its MAC holds in the DHCP lease table,
@@ -2588,8 +2588,8 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
     )
 }
 
-/// Starts or stops an instance from a PUT of its state, as an operation. A stop of a hung instance fails inside its operation
-/// and leaves it running, unless it is forced and only the graceful stop hangs.
+/// Starts, stops or restarts an instance from a PUT of its state, as an operation. A stop or a restart of a hung instance fails
+/// inside its operation and leaves it running, unless it is forced and only the graceful stop hangs.
 fn change_state(
     shared: &Shared,
     store: &mut Store,
@@ -2623,7 +2623,18 @@ fn change_state(
             }
             answered(shared, store, "instance", "PUT", Ok(()))
         }
-        _ => bad("the fake takes only a start or a stop"),
+        "restart" if !running => bad("The instance is already stopped"),
+        "restart" => {
+            // A restart is a stop and a start in one operation: a hung instance fails its stop half and stays running.
+            let hung = store.hung.get(&store.objects[index].name).copied();
+            if hung.is_some_and(|forced_too| forced_too || !force) {
+                let failure = Err((400, "Failed shutting down instance".to_string()));
+                return answered(shared, store, "instance", "PUT", failure);
+            }
+            store.start(index, shared.counter.fetch_add(1, Ordering::SeqCst));
+            answered(shared, store, "instance", "PUT", Ok(()))
+        }
+        _ => bad("the fake takes only a start, a stop or a restart"),
     }
 }
 

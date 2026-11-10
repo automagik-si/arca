@@ -1,5 +1,5 @@
-//! Inert action proposals: a viewer may ask the owner to approve one of a closed set of service, database, GPU, storage
-//! and snapshot actions.
+//! Inert action proposals: a viewer may ask the owner to approve one of a closed set of service, database, GPU, storage,
+//! snapshot and instance start, stop and restart actions.
 //!
 //! A proposal changes nothing. It carries the action's own arguments, a digest over the canonical `{action, args}`, the
 //! exact arguments the owner is shown as `details`, and a plain-language summary built here from the validated arguments.
@@ -60,11 +60,14 @@ pub enum ActionKind {
     StorageAdd,
     SnapshotCreate,
     SnapshotDelete,
+    InstanceStart,
+    InstanceStop,
+    InstanceRestart,
 }
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 12] = [
+    pub const ALL: [ActionKind; 15] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServicePublish,
@@ -77,6 +80,9 @@ impl ActionKind {
         Self::StorageAdd,
         Self::SnapshotCreate,
         Self::SnapshotDelete,
+        Self::InstanceStart,
+        Self::InstanceStop,
+        Self::InstanceRestart,
     ];
 
     /// The verb name this action runs.
@@ -94,7 +100,18 @@ impl ActionKind {
             Self::StorageAdd => "storage_add",
             Self::SnapshotCreate => "snapshot_create",
             Self::SnapshotDelete => "snapshot_delete",
+            Self::InstanceStart => "instance_start",
+            Self::InstanceStop => "instance_stop",
+            Self::InstanceRestart => "instance_restart",
         }
+    }
+
+    /// Whether the action starts, stops or restarts one instance.
+    pub fn is_lifecycle(self) -> bool {
+        matches!(
+            self,
+            Self::InstanceStart | Self::InstanceStop | Self::InstanceRestart
+        )
     }
 
     /// Whether the action adds snapshot storage or makes or deletes a snapshot.
@@ -299,6 +316,25 @@ impl ActionKind {
             Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete => {
                 crate::storage::details(self, args)
             }
+            Self::InstanceStart | Self::InstanceStop | Self::InstanceRestart => {
+                let instance = text("instance");
+                let effect = match self {
+                    Self::InstanceStart => {
+                        format!("Starts {instance}. If it already runs, nothing changes.")
+                    }
+                    Self::InstanceStop => format!(
+                        "Shuts {instance} down; everything it serves is unavailable until it is started again. If it is already stopped, nothing changes."
+                    ),
+                    _ => format!(
+                        "Shuts {instance} down and starts it again; everything it serves is unavailable for a moment. If it is stopped, it is started."
+                    ),
+                };
+                vec![
+                    row("Project", text("project")),
+                    row("Instance", instance),
+                    row("Effect", &effect),
+                ]
+            }
         }
     }
 
@@ -370,6 +406,18 @@ impl ActionKind {
             ),
             Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete => {
                 crate::storage::summary(self, args)
+            }
+            Self::InstanceStart | Self::InstanceStop | Self::InstanceRestart => {
+                let word = match self {
+                    Self::InstanceStart => "Start",
+                    Self::InstanceStop => "Stop",
+                    _ => "Restart",
+                };
+                format!(
+                    "{word} the instance {} in project {}",
+                    text("instance"),
+                    text("project")
+                )
             }
         }
     }

@@ -11,8 +11,10 @@ const PROPOSE_ACTIONS = new Set([
   'service_create', 'service_remove', 'service_publish', 'service_unpublish',
   'service_connect', 'service_disconnect', 'postgres_create', 'gpu_attach', 'gpu_detach',
   'storage_add', 'snapshot_create', 'snapshot_delete',
+  'instance_start', 'instance_stop', 'instance_restart',
 ]);
 const GPU_ACTIONS = new Set(['gpu_attach', 'gpu_detach']);
+const INSTANCE_ACTIONS = new Set(['instance_start', 'instance_stop', 'instance_restart']);
 
 function normalizePci(value) {
   const match = String(value ?? '').trim().toLowerCase()
@@ -20,6 +22,9 @@ function normalizePci(value) {
   return match ? `${match[1] ?? '0000'}:${match[2]}` : '';
 }
 const APPROVAL_TIMEOUT_MS = 30_000;
+// A stop or a restart is graceful: the kernel gives the instance 60 seconds and one call takes at most 150,
+// so these cards wait as long as the approval page waits for a linked kernel before they offer a retry.
+const INSTANCE_APPROVAL_TIMEOUT_MS = 180_000;
 const NO_SUCH_PLAN = 'This proposal is no longer waiting. It may have been approved or declined elsewhere. Check Steps.';
 const MISSING_PROPOSAL = 'The proposal is not waiting any more.';
 // An approval refusal names the approval itself, so it gets a plain sentence. A handler refusal after
@@ -147,6 +152,13 @@ function plainError(error) {
 // The kernel returns the verb's own result. Only fields the contract names are read, and only as text.
 function plainResult(action, result) {
   const value = result && typeof result === 'object' ? result : {};
+  if (INSTANCE_ACTIONS.has(action)) {
+    // The kernel says what it did, or that nothing needed doing ("is already running; nothing was started").
+    const message = typeof value.message === 'string' ? value.message.trim() : '';
+    if (!message) return 'Arca finished the change.';
+    const sentence = `${message.charAt(0).toUpperCase()}${message.slice(1)}`;
+    return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
+  }
   if (value.removed === true) return 'The service was removed.';
   if (value.unpublished === true) return 'The service is no longer published.';
   if (typeof value.url === 'string' && value.url) return `The change is live at ${value.url}.`;
@@ -1574,7 +1586,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         body: JSON.stringify(plan.linkedHost
           ? { plan: plan.id, approval, host: plan.linkedHost }
           : { plan: plan.id, approval }),
-        signal: AbortSignal.timeout(APPROVAL_TIMEOUT_MS),
+        signal: AbortSignal.timeout(INSTANCE_ACTIONS.has(plan.action) ? INSTANCE_APPROVAL_TIMEOUT_MS : APPROVAL_TIMEOUT_MS),
       });
       const body = await response.json().catch(() => ({}));
       if (!response.ok) {

@@ -10,6 +10,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
+| `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
@@ -255,6 +256,42 @@ secrets redacted and a capped, truncated result. The six shipped templates live 
 images and vendored npm lockfile. One of them, `workspace-vm`, is a virtual machine for a bridged node (see
 "Bridged nodes and virtual machines").
 
+`arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
+script its entrypoint reads (`postgres-autopg.sh` for `postgres-autopg`), from the build itself, so no checkout is
+needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
+dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
+`service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
+(`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
+`service_create` refuses with the alias when the project's image listing answers and no image there carries it,
+before anything is created. A listing that cannot be read decides nothing, and the create goes on.
+
+The `automagik` image is built from a checkout with `bash templates/automagik.build.sh PROJECT PROFILE
+local:BASE_FINGERPRINT`, which publishes it in `PROJECT` under the alias the template names. `PROFILE` must carry a
+root disk and a NIC with internet access and DNS, because the builder downloads Node, Tailscale and the plugins. The
+`arca-service` profile has no NIC (each service gets its own), so it cannot be the build profile: use one that adds a
+NIC on a network the project may use, and delete it afterwards if it was made for the build. The script waits up to
+60 seconds for the builder to resolve DNS and says so when it never does. The base is an amd64 Debian image already
+in the project, prepared like this (Debian 13 here), with the same `PROFILE`:
+
+```bash
+incus init images:debian/13 base-prep --project PROJECT --profile PROFILE
+incus start base-prep --project PROJECT
+incus exec base-prep --project PROJECT --env DEBIAN_FRONTEND=noninteractive -- sh -c \
+  'apt-get update && apt-get install -y --no-install-recommends bash ca-certificates curl git xz-utils tar passwd \
+   util-linux systemd && apt-get clean && rm -rf /var/lib/apt/lists/*'
+incus stop base-prep --project PROJECT
+incus publish base-prep --project PROJECT   # prints the BASE_FINGERPRINT
+incus delete base-prep --project PROJECT
+```
+
+The pull also leaves a cached copy of `images:debian/13` in the project; delete it if it is not wanted. The build
+removes its own builder instance and leaves the base and the built image.
+
+When a create fails in the kernel, the refusal carries the recorded reason and says what remains: `nothing was left
+behind` only when the cleanup that follows completed and nothing waits for an approval. A template with `data`
+leaves its data volume in a delete plan for the owner's approval, and the refusal names it. When the cleanup did not
+complete (for example the create's outcome is not known), the refusal says so.
+
 Templates may also set `limits` with an optional decimal-string `cpu` and/or a size-string `memory` (for example,
 `{"cpu":"4","memory":"4GiB"}`); at least one is required when `limits` is present. These instance settings override the
 shared profile. `cpu`, `memory` and a data `size` must start with a digit 1-9; zero is refused. `autostart` defaults to
@@ -311,15 +348,15 @@ The 0.1.0 release predates `x-arca-read-only-hint`, so its methods carry only `x
 
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
 
-Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `gpu_detach`, `storage_add`, `snapshot_delete`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
+Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
 
 ## The MCP server
 
 `serve` answers `POST /mcp` with JSON responses (streamable HTTP, protocol version `2025-11-25`) on the unix socket. The verbs
 in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, `token_list`, `journal_list`, `plan_list`,
 `action_propose`, `plan_decline`, `approval_submit`, `action_approve`, `peer_keys_sync`, the Postgres and ontology verbs, `service_create`, `service_list` and
-`service_status`, `gpu_attach` and `gpu_detach`, and `storage_list`, `storage_add`, `snapshot_create`, `snapshot_list` and
-`snapshot_delete`.
+`service_status`, `gpu_attach` and `gpu_detach`, `storage_list`, `storage_add`, `snapshot_create`, `snapshot_list` and
+`snapshot_delete`, and `instance_start`, `instance_stop` and `instance_restart`.
 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
@@ -482,6 +519,56 @@ newest successful read, so a late failure does not label averaged figures. A win
 the failure reason. The failure and provenance fields are additions: `cpu.coresKnown`, `memory.usedBytes`, `cpu.reason`,
 `load.reason` and `memory.reason`. Every field the earlier schema carried keeps its name and meaning, and a local node's
 figures do not change.
+
+## Starting, stopping and restarting instances
+
+`instance_start`, `instance_stop` and `instance_restart` take `{project, instance}` and change the power state of one
+existing Incus instance. They exist so that Arca can bring its own instances back after a host crash, and stop or restart
+one when the owner says so.
+
+They act only on an instance Arca owns or has adopted: one in `kernel.projects` whose own config carries the kernel's
+mark (`user.arcakernel.entry`, which an adoption leaves as `adopt-<name>`), the same check `gpu_attach` makes. An instance
+outside the family, one with no mark, droidd's, one both marks contest, and one whose delete plan was declined are each
+refused with `InstanceNotArca` and a sentence that says why; no write is sent to it (an instance inside the family is read first). A name that does not exist is
+`InstanceUnknown`. A watch-only node has no state writer and answers `InstanceLifecycleDisabled`.
+
+| Verb | Who runs it | On a running instance | On a stopped instance |
+|------|-------------|-----------------------|-----------------------|
+| `instance_start` | a `doctor` token, directly; no approval | nothing changes, `changed: false`, "is already running" | starts it |
+| `instance_stop` | only an approved action proposal | shuts it down | nothing changes, `changed: false`, "is already stopped" |
+| `instance_restart` | only an approved action proposal | shuts it down and starts it again | starts it, and says so |
+
+A stop and a restart interrupt whatever the instance serves, so they are destructive verbs (`destructiveHint: true`, with
+the optional `confirm`) and their `approval` takes only the one-shot grant that an approved proposal arms: a direct call
+with anything else is `NotApproved`. All three can be proposed with `action_propose`, so a viewer (the canvas Doctor) can
+ask and the owner approves on the approval page; an approved `instance_start` runs with no grant. The owner approval
+requests (`owner_approval_request`) have no word for a stop or a restart, so those two run through a proposal only. An
+instance that is not Arca's cannot be proposed either, so the owner is never shown a card for it.
+
+A stop and a restart are graceful: Incus gives the instance 60 seconds to shut down. Arca forces nothing. One call takes
+at most 150 seconds, and the approval page waits 180 seconds for a linked kernel's answer to an approval (30 for any other
+relayed write), so a slow stop on a linked host still answers as done or with its own refusal. An instance
+that does not shut down stays running and the call is refused with `InstanceStopFailed` or `InstanceRestartFailed`, with
+the state the instance is in now. A frozen instance, or one in an error state, is left as it is
+(`InstanceStateUnsupported`). An instance recreated between the owner check and the change is refused with
+`InstanceChanged`, and nothing is sent to it.
+
+The result is `{project, instance, action, status, changed, message}`: `status` is the state after the call and `message`
+is the sentence a person reads.
+
+A power state is not a desired-state entry, so these changes are not in `journal.jsonl` and `journal_list` does not show
+them. Each call that passes its gate is written to `instance-actions.jsonl` in the state directory instead:
+
+```
+{"kind":"begin","id":"ia-<ms>-<n>","at_ms":<ms>,"token_id":"<the caller's token, or owner-approval>","proposal":"<act-… of the approved proposal, or null>","action":"start","project":"<project>","instance":"<instance>"}
+{"kind":"end","id":"ia-<ms>-<n>","outcome":"started","code":null,"uuid":"<volatile uuid>","status":"Running"}
+```
+
+`outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`, `refused` or
+`failed`, and `code` is the refusal's code for the last two: `failed` only when a state change was sent and did not finish.
+`proposal` is the approved proposal a stop or a restart ran from; a start carries no grant, so it is `null` there. The `begin` line is durable before anything is sent to Incus:
+when it cannot be written (the file is a link, or is not mode 0600) the call is refused with `InstanceJournalUnavailable`
+and nothing changes. A file past 8 MiB is set aside as `instance-actions.jsonl.1`, replacing the one set aside before.
 
 ## Snapshot storage and snapshots
 
@@ -804,6 +891,7 @@ A call sends `initialize` and then `tools/call`, each on its own connection. Its
 | `desired.lock` | the lock held while `serve` runs. A second process over the same directory is refused |
 | `journal.jsonl` | the journal of every effect the reconciler sent, as intents and outcomes |
 | `action-proposals.jsonl` | the action proposals and their `proposed`, `approved`, `declined` and `result` events. Opening re-checks every proposed record against its action's validation and `kernel.postgresImage`, then compacts it to the waiting, unexpired proposals; an unreadable, invalid or oversized file is renamed `*.bad-<ts>` and the kernel starts empty. An append that takes it past about 1 MiB compacts it too, and a stale compaction temporary file is removed at open |
+| `instance-actions.jsonl` | every `instance_start`, `instance_stop` and `instance_restart` that passed its gate: a `begin` line before anything is sent to Incus and an `end` line with what happened. Mode 0600, created on the first action |
 | `approval-nonces.jsonl` | the approval nonces that were spent |
 | `passkey-counts.jsonl` | the last sign count kept for each passkey. Mode 0600 |
 | `secrets/` | the secret files the writer reads, if any |
@@ -830,10 +918,11 @@ keys are sorted, it has no spaces, and it ends without a newline:
 {"action":"delete","expiresAt":"<ten minutes after issue>","host":"<host>","issuedAt":"<now>","nonce":"<32 hex digits>","paramsDigest":"<digest of {\"plan\":<plan>}>","target":"plan-<plan>"}
 ```
 
-An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of twelve gated service,
-database, GPU, storage or snapshot verbs: `service_create`, `service_remove`, `service_publish`, `service_unpublish`,
-`service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create` or
-`snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)). `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
+An action proposal is an inert request from a viewer (normally the canvas Doctor) to run one of fifteen gated service,
+database, GPU, storage, snapshot or instance verbs: `service_create`, `service_remove`, `service_publish`, `service_unpublish`,
+`service_connect`, `service_disconnect`, `postgres_create`, `gpu_attach`, `gpu_detach`, `storage_add`, `snapshot_create`,
+`snapshot_delete` (see [Snapshot storage and snapshots](#snapshot-storage-and-snapshots)), `instance_start`, `instance_stop` or
+`instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
 differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains.

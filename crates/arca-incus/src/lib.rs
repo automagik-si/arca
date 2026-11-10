@@ -1,7 +1,8 @@
 //! Arca's Incus access. The read client sends only GET. The journal writer changes kernel-family objects under ownership
 //! checks. The adoption writer has its separate closed migration table. The device assigner changes only one existing
 //! instance's `devices` map, only for a kernel-family instance after the owner approved an action proposal; it is not part
-//! of the desired-state journal. The snapshot writer adds snapshot pools and copies apps and data volumes into its own
+//! of the desired-state journal. The state changer starts, gracefully stops or gracefully restarts one existing kernel-family
+//! instance and writes nothing else. The snapshot writer adds snapshot pools and copies apps and data volumes into its own
 //! `arcak-snapshots` project after the owner approved it (a host folder through a short-lived copy helper container
 //! there), and writes nowhere else. The
 //! service exec module adds only closed commands, fixed file destinations and exact recording cleanup; it is called by
@@ -18,6 +19,8 @@ pub mod fake;
 pub mod fake_storage;
 #[cfg(feature = "write")]
 pub mod folder;
+#[cfg(feature = "write")]
+pub mod lifecycle;
 pub mod read;
 pub mod shim;
 #[cfg(feature = "write")]
@@ -35,6 +38,8 @@ pub use adopt::{
 pub use assign::{DeviceAssigner, GpuChange, InstanceDevices, device_name, normalize_pci};
 pub use fake::{Appears, OpId};
 pub use fake::{FakeIncus, FakeState, RecordedRequest, WriteRecord};
+#[cfg(feature = "write")]
+pub use lifecycle::{CALL_BUDGET, GRACE_SECONDS, InstanceState, StateAction, StateChanger};
 pub use read::{IncusError, IncusRead, Target, Unconfirmed, UnixIncus};
 pub use read::{
     OPERATIONS_PATH, RunningOp, SESSION_DESCRIPTIONS, TOKEN_CLASS, operation_names, running_on,

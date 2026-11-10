@@ -1298,8 +1298,15 @@ pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, Tem
                     .get("file")
                     .and_then(Value::as_str)
                     .ok_or_else(|| TemplateError::refused("entrypoint: invalid file"))?;
-                let script = std::fs::read_to_string(dir.join(file))
-                    .map_err(|_| TemplateError::refused("entrypoint: file cannot be read"))?;
+                if !script_name_ok(file) {
+                    return Err(TemplateError::refused(
+                        "entrypoint: invalid file (a plain file name in the templates directory: \
+                         letters, digits, dots, dashes and underscores, not starting with a dot)",
+                    ));
+                }
+                let path = dir.join(file);
+                let script = std::fs::read_to_string(&path)
+                    .map_err(|error| script_unreadable(&template.name, file, &error))?;
                 out.push(shell_quote(script.trim_end_matches('\n')));
             }
             _ => return Err(TemplateError::refused("entrypoint: invalid argument")),
@@ -1310,6 +1317,32 @@ pub fn entrypoint(template: &Template, dir: &Path) -> Result<Option<String>, Tem
         return Err(TemplateError::refused("entrypoint: too long"));
     }
     Ok(Some(joined))
+}
+
+/// Whether `file` is a plain file name, so an entrypoint script is read from the template directory and nowhere else.
+fn script_name_ok(file: &str) -> bool {
+    !file.is_empty()
+        && file.len() <= 128
+        && !file.starts_with('.')
+        && file
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The refusal for an entrypoint script that cannot be read: the file that was tried, relative to the state directory,
+/// and for a missing file where it belongs. A template's JSON copied in without its script is the usual cause.
+fn script_unreadable(template: &str, file: &str, error: &std::io::Error) -> TemplateError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return TemplateError::refused(format!(
+            "template {template}: its entrypoint script is not installed (templates/{file} does not exist). \
+             The script belongs beside templates/{template}.json in the state directory; for a template Arca ships, \
+             `arca templates install --config <file>` puts the template and its script there"
+        ));
+    }
+    TemplateError::refused(format!(
+        "template {template}: its entrypoint script templates/{file} cannot be read ({})",
+        error.kind()
+    ))
 }
 
 fn shell_quote(value: &str) -> String {

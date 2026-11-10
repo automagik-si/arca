@@ -18,9 +18,16 @@ use serde_json::{Value, json};
 
 use crate::config::LinkedHost;
 
-/// The longest a relayed approval or decline may take, in either direction: the linked kernel runs the action before it
-/// answers.
+/// The longest a relayed decline or any other relayed write may take, in either direction.
 const TIMEOUT: Duration = Duration::from_secs(30);
+/// The margin a relayed approval waits beyond the longest action it can run.
+const APPROVAL_MARGIN: Duration = Duration::from_secs(30);
+/// The longest a relayed approval may take: the linked kernel runs the approved action before it answers, and the door
+/// sends nothing until then. The longest such action is a graceful instance stop or restart, so the relay waits past its
+/// whole budget: a slow stop still answers through the relay, as done or as its own refusal, never as "could not be
+/// reached" while it goes on.
+const APPROVAL_TIMEOUT: Duration =
+    Duration::from_secs(arca_incus::CALL_BUDGET.as_secs() + APPROVAL_MARGIN.as_secs());
 /// The longest a listing or a status read may take. The canvas polls the list, so a linked kernel that hangs must not hold
 /// the page's own list.
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,12 +58,7 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
         "method": "tools/call",
         "params": { "name": verb, "arguments": arguments },
     });
-    let timeout = if verb == "plan_list" || verb == "arca_status" {
-        LIST_TIMEOUT
-    } else {
-        TIMEOUT
-    };
-    let (status, body) = post(host, &token, &request, timeout)?;
+    let (status, body) = post(host, &token, &request, timeout_for(verb))?;
     match status {
         200 => {}
         401 | 403 => return Err(RelayError::Token),
@@ -89,6 +91,15 @@ pub fn call(host: &LinkedHost, verb: &str, arguments: Value) -> Result<Value, Re
         .get("structuredContent")
         .cloned()
         .ok_or(RelayError::Unreachable)
+}
+
+/// How long a relayed call of `verb` waits for the linked kernel's answer.
+fn timeout_for(verb: &str) -> Duration {
+    match verb {
+        "plan_list" | "arca_status" => LIST_TIMEOUT,
+        "action_approve" => APPROVAL_TIMEOUT,
+        _ => TIMEOUT,
+    }
 }
 
 /// `O_NOFOLLOW` on Linux: the open fails on a symbolic link instead of following it.
@@ -176,4 +187,22 @@ fn post(
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or(RelayError::Unreachable)?;
     Ok((status, reply[end + 4..].to_vec()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relayed_approval_waits_past_the_longest_action_it_can_run() {
+        // An approved instance stop gives Incus 60 s and may take its whole call budget; the relay must outlast it, or the
+        // owner reads "could not be reached" while the stop goes on.
+        let approval = timeout_for("action_approve");
+        assert!(approval >= arca_incus::CALL_BUDGET + APPROVAL_MARGIN);
+        assert!(approval > Duration::from_secs(arca_incus::GRACE_SECONDS));
+        // The polled reads stay short, and a decline runs nothing.
+        assert_eq!(timeout_for("plan_list"), LIST_TIMEOUT);
+        assert_eq!(timeout_for("arca_status"), LIST_TIMEOUT);
+        assert_eq!(timeout_for("plan_decline"), TIMEOUT);
+    }
 }
