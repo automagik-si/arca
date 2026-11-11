@@ -349,6 +349,10 @@ fn this_checkout_carries_one_version_everywhere() {
 fn set_writes_the_version_into_every_field_and_touches_no_other_line() {
     let scratch = Scratch::new("set");
     copy_version_files(&scratch);
+    // The copy starts at a version of its own: this checkout carries whatever was released last, which one day is
+    // the very number this test sets.
+    assert_eq!(scratch.answer(&["set", "0.1.0"]), "version: 0.1.0");
+    assert_eq!(scratch.answer(&["check"]), "version: 0.1.0 everywhere");
     let crates = fs::read_dir(Path::new(REPO).join("crates"))
         .expect("the crates directory")
         .count();
@@ -679,12 +683,19 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
 #[test]
 fn the_release_files_carry_the_installer_and_an_installer_at_another_version_stops_the_release() {
     let scratch = Scratch::new("release-sh");
-    for script in ["scripts/release.sh", "scripts/install.sh"] {
-        scratch.write(
-            script,
-            &fs::read_to_string(Path::new(REPO).join(script)).expect("the script"),
-        );
-    }
+    scratch.write(
+        "scripts/release.sh",
+        &fs::read_to_string(Path::new(REPO).join("scripts/release.sh")).expect("the script"),
+    );
+    // The installer starts at a version that is not the release's, whatever this checkout carries.
+    let own =
+        fs::read_to_string(Path::new(REPO).join("scripts/install.sh")).expect("the installer");
+    let carried = format!("\nARCA_VERSION={}\n", env!("CARGO_PKG_VERSION"));
+    assert_eq!(own.matches(&carried).count(), 1);
+    scratch.write(
+        "scripts/install.sh",
+        &own.replacen(&carried, "\nARCA_VERSION=0.7.9\n", 1),
+    );
     scratch.write(
         "Cargo.toml",
         "[workspace]\n\n[workspace.package]\nversion = \"0.8.0\"\n",
@@ -721,10 +732,7 @@ fn the_release_files_carry_the_installer_and_an_installer_at_another_version_sto
     assert_eq!(refused.status.code(), Some(1));
     let said = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        said.contains(&format!(
-            "scripts/install.sh installs \"{}\", not 0.8.0",
-            env!("CARGO_PKG_VERSION")
-        )),
+        said.contains("scripts/install.sh installs \"0.7.9\", not 0.8.0"),
         "{said}"
     );
     assert!(!scratch.0.join("dist").exists() && !scratch.0.join("out").exists());
@@ -733,11 +741,7 @@ fn the_release_files_carry_the_installer_and_an_installer_at_another_version_sto
     // the checksums of those two in that order, and the notes.
     scratch.git(&["tag", "-d", "v0.8.0"]);
     let own = scratch.read("scripts/install.sh");
-    let installer = own.replacen(
-        &format!("\nARCA_VERSION={}\n", env!("CARGO_PKG_VERSION")),
-        "\nARCA_VERSION=0.8.0\n",
-        1,
-    );
+    let installer = own.replacen("\nARCA_VERSION=0.7.9\n", "\nARCA_VERSION=0.8.0\n", 1);
     scratch.write("scripts/install.sh", &installer);
     scratch.git(&["commit", "-q", "-am", "chore(release): v0.8.0"]);
     scratch.tag("v0.8.0");
