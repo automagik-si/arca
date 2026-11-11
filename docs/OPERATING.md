@@ -2470,73 +2470,122 @@ hardware. Inside it a small controller keeps a set of slots. Each slot registers
 one job on it in a fresh container, removes it, and starts over with a new runner. The virtual machine is the wall
 between your jobs and the machine Arca runs on: nothing outside the pool changes when a job runs.
 
+Read "Who can reach what" below before you create one. In short: every job that runs in the pool can get at the pool's
+GitHub credential, so the pool is only as closed as the list of repositories allowed to send it jobs.
+
 You need a node that may create a virtual machine of the template's size (16 CPUs, 32GiB of memory, a 200GiB disk: the
 node's `kernel.vmLimits`, or `kernel.bridged.limits`, must allow it), the shipped templates installed
-(`arca templates install`), and a GitHub organisation, or one repository, that you administer. The Arca steps are
-Arca's own verbs: ask the assistant you use with Arca to run them. `service_create` and `instance_start` can be shown
-on the approval page; `service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope
-token, and the credential passes through that assistant's conversation.
+(`arca templates install`), and a GitHub organisation that you administer. The Arca steps are Arca's own verbs: ask
+the assistant you use with Arca to run them. `service_create` and `instance_start` can be shown on the approval page;
+`service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope token, and the
+credential passes through that assistant's conversation.
 
-**1. The template for your organisation.** The settings are part of the template, so each pool has its own copy.
+**1. A runner group, on GitHub.** A runner group is GitHub's own list of the repositories that may use a set of
+runners. It is the control that decides who can send jobs to the pool; a label is not one, because any workflow in an
+allowed repository can ask for any label.
+
+- Open the organisation's "Settings", then "Actions", then "Runner groups", and select "New runner group". Give it a
+  name (for example `arca-pool`). For repository access choose selected repositories, and select only the
+  repositories whose workflows you trust to run here. Leave public repositories off, which is how GitHub starts a
+  group. Select "Create group". (GitHub offers extra runner groups from its Team plan up.)
+- Note the group's number: the pool needs it as `runnerGroupId`. It is the number at the end of the group page's
+  address in your browser. If you cannot find it, the pool tells you: a pool created with the wrong number does not
+  start, and its log (`service_logs`) lists the organisation's runner groups with their numbers.
+- Keep GitHub's approval for outside contributions on: the organisation's "Settings", "Actions", "General",
+  "Approval for running fork pull request workflows from contributors", set to "Require approval for all external
+  contributors". For private repositories leave "Run workflows from fork pull requests" off. An approval is a decision
+  to run that person's code inside your pool. GitHub runs `pull_request_target` workflows whatever this setting says.
+
+The pool refuses to start on the organisation's default runner group, which the shipped template names
+(`runnerGroupId: 1`): every repository that group admits could send its jobs to the pool. The refusal, in
+`service_logs`, lists the groups to choose from. A settings key, `allowDefaultRunnerGroup: true`, starts it there
+anyway, and every status then carries a warning. A pool for one repository has no runner group: only that
+repository's workflows reach it.
+
+**2. A credential, on GitHub.** The pool registers its runners with it. Know what each kind can do in the wrong
+hands before you choose:
+
+| Credential | The permission it needs | What whoever holds it can do |
+|------------|-------------------------|------------------------------|
+| A GitHub App on the organisation (recommended) | Organization permission "Self-hosted runners": "Read and write", and nothing else | Everything GitHub puts under that permission: register runners with any labels in any runner group, create, change and delete runner groups (one open to every repository included), and remove runners. So the holder can make a runner that receives the jobs of other repositories of the organisation, together with the secrets those jobs are given. It cannot read code or change settings by itself. |
+| A fine-grained personal access token on the organisation | The same organisation permission | The same, as you: the token is tied to your account, expires on the date GitHub shows (the pool stops registering runners that day), and carries whatever else was ticked when it was made. |
+| A pool for one repository, with either kind | Repository permission "Administration": "Read and write" | Far more than runners. GitHub has no narrower permission for a repository's runners, and this one also covers changing the repository's settings, adding and removing collaborators, changing and removing branch protection, adding deploy keys, and deleting the repository. |
+
+The narrowest is the first: an App with the one organisation permission, with the pool in a runner group of selected
+repositories. Use it. A repository-level pool looks smaller and is not: its credential can take the repository over.
+
+To make the App: select your profile picture, then "Your organizations", then "Settings" beside the organisation, then
+"Developer settings", "GitHub Apps" and "New GitHub App". Give it a name (for example `example-runner-pool`) and any
+homepage URL. Under "Webhook", deselect "Active". Under "Permissions", open "Organization permissions" and set
+"Self-hosted runners" to "Read and write"; set nothing else. Create the app. On the app's page, copy its "Client ID"
+(it begins `Iv`; the numeric App ID is not what the pool takes). In the private keys part of the page, create a key
+(GitHub's guide calls the button "New key"). A file in PEM form is downloaded: that is the private key. Treat it like
+a password. Then select "Install App" and install it on the organisation.
+
+For a token instead: your own "Settings", "Developer settings", "Personal access tokens", "Fine-grained tokens",
+"Generate new token"; resource owner the organisation; organisation permission "Self-hosted runners", "Read and
+write".
+
+**3. The template for your organisation.** The settings are part of the template, so each pool has its own copy.
 Whoever looks after the node copies `<stateDir>/templates/github-runner-pool.json` to a new name, for example
-`example-ci.json`, sets `"name"` to `example-ci`, and sets `settings.url` to your organisation
-(`https://github.com/example-org`) or to one repository (`https://github.com/example-org/example-repo`). This is the
-one step that is a file and not a verb: Arca has no verb that edits a template. The script `github-runner-pool.sh`
-stays as it is, beside it.
+`example-ci.json`, sets `"name"` to `example-ci`, sets `settings.url` to your organisation
+(`https://github.com/example-org`) and `settings.runnerGroupId` to the number from step 1. This is the one step that
+is a file and not a verb: Arca has no verb that edits a template. The script `github-runner-pool.sh` stays as it is,
+beside it.
 
 | Setting | Meaning |
 |---------|---------|
-| `url` | The organisation or the repository the runners belong to. |
-| `runnerGroupId` | The runner group the runners join. `1` is GitHub's default group. |
+| `url` | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). |
+| `runnerGroupId` | The number of the runner group the runners join (step 1). Not used for a repository. |
+| `allowDefaultRunnerGroup` | `true` lets the pool start on the organisation's default runner group. Leave it out. |
 | `classes` | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). |
 | `maxSlots` | The cap: never more than this many slots at once, whatever the classes add up to. |
 | `reserveMemory` | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | The disk the Docker layer caches and the dependency caches may use, over all slots. |
 | `runnerImage`, `dockerImage` | The runner's and the Docker daemon's public images, pinned by digest. |
+| `enterprise`, `apiUrl` | For GitHub Enterprise only. The credential is sent to the API's host, so that host is never guessed: for `github.com` it is `https://api.github.com` and no setting changes it. A `url` on another host is refused unless `enterprise` is `true`; the API is then `https://<host>/api/v3`, or `apiUrl`, which must begin `https://` and be on that host or on `api.<host>`. |
 
 The virtual machine's own size is the template's `limits` and `rootSize`. The shipped numbers fit together: four
 `standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are 16 CPUs and 24GiB, and 4GiB is kept
 back. That is 28GiB of the machine's 32GiB on purpose: a virtual machine sees a little less memory than its size, and
-a slot that does not fit whole is never started. Settings are
-read when the pool is created and are fixed from then on (see "What to know").
+a slot that does not fit whole is never started. Settings are read when the pool is created and are fixed from then
+on (see "What to know").
 
-**2. A credential, on GitHub.** A GitHub App is the better one: its key does not expire, and it can do nothing but
-manage runners.
+**4. Arca: `service_create`** with `{"name": "ci-pool", "template": "example-ci"}`. The pool is created and stays
+`stopped`, because it has no credential yet. Leave `bridge` out, so that it joins Arca's own service network (see
+"The network" below).
 
-- Select your profile picture, then "Your organizations", then "Settings" beside the organisation, then "Developer
-  settings", "GitHub Apps" and "New GitHub App". Give it a name (for example `example-runner-pool`) and any homepage
-  URL. Under "Webhook", deselect "Active". Under "Permissions", open "Organization permissions" and set "Self-hosted
-  runners" to "Read and write" (for a pool that serves one repository: "Repository permissions", "Administration",
-  "Read and write"). Create the app.
-- On the app's page, copy its "Client ID" (it begins `Iv`). In the private keys part of the page, create a key
-  (GitHub's guide calls the button "New key"). A file in PEM form is downloaded: that is the private key. Treat it
-  like a password.
-- Select "Install App" and install it on the organisation (or on the one repository).
-
-Or a fine-grained personal access token: your own "Settings", "Developer settings", "Personal access tokens",
-"Fine-grained tokens", "Generate new token"; resource owner the organisation; organisation permission "Self-hosted
-runners", "Read and write" (for one repository: repository permission "Administration", "Read and write"). A token
-expires on the date GitHub shows, and the pool stops registering runners that day.
-
-**3. Arca: `service_create`** with `{"name": "ci-pool", "template": "example-ci"}`. The pool is created and stays
-`stopped`, because it has no credential yet.
-
-**4. Arca: `service_secret_set`**, for the App twice:
+**5. Arca: `service_secret_set`**, for the App twice:
 `{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
 `{"name": "ci-pool", "key": "GITHUB_APP_PRIVATE_KEY", "value": "<the whole content of the key file>"}`. The key keeps
 its line breaks; a key pasted on one line works too. For a token, once:
 `{"name": "ci-pool", "key": "GITHUB_TOKEN", "value": "<the token>"}`. Arca answers `{"ok": true}` and no answer, list
-or log shows a value again.
+or log shows a value again. When the App's two secrets and a token are all set, the pool uses the App and says so.
 
-**5. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
+**6. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
 the answer names the secrets written into it. Its first boot installs Docker and downloads the two images, which
 takes a few minutes.
 
-**6. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below). On GitHub, the
-organisation's "Settings", "Actions", "Runners" lists runners named `ci-pool-standard-0-...` as idle.
+**7. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
+group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
+`ci-pool-<the pool's id>-standard-0-...` as idle.
 
-**7. Use it.** A job runs on the pool when its `runs-on` asks for labels that one class has all of, for example
-`runs-on: [self-hosted, linux, x64, arca]`, or `[self-hosted, linux, x64, arca-large]` for the large slot.
+**8. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
+that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
+`[self-hosted, linux, x64, arca-large]` for the large slot.
+
+### Who can reach what
+
+- **A job can reach the pool's credential.** Jobs get Docker, and the Docker daemon of a slot runs privileged inside
+  the virtual machine. A job that sets out to can leave its container, read the virtual machine's disk, and with it
+  the GitHub credential in `/etc/arca-secrets`, the other slots and their caches. The pool keeps jobs tidy and apart
+  by default; it does not defend them against each other or defend its credential against them.
+- **So the runner group is the wall.** Everyone who can get a workflow run in a repository the runner group admits
+  (by pushing a branch there, or through an approved pull request) can, in effect, hold the credential, and what the
+  credential can do is in the table of step 2. Admit only repositories where you would trust every person with write
+  access that far. That is why the pool refuses the default runner group and why public repositories stay off.
+- **Nothing beyond the virtual machine.** A job that takes over the virtual machine has the virtual machine: its own
+  disk, and the network it is on. It does not have the machine Arca runs on, Arca's other services or Arca's secrets.
 
 ### Reading the pool
 
@@ -2544,12 +2593,14 @@ Every minute the controller writes a status block to the virtual machine's conso
 returns, and one line when a job finishes:
 
 ```
-arca-runner-pool: job slot=0 class=standard labels=self-hosted,linux,x64,arca name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4 runner=ci-pool-standard-0-1a2b3c4d
-arca-runner-pool: slot 0 standard 4096MiB/2cpu busy 41s ci-pool-standard-0-5e6f7a8b job "test"
-arca-runner-pool: slot 1 standard 4096MiB/2cpu idle 12s ci-pool-standard-1-9c0d1e2f
+arca-runner-pool: job slot=0 class=standard labels=self-hosted,linux,x64,arca name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4 runner=ci-pool-1a2b3c4d-standard-0-5e6f7a8b
+arca-runner-pool: slot 0 standard 4096MiB/2cpu busy 41s ci-pool-1a2b3c4d-standard-0-9c0d1e2f job "test"
+arca-runner-pool: slot 1 standard 4096MiB/2cpu idle 12s ci-pool-1a2b3c4d-standard-1-0a1b2c3d
 arca-runner-pool: slot 4 large 8192MiB/8cpu queued (pausing 40s after a failure)
 arca-runner-pool: class standard last 412 jobs: seconds avg 130, peak memory avg 1210 MiB max 3105 MiB, cpu-seconds avg 95, cpus used avg 0.7
-arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failures=2 memory_reserved=16384MiB of 27955MiB slots_cap=5
+arca-runner-pool: recent job finished=2026-01-01T10:00:00Z slot=0 class=standard name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4
+arca-runner-pool: pool ci-pool id 1a2b3c4d for https://github.com/example-org, runner group 7 "arca-pool", selected repositories only, public repositories off
+arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failures=2 runner_updates=0 memory_reserved=16384MiB of 27955MiB slots_cap=5
 ```
 
 | In the totals | Meaning |
@@ -2558,10 +2609,15 @@ arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failure
 | `starting` | Slots registering, starting or cleaning up. |
 | `queued` | Slots the pool wants and has not started. The slot's own line says why: the cap, memory no slot has reserved, memory that is free now, a pause after a failure, or no credential. |
 | `jobs_done` | Jobs finished since the controller started, whatever their result. |
-| `failures` | Failures of the pool itself since the controller started: GitHub refused the credential or a registration, a container did not start, a runner went away before it took a job. A job that fails its own steps is a job done, with `result=Failed`. |
+| `failures` | Failures of the pool itself since the controller started: GitHub refused the credential or a registration, the runner group was refused, a container did not start, a runner went away before it took a job. A job that fails its own steps is a job done, with `result=Failed`. |
+| `runner_updates` | Runners that GitHub told to update themselves before their job (see "Pins" below). Above zero means the pool's pinned runner is behind. |
 
-The same job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with
-its finish time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name.
+The `pool` line names the runner group the pool registers in and how GitHub has it set; a group open to every
+repository, one that admits public repositories, and the default group each show as `WARNING` there. The last ten
+finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
+job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
+time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some
+twenty thousand jobs) the file is set aside as `jobs.tsv.1`, replacing the one set aside before.
 
 **Sizing runners from real numbers.** The `class` line is what the last 2000 jobs of a class used, beside the size the
 class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit;
@@ -2580,12 +2636,9 @@ CPU ceiling is generous. New sizes go into the template, and a pool created from
 - **Docker, and how far jobs are apart.** Each slot has a Docker daemon of its own, started fresh for each job. A
   job's containers, volumes and networks are removed after it; the daemon's images and build cache stay for the next
   job of that slot. Two jobs therefore never see each other's containers or share a daemon. They are not walled off
-  from each other the way two virtual machines are: the slot's daemon runs privileged, so a job that sets out to can
-  reach the virtual machine itself, and through it the other slots, their caches and the pool's GitHub credential.
-  The pool keeps one customer's jobs tidy and apart by default; it does not defend them against each other. Run only
-  workflows you trust on it (do not let pull requests from forks use these labels), and prefer the GitHub App, whose
-  only power is managing runners. One shared daemon would have reused more cache and separated jobs less; a daemon
-  without root would separate them more and refuse the jobs that need privileged containers.
+  from each other the way two virtual machines are ("Who can reach what" above). One shared daemon would have reused
+  more cache and separated jobs less; a daemon without root would separate them more and refuse the jobs that need
+  privileged containers.
 - **Caches.** Each slot keeps its Docker layer cache, a tool cache (`RUNNER_TOOL_CACHE`, which the `setup-*` actions
   fill) and a directory for anything else a workflow wants to keep (`POOL_CACHE_DIR`, `/var/cache/pool` in the job).
   They are on the virtual machine's disk and survive jobs and restarts. Each slot has an equal share of `dockerCache`
@@ -2593,23 +2646,39 @@ CPU ceiling is generous. New sizes go into the template, and a pool created from
   shared by the jobs that run in the same slot one after another, so a job can leave something there for a later one.
 - **Where the credential lives.** In Arca's private `secrets/` directory, and in the virtual machine in
   `/etc/arca-secrets`, readable by root there. It is not in Incus's config, in Arca's journals or in any log. The
-  controller makes every short-lived token from it by itself and prints none.
+  controller makes every short-lived token from it by itself and prints none. A runner's one-job registration is
+  handed to its container as a file in the virtual machine's memory, not through Docker's own record on disk.
 - **A new credential.** `service_secret_set` again, then `instance_start` again: the start restarts nothing, writes
-  the new value into the virtual machine, and the controller uses it for the next token.
+  the new value into the virtual machine, and the controller uses it for the next token. To retire a credential a job
+  may have taken, delete the App's key (or the token) on GitHub: that, not Arca, makes it worthless.
 - **Stopping and restarting.** `instance_stop` and `instance_restart` need your approval. Runners that are idle are
   taken off GitHub first; a job that is running is lost and GitHub reports it as failed. After the machine Arca runs
   on restarts, the pool starts by itself.
-- **Pins.** The virtual machine is `images:debian/13/cloud`, the public Debian 13 image with cloud-init, which is what
-  runs the first boot and grows the disk. It is named by its alias and not by a fingerprint: the public server
-  rebuilds it daily and keeps the last few builds only, so a fingerprint would stop resolving within days. Docker in
-  the virtual machine is Debian's own package. The runner is `ghcr.io/actions/actions-runner` 2.338.2 and the slot's
-  daemon is `docker` 29.9.3-dind, both by digest. GitHub stops giving jobs to a runner that is more than 63 days
-  behind the newest release unless it updates itself, which the runner does when a job arrives; a later Arca release
-  moves the pin.
+- **Pins, and what you are trusting.** The runner is `ghcr.io/actions/actions-runner` 2.338.2 and the slot's daemon is
+  `docker` 29.9.3-dind, both by digest: the bytes are fixed. The virtual machine is `images:debian/13/cloud`, the
+  public Debian 13 image with cloud-init (which runs the first boot and grows the disk), named by its alias and not by
+  a fingerprint: the public server rebuilds it daily and keeps the last few builds only, so a fingerprint would stop
+  resolving within days. For that image you trust the public image server (images.linuxcontainers.org) and its
+  build of that day, over TLS, as for every `images:` template; `service_status` shows `baseImage`, the fingerprint
+  of the build the machine was actually made from. Docker in the virtual machine is Debian's own package, from
+  Debian's signed archive.
+- **When the pinned runner gets old.** A pool keeps the runner it was created with; a later Arca release moves the
+  pin in the shipped template and does not reach a pool that exists. Once GitHub has a newer runner it tells each
+  runner to update itself before it gives it a job. The pool's runners can: each updates inside its own fresh
+  container and then takes its job. The cost is a download before every job, since every runner starts from the
+  pinned image again; the log says so once per runner and `runner_updates` counts them. A job that itself runs in a
+  container (`container:`) still gets the pinned release's bundled tools. To end this, create a second pool from a
+  template with a newer `runnerImage` (after an Arca release: `arca templates install --replace`, then copy it as in
+  step 3), check it, and remove the first.
 - **Changing a pool.** Settings, sizes and pins are read when the virtual machine is created. To change them, create a
   second pool from the changed template, check it, and remove the first: both can serve the same labels meanwhile.
 - **The network.** The pool only calls out: to GitHub, to the image registries and to Debian's mirrors. It has no port,
-  and nothing can connect to it.
+  and nothing can connect to it. Created without `bridge` it is on Arca's own service network, where a virtual machine
+  may reach the internet (over IPv4) and nothing else: not the machine Arca runs on, not your local network, not
+  Arca's other services. Created with `bridge` it sits on that host bridge's network like any machine plugged into
+  it, with no filter from Arca, and so does every job in it: a job can then reach the other hosts of that network.
+  Use the service network for a pool unless you have a reason not to. A GitHub Enterprise host or a package mirror on
+  a private address cannot be reached from the service network.
 
 ## Tenants
 
@@ -2735,24 +2804,34 @@ against a fake GitHub API (a small HTTP server in the test that checks every tok
 `docker` (`tests/runner_pool/fake-docker.sh`, which plays a runner that takes one job with the configuration it was
 started with). It needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. It covers
 registration with an App and with a token, one job per runner, replacement, admission by reserved and by free memory,
-the cap, the job records, the pause after failures, cleanup of what an earlier controller left, and that no
-credential is in any output, file or command line. `crates/arca/tests/services/vm_secrets.rs` covers the kernel's half
-against the fake Incus.
+the cap, the job records and their bound, the pause after failures, the refusal of the default runner group, a runner
+that GitHub tells to update itself, a token renewed before an old runner is removed, cleanup of exactly this pool's
+leftovers, the API host rule, and that no credential is in any output, file or command line.
+`crates/arca/tests/services/vm_secrets.rs` covers the kernel's half against the fake Incus.
 
 Not proven by these tests, because they need a real virtual machine and a real GitHub organisation:
 
 - that the virtual machine boots from `images:debian/13/cloud` on a real node, that cloud-init runs the first-boot
-  script and writes the settings, and that the guest agent takes the secret files;
+  script and writes the settings, and that the guest agent takes the secret files and answers a read of their
+  directory as Incus's source says;
+- that a virtual machine on the service network reaches GitHub, the registries and Debian's mirrors: the NIC rules
+  allow it (the same rules every container service has) and Incus adds its own for DNS and DHCP, but no pool has
+  made the calls;
 - that Debian's Docker package installs, and that the two pinned images pull and start as the script starts them: the
-  slot's privileged daemon, the runner sharing its network and socket, jobs that use `container:` and `services:`;
-- that GitHub accepts the App's token and the registration requests as the fake does, lists a runner as `offline`
-  when it is, and gives a registered runner a job;
+  slot's privileged daemon, the runner sharing its network and socket, the runner's command reading its registration
+  from the mounted file, jobs that use `container:` and `services:`;
+- that GitHub accepts the App's token and the registration requests as the fake does, answers the runner-group
+  requests in the shape the fake has, lists a runner as `offline` when it is, and gives a registered runner a job;
+- that a real runner told to update itself completes the update inside its container and then takes its job, and
+  prints the line the pool looks for: the fake plays what the runner's own source does, a replacement of its
+  directories that fails on a mount;
 - that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, and that the peak
   memory and CPU seconds read from the slice are the job's;
 - that the controller's lines reach `service_logs` through the virtual machine's console;
-- the cache bounds on a real disk, a real job's cleanup, and behaviour over days (runner self-update, token renewal
-  after an hour, a host restart);
-- the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work.
+- the cache bounds on a real disk, a real job's cleanup, and behaviour over days (token renewal after an hour, a host
+  restart);
+- the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work, and
+  that a runner group's number is at the end of its page's address.
 
 ### Service wiring
 

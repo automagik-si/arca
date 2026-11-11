@@ -244,6 +244,34 @@ fn a_vm_with_secrets_is_created_stopped_with_its_script_and_incus_never_receives
             .all(|key| !key.starts_with("environment.") && !key.starts_with("user.arca.secret"))
     );
 
+    // On the managed service network the machine may call out to the internet and to nothing else, by the rules every
+    // container service has: private ranges, IPv6, the host's own addresses and the gateway are rejected first, and
+    // the last rule allows the rest. Nothing may connect to it. (Incus adds its own rules for DNS and DHCP to the
+    // bridge.)
+    let acl = rig
+        .get("/1.0/network-acls/arcak-svc-svc-p1?project=default")
+        .expect("the machine's ACL");
+    assert_eq!(acl["ingress"], json!([]));
+    let egress = acl["egress"].as_array().expect("egress rules");
+    let last = egress.last().expect("a last rule");
+    assert_eq!(
+        (
+            last["action"].as_str(),
+            last["destination"].as_str(),
+            last["protocol"].as_str()
+        ),
+        (Some("allow"), Some(""), Some(""))
+    );
+    assert!(
+        egress[..egress.len() - 1]
+            .iter()
+            .all(|rule| rule["action"] == "reject")
+    );
+    assert_eq!(
+        instance(&rig, "p1")["devices"]["eth0"]["security.acls"],
+        "arcak-svc-svc-p1"
+    );
+
     for (key, value) in [("API_TOKEN", TOKEN), ("SIGNING_KEY", KEY)] {
         let answer = rig
             .call(

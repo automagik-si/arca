@@ -1,8 +1,10 @@
 #!/bin/bash
 # A stand-in for the docker command, for crates/arca/tests/runner_pool.rs. It keeps each container as a directory
 # under $FAKE_DOCKER_DIR, writes every call's arguments to $FAKE_DOCKER_DIR/calls.log, and plays a runner: a container
-# started from the runner image asks the fake GitHub for a job with the just-in-time configuration in its environment,
-# runs it once and exits. Nothing here is Docker.
+# started from the runner image reads its just-in-time configuration from the file mounted at /run/arca/jitconfig, asks
+# the fake GitHub for a job with it, runs the job once and exits. When GitHub tells it to update itself first it does
+# what a real runner does: it replaces its own files, which fails when its tools directory is a mount. Nothing here is
+# Docker.
 set -u
 root=$FAKE_DOCKER_DIR
 mkdir -p "$root/containers"
@@ -12,27 +14,59 @@ command=${1-}
 
 # The name, the slice and the image of a `docker run` or `docker create`: the image is the first argument that is
 # neither an option nor an option's value.
-name='' cgroup_parent='' image='' passes_jit=''
+name='' cgroup_parent='' image='' jit_file='' tools_mounted='' command_line=''
 parse_run() {
   while [ $# -gt 0 ]; do
     case $1 in
       --name) name=$2; shift 2 ;;
       --cgroup-parent) cgroup_parent=$2; shift 2 ;;
-      -e) [ "$2" = ACTIONS_RUNNER_INPUT_JITCONFIG ] && passes_jit=1; shift 2 ;;
-      --label | --network | -v) shift 2 ;;
+      -v)
+        case $2 in
+          *:/run/arca/jitconfig:ro) jit_file=${2%:/run/arca/jitconfig:ro} ;;
+          *:/home/runner/externals | *:/home/runner/externals:*) tools_mounted=1 ;;
+        esac
+        shift 2
+        ;;
+      -e | --label | --network) shift 2 ;;
       -d | --privileged) shift ;;
       -*) shift ;;
-      *) image=$1; return ;;
+      *)
+        image=$1
+        shift
+        command_line=$*
+        return
+        ;;
     esac
   done
 }
 
 play_runner() {
-  local dir=$1 jit=$2 answer job seconds result
+  local dir=$1 jit=$2 tools_mounted=$3 answer job seconds result
   echo "Connected to GitHub" >>"$dir/log"
   echo "Listening for Jobs" >>"$dir/log"
   while [ -d "$dir" ]; do
     answer=$(printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/poll" 2>/dev/null) || answer=''
+    if [ "$(printf '%s' "$answer" | jq -r '.update // empty' 2>/dev/null)" = true ]; then
+      # GitHub wants a newer runner: the runner downloads it and replaces its own bin and externals directories.
+      echo "Runner update in progress, do not shutdown runner." >>"$dir/log"
+      echo "Downloading 9.999.0 runner" >>"$dir/log"
+      sleep 0.4
+      [ -d "$dir" ] || return
+      if [ -n "$tools_mounted" ]; then
+        echo "mv: cannot move '/home/runner/externals' to '/home/runner/externals.old': Device or resource busy" >>"$dir/log"
+        echo 1 >"$dir/exit"
+        return
+      fi
+      if [ -n "${FAKE_UPDATE_FAILS:-}" ]; then
+        echo "An error occurred: the update could not be downloaded" >>"$dir/log"
+        echo 1 >"$dir/exit"
+        return
+      fi
+      echo "Runner will exit shortly for update, should be back online within 10 seconds." >>"$dir/log"
+      printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/updated" >/dev/null 2>&1
+      echo "Listening for Jobs" >>"$dir/log"
+      continue
+    fi
     job=$(printf '%s' "$answer" | jq -r '.job // empty' 2>/dev/null)
     if [ -n "$job" ]; then
       seconds=$(printf '%s' "$answer" | jq -r '.seconds')
@@ -72,8 +106,13 @@ case $command in
       printf 'usage_usec %s\nuser_usec 1\nsystem_usec 1\n' "${FAKE_CPU_USEC:-73400000}" >"$cgroup/cpu.stat"
     fi
     if [ "$command" = run ] && [ "$image" = "$FAKE_RUNNER_IMAGE" ] && [ "$name" != "${name%-run}" ]; then
-      [ -n "$passes_jit" ] || { echo "fake docker: the runner was given no configuration" >&2; exit 125; }
-      play_runner "$dir" "${ACTIONS_RUNNER_INPUT_JITCONFIG-}" </dev/null >/dev/null 2>&1 &
+      # The container's command reads the configuration from the mounted file, as the real one does.
+      case $command_line in
+        '/bin/bash -c ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/arca/jitconfig) && export ACTIONS_RUNNER_INPUT_JITCONFIG && exec /home/runner/run.sh') ;;
+        *) echo "fake docker: the runner's command does not read its configuration" >&2; exit 125 ;;
+      esac
+      [ -r "$jit_file" ] || { echo "fake docker: the runner was given no configuration file" >&2; exit 125; }
+      play_runner "$dir" "$(cat "$jit_file")" "$tools_mounted" </dev/null >/dev/null 2>&1 &
     fi
     echo "id-$name"
     ;;

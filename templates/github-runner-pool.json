@@ -1,6 +1,6 @@
 {
   "name": "github-runner-pool",
-  "description": "A pool of GitHub Actions runners in one virtual machine (Debian 13 cloud image; 16 CPUs, 32GiB, 200GiB). Each slot runs one job on a fresh just-in-time runner (actions/runner 2.338.2, by digest) with a Docker daemon of its own (docker 29.9.3-dind, by digest), then replaces it. Set settings.url to your organisation or repository in a copy of this template. It is created stopped: set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY, or GITHUB_TOKEN, with service_secret_set, then instance_start.",
+  "description": "A pool of GitHub Actions runners in one virtual machine (Debian 13 cloud image; 16 CPUs, 32GiB, 200GiB). A slot runs one job on a fresh just-in-time runner (actions/runner 2.338.2, by digest) with its own Docker daemon (docker 29.9.3-dind, by digest), then replaces it. In a copy of this template set settings.url and settings.runnerGroupId (a dedicated runner group; the default is refused). Created stopped: set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY, or GITHUB_TOKEN, then instance_start.",
   "kind": "virtual-machine",
   "image": "images:debian/13/cloud",
   "limits": { "cpu": "16", "memory": "32GiB" },

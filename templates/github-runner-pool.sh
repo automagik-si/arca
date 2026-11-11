@@ -10,16 +10,20 @@
 #   own, records what the job used, removes both and starts over with a new registration.
 #
 # What it reads:
-# - /etc/arca/settings.json: the template's `settings`, written by cloud-init at the first boot.
+# - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
 # - /etc/arca-secrets/<NAME>: the template's secrets, written by Arca at each start (service_secret_set, then
 #   instance_start). Either GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY (a GitHub App installed on the organisation
-#   or repository), or GITHUB_TOKEN (a fine-grained token). The controller mints every short-lived token itself.
+#   or repository), or GITHUB_TOKEN (a fine-grained token). When both are there the App is used. The controller mints
+#   every short-lived token itself.
 #
 # What it writes: a status block and one line per finished job on the machine's console (service_logs), the same job
-# lines in /var/log/arca-runner-pool/jobs.tsv, and the last status block in /var/log/arca-runner-pool/status.txt.
+# lines in /var/log/arca-runner-pool/jobs.tsv (bounded: one older file is kept), and the last status block in
+# /var/log/arca-runner-pool/status.txt.
 #
-# No credential is ever printed, put on a command line or written outside /run: a token reaches curl on its standard
-# input, and a runner's just-in-time configuration reaches its container through the environment.
+# No credential is ever printed or put on a command line. A token reaches curl on its standard input. A runner's
+# just-in-time configuration reaches its container as a file on /run (memory), which the container's own command
+# reads into the runner's environment: it is not in Docker's record of the container on disk. The installation token
+# and a key that had to be put back into lines are kept in /run/arca-runner-pool, which only root enters.
 #
 # Every path, pause and external program below can be replaced through the environment, which is how the test in
 # crates/arca/tests/runner_pool.rs drives the controller against a fake GitHub and a fake docker.
@@ -39,6 +43,10 @@ set -u
 : "${POOL_READY_WAIT:=60}"     # seconds a slot's Docker daemon is given to come up
 : "${POOL_BACKOFF_MAX:=300}"   # the longest pause after failures, in seconds
 : "${POOL_STOP_WAIT:=60}"      # seconds the slots are given to clean up when the controller stops
+: "${POOL_TOKEN_TTL:=3000}"    # seconds an installation token is used; GitHub's lasts 3600
+: "${POOL_REFUSE_EVERY:=300}"  # seconds between two tellings of why the pool does not start
+: "${POOL_JOBS_MAX:=4194304}"  # bytes of jobs.tsv before it is set aside as jobs.tsv.1
+: "${POOL_STATUS_JOBS:=10}"    # finished jobs repeated in each status block
 
 INSTALLED=/usr/local/sbin/arca-runner-pool
 # The runner image's own user and docker group (the image fixes both).
@@ -167,13 +175,38 @@ load_settings() {
     return 1
   fi
   if [ -n "$repo" ]; then SCOPE="/repos/$owner/$repo"; else SCOPE="/orgs/$owner"; fi
-  API_URL=${POOL_API_URL:-$(setting .apiUrl)}
-  if [ -z "$API_URL" ]; then
-    if [ "$host" = github.com ]; then API_URL=https://api.github.com; else API_URL="https://$host/api/v3"; fi
+  # The credential is sent to the API's host, so that host is never taken from a setting alone: github.com has one
+  # API, and any other host needs `enterprise` set to true and an API on that host itself.
+  local api
+  api=$(setting .apiUrl)
+  api=${api%/}
+  if [ "$host" = github.com ]; then
+    if [ -n "$api" ] && [ "$api" != https://api.github.com ]; then
+      say "settings: apiUrl: the API of github.com is https://api.github.com and nothing else; leave apiUrl out"
+      return 1
+    fi
+    API_URL=https://api.github.com
+  else
+    if [ "$(jq -r '.enterprise == true' "$POOL_SETTINGS")" != true ]; then
+      say "settings: url is on $host, not on github.com. For a GitHub Enterprise host, set enterprise to true: the pool's credential is then sent to that host"
+      return 1
+    fi
+    : "${api:=https://$host/api/v3}"
+    case $api in
+      "https://$host" | "https://$host/"* | "https://api.$host" | "https://api.$host/"*) ;;
+      *)
+        say "settings: apiUrl must begin https:// and be on $host or api.$host: the pool's credential is sent there"
+        return 1
+        ;;
+    esac
+    API_URL=$api
   fi
-  API_URL=${API_URL%/}
+  # The test's fake GitHub. Only root on the machine can set it, in the controller's own unit.
+  [ -z "${POOL_API_URL:-}" ] || API_URL=${POOL_API_URL%/}
   GROUP=$(setting .runnerGroupId)
-  : "${GROUP:=1}"
+  ALLOW_DEFAULT_GROUP=$(jq -r '.allowDefaultRunnerGroup == true' "$POOL_SETTINGS")
+  # A repository has no runner groups: its runners are registered with GitHub's fixed group number.
+  [ -z "$repo" ] || GROUP=1
   MAX_SLOTS=$(setting .maxSlots)
   RUNNER_IMAGE=$(setting .runnerImage)
   DOCKER_IMAGE=$(setting .dockerImage)
@@ -225,8 +258,20 @@ load_settings() {
   DOCKER_BUDGET=$((docker_cache / SLOTS))
   DEPENDENCY_BUDGET=$((dependency_cache / SLOTS))
   POOL_NAME=${POOL_NAME:-$(hostname 2>/dev/null)}
-  POOL_NAME=$(printf '%s' "$POOL_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-24)
+  POOL_NAME=$(printf '%s' "$POOL_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | cut -c1-20)
   : "${POOL_NAME:=pool}"
+}
+
+# This pool's own id: eight hex digits made once and kept on its disk. Every runner it registers carries it in its
+# name, so the pool recognises its own runners on GitHub and never another pool's, whatever that pool is called.
+load_pool_id() {
+  local file="$POOL_STATE/pool-id"
+  POOL_ID=$(cat "$file" 2>/dev/null)
+  case $POOL_ID in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) return 0 ;;
+  esac
+  POOL_ID=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+  printf '%s\n' "$POOL_ID" >"$file.new" && mv "$file.new" "$file"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -294,9 +339,9 @@ app_key_file() {
   printf '%s' "$out"
 }
 
-# A token for GitHub's API, in $TOKEN: the fine-grained token itself, or an installation token minted from the App's
-# key and kept in $POOL_RUN until five minutes before it ends. One slot mints at a time. When there is none,
-# $TOKEN_ERROR says why, without a credential.
+# A token for GitHub's API, in $TOKEN: an installation token minted from the App's key and kept in $POOL_RUN for
+# POOL_TOKEN_TTL seconds, or the fine-grained token itself. The App is used when its two secrets are there, whether or
+# not a token is there too. One slot mints at a time. When there is none, $TOKEN_ERROR says why, without a credential.
 github_token() {
   TOKEN=''
   TOKEN_ERROR=''
@@ -320,13 +365,13 @@ github_token() {
     tag=$(cat "$(secret_file GITHUB_APP_CLIENT_ID)" "$(secret_file GITHUB_APP_PRIVATE_KEY)" | sha256sum | cut -c1-32)
     if [ -s "$POOL_RUN/token" ]; then
       read -r held_tag held_until held_token <"$POOL_RUN/token"
-      if [ "$held_tag" = "$tag" ] && [ "$held_until" -gt $(($(now) + 300)) ] 2>/dev/null; then
+      if [ "$held_tag" = "$tag" ] && [ "$held_until" -gt "$(now)" ] 2>/dev/null; then
         printf 'ok %s' "$held_token"
         exit 0
       fi
     fi
     case $client in '' | *[!A-Za-z0-9._-]*)
-      printf 'no GITHUB_APP_CLIENT_ID is not a client ID or an App ID'
+      printf 'no GITHUB_APP_CLIENT_ID is not a client ID (the App page shows it; it begins Iv)'
       exit 0
       ;;
     esac
@@ -362,8 +407,8 @@ github_token() {
       printf 'no GitHub answered without a token'
       exit 0
     fi
-    # Installation tokens last an hour; this one is used for fifty minutes.
-    (umask 077 && printf '%s %s %s\n' "$tag" $((at + 3300)) "$token" >"$POOL_RUN/token.new") &&
+    # Installation tokens last an hour; this one is used for POOL_TOKEN_TTL seconds, fifty minutes.
+    (umask 077 && printf '%s %s %s\n' "$tag" $((at + POOL_TOKEN_TTL)) "$token" >"$POOL_RUN/token.new") &&
       mv "$POOL_RUN/token.new" "$POOL_RUN/token"
     printf 'ok %s' "$token"
   )
@@ -431,7 +476,7 @@ slot_reap() {
   docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
   # Whatever is left in the slot's slice ends with it, and its memory peak starts from nothing for the next job.
   systemctl stop "$(slot_slice "$slot")" >/dev/null 2>&1
-  rm -rf "$dir/work" "$dir/sock"
+  rm -rf "$dir/work" "$dir/sock" "$POOL_RUN/jit/$slot"
   used=$(du -sb "$dir/toolcache" "$dir/cache" 2>/dev/null | awk '{ total += $1 } END { print total + 0 }')
   if [ "${used:-0}" -gt "$DEPENDENCY_BUDGET" ]; then
     find "$dir/toolcache" "$dir/cache" -mindepth 1 -delete 2>/dev/null
@@ -444,7 +489,7 @@ slot_reap() {
 slot_cycle() {
   local slot=$1
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
-  local started busy_since='' job='' result='' peak cpu seconds finished cgroup
+  local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' 
   ABORT=''
   trap 'ABORT=1' TERM INT
   dir=$(slot_dir "$slot")
@@ -460,7 +505,7 @@ slot_cycle() {
   fi
   token=$TOKEN
   TOKEN=''
-  name="$POOL_NAME-$class-$slot-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+  name="$POOL_NAME-$POOL_ID-$class-$slot-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
   body=$(jq -nc --arg name "$name" --argjson group "$GROUP" --argjson labels "${SLOT_LABELS_JSON[$slot]}" \
     '{name: $name, runner_group_id: $group, labels: $labels, work_folder: "_work"}')
   if ! api POST "$SCOPE/actions/runners/generate-jitconfig" "$token" "$body"; then
@@ -485,12 +530,14 @@ slot_cycle() {
   if [ "$(id -u)" = 0 ]; then chown "$RUNNER_UID:$DOCKER_GID" "$dir/work" "$dir/toolcache" "$dir/cache"; fi
   set_state "$slot" starting "$name"
   docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
-  # The slot's own Docker daemon. Its data directory is the slot's layer cache.
+  # The slot's own Docker daemon. Its data directory is the slot's layer cache. It has a read-only copy of the
+  # runner's bundled tools at the runner's own path, because a job that runs in a container has them mounted from
+  # there by this daemon.
   if ! docker run -d --name "$daemon" --label "arca.pool=$POOL_NAME" --privileged --cgroup-parent "$slice" \
     -v "$dir/sock:/var/run" -v "$dir/work:/home/runner/_work" -v "$EXTERNALS:/home/runner/externals:ro" \
     -v "$dir/toolcache:/opt/hostedtoolcache" -v "$dir/docker:/var/lib/docker" \
     "$DOCKER_IMAGE" dockerd --host=unix:///var/run/docker.sock --group="$DOCKER_GID" >/dev/null 2>&1; then
-    slot_abandon "$slot" "$token" "$runner_id"
+    slot_abandon "$slot" "$runner_id"
     slot_failed "$slot" "the slot's Docker daemon could not be started"
     return 0
   fi
@@ -498,26 +545,36 @@ slot_cycle() {
   until docker exec "$daemon" docker info >/dev/null 2>&1; do
     tries=$((tries + 1))
     if [ -n "$ABORT" ] || [ "$tries" -gt "$POOL_READY_WAIT" ]; then
-      slot_abandon "$slot" "$token" "$runner_id"
+      slot_abandon "$slot" "$runner_id"
       [ -n "$ABORT" ] || slot_failed "$slot" "the slot's Docker daemon did not come up within $POOL_READY_WAIT seconds"
       return 0
     fi
     nap 1
   done
   # The runner: a fresh container from the pinned image, sharing the daemon's network so a job's service containers
-  # answer on localhost. The just-in-time configuration is in its environment only.
-  if ! ACTIONS_RUNNER_INPUT_JITCONFIG=$jit docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
+  # answer on localhost. Its own files, the bundled tools among them, are the image's and are writable and not a mount,
+  # so the runner can replace them when GitHub tells it to update itself. Its just-in-time configuration is a file on
+  # /run that the container's command reads into the runner's environment: Docker's record of the container holds the
+  # path, never the configuration.
+  mkdir -p "$POOL_RUN/jit"
+  chmod 700 "$POOL_RUN/jit"
+  (umask 077 && printf '%s' "$jit" >"$POOL_RUN/jit/$slot")
+  chmod 400 "$POOL_RUN/jit/$slot"
+  if [ "$(id -u)" = 0 ]; then chown "$RUNNER_UID:$DOCKER_GID" "$POOL_RUN/jit/$slot"; fi
+  jit=''
+  # shellcheck disable=SC2016
+  if ! docker run -d --name "$runner" --label "arca.pool=$POOL_NAME" \
     --cgroup-parent "$slice" --network "container:$daemon" \
-    -e ACTIONS_RUNNER_INPUT_JITCONFIG -e DOCKER_HOST=unix:///var/run/docker.sock \
+    -e DOCKER_HOST=unix:///var/run/docker.sock \
     -e RUNNER_TOOL_CACHE=/opt/hostedtoolcache -e POOL_CACHE_DIR=/var/cache/pool \
-    -v "$dir/sock:/var/run" -v "$dir/work:/home/runner/_work" -v "$EXTERNALS:/home/runner/externals:ro" \
+    -v "$POOL_RUN/jit/$slot:/run/arca/jitconfig:ro" \
+    -v "$dir/sock:/var/run" -v "$dir/work:/home/runner/_work" \
     -v "$dir/toolcache:/opt/hostedtoolcache" -v "$dir/cache:/var/cache/pool" \
-    "$RUNNER_IMAGE" /home/runner/run.sh >/dev/null 2>&1; then
-    slot_abandon "$slot" "$token" "$runner_id"
+    "$RUNNER_IMAGE" /bin/bash -c 'ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat /run/arca/jitconfig) && export ACTIONS_RUNNER_INPUT_JITCONFIG && exec /home/runner/run.sh' >/dev/null 2>&1; then
+    slot_abandon "$slot" "$runner_id"
     slot_failed "$slot" "the runner container could not be started"
     return 0
   fi
-  jit=''
   started=$(now)
   set_state "$slot" idle "$name"
 
@@ -530,14 +587,23 @@ slot_cycle() {
       job=$(plain "$(docker logs "$runner" 2>&1 | sed -n 's/.*Running job: //p' | head -n1)")
       set_state "$slot" busy "$name ${job:+job \"$job\"}"
     fi
+    # GitHub tells a runner older than its newest release to update itself before it takes a job. It does so inside
+    # its own container; the pool says it once per runner, because every fresh runner will until the pin moves.
+    if [ -z "$updating" ] && [ -z "$busy_since" ] && docker logs "$runner" 2>&1 | grep -q 'Runner update in progress'; then
+      updating=1
+      printf x >>"$POOL_RUN/updates"
+      set_state "$slot" updating "$name"
+      say "slot $slot: GitHub told this runner to update itself, because the pool's pinned runner is older than GitHub's newest. It updates inside its own container and then takes its job; every new runner of this pool does the same, at the cost of a download each, until a pool is created with a newer runnerImage"
+    fi
     nap "$POOL_POLL"
   done
 
   if [ -n "$ABORT" ]; then
     # The controller is stopping. A runner that has no job is taken off GitHub; one with a job is lost with it.
-    [ -n "$busy_since" ] || slot_abandon "$slot" "$token" "$runner_id"
+    [ -n "$busy_since" ] || slot_abandon "$slot" "$runner_id"
     docker rm -fv "$runner" "$daemon" >/dev/null 2>&1
     systemctl stop "$slice" >/dev/null 2>&1
+    rm -f "$POOL_RUN/jit/$slot"
     return 0
   fi
 
@@ -562,20 +628,28 @@ slot_cycle() {
     slot_reap "$slot"
   else
     slot_reap "$slot"
-    slot_abandon "$slot" "$token" "$runner_id"
-    slot_failed "$slot" "its runner stopped (exit $code) before it took a job"
+    slot_abandon "$slot" "$runner_id"
+    if [ -n "$updating" ]; then
+      slot_failed "$slot" "its runner stopped (exit $code) while it was updating itself, before it took a job"
+    else
+      slot_failed "$slot" "its runner stopped (exit $code) before it took a job"
+    fi
   fi
   return 0
 }
 
-# Takes a runner that will never run off GitHub, so no dead registration is left. Best effort: GitHub removes an
-# offline ephemeral runner by itself after a day.
+# Takes a runner that will never run off GitHub, so no dead registration is left. The token is asked for here and not
+# kept from the slot's start: an idle runner can be older than the token it was registered with. Best effort: GitHub
+# removes an offline ephemeral runner by itself after a day.
 slot_abandon() {
-  local slot=$1 token=$2 runner_id=$3
+  local slot=$1 runner_id=$2
   docker rm -fv "$POOL_NAME-s$slot-run" "$POOL_NAME-s$slot-dind" >/dev/null 2>&1
   systemctl stop "$(slot_slice "$slot")" >/dev/null 2>&1
+  rm -f "$POOL_RUN/jit/$slot"
   case $runner_id in '' | *[!0-9]*) return 0 ;; esac
-  api DELETE "$SCOPE/actions/runners/$runner_id" "$token" || true
+  github_token || return 0
+  api DELETE "$SCOPE/actions/runners/$runner_id" "$TOKEN" || true
+  TOKEN=''
   rm -f "$API_OUT"
 }
 
@@ -640,14 +714,16 @@ clean_containers() {
   systemctl stop 'arcapool-s*.slice' >/dev/null 2>&1
 }
 
-# The runners an earlier controller of this pool left on GitHub: those with this pool's name that GitHub lists as
-# offline. It runs before any slot starts, so no runner of this controller is among them.
+# The runners an earlier controller of this pool left on GitHub: those GitHub lists as offline whose whole name is one
+# this pool gives (its name, its own id, a class, a slot and eight hex digits). A runner of another pool is never
+# matched, also when that pool's name begins with this one's. It runs before any slot starts, so no runner of this
+# controller is among them.
 clean_runners() {
   local token=$1 page id listed stale
   for page in 1 2 3 4 5 6 7 8 9 10; do
     api GET "$SCOPE/actions/runners?per_page=100&page=$page" "$token" || break
     listed=$(jq -r '.runners // [] | length' "$API_OUT")
-    stale=$(jq -r --arg prefix "$POOL_NAME-" '.runners // [] | .[] | select((.name // "") | startswith($prefix)) | select(.status == "offline") | .id' "$API_OUT")
+    stale=$(jq -r --arg own "^$POOL_NAME-$POOL_ID-[a-z0-9]+-[0-9]+-[0-9a-f]{8}\$" '.runners // [] | .[] | select((.name // "") | test($own)) | select(.status == "offline") | .id' "$API_OUT")
     for id in $stale; do
       case $id in *[!0-9]*) continue ;; esac
       api DELETE "$SCOPE/actions/runners/$id" "$token" || true
@@ -655,6 +731,74 @@ clean_runners() {
     [ "$listed" = 100 ] || break
   done
   rm -f "$API_OUT"
+}
+
+# The organisation's runner groups, as words for a refusal: each with its id.
+runner_groups() {
+  local token=$1
+  api GET "$SCOPE/actions/runner-groups?per_page=100" "$token" || return 1
+  jq -r '[.runner_groups // [] | .[] | "\(.id) \"\(.name // "" | gsub("[^A-Za-z0-9 ._-]"; "?"))\"" + (if .default then " (the default group)" else "" end)] | join(", ")' "$API_OUT"
+}
+
+# Whether the pool may register runners in its runner group. An organisation's default group is refused unless the
+# settings say allowDefaultRunnerGroup: every repository that group admits could send its jobs here, and a job here can
+# reach the pool's credential. Returns 0 to go on, 1 for a refusal that only another pool (other settings) ends, and 2
+# when GitHub could not be asked. $GROUP_WORDS says what was found.
+check_runner_group() {
+  local token=$1 name default visibility public groups
+  GROUP_WORDS=''
+  GROUP_NOTE=''
+  case $SCOPE in /repos/*)
+    GROUP_NOTE='one repository (a repository has no runner groups)'
+    return 0
+    ;;
+  esac
+  case $GROUP in '' | *[!0-9]*)
+    groups=$(runner_groups "$token") || groups='(they could not be listed)'
+    GROUP_WORDS="settings: runnerGroupId is not set. Create a runner group for this pool on GitHub, limited to selected repositories and with public repositories off, and create the pool with its id as runnerGroupId. The organisation's runner groups are: $groups"
+    return 1
+    ;;
+  esac
+  if ! api GET "$SCOPE/actions/runner-groups/$GROUP" "$token"; then
+    if [ "$API_CODE" != 404 ]; then
+      GROUP_WORDS="the runner group $GROUP could not be read: $API_ERROR"
+      return 2
+    fi
+    groups=$(runner_groups "$token") || groups='(they could not be listed)'
+    GROUP_WORDS="settings: runnerGroupId $GROUP is not a runner group of $URL. Its runner groups are: $groups"
+    return 1
+  fi
+  name=$(jq -r '.name // "" | gsub("[^A-Za-z0-9 ._-]"; "?")' "$API_OUT")
+  default=$(jq -r '.default == true' "$API_OUT")
+  visibility=$(jq -r '.visibility // "unknown" | gsub("[^a-z]"; "?")' "$API_OUT")
+  public=$(jq -r '.allows_public_repositories == true' "$API_OUT")
+  if [ "$default" = true ] && [ "$ALLOW_DEFAULT_GROUP" != true ]; then
+    groups=$(runner_groups "$token") || groups='(they could not be listed)'
+    GROUP_WORDS="the pool does not start on the organisation's default runner group ($GROUP \"$name\"): every repository that group admits could send its jobs here, and a job here can reach the pool's GitHub credential. Create a runner group for this pool, limited to selected repositories and with public repositories off, and create the pool with its id as runnerGroupId. The organisation's runner groups are: $groups"
+    return 1
+  fi
+  GROUP_NOTE="runner group $GROUP \"$name\""
+  case $visibility in
+    selected) GROUP_NOTE="$GROUP_NOTE, selected repositories only" ;;
+    *) GROUP_NOTE="$GROUP_NOTE, WARNING: open to every repository of the organisation ($visibility)" ;;
+  esac
+  if [ "$public" = true ]; then
+    GROUP_NOTE="$GROUP_NOTE, WARNING: public repositories admitted, so a pull request from anyone can run code in this pool"
+  else
+    GROUP_NOTE="$GROUP_NOTE, public repositories off"
+  fi
+  [ "$default" != true ] || GROUP_NOTE="$GROUP_NOTE, WARNING: the default group, allowed by allowDefaultRunnerGroup"
+  return 0
+}
+
+# Sets jobs.tsv aside as jobs.tsv.1, replacing the one set aside before, once it passes POOL_JOBS_MAX. The header is
+# appended to the new file, never written over it: a slot may have put a job's line there in between.
+rotate_jobs() {
+  local size
+  size=$(stat -c %s "$POOL_LOGS/jobs.tsv" 2>/dev/null || echo 0)
+  [ "$size" -gt "$POOL_JOBS_MAX" ] || return 0
+  mv "$POOL_LOGS/jobs.tsv" "$POOL_LOGS/jobs.tsv.1"
+  printf '%s\n' "$JOBS_HEADER" >>"$POOL_LOGS/jobs.tsv"
 }
 
 count_of() { stat -c %s "$POOL_RUN/$1" 2>/dev/null || echo 0; }
@@ -674,7 +818,7 @@ print_status() {
         reserved=$((reserved + SLOT_MEM[slot]))
         case $phase in
           busy) busy=$((busy + 1)) ;;
-          idle) idle=$((idle + 1)) ;;
+          idle | updating) idle=$((idle + 1)) ;;
           *) starting=$((starting + 1)) ;;
         esac
         line="$phase $((at - since))s${words:+ $words}"
@@ -686,11 +830,15 @@ print_status() {
     done
     # What the last jobs of each class used, beside the class's size: the numbers to tune the sizes from.
     for class in "${CLASS_NAMES[@]}"; do
-      tail -n 2000 "$POOL_LOGS/jobs.tsv" 2>/dev/null | awk -F'\t' -v class="$class" '
+      cat "$POOL_LOGS/jobs.tsv.1" "$POOL_LOGS/jobs.tsv" 2>/dev/null | tail -n 2000 | awk -F'\t' -v class="$class" '
         $3 == class { n++; s += $7; if ($8 > peak) peak = $8; mem += $8; cpu += $9 }
         END { if (n) printf "arca-runner-pool: class %s last %d jobs: seconds avg %d, peak memory avg %d MiB max %d MiB, cpu-seconds avg %d, cpus used avg %.1f\n", class, n, s / n, mem / n / 1048576, peak / 1048576, cpu / n, (s ? cpu / s : 0) }'
     done
-    say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
+    # The last finished jobs again, so they stay within reach of service_logs however many status blocks follow.
+    tail -n "$POOL_STATUS_JOBS" "$POOL_LOGS/jobs.tsv" 2>/dev/null | awk -F'\t' '
+      $1 != "finished" { printf "arca-runner-pool: recent job finished=%s slot=%s class=%s name=\"%s\" result=%s seconds=%s peak_memory_mib=%d cpu_seconds=%s\n", $1, $2, $3, $5, $6, $7, $8 / 1048576, $9 }'
+    say "pool $POOL_NAME id $POOL_ID for $URL, $GROUP_NOTE"
+    say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
   } | tee "$POOL_LOGS/status.txt.new"
   mv "$POOL_LOGS/status.txt.new" "$POOL_LOGS/status.txt"
 }
@@ -699,20 +847,23 @@ run_pool() {
   STOP=''
   trap 'STOP=1' TERM INT
   load_settings || {
-    say "the pool does not start until its settings are right: they are the template's settings, fixed when the machine was created"
+    say "the pool does not start until its settings are right: they were fixed when the machine was created, so create the pool again with the right ones"
     # Stay up, so the reason stays on the console instead of a restart loop.
     while [ -z "$STOP" ]; do nap 300; done
     return 1
   }
-  mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp"
-  chmod 700 "$POOL_RUN" "$POOL_RUN/tmp"
-  rm -f "$POOL_RUN"/slots/* "$POOL_RUN/jobs" "$POOL_RUN/failures" "$POOL_RUN/backoff" "$POOL_RUN/backoff-until" "$POOL_RUN"/tmp/*
-  [ -s "$POOL_LOGS/jobs.tsv" ] ||
-    printf 'finished\tslot\tclass\tlabels\tjob\tresult\tseconds\tpeak_memory_bytes\tcpu_seconds\trunner\n' >"$POOL_LOGS/jobs.tsv"
+  mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp" "$POOL_RUN/jit"
+  chmod 700 "$POOL_RUN" "$POOL_RUN/tmp" "$POOL_RUN/jit"
+  rm -f "$POOL_RUN"/slots/* "$POOL_RUN"/jit/* "$POOL_RUN/jobs" "$POOL_RUN/failures" "$POOL_RUN/updates" "$POOL_RUN/backoff" "$POOL_RUN/backoff-until" "$POOL_RUN"/tmp/*
+  load_pool_id
+  JOBS_HEADER=$(printf 'finished\tslot\tclass\tlabels\tjob\tresult\tseconds\tpeak_memory_bytes\tcpu_seconds\trunner')
+  [ -s "$POOL_LOGS/jobs.tsv" ] || printf '%s\n' "$JOBS_HEADER" >"$POOL_LOGS/jobs.tsv"
   local total
   total=$(meminfo_bytes MemTotal)
   BUDGET=$((${total:-0} - RESERVE))
-  say "pool $POOL_NAME for $URL: $SLOTS slots in ${#CLASS_NAMES[@]} classes, at most $MAX_SLOTS at once, $(mib "$BUDGET") MiB of memory for slots"
+  GROUP_NOTE=''
+  GROUP_WORDS=''
+  say "pool $POOL_NAME id $POOL_ID for $URL: $SLOTS slots in ${#CLASS_NAMES[@]} classes, at most $MAX_SLOTS at once, $(mib "$BUDGET") MiB of memory for slots"
   write_slices
 
   local waited=0
@@ -724,6 +875,9 @@ run_pool() {
     waited=$((waited + 5))
   done
   [ -z "$STOP" ] || return 0
+  if [ "$(credential_kind)" = app ] && [ -s "$(secret_file GITHUB_TOKEN)" ]; then
+    say "signing in as the GitHub App: GITHUB_TOKEN is set too and is not used"
+  fi
   until prepare_images; do
     [ -z "$STOP" ] || return 0
     nap 30
@@ -740,6 +894,24 @@ run_pool() {
     nap "$pause"
   done
   [ -z "$STOP" ] || return 0
+  # Nor before its runner group is one a pool may use. A refusal is told again every POOL_REFUSE_EVERY seconds, so it
+  # stays on the console; only a pool created with other settings ends it.
+  local verdict
+  while :; do
+    github_token || {
+      nap "$POOL_BACKOFF_MAX"
+      [ -z "$STOP" ] || return 0
+      continue
+    }
+    check_runner_group "$TOKEN"
+    verdict=$?
+    [ "$verdict" != 0 ] || break
+    printf x >>"$POOL_RUN/failures"
+    say "$GROUP_WORDS"
+    if [ "$verdict" = 1 ]; then nap "$POOL_REFUSE_EVERY"; else nap "$POOL_BACKOFF_MAX"; fi
+    [ -z "$STOP" ] || return 0
+  done
+  say "registering runners in $GROUP_NOTE"
   clean_runners "$TOKEN"
   TOKEN=''
 
@@ -793,6 +965,7 @@ run_pool() {
       fi
     done
     if [ $((at - last_status)) -ge "$POOL_STATUS_EVERY" ]; then
+      rotate_jobs
       print_status
       last_status=$at
     fi
