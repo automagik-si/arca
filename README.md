@@ -4,9 +4,9 @@ Automagik Arca is a Rust kernel for a node's own infrastructure. The kernel read
 applies a change only after the node's owner has approved it and the change is written to a journal. Each node signs its
 own desired state with its own key. It talks to Incus over the local unix socket. The program is one binary, `arca`.
 
-**Status: an alpha for single hosts.** Hardening for shared or distributed hosts comes later. The newest release is
-on the [releases page](https://github.com/automagik-si/arca/releases/latest), and [`CHANGELOG.md`](CHANGELOG.md) says
-what changed in each one.
+**Status: an alpha for single hosts.** Hardening for shared or distributed hosts comes later. Every release is on the
+[releases page](https://github.com/automagik-si/arca/releases), and [`CHANGELOG.md`](CHANGELOG.md) says what changed
+in each one.
 
 ## Quickstart: a read-only node in five minutes
 
@@ -26,7 +26,9 @@ install -D -m 0755 "arca-$v-linux-x86_64" ~/.local/bin/arca
 arca --version
 ```
 
-The first two lines ask GitHub which release is the newest. `sha256sum` must answer
+The first two lines ask GitHub which release is the newest. GitHub answers only with a release that is not a
+pre-release: until the first such release (`0.8.0`) is out, they find nothing and say so, and you set `v` yourself to
+a version from the releases page, for example `v=0.1.0-alpha.7`. `sha256sum` must answer
 `arca-<version>-linux-x86_64: OK`. `arca --version` prints
 `Automagik Arca <version> (<commit>, x86_64-unknown-linux-gnu)`; if the shell does not find `arca`, put
 `~/.local/bin` on your `PATH`.
@@ -182,10 +184,17 @@ ships has changed:
    `0.N.(P+1)`. A change to documents, tests or the workflows alone releases nothing. The lists are at the top of
    `scripts/version.sh`.
 3. It writes the version into the manifests and the lock files, writes that version's section of `CHANGELOG.md`,
-   commits both as `chore(release): v<version>` and tags the commit `v<version>`.
-4. It builds the release files at the tag with `scripts/release.sh`, pushes `dev` and the tag together, and publishes
-   the GitHub release with `arca-<version>-linux-x86_64` and `SHA256SUMS`.
+   commits both as `chore(release): v<version>`, tags the commit `v<version>`, and builds the release files at the
+   tag with `scripts/release.sh`.
+4. A second job pushes `dev` and the tag together and publishes the GitHub release with
+   `arca-<version>-linux-x86_64` and `SHA256SUMS`.
 5. `main` moves to the release commit. `main` holds released commits and nothing else.
+
+Steps 1 to 3 run the repository's code and its dependencies' (build scripts, tests, a package's install), so their
+job may only read: it holds no token that can write. It hands the release commit, its tag and the files to the second
+job, which holds the token that can write and runs none of that code. Before it pushes, the second job checks that it
+was handed exactly one commit on top of `dev`, named as a release commit and touching only the files that state the
+version, with the tag on it, and that the binary matches `SHA256SUMS`.
 
 If any step before the push fails, no version is taken. If the push landed and the publishing failed, the next run
 publishes that same tag before it does anything else; start one by hand with `gh workflow run release.yml --ref dev`.

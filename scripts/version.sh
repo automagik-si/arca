@@ -41,6 +41,9 @@ INERT=(
     '^\.gitignore$'
     '^crates/[^/]+/tests/'
     '^packages/[^/]+/test/'
+    # A script only the workflows call. scripts/release.sh and scripts/version.sh are not among them: a person runs
+    # them too, and they are in the patch list below.
+    '^scripts/ci-[^/]+$'
 )
 # A change under one of these ships, but the binary is not built from it: a patch. scripts/build-portable.sh is not
 # here, because its flags change the binary.
@@ -227,12 +230,17 @@ kind() {
 # One line per change since a tag: the subjects on dev's own line (a merge counts once, by its subject), without the
 # release commits and the commits that ship nothing by their own word (ci, docs, test), and without the "merge: " word
 # and the review note a merge subject ends with.
+#
+# A subject is text someone else wrote, and it goes into CHANGELOG.md and the release notes. It is never run or
+# expanded. Its control characters are removed (a bare carriage return would be shown as a line break, and what
+# follows it as a line of its own), and a leading "#" is escaped, so no subject can stand as a heading.
 subjects() {
     local range="HEAD"
     [ -z "${1-}" ] || range="$1..HEAD"
     git -C "$root" log --first-parent --format=%s "$range" |
+        LC_ALL=C tr -d '\000-\011\013-\037\177' |
         grep -vE '^(chore\(release\)|ci|docs|test)(\([^)]*\))?!?: ' |
-        sed -E 's/^merge: //; s/ \(([^()]*)?review[^()]*\)$//' || true
+        sed -E 's/^merge: //; s/ \(([^()]*)?review[^()]*\)$//; s/^[[:space:]]+//; s/^#/\\#/' || true
 }
 
 # Stdin without its HTML comments (a comment starts a line with "<!--" and ends a line with "-->"), and without the

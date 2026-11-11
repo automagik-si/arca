@@ -7,24 +7,33 @@ name: Release
 # is not built from it; nothing is cut when everything that changed is inert (documents, tests, these workflows).
 # The lists are in scripts/version.sh and nowhere else.
 #
-# The cut, in order:
-#   1. the gates: cargo fmt, clippy and the tests, and the canvas package's tests;
-#   2. the version is written where the tree states it, with its section of CHANGELOG.md, and committed as
-#      `chore(release): v<version>` with the tag `v<version>`;
-#   3. scripts/release.sh builds the release files at that tag, the only way they are built;
-#   4. dev and the tag are pushed together, in one atomic push;
-#   5. the GitHub release `v<version>` is published with
-#        arca-<version>-linux-x86_64   the portable binary (glibc 2.34 or newer)
-#        SHA256SUMS                    its checksum
-#      and that version's CHANGELOG.md section as the notes;
-#   6. main moves to the release commit (the job below). main holds released commits and nothing else.
+# Three jobs, and the line between the first two is the point of the design:
 #
-# Nothing is taken when a step before the push fails: no version, no tag. When dev moved while a run was cutting, its
-# push lands neither the commit nor the tag, the run ends cleanly, and the run for the newer push releases those
-# changes too. Cuts queue one at a time.
+#   cut      reads, and may write nothing. It runs everything that is the repository's or a dependency's code: the
+#            gates (cargo fmt, clippy, the tests, the canvas package's tests), scripts/version.sh, which writes the
+#            version and its CHANGELOG.md section, and scripts/release.sh, which builds the release files. It commits
+#            the version as `chore(release): v<version>`, tags it, and hands over a git bundle (that one commit and
+#            its tag) and the files. Its token is read-only and no step but the one that lists the releases sees it.
+#   publish  may write, and runs no code of the repository and none of its scripts: git, gh and sha256sum from the
+#            runner's image, on the lines written in this file. It checks what was handed over (the bundle is exactly
+#            one commit on top of dev, named as a release commit, touching only the files that state the version;
+#            the tag points at it; SHA256SUMS matches the binary), pushes dev and the tag in one atomic push, and
+#            publishes the GitHub release `v<version>` with
+#              arca-<version>-linux-x86_64   the portable binary (glibc 2.34 or newer)
+#              SHA256SUMS                    its checksum
+#            and that version's CHANGELOG.md section as the notes.
+#   main     moves main to the release commit. main holds released commits and nothing else.
 #
-# When the push landed but the publishing failed, the tag has no release. The next run, by a push or by hand, sees
-# that first: it builds that tag again and publishes it, and takes no new version. Run it again for what came after.
+# So a dependency that turns hostile in a build script, a test or an install script finds no token that can push to
+# dev or touch a published release.
+#
+# Nothing is taken when anything before the push fails: no version, no tag. When dev moved while a run was cutting,
+# neither the commit nor the tag lands, the run ends cleanly, and the run for the newer push releases those changes
+# too. Runs queue one at a time, across all three jobs, and a run that has started is never cancelled.
+#
+# When the push landed but the publishing failed, the tag has no release (a draft does not count as one). The next
+# run, by a push or by hand, sees that first: it builds that tag again and publishes it, and takes no new version.
+# Run it again for what came after.
 #
 # The workflow's own push starts no run: GitHub starts none for a push made with the workflow token. So the release
 # commit has no CI run of its own. What covers it is this cut's own gate, which ran on its parent; the commit adds
@@ -53,37 +62,41 @@ on:
 
 permissions: {}
 
+# One run at a time, all its jobs together: the next run starts only after this one's publishing and main are done.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   cut:
-    name: Cut v<version> on dev
+    name: Cut v<version>
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    concurrency:
-      group: release-cut
-      cancel-in-progress: false
     permissions:
-      contents: write
+      contents: read
     outputs:
-      version: ${{ steps.publish.outputs.version }}
-      sha: ${{ steps.publish.outputs.sha }}
-    env:
-      GH_TOKEN: ${{ github.token }}
-      PRERELEASE: ${{ inputs.prerelease }}
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.cut.outputs.version || steps.plan.outputs.version }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: dev
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
       - name: What this run does
         id: plan
+        env:
+          # Read-only: this job's token may read contents and nothing more. No other step of the job sees it.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           last=$(scripts/version.sh last)
-          # A tag whose release was never published comes first: this run finishes it and cuts nothing new.
-          # The list must be read: an error here stops the run rather than guess.
-          published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '.[].tagName')
+          # A tag whose release was never published comes first: this run finishes it and cuts nothing new. A draft
+          # is not a published release. The list must be read: an error here stops the run rather than guess.
+          published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft | not) | .tagName')
           if [[ -n "${last}" ]] && ! grep -qxF -- "${last}" <<< "${published}"; then
             echo "::notice::${last} was tagged and never published: this run publishes it and cuts nothing new"
             { echo "mode=finish"; echo "version=${last#v}"; } >> "$GITHUB_OUTPUT"
@@ -127,7 +140,7 @@ jobs:
           cargo clippy --workspace -- -D warnings
           cargo test --workspace
 
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: steps.plan.outputs.mode == 'cut'
         with:
           node-version: 24.11.0
@@ -171,24 +184,149 @@ jobs:
           VERSION: ${{ steps.plan.outputs.version }}
         run: git checkout -q --detach "v${VERSION}"
 
-      # At the tag, from a clean tree, before anything is pushed: a build that fails takes no version.
+      # At the tag, from a clean tree: scripts/release.sh is the one way the files are built.
       - name: Build the release files
         if: steps.plan.outputs.mode != 'none'
         run: scripts/release.sh
 
+      # What the publishing job gets: the three files, and for a new cut the release commit and its tag as a bundle.
+      - name: Hand over
+        if: steps.plan.outputs.mode != 'none'
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          VERSION: ${{ steps.cut.outputs.version || steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir handover
+          cp "dist/arca-${VERSION}-linux-x86_64" dist/SHA256SUMS dist/RELEASE-NOTES.md handover/
+          if [[ "${MODE}" == "cut" ]]; then
+            git bundle create -q handover/release.bundle "refs/tags/v${VERSION}" "^HEAD~1"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.plan.outputs.mode != 'none'
+        with:
+          name: release
+          path: handover/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Push and publish v<version>
+    needs: cut
+    if: needs.cut.outputs.mode == 'cut' || needs.cut.outputs.mode == 'finish'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      sha: ${{ steps.publish.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MODE: ${{ needs.cut.outputs.mode }}
+      VERSION: ${{ needs.cut.outputs.version }}
+      PRERELEASE: ${{ inputs.prerelease }}
+      HANDOVER: ${{ runner.temp }}/release
+    # This job holds the token that can write. It runs nothing from the repository: no script of it, no build, no
+    # test, no package's install. Only git, gh and sha256sum, on the lines below.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      # Everything handed over was made beside code this job does not trust. It is read as data and checked.
+      - name: Check what was handed over
+        id: check
+        run: |
+          set -euo pipefail
+          stop() { echo "::error::$*"; exit 1; }
+          [[ "${VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || stop "not a version: ${VERSION}"
+          [[ "${MODE}" == "cut" || "${MODE}" == "finish" ]] || stop "not a mode: ${MODE}"
+          tag="v${VERSION}"
+          asset="arca-${VERSION}-linux-x86_64"
+
+          # Exactly the files expected, each a plain file, and nothing else.
+          expected=$'./RELEASE-NOTES.md\n./SHA256SUMS\n'"./${asset}"
+          [[ "${MODE}" != "cut" ]] || expected+=$'\n./release.bundle'
+          found=$(cd "${HANDOVER}" && find . -mindepth 1 | LC_ALL=C sort)
+          [[ "${found}" == "$(LC_ALL=C sort <<< "${expected}")" ]] || stop "the handed-over files are not the expected ones: ${found//$'\n'/ }"
+          while IFS= read -r file; do
+            [[ -f "${HANDOVER}/${file}" && ! -L "${HANDOVER}/${file}" ]] || stop "${file} is not a plain file"
+          done <<< "${expected}"
+
+          # SHA256SUMS names the binary alone, and the binary is the one it names.
+          [[ "$(wc -l < "${HANDOVER}/SHA256SUMS")" == 1 ]] || stop "SHA256SUMS does not hold exactly one line"
+          read -r sum name < "${HANDOVER}/SHA256SUMS"
+          [[ "${sum}" =~ ^[0-9a-f]{64}$ && "${name}" == "${asset}" ]] || stop "SHA256SUMS does not name ${asset} with a SHA-256"
+          (cd "${HANDOVER}" && sha256sum --check --strict --quiet SHA256SUMS) || stop "${asset} does not match SHA256SUMS"
+
+          # The tag has no published release yet. A draft is not one.
+          published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft | not) | .tagName')
+          ! grep -qxF -- "${tag}" <<< "${published}" || stop "${tag} is already published"
+
+          git fetch -q origin dev
+          dev=$(git rev-parse origin/dev)
+          on_remote=$(git ls-remote origin "refs/tags/${tag}")
+          if [[ "${MODE}" == "finish" ]]; then
+            # The tag is already on the remote; nothing is pushed.
+            [[ -n "${on_remote}" ]] || stop "${tag} is not on the remote, so there is nothing to finish"
+            git fetch -q origin "refs/tags/${tag}:refs/tags/${tag}"
+            echo "commit=$(git rev-parse "refs/tags/${tag}^{commit}")" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [[ -z "${on_remote}" ]] || stop "${tag} is already on the remote"
+          # The bundle holds one thing: the tag. It is an annotated tag on a commit.
+          heads=$(git bundle list-heads "${HANDOVER}/release.bundle")
+          [[ "$(wc -l <<< "${heads}")" == 1 && "${heads#* }" == "refs/tags/${tag}" ]] || stop "the bundle does not hold ${tag} alone"
+          # Its commit stands on one parent, which the bundle's own first lines name. When that parent is no longer
+          # dev's tip, dev moved while this run was cutting: nothing is pushed, and the run for the newer push
+          # releases these changes too.
+          parents=$(LC_ALL=C sed -n -e '/^$/q' -e 's/^-\([0-9a-f]\{40\}\).*$/\1/p' "${HANDOVER}/release.bundle")
+          [[ "${parents}" =~ ^[0-9a-f]{40}$ ]] || stop "the bundle does not stand on exactly one commit"
+          if [[ "${parents}" != "${dev}" ]]; then
+            git merge-base --is-ancestor "${parents}" "${dev}" 2>/dev/null || stop "the bundle does not stand on dev"
+            echo "::notice::dev moved on while this run cut ${tag}; the run for the newer push releases these changes too"
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch -q "${HANDOVER}/release.bundle" "refs/tags/${tag}:refs/tags/${tag}" || stop "the bundle cannot be read on top of dev"
+          [[ "$(git for-each-ref --format='%(objecttype) %(tag) %(*objecttype)' "refs/tags/${tag}")" == "tag ${tag} commit" ]] ||
+            stop "${tag} is not an annotated tag of that name on a commit"
+          commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          [[ "$(git rev-list --parents -n 1 "${commit}")" == "${commit} ${dev}" ]] || stop "the release commit is not exactly one commit on top of dev"
+          [[ "$(git log -1 --format=%s "${commit}")" == "chore(release): ${tag}" ]] || stop "the commit is not named chore(release): ${tag}"
+          # A release commit states the version and the changelog section, and touches nothing else.
+          while IFS= read -r path; do
+            case "${path}" in
+              CHANGELOG.md|Cargo.toml|Cargo.lock|packages/arca-canvas-dsh/package.json|packages/arca-canvas-dsh/package-lock.json) ;;
+              *) stop "the release commit changes ${path}" ;;
+            esac
+          done < <(git diff --name-only --no-renames "${dev}" "${commit}")
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
       - name: Push dev and the tag
         id: push
-        if: steps.plan.outputs.mode == 'cut'
+        if: needs.cut.outputs.mode == 'cut' && steps.check.outputs.commit != ''
         env:
-          VERSION: ${{ steps.cut.outputs.version }}
+          COMMIT: ${{ steps.check.outputs.commit }}
         run: |
           set -euo pipefail
           # Atomic: when dev moved meanwhile (a second push), neither lands, so no tag names a release commit dev
           # never got. The newer push's own run (queued behind this one) then releases these changes with its
           # own, so this run stops here, cleanly: no version, and the steps and the job after it skip.
-          if ! git push -q --atomic origin HEAD:refs/heads/dev "refs/tags/v${VERSION}"; then
+          if ! git push -q --atomic origin "${COMMIT}:refs/heads/dev" "refs/tags/v${VERSION}"; then
             git fetch -q origin dev
-            if [[ "$(git rev-parse origin/dev)" != "$(git rev-parse HEAD~1)" ]]; then
+            if [[ "$(git rev-parse origin/dev)" != "$(git rev-parse "${COMMIT}^")" ]]; then
               echo "::notice::dev moved on while this run cut v${VERSION}; the run for the newer push releases these changes too"
               exit 0
             fi
@@ -198,38 +336,36 @@ jobs:
 
       - name: Publish the release
         id: publish
-        if: steps.plan.outputs.mode == 'finish' || steps.push.outputs.pushed == 'true'
+        if: steps.check.outputs.commit != '' && (needs.cut.outputs.mode == 'finish' || steps.push.outputs.pushed == 'true')
         env:
-          VERSION: ${{ steps.cut.outputs.version || steps.plan.outputs.version }}
+          COMMIT: ${{ steps.check.outputs.commit }}
         run: |
           set -euo pipefail
           # A dispatched prerelease is never Latest; every other release is, full or patch: each one carries the
           # binary.
           flags=(--latest)
           [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
-          gh release create "v${VERSION}" "dist/arca-${VERSION}-linux-x86_64" dist/SHA256SUMS "${flags[@]}" \
+          cd "${HANDOVER}"
+          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" SHA256SUMS "${flags[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "Automagik Arca ${VERSION}" \
-            --notes-file dist/RELEASE-NOTES.md
+            --notes-file RELEASE-NOTES.md
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=${COMMIT}" >> "$GITHUB_OUTPUT"
 
   main:
     name: main follows
-    needs: cut
-    if: needs.cut.outputs.version != ''
+    needs: publish
+    if: needs.publish.outputs.version != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    concurrency:
-      group: release-main
-      cancel-in-progress: false
     permissions:
       contents: write
     env:
-      SHA: ${{ needs.cut.outputs.sha }}
+      SHA: ${{ needs.publish.outputs.sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: dev
           fetch-depth: 0
@@ -238,8 +374,9 @@ jobs:
         run: |
           set -euo pipefail
           # Fast-forward only: main holds released commits and nothing else. The first release creates it.
+          # The full name of the branch: a pattern such as `main` would also match another branch ending in /main.
           found=0
-          git ls-remote --exit-code --heads origin main > /dev/null || found=$?
+          git ls-remote --exit-code origin refs/heads/main > /dev/null || found=$?
           if [[ "${found}" == 2 ]]; then
             git push -q origin "${SHA}:refs/heads/main"
             echo "main created at ${SHA}"
@@ -247,7 +384,7 @@ jobs:
             echo "::error::could not read the remote's branches"
             exit 1
           else
-            git fetch -q origin main
+            git fetch -q origin "refs/heads/main:refs/remotes/origin/main"
             if git merge-base --is-ancestor origin/main "${SHA}"; then
               git push -q origin "${SHA}:refs/heads/main"
             else
