@@ -1064,3 +1064,6 @@ fn a_bridged_nodes_lowered_caps_are_refused_below_use_and_followed_above_it() {
 
 #[path = "vm_secrets.rs"]
 mod vm_secrets;
+
+#[path = "create_settings.rs"]
+mod create_settings;

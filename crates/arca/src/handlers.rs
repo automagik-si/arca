@@ -3146,12 +3146,17 @@ fn enrich_service_create(
                 "bridge and mac: only a virtual-machine template takes them".into(),
             ));
         }
+        crate::service::create_settings(&template, payload.get("settings"))
+            .map_err(service_template_error)?;
         let mut payload = payload.clone();
         if let (Some(stated), Some(object)) = (stated, payload.as_object_mut()) {
             object.insert("kernelAccess".to_string(), stated);
         }
         return Ok(payload);
     }
+    // The settings a create gives are checked now, so the owner's card never shows a value the create would refuse.
+    crate::service::create_settings(&template, payload.get("settings"))
+        .map_err(service_template_error)?;
     if cfg.kernel.vm_caps().is_none() {
         return Err(service_refused(no_vm_caps(&template.name)));
     }
@@ -4403,11 +4408,14 @@ enum VmPlace {
 /// The record of a virtual machine. On a host bridge it has no address, gateway or port; on the managed service network
 /// it has those of a container. Neither has an environment. Its template's first-boot script and settings are recorded
 /// as cloud-init reads them. One whose template declares secrets is created stopped: `service_secret_set` stores them
-/// and `instance_start` starts it and writes them into the guest, so they are never in its config.
+/// and `instance_start` starts it and writes them into the guest, so they are never in its config. `settings` is what
+/// the create asked to replace of the template's settings (`service::create_settings` has checked it): the machine
+/// gets the merged object, and the record keeps the replaced values beside it.
 fn vm_service_config(
     name: &str,
     template: &crate::service::Template,
     templates_dir: &std::path::Path,
+    settings: Option<&Value>,
     place: VmPlace,
     pool: String,
     now: u64,
@@ -4416,8 +4424,10 @@ fn vm_service_config(
     let root_size = template.root_size.clone().ok_or_else(internal)?;
     let user_data =
         crate::service::first_boot(template, templates_dir).map_err(service_template_error)?;
-    let vendor_data =
-        crate::service::settings_vendor_data(template).map_err(service_template_error)?;
+    let settings =
+        crate::service::create_settings(template, settings).map_err(service_template_error)?;
+    let vendor_data = crate::service::vendor_data_of(&template.name, settings.merged.as_ref())
+        .map_err(service_template_error)?;
     let (bridge, mac, ipv4, gateway, ports) = match place {
         VmPlace::Host { bridge, mac } => (bridge, mac, String::new(), String::new(), Vec::new()),
         VmPlace::Managed { ipv4, gateway } => (
@@ -4460,6 +4470,7 @@ fn vm_service_config(
             mac,
             user_data,
             vendor_data,
+            settings: settings.replaced,
         }),
         tenant: None,
         kernel_access: None,
@@ -4660,6 +4671,7 @@ impl ToolHandler for ServiceHandler {
                 "deploy",
                 "start",
                 "kernelAccess",
+                "settings",
                 // Only an approved proposal carries it: the one-shot grant of its approval.
                 "approval",
             ],
@@ -4864,6 +4876,11 @@ impl ToolHandler for ServiceHandler {
                     // by an alias does not say which build that was.
                     if let Some(image) = live.and_then(crate::service::base_image) {
                         view["baseImage"] = json!(image);
+                    }
+                    // The settings the machine was created with, as its guest reads them. They never hold a secret:
+                    // a template's secrets are named apart and are never part of this object.
+                    if let Some(settings) = config.vm.as_ref().and_then(|vm| vm.guest_settings()) {
+                        view["settings"] = settings;
                     }
                     // Whether the access its record names is the one that stands: the device on the instance, and
                     // the listener of this server.
@@ -5180,6 +5197,8 @@ impl ToolHandler for ServiceHandler {
                     if let Some(why) = mode_refusal(&self.cfg, &all_entries) {
                         return Err(service_refused(why));
                     }
+                    crate::service::create_settings(&template, args.get("settings"))
+                        .map_err(service_template_error)?;
                     // A tenant's machine joins the managed service network and nothing else: a host bridge would put
                     // it on the host's own network.
                     if tenant.is_some() && args.get("bridge").is_some() {
@@ -5309,8 +5328,15 @@ impl ToolHandler for ServiceHandler {
                         project_changes(&all_entries, &self.cfg, needs)
                             .map_err(no_service_project)?
                     };
-                    let mut config =
-                        vm_service_config(&name, &template, &templates_dir, place, pool, now)?;
+                    let mut config = vm_service_config(
+                        &name,
+                        &template,
+                        &templates_dir,
+                        args.get("settings"),
+                        place,
+                        pool,
+                        now,
+                    )?;
                     let deploy =
                         tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
                     self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);
@@ -5349,6 +5375,9 @@ impl ToolHandler for ServiceHandler {
                         "bridge and mac: only a virtual-machine template takes them".into(),
                     ));
                 }
+                // A container template has no settings a create may set: said before anything is written.
+                crate::service::create_settings(&template, args.get("settings"))
+                    .map_err(service_template_error)?;
                 local_image_present(&read, &template, project)?;
                 if let Some(scope) = &tenant {
                     if template.lan.is_some() || template.publishable {

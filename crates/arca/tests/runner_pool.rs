@@ -112,6 +112,10 @@ struct State {
     /// How long an installation token is taken, when not for ever. GitHub's last an hour.
     token_life: Option<Duration>,
     minted_at: Vec<(String, Instant)>,
+    /// Whether the repository a repository-level pool serves is public.
+    repo_public: bool,
+    /// Whether a runner group is answered without its `default` field, as no real GitHub does.
+    group_without_default: bool,
 }
 
 struct Github {
@@ -554,6 +558,14 @@ fn answer(
         json!({ "id": group.id, "name": group.name, "default": group.default,
             "visibility": group.visibility, "allows_public_repositories": group.public })
     };
+    if method == "GET" && scope.starts_with("/repos/") && path == scope {
+        return (
+            200,
+            Some(
+                json!({ "id": 5150, "full_name": &scope["/repos/".len()..], "private": !state.repo_public }),
+            ),
+        );
+    }
     if method == "GET" && scope.starts_with("/orgs/") {
         if path.starts_with(&format!("{groups}?")) {
             let listed: Vec<Value> = state.groups.iter().map(group_json).collect();
@@ -564,6 +576,9 @@ fn answer(
         }
         if let Some(id) = path.strip_prefix(&format!("{groups}/")) {
             return match state.groups.iter().find(|group| group.id.to_string() == id) {
+                Some(group) if state.group_without_default => {
+                    (200, Some(json!({ "id": group.id, "name": group.name })))
+                }
                 Some(group) => (200, Some(group_json(group))),
                 None => message(404, "Not Found"),
             };
@@ -798,6 +813,23 @@ impl Pool {
                 pool.dir.join("systemctl.log").display()
             ),
         );
+        // Layering the runner's files is a mount, which only root makes: a stand-in records it and makes the
+        // directory, or fails as a machine without overlay would.
+        executable(
+            &pool.dir.join("bin/mount"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{0}'\n[ ! -e '{1}' ] || exit 32\nfor last; do :; done\nmkdir -p \"$last\"\n",
+                pool.dir.join("mount.log").display(),
+                pool.dir.join("no-overlay").display()
+            ),
+        );
+        executable(
+            &pool.dir.join("bin/umount"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n",
+                pool.dir.join("umount.log").display()
+            ),
+        );
         // The real curl, with every argument recorded: a credential on a command line would be seen here.
         executable(
             &pool.dir.join("bin/curl"),
@@ -859,6 +891,7 @@ impl Pool {
             .env("POOL_BACKOFF_MAX", "1")
             .env("POOL_STOP_WAIT", "10")
             .env("POOL_REFUSE_EVERY", "1")
+            .env("POOL_GROUP_EVERY", "1")
             .envs(report_missing_programs(&self.dir.join("not-found.log")))
             .env("FAKE_PATH", std::env::var("PATH").unwrap_or_default())
             .envs(self.env.iter().map(|(key, value)| (*key, value.as_str())))
@@ -1248,9 +1281,16 @@ fn an_app_registers_a_fresh_runner_per_job_replaces_it_and_prints_no_credential(
         assert_eq!(run.contains(RUNNER_IMAGE), !daemon, "{run}");
         assert!(run.contains("--cgroup-parent arcapool-s"), "{run}");
         assert!(run.contains("--label arca.pool=pool1"), "{run}");
-        // The runner's bundled tools are mounted into the daemon only: the runner keeps its image's own, which it
-        // can replace when GitHub tells it to update itself.
-        assert_eq!(run.contains(":/home/runner/externals"), daemon, "{run}");
+        // The runner and its daemon share one layered copy of the runner's files, at the runner's own path: the
+        // runner writes it and the daemon reads it. The tools are no mount of their own, so a runner can replace
+        // them when GitHub tells it to update itself, and the daemon then sees the new ones.
+        assert!(!run.contains(":/home/runner/externals"), "{run}");
+        assert_eq!(
+            run.contains("/layer/home:/home/runner:ro "),
+            daemon,
+            "{run}"
+        );
+        assert_eq!(run.contains("/layer/home:/home/runner "), !daemon, "{run}");
         if !daemon {
             assert!(run.contains("--network container:pool1-s"), "{run}");
             // The configuration is a file on the controller's run directory, read by the container's own command:
@@ -1271,12 +1311,46 @@ fn an_app_registers_a_fresh_runner_per_job_replaces_it_and_prints_no_credential(
         pool.read("systemctl.log")
             .contains("stop arcapool-s0.slice")
     );
+    // The layered copy: the pinned image's files below, a fresh layer for each job above, taken away after it.
+    let state_dir = pool.dir.join("state");
+    let mounts = pool.read("mount.log");
+    let first = mounts.lines().next().expect("a mount");
+    let lower = first
+        .split("lowerdir=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect("a lower layer");
+    assert!(
+        lower.starts_with(&format!("{}/runner-home/", state_dir.display())),
+        "{first}"
+    );
+    assert!(calls.contains(&format!("cp -a pool1-externals:/home/runner/. {lower}/")));
+    for slot in 0..3 {
+        let layer = format!("{}/slots/{slot}/layer", state_dir.display());
+        assert!(
+            mounts.contains(&format!(
+                "-t overlay overlay -o lowerdir={lower},upperdir={layer}/upper,workdir={layer}/work {layer}/home"
+            )),
+            "{mounts}"
+        );
+        assert!(
+            pool.read("umount.log")
+                .contains(&format!("-l {layer}/home"))
+        );
+        // While its runner waits for a job the slot's layer is there.
+        assert!(std::path::Path::new(&layer).join("home").is_dir());
+    }
+    assert_eq!(mounts.lines().count(), 7, "one fresh layer for each runner");
 
     // Stopping: the idle runners are taken off GitHub and nothing is left running.
     let idle: Vec<u64> = github.live().iter().map(|runner| runner.id).collect();
     assert_eq!(pool.stop(), Some(0));
     assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
     assert_eq!(pool.containers(), Vec::<String>::new());
+    // Every slot's layer is taken away with its runner.
+    for slot in 0..3 {
+        assert!(!state_dir.join(format!("slots/{slot}/layer")).exists());
+    }
     {
         let state = github.state();
         for id in idle {
@@ -1615,6 +1689,35 @@ fn failures_are_counted_said_without_the_credential_and_paused_and_leftovers_are
     wait_for(&pool, "a fresh runner in its place", || {
         github.live().iter().any(|runner| runner.id != gone.id)
     });
+    // That runner had its files layered and never reached a job. The pool cannot tell a runner GitHub removed from
+    // one that could not start that way, so the next runners start with their image's own files, and it says so
+    // once: one bad start never keeps the pool from running.
+    assert_eq!(
+        pool.output()
+            .matches("A runner stopped before its first job with its files layered. Runners start with their image's own files from now on")
+            .count(),
+        1
+    );
+    let calls = pool.read("docker/calls.log");
+    let last_runner = calls
+        .lines()
+        .filter(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
+        .next_back()
+        .expect("a runner");
+    assert!(!last_runner.contains(":/home/runner "), "{last_runner}");
+    let last_daemon = calls
+        .lines()
+        .filter(|line| line.starts_with("run ") && line.contains(DOCKER_IMAGE))
+        .next_back()
+        .expect("a daemon");
+    assert!(
+        last_daemon.contains("/externals:/home/runner/externals:ro"),
+        "{last_daemon}"
+    );
+    // A pool for one repository has no runner group: it says whether the repository is private.
+    assert!(pool.output().contains(
+        "registering runners in one private repository (a repository has no runner groups)"
+    ));
     assert_eq!(
         pool.output().matches(" failed: ").count(),
         failures_before + 1
@@ -1684,6 +1787,41 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_registered() {
         (
             with("url", json!("https://github.com/a/b/c")),
             "settings: url names an organisation",
+        ),
+        // The URL's host is where the credential goes: a plain host name, with nothing that could make another
+        // host of it.
+        (
+            with(
+                "url",
+                json!("https://github.com@elsewhere.example/example-org"),
+            ),
+            "settings: url: its host must be a plain host name (letters, digits, dots and dashes), with no user, password, query or fragment",
+        ),
+        (
+            with("url", json!("https://user:word@github.com/example-org")),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with(
+                "url",
+                json!("https://github.com#@elsewhere.example/example-org"),
+            ),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with(
+                "url",
+                json!("https://github.com?x=elsewhere.example/example-org"),
+            ),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with("url", json!("https://github.com:port/example-org")),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with("url", json!("https://.github.com/example-org")),
+            "settings: url: its host must be a plain host name",
         ),
         // The credential goes to the API's host: github.com has one API, and another host is named on purpose.
         (
@@ -1825,7 +1963,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             && description.contains("docker 29.9.3-dind")
     );
     // The default slots fit the machine: the cap admits them all, their CPUs are the machine's 16, and their memory
-    // and the reserve leave 4GiB of its 32GiB, since a virtual machine sees a little less memory than its size.
+    // fits what a 32GiB machine really has for slots once the reserve is kept back (27921MiB on the first pool).
     let bytes =
         |text: &Value| arca::service::size_bytes(text.as_str().expect("a size")).expect("bytes");
     let classes = settings["classes"].as_array().expect("classes");
@@ -1840,8 +1978,14 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert_eq!(cpus, 16);
     assert_eq!(
         memory + bytes(&settings["reserveMemory"]),
-        arca::service::size_bytes("28GiB").expect("bytes")
+        arca::service::size_bytes("30GiB").expect("bytes")
     );
+    assert!(
+        memory <= 27921 * (1 << 20),
+        "the slots fit a real 32GiB machine"
+    );
+    assert_eq!(classes.len(), 2);
+    assert_eq!(classes[1]["memory"], "9GiB");
     // The same settings start the controller: it reads them, makes its slices and waits for a credential.
     let scratch = std::env::temp_dir().join(format!(
         "arca-runner-pool-gh-{}-{}",
@@ -1850,18 +1994,18 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     ));
     fs::create_dir_all(&scratch).expect("scratch");
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
-    // What such a machine reports: a little less than 32GiB.
-    let mut pool = Pool::new(settings, 32 * GIB - 700 * (1 << 20), 30 * GIB);
+    // What such a machine reports: 27921MiB for slots after the 4GiB kept back.
+    let mut pool = Pool::new(settings, (27921 + 4096) * (1 << 20), 30 * GIB);
     pool.start(&github);
     wait_for(&pool, "the shipped settings load", || {
-        pool.output().contains("pool pool1 id abcd1234 for https://github.com/example-org: 5 slots in 2 classes, at most 5 at once, 27972 MiB of memory for slots")
+        pool.output().contains("pool pool1 id abcd1234 for https://github.com/example-org: 4 slots in 2 classes, at most 4 at once, 27921 MiB of memory for slots")
     });
     wait_for(&pool, "the wait for a credential", || {
         pool.output().contains("waiting for a credential")
     });
     assert!(
-        pool.read("units/arcapool-s4.slice")
-            .contains("MemoryMax=8589934592\nMemorySwapMax=0\nCPUQuota=800%")
+        pool.read("units/arcapool-s3.slice")
+            .contains("MemoryMax=9663676416\nMemorySwapMax=0\nCPUQuota=600%")
     );
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
@@ -2049,7 +2193,7 @@ fn the_default_runner_group_is_refused_and_a_dedicated_one_is_described() {
     let mut pool = one_slot_pool(&github, |settings| settings["runnerGroupId"] = json!(8));
     pool.start(&github);
     wait_for(&pool, "the wide group described", || {
-        pool.output().contains("registering runners in runner group 8 \"wide\", WARNING: open to every repository of the organisation (all), WARNING: public repositories admitted, so a pull request from anyone can run code in this pool")
+        pool.output().contains("registering runners in runner group 8 \"wide\", WARNING: open to every repository of the organisation (all), WARNING: public repositories admitted, so a pull request from anyone, once it is approved to run, runs code in this pool")
     });
     pool.stop();
     let _ = fs::remove_dir_all(scratch);
@@ -2087,6 +2231,32 @@ fn a_runner_github_tells_to_update_updates_inside_its_container_and_then_takes_i
     });
     assert_eq!(pool.output().matches(said).count(), 2);
     assert!(totals(&pool).contains("failures=0"), "{}", totals(&pool));
+    // The runner and its daemon shared one copy of the runner's files, so the daemon saw the updated tools.
+    let calls = pool.read("docker/calls.log");
+    assert!(calls.contains("/slots/0/layer/home:/home/runner:ro "));
+    assert!(calls.contains("/slots/0/layer/home:/home/runner "));
+    // A runner that finished its update and then went away is not said to have died while updating.
+    let updated = github
+        .live()
+        .into_iter()
+        .find(|runner| runner.updated)
+        .expect("the idle, updated runner");
+    wait_for(&pool, "the update seen as finished", || {
+        pool.read("run/slots/0").starts_with("idle")
+    });
+    github
+        .state()
+        .runners
+        .iter_mut()
+        .find(|runner| runner.id == updated.id)
+        .unwrap()
+        .deleted = true;
+    wait_for(&pool, "the runner that went away after its update", || {
+        pool.output().contains("slot 0 (small) failed: its runner stopped (exit 1) after it had updated itself, before it took a job")
+    });
+    assert!(!pool.output().contains("while it was updating itself"));
+    // An updated runner that went away is no sign that layering failed.
+    assert!(!pool.output().contains("with its files layered"));
     assert_eq!(pool.stop(), Some(0));
     drop(pool);
 
@@ -2143,5 +2313,174 @@ fn an_idle_runner_older_than_its_token_is_still_taken_off_github_when_the_pool_s
     // No request was refused for an old token.
     assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
     drop(state);
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn the_runner_group_is_read_again_and_one_that_becomes_refused_holds_new_slots() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    // An answer that does not say whether the group is the default one is no ground to start on.
+    github.state().group_without_default = true;
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.start(&github);
+    wait_for(&pool, "the answer without a default field refused", || {
+        pool.output().contains("GitHub's answer for runner group 7 does not name that group or does not say whether it is the default one")
+    });
+    assert!(github.registrations().is_empty());
+    // With a whole answer the pool starts.
+    github.state().group_without_default = false;
+    wait_for(&pool, "a runner once the answer is whole", || {
+        github.live().len() == 1
+    });
+
+    // Later the group is opened to public repositories on GitHub: the next status says so.
+    github.state().groups[1].public = true;
+    wait_for(&pool, "the warning after the group changed", || {
+        pool.read("logs/status.txt").contains("runner group 7 \"arca pool\", selected repositories only, WARNING: public repositories admitted, so a pull request from anyone, once it is approved to run, runs code in this pool")
+    });
+    // Later still it is made the organisation's default group: no new slot starts, and the pool says why.
+    github.state().groups[1].default = true;
+    wait_for(&pool, "the refusal after the group changed", || {
+        pool.output().contains(
+            "the pool does not start on the organisation's default runner group (7 \"arca pool\")",
+        )
+    });
+    let registered = github.registrations().len();
+    // The runner that waits is left; its job runs, and no runner takes its place while the group is refused.
+    github.queue(&["arca"], "the last job", 0.2);
+    wait_for(&pool, "the job of the runner that was waiting", || {
+        pool.jobs().len() == 1
+    });
+    wait_for(&pool, "the slot held", || {
+        let status = pool.read("logs/status.txt");
+        status.contains("queued (held: its runner group is refused now (see the pool line))")
+            && status.contains(
+                "REFUSED: runner group 7 \"arca pool\" is the organisation's default group",
+            )
+    });
+    assert_eq!(github.registrations().len(), registered);
+    // Put right on GitHub, the pool goes on by itself.
+    github.state().groups[1].default = false;
+    wait_for(&pool, "a new runner once the group is put right", || {
+        github.registrations().len() > registered
+    });
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_pool_for_a_public_repository_says_so_in_every_status() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, "/repos/example-org/example-repo");
+    github.state().repo_public = true;
+    github.state().tokens.push(PAT.to_string());
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(1)]),
+            1,
+            "https://github.com/example-org/example-repo",
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    let warning = "one repository, WARNING: it is public, so a pull request from anyone, once it is approved to run, runs code in this pool";
+    wait_for(&pool, "the warning at the start", || {
+        pool.output()
+            .contains(&format!("registering runners in {warning}"))
+    });
+    wait_for(&pool, "the warning in the status", || {
+        pool.read("logs/status.txt").contains(warning)
+    });
+    // A repository's runners are registered with GitHub's fixed group number, whatever the settings say.
+    wait_for(&pool, "a runner", || github.live().len() == 1);
+    let asked: Value = serde_json::from_str(&github.registrations()[0].body).expect("the request");
+    assert_eq!(asked["runner_group_id"], 1);
+    // Made private on GitHub, the next read says so.
+    github.state().repo_public = false;
+    wait_for(&pool, "the status after it is made private", || {
+        pool.read("logs/status.txt")
+            .contains("one private repository")
+    });
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_machine_that_cannot_layer_starts_runners_with_their_images_own_files() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().update_required = true;
+    let mut pool = one_slot_pool(&github, |_| {});
+    fs::write(pool.dir.join("no-overlay"), "").expect("the switch");
+    pool.start(&github);
+    wait_for(&pool, "the fallback said", || {
+        pool.output().contains("The runner's files could not be layered on this machine (overlay mount). Runners start with their image's own files from now on; after a runner updates itself, a job that runs in a container (container:) still gets the pinned release's bundled tools")
+    });
+    // The runner still updates itself (its tools are its image's own files, not a mount) and takes its job.
+    wait_for(&pool, "the updated runner idle", || {
+        github.live().iter().any(|runner| runner.updated)
+    });
+    github.queue(&["arca"], "a job without layering", 0.2);
+    wait_for(&pool, "the job", || pool.jobs().len() == 1);
+    wait_for(&pool, "a second runner", || {
+        github.state().runners.len() >= 2
+    });
+    assert_eq!(pool.stop(), Some(0));
+    // The mount was tried once and said once; every runner had no home mount and every daemon the pinned tools.
+    assert_eq!(pool.read("mount.log").lines().count(), 1);
+    assert_eq!(pool.output().matches("could not be layered").count(), 1);
+    let calls = pool.read("docker/calls.log");
+    for run in calls.lines().filter(|line| line.starts_with("run ")) {
+        let daemon = run.contains(DOCKER_IMAGE);
+        assert!(!run.contains(":/home/runner "), "{run}");
+        assert!(!run.contains(":/home/runner:ro"), "{run}");
+        assert_eq!(
+            run.contains("/externals:/home/runner/externals:ro"),
+            daemon,
+            "{run}"
+        );
+    }
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_running_job_is_shown_as_busy_and_is_timed_from_when_it_began() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.start(&github);
+    wait_for(&pool, "an idle runner", || github.live().len() == 1);
+    // The runner waits a while before a job comes: that wait is no part of the job.
+    std::thread::sleep(Duration::from_millis(3200));
+    github.queue(&["arca"], "a long test", 2.0);
+    // While the job runs, the slot is busy and names it, and the totals count it.
+    wait_for(&pool, "the slot shown as busy", || {
+        let state = pool.read("run/slots/0");
+        state.starts_with("busy\t") && state.contains("job \"a long test\"")
+    });
+    wait_for(&pool, "the busy slot in the totals", || {
+        totals(&pool).contains("busy=1 idle=0")
+    });
+    assert!(
+        pool.read("logs/status.txt").contains("busy")
+            && pool.read("logs/status.txt").contains("job \"a long test\""),
+        "{}",
+        pool.read("logs/status.txt")
+    );
+    wait_for(&pool, "the job", || pool.jobs().len() == 1);
+    // Timed from the runner's own "Running job" line: about two seconds, not the five since the runner started.
+    let seconds: u64 = pool.jobs()[0][6].parse().expect("seconds");
+    assert!((1..=3).contains(&seconds), "{seconds}");
+    assert_eq!(pool.stop(), Some(0));
+    // The pool never asks Docker for a runner's processes: it reads the runner's own lines.
+    assert!(
+        !pool
+            .read("docker/calls.log")
+            .lines()
+            .any(|call| call.starts_with("top "))
+    );
     let _ = fs::remove_dir_all(scratch);
 }

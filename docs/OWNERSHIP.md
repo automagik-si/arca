@@ -1048,8 +1048,9 @@ in `crates/arca-kernel/src/plugin.rs`; `ServiceHandler::settle_create` in `crate
 `crates/arca/tests/services/mixed.rs` and, for the cases that stay open,
 `a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` in `crates/arca-providers/tests/incus_provider.rs`.
 
-**Rule 68.** A virtual-machine template may carry a first-boot script, settings and secrets. The script and the settings are
-part of the machine's create and of nothing later; the secrets never enter Incus's instance config.
+**Rule 68.** A virtual-machine template may carry a first-boot script, settings and secrets, and may let a create replace
+some of its settings. The script and the settings are part of the machine's create and of nothing later; the secrets never
+enter Incus's instance config.
 
 - `firstBoot` is `{ "file": "<name>" }`, a plain file beside the template, read as an entrypoint's file is. Its text becomes
   the instance key `cloud-init.user-data`, so it begins `#!` (cloud-init runs it once, as root, at the first boot) or
@@ -1059,6 +1060,18 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   body is built from the record; a record without them is exactly the one an earlier kernel wrote, and its create is
   unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
   script or setting applies to a machine created after the change.
+- `createSettings` lists the top-level keys of `settings` that one `service_create` may replace with its own `settings`
+  argument. The value in the template is the default and gives the type. `create_settings` refuses, before any write and
+  again when a create is proposed: a key that is not listed; a value of another JSON type than the default (a whole
+  number stays whole); a control character in any string or key, or more than eight levels; and, where the default is an
+  `https://` address, anything but `https://<host>[:<port>][/<path>]` with a plain host and path (`https_address_ok`: no
+  `@`, `?`, `#`, `%`, space or backslash), since such a setting decides where the guest sends a credential; and a merged
+  object over the settings size. The machine's `cloud-init.vendor-data` is built from the merged object; the record
+  keeps the replaced values as `vm.settings`, and a record of a create that gave none has no such key and is the record
+  of before. `service_status` answers `settings`, read back from the record's vendor data (`Vm::guest_settings`), so it
+  is what the machine got whatever the template says later; the owner's card has one row for each replaced key with its
+  value (`ActionKind::details`), control characters removed and a long value cut with an ellipsis. Settings never hold a
+  secret. Tests in `crates/arca/tests/services/create_settings.rs`.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
   machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
@@ -1099,15 +1112,21 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   the project the record names; that project must be the record's own tenant's, and the tenant's entry must exist and
   name it. The writer is the exec seam's (`writer_for`): bound to the entry, over the node's family and that one
   tenant's project, so it reads no other tenant's instance as owned. Only the two guest-secret destinations
-  (`/etc/arca-secrets` and a file in it) follow the owned instance into a tenant's project (`guest_target`). A command,
-  a recording and every other file stay in the node's own project and are refused for a tenant's instance (`target`),
-  so Rule 50's seam is as it was. The instance verbs already refuse a call that names a tenant together with another
+  (`/etc/arca-secrets` and a file in it) follow the owned instance into a tenant's project (`guest_target`). A command
+  and every other file stay in the node's own project and are refused for a tenant's instance (`target`). A recording
+  is read and deleted by a path that names the node's own project and no other, so it cannot reach a tenant's
+  instance either, and none exists there since no command runs there. Rule 50's seam is as it was. The instance verbs already refuse a call that names a tenant together with another
   project, and a tenant's project without its tenant (Rule 65), before any instance is read.
 - The guest agent is waited for, up to 120 seconds: a machine that has just started boots before it takes a file. When
   it never answers, the verb is refused with `InstanceSecretsNotWritten` and the machine stays running. The answer says
   what to do next once, and only what is true: to run `instance_start` again when the guest was not ready or a request
-  did not get through, and that running it again changes nothing when something has to be put right first (a secret
-  that cannot be read, a directory in the guest that is not private, a record that does not fit its instance).
+  did not get through (a read of the instance that timed out among them), and that running it again changes nothing
+  when something has to be put right first (a secret that cannot be read, a directory in the guest that is not
+  private, a record that does not fit its instance, an instance that is no longer the one Arca created, a kernel lock
+  that is poisoned until Arca is restarted). The place checks are one function, `misplaced` in
+  `crates/arca/src/guest_secrets.rs`, with its own tests there: a tenant entry that is missing or names another
+  project, a record in another project or with another instance than its own, and a journalled instance that is
+  missing, has no uuid, or is in another project.
 
 Source: `first_boot`, `settings_vendor_data`, `validate_vm_template` and `vm_config` in `crates/arca/src/service.rs`;
 `vm_service_config` in `crates/arca/src/handlers.rs`; `call_wiring` in `crates/arca/src/service_wiring.rs`;

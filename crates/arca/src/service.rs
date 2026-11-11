@@ -143,9 +143,34 @@ pub struct Vm {
     /// The template's first-boot script, as the instance's `cloud-init.user-data`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
-    /// The template's settings, as a `cloud-init.vendor-data` that writes them to [`GUEST_SETTINGS_PATH`].
+    /// The service's settings, as a `cloud-init.vendor-data` that writes them to [`GUEST_SETTINGS_PATH`]: the
+    /// template's, with the values its create replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_data: Option<String>,
+    /// The settings its create replaced, by key, when it replaced any. The machine got them merged into the
+    /// template's ([`Vm::guest_settings`]); they are kept apart here so the record says what was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Map<String, Value>>,
+}
+
+impl Vm {
+    /// The settings object the machine was created with, exactly as its guest reads it at
+    /// [`GUEST_SETTINGS_PATH`]: read back from the cloud-init data the create carried, so a template edited since
+    /// changes nothing here. `None` for a machine without settings.
+    pub fn guest_settings(&self) -> Option<Value> {
+        use base64::Engine as _;
+        let content = self
+            .vendor_data
+            .as_deref()?
+            .lines()
+            .find_map(|line| line.strip_prefix("  content: "))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content.trim())
+            .ok()?;
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .filter(Value::is_object)
+    }
 }
 
 /// The kernel access an instance's own devices show: its `kernel` device, when it is exactly the device Arca makes for
@@ -1060,6 +1085,10 @@ pub struct Template {
     /// kind sets it, and it never holds a secret.
     #[serde(default)]
     pub settings: Option<Value>,
+    /// The top-level keys of `settings` that a `service_create` may replace for one service. Each is a key of
+    /// `settings`, whose value there is the default and gives the type. No other kind sets it.
+    #[serde(default)]
+    pub create_settings: Vec<String>,
     /// A container template whose service may talk to this node's kernel: `{ "port": <n> }`, the port inside the
     /// instance where the kernel answers on loopback. Only a service of the node's own project is created from such a
     /// template, never one in a tenant.
@@ -1134,7 +1163,10 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: only a virtual-machine template has a rootSize"
         )));
     }
-    if template.first_boot.is_some() || template.settings.is_some() {
+    if template.first_boot.is_some()
+        || template.settings.is_some()
+        || !template.create_settings.is_empty()
+    {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has a firstBoot or settings"
         )));
@@ -1326,6 +1358,20 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     {
         return refused("settings is one JSON object of at most 16KiB");
     }
+    let mut listed = BTreeSet::new();
+    if template.create_settings.len() > 32
+        || !template.create_settings.iter().all(|key| {
+            listed.insert(key.as_str())
+                && template
+                    .settings
+                    .as_ref()
+                    .is_some_and(|settings| settings.get(key).is_some())
+        })
+    {
+        return refused(
+            "createSettings lists at most 32 distinct keys of settings, each with its default there",
+        );
+    }
     if let Some(description) = &template.description
         && description.chars().count() > 500
     {
@@ -1383,20 +1429,186 @@ pub fn first_boot(template: &Template, dir: &Path) -> Result<Option<String>, Tem
 /// by every user of the guest: one `write_files` entry whose content is base64, so no setting can change the YAML
 /// around it. `None` for a template without settings.
 pub fn settings_vendor_data(template: &Template) -> Result<Option<String>, TemplateError> {
+    vendor_data_of(&template.name, template.settings.as_ref())
+}
+
+/// [`settings_vendor_data`] for one settings object: a template's own, or a service's merged one.
+pub fn vendor_data_of(
+    template: &str,
+    settings: Option<&Value>,
+) -> Result<Option<String>, TemplateError> {
     use base64::Engine as _;
-    let Some(settings) = &template.settings else {
+    let Some(settings) = settings else {
         return Ok(None);
     };
     let text = serde_json::to_string(settings)
         .ok()
         .filter(|text| settings.is_object() && text.len() <= SETTINGS_MAX)
-        .ok_or_else(|| {
-            TemplateError::refused(format!("template {}: invalid settings", template.name))
-        })?;
+        .ok_or_else(|| TemplateError::refused(format!("template {template}: invalid settings")))?;
     let content = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     Ok(Some(format!(
         "#cloud-config\nwrite_files:\n- path: {GUEST_SETTINGS_PATH}\n  permissions: '0644'\n  encoding: b64\n  content: {content}\n"
     )))
+}
+
+/// The settings of one new service, as [`create_settings`] works them out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServiceSettings {
+    /// What the guest reads: the template's settings with the create's values in place of the defaults. `None` for
+    /// a template without settings.
+    pub merged: Option<Value>,
+    /// The values the create replaced, by key. `None` when it gave none.
+    pub replaced: Option<Map<String, Value>>,
+}
+
+/// The settings of one new service: the template's, with the values its `service_create` gave in `given` put in place
+/// of the defaults. Every refusal is in plain words and names the key:
+///
+/// - only a key the template lists in `createSettings` may be given;
+/// - a value has the JSON type of the template's default, and a whole number stays a whole number;
+/// - no string or key anywhere in a value holds a control character, and a value nests at most eight deep;
+/// - where the default is an `https://` address the value is one too, with a plain host and path: no user or password
+///   (`@`), no query, no fragment, nothing percent-encoded. Such a value decides where the machine sends a
+///   credential, so it is never taken loosely;
+/// - the merged object stays within the size a template's settings may have.
+pub fn create_settings(
+    template: &Template,
+    given: Option<&Value>,
+) -> Result<ServiceSettings, TemplateError> {
+    let name = &template.name;
+    let refused = |why: String| Err(TemplateError::refused(why));
+    let unchanged = || ServiceSettings {
+        merged: template.settings.clone(),
+        replaced: None,
+    };
+    let Some(given) = given else {
+        return Ok(unchanged());
+    };
+    let Some(given) = given.as_object() else {
+        return refused("settings: expected an object of setting names and values".into());
+    };
+    if given.is_empty() {
+        return Ok(unchanged());
+    }
+    let Some(defaults) = template
+        .settings
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|_| template.is_vm() && !template.create_settings.is_empty())
+    else {
+        return refused(format!(
+            "settings: template {name} lets a create set none (its createSettings lists none)"
+        ));
+    };
+    let mut merged = defaults.clone();
+    for (key, value) in given {
+        let Some(default) = defaults
+            .get(key)
+            .filter(|_| template.create_settings.iter().any(|listed| listed == key))
+        else {
+            let shown: String = key.chars().filter(|c| !c.is_control()).take(64).collect();
+            return refused(format!(
+                "settings.{shown}: template {name} does not let a create set it; it lets a create set {}",
+                template.create_settings.join(", ")
+            ));
+        };
+        let kind = json_kind(default);
+        if json_kind(value) != kind {
+            return refused(format!(
+                "settings.{key}: expected {kind}, the type of the template's default"
+            ));
+        }
+        if !plain_json(value, 0) {
+            return refused(format!(
+                "settings.{key}: a value holds no control character and nests at most eight deep"
+            ));
+        }
+        if default
+            .as_str()
+            .is_some_and(|default| default.starts_with("https://"))
+            && !value.as_str().is_some_and(https_address_ok)
+        {
+            return refused(format!(
+                "settings.{key}: expected an https address like the template's default, https://<host>/<path>, with a plain host name and path: no user or password (@), no query (?), no fragment (#) and nothing percent-encoded"
+            ));
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    let merged = Value::Object(merged);
+    if serde_json::to_string(&merged).map_or(true, |text| text.len() > SETTINGS_MAX) {
+        return refused(format!(
+            "settings: with these values the settings of template {name} pass 16KiB"
+        ));
+    }
+    Ok(ServiceSettings {
+        merged: Some(merged),
+        replaced: Some(given.clone()),
+    })
+}
+
+/// The JSON type of a value, in the words a refusal uses. A whole number and a number with a fraction are two types:
+/// a setting that counts something is not given `2.5`.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "true or false",
+        Value::Number(number) if number.is_u64() || number.is_i64() => "a whole number",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Whether no string and no key in `value` holds a control character, and it nests at most eight deep.
+fn plain_json(value: &Value, depth: usize) -> bool {
+    let plain = |text: &str| !text.chars().any(char::is_control);
+    match value {
+        Value::String(text) => plain(text),
+        Value::Array(items) => depth < 8 && items.iter().all(|item| plain_json(item, depth + 1)),
+        Value::Object(map) => {
+            depth < 8
+                && map
+                    .iter()
+                    .all(|(key, item)| plain(key) && plain_json(item, depth + 1))
+        }
+        _ => true,
+    }
+}
+
+/// Whether `text` is `https://<host>[:<port>][/<path>]` with a plain host and path. The host is letters, digits, dots
+/// and dashes, beginning and ending with a letter or a digit; the path is letters, digits and `. _ ~ - /`. So there is
+/// no `@` (a user or password, which would make the part before it something else than the host), no `?`, no `#`, no
+/// `%`, no space and no backslash.
+pub fn https_address_ok(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let edge = |byte: Option<u8>| byte.is_some_and(|b| b.is_ascii_alphanumeric());
+    text.len() <= 2048
+        && (1..=253).contains(&host.len())
+        && edge(host.bytes().next())
+        && edge(host.bytes().last())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        && !host.contains("..")
+        && port.is_none_or(|port| {
+            (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit())
+        })
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-' | b'/'))
+        && !path.contains("//")
+        && !path.split('/').any(|part| part == ".." || part == ".")
 }
 
 /// Whether the path is the root once repeated separators and `.` segments are dropped.

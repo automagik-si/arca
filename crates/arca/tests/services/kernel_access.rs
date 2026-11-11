@@ -91,6 +91,7 @@ fn the_plugin_refuses_a_record_that_gives_kernel_access_to_anything_else() {
         mac: None,
         user_data: None,
         vendor_data: None,
+        settings: None,
     });
     cases.push(("a virtual machine", vm));
     for (what, port, connect) in [
