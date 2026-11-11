@@ -38,7 +38,12 @@ async function fake(t, respond = reply, initialize = async () => {}) {
     res.end(typeof value === 'string' ? value : JSON.stringify(value));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => server.close(resolve)));
+  // A request the server never answers stays open until its reader gives up, and a test that has failed may never get
+  // there. Its connections are closed here, so the server always closes and the test process always ends.
+  t.after(() => new Promise((resolve) => {
+    server.closeAllConnections?.();
+    server.close(resolve);
+  }));
   config.devicesUrl = `http://127.0.0.1:${server.address().port}/reader-mcp`;
   return { config, calls, dir, server };
 }
@@ -222,11 +227,42 @@ const refusedUrls = [
 for (const url of allowedUrls) test(`URL permits ${url}`, () => assert.ok(validateDevicesUrl(url)));
 for (const url of refusedUrls) test(`URL refuses ${url}`, () => assert.equal(validateDevicesUrl(url), null));
 
+// The real timer, kept for until(): a test that owns the clock replaces the global one.
+const realSetTimeout = setTimeout;
+
+// For a test that owns the clock (`t.mock.timers`). Such a test may leave nothing of its cache running when it ends,
+// failed or not. The runner numbers a test's timers from one, and a timer is cleared by its number: when code of an
+// earlier test clears its deadline late, it clears the timer with that number in the test running now. So this hook
+// stops the cache and waits until its last device read has ended; what the cache does after that, clearing the read's
+// deadline included, is over before the next timer. Call it before fake(): hooks run in the order they were made, and
+// this one needs the server still there.
+function leavesNothingRunning(t) {
+  let cache;
+  let reading = 0;
+  t.after(async () => {
+    cache?.stop();
+    await until(() => reading === 0);
+    await new Promise((resolve) => realSetTimeout(resolve, 0));
+  });
+  return {
+    devices: (client) => ({
+      call(...args) {
+        reading++;
+        return client.call(...args).finally(() => { reading--; });
+      },
+    }),
+    cache(made) {
+      cache = made;
+      return made;
+    },
+  };
+}
+
 async function until(predicate, timeout = 1000) {
   const deadline = performance.now() + timeout;
   while (!predicate()) {
     assert.ok(performance.now() < deadline, 'timed out waiting for device phase');
-    await new Promise((resolve) => setTimeout(resolve, 2));
+    await new Promise((resolve) => realSetTimeout(resolve, 2));
   }
 }
 
@@ -308,10 +344,13 @@ test('one phase reads at most two phone_status calls and rotates', async (t) => 
 
 test('a timed-out phone_status holds that phone for at least sixty seconds', async (t) => {
   let clock = 1000;
-  const { config, calls } = await fake(t, (body) => body.params.name === 'phone_status'
-    ? new Promise((resolve) => setTimeout(() => resolve(reply(body)), 500))
+  // The first phone_status is never answered; the later ones are answered at once. No read here waits on a clock.
+  let hang = true;
+  const { config, calls } = await fake(t, (body) => body.params.name === 'phone_status' && hang
+    ? new Promise(() => {})
     : reply(body));
   const client = createDevicesClient(config);
+  const untimed = new AbortController().signal;
   const state = { lastFailureAt: new Map(), cursor: 0, now: () => clock };
   const statusCalls = () => calls.filter(({ body }) => body.params?.name === 'phone_status').length;
   // The deadline has to pass while phone_status is being read. A timer can pass before that read is even sent, on a
@@ -325,15 +364,16 @@ test('a timed-out phone_status holds that phone for at least sixty seconds', asy
   assert.equal(statusCalls(), 1);
   assert.equal(state.lastFailureAt.has('example-phone'), true);
   assert.equal(state.lastFailureAt.get('example-phone'), clock);
+  hang = false;
 
-  const second = await collectDevices(client, AbortSignal.timeout(1000), state);
+  const second = await collectDevices(client, untimed, state);
   assert.equal(second.devices, 'unreachable');
   assert.equal(statusCalls(), 1, 'the failed phone is skipped immediately');
   clock += 59_999;
-  await collectDevices(client, AbortSignal.timeout(1000), state);
+  await collectDevices(client, untimed, state);
   assert.equal(statusCalls(), 1, 'the phone is skipped just before sixty seconds');
   clock += 1;
-  const fourth = await collectDevices(client, AbortSignal.timeout(1000), state);
+  const fourth = await collectDevices(client, untimed, state);
   assert.equal(statusCalls(), 2, 'the phone is retried at sixty seconds');
   assert.equal(fourth.devices, 'ok');
   assert.equal(state.lastFailureAt.has('example-phone'), false);
@@ -387,6 +427,11 @@ test('a device phase is single-flight while its first list read is pending', asy
 });
 
 test('never-answering device server cannot block first Arca snapshot or polls and is aborted', async (t) => {
+  // The clock is the test's. On a real one "the polls do not wait for the devices" is a race between the polls and the
+  // device deadline, and a slow machine loses it. Here no time passes unless the test says so, so every poll below
+  // happens while the device read is unanswered and its 150 ms have not passed.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = leavesNothingRunning(t);
   const { config, server } = await fake(t);
   server.removeAllListeners('request');
   let requests = 0, closed = 0;
@@ -398,25 +443,37 @@ test('never-answering device server cannot block first Arca snapshot or polls an
   });
   let arcaReads = 0;
   const logs = [];
-  const start = performance.now();
-  const cache = createSnapshotCache({ async call(tool) { arcaReads++; return arca[tool]; } }, 10,
-    { devicesTimeoutMs: 150, log: (line) => logs.push(line) }, createDevicesClient(config));
-  t.after(() => cache.stop());
-  await until(() => cache.get().machine);
-  const elapsed = performance.now() - start;
-  assert.ok(elapsed < 100, `first snapshot took ${elapsed}ms`);
-  await until(() => arcaReads >= 18 && requests === 1);
-  assert.ok(performance.now() - start < 100, 'subsequent Arca polls must not wait for devices');
+  const cache = running.cache(createSnapshotCache({ async call(tool) { arcaReads++; return arca[tool]; } }, 10,
+    { devicesTimeoutMs: 150, log: (line) => logs.push(line) }, running.devices(createDevicesClient(config))));
+  await until(() => cache.get().machine && requests === 1);
+  const readsPerPoll = arcaReads;
+  // Nine more polls, 10 ms apart: 90 ms on the clock, and the device read still hangs. A poll is over when the cache
+  // holds a new snapshot; the next one is due 10 ms after that.
+  for (let poll = 2; poll <= 10; poll++) {
+    const before = cache.get();
+    t.mock.timers.tick(10);
+    await until(() => cache.get() !== before);
+  }
+  assert.equal(arcaReads, readsPerPoll * 10);
+  assert.equal(requests, 1, 'the polls went on without a second device read');
+  assert.equal(closed, 0, 'the device read is still unanswered');
+  assert.deepEqual(logs, []);
   assert.equal(cache.get().error, null);
   assert.equal(cache.get().devices, 'unavailable');
   assert.deepEqual(cache.get().phones, []);
-  await until(() => closed === 1);
+  // The device deadline passes at 150 ms and ends the read.
+  t.mock.timers.tick(60);
+  await until(() => closed === 1 && logs.length === 1);
   assert.deepEqual(logs, ['Arca canvas devices: unavailable']);
-  await until(() => requests >= 2);
+  // The next poll reads the devices again.
+  await until(() => {
+    t.mock.timers.tick(10);
+    return requests >= 2;
+  });
   cache.stop();
   await until(() => closed === requests);
   assert.deepEqual(logs, ['Arca canvas devices: unavailable']);
-  t.diagnostic(`first Arca snapshot ${elapsed.toFixed(1)}ms (<100ms); whole device deadline 150ms; all ${closed} requests closed`);
+  t.diagnostic(`${readsPerPoll * 10} Arca reads in 10 polls before the 150 ms device deadline; all ${closed} requests closed`);
 });
 
 test('missing reader token logs its setting once, and recovery changes the state', async (t) => {
@@ -437,25 +494,38 @@ test('missing reader token logs its setting once, and recovery changes the state
 });
 
 test('one overall deadline includes initialize and tools/call, aborting the unfinished request', async (t) => {
+  // The clock is the test's. Measured on a real one, the 100 ms can be over before initialize is answered on a slow
+  // machine, and then there is no second request to abort. Here 60 ms pass while initialize is being read and 40 ms
+  // while tools/call is. A deadline of its own for each request would leave tools/call 60 ms more, and it is never
+  // answered: only one deadline over both requests ends it here.
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const running = leavesNothingRunning(t);
   const { config, server } = await fake(t);
   server.removeAllListeners('request');
   let requests = 0, closed = 0;
+  let answerInitialize;
   server.on('request', async (req, res) => {
     requests++;
     let data = '';
     for await (const chunk of req) data += chunk;
     const body = JSON.parse(data);
-    const timer = setTimeout(() => res.end(JSON.stringify(body.method === 'initialize'
-      ? { jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25' } } : reply(body))), 60);
-    res.on('close', () => { clearTimeout(timer); closed++; });
+    res.on('close', () => { closed++; });
+    // initialize is answered when the test says so, tools/call never.
+    if (body.method === 'initialize') {
+      answerInitialize = () => res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25' } }));
+    }
   });
   const logs = [];
-  const start = performance.now();
-  const cache = createSnapshotCache(arcaClient, 10000,
-    { devicesTimeoutMs: 100, log: (line) => logs.push(line) }, createDevicesClient(config));
-  t.after(() => cache.stop());
+  const cache = running.cache(createSnapshotCache(arcaClient, 10000,
+    { devicesTimeoutMs: 100, log: (line) => logs.push(line) }, running.devices(createDevicesClient(config))));
+  await until(() => answerInitialize);
+  t.mock.timers.tick(60);
+  assert.equal(requests, 1);
+  answerInitialize();
+  await until(() => requests === 2);
+  assert.deepEqual(logs, [], 'initialize was answered inside the deadline');
+  t.mock.timers.tick(40);
   await until(() => logs.length === 1 && closed === 2);
-  assert.ok(performance.now() - start < 180, 'deadline must cover both requests together');
   assert.equal(requests, 2);
   assert.equal(cache.get().devices, 'unavailable');
   assert.equal(cache.get().error, null);
