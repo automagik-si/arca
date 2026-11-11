@@ -1744,6 +1744,14 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
     })
 }
 
+/// The fingerprint of the image an instance was created from, as Incus records it on the instance
+/// (`volatile.base_image`): 64 hex digits. `None` when the row carries none.
+pub fn base_image(row: &Value) -> Option<&str> {
+    row["config"]["volatile.base_image"]
+        .as_str()
+        .filter(|image| image.len() == 64 && image.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
 /// A project instance with no service record.
 pub fn unknown_view(row: &Value) -> Option<Value> {
     let name = row["name"].as_str()?;

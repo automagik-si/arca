@@ -2425,7 +2425,13 @@ fn service_status_params_base() -> Value {
 }
 
 fn service_status_result() -> Value {
-    service_view_schema()
+    let mut view = service_view_schema();
+    view["properties"]["baseImage"] = json!({
+        "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
+        "maxLength": 64,
+        "type": "string"
+    });
+    view
 }
 
 /// A short line for a successful `service_logs`.

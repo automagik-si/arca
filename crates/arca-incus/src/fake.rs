@@ -813,7 +813,8 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
     };
     if let Some((status, body)) = service_response(shared, &request) {
         record(shared, &request, status);
-        let _ = respond(&mut stream, status, reason(status), "", &body);
+        let extra = file_headers(shared, &request, status);
+        let _ = respond(&mut stream, status, reason(status), &extra, &body);
         drain(&mut stream);
         return;
     }
@@ -2925,8 +2926,12 @@ struct ServiceFake {
     calls: Vec<ServiceRequest>,
     recordings: BTreeMap<String, Vec<u8>>,
     files: BTreeMap<String, Vec<u8>>,
-    /// How many file writes to a virtual machine still fail, as they do until its guest agent runs.
+    /// How many file requests to a virtual machine still fail, as they do until its guest agent runs.
     agent_unready: u32,
+    /// The type, mode, uid and gid each file was written with, as the request's headers gave them.
+    file_meta: BTreeMap<String, [String; 4]>,
+    /// Whether a directory request for a path that exists is refused. Incus 7.6 answers it with success.
+    refuse_existing_directory: bool,
 }
 
 /// Request evidence for tests only; bodies may contain test secrets, so this has no Debug implementation.
@@ -2973,10 +2978,62 @@ impl FakeIncus {
     pub fn service_files(&self) -> BTreeMap<String, Vec<u8>> {
         lock(&self.shared.service).files.clone()
     }
-    /// Makes the next `times` file writes to a virtual machine fail, as Incus fails them while the guest agent has
+    /// Makes the next `times` file requests to a virtual machine fail, as Incus fails them while the guest agent has
     /// not started yet.
     pub fn set_guest_agent_unready(&self, times: u32) {
         lock(&self.shared.service).agent_unready = times;
+    }
+    /// Makes a directory request for a path that already exists fail. Incus 7.6 answers one with success; this is a
+    /// server that does not.
+    pub fn set_refuse_existing_directory(&self, refuse: bool) {
+        lock(&self.shared.service).refuse_existing_directory = refuse;
+    }
+    /// Puts a file or a directory into an instance's guest as something inside the guest made it: `kind` is `file` or
+    /// `directory`, and `mode` and `owner` (its uid; its group is root's) are what a read of it then reports.
+    pub fn put_guest_file(
+        &self,
+        project: &str,
+        name: &str,
+        path: &str,
+        kind: &str,
+        mode: &str,
+        owner: u32,
+    ) {
+        let mut service = lock(&self.shared.service);
+        let key = format!("{project}/{name}:{path}");
+        service.files.insert(key.clone(), Vec::new());
+        service.file_meta.insert(
+            key,
+            [
+                kind.to_string(),
+                mode.to_string(),
+                owner.to_string(),
+                "0".to_string(),
+            ],
+        );
+    }
+}
+
+/// The headers Incus answers a file read with: the file's type, mode and owner. Empty for every other answer.
+fn file_headers(shared: &Shared, request: &Request, status: u16) -> String {
+    if request.method != "GET" || status != 200 || !request.path().ends_with("/files") {
+        return String::new();
+    }
+    let segments: Vec<&str> = request.path().split('/').collect();
+    let ["", "1.0", "instances", name, "files"] = segments.as_slice() else {
+        return String::new();
+    };
+    let query = request.target.split_once('?').map_or("", |(_, q)| q);
+    let project = query_param(query, "project").unwrap_or(DEFAULT_PROJECT);
+    let path = crate::read::percent_decode(query_param(query, "path").unwrap_or(""));
+    match lock(&shared.service)
+        .file_meta
+        .get(&format!("{project}/{name}:{path}"))
+    {
+        Some([kind, mode, uid, gid]) => format!(
+            "X-Incus-type: {kind}\r\nX-Incus-mode: {mode}\r\nX-Incus-uid: {uid}\r\nX-Incus-gid: {gid}\r\n"
+        ),
+        None => String::new(),
     }
 }
 
@@ -3032,9 +3089,11 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
     if rest == ["files"] {
         let path = crate::read::percent_decode(query_param(query, "path").unwrap_or(""));
         let key = format!("{project}/{name}:{path}");
-        // A virtual machine takes a file through its guest agent only: not while it is stopped, and not before the
-        // agent runs.
-        if request.method == "POST" && store.objects[index].body["type"] == "virtual-machine" {
+        // A virtual machine takes or gives a file through its guest agent only: not while it is stopped, and not
+        // before the agent runs.
+        if matches!(request.method.as_str(), "POST" | "GET")
+            && store.objects[index].body["type"] == "virtual-machine"
+        {
             if store.objects[index].body["status"] != "Running" {
                 return Some(encoded(500, "Instance is not running"));
             }
@@ -3045,6 +3104,28 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
         }
         return Some(match request.method.as_str() {
             "POST" => {
+                let header = |name: &str| request.header(name).unwrap_or("").to_string();
+                let directory = header("x-incus-type") == "directory";
+                if directory && service.files.contains_key(&key) {
+                    // Incus leaves a directory that exists as it is and answers with success.
+                    return Some(if service.refuse_existing_directory {
+                        encoded(500, "file exists")
+                    } else {
+                        (200, b"{}".to_vec())
+                    });
+                }
+                // Incus sets the mode and the owner of a file it creates, and leaves those of one that exists.
+                if !service.files.contains_key(&key) {
+                    service.file_meta.insert(
+                        key.clone(),
+                        [
+                            header("x-incus-type"),
+                            header("x-incus-mode"),
+                            header("x-incus-uid"),
+                            header("x-incus-gid"),
+                        ],
+                    );
+                }
                 service.files.insert(key, request.body.clone());
                 (200, b"{}".to_vec())
             }
@@ -3055,6 +3136,7 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
                 .map_or_else(|| encoded(404, "not found"), |bytes| (200, bytes)),
             "DELETE" => {
                 service.files.remove(&key);
+                service.file_meta.remove(&key);
                 (200, b"{}".to_vec())
             }
             _ => encoded(405, "method"),

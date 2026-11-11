@@ -4638,10 +4638,14 @@ impl ToolHandler for ServiceHandler {
                     .into_iter()
                     .find(|(_, config)| config.name == name);
                 if let Some((_, config)) = record {
-                    return Ok(crate::service::view(
-                        &config,
-                        service_live_in(&rows, &config.project, &config.instance),
-                    ));
+                    let live = service_live_in(&rows, &config.project, &config.instance);
+                    let mut view = crate::service::view(&config, live);
+                    // The image the instance was made from, as Incus recorded it: a template that names an image
+                    // by an alias does not say which build that was.
+                    if let Some(image) = live.and_then(crate::service::base_image) {
+                        view["baseImage"] = json!(image);
+                    }
+                    return Ok(view);
                 }
                 if let Some(row) = rows.iter().find(|row| {
                     row["name"].as_str()

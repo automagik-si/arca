@@ -1051,14 +1051,25 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   script or setting applies to a machine created after the change.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
-  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value. A
-  virtual machine whose template declares secrets is created stopped.
+  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
+  carriage return before a line feed is dropped, and a carriage return alone is refused. A virtual machine whose template
+  declares secrets is created stopped. That fails closed and is not a guarantee that it never boots without them: a
+  machine with `boot.autostart` that Incus starts by itself before the first `instance_start` boots with no secret file,
+  and what runs in it must wait for the file.
 - The channel is Incus's file request, which Incus hands to the guest agent: after `instance_start` or `instance_restart`
   has left the machine running, Arca reads each stored value and sends `POST /1.0/instances/<name>/files?path=...` with the
   value as the request body. First `/etc/arca-secrets`, a directory of root's with mode 0700; then one file per secret in
   it, named by the secret, of root's with mode 0600. The directory comes first because Incus makes a new file before it
-  sets its mode, and only root enters the directory. A start of a machine that already runs writes them again and restarts
-  nothing, which is how a new value arrives without an approval.
+  sets its mode, and only root enters the directory. The directory is read before it is made (`GET` of the same path:
+  its type, mode and owner are in the answer's headers), so one an earlier start made is left alone and nothing depends
+  on how Incus answers a request to make a directory that exists. Anything else at the path, a file, a link, or a
+  directory with another mode or owner, refuses the start's secrets in words and nothing is written under it. A start of
+  a machine that already runs writes the files again and restarts nothing, which is how a new value arrives without an
+  approval.
+- Each stored value is read by the provider's own rule for a secret file and by nothing looser
+  (`arca_providers::incus::read_entry_secret`): the reference names this entry's secret or a shared one, the secrets
+  directory and every directory on the way are real, private and this process's own, the file is a regular file of this
+  process's with mode 0600 and at most 64KiB, and the file that was checked is the file that is read.
 - Why it is safe: the value is in two places at rest, Arca's secret store and the guest's own disk, and passes through
   Incus as a request body, which Incus neither stores nor logs (its lifecycle event names the path). It is not in the
   instance config, the desired state, the effect journal, the exec audit or any answer. The instance action journal gets
@@ -1085,6 +1096,8 @@ Incus's `fileSFTPPost` in `cmd/incusd/instance_file.go` for the order of create 
 the fake received is read: a secret is in the body of its own file request and nowhere else),
 `a_secret_set_on_a_running_vm_applies_at_its_next_start_which_never_restarts_it`,
 `a_guest_agent_that_is_not_up_yet_is_waited_for_and_one_that_never_answers_is_said_in_words`,
+`the_guest_directory_is_read_before_it_is_made_and_one_that_is_not_private_is_refused`,
+`a_stored_secret_is_read_by_the_providers_rule_and_a_key_with_crlf_lines_is_stored_with_line_feeds`,
 `a_vm_template_takes_a_first_boot_script_settings_and_secrets_and_no_other_kind_does` and
 `the_create_requests_of_an_oci_a_system_and_a_plain_vm_template_are_the_golden_ones`, whose golden file was written by the
 kernel before this rule. The fake refuses a file for a virtual machine that is stopped or whose agent is not up, as Incus
@@ -1270,6 +1283,11 @@ must run before any live write.
   QEMU has no virtio-9p (the config share is the `agent:config` drive of Rule 59), and its guest agent then takes a file
   request for `/etc/arca-secrets` with the mode and owner asked for (Rule 68). The fake models the agent only as ready or
   not ready.
+- A file `GET` of a directory in a virtual machine's guest answers 200 with `X-Incus-type: directory` and the directory's
+  `X-Incus-mode`, `X-Incus-uid` and `X-Incus-gid`, and 404 when nothing is at the path; a guest whose agent is not up
+  answers neither (Rule 61). Read from `fileSFTPGet` in Incus 7.6's `cmd/incusd/instance_file.go`. A directory `POST`
+  for a path that exists is answered with success there (`fileSFTPPost`); Arca no longer sends one, and the fake can
+  refuse it to show that.
 - An instance's config PATCH that names one `user.*` key leaves every other key, device and profile as it was, does not
   restart the instance, and is refused with 412 under a stale `If-Match` (Rule 52). The adoption's Mark step relies on the same
   behaviour for a stopped instance; the import sends it to a running one.

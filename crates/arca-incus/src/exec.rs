@@ -266,6 +266,17 @@ impl ServiceFile {
     }
 }
 
+/// What a read of [`GUEST_SECRETS_DIR`] in a guest found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestSecretsDir {
+    /// Nothing is at the path.
+    Missing,
+    /// A directory of root's that only root enters: mode 0700, uid 0, gid 0.
+    Private,
+    /// Something else is at the path: a file, a link, or a directory with another owner or mode.
+    NotPrivate,
+}
+
 pub fn valid_operation_id(id: &str) -> bool {
     operation_id(id)
 }
@@ -372,6 +383,48 @@ impl UnixIncusWriter {
         }
         Ok(framed.body)
     }
+    /// Reads what is at [`GUEST_SECRETS_DIR`] in this entry's freshly checked instance: its type, mode and owner, from
+    /// the answer's headers. The answer's body, a listing of names, is not read. An answer that is neither a success
+    /// nor "not found" is an error: a guest whose agent does not run yet answers so.
+    pub fn guest_secrets_dir(&self, owned: &Owned) -> Result<GuestSecretsDir, IncusError> {
+        let path = target(owned)?;
+        if owned.entry() != self.entry() {
+            return Err(refused());
+        }
+        let fresh = self.read_owned(owned.target())?;
+        if fresh.uuid() != owned.uuid() || fresh.tombstone().is_some() {
+            return Err(refused());
+        }
+        let path = format!("{path}/files?project={SERVICE_PROJECT}&path={GUEST_SECRETS_DIR}");
+        check_path(&path)?;
+        let request = format!("GET {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n");
+        let framed = exchange_capped(
+            &self.socket,
+            self.request_timeout(Duration::from_secs(10)),
+            request.as_bytes(),
+            OUTPUT_CAP,
+        )?;
+        match framed.status {
+            404 => Ok(GuestSecretsDir::Missing),
+            200 => {
+                // Incus prints the mode as four octal digits; a leading zero more or less is the same mode.
+                let mode = framed
+                    .header("x-incus-mode")
+                    .and_then(|mode| u32::from_str_radix(mode, 8).ok());
+                let private = framed.header("x-incus-type") == Some("directory")
+                    && mode == Some(0o700)
+                    && framed.header("x-incus-uid") == Some("0")
+                    && framed.header("x-incus-gid") == Some("0");
+                Ok(if private {
+                    GuestSecretsDir::Private
+                } else {
+                    GuestSecretsDir::NotPrivate
+                })
+            }
+            _ => Err(bad()),
+        }
+    }
+
     /// The payload is sent only as the files request body, with root ownership and mode 0600. A directory destination
     /// takes no payload and is made with mode 0700; Incus leaves one that exists as it is.
     pub fn write_service_file(

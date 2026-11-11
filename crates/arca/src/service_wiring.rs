@@ -352,9 +352,18 @@ impl ServiceHandler {
             }
             // A virtual machine's secret is a file in its guest, never an environment value, so it may have line
             // breaks: a private key in PEM form is several lines.
+            // A key file saved on another system ends each line with a carriage return and a line feed: the
+            // pair is stored as one line feed.
             let lines = cfg.vm.is_some();
-            let value = args["value"]
-                .as_str()
+            let given = args["value"].as_str().map(|given| {
+                if lines {
+                    given.replace("\r\n", "\n")
+                } else {
+                    given.to_owned()
+                }
+            });
+            let value = given
+                .as_deref()
                 .filter(|s| {
                     (8..=4096).contains(&s.chars().count())
                         && !s.chars().any(|c| c.is_control() && !(lines && c == '\n'))

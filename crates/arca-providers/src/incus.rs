@@ -827,12 +827,7 @@ impl IncusProvider {
     /// Whether the secrets directory is a real directory, not a symlink, owned by this process, and private: no group or other
     /// bits. While it is not, no reference resolves and no secret is known, so nothing is read from it.
     fn secrets_root_private(&self) -> bool {
-        fs::symlink_metadata(&self.secrets_dir).is_ok_and(|meta| {
-            meta.is_dir()
-                && !meta.file_type().is_symlink()
-                && meta.uid() == self.uid
-                && meta.mode() & 0o077 == 0
-        })
+        secrets_root_private(&self.secrets_dir, self.uid)
     }
 
     /// The content of the secret a reference names. The name is checked as a plain path. The secrets directory must be private,
@@ -856,58 +851,7 @@ impl IncusProvider {
 
     /// Reads a usable secret file without an entry check, including during the directory walk.
     fn read_secret_file(&self, reference: &str) -> Result<String, EffectRefusal> {
-        let name = reference
-            .strip_prefix(SECRET_PREFIX)
-            .filter(|name| valid_secret_name(name))
-            .ok_or_else(|| {
-                EffectRefusal::Provider("a secret reference names no valid secret".to_string())
-            })?;
-        let unavailable = || EffectRefusal::Provider("a secret is not available".to_string());
-        if !self.secrets_root_private() {
-            return Err(unavailable());
-        }
-        let parts: Vec<&str> = name.split('/').collect();
-        if parts.iter().any(|part| part.is_empty()) {
-            return Err(unavailable());
-        }
-        let mut path = self.secrets_dir.clone();
-        for (index, part) in parts.iter().enumerate() {
-            path.push(part);
-            let meta = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
-            if meta.file_type().is_symlink() {
-                return Err(unavailable());
-            }
-            if index + 1 < parts.len() {
-                let private = meta.is_dir() && meta.uid() == self.uid && meta.mode() & 0o077 == 0;
-                if !private {
-                    return Err(unavailable());
-                }
-                continue;
-            }
-            if !meta.is_file()
-                || (meta.mode() & 0o777) != 0o600
-                || meta.uid() != self.uid
-                || meta.len() > SECRET_MAX_BYTES
-            {
-                return Err(unavailable());
-            }
-            let opened = File::open(&path).map_err(|_| unavailable())?;
-            let opened_meta = opened.metadata().map_err(|_| unavailable())?;
-            if opened_meta.dev() != meta.dev() || opened_meta.ino() != meta.ino() {
-                return Err(unavailable());
-            }
-            let mut text = String::new();
-            opened
-                .take(SECRET_MAX_BYTES + 1)
-                .read_to_string(&mut text)
-                .map_err(|_| unavailable())?;
-            let len = text.len() as u64;
-            if len > SECRET_MAX_BYTES {
-                return Err(unavailable());
-            }
-            return Ok(text);
-        }
-        Err(unavailable())
+        read_secret_file(&self.secrets_dir, self.uid, reference)
     }
 
     /// Shared and own usable secrets, as (reference, content). Unusable files are skipped.
@@ -1889,6 +1833,98 @@ fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
         u32::MAX << (32 - length)
     };
     (u32::from(a.0) & mask) == (u32::from(b.0) & mask)
+}
+
+/// Whether `secrets_dir` is a real directory, not a symlink, owned by `uid`, and private: no group or other bits.
+fn secrets_root_private(secrets_dir: &Path, uid: u32) -> bool {
+    fs::symlink_metadata(secrets_dir).is_ok_and(|meta| {
+        meta.is_dir()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == uid
+            && meta.mode() & 0o077 == 0
+    })
+}
+
+/// The content of the secret `reference` names, read for `entry` by the provider's own rules: the name is a valid secret
+/// name, the secret is the entry's own or a shared one, and the file passes every check [`read_secret_file`] makes for the
+/// user this process runs as. The error is a fixed reason and never holds the value. A caller outside the effect journal
+/// (a virtual machine's secrets, written into its guest) reads a secret through this and through nothing looser.
+pub fn read_entry_secret(
+    secrets_dir: &Path,
+    entry: &EntryId,
+    reference: &str,
+) -> Result<String, &'static str> {
+    let name = reference
+        .strip_prefix(SECRET_PREFIX)
+        .filter(|name| valid_secret_name(name))
+        .ok_or("a secret reference names no valid secret")?;
+    if !may_use_secret(entry, name) {
+        return Err("a secret reference names another entry's secret");
+    }
+    let uid = process_uid().map_err(|_| "this process's user could not be read")?;
+    read_secret_file(secrets_dir, uid, reference).map_err(|_| "a secret is not available")
+}
+
+/// Reads a usable secret file under `secrets_dir` without an entry check. The secrets directory must be private, and so
+/// must each directory on the way: a real directory, owned by `uid`, with no group or other bits. The file must be a
+/// regular file, mode 0600, owned by `uid`, and small, and the file opened must be the one that was checked.
+fn read_secret_file(
+    secrets_dir: &Path,
+    uid: u32,
+    reference: &str,
+) -> Result<String, EffectRefusal> {
+    let name = reference
+        .strip_prefix(SECRET_PREFIX)
+        .filter(|name| valid_secret_name(name))
+        .ok_or_else(|| {
+            EffectRefusal::Provider("a secret reference names no valid secret".to_string())
+        })?;
+    let unavailable = || EffectRefusal::Provider("a secret is not available".to_string());
+    if !secrets_root_private(secrets_dir, uid) {
+        return Err(unavailable());
+    }
+    let parts: Vec<&str> = name.split('/').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(unavailable());
+    }
+    let mut path = secrets_dir.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        path.push(part);
+        let meta = fs::symlink_metadata(&path).map_err(|_| unavailable())?;
+        if meta.file_type().is_symlink() {
+            return Err(unavailable());
+        }
+        if index + 1 < parts.len() {
+            let private = meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0;
+            if !private {
+                return Err(unavailable());
+            }
+            continue;
+        }
+        if !meta.is_file()
+            || (meta.mode() & 0o777) != 0o600
+            || meta.uid() != uid
+            || meta.len() > SECRET_MAX_BYTES
+        {
+            return Err(unavailable());
+        }
+        let opened = File::open(&path).map_err(|_| unavailable())?;
+        let opened_meta = opened.metadata().map_err(|_| unavailable())?;
+        if opened_meta.dev() != meta.dev() || opened_meta.ino() != meta.ino() {
+            return Err(unavailable());
+        }
+        let mut text = String::new();
+        opened
+            .take(SECRET_MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| unavailable())?;
+        let len = text.len() as u64;
+        if len > SECRET_MAX_BYTES {
+            return Err(unavailable());
+        }
+        return Ok(text);
+    }
+    Err(unavailable())
 }
 
 /// The entry a secret name belongs to: its first segment, when that parses as an entry id and another segment follows.

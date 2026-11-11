@@ -2281,15 +2281,19 @@ virtual machine's Incus config. A template that is edited later applies to machi
 **Secrets of a virtual machine.** A container's secret is an environment value in its Incus config. A virtual
 machine's is never there. The steps:
 
-1. `service_create` creates a machine whose template declares secrets **stopped**, so it never boots without them.
+1. `service_create` creates a machine whose template declares secrets **stopped**. This fails closed; it is not a
+   promise that the machine never boots without them. A template with `autostart` is started by Incus itself when the
+   host restarts, also before the first `instance_start`: the machine then boots with no secret file, and what runs in
+   it has to wait for one (the runner pool registers nothing until its credential is there).
 2. `service_secret_set` with `{"name", "key", "value"}` stores the value in Arca's private `secrets/` directory, as for
    a container, and answers `{"ok": true}`. The value is 8 to 4096 characters; for a virtual machine it may have line
-   breaks (a private key in PEM form is several lines), and no other control character. Nothing is sent to the machine
-   yet.
+   breaks (a private key in PEM form is several lines; a file with Windows line endings is stored with plain line
+   breaks), and no other control character. Nothing is sent to the machine yet.
 3. `instance_start` with `{"project": "arcak-svc", "instance": "<name>"}` starts the machine, waits for its guest agent
    (up to 120 seconds: a new machine boots first) and writes each stored secret into the guest as the file
-   `/etc/arca-secrets/<KEY>`. The directory is root's with mode 0700 and each file is root's with mode 0600. The answer
-   names the secrets it wrote.
+   `/etc/arca-secrets/<KEY>`. The directory is root's with mode 0700 and each file is root's with mode 0600. Arca
+   makes the directory once and leaves it alone afterwards; if something else is at that path (a directory others can
+   enter, or a file), nothing is written and the answer says so. The answer names the secrets it wrote.
 
 A new value: run `service_secret_set` again, then `instance_start` again. A start of a machine that is already running
 restarts nothing and writes the files again, so a secret is replaced without an approval and without interrupting the
@@ -2307,6 +2311,10 @@ Where a virtual machine's secret is, and is not:
 - It is not in the instance's config in Incus (so `incus config show` does not show it), in Arca's desired state, in
   the effect journal, in `instance-actions.jsonl` (which names the secrets written), in `exec-audit.jsonl`, or in any
   answer or refusal. `service_logs` replaces a stored value with `[secret]` when it fits on one line.
+
+**Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
+does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the
+instance when it created it, so the build can be looked up, and two machines compared, afterwards.
 
 ### What every virtual machine carries
 

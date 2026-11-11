@@ -506,6 +506,158 @@ fn a_guest_agent_that_is_not_up_yet_is_waited_for_and_one_that_never_answers_is_
 }
 
 #[test]
+fn the_guest_directory_is_read_before_it_is_made_and_one_that_is_not_private_is_refused() {
+    let rig = pool_rig();
+    rig.call("service_create", json!({"name":"p1","template":"pool"}))
+        .expect("create");
+    rig.call(
+        "service_secret_set",
+        json!({"name":"p1","key":"API_TOKEN","value":TOKEN}),
+    )
+    .expect("set");
+    let life = life(&rig, Duration::from_millis(200));
+    start(&life, "p1").expect("the first start makes the directory");
+    let directory_posts = |rig: &Rig| {
+        rig.fake
+            .service_requests()
+            .iter()
+            .filter(|request| {
+                request.method == "POST" && request.path.ends_with("path=/etc/arca-secrets")
+            })
+            .count()
+    };
+    assert_eq!(directory_posts(&rig), 1);
+    // A second start finds the directory and does not ask for it again, so nothing depends on how Incus answers a
+    // request to make a directory that exists: this server would refuse one.
+    rig.fake.set_refuse_existing_directory(true);
+    start(&life, "p1").expect("a start with the directory in place");
+    assert_eq!(directory_posts(&rig), 1);
+    assert_eq!(guest_file(&rig, "p1", "API_TOKEN").as_deref(), Some(TOKEN));
+    // The read asks for the directory alone and carries no secret.
+    let reads: Vec<_> = rig
+        .fake
+        .service_requests()
+        .into_iter()
+        .filter(|request| request.method == "GET" && request.path.contains("/files?"))
+        .collect();
+    assert_eq!(reads.len(), 2);
+    assert!(
+        reads
+            .iter()
+            .all(|request| request.path.ends_with("path=/etc/arca-secrets")
+                && request.body.is_empty())
+    );
+
+    // Something else at the path (a directory others can enter, another owner's, or a file) is never written under.
+    for (name, kind, mode, uid) in [
+        ("p2", "directory", "0755", 0),
+        ("p3", "directory", "0700", 1000),
+        ("p4", "file", "0600", 0),
+    ] {
+        rig.call("service_create", json!({"name":name,"template":"pool"}))
+            .expect("create");
+        rig.call(
+            "service_secret_set",
+            json!({"name":name,"key":"API_TOKEN","value":TOKEN}),
+        )
+        .expect("set");
+        rig.fake
+            .put_guest_file(PROJECT, name, "/etc/arca-secrets", kind, mode, uid);
+        let Err(CallError::Refused { code, message }) = start(&life, name) else {
+            panic!("a refusal");
+        };
+        assert_eq!(code, "InstanceSecretsNotWritten");
+        assert!(
+            message.contains("/etc/arca-secrets in the guest is not a directory that only root can enter (mode 0700, owner root), and Arca did not make it so; nothing was written"),
+            "{message}"
+        );
+        assert_eq!(guest_file(&rig, name, "API_TOKEN"), None);
+    }
+}
+
+#[test]
+fn a_stored_secret_is_read_by_the_providers_rule_and_a_key_with_crlf_lines_is_stored_with_line_feeds()
+ {
+    let rig = pool_rig();
+    rig.call("service_create", json!({"name":"p1","template":"pool"}))
+        .expect("create");
+    // A key file saved with carriage returns: the guest gets it with line feeds, and no carriage return is stored.
+    rig.call(
+        "service_secret_set",
+        json!({"name":"p1","key":"SIGNING_KEY","value":KEY.replace('\n', "\r\n")}),
+    )
+    .expect("set");
+    // A lone carriage return is still a control character.
+    assert!(matches!(
+        rig.call(
+            "service_secret_set",
+            json!({"name":"p1","key":"API_TOKEN","value":"a-return\rin-the-value"})
+        ),
+        Err(CallError::Invalid(_))
+    ));
+    let life = life(&rig, Duration::from_millis(200));
+    start(&life, "p1").expect("start");
+    assert_eq!(guest_file(&rig, "p1", "SIGNING_KEY").as_deref(), Some(KEY));
+
+    // The stored file is read by the provider's rule. A file that others can read is not a secret any more, and a
+    // link is never followed: the start says the secret could not be read and writes nothing new.
+    let record: service::ServiceConfig =
+        serde_json::from_value(entry(&rig, "service-p1").config).expect("the record");
+    let stored = rig.dir.join("secrets").join(
+        record.secret_refs["SIGNING_KEY"]
+            .strip_prefix("arca-secret:")
+            .expect("a reference"),
+    );
+    let refused = |rig: &Rig| {
+        let Err(CallError::Refused { code, message }) = start(&life, "p1") else {
+            panic!("a refusal");
+        };
+        assert_eq!(code, "InstanceSecretsNotWritten");
+        assert!(
+            message.contains(
+                "the stored secret SIGNING_KEY could not be read (a secret is not available)"
+            ),
+            "{message}"
+        );
+        assert!(!holds_a_secret(&message));
+        let _ = rig;
+    };
+    fs::set_permissions(&stored, fs::Permissions::from_mode(0o640)).expect("chmod");
+    refused(&rig);
+    fs::set_permissions(&stored, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let aside = stored.with_file_name("aside");
+    fs::rename(&stored, &aside).expect("aside");
+    std::os::unix::fs::symlink(&aside, &stored).expect("a link");
+    refused(&rig);
+    fs::remove_file(&stored).expect("unlink");
+    fs::rename(&aside, &stored).expect("back");
+    // Its directory must be private too.
+    let dir = stored.parent().expect("the service's directory");
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o750)).expect("chmod");
+    refused(&rig);
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+    // Another service's secret is never written into this machine, whatever the record names.
+    rig.call("service_create", json!({"name":"p2","template":"pool"}))
+        .expect("create");
+    rig.call(
+        "service_secret_set",
+        json!({"name":"p2","key":"API_TOKEN","value":TOKEN}),
+    )
+    .expect("set");
+    let other: service::ServiceConfig =
+        serde_json::from_value(entry(&rig, "service-p2").config).expect("the record");
+    assert_eq!(
+        arca_providers::incus::read_entry_secret(
+            &rig.dir.join("secrets"),
+            &arca_kernel::desired::EntryId("service-p1".into()),
+            &other.secret_refs["API_TOKEN"],
+        ),
+        Err("a secret reference names another entry's secret")
+    );
+    start(&life, "p1").expect("the secret is readable again");
+}
+
+#[test]
 fn a_vm_without_secrets_and_a_container_start_as_before_and_a_start_writes_nothing_into_them() {
     let rig = pool_rig();
     let created = rig
@@ -520,6 +672,20 @@ fn a_vm_without_secrets_and_a_container_start_as_before_and_a_start_writes_nothi
             .keys()
             .all(|key| !key.starts_with("cloud-init."))
     );
+    // service_status names the image build the machine was made from once Incus has recorded it: the template names
+    // an alias, which says nothing about the build.
+    let status = |rig: &Rig| {
+        rig.call("service_status", json!({"name":"ws1"}))
+            .expect("status")
+    };
+    assert!(status(&rig).get("baseImage").is_none());
+    let fingerprint = "ab".repeat(32);
+    rig.edit(
+        "PATCH",
+        &format!("/1.0/instances/ws1?project={PROJECT}"),
+        json!({"config": {"volatile.base_image": fingerprint}}),
+    );
+    assert_eq!(status(&rig)["baseImage"], json!(fingerprint));
     // Its record is the one an earlier kernel wrote: no key for the script or the settings.
     let record = entry(&rig, "service-ws1").config;
     assert_eq!(record["vm"], json!({"rootSize":"20GiB","mac":null}));

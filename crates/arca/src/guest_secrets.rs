@@ -2,7 +2,8 @@
 //!
 //! A container's secret reaches it as an environment value in its Incus config. A virtual machine's never does: its
 //! Incus config, the desired state and the effect journal hold a reference at most. The value is read from the secret
-//! store (the private files `service_secret_set` writes under `<stateDir>/secrets`) and sent as the body of an Incus
+//! store (the private files `service_secret_set` writes under `<stateDir>/secrets`) by the provider's own rule
+//! (`arca_providers::incus::read_entry_secret`) and sent as the body of an Incus
 //! file request, which Incus hands to the guest agent: `/etc/arca-secrets` (root's, mode 0700) and one file per secret
 //! in it, named by the secret (root's, mode 0600). The files are on the guest's own disk, so a guest that restarts by
 //! itself still has them; `instance_start` and `instance_restart` write them again, which is how a new value arrives.
@@ -11,16 +12,14 @@
 //! instance is this entry's own by its journalled uuid, and its outcome is a line of the instance action journal that
 //! names the secrets and never a value.
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arca_incus::exec::{GUEST_SECRETS_DIR, SecretName, ServiceFile};
+use arca_incus::exec::{GUEST_SECRETS_DIR, GuestSecretsDir, SecretName, ServiceFile};
 use arca_incus::{ProjectFamily, UnixIncusWriter};
 use arca_kernel::desired::EntryId;
 use arca_kernel::ownership::{IncusKind, ObjectRef};
-use arca_providers::incus::SECRET_PREFIX;
+use arca_providers::incus::read_entry_secret;
 
 use crate::config::NodeConfig;
 use crate::kernel::Kernel;
@@ -32,8 +31,6 @@ const AGENT_WAIT: Duration = Duration::from_secs(120);
 const AGENT_PAUSE: Duration = Duration::from_secs(3);
 /// The time one file request may take.
 const REQUEST_BUDGET: Duration = Duration::from_secs(15);
-/// The largest secret file read from the store, in bytes.
-const SECRET_MAX_BYTES: u64 = 64 * 1024;
 
 /// Writes a virtual-machine service's secrets into its guest.
 pub struct GuestSecrets {
@@ -99,13 +96,16 @@ impl GuestSecrets {
             return Err("its record names another instance".into());
         }
         let uuid = uuid.ok_or_else(|| "its instance has no journalled uuid".to_string())?;
-        // Every value is read before anything is sent, so a secret that cannot be read leaves the guest as it was.
+        // Every value is read before anything is sent, so a secret that cannot be read leaves the guest as it was. It
+        // is read by the provider's own rule: this entry's secret, in private directories, a private file of this
+        // process's user, and the file that was checked is the file that is read.
+        let secrets = self.cfg.state_dir.join("secrets");
         let mut files = Vec::new();
         for (key, reference) in &record.secret_refs {
             let name = SecretName::new(key)
                 .map_err(|_| format!("the secret name {key} cannot be a file name"))?;
-            let value = read_secret(&self.cfg.state_dir.join("secrets"), reference)
-                .ok_or_else(|| format!("the stored secret {key} could not be read"))?;
+            let value = read_entry_secret(&secrets, &entry, reference)
+                .map_err(|why| format!("the stored secret {key} could not be read ({why})"))?;
             files.push((key.clone(), name, value));
         }
         let family = ProjectFamily::new(
@@ -135,14 +135,29 @@ impl GuestSecrets {
         if owned.tombstone().is_some() {
             return Err("its instance is being removed".into());
         }
-        // The directory first: a new file is made before its mode is set, and only root enters the directory.
+        // The directory first: a new file is made before its mode is set, and only root enters the directory. It is
+        // read before it is made, so a directory an earlier start made is left as it is and nothing depends on how
+        // Incus answers a request to make one that exists. Anything else at the path is refused: a secret is never
+        // written under a directory another user can enter.
         let until = Instant::now() + self.wait;
         loop {
-            if writer()
-                .write_service_file(&owned, &ServiceFile::GuestSecretsDir, &[])
-                .is_ok()
-            {
-                break;
+            match writer().guest_secrets_dir(&owned) {
+                Ok(GuestSecretsDir::Private) => break,
+                Ok(GuestSecretsDir::NotPrivate) => {
+                    return Err(format!(
+                        "{GUEST_SECRETS_DIR} in the guest is not a directory that only root can enter (mode 0700, owner root), and Arca did not make it so; nothing was written"
+                    ));
+                }
+                Ok(GuestSecretsDir::Missing) => {
+                    if writer()
+                        .write_service_file(&owned, &ServiceFile::GuestSecretsDir, &[])
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                // The agent does not answer yet.
+                Err(_) => {}
             }
             if Instant::now() + self.pause > until {
                 return Err(format!(
@@ -165,27 +180,6 @@ impl GuestSecrets {
         }
         Ok(Some(written))
     }
-}
-
-/// The value a reference names in the secret store: a private regular file, never a link, under private directories.
-fn read_secret(secrets: &Path, reference: &str) -> Option<String> {
-    let name = reference.strip_prefix(SECRET_PREFIX)?;
-    let mut path = secrets.to_path_buf();
-    for part in name.split('/') {
-        if part.is_empty()
-            || !part
-                .bytes()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        {
-            return None;
-        }
-        path.push(part);
-    }
-    let meta = std::fs::symlink_metadata(&path).ok()?;
-    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > SECRET_MAX_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
 }
 
 /// The words a start's answer adds for the secrets it wrote, by name.
