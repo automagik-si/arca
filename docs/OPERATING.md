@@ -2303,9 +2303,14 @@ When the guest agent does not answer in time (the image has none, or the machine
 with `InstanceSecretsNotWritten`: the machine is running, its secrets are not in it, and running `instance_start`
 again writes them.
 
-Inside a tenant this last step is not built yet: a virtual machine there keeps its secrets stored, and its start
-answers `InstanceSecretsNotWritten` and says that they were not written into the guest. A template that needs its
-secrets in the guest, the runner pool among them, runs in the node's own project for now.
+Inside a tenant the steps are the same, with `tenant` in each call: `service_secret_set` with
+`{"name", "key", "value", "tenant"}`, then `instance_start` with `{"tenant": "<id>", "service": "<name>"}`, which a
+token whose tool allowlist names `instance_start` may call without an approval. The secrets are written into that
+tenant's own machine and into no other: Arca addresses the machine it created for that service, from its own record,
+and a call cannot name another tenant's project or the node's. A command is still never run inside a tenant's machine.
+
+When secrets were not written, the answer says once what to do: run `instance_start` again when the machine was not
+ready, or that running it again changes nothing until the cause it names is put right.
 
 Where a virtual machine's secret is, and is not:
 

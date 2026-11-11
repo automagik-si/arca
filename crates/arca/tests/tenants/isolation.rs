@@ -1037,46 +1037,395 @@ fn a_removal_that_was_cut_short_is_finished_by_the_next_approved_removal() {
     assert!(!message.contains("every instance is removed"), "{message}");
 }
 
-/// A virtual machine whose template declares secrets, inside a tenant: it is created stopped and its secrets are stored
-/// as a container's are, and a start says in words that they are not written into its guest. The file requests that
-/// carry them are made in the node's own project only (Rule 68), so a tenant's machine is told so and never passed over
-/// in silence.
-#[test]
-fn a_tenants_machine_keeps_its_secrets_stored_and_a_start_says_they_are_not_in_its_guest() {
+/// A virtual-machine template that declares one secret.
+fn keys_template() -> Value {
+    json!({
+        "name": "keys", "kind": "virtual-machine", "image": "images:debian/13/cloud",
+        "limits": { "cpu": "2", "memory": "4GiB" }, "rootSize": "20GiB", "secrets": ["API_TOKEN"]
+    })
+}
+
+const SECRET_A: &str = "synthetic-token-of-tenant-a-0123456789";
+const SECRET_B: &str = "synthetic-token-of-tenant-b-9876543210";
+
+/// Tenants `A` and `B`, each with a virtual machine `box` whose secret is set and that is still stopped.
+fn two_boxes() -> Rig {
     let rig = two_tenants(policy());
-    rig.template(
-        "keys",
-        json!({
-            "name": "keys", "kind": "virtual-machine", "image": "images:debian/13/cloud",
-            "limits": { "cpu": "2", "memory": "4GiB" }, "rootSize": "20GiB", "secrets": ["API_TOKEN"]
-        }),
+    rig.template("keys", keys_template());
+    for (tenant, value) in [(A, SECRET_A), (B, SECRET_B)] {
+        let made = create(&rig, "box", "keys", Some(tenant));
+        assert_eq!(made["state"], "stopped");
+        rig.call(
+            "service_secret_set",
+            json!({ "name": "box", "key": "API_TOKEN", "value": value, "tenant": tenant }),
+        )
+        .expect("the secret is stored");
+    }
+    rig
+}
+
+/// Every guest file the fake holds, as `<project>/<instance>:<path>` with its content.
+fn guest_files(rig: &Rig) -> Vec<(String, String)> {
+    rig.fake()
+        .service_files()
+        .into_iter()
+        .map(|(key, bytes)| (key, String::from_utf8(bytes).expect("text")))
+        .collect()
+}
+
+/// Every file request the fake received, as `<method> <target>`.
+fn file_requests(rig: &Rig) -> Vec<String> {
+    rig.fake()
+        .service_requests()
+        .into_iter()
+        .filter(|request| request.path.split('?').next().unwrap().ends_with("/files"))
+        .map(|request| format!("{} {}", request.method, request.path))
+        .collect()
+}
+
+/// A start of a tenant's virtual machine writes its stored secrets into its own guest, in its own tenant's project, and
+/// into no other machine: not the other tenant's machine of the same name, and not one of the node's own.
+#[test]
+fn a_start_writes_a_tenants_machine_its_own_secrets_in_its_own_project_and_nowhere_else() {
+    let rig = two_boxes();
+    let started = rig
+        .call_token(
+            "cloud",
+            "instance_start",
+            json!({ "tenant": A, "service": "box" }),
+            &["instance_start"],
+        )
+        .expect("the start");
+    assert_eq!(started["project"], project(A));
+    assert_eq!(started["instance"], "box-aaaaaaaa");
+    assert_eq!(
+        started["message"],
+        "started the instance box-aaaaaaaa in project arcak-t-aaaaaaaa. Its secret (API_TOKEN) was written into the guest, in /etc/arca-secrets."
     );
-    let made = create(&rig, "box", "keys", Some(A));
-    assert_eq!(made["state"], "stopped");
+    // A's guest holds A's secret, under the private directory. Nothing else holds anything.
+    assert_eq!(
+        guest_files(&rig),
+        vec![
+            (
+                "arcak-t-aaaaaaaa/box-aaaaaaaa:/etc/arca-secrets".to_string(),
+                String::new()
+            ),
+            (
+                "arcak-t-aaaaaaaa/box-aaaaaaaa:/etc/arca-secrets/API_TOKEN".to_string(),
+                SECRET_A.to_string()
+            ),
+        ]
+    );
+    // Every file request named A's project and A's instance: the read of the directory, the directory, the file.
+    assert_eq!(
+        file_requests(&rig),
+        vec![
+            "GET /1.0/instances/box-aaaaaaaa/files?project=arcak-t-aaaaaaaa&path=/etc/arca-secrets",
+            "POST /1.0/instances/box-aaaaaaaa/files?project=arcak-t-aaaaaaaa&path=/etc/arca-secrets",
+            "POST /1.0/instances/box-aaaaaaaa/files?project=arcak-t-aaaaaaaa&path=/etc/arca-secrets/API_TOKEN",
+        ]
+    );
+    // B's machine was not started and holds nothing; B's secret went nowhere.
+    assert_eq!(
+        rig.get(&instance_path(&project(B), "box")).unwrap()["status"],
+        "Stopped"
+    );
+    assert!(
+        guest_files(&rig)
+            .iter()
+            .all(|(_, content)| content != SECRET_B)
+    );
+    // The journal names the secret and the tenant, and holds no value.
+    let journal = fs::read_to_string(rig.dir.join(arca::lifecycle::INSTANCE_ACTIONS_FILE)).unwrap();
+    let last: Value = serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+    assert_eq!(last["kind"], "guest_secrets");
+    assert_eq!(last["outcome"], "written");
+    assert_eq!(last["secrets"], json!(["API_TOKEN"]));
+    assert!(!journal.contains(SECRET_A) && !journal.contains(SECRET_B));
+
+    // A new value reaches the guest at the next start, which restarts nothing.
+    let rotated = "synthetic-token-of-tenant-a-rotated-000";
     rig.call(
         "service_secret_set",
-        json!({ "name": "box", "key": "API_TOKEN", "value": "synthetic-token-0123456789", "tenant": A }),
+        json!({ "name": "box", "key": "API_TOKEN", "value": rotated, "tenant": A }),
     )
-    .expect("the secret is stored");
-    let (code, message) = refusal(rig.call_token(
+    .expect("set again");
+    let again = rig
+        .call_token(
+            "cloud",
+            "instance_start",
+            json!({ "tenant": A, "instance": "box-aaaaaaaa" }),
+            &["instance_start"],
+        )
+        .expect("a start of a running machine");
+    assert_eq!(again["changed"], false);
+    assert_eq!(
+        guest_files(&rig)
+            .into_iter()
+            .find(|(key, _)| key.ends_with("/API_TOKEN"))
+            .map(|(_, content)| content),
+        Some(rotated.to_string())
+    );
+    // B's start writes B's own, in B's project.
+    rig.call_token(
         "cloud",
         "instance_start",
-        json!({ "tenant": A, "service": "box" }),
+        json!({ "tenant": B, "service": "box" }),
         &["instance_start"],
+    )
+    .expect("B's start");
+    let files = guest_files(&rig);
+    assert!(files.contains(&(
+        "arcak-t-bbbbbbbb/box-bbbbbbbb:/etc/arca-secrets/API_TOKEN".to_string(),
+        SECRET_B.to_string()
+    )));
+    assert!(
+        files
+            .iter()
+            .all(
+                |(key, content)| key.starts_with("arcak-t-bbbbbbbb/") == (content == SECRET_B)
+                    || content.is_empty()
+            )
+    );
+    // A service without stored secrets in a tenant starts as before, and nothing is asked of its guest.
+    let before = file_requests(&rig).len();
+    create(&rig, "web", "app", Some(B));
+    rig.call_token(
+        "cloud",
+        "instance_start",
+        json!({ "tenant": B, "service": "web" }),
+        &["instance_start"],
+    )
+    .expect("a start of a service without secrets");
+    assert_eq!(file_requests(&rig).len(), before);
+}
+
+/// A call inside a tenant cannot name another tenant's project or the node's own, and so cannot have a secret written
+/// anywhere but into the tenant's own machine. Each such call is refused before the instance is touched, and no file
+/// request is sent.
+#[test]
+fn a_call_in_a_tenant_cannot_send_secrets_to_another_tenants_or_the_nodes_project() {
+    let rig = two_boxes();
+    // A machine of the node's own, with a secret too.
+    rig.call(
+        "service_create",
+        json!({ "name": "own", "template": "keys" }),
+    )
+    .expect("the node's own machine");
+    rig.call(
+        "service_secret_set",
+        json!({ "name": "own", "key": "API_TOKEN", "value": "synthetic-token-of-the-node-0123" }),
+    )
+    .expect("stored");
+    let start =
+        |args: Value| rig.call_token("economy", "instance_start", args, &["instance_start"]);
+    // Another tenant's project, or the node's, beside the tenant the call names.
+    for args in [
+        json!({ "tenant": A, "project": project(B), "instance": "box-bbbbbbbb" }),
+        json!({ "tenant": A, "project": "arcak-svc", "instance": "own" }),
+    ] {
+        assert!(
+            matches!(
+                start(args.clone()),
+                Err(CallError::Invalid(why)) if why == "project: it is not the project of the tenant the call names"
+            ),
+            "{args}"
+        );
+    }
+    // A tenant's project named without its tenant: a tenant is reached by its id only.
+    assert!(matches!(
+        start(json!({ "project": project(B), "instance": "box-bbbbbbbb" })),
+        Err(CallError::Invalid(why)) if why == "project: a tenant's project is named by tenant, not by project"
     ));
+    // Another tenant's instance, or the node's, by name: there is no such instance in the tenant the call names.
+    for instance in ["box-bbbbbbbb", "own"] {
+        let (code, _) = refusal(start(json!({ "tenant": A, "instance": instance })));
+        assert_eq!(code, "InstanceUnknown", "{instance}");
+    }
+    // Nothing was started and no file request was sent, to anyone.
+    for (place, name) in [(project(A), "box"), (project(B), "box")] {
+        assert_eq!(
+            rig.get(&instance_path(&place, name)).unwrap()["status"],
+            "Stopped"
+        );
+    }
+    assert_eq!(file_requests(&rig), Vec::<String>::new());
+
+    // Below the verbs: the delivery finds a record only where the project and the instance are that record's own. A
+    // crossed pair is no record at all, so nothing is read and nothing is sent.
+    let secrets = arca::guest_secrets::GuestSecrets::new(rig.cfg.clone(), rig.kernel.clone())
+        .with_wait(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
+        );
+    for (place, instance) in [
+        (project(A), "box-bbbbbbbb"),
+        (project(B), "box-aaaaaaaa"),
+        ("arcak-svc".to_string(), "box-aaaaaaaa"),
+        (project(A), "own"),
+        ("arcak-t-cccccccc".to_string(), "box-aaaaaaaa"),
+        ("default".to_string(), "box-aaaaaaaa"),
+    ] {
+        assert_eq!(
+            secrets.deliver(&place, instance),
+            Ok(None),
+            "{place} {instance}"
+        );
+    }
+    assert_eq!(file_requests(&rig), Vec::<String>::new());
+}
+
+/// The seam itself. A writer is bound to one entry and reaches the node's family and that entry's own tenant project.
+/// Through it the two guest-secret destinations go to the owned instance's project; a command and every other file stay
+/// in the node's own project and are refused for a tenant's instance; and another tenant's instance cannot be read as
+/// owned at all.
+#[test]
+fn the_guest_file_seam_follows_the_owned_instance_and_a_command_never_does() {
+    use arca::service_exec::{ExecTarget, writer_for};
+    use arca_incus::exec::{ExecCommand, JournalLines, SecretName, ServiceFile};
+    use arca_kernel::ownership::{IncusKind, ObjectRef};
+    let rig = two_boxes();
+    for tenant in [A, B] {
+        rig.call_token(
+            "cloud",
+            "instance_start",
+            json!({ "tenant": tenant, "service": "box" }),
+            &["instance_start"],
+        )
+        .expect("start");
+    }
+    let target = |tenant: &str| {
+        let kernel = rig.kernel.lock().unwrap();
+        let entry = kernel
+            .entries()
+            .iter()
+            .find(|entry| entry.id.0 == format!("t-{tenant}-service-box"))
+            .expect("the entry")
+            .clone();
+        let service: arca::service::ServiceConfig =
+            serde_json::from_value(entry.config.clone()).expect("the record");
+        let object = kernel
+            .service_object(&entry.id, &service.instance)
+            .expect("the journal's instance");
+        (
+            ExecTarget {
+                entry: entry.id.clone(),
+                uuid: object.uuid.clone(),
+                retained: kernel.retained_entries().expect("retained"),
+                service,
+            },
+            object,
+        )
+    };
+    let (target_a, object_a) = target(A);
+    let (_, object_b) = target(B);
+    // The journal holds each instance in its own tenant's project.
+    assert_eq!(object_a.project, project(A));
+    assert_eq!(object_b.project, project(B));
+    let budget = std::time::Duration::from_secs(5);
+    let writer = writer_for(&rig.cfg, &target_a, budget).expect("A's writer");
+    let owned = writer.read_owned(&object_a).expect("A's own instance");
+    let before = file_requests(&rig).len();
+    // The guest-secret file goes to A's project.
+    writer
+        .write_service_file(
+            &owned,
+            &ServiceFile::GuestSecret(SecretName::new("API_TOKEN").unwrap()),
+            b"synthetic-seam-value",
+        )
+        .expect("a guest secret in the tenant's project");
+    assert_eq!(
+        file_requests(&rig)[before..],
+        [
+            "POST /1.0/instances/box-aaaaaaaa/files?project=arcak-t-aaaaaaaa&path=/etc/arca-secrets/API_TOKEN"
+        ]
+    );
+    // Every other file, and a command, are refused for a tenant's instance, and nothing is sent.
+    let sent = rig.fake().service_requests().len();
+    let refused = arca_incus::IncusError::Refused("invalid service exec target or argument".into());
+    for file in [
+        ServiceFile::TailnetKey,
+        ServiceFile::Secret(SecretName::new("API_TOKEN").unwrap()),
+    ] {
+        assert_eq!(
+            writer.write_service_file(&owned, &file, b"synthetic-seam-value"),
+            Err(refused.clone())
+        );
+    }
+    assert_eq!(
+        writer.start_service_exec(
+            &owned,
+            &ExecCommand::Journal(JournalLines::new(5).unwrap()),
+            budget
+        ),
+        Err(refused.clone())
+    );
+    assert!(
+        rig.fake().service_requests()[sent..]
+            .iter()
+            .all(|request| request.method == "GET" && !request.path.contains("/files")),
+        "nothing but the writer's own ownership reads was sent"
+    );
+    // A's writer does not reach B's project: B's instance is not read as owned, by its own uuid or by A's.
+    for uuid in [object_b.uuid.clone(), object_a.uuid.clone()] {
+        let crossed = ObjectRef {
+            kind: IncusKind::Instance,
+            project: project(B),
+            parent: None,
+            name: "box-bbbbbbbb".into(),
+            uuid,
+        };
+        assert!(writer.read_owned(&crossed).is_err());
+    }
+    // A record that names another tenant's project than its own gets no writer at all.
+    let mut crossed = target_a.clone();
+    crossed.service.project = project(B);
+    assert!(writer_for(&rig.cfg, &crossed, budget).is_err());
+    // B's guest still holds B's secret and nothing of this.
+    assert!(guest_files(&rig).contains(&(
+        "arcak-t-bbbbbbbb/box-bbbbbbbb:/etc/arca-secrets/API_TOKEN".to_string(),
+        SECRET_B.to_string()
+    )));
+}
+
+/// What to do next is said once and is true: a guest that was not ready is asked again, and a refusal that needs
+/// something put right says that asking again changes nothing.
+#[test]
+fn a_secret_that_was_not_written_says_whether_asking_again_can_help() {
+    let rig = two_boxes();
+    let start = || {
+        rig.call_token(
+            "cloud",
+            "instance_start",
+            json!({ "tenant": A, "service": "box" }),
+            &["instance_start"],
+        )
+    };
+    // The guest's agent never answers: asking again is the way.
+    rig.fake().set_guest_agent_unready(u32::MAX);
+    let (code, message) = refusal(start());
     assert_eq!(code, "InstanceSecretsNotWritten");
     assert!(
-        message.contains("this Arca does not yet write a virtual machine's secrets into its guest inside a tenant; they stay stored"),
+        message.ends_with("its agent is not running yet, or its image has none. Run instance_start for it again to write them; that never restarts it"),
         "{message}"
     );
-    assert!(!message.contains("synthetic-token"));
-    // The machine runs, and nothing was sent to its guest.
-    assert_eq!(
-        rig.get(&instance_path(&project(A), "box")).unwrap()["status"],
-        "Running"
+    assert!(!message.contains("changes nothing"));
+    // Something else sits where the directory goes: asking again changes nothing, and the answer does not say to.
+    rig.fake().set_guest_agent_unready(0);
+    rig.fake().put_guest_file(
+        &project(A),
+        "box-aaaaaaaa",
+        "/etc/arca-secrets",
+        "directory",
+        "0755",
+        0,
     );
-    assert!(rig.fake().service_files().is_empty());
-    // A machine without secrets in a tenant starts as before.
-    let plain = create(&rig, "plain", "vm", Some(B));
-    assert_eq!(plain["state"], "running");
+    let (code, message) = refusal(start());
+    assert_eq!(code, "InstanceSecretsNotWritten");
+    assert!(
+        message.ends_with("and Arca did not make it so; nothing was written. Running instance_start again changes nothing until that is put right"),
+        "{message}"
+    );
+    assert!(!message.contains("Run instance_start for it again"));
+    assert!(!message.contains(SECRET_A));
 }
