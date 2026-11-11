@@ -4191,7 +4191,7 @@ pub(crate) fn adopted_config(
         vm: None,
         tenant: None,
         // The device is the instance's own, so a record made again from the instance says it has the access. Only an
-        // instance of the node's own project is read for it.
+        // instance of the node's own project is read for it, and `adopt_services` keeps it only for this node's socket.
         kernel_access: (project == arca_netproject::PROJECT)
             .then(|| crate::service::kernel_link_of(row))
             .flatten(),
@@ -4228,7 +4228,8 @@ fn adoption_subnet(cfg: &NodeConfig, row: &Value, cidr: &str, gateway: &str) -> 
     }
 }
 
-/// Adds a record for every kernel-owned marked instance without one. Nothing on the instance is read into a secret or re-rendered.
+/// Adds a record for every kernel-owned marked instance without one, and keeps the kernel access of a record made this
+/// way the same as the instance's device. Nothing on the instance is read into a secret or re-rendered.
 fn adopt_services(
     kernel: &Mutex<Kernel>,
     cfg: &NodeConfig,
@@ -4244,14 +4245,41 @@ fn adopt_services(
             continue;
         }
         let (cidr, gateway) = adoption_subnet(cfg, row, cidr, gateway);
-        let Some(config) = adopted_config(row, rows, &cidr, &gateway, now) else {
+        let Some(mut config) = adopted_config(row, rows, &cidr, &gateway, now) else {
             continue;
         };
+        // A kernel device is read back only when it connects to this node's own services socket. One made by hand for
+        // any other path is not an access Arca gave: the record does not name it, so it never stands between this node
+        // and its next start.
+        config.kernel_access = config
+            .kernel_access
+            .filter(|link| cfg.kernel_access().as_deref() == Some(link.connect.as_str()));
         let id = format!("service-{}", config.name);
-        if entries
+        if let Some(held) = entries
             .iter()
-            .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
+            .find(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
         {
+            // A record made from an instance follows the instance's device: taken off by hand, it leaves the record
+            // at the next call, so the record never keeps `serve` from a start over a config without the socket.
+            // A record Arca itself created is never changed here.
+            let read = config
+                .kernel_access
+                .as_ref()
+                .and_then(|link| serde_json::to_value(link).ok());
+            if held.config["adopted"] == true && held.config.get("kernelAccess") != read.as_ref() {
+                let mut record = held.config.clone();
+                if let Some(object) = record.as_object_mut() {
+                    match read {
+                        Some(read) => object.insert("kernelAccess".to_string(), read),
+                        None => object.remove("kernelAccess"),
+                    };
+                }
+                changes.push(crate::desired_store::EntryChange::Put(service_entry(
+                    &id,
+                    "arca.service",
+                    record,
+                )));
+            }
             continue;
         }
         changes.push(crate::desired_store::EntryChange::Put(service_entry(

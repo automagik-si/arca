@@ -101,9 +101,9 @@ jobs:
     name: cargo clippy
     needs: runners
     runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
-    timeout-minutes: 60
+    timeout-minutes: 15
     env:
-      # The CPUs of our pool's `large` class (6 CPUs, 10GiB).
+      # The CPUs of our pool's `large` class.
       CI_SLOT_CPUS: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -118,7 +118,7 @@ jobs:
     name: cargo test
     needs: runners
     runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       CI_SLOT_CPUS: 6
     steps:
@@ -134,7 +134,7 @@ jobs:
     name: canvas node --test
     needs: runners
     runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
-    timeout-minutes: 30
+    timeout-minutes: 15
     env:
       CI_SLOT_CPUS: 2
     defaults:

@@ -149,12 +149,18 @@ approval page is never on it, on any node and whatever the config becomes: a req
 is 404, and a request that carries an `Origin` is 403. A node may serve its approval page and have this socket too; the
 two sockets are separate, and one path cannot be both.
 
-Incus connects to this socket, as root, for a service with kernel access (see "A service that may talk to the kernel").
-Root is served for that reason alone, and root can already do everything on the host. No other local user reaches the
-socket, and it has no port: nothing on the host can take a port in its place while the server is down. The directory
-that holds it must belong to the server's user or to root and be writable by its owner alone; `serve` refuses to bind
-it anywhere else, since another user could put a socket of its own at the path and be sent a service's token. The
-socket has its own limit of 64 connections, apart from every other listener's. A clean stop removes it.
+Incus connects to this socket for a service with kernel access (see "A service that may talk to the kernel"), and
+Incus's proxy helper runs as uid 0: that is why uid 0 is served. Serving uid 0 means every process of the host that runs
+as uid 0, and Incus's proxy helper acting for any instance whose device names this path. Arca gives such a device to a
+service of the node's own project alone, a tenant's project blocks proxy devices, and whoever can add one by hand
+already administers Incus. None of them gets anything from the socket without a token. No other local user reaches the
+socket, and it has no port: nothing on the host can take a port in its place while the server is down.
+
+The directory that holds the socket must belong to the server's user or to root and be writable by its owner alone, and
+so must every directory above it, except that a directory above it may be sticky instead, as `/tmp` is. `serve` refuses
+to bind the socket anywhere else, naming the directory: a user who could write there, or rename a directory on the way,
+could put a socket of their own at the path and be sent a service's token. The socket has its own limit of 64
+connections, apart from every other listener's. A clean stop removes it.
 
 ## The link
 
@@ -406,9 +412,9 @@ Incus listens inside the instance, on its loopback, and connects from the host t
 (`listen.services`). Inside the instance the kernel is `http://127.0.0.1:7461/mcp`: plain HTTP that never leaves the
 instance's loopback, so a client that allows plain HTTP on loopback alone works unchanged. Nothing crosses the bridge.
 
-The device carries bytes and no authority. Every process in the instance reaches the listener, and each one gets what the
+The device carries bytes and no authority. Every process in the instance reaches the socket, and each one gets what the
 token it sends allows: a call without a token is 401, and a token is held to its scope and its tool list
-(`arca token mint --tools`). Give the service a token whose tool list names the verbs it needs, as a service secret.
+(`arca token mint --tools`) on `POST /mcp` and on the GET routes alike. Give the service a token whose tool list names the verbs it needs, as a service secret.
 
 A create of such a template is refused, before anything is written, unless all of these hold:
 
@@ -445,7 +451,17 @@ the config has become, so a device is never left connected to a listener that co
 The device is the instance's own. It stays through a restart of the instance and of `serve` (tested against the fake
 Incus), and it is deleted with the instance by `service_remove`. That it is there again after a restart of the host is
 Incus's to keep, in its own database, and is not yet checked on a live node. A record that is lost and made again from
-the instance's marks reads the device back, so `service_list` still says the service has the access.
+the instance's marks reads the device back when it connects to this node's own `listen.services`, so `service_list`
+still says the service has the access.
+
+A `kernel` device somebody made by hand, with `incus config device add`, is not an access Arca gave. One that names
+another path is never read into a record: `service_list` shows no `kernelAccess` for it, `serve` starts as it would
+without it, and nothing of Arca listens at that path. One that names this node's own services socket, on an instance
+whose record was lost and made again from its marks, is read back as above, and `serve` then refuses to start without
+that socket, as for any service with the access. Arca does not remove such a service (it writes nothing to a record
+made this way), so the way out is the device: start `serve` with `listen.services` at the path the refusal names, take
+the device off (`incus config device remove <instance> kernel --project arcak-svc`), and call `service_list` once. The
+record follows the device at every service call, so it no longer names the access, and the config may then change.
 
 The effect journal records the create of the instance, and the digest it keeps (`op_digest`) is the digest of the create
 that carries the device; `journal_list` shows the effect, not the body. The service's record in the desired state names
@@ -458,17 +474,18 @@ What a process in the instance can and cannot do through the device:
 - It can hold connections open. The socket's own limit of 64 is then spent, which stops other services with kernel
   access from calling the kernel; the unix socket, the tailnet listener and the proxy listener are not affected.
 
-Not yet checked on a live Incus, and the first things to check there:
+Checked on a live node (Incus 7.6, SELinux enforcing): a container with a proxy device of this shape (`bind=instance`,
+`listen=tcp:127.0.0.1:<port>`, `connect=unix:<path>`, the path a socket of mode 0600 under the server user's runtime
+directory) reached the socket on the host, and the host saw the peer as uid 0, which the services socket serves.
 
-- that a proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` is accepted on a
-  container in the restricted service project and listens on the container's loopback;
-- that Incus connects to the socket as root, which is the one peer beside the server's own user the socket serves, and
-  that the confinement of Incus's proxy helper lets it reach a socket under the server's runtime directory.
+Not yet checked on a live Incus: the same device on a container of the restricted service project as Arca itself
+creates it, on an application (OCI) container, on a host confined by AppArmor in place of SELinux, and after a restart
+of the host.
 
-To check it on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus config
-device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode 0600,
-owned by the server's user; and the service's own log shows its first call to the kernel answered. If the service's
-calls are closed with no answer while `ready` is true, Incus is not connecting as root.
+To check a service on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus
+config device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode
+0600, owned by the server's user; and the service's own log shows its first call to the kernel answered. If the
+service's calls are closed with no answer while `ready` is true, Incus is not connecting as uid 0.
 
 `service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
 approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends
@@ -2130,7 +2147,9 @@ The four health components feed `service-down`. Each one is checked on every tic
 
 `GET /metrics` and `GET /alerts` are served on every listener of `serve`, and each needs a bearer token of any stored scope,
 the same token as the MCP calls. Without a valid bearer the answer is 401. A request with an `Origin` header is 403, and any
-other path is 404. Pass the token in the `Authorization` header:
+other path is 404. Each route is the reading of one verb, and a token is admitted to the route as it is to the verb:
+`/metrics` is `node_metrics` and `/alerts` is `alerts_list`. A token minted with `--tools` therefore needs that verb in
+its list, or the route answers 403 with no body; a token with no list reads both, as before. Pass the token in the `Authorization` header:
 
 ```sh
 curl --unix-socket /run/arca/arca.sock -H "Authorization: Bearer $(cat <token file>)" http://arca/metrics
@@ -2888,6 +2907,20 @@ is never started (two slots of 10GiB beside the two small ones would not fit). G
 job needs: a full `cargo test` of a large workspace has been seen to fill a 10GiB slot. Settings are read when the pool is created and are fixed from then on (see "What to
 know").
 
+**Sizing so that every slot fits.** A slot is started only while its whole memory fits, so the rule is:
+
+    the memory of all slots together  <=  the memory the machine reports  -  reserveMemory
+
+The machine reports less memory than the size in `limits`: its kernel keeps some for itself. The first pool's machine
+of 32GiB (32768 MiB) reported 32017 MiB, which is 751 MiB, or 2.3%, less. So keep the slots and `reserveMemory`
+together under about 97% of the machine's size: leave 1GiB free for every 32GiB. Sizes that add up to exactly the
+machine's size do not fit. That first pool had two slots of 4GiB, two of 10GiB and 4GiB kept back, 32GiB in all: it
+had 27921 MiB for slots, they asked for 28672 MiB, and the fourth slot stayed `queued` beside three idle ones. The
+controller now says this at its start and in every status block, as a `WARNING` with the numbers and how much is too
+much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
+once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
+that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
+
 **4. Arca: `service_secret_set`**, for the App twice:
 `{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
 `{"name": "ci-pool", "key": "GITHUB_APP_PRIVATE_KEY", "value": "<the whole content of the key file>"}`. The key keeps
@@ -2902,6 +2935,16 @@ takes a few minutes.
 **6. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
 group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
 `ci-pool-<the pool's id>-standard-0-...` as idle.
+
+The first boot, before there is a controller, writes its own lines to the machine's console, which is where
+`service_logs` reads the controller's lines from. `arca-runner-pool: first boot: installing ...` is its first line and
+`first boot done: the controller is installed and started` its last. A first boot that could not finish ends with
+`first boot failed:` and the reason: the commands that are still missing after the install, by name, or that Docker
+or the controller's service did not start. These first-boot lines have not yet been seen in `service_logs` on a real
+pool, so do not read their absence as "still starting". If a pool that is `running` shows no line of the pool after a
+few minutes, look inside the machine: `/var/log/cloud-init-output.log` holds everything the first boot printed, its
+failure line included, and what the package manager itself said, which is never on the console. A machine whose first
+boot failed has no pool; remove it with `service_remove` and create it again once the cause is gone.
 
 **7. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
@@ -2957,9 +3000,19 @@ time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seco
 twenty thousand jobs) the file is set aside as `jobs.tsv.1`, replacing the one set aside before.
 
 **Sizing runners from real numbers.** The `class` line is what the last 2000 jobs of a class used, beside the size the
-class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit;
-one whose `max` is at its `memory` has jobs that were cut short for memory. `cpus used avg` far below `cpu` says the
-CPU ceiling is generous. New sizes go into the template, and a pool created from it has them.
+class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit.
+`cpus used avg` far below `cpu` says the CPU ceiling is generous. New sizes go into the template, and a pool created
+from it has them.
+
+A `max` that is at the class's `memory` does not by itself say the jobs need more. The peak is the kernel's count for
+the slot (`memory.peak`), and that count includes the files a job read and wrote that the kernel still keeps in memory
+(page cache). A build writes many gigabytes, so it fills whatever its slot has, and the kernel gives that memory back
+when the job asks for its own. Such a job may have been held at the limit, slowed or cut short, or may only have been
+caching. To tell, look at the job's result and seconds, or run it once in a smaller class and compare. On the first
+pool this repository's `cargo test` peaked at exactly the 10240 MiB of its slot. Measured on the machine the
+repository is built on, not on the pool, the same job needs about 3.2GiB of its own and 19GB of disk, and under a
+4GiB limit it still passes, 5% slower. So the pool's peak is read as page cache, and 10GiB as enough for that class;
+neither has been measured on the pool itself.
 
 ### What to know
 
@@ -3169,18 +3222,42 @@ cleanup of exactly this pool's leftovers, the URL and API host rules, and that n
 or command line. `crates/arca/tests/services/vm_secrets.rs` and `create_settings.rs` cover the kernel's half against
 the fake Incus.
 
-Seen since on a real node, with a real GitHub organisation (the first pool): the virtual machine boots from
-`images:debian/13/cloud`, cloud-init runs the first-boot script and writes the settings, the guest agent takes the
-secret files, the machine reaches GitHub, the registries and Debian's mirrors from the service network, both pinned
-images pull and start as the script starts them, the App's token, the runner-group read and the registrations are
-accepted, jobs run, a slot's memory limit holds, and the controller's lines reach `service_logs`. Two faults were found
-there. Debian 13 ships the Docker command-line client as a package of its own (fixed apart from this work). And a
-slot whose runner was running a job was shown as idle: the pool asked Docker for the runner's processes in a form
-Docker refuses, so no job was ever seen as running and a job's seconds counted the runner's wait before it. The pool
-now reads the runner's own "Running job" line, which it had read correctly all along for the job's name.
+The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
+(`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
+machine after its install and names what is missing. No wait in these tests is without a bound, and none
+ends a controller with the `kill` program. Given a negative number, to signal a process group, that program reads
+only the number's first digit in procps-ng up to 4.0.4: it signals another group or, when the digit is 1, every
+process of the user. A failed test once waited for ever for a controller that program had not killed. Ubuntu 24.04,
+which the pool's job image is, carries that version, and so does Debian 12; Debian 13, which the pool's own machine
+is, has the fix (4.0.4-9), as has procps-ng from 4.0.5. Nothing else in this repository signals a process group
+through that program: the scripts use their shell's own `kill`, and the other uses name one process.
+One test runs the first boot itself as far as a test can, with a
+stand-in `apt-get` and two programs left missing: it must stop, name the two, and say so on the console. No test here
+runs apt, so none can prove that the packages of `POOL_PACKAGES` bring those programs on a real Debian.
 
-Still not proven, by the tests or on that node:
+Seen on a real node, on the first pool (a Debian 13 machine on a cloud node, serving this repository's own CI):
 
+- the virtual machine boots from `images:debian/13/cloud`, cloud-init runs the first-boot script and writes the
+  settings, and the guest agent takes both secret files into `/etc/arca-secrets`;
+- the virtual machine reaches Debian's mirrors, the registries and GitHub;
+- Debian's `docker.io` installs and its daemon runs. That first boot then stopped: on Debian 13 the `docker` command
+  is a package of its own, `docker-cli`, which `docker.io` only recommends, and the script did not name it. With
+  `docker-cli` installed by hand and the script run again, the rest went through at the first try;
+- the two pinned images pull and start as the script starts them, GitHub accepts the App's token, answers the
+  runner-group requests and the registrations, and gives the registered runners jobs: four runners registered and
+  ran this repository's gate;
+- the controller's lines reach `service_logs` through the virtual machine's console;
+- a slot's memory limit holds: a job that filled its slot stayed within it;
+- a slot whose runner was running a job was shown as idle, and the totals said `busy=0`. The pool asked Docker for
+  the runner's processes in a form Docker refuses, so no job was ever seen as running and a job's seconds counted the
+  runner's wait before it. The pool now reads the runner's own "Running job" line, which it had read correctly all
+  along for the job's name.
+
+Not proven yet, by these tests or on that node:
+
+- that a first boot with `docker-cli` in its package list finishes by itself on a fresh machine;
+- that the first boot's own lines reach `service_logs`: they are now written to the machine's console as the
+  controller's are, and the test reads them from a file in the console's place;
 - a real runner told to update itself, inside its container, with its just-in-time registration: that it replaces
   its directories, comes back and takes its job, and prints the lines the pool looks for. The fake plays what the
   runner's own source does (`update.sh.template`, `run-helper.sh.template`);
@@ -3188,7 +3265,12 @@ Still not proven, by the tests or on that node:
   mounted, and the daemon seeing the updated tools. A machine where it does not work falls back by itself, which is
   tested; that the layered start works is not;
 - jobs that use `container:` and `services:`;
-- the cache bounds on a real disk, and behaviour over days (token renewal after an hour, a host restart);
+- that GitHub lists a runner as `offline` when it is, and answers a repository's `private` field as its
+  documentation says;
+- that the CPU ceiling of a slot's slice holds for a job's own containers, and that the peak memory and CPU seconds
+  read from the slice are the job's;
+- the cache bounds on a real disk, a real job's cleanup, and behaviour over days (token renewal after an hour, a host
+  restart);
 - a pool inside a tenant;
 - the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work, and
   that a runner group's number is at the end of its page's address.
@@ -3403,8 +3485,12 @@ the wall between the job and the machine Arca runs on.
 **On the pool.** `fmt` and `canvas` ask for `[self-hosted, linux, x64, arca]`, the `standard` class; `clippy` and
 `test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class. The pool that serves this repository has
 two slots of each, `standard` with 2 CPUs and 4GiB and `large` with 6 CPUs and 10GiB, so all four jobs run at the
-same time. Those are not the shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the
-two CPU numbers (`CI_SLOT_CPUS`); change them there when the pool's classes change.
+same time once the machine has memory for all four slots ("Sizing so that every slot fits"). Those are not the
+shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the two CPU numbers
+(`CI_SLOT_CPUS`); change them there when the pool's classes change.
+
+Every job has a time limit, 30 minutes for `cargo test` and 15 for the others: a job that hangs gives its slot back
+then, and without a limit GitHub lets it hold the slot for six hours.
 
 A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs what is missing first: the
 toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's virtual machine and not its

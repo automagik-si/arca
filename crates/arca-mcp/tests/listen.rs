@@ -831,6 +831,44 @@ fn serve_services_refuses_a_path_or_a_directory_another_user_could_take() {
         assert!(fs::symlink_metadata(&path).is_err(), "nothing was bound");
         fs::set_permissions(scratch.path(), Permissions::from_mode(0o700)).expect("close it");
     }
+    // A directory above the socket's own that a group or others may write to: whoever can rename the socket's
+    // directory can put another in its place. Reaching the directory through a symlink changes nothing.
+    let scratch = Scratch::new("services-above");
+    let loose = scratch.at("loose");
+    let inner = loose.join("inner");
+    fs::create_dir_all(&inner).expect("the directories");
+    fs::set_permissions(&inner, Permissions::from_mode(0o700)).expect("the socket's own directory");
+    fs::set_permissions(&loose, Permissions::from_mode(0o777)).expect("open the one above");
+    symlink(&inner, scratch.at("link")).expect("a symlink to the socket's directory");
+    for path in [
+        inner.join("services.sock"),
+        scratch.at("link/services.sock"),
+    ] {
+        let err = rt
+            .block_on(serve_services(empty_router("services-above-router"), &path))
+            .expect_err("a directory above that others may write to is refused");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::PermissionDenied,
+            "{}",
+            path.display()
+        );
+        assert!(err.to_string().contains("loose"), "{err}");
+        assert!(fs::symlink_metadata(inner.join("services.sock")).is_err());
+    }
+    // With the sticky bit, as /tmp has, nobody but its owner can rename what is in it: the socket is served.
+    fs::set_permissions(&loose, Permissions::from_mode(0o1777)).expect("make it sticky");
+    let path = inner.join("services.sock");
+    let (router, served) = (empty_router("services-sticky-router"), path.clone());
+    rt.spawn(async move { serve_services(router, &served).await });
+    wait_for_path(&path);
+    let reply = post(
+        &mut connect_unix(&path),
+        &[],
+        &rpc(json!(1), "ping", json!({})),
+    );
+    assert_eq!(reply.status, 401);
+    fs::set_permissions(&loose, Permissions::from_mode(0o700)).expect("close it");
 }
 
 /// The socket a service with kernel access reaches the kernel through, with the MCP router alone. It is mode 0600 in

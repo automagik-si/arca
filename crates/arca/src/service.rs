@@ -175,7 +175,8 @@ impl Vm {
 
 /// The kernel access an instance's own devices show: its `kernel` device, when it is exactly the device Arca makes for
 /// some port and some services socket path ([`kernel_device`]). `None` for an instance with no such device, or with one
-/// of any other shape. A record made again from an instance's marks reads it, so the record says what the instance has.
+/// of any other shape. A record made again from an instance's marks reads it, when it connects to the node's own
+/// services socket, so the record says what the instance has.
 pub fn kernel_link_of(row: &Value) -> Option<KernelLink> {
     let device = &row["devices"][KERNEL_DEVICE];
     let link = KernelLink {

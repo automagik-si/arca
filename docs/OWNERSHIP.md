@@ -1338,17 +1338,22 @@ says it in words; an approval given before the template declared it, or for anot
 project blocks proxy devices as well (Rule 62). The socket answers 401 to a call without a token and holds a token to
 its scope and tool list, as every listener does, so a process in the instance may do exactly what the token it holds
 allows. The device is part of the instance: it is created with it, and removed with it (Rule 66). A record made again
-from an instance's marks reads the device back, for an instance of the node's own project alone.
+from an instance's marks reads the device back, for an instance of the node's own project alone and only when the
+device connects to this node's own services socket: a device made by hand for another path is in no record.
 
-The socket is mode 0600 in a directory only the server's user (or root) may write to, and it serves that user and
-root: Incus connects as root. No other local user reaches it, and it has no port another process could take while the
-server is down. Root is served because Incus is root, and root already holds everything the kernel guards.
+The socket is mode 0600 in a directory that only the server's user (or root) may write to, under directories nobody
+else can rename, and it serves that user and uid 0. Incus's proxy helper runs as uid 0, which is why uid 0 is served:
+that admits every process of the host running as uid 0, and the proxy helper for any instance whose device names the
+path. Arca makes such a device for a service of the node's own project alone, a tenant's project blocks proxy devices
+(Rule 62), and a device added by hand is the act of someone who administers Incus. No other local user reaches the
+socket, and it has no port another process could take while the server is down. Whoever connects holds nothing without
+a token: the GET routes are held to a token's scope and tool list as the verbs they read are.
 Source: `KernelAccess`, `KernelLink`, `kernel_device`, `kernel_link_of`, `kernel_connect_ok`, `Service::apply` and
 `validate_template` in `crates/arca/src/service.rs`; `ListenConfig::services`, `NodeConfig::kernel_access` and `check`
 in `crates/arca/src/config.rs`; `kernel_access_for`, `kernel_access_refusal`, `enrich_service_create`,
 `ActionExecutor::run`, `adopted_config` and the `service_create` and `service_status` arms of `ServiceHandler` in
-`crates/arca/src/handlers.rs`; `kernel_access_words` in `crates/arca/src/action_proposal.rs`; `mcp`, `serve_services`,
-`services_path_ok` and `owner_admitted` in `crates/arca-mcp/src/http.rs`; `check_bridged_start` and the
+`crates/arca/src/handlers.rs`; `kernel_access_words` in `crates/arca/src/action_proposal.rs`; `mcp`, `serve_get`,
+`serve_services`, `services_dir_ok`, `services_path_ok` and `owner_admitted` in `crates/arca-mcp/src/http.rs`; `check_bridged_start` and the
 `services_router` of `crates/arca/src/cmd_serve.rs`. Tests in `crates/arca/tests/tenants/kernel_access.rs`
 (`a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_acl_rule_for_it`,
 `an_ordinary_template_gets_no_such_device_and_cannot_ask_for_one`,
@@ -1365,7 +1370,8 @@ in `crates/arca/src/config.rs`; `kernel_access_for`, `kernel_access_refusal`, `e
 (`the_services_socket_gives_its_peer_only_what_the_token_gives_and_serves_no_approval_page`,
 `serve_services_refuses_a_path_or_a_directory_another_user_could_take`) and in `crates/arca/tests/e2e_mcp.rs`
 (`the_services_socket_of_a_node_that_serves_its_approval_page_serves_mcp_alone`,
-`a_proxy_listener_without_an_approval_origin_serves_no_page_route`). The device's behaviour on a live Incus is under
+`a_proxy_listener_without_an_approval_origin_serves_no_page_route`), and
+`metrics_and_alerts_are_held_to_the_tokens_tool_list` in `crates/arca/tests/export_contract.rs`. The device's behaviour on a live Incus is under
 "Assumptions to confirm".
 
 ## Out of scope
@@ -1381,11 +1387,12 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
-- A proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` is accepted on a
-  container in the restricted service project (`restricted.devices.proxy=allow`), listens on the container's own
-  loopback, and connects to the unix socket at `<path>` on the host as root, which the services socket serves, with
-  the confinement of Incus's proxy helper letting it reach that path (Rule 69). The fake stores the device and models
-  none of this. Also unconfirmed: that the device is in place again after a restart of the host.
+- A proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` on a container reaches
+  a unix socket of mode 0600 on the host, and the host sees the peer as uid 0, which the services socket serves (Rule
+  69): confirmed on a live node (Incus 7.6, SELinux enforcing). Still to confirm: the same on a container of the
+  restricted service project (`restricted.devices.proxy=allow`) as Arca creates it, on an application (OCI)
+  container, under AppArmor, and that the device is in place again after a restart of the host. The fake stores the
+  device and models none of this.
 - A virtual machine from a public cloud image (`images:debian/13/cloud`) that Arca creates runs its
   `cloud-init.user-data` once at its first boot and writes the file its `cloud-init.vendor-data` names, on a host whose
   QEMU has no virtio-9p (the config share is the `agent:config` drive of Rule 59), and its guest agent then takes a file
