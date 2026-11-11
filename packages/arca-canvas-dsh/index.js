@@ -108,7 +108,7 @@ export const Config = z.transform(z.object({
 
 const page = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<meta name="color-scheme" content="light dark"><title>Arca canvas</title>
+<meta name="color-scheme" content="light dark"><title>Automagik Arca canvas</title>
 <link rel="stylesheet" href="arca-canvas/page.css"></head>
 <body><main id="arca-root" data-arca-base="/arca-canvas"></main><script src="arca-canvas/page.js" defer></script></body></html>`;
 const assets = new Map([

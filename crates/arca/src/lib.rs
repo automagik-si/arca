@@ -48,6 +48,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::config::ConfigError;
 
 const USAGE: &str = "usage: arca <command>
+  version (or --version, -V)
   watch --once --json --config <file>
   metrics --json [--sample-for <seconds, 0 to 60>] --config <file>
   link serve --config <file> (forwards arca/mcp/1 to listen.unix by default)
@@ -130,6 +131,17 @@ pub fn call_failure(error: CallError) -> Failure {
 
 fn runtime_failure(error: io::Error) -> Failure {
     Failure::Runtime(error.to_string())
+}
+
+/// What `arca --version` and `arca version` print: the product name, the version, and in brackets the short commit the
+/// binary was built from and its target triple. The commit reads `unknown` when the build had no git checkout.
+pub fn version_line() -> String {
+    format!(
+        "Automagik Arca {} ({}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("ARCA_BUILD_COMMIT"),
+        env!("ARCA_BUILD_TARGET")
+    )
 }
 
 pub fn usage_failure() -> Failure {
@@ -246,6 +258,10 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
         )?),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
+            Ok(None)
+        }
+        "version" | "--version" | "-V" if rest.is_empty() => {
+            println!("{}", version_line());
             Ok(None)
         }
         _ => Err(usage_failure()),

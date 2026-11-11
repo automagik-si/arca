@@ -1,10 +1,10 @@
 [package]
 name = "arca-providers"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca's host providers: the read-only Incus provider that serves plugins, which can never write"
+description = "Automagik Arca's host providers: the read-only Incus provider that serves plugins, which can never write"
 
 [dependencies]
 # The provider is the one crate that enables the writer; see docs/OWNERSHIP.md, rule 28.

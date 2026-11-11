@@ -1,10 +1,10 @@
 [package]
 name = "arca"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Arca node binary: one-shot watch and metrics reads, token minting, the recording shim and the Arca MCP server, all from one node config file"
+description = "The Automagik Arca node binary: one-shot watch and metrics reads, token minting, the recording shim and the Arca MCP server, all from one node config file"
 
 [lib]
 path = "src/lib.rs"

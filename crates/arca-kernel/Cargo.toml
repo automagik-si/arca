@@ -1,10 +1,10 @@
 [package]
 name = "arca-kernel"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca kernel contracts: canonical JSON, digests, node identity, signed desired state and the ownership model"
+description = "Automagik Arca kernel contracts: canonical JSON, digests, node identity, signed desired state and the ownership model"
 
 [dependencies]
 ed25519-dalek.workspace = true

@@ -1,10 +1,10 @@
 [package]
 name = "arca-watch"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca's watch-only plugin: classes every Incus instance by owner and reports drift, with no write path"
+description = "Automagik Arca's watch-only plugin: classes every Incus instance by owner and reports drift, with no write path"
 
 [package.metadata.arca]
 kind = "plugin"

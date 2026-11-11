@@ -1,7 +1,7 @@
 # Ownership model
 
-This document states which Incus objects the Arca kernel may write, how an object's owner is read, and how a removal
-proceeds. Each rule is followed by its `Source:`, the code or test in this repository that enforces it. Where a rule rests on
+This document states which Incus objects the Automagik Arca kernel may write, how an object's owner is read, and how a
+removal proceeds. Each rule is followed by its `Source:`, the code or test in this repository that enforces it. Where a rule rests on
 Incus behaviour that has not yet been checked against a live host, the rule says so, and the behaviour is listed under
 "Assumptions to confirm". Such a rule holds against the fake Incus in this repository, and a live probe must confirm it before
 any live write.
