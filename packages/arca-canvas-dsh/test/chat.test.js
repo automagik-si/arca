@@ -345,8 +345,11 @@ function raceDsh({ conflictResume = false, releaseOnConflict = false } = {}) {
         resumeAttempts += 1;
         resumeIds.push(options.resumeSessionId);
         if (conflictResume && firstResumePending) {
-          // The collision itself lets the first resume go, so the second attempt never waits on the test.
-          if (releaseOnConflict) resolveGate();
+          // The first resume lets go after the collision, not during it. That is later than the retry of a chat
+          // that does not wait for the holder, which collides again and fails; and it is before any timer, because an
+          // immediate set while a request is being handled runs before the next timer. So the second attempt's bound
+          // cannot pass first, and the second attempt never waits on the test.
+          if (releaseOnConflict) setImmediate(resolveGate);
           const error = new Error(`session "${options.resumeSessionId}" is already owned by an active write handle`);
           error.name = 'SessionAlreadyOwnedError';
           throw error;
@@ -379,20 +382,21 @@ async function harness(t, options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'arca-chat-'));
   let chat;
   let server;
-  // One hook, and the directory goes last. The hooks of a test stop at the first one that throws, and removing the
-  // directory can throw while the chat still writes its state there. A server left listening after that keeps the
-  // test process alive for good, so a failed test would never end.
+  // One hook: the server goes first and the directory last. A server left listening keeps the test process alive for
+  // good, so nothing may come between a failed test and its close: the hooks of a test stop at the first one that
+  // throws, removing the directory can throw while the chat still writes its state there, and the chat's own close
+  // waits for the agent's dispose, which a test may have made hang. That close gets a limit for the same reason.
   t.after(async () => {
     try {
-      await chat?.close();
+      if (server) {
+        await new Promise((resolve) => {
+          server.closeAllConnections?.();
+          server.close(resolve);
+        });
+      }
     } finally {
       try {
-        if (server) {
-          await new Promise((resolve) => {
-            server.closeAllConnections?.();
-            server.close(resolve);
-          });
-        }
+        if (chat) await within(chat.close(), 5000, 'the chat did not close');
       } finally {
         await rm(dir, { recursive: true, force: true });
       }
@@ -450,8 +454,21 @@ async function harness(t, options = {}) {
   return {
     chat, fake, statePath, dir, port: server.address().port, clientCalls,
     dropped: () => dropped,
-    settled: () => Promise.all(handled),
+    settled: () => within(Promise.all(handled), 3000, 'the chat has not finished with its requests'),
   };
+}
+
+// The promise's own outcome, or a failure that says what was waited for once the limit has passed.
+async function within(promise, ms, what) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out: ${what}`)), ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function parseEvents(raw) {
@@ -1767,7 +1784,8 @@ test('an agent error with no turn/end releases the turn and the next request', a
   const elapsed = Date.now() - started;
   assert.equal(first.events.at(-1).data.reason, 'error');
   assert.deepEqual(fake.cancels, ['error']);
-  assert.ok(elapsed < turnMs, `the error released the turn in ${elapsed}ms, before its deadline`);
+  // The fallback this test set to 20 ms released the turn. The default one would have taken this long.
+  assert.ok(elapsed < DEFAULTS.cancelMs, `the error released the turn in ${elapsed}ms`);
   const second = await post(port, { message: 'after error' });
   assert.equal(second.status, 200);
   assert.equal(second.events.at(-1).data.reason, 'complete');
