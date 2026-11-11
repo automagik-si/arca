@@ -17,6 +17,10 @@ Each release now carries `install.sh`, the installer, beside the binary. It inst
 `SHA256SUMS` lists it with the binary: check a download with `sha256sum --check --ignore-missing SHA256SUMS`, and
 stop unless it prints `arca-<version>-linux-x86_64: OK`.
 
+- A workspace's own settings are given when it is created: the `automagik-workspace` template lists `reach`,
+  `publicUrl` and the three Cloudflare Access settings in `createSettings`, so `service_create` takes them in
+  `settings` and no copy of the template is made. `serverImage` is not listed: the image a workspace runs stays the
+  template's to pin. `publicUrl` now ships empty, which means "not set".
 - The `automagik-workspace` template can be reached on a tailnet instead of through a Cloudflare Tunnel:
   `settings.reach` is `cloudflare` (as before, and when it is left out) or `tailnet`. With `tailnet` the machine
   runs a Tailscale node (Tailscale's own image, by digest) in a network namespace of its own, which serves HTTPS on
@@ -28,7 +32,7 @@ stop unless it prints `arca-<version>-linux-x86_64: OK`.
   code. Arca does not yet hand that code to the owner. Both reaches now pin the Automagik server build that has
   the passkey sign-in (`5fe0be6`). With the Cloudflare reach the connector is no longer started beside a gate that
   has no Access settings, where nobody could sign in through it. See "On a tailnet instead" in `docs/OPERATING.md`.
-- An installer, `scripts/install.sh`: one command that leaves what the README's quickstart leaves, a read-only node
+- An installer, `scripts/install.sh`: one command that leaves what `docs/QUICKSTART.md` leaves, a read-only node
   for the user who runs it. It checks the machine first (Linux, x86_64, glibc 2.34 or newer, `curl`, `sha256sum`, a
   runtime directory that is the user's alone, an Incus socket this user may open) and, when something is missing, says
   what and how to fix it and changes nothing. It refuses to run as root. It downloads one named release
@@ -44,8 +48,8 @@ stop unless it prints `arca-<version>-linux-x86_64: OK`.
   the unit and the program, while the program is still the file it installed, and keeps the config, the tokens and
   the state. It never runs `sudo`, writes only in the user's home, never prints the token, and works from a pipe and in
   a shell with no `XDG_RUNTIME_DIR`. It refuses a user who already has the operating guide's units
-  (`arca-watch.service`, `arca-shim.service`). The script is not a release asset yet: the README reads it from the
-  `dev` branch. It is tested against stand-ins, and was run for real only on a machine that already had Incus and
+  (`arca-watch.service`, `arca-shim.service`). The script is not a release asset yet: the quickstart reads it from
+  the `dev` branch. It is tested against stand-ins, and was run for real only on a machine that already had Incus and
   Arca.
 - Two families of refusal have their own codes, so a caller no longer reads the sentence to tell them from any other
   refusal. `capacity`: the call would pass a cap of a tenant or of the node (instances, containers, virtual machines,
@@ -62,6 +66,13 @@ stop unless it prints `arca-<version>-linux-x86_64: OK`.
   is a break against a released document. The approval page's 403 answers carry the same fields, and its 429 answers
   carry `refusal: "rate"` beside `message`. The table is in `docs/OPERATING.md`, "Refusals for want of room and for
   asking too often".
+- The README is now one short page: what Arca is, how to get it, how it works and what it runs, with the Arca logo and
+  one diagram (the files are in `assets/readme/`, each with one file for a light page and one for a dark page). Its
+  long sections moved into `docs/`, word for word: the quickstart is `docs/QUICKSTART.md`, with "Install with one
+  command" above its steps by hand; the status table and "What it does today" open `docs/OPERATING.md`; the crate
+  table is `docs/ARCHITECTURE.md`; "Build and test" and "Releasing" are `docs/BUILDING.md`. A link to
+  `README.md#quickstart-a-read-only-node-in-five-minutes` now stops at the top of the README: the quickstart's address
+  is `docs/QUICKSTART.md`.
 - A new shipped template, `automagik-workspace`: one Automagik workspace in its own virtual machine (2 CPUs, 4GiB,
   20GiB), published through a Cloudflare Tunnel whose connector runs inside the same machine. A keeper runs the
   Automagik server, its gate (the same image, the only door to the server) and the connector in one network

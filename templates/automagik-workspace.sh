@@ -52,8 +52,9 @@
 #
 # What it reads:
 # - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
-#   publicUrl is the workspace's exact public origin (https://<host>, no path); the shipped example address means
-#   "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
+#   Those a service_create gave (the template lists which it may) stand in place of the template's own.
+#   publicUrl is the workspace's exact public origin (https://<host>, no path); empty, as the template ships it,
+#   means "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
 #   that address (none of them a secret): all three are set, or none. serverImage is the server's image by digest.
 #   reach is "cloudflare" (also when it is left out) or "tailnet"; with "tailnet" publicUrl is the node's own
 #   https://<machine>.<tailnet>.ts.net and the Access settings are refused.
@@ -95,8 +96,6 @@ set -u
 : "${WS_BACKOFF_MAX:=300}"    # the longest pause before a part that keeps failing is started again, in seconds
 : "${WS_APT_PAUSE:=20}"       # seconds between two tries of the first boot's package install
 
-# The address the shipped template carries for settings.publicUrl. It is nobody's, and means "not set".
-EXAMPLE_URL='https://workspace.example.com'
 SERVER=automagik-server
 GATE=automagik-gate
 TUNNEL=automagik-tunnel
@@ -205,7 +204,7 @@ install_workspace() {
   fi
   # Settings that cannot be used never change: they are part of the machine. That is said now, on the console, and
   # the keeper is installed all the same, so that every later look at service_logs finds the reason again.
-  load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. The workspace will not start; service_remove it and create it again from a template whose settings are right"
+  load_settings || boot_say "first boot: the settings cannot be used: $REFUSAL. The workspace will not start; service_remove it and create it again with settings that are right"
   if ! data_directories; then
     boot_say "first boot failed: the data directories $WS_DATA and $WS_GATE_DATA could not be made for the server's user ($WS_DATA_OWNER). The machine has no workspace"
     exit 1
@@ -264,7 +263,9 @@ load_settings() {
     refuse "the settings are missing or are not one JSON object ($WS_SETTINGS)"
     return
   fi
-  url=$(jq -r '.publicUrl | if type == "string" then . else "" end' "$WS_SETTINGS")
+  # An empty publicUrl, as the template ships it, means "not set". One that is not a string becomes "!", which
+  # the rules below refuse.
+  url=$(jq -r '.publicUrl | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   REACH=$(jq -r '.reach | if . == null then "cloudflare" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   SERVER_IMAGE=$(jq -r '.serverImage | if type == "string" then . else "" end' "$WS_SETTINGS")
   # A missing key is an empty one, and so is an empty list. A value of the wrong kind becomes "!", which no rule
@@ -285,7 +286,7 @@ load_settings() {
   fi
   # The gate takes its origin exactly as a browser writes it, and stops when it is written another way: no path, no
   # closing slash, and a port only when it is not https's own 443.
-  if [ "$url" = "$EXAMPLE_URL" ]; then
+  if [ -z "$url" ]; then
     PUBLIC_URL=''
   elif [[ $url =~ ^https://[0-9.]+(:[0-9]*)?$ ]]; then
     refuse "settings.publicUrl is a name, not an IP address: the gate takes none as its origin, and no passkey belongs to one"
@@ -750,7 +751,7 @@ look_at_server() {
 
 look_at_gate() {
   if [ -z "$PUBLIC_URL" ]; then
-    GATE_STATE="no gate is started, because no public address is set (settings.publicUrl is the template's example)"
+    GATE_STATE="no gate is started, because no public address is set (settings.publicUrl is empty)"
     return
   fi
   health_words gate "$GATE" "$GATE_PORT"
@@ -894,7 +895,7 @@ run_workspace() {
     [ -z "$STOP" ] || exit 0
   done
   until load_settings; do
-    say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. They are fixed when the machine is created: service_remove it and create it again from a template whose settings are right"
+    say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. They are fixed when the machine is created: service_remove it and create it again with settings that are right"
     nap "$WS_REFUSE_EVERY"
     [ -z "$STOP" ] || exit 0
   done

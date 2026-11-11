@@ -445,7 +445,7 @@ impl Drop for Machine {
     }
 }
 
-/// The config of the README's quickstart, for this machine.
+/// The config of the quickstart (`docs/QUICKSTART.md`), for this machine.
 fn quickstart_config(machine: &Machine) -> Value {
     json!({
         "stateDir": machine.home(".local/state/arca-node"),
@@ -1561,29 +1561,30 @@ fn a_machine_it_cannot_run_on_is_refused_with_every_reason_at_once() {
 }
 
 #[test]
-fn the_script_is_what_the_readme_and_the_hard_rules_say() {
+fn the_script_is_what_the_quickstart_and_the_hard_rules_say() {
     let text = script_text();
 
     // The release it installs is the repository's one version: scripts/version.sh writes this line with every other
-    // field, and a release whose installer names another version fails. The quickstart writes no version by hand any
-    // more: it asks GitHub for the newest release.
-    let readme = fs::read_to_string(repo().join("README.md")).expect("the README");
+    // field, and a release whose installer names another version fails. The quickstart (docs/QUICKSTART.md, "By
+    // hand") writes no version by hand any more: it asks GitHub for the newest release.
     assert_eq!(
         current(),
         env!("CARGO_PKG_VERSION"),
         "scripts/install.sh installs the version the repository carries"
     );
-    let by_hand = readme
+    let quickstart =
+        fs::read_to_string(repo().join("docs/QUICKSTART.md")).expect("docs/QUICKSTART.md");
+    let by_hand = quickstart
         .lines()
         .find_map(|line| line.strip_prefix("v="))
         .expect("the quickstart says which release it downloads");
     assert!(
         by_hand.contains("https://github.com/automagik-si/arca/releases/latest"),
-        "the quickstart asks for the newest release and names none: {by_hand}"
+        "docs/QUICKSTART.md asks for the newest release and names none: {by_hand}"
     );
     assert!(
-        readme.contains("scripts/install.sh"),
-        "the README shows the installer"
+        quickstart.contains("scripts/install.sh"),
+        "docs/QUICKSTART.md shows the installer"
     );
 
     // It never becomes another user, and never uses the address that skips pre-releases.
@@ -1621,7 +1622,7 @@ fn the_script_is_what_the_readme_and_the_hard_rules_say() {
         assert!(line.contains(":?}"), "not guarded: {line}");
     }
 
-    // shellcheck, where the machine has it, for both shells the README names.
+    // shellcheck, where the machine has it, for both shells the quickstart names.
     match find("shellcheck") {
         Some(shellcheck) => {
             for shell in ["sh", "bash"] {

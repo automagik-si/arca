@@ -1,6 +1,6 @@
 {
   "name": "automagik-workspace",
-  "description": "One Automagik workspace in its own virtual machine (Debian 13 cloud image; 2 CPUs, 4GiB, 20GiB): the Automagik server and its gate (one image, by digest) and, as settings.reach says, a Cloudflare Tunnel connector (cloudflared 2026.10.7) or a tailnet node (Tailscale 1.104.4), sharing one loopback. Set the settings in a copy of this template. Created stopped: set TUNNEL_TOKEN or TAILSCALE_AUTHKEY, then instance_start.",
+  "description": "One Automagik workspace in its own virtual machine (Debian 13 cloud image; 2 CPUs, 4GiB, 20GiB): the Automagik server and its gate (one image, by digest) and, as settings.reach says, a Cloudflare Tunnel connector (cloudflared 2026.10.7) or a tailnet node (Tailscale 1.104.4). Give reach, publicUrl and the Access settings at create (settings). Created stopped: set TUNNEL_TOKEN or TAILSCALE_AUTHKEY, then instance_start.",
   "kind": "virtual-machine",
   "image": "images:debian/13/cloud",
   "limits": { "cpu": "2", "memory": "4GiB" },
@@ -8,9 +8,10 @@
   "autostart": true,
   "firstBoot": { "file": "automagik-workspace.sh" },
   "secrets": ["TUNNEL_TOKEN", "TAILSCALE_AUTHKEY"],
+  "createSettings": ["reach", "publicUrl", "accessTeamDomain", "accessAudience", "accessEmails"],
   "settings": {
     "reach": "cloudflare",
-    "publicUrl": "https://workspace.example.com",
+    "publicUrl": "",
     "accessTeamDomain": "",
     "accessAudience": "",
     "accessEmails": [],
