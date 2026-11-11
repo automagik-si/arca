@@ -15,20 +15,23 @@
 #     automagik-server   the Automagik server image. It listens on its loopback (port 3081) and keeps its state in
 #                        /data, which is the machine's /var/lib/automagik-workspace/data, owned by uid 1000.
 #     automagik-gate     the same image by the same digest, started with the gate's entrypoint. It listens on the
-#                        same loopback at settings.gatePort and is the only door to the server: it signs the owner
+#                        same loopback at port 3082 and is the only door to the server: it signs the owner
 #                        in and holds the server's own sign-in credential, which never leaves the machine. Its state
 #                        is in /var/lib/automagik-workspace/gate; it reads the server's data read-only. It is
 #                        started only when a public address is set: the gate does not start without its origin.
 #     automagik-tunnel   cloudflared, as a remotely-managed tunnel. It calls out to Cloudflare; nothing calls in. The
-#                        route in Cloudflare names http://127.0.0.1:<gatePort>. Its metrics listener is put on
-#                        loopback, where a container would otherwise open it to every address.
+#                        route in Cloudflare names http://127.0.0.1:3082. Its metrics listener is put on loopback,
+#                        where a container would otherwise open it to every address.
+#   The server is never told its public name. The gate speaks to it as loopback, so it needs none, and without one it
+#   refuses (HTTP 403) every request that comes under a public name: a route in Cloudflare that names the server's
+#   port instead of the gate's shows that refusal at once, and never the workspace without its gate.
 #   Plain `docker run` gives this shape; Docker Compose is not installed.
 #
 # What it reads:
 # - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
 #   publicUrl is the workspace's exact public origin (https://<host>, no path); the shipped example address means
 #   "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
-#   that address (none of them a secret): all three are set, or none.
+#   that address (none of them a secret): all three are set, or none. serverImage is the server's image by digest.
 # - /etc/arca-secrets/TUNNEL_TOKEN: the tunnel's token, written by Arca at each start (service_secret_set, then
 #   instance_start). The server and the gate start without it; the tunnel waits for it, and a new token replaces the
 #   tunnel only.
@@ -69,21 +72,24 @@ SERVER=automagik-server
 GATE=automagik-gate
 TUNNEL=automagik-tunnel
 
-# What this script takes from the Automagik server image, each in this one place. The gate is the Automagik
-# repository's commit 89a2c1f (server/compose.gate.yml, server/gate-entrypoint.mjs). Its Cloudflare Access sign-in was
-# still a pull request there (1082) when this was written, so the three ACCESS names were agreed and not yet in
-# released code: a change of any name is one line here.
+# What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
+# them at commit 8fb2e6f (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs): the build the
+# shipped template pins. A later build that changes one of them changes one line here.
 SERVER_PORT=3081                                  # the server's own port, fixed in the image
+GATE_PORT=3082                                    # the gate's port, the one upstream's compose file fixes
 IMAGE_NODE=/nodejs/bin/node                       # the image's node
 GATE_ENTRY=/opt/automagik/gate-entrypoint.mjs     # the gate's entrypoint, in the same image
 HEALTH_ENTRY=/opt/automagik/healthcheck.mjs       # the image's own check: prints the HTTP code, succeeds on 401
-PUBLIC_URL_ENV=AUTOMAGIK_PUBLIC_URL               # the server: its public address
 GATE_ENABLED_ENV=AUTOMAGIK_GATE_ENABLED           # the gate: 1 turns it on
 GATE_ORIGIN_ENV=AUTOMAGIK_GATE_ORIGIN             # the gate: the exact public origin
 GATE_PORT_ENV=AUTOMAGIK_GATE_PORT                 # the gate: its loopback port
 ACCESS_TEAM_ENV=AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN # the gate: the Cloudflare Access team's host name
 ACCESS_AUDIENCE_ENV=AUTOMAGIK_GATE_ACCESS_AUD     # the gate: the Access application's audience tag
 ACCESS_EMAILS_ENV=AUTOMAGIK_GATE_ACCESS_EMAILS    # the gate: the e-mail addresses that may sign in, comma-separated
+
+# The connector's image, by digest: the one templates/cloudflare-tunnel.json pins (cloudflared 2026.10.7). It is not a
+# setting: a workspace does not choose its connector.
+TUNNEL_IMAGE=docker.io/cloudflare/cloudflared@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
 
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
@@ -198,43 +204,37 @@ refuse() {
   return 1
 }
 
-# Reads the settings into PUBLIC_URL, GATE_PORT, SERVER_IMAGE, TUNNEL_IMAGE and the ACCESS_ values. When they cannot
-# be used it fails, with the reason, in words, in REFUSAL.
+# Reads the settings into PUBLIC_URL, SERVER_IMAGE and the ACCESS_ values. When they cannot be used it fails, with
+# the reason, in words, in REFUSAL.
 load_settings() {
-  local url address='[A-Za-z0-9._%+-]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?'
+  local url port address='[A-Za-z0-9._%+-]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?'
   REFUSAL=''
   if ! jq -e 'type == "object"' "$WS_SETTINGS" >/dev/null 2>&1; then
     refuse "the settings are missing or are not one JSON object ($WS_SETTINGS)"
     return
   fi
   url=$(jq -r '.publicUrl | if type == "string" then . else "" end' "$WS_SETTINGS")
-  GATE_PORT=$(jq -r '.gatePort | if type == "number" and . == floor then . else "" end' "$WS_SETTINGS")
   SERVER_IMAGE=$(jq -r '.serverImage | if type == "string" then . else "" end' "$WS_SETTINGS")
-  TUNNEL_IMAGE=$(jq -r '.tunnelImage | if type == "string" then . else "" end' "$WS_SETTINGS")
-  # A missing key is an empty one. A value of the wrong kind becomes "!", which no rule below takes.
+  # A missing key is an empty one, and so is an empty list. A value of the wrong kind becomes "!", which no rule
+  # below takes. Each entry of the list is one whole address: an entry that holds a comma, a space or a line break
+  # is not one, so the comma-separated value the gate gets has exactly as many addresses as the list has entries.
   ACCESS_TEAM=$(jq -r '.accessTeamDomain | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   ACCESS_AUDIENCE=$(jq -r '.accessAudience | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
-  ACCESS_EMAILS=$(jq -r '.accessEmails | if . == null then "" elif type == "array" and all(.[]; type == "string") then join(",") else "!" end' "$WS_SETTINGS")
+  ACCESS_EMAILS=$(jq -r --arg address "\\A$address\\z" '.accessEmails | if . == null or . == [] then "" elif type == "array" and length <= 16 and all(.[]; type == "string" and test($address)) then join(",") else "!" end' "$WS_SETTINGS" 2>/dev/null) || ACCESS_EMAILS='!'
   ACCESS_COUNT=0
-  if ! [[ $GATE_PORT =~ ^[0-9]{1,5}$ ]] || [ "$GATE_PORT" -lt 1 ] || [ "$GATE_PORT" -gt 65535 ] ||
-    [ "$GATE_PORT" -eq "$SERVER_PORT" ]; then
-    refuse "settings.gatePort is the gate's port, a whole number from 1 to 65535 that is not the server's own $SERVER_PORT"
-    return
-  fi
   if ! pinned "$SERVER_IMAGE"; then
     refuse "settings.serverImage is an image by digest: <registry>/<name>@sha256:<64 hex digits>"
     return
   fi
-  if ! pinned "$TUNNEL_IMAGE"; then
-    refuse "settings.tunnelImage is an image by digest: <registry>/<name>@sha256:<64 hex digits>"
-    return
-  fi
+  # The gate takes its origin exactly as a browser writes it, and stops when it is written another way: no path, no
+  # closing slash, and a port only when it is not https's own 443.
   if [ "$url" = "$EXAMPLE_URL" ]; then
     PUBLIC_URL=''
-  elif [[ $url =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?$ ]]; then
+  elif [[ $url =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:([1-9][0-9]{0,4}))?$ ]] &&
+    port=${BASH_REMATCH[3]} && { [ -z "$port" ] || { [ "$port" -le 65535 ] && [ "$port" -ne 443 ]; }; }; then
     PUBLIC_URL=$url
   else
-    refuse "settings.publicUrl is the workspace's exact public origin: https://<host name>, in lower case, with at most a port, and no path or closing slash"
+    refuse "settings.publicUrl is the workspace's exact public origin: https://<host name>, in lower case, with no path or closing slash, and a port only when it is not 443 (1 to 65535, written without a leading 0)"
     return
   fi
   [ -n "$ACCESS_TEAM$ACCESS_AUDIENCE$ACCESS_EMAILS" ] || return 0
@@ -246,8 +246,8 @@ load_settings() {
     refuse "the Cloudflare Access settings need settings.publicUrl: the address the Access application protects"
     return
   fi
-  if ! [[ $ACCESS_TEAM =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-    refuse "settings.accessTeamDomain is the Cloudflare Access team's host name alone, in lower case and without https://, such as example.cloudflareaccess.com"
+  if ! [[ $ACCESS_TEAM =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.cloudflareaccess\.com$ ]]; then
+    refuse "settings.accessTeamDomain is the Cloudflare Access team's host name alone, in lower case and without https://: <team>.cloudflareaccess.com"
     return
   fi
   if ! [[ $ACCESS_AUDIENCE =~ ^[A-Za-z0-9]{32,128}$ ]]; then
@@ -255,7 +255,7 @@ load_settings() {
     return
   fi
   if ! [[ $ACCESS_EMAILS =~ ^$address(,$address){0,15}$ ]]; then
-    refuse "settings.accessEmails is a list of 1 to 16 e-mail addresses"
+    refuse "settings.accessEmails is a list of 1 to 16 e-mail addresses, one in each entry"
     return
   fi
   ACCESS_COUNT=$(jq -r '.accessEmails | length' "$WS_SETTINGS")
@@ -292,13 +292,27 @@ proven() {
   PAUSE[$1]=5
 }
 
-running() {
-  [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]
+# What Docker says of a container: "running", "exited <code>", "absent", or "unknown" when Docker could not be asked
+# (a daemon that is restarting, a call that failed). Nothing is ever removed or started on "unknown": a container
+# is only acted on when Docker has said that it stopped or that it is not there.
+state_of() {
+  local out
+  if out=$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$1" 2>&1); then
+    case $out in
+      'true '*) echo running ;;
+      'false '[0-9]*) echo "exited ${out#false }" ;;
+      *) echo unknown ;;
+    esac
+  else
+    case ${out,,} in
+      *'no such object'* | *'no such container'*) echo absent ;;
+      *) echo unknown ;;
+    esac
+  fi
 }
 
-# What a container that is there and not running ended with; nothing when there is no such container.
-exit_code() {
-  docker inspect -f '{{.State.ExitCode}}' "$1" 2>/dev/null
+running() {
+  [ "$(state_of "$1")" = running ]
 }
 
 # The last line of what docker said, on one line and bounded. No secret is on a docker command line here, so none is
@@ -307,26 +321,27 @@ last_line() {
   printf '%s\n' "$1" | tail -n 1 | tr -d '\000-\037' | cut -c1-300
 }
 
-# The gate and the tunnel live in the server's network namespace. A server container that is gone took the
-# namespace with it, so both are removed with it and start again beside the new one.
+# The gate and the tunnel live in the server's network namespace. A server container that stopped or is gone took
+# the namespace with it, so both are removed with it and start again beside the new one. The server is given no
+# public name: see the head of this file.
 keep_server() {
-  local code out
-  running "$SERVER" && return 0
-  code=$(exit_code "$SERVER")
+  local state out
+  state=$(state_of "$SERVER")
+  case $state in
+    running | unknown) return 0 ;;
+  esac
   docker rm -f "$GATE" "$TUNNEL" >/dev/null 2>&1
   rm -f "$WS_RUN/tunnel-token.sha256"
   REGISTERED=''
-  if [ -n "$code" ]; then
-    say "the server stopped (exit code $code); it is started again after a pause, and the gate and the tunnel with it"
+  if [ "$state" != absent ]; then
+    say "the server stopped (exit code ${state#exited }); it is started again after a pause, and the gate and the tunnel with it"
     docker rm -f "$SERVER" >/dev/null 2>&1
     failed server
     return 0
   fi
   due server || return 0
-  local args=(run -d --name "$SERVER" --restart no -v "$WS_DATA:/data")
-  [ -z "$PUBLIC_URL" ] || args+=(-e "$PUBLIC_URL_ENV=$PUBLIC_URL")
   say "starting the server (Docker downloads its image first when it is not on this machine yet)"
-  if out=$(docker "${args[@]}" "$SERVER_IMAGE" 2>&1 >/dev/null); then
+  if out=$(docker run -d --name "$SERVER" --restart no -v "$WS_DATA:/data" "$SERVER_IMAGE" 2>&1 >/dev/null); then
     say "the server is started from $SERVER_IMAGE"
   else
     docker rm -f "$SERVER" >/dev/null 2>&1
@@ -339,17 +354,19 @@ keep_server() {
 # cannot write but for its own /data, and no capability. It reads the server's data read-only, for the server's
 # sign-in credential.
 keep_gate() {
-  local code out
+  local state out
   [ -n "$PUBLIC_URL" ] || return 0
   running "$SERVER" || return 0
-  running "$GATE" && return 0
-  code=$(exit_code "$GATE")
-  if [ -n "$code" ]; then
-    say "the gate stopped (exit code $code); it is started again after a pause. The gate says nothing of its settings in its own output; when it keeps stopping, the usual causes are a server image that has no gate, or settings its gate does not take"
-    docker rm -f "$GATE" >/dev/null 2>&1
-    failed gate
-    return 0
-  fi
+  state=$(state_of "$GATE")
+  case $state in
+    running | unknown) return 0 ;;
+    exited*)
+      say "the gate stopped (exit code ${state#exited }); it is started again after a pause. The gate says nothing of its settings in its own output; when it keeps stopping, the usual causes are a server image that has no gate, or settings its gate does not take"
+      docker rm -f "$GATE" >/dev/null 2>&1
+      failed gate
+      return 0
+      ;;
+  esac
   due gate || return 0
   local args=(run -d --name "$GATE" --network "container:$SERVER" --restart no --read-only --cap-drop ALL
     --security-opt no-new-privileges:true --entrypoint "$IMAGE_NODE"
@@ -378,23 +395,25 @@ TUNNEL_TRIED=''
 REGISTERED=''
 
 keep_tunnel() {
-  local dir=$WS_RUN/tunnel digest code out
+  local dir=$WS_RUN/tunnel digest state out
   running "$SERVER" || return 0
   [ -e "$WS_SECRETS/TUNNEL_TOKEN" ] || return 0
   digest=$(token_digest)
   [ "$digest" != "$EMPTY_DIGEST" ] || return 0
-  if running "$TUNNEL"; then
-    [ "$digest" != "$(cat "$WS_RUN/tunnel-token.sha256" 2>/dev/null)" ] || return 0
-    say "TUNNEL_TOKEN changed: the tunnel is started again with the new one"
-    docker rm -f "$TUNNEL" >/dev/null 2>&1
-  else
-    code=$(exit_code "$TUNNEL")
-    if [ -n "$code" ]; then
-      say "the tunnel stopped (exit code $code); it is started again after a pause. When it keeps stopping, the usual cause is a token Cloudflare does not accept: set TUNNEL_TOKEN again (service_secret_set, then instance_start)"
+  state=$(state_of "$TUNNEL")
+  case $state in
+    unknown) return 0 ;;
+    running)
+      [ "$digest" != "$(cat "$WS_RUN/tunnel-token.sha256" 2>/dev/null)" ] || return 0
+      say "TUNNEL_TOKEN changed: the tunnel is started again with the new one"
+      docker rm -f "$TUNNEL" >/dev/null 2>&1
+      ;;
+    exited*)
+      say "the tunnel stopped (exit code ${state#exited }); it is started again after a pause. When it keeps stopping, the usual cause is a token Cloudflare does not accept: set TUNNEL_TOKEN again (service_secret_set, then instance_start)"
       docker rm -f "$TUNNEL" >/dev/null 2>&1
       failed tunnel
-    fi
-  fi
+      ;;
+  esac
   # A token that was not tried yet does not wait for the pause its predecessor earned.
   [ "$digest" = "$TUNNEL_TRIED" ] || proven tunnel
   due tunnel || return 0
@@ -412,8 +431,8 @@ keep_tunnel() {
     return 0
   fi
   say "starting the tunnel (Docker downloads its image first when it is not on this machine yet)"
-  if out=$(docker run -d --name "$TUNNEL" --network "container:$SERVER" --restart no --user "$WS_TUNNEL_OWNER" \
-    -v "$dir:/run/arca-tunnel:ro" "$TUNNEL_IMAGE" \
+  if out=$(docker run -d --name "$TUNNEL" --network "container:$SERVER" --restart no --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$WS_TUNNEL_OWNER" -v "$dir:/run/arca-tunnel:ro" "$TUNNEL_IMAGE" \
     tunnel --no-autoupdate --metrics 127.0.0.1:20241 run --token-file /run/arca-tunnel/token 2>&1 >/dev/null); then
     printf '%s\n' "$digest" >"$WS_RUN/tunnel-token.sha256"
     say "the tunnel is started from $TUNNEL_IMAGE"
@@ -440,10 +459,17 @@ health_code() {
 # Each look sets one variable rather than printing, so what it learns (a part seen working) stays with the keeper.
 health_words() {
   local code
-  if ! running "$2"; then
-    WORDS="the $1 is not running"
-    return
-  fi
+  case $(state_of "$2") in
+    running) ;;
+    unknown)
+      WORDS="Docker did not answer about the $1"
+      return
+      ;;
+    *)
+      WORDS="the $1 is not running"
+      return
+      ;;
+  esac
   code=$(health_code "$2")
   case $code in
     401)
@@ -475,6 +501,8 @@ look_at_tunnel() {
     TUNNEL_STATE="the tunnel waits for TUNNEL_TOKEN (service_secret_set, then instance_start)"
   elif [ "$(token_digest)" = "$EMPTY_DIGEST" ]; then
     TUNNEL_STATE="the tunnel waits: TUNNEL_TOKEN is empty (service_secret_set, then instance_start)"
+  elif [ "$(state_of "$TUNNEL")" = unknown ]; then
+    TUNNEL_STATE="Docker did not answer about the tunnel"
   elif ! running "$TUNNEL"; then
     TUNNEL_STATE="the tunnel is not running"
   else
@@ -515,20 +543,23 @@ run_workspace() {
   local missing state last='' said=0
   : "${WS_NAME:=$(hostname)}"
   trap 'STOP=1' TERM INT
-  missing=$(missing_programs)
-  if [ -n "$missing" ]; then
-    say "these commands are missing on this machine: $missing. The first boot did not finish; /var/log/cloud-init-output.log inside the machine says why"
-    exit 1
-  fi
+  # Whatever keeps the workspace from starting is said at intervals by a keeper that stays up: one that exits is
+  # started again by systemd every few seconds, with a line on the console each time.
+  until missing=$(missing_programs) && [ -z "$missing" ]; do
+    say "workspace $WS_NAME does not start: these commands are missing on this machine: $missing. The first boot did not finish; /var/log/cloud-init-output.log inside the machine says why"
+    nap "$WS_REFUSE_EVERY"
+    [ -z "$STOP" ] || exit 0
+  done
   until load_settings; do
     say "workspace $WS_NAME does not start: its settings cannot be used: $REFUSAL. They are fixed when the machine is created: service_remove it and create it again from a template whose settings are right"
     nap "$WS_REFUSE_EVERY"
     [ -z "$STOP" ] || exit 0
   done
-  if ! mkdir -p "$WS_RUN" || ! chmod 0700 "$WS_RUN" || ! data_directories; then
+  until mkdir -p "$WS_RUN" && chmod 0700 "$WS_RUN" && data_directories; do
     say "workspace $WS_NAME does not start: $WS_RUN, $WS_DATA or $WS_GATE_DATA could not be made"
-    exit 1
-  fi
+    nap "$WS_REFUSE_EVERY"
+    [ -z "$STOP" ] || exit 0
+  done
   say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the tunnel, in one network namespace; $(public_state)"
   while [ -z "$STOP" ]; do
     keep_server

@@ -2529,7 +2529,7 @@ three containers, in the shape of Automagik's own `server/compose.gate.yml`:
 | Container | What it is | Where it listens |
 |-----------|------------|------------------|
 | `automagik-server` | The Automagik server image. Its state is in `/data`. | Its own loopback, port 3081. It has a network namespace of its own and no published port. |
-| `automagik-gate` | The same image by the same digest, started with the gate's entrypoint. The only door to the server: it signs the owner in, and it holds the server's own sign-in credential, which never leaves the machine. | The same loopback, `settings.gatePort` (3082): it joins the server's network namespace. |
+| `automagik-gate` | The same image by the same digest, started with the gate's entrypoint. The only door to the server: it signs the owner in, and it holds the server's own sign-in credential, which never leaves the machine. | The same loopback, port 3082: it joins the server's network namespace. |
 | `automagik-tunnel` | Cloudflare's connector (`cloudflared`). It calls out to Cloudflare; nothing calls in. | Nothing but its metrics, put on that loopback too. It joins the same namespace and hands visitors to the gate's port. |
 
 The three share one loopback that belongs to none of the machine's own addresses. Nothing listens on the machine's
@@ -2565,7 +2565,9 @@ token passes through that assistant's conversation.
    `example-workspace.json`, sets `"name"` to `example-workspace`, sets `settings.publicUrl` to the address the
    workspace will have (`https://workspace.example.com`, with no closing slash), and sets the three Access settings
    from step 2: `accessTeamDomain`, `accessAudience` and `accessEmails` (the same addresses as the policy). This is
-   the one step that is a file and not a verb. The script `automagik-workspace.sh` stays as it is, beside it.
+   the one step that is a file and not a verb, and it is temporary: once `service_create` takes a service's own
+   settings, these are given at create and no copy is made. The script `automagik-workspace.sh` stays as it is,
+   beside it.
 4. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. The machine is created
    and stays `stopped`, because it has no token yet. Leave `bridge` out, so that it joins Arca's own service network.
 5. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The
@@ -2577,7 +2579,9 @@ token passes through that assistant's conversation.
    application of step 2 in place. Select "Add route", then "Published application". Enter the subdomain
    (`workspace`), choose your domain (`example.com`) in "Domain", and in "Service URL" enter `http://127.0.0.1:3082`:
    the gate's port, not the server's 3081. That address is the loopback the connector shares with the gate. Select
-   "Add route".
+   "Add route". A route that names 3081 by mistake does not open the workspace without its gate: the server is
+   never told its public name, so it answers every request under one with a refusal (HTTP 403), and the address
+   shows that at once. Correct the port in the route.
 8. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
    `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel is running and has registered with Cloudflare; public address https://workspace.example.com, sign-in by Cloudflare Access (team example.cloudflareaccess.com, 1 e-mail address(es))`.
    The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
@@ -2585,33 +2589,33 @@ token passes through that assistant's conversation.
 
 | Setting | Meaning |
 |---------|---------|
-| `publicUrl` | The workspace's exact public origin: `https://`, a host name in lower case and at most a port; no path and no closing slash. The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and the server as `AUTOMAGIK_PUBLIC_URL`. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
-| `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`example.cloudflareaccess.com`, no `https://`), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
-| `gatePort` | The gate's port on the shared loopback, `3082`; the gate gets it as `AUTOMAGIK_GATE_PORT`. The route in Cloudflare names it. It is never 3081, the server's own. |
+| `publicUrl` | The workspace's exact public origin, as a browser writes it: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
+| `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16, one address in each entry). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
 | `serverImage` | The Automagik server's public image, pinned by digest. The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below). |
-| `tunnelImage` | The connector's public image, pinned by digest: the one the `cloudflare-tunnel` template pins. |
+
+Two things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image is
+fixed in the script at the digest the `cloudflare-tunnel` template pins.
 
 What to know:
 
-- **The pinned server image is older than the gate.** The gate (the Automagik repository's commit `89a2c1f`),
-  `AUTOMAGIK_PUBLIC_URL` (`3659283`) and the gate's Cloudflare Access sign-in (still a pull request there, 1082,
-  when this was written) are all newer than the server release this template pins. With the pinned image the machine comes
-  up and the server is healthy, and the gate's container stops at once, because that image has no gate: the keeper
-  says `the gate stopped (exit code ...)` and tries again after a pause, and the public address leads nowhere. Set
-  `settings.serverImage` to the digest of a build that has the gate with the Access sign-in. Everything this script
-  takes from the image (three paths, the port 3081 and the seven variable names) is in one block at the top of
-  `automagik-workspace.sh`; check the three Access names against that build, since they were agreed before the code
-  that reads them was merged.
+- **The pinned server image.** `settings.serverImage` is build `3.128.0-8fb2e6f0` of the Automagik server, from
+  the Automagik repository's commit `8fb2e6f`: the first with the gate and its Cloudflare Access sign-in. An older
+  build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
+  tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
+  (three paths, the two ports and the six variable names) is in one block at the top of `automagik-workspace.sh`,
+  as that commit has them; check the block when you move the pin to a later build.
 - **The first sign-in.** The server signs a browser in with a link that it writes once into its own data. Arca
   never reads that link, the keeper never reads the server's or the gate's data, and the keeper never copies their
   output to the console, so the link is in no `service_logs` answer and reaches no assistant. The way in is
   Cloudflare Access: the gate checks the proof Cloudflare attaches to each request of a signed-in visitor (that it
   is signed by your team, is for this application, has not expired and names one of the listed addresses), keeps
-  the server's link to itself and signs that visitor in. No link leaves the machine. Without the three Access
+  the server's link to itself and signs that visitor in. No link leaves the machine. The sign-in happens when a
+  page is opened; the workspace's live connections then ride on the gate's own session. Without the three Access
   settings the gate is still the only door, and it has no sign-in to offer: nobody gets in.
 - **Access is the lock on the address.** Keep the Access policy to the addresses in `accessEmails`, and add the
   route only after it. The gate refuses a visitor Cloudflare did not sign in; the policy keeps strangers from
-  reaching the gate at all.
+  reaching the gate at all. To check a proof the gate fetches your team's public keys from
+  `https://<team>.cloudflareaccess.com`, an outgoing call the service network allows like any other.
 - **All three Access settings, or none.** The gate does not start with one or two. The first boot checks the
   settings and says on the console what is wrong, and the keeper repeats it; nothing is started with settings that
   cannot be used. Settings are fixed when the machine is created, so the cure is a corrected template and a new
@@ -2629,7 +2633,10 @@ What to know:
   the server's and the gate's containers: HTTP 401 on the loopback port, the answer to a visitor who has not signed
   in. A part that stops is started again after a pause that doubles up to five minutes. A tunnel that keeps
   stopping usually has a token Cloudflare does not accept. When the server's container is replaced, the gate and
-  the connector are started again beside it, since they live in its network namespace.
+  the connector are started again beside it, since they live in its network namespace. When Docker itself does not
+  answer, the keeper says so and touches nothing: a container is only removed or started once Docker has said that
+  it stopped or is not there. A keeper that cannot start at all (a missing command, settings that cannot be used)
+  stays up and repeats the reason every five minutes.
 - **The data.** The server's `/data` is the machine's `/var/lib/automagik-workspace/data` and the gate's is
   `/var/lib/automagik-workspace/gate`, both on the machine's own disk and owned by uid 1000, the image's user. The
   gate reads the server's data read-only; the server never sees the gate's. Both live and die with the machine:
@@ -2637,7 +2644,8 @@ What to know:
   snapshot carries the token's file too.
 - **No Docker Compose.** The keeper starts the three containers with `docker run`, with the same image, entrypoint,
   environment, volumes, shared network namespace and restrictions (read-only file system, no capability, no new
-  privileges) that Automagik's compose file gives the gate. The first boot installs `docker.io` and `docker-cli`
+  privileges) that Automagik's compose file gives the gate, and gives the server no environment, as that file
+  does. The connector gets the same three restrictions. The first boot installs `docker.io` and `docker-cli`
   (on Debian 13 the `docker` command is a package of its own) and no compose package.
 - **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
 - **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
@@ -3040,9 +3048,10 @@ unchanged, against a fake `docker` (`tests/automagik_workspace/fake-docker.sh`, 
 directory, refuses a container that joins the network namespace of one that is not running, and plays the image's
 health check). The script's `PATH` holds the programs it lists for itself and nothing else. It needs `bash` and `jq`
 on the machine that runs it. It covers what each of the three containers is started with (no published port and no
-host network, the gate and the connector in the server's namespace, the gate's entrypoint, restrictions,
-environment and volumes, the token as a file, the metrics listener on loopback), a server alone when no public
-address is set, the wait for the token, an empty token, a new token replacing the connector only, each part
+host network, a server that is never given its public name, the gate and the connector in the server's namespace,
+the gate's entrypoint, restrictions, environment and volumes, the token as a file, the metrics listener on
+loopback), a server alone when no public address is set, a Docker that does not answer (nothing is removed or
+started), a keeper that cannot start (it stays up and says why), the wait for the token, an empty token, a new token replacing the connector only, each part
 stopping, the gate and the connector following a replaced server, the health words for 401, 200, another code and
 no answer, a start that Docker refuses, the settings that are refused (by the keeper and, on the console, by the
 first boot), the first boot's packages, unit and console lines, its three failures, and that the token is in no
@@ -3054,15 +3063,18 @@ Not proven by these tests, because they need a real virtual machine, the images 
   that the keeper's lines reach `service_logs` through the console;
 - that Debian's `docker.io` and `docker-cli` install and that the pinned images pull and start as the script starts
   them: the server writing to the mounted `/data` as uid 1000, the gate on a read-only file system with no
-  capability, the connector as uid 65532 reading its token with `--token-file` and keeping its metrics on
-  `127.0.0.1:20241`, and two containers joining the first one's network namespace;
-- anything of the gate on a real image: no released server image had it. The entrypoint path, the health check's
-  behaviour in the gate's container, the answer 401 and the gate's variable names were read from the Automagik
-  repository at commit `89a2c1f`. The three Cloudflare Access variable names were not in any code there yet (pull
-  request 1082);
+  capability, the connector as uid 65532 on a read-only file system with no capability, reading its token with
+  `--token-file` and keeping its metrics on `127.0.0.1:20241` (those three restrictions are the ones Cloudflare's
+  own Helm chart gives the connector; they were not run here), and two containers joining the first one's network
+  namespace;
+- anything of the gate on the real image: the pinned build was not pulled or run. The entrypoint path, the health
+  check's behaviour in the gate's container, the answer 401, the variable names and the rules the gate applies to
+  the Access settings were read from the Automagik repository at commit `8fb2e6f`, the pinned build's;
 - that nothing in the machine listens beyond loopback (the image's own services were not listed on a live machine);
 - that the connector says `Registered tunnel connection`, the line the keeper looks for, and that a route to
   `http://127.0.0.1:3082` carries the workspace's pages, WebSockets and long-lived streams through Cloudflare;
+- that a route to the server's port 3081 is refused with 403: that is the server's own rule for a `Host` it was not
+  told to trust, read in its code and not exercised here;
 - the sign-in through Cloudflare Access, end to end;
 - the Cloudflare screens named in the steps, which follow the tunnel section above and Cloudflare's documentation
   and were not walked through in this work.

@@ -4,7 +4,8 @@
 # container is running while its directory holds the file `running`; the test stops one by removing that file and
 # writing `exit`. A container that joins another's network namespace starts only while that one runs, as with Docker.
 # A container given a directory at /run/arca-tunnel records the digest of the token file it finds there, as proof
-# that the token reached it as a file. `docker exec` plays the image's health check: it prints the code in
+# that the token reached it as a file. While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it
+# does when the daemon cannot be reached. `docker exec` plays the image's health check: it prints the code in
 # $FAKE_DOCKER_DIR/health-<name> (401 when there is no such file) and succeeds on 401. Nothing here is Docker.
 set -u
 root=$FAKE_DOCKER_DIR
@@ -53,15 +54,20 @@ case $command in
     ;;
   inspect)
     format=$2 name=$3
+    if [ -e "$root/fail-inspect" ]; then
+      echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+      exit 1
+    fi
     [ -d "$root/containers/$name" ] || {
-      echo "Error response from daemon: No such object: $name" >&2
+      echo "Error: No such object: $name" >&2
       exit 1
     }
-    case $format in
-      '{{.State.Running}}') if [ -e "$root/containers/$name/running" ]; then echo true; else echo false; fi ;;
-      '{{.State.ExitCode}}') cat "$root/containers/$name/exit" 2>/dev/null || echo 0 ;;
-      *) exit 2 ;;
-    esac
+    [ "$format" = '{{.State.Running}} {{.State.ExitCode}}' ] || exit 2
+    if [ -e "$root/containers/$name/running" ]; then
+      echo "true 0"
+    else
+      echo "false $(cat "$root/containers/$name/exit" 2>/dev/null || echo 0)"
+    fi
     ;;
   rm)
     [ "${1-}" = -f ] && shift

@@ -26,7 +26,6 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 const SERVER_IMAGE: &str = "registry.example/server@sha256:1111111111111111111111111111111111111111111111111111111111111111";
-const TUNNEL_IMAGE: &str = "registry.example/tunnel@sha256:2222222222222222222222222222222222222222222222222222222222222222";
 const TOKEN: &str = "eyJzeW50aGV0aWMiOiJ0dW5uZWwtdG9rZW4tZm9yLXRlc3RzLW9ubHkifQ";
 const OTHER_TOKEN: &str = "eyJzeW50aGV0aWMiOiJhLXNlY29uZC10dW5uZWwtdG9rZW4ifQ";
 const URL: &str = "https://team.example.org";
@@ -85,14 +84,18 @@ fn listed_programs() -> Vec<String> {
     list.split_whitespace().map(str::to_string).collect()
 }
 
+/// The connector's image, which the script fixes: the value of its `TUNNEL_IMAGE`.
+fn tunnel_image() -> String {
+    let text = fs::read_to_string(script()).expect("the script");
+    text.lines()
+        .find_map(|line| line.strip_prefix("TUNNEL_IMAGE="))
+        .expect("the script pins the connector")
+        .to_string()
+}
+
 /// A workspace's settings with a public address and no Cloudflare Access application.
 fn settings(public_url: &str) -> Value {
-    json!({
-        "publicUrl": public_url,
-        "gatePort": 3082,
-        "serverImage": SERVER_IMAGE,
-        "tunnelImage": TUNNEL_IMAGE
-    })
+    json!({ "publicUrl": public_url, "serverImage": SERVER_IMAGE })
 }
 
 /// The same, with the owner's Cloudflare Access application for that address.
@@ -355,29 +358,41 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_one_secret_and_
                 .any(|(shipped, _)| *shipped == name)
         );
     }
-    // Each image is one value in settings, by digest. The server's is this template's own to move (the gate runs
-    // from the same value), since a workspace needs a server that has the gate. The connector's is the
-    // cloudflare-tunnel template's pin, digest and all.
+    // The server's image is one value in settings, by digest: this template's own to move (the gate runs from the
+    // same value), since a workspace needs a server that has the gate. The connector is no setting: the script
+    // fixes it, at the cloudflare-tunnel template's pin, digest and all. The settings are only what a workspace's
+    // owner decides.
     let settings = template.settings.as_ref().expect("settings");
-    let digest_of = |key: &str| {
-        let image = settings[key].as_str().expect("an image");
-        let (repository, digest) = image.split_once("@sha256:").expect("a digest");
-        assert!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
-        (repository.to_string(), format!("sha256:{digest}"))
-    };
-    assert!(digest_of("serverImage").0.ends_with("/automagik-server"));
+    let mut keys: Vec<&str> = settings
+        .as_object()
+        .expect("an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
     assert_eq!(
-        digest_of("tunnelImage"),
-        (
-            tunnel.image.clone(),
-            tunnel.digest.clone().expect("a digest")
-        )
+        keys,
+        [
+            "accessAudience",
+            "accessEmails",
+            "accessTeamDomain",
+            "publicUrl",
+            "serverImage"
+        ]
     );
+    let image = settings["serverImage"].as_str().expect("an image");
+    let (repository, digest) = image.split_once("@sha256:").expect("a digest");
+    assert!(repository.ends_with("/automagik-server"));
+    assert!(digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
     let text = fs::read_to_string(dir.join("automagik-workspace.json")).expect("the template");
+    assert_eq!(text.matches("@sha256:").count(), 1, "one value for the pin");
     assert_eq!(
-        text.matches("@sha256:").count(),
-        2,
-        "one value for each pin"
+        tunnel_image(),
+        format!(
+            "{}@{}",
+            tunnel.image,
+            tunnel.digest.as_deref().expect("a digest")
+        )
     );
     let description = template.description.as_deref().expect("a description");
     assert!(description.contains("cloudflared 2026.10.7"));
@@ -387,7 +402,6 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_one_secret_and_
             .as_deref()
             .is_some_and(|text| text.contains("cloudflared 2026.10.7"))
     );
-    assert_eq!(settings["gatePort"], 3082);
     // The shipped address is nobody's and the Access settings ship empty. The same settings start the keeper, which
     // starts the server alone, with nothing of them in its environment, and says that no gate is started.
     assert_eq!(settings["publicUrl"], "https://workspace.example.com");
@@ -430,13 +444,14 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
         "status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel waits for TUNNEL_TOKEN (service_secret_set, then instance_start); public address",
     );
     // The server: a network namespace of its own, no published port and no host network, its data on the machine's
-    // disk, its public address in its environment.
+    // disk, and nothing in its environment. It is never told its public name, so it refuses every request under
+    // one: a route that names its port instead of the gate's fails closed.
     let data = workspace.dir.join("data");
     let gate_data = workspace.dir.join("gate");
     assert_eq!(
         workspace.runs("automagik-server"),
         [format!(
-            "run -d --name automagik-server --restart no -v {}:/data -e AUTOMAGIK_PUBLIC_URL={URL} {SERVER_IMAGE}",
+            "run -d --name automagik-server --restart no -v {}:/data {SERVER_IMAGE}",
             data.display()
         )]
     );
@@ -473,9 +488,10 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
     assert_eq!(
         workspace.runs("automagik-tunnel"),
         [format!(
-            "run -d --name automagik-tunnel --network container:automagik-server --restart no --user {} -v {}:/run/arca-tunnel:ro {TUNNEL_IMAGE} tunnel --no-autoupdate --metrics 127.0.0.1:20241 run --token-file /run/arca-tunnel/token",
+            "run -d --name automagik-tunnel --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --user {} -v {}:/run/arca-tunnel:ro {} tunnel --no-autoupdate --metrics 127.0.0.1:20241 run --token-file /run/arca-tunnel/token",
             me(),
-            token_dir.display()
+            token_dir.display(),
+            tunnel_image()
         )]
     );
     // The container found the token in its file, without the line break, and the file is its user's alone.
@@ -515,7 +531,13 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
     // No port is published and no container is on the host's network; nothing but the three was started; and the
     // token is in no output, no file outside the machine's memory and no command line.
     let calls = workspace.read("docker/calls.log");
-    for forbidden in [" -p ", "--publish", "--network host", "--privileged"] {
+    for forbidden in [
+        " -p ",
+        "--publish",
+        "--network host",
+        "--privileged",
+        "AUTOMAGIK_PUBLIC_URL",
+    ] {
         assert!(!calls.contains(forbidden), "{forbidden}");
     }
     assert_eq!(
@@ -679,23 +701,32 @@ fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
 #[test]
 fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
     let access = |team: &str, audience: &str, emails: Value| json!({ "accessTeamDomain": team, "accessAudience": audience, "accessEmails": emails });
-    let cases: [(Value, &str); 16] = [
+    let cases: [(Value, &str); 18] = [
         (
             json!({ "serverImage": "registry.example/server:latest" }),
             "settings.serverImage is an image by digest",
         ),
         (
-            json!({ "tunnelImage": "registry.example/tunnel" }),
-            "settings.tunnelImage is an image by digest",
-        ),
-        (
             json!({ "publicUrl": "http://team.example.org" }),
             "settings.publicUrl is the workspace's exact public origin: https://<host name>",
         ),
-        // The gate takes an exact origin: a closing slash or a path is not one.
+        // The gate takes an exact origin, as a browser writes it: a closing slash or a path is not one, nor is
+        // https's own port written out, a port that is none, or one with a leading 0. The gate would stop on each.
         (
             json!({ "publicUrl": "https://team.example.org/" }),
-            "no path or closing slash",
+            "with no path or closing slash",
+        ),
+        (
+            json!({ "publicUrl": "https://team.example.org:443" }),
+            "a port only when it is not 443",
+        ),
+        (
+            json!({ "publicUrl": "https://team.example.org:99999" }),
+            "(1 to 65535, written without a leading 0)",
+        ),
+        (
+            json!({ "publicUrl": "https://team.example.org:08443" }),
+            "(1 to 65535, written without a leading 0)",
         ),
         (
             json!({ "publicUrl": "https://team.example.org/?next=1" }),
@@ -708,14 +739,6 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
         (
             json!({ "publicUrl": "https://team.example.org -e OTHER=1" }),
             "settings.publicUrl is the workspace's exact public origin",
-        ),
-        (
-            json!({ "gatePort": "3082" }),
-            "settings.gatePort is the gate's port",
-        ),
-        (
-            json!({ "gatePort": 3081 }),
-            "a whole number from 1 to 65535 that is not the server's own 3081",
         ),
         // The Access settings: all three or none, each of its own shape, and only beside a public address.
         (
@@ -736,19 +759,37 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
                 ACCESS_AUDIENCE,
                 json!(["owner@example.com"]),
             ),
-            "settings.accessTeamDomain is the Cloudflare Access team's host name alone, in lower case and without https://",
+            "settings.accessTeamDomain is the Cloudflare Access team's host name alone, in lower case and without https://: <team>.cloudflareaccess.com",
+        ),
+        // A team domain is Cloudflare's, never another host: the gate fetches its signing keys from it.
+        (
+            access(
+                "team.example.com",
+                ACCESS_AUDIENCE,
+                json!(["owner@example.com"]),
+            ),
+            "<team>.cloudflareaccess.com",
         ),
         (
             access(ACCESS_TEAM, "short", json!(["owner@example.com"])),
             "settings.accessAudience is the Access application's audience tag",
         ),
+        // One entry is one address: two in one entry would be two for the gate and one in the count.
         (
             access(
                 ACCESS_TEAM,
                 ACCESS_AUDIENCE,
-                json!(["owner@example.com, -e OTHER=1"]),
+                json!(["owner@example.com,other@example.org"]),
             ),
-            "settings.accessEmails is a list of 1 to 16 e-mail addresses",
+            "settings.accessEmails is a list of 1 to 16 e-mail addresses, one in each entry",
+        ),
+        (
+            access(
+                ACCESS_TEAM,
+                ACCESS_AUDIENCE,
+                json!(["owner@example.com\nother@example.org"]),
+            ),
+            "settings.accessEmails is a list of 1 to 16 e-mail addresses, one in each entry",
         ),
         (
             {
@@ -796,6 +837,91 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
         &workspace,
         "the settings are missing or are not one JSON object",
     );
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn a_port_in_the_public_origin_is_taken_when_it_is_not_443() {
+    let mut workspace = Workspace::new(&settings("https://team.example.org:8443"));
+    workspace.start();
+    says(&workspace, "the gate is healthy (HTTP 401");
+    assert!(
+        workspace.runs("automagik-gate")[0]
+            .contains("-e AUTOMAGIK_GATE_ORIGIN=https://team.example.org:8443 ")
+    );
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn a_docker_that_does_not_answer_leaves_every_running_container_alone() {
+    let mut workspace = Workspace::new(&settings(URL));
+    workspace.secret(TOKEN);
+    workspace.start();
+    says(&workspace, "the tunnel is started from");
+    says(&workspace, "the gate is healthy (HTTP 401");
+    let before = workspace.read("docker/calls.log");
+    let acted = |calls: &str| {
+        calls
+            .lines()
+            .filter(|line| line.starts_with("run ") || line.starts_with("rm "))
+            .count()
+    };
+    // The daemon stops answering for a while: that is said, and nothing is removed or started.
+    fs::write(workspace.dir.join("docker/fail-inspect"), "").expect("the failure");
+    says(
+        &workspace,
+        "status: Docker did not answer about the server; Docker did not answer about the gate; Docker did not answer about the tunnel",
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    fs::remove_file(workspace.dir.join("docker/fail-inspect")).expect("mended");
+    wait_for(&workspace, "the healthy status again", || {
+        workspace
+            .output()
+            .rsplit("Docker did not answer about the server")
+            .next()
+            .is_some_and(|after| after.contains("status: the server is healthy"))
+    });
+    assert_eq!(acted(&workspace.read("docker/calls.log")), acted(&before));
+    for name in ["automagik-server", "automagik-gate", "automagik-tunnel"] {
+        assert!(
+            workspace
+                .dir
+                .join(format!("docker/containers/{name}/running"))
+                .exists(),
+            "{name}"
+        );
+        assert_eq!(workspace.runs(name).len(), 1, "{name}");
+    }
+    assert!(!workspace.output().contains("stopped (exit code"));
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn a_keeper_that_cannot_start_stays_up_and_says_why() {
+    // A command the first boot should have installed is missing: the keeper says so at intervals and does not
+    // exit, so systemd is not starting it over and over; when the command is there, it goes on.
+    let mut workspace = Workspace::new(&settings(URL));
+    let jq = workspace.dir.join("bin/jq");
+    let aside = workspace.dir.join("jq.aside");
+    fs::rename(&jq, &aside).expect("no jq");
+    workspace.start();
+    let words = "workspace team1 does not start: these commands are missing on this machine: jq.";
+    wait_for(&workspace, "the reason, said twice", || {
+        workspace.output().matches(words).count() >= 2
+    });
+    assert!(
+        workspace
+            .child
+            .as_mut()
+            .expect("the keeper")
+            .try_wait()
+            .expect("its status")
+            .is_none(),
+        "the keeper exited"
+    );
+    assert_eq!(workspace.read("docker/calls.log"), "");
+    fs::rename(&aside, &jq).expect("jq again");
+    says(&workspace, "the server is healthy (HTTP 401");
     assert_eq!(workspace.stop(), Some(0));
 }
 

@@ -11,9 +11,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   template has no port, no link and no host listener. Its one secret is `TUNNEL_TOKEN`. Its settings carry the
   public address and the owner's Cloudflare Access application (team domain, audience tag, allowed e-mail
   addresses), all three or none. The first boot says on the console what it installs and what failed, and the keeper
-  says whether each part is healthy (HTTP 401) and whether the tunnel has registered. The server image pinned today
-  is older than the gate, so `settings.serverImage` has to be replaced by a build that has it before a workspace
-  serves anything: see "An Automagik workspace in its own virtual machine" in `docs/OPERATING.md`.
+  says whether each part is healthy (HTTP 401) and whether the tunnel has registered. The pinned server image is the
+  first build with the gate and its Cloudflare Access sign-in (`3.128.0-8fb2e6f0`). No workspace was brought up on
+  a real machine in this work: see "An Automagik workspace in its own virtual machine" in `docs/OPERATING.md` for
+  the steps and for what stays unproven.
 - Automagik Arca carries the Open Intelligence tag of the [we unfold](https://weunfold.ai/) movement, in its
   one-colour cut with the we unfold mark: in the two READMEs, and at the foot of every page `arca serve` returns (the
   approval page, the canvas, its sign-in page and its error page). On a page it is an inline picture 170 px wide, in
