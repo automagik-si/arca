@@ -1,0 +1,20 @@
+{
+  "name": "automagik-workspace",
+  "description": "One Automagik workspace in its own virtual machine (Debian 13 cloud image; 2 CPUs, 4GiB, 20GiB): the Automagik server, its gate (the same image) and a Cloudflare Tunnel connector (cloudflared 2026.10.7), by digest, sharing one loopback. In a copy of this template set settings.publicUrl and the three Cloudflare Access settings. Created stopped: set TUNNEL_TOKEN, then instance_start.",
+  "kind": "virtual-machine",
+  "image": "images:debian/13/cloud",
+  "limits": { "cpu": "2", "memory": "4GiB" },
+  "rootSize": "20GiB",
+  "autostart": true,
+  "firstBoot": { "file": "automagik-workspace.sh" },
+  "secrets": ["TUNNEL_TOKEN"],
+  "settings": {
+    "publicUrl": "https://workspace.example.com",
+    "accessTeamDomain": "",
+    "accessAudience": "",
+    "accessEmails": [],
+    "gatePort": 3082,
+    "serverImage": "ghcr.io/automagik-si/automagik-server@sha256:671cdd101bc48863974c22b8331c4e390bbfaca3de4d2cd7f51491068105e450",
+    "tunnelImage": "docker.io/cloudflare/cloudflared@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba"
+  }
+}
