@@ -1036,3 +1036,47 @@ fn a_removal_that_was_cut_short_is_finished_by_the_next_approved_removal() {
     );
     assert!(!message.contains("every instance is removed"), "{message}");
 }
+
+/// A virtual machine whose template declares secrets, inside a tenant: it is created stopped and its secrets are stored
+/// as a container's are, and a start says in words that they are not written into its guest. The file requests that
+/// carry them are made in the node's own project only (Rule 68), so a tenant's machine is told so and never passed over
+/// in silence.
+#[test]
+fn a_tenants_machine_keeps_its_secrets_stored_and_a_start_says_they_are_not_in_its_guest() {
+    let rig = two_tenants(policy());
+    rig.template(
+        "keys",
+        json!({
+            "name": "keys", "kind": "virtual-machine", "image": "images:debian/13/cloud",
+            "limits": { "cpu": "2", "memory": "4GiB" }, "rootSize": "20GiB", "secrets": ["API_TOKEN"]
+        }),
+    );
+    let made = create(&rig, "box", "keys", Some(A));
+    assert_eq!(made["state"], "stopped");
+    rig.call(
+        "service_secret_set",
+        json!({ "name": "box", "key": "API_TOKEN", "value": "synthetic-token-0123456789", "tenant": A }),
+    )
+    .expect("the secret is stored");
+    let (code, message) = refusal(rig.call_token(
+        "cloud",
+        "instance_start",
+        json!({ "tenant": A, "service": "box" }),
+        &["instance_start"],
+    ));
+    assert_eq!(code, "InstanceSecretsNotWritten");
+    assert!(
+        message.contains("this Arca does not yet write a virtual machine's secrets into its guest inside a tenant; they stay stored"),
+        "{message}"
+    );
+    assert!(!message.contains("synthetic-token"));
+    // The machine runs, and nothing was sent to its guest.
+    assert_eq!(
+        rig.get(&instance_path(&project(A), "box")).unwrap()["status"],
+        "Running"
+    );
+    assert!(rig.fake().service_files().is_empty());
+    // A machine without secrets in a tenant starts as before.
+    let plain = create(&rig, "plain", "vm", Some(B));
+    assert_eq!(plain["state"], "running");
+}

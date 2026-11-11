@@ -1082,6 +1082,11 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   only for a record that is a virtual machine Arca created, in the service project, through a writer bound to the record's
   entry, on the instance whose uuid the effect journal holds, and not on one with a tombstone. An adopted service and a
   container get nothing.
+- Inside a tenant (Rule 61) a virtual machine's secrets are stored as anywhere, and are not written into its guest: the
+  file requests are made in the node's own service project only, as the exec seam's are (Rule 50). A start of such a
+  machine says so with `InstanceSecretsNotWritten`, and sends nothing. Test
+  `a_tenants_machine_keeps_its_secrets_stored_and_a_start_says_they_are_not_in_its_guest` in
+  `crates/arca/tests/tenants/isolation.rs`.
 - The guest agent is waited for, up to 120 seconds: a machine that has just started boots before it takes a file. When
   it never answers, the verb is refused with `InstanceSecretsNotWritten`, the machine stays running, and the answer says to
   run `instance_start` again.
@@ -1285,7 +1290,7 @@ must run before any live write.
   not ready.
 - A file `GET` of a directory in a virtual machine's guest answers 200 with `X-Incus-type: directory` and the directory's
   `X-Incus-mode`, `X-Incus-uid` and `X-Incus-gid`, and 404 when nothing is at the path; a guest whose agent is not up
-  answers neither (Rule 61). Read from `fileSFTPGet` in Incus 7.6's `cmd/incusd/instance_file.go`. A directory `POST`
+  answers neither (Rule 68). Read from `fileSFTPGet` in Incus 7.6's `cmd/incusd/instance_file.go`. A directory `POST`
   for a path that exists is answered with success there (`fileSFTPPost`); Arca no longer sends one, and the fake can
   refuse it to show that.
 - An instance's config PATCH that names one `user.*` key leaves every other key, device and profile as it was, does not

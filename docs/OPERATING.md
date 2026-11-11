@@ -2303,6 +2303,10 @@ When the guest agent does not answer in time (the image has none, or the machine
 with `InstanceSecretsNotWritten`: the machine is running, its secrets are not in it, and running `instance_start`
 again writes them.
 
+Inside a tenant this last step is not built yet: a virtual machine there keeps its secrets stored, and its start
+answers `InstanceSecretsNotWritten` and says that they were not written into the guest. A template that needs its
+secrets in the guest, the runner pool among them, runs in the node's own project for now.
+
 Where a virtual machine's secret is, and is not:
 
 - It is in Arca's `secrets/` directory, and on the machine's own disk in `/etc/arca-secrets`. The second copy is why a

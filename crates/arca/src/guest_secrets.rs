@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 
 use arca_incus::exec::{GUEST_SECRETS_DIR, GuestSecretsDir, SecretName, ServiceFile};
 use arca_incus::{ProjectFamily, UnixIncusWriter};
-use arca_kernel::desired::EntryId;
 use arca_kernel::ownership::{IncusKind, ObjectRef};
 use arca_providers::incus::read_entry_secret;
 
@@ -62,21 +61,29 @@ impl GuestSecrets {
     /// secrets is set. `Ok(Some(names))` names the secrets written. An error says in plain words what was not done,
     /// and never holds a value.
     pub fn deliver(&self, project: &str, instance: &str) -> Result<Option<Vec<String>>, String> {
-        if project != arca_netproject::PROJECT {
+        // The record is found by the instance it names, in the node's own project or in a tenant's.
+        let tenant = arca_kernel::ownership::tenant_of_project(project);
+        if project != arca_netproject::PROJECT && tenant.is_none() {
             return Ok(None);
         }
-        let entry = EntryId(format!("service-{instance}"));
-        let (record, uuid, retained) = {
+        let (entry, record, uuid, retained) = {
             let kernel = self
                 .kernel
                 .lock()
                 .map_err(|_| "the kernel could not be read".to_string())?;
-            let Some(record) = kernel
+            let Some((entry, record)) = kernel
                 .entries()
                 .iter()
-                .find(|found| found.id == entry && found.plugin.0 == "arca.service")
-                .and_then(|found| {
-                    serde_json::from_value::<ServiceConfig>(found.config.clone()).ok()
+                .filter(|found| found.plugin.0 == "arca.service")
+                .filter_map(|found| {
+                    serde_json::from_value::<ServiceConfig>(found.config.clone())
+                        .ok()
+                        .map(|record| (found.id.clone(), record))
+                })
+                .find(|(id, record)| {
+                    record.project == project
+                        && record.instance == instance
+                        && id.0 == record.entry_id()
                 })
             else {
                 return Ok(None);
@@ -84,14 +91,24 @@ impl GuestSecrets {
             if record.vm.is_none() || record.adopted || record.secret_refs.is_empty() {
                 return Ok(None);
             }
+            let uuid = kernel.service_uuid(&entry, instance);
             (
+                entry,
                 record,
-                kernel.service_uuid(&entry, instance),
+                uuid,
                 kernel
                     .retained_entries()
                     .map_err(|_| "the kernel's retained set could not be read".to_string())?,
             )
         };
+        // The file requests are made in the node's own service project only. A virtual machine in a tenant keeps its
+        // stored secrets, and they are not written into its guest: said in words, never passed over in silence.
+        if tenant.is_some() || record.tenant.is_some() {
+            return Err(
+                "this Arca does not yet write a virtual machine's secrets into its guest inside a tenant; they stay stored, and running instance_start again does not change that"
+                    .into(),
+            );
+        }
         if record.project != project || record.instance != instance || record.name != instance {
             return Err("its record names another instance".into());
         }
