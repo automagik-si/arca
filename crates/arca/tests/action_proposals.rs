@@ -278,7 +278,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         match action {
             ActionKind::ServiceCreate => json!({
                 "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
-                "tenant": "abcdefgh", "deploy": "d1",
+                "tenant": "abcdefgh", "deploy": "d1", "start": false,
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUnpublish
@@ -477,17 +477,19 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (_, "image") => "Image",
                 (_, "bridge") => "Host bridge",
                 (_, "mac") => "MAC address",
+                (ActionKind::ServiceCreate, "start") => "Start",
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details
                 .iter()
                 .find(|row| row.label == label)
                 .unwrap_or_else(|| panic!("{action:?} details lack {label}"));
-            assert_eq!(
-                row.value,
-                prepared[field.as_str()].as_str().expect("a string field"),
-                "{action:?} {label}"
-            );
+            // The one field that is not a string is shown in words.
+            let expected = match &prepared[field.as_str()] {
+                Value::Bool(start) => arca::action_proposal::start_words(*start),
+                value => value.as_str().expect("a string field"),
+            };
+            assert_eq!(row.value, expected, "{action:?} {label}");
             seen += 1;
         }
         assert_eq!(seen, details.len(), "{action:?} has an extra detail row");
