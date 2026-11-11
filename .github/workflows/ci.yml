@@ -1,0 +1,104 @@
+# The repository's gate, on our own runner pool (templates/github-runner-pool; docs/OPERATING.md, "Continuous
+# integration").
+#
+# SAFETY. This repository is public and these jobs run on self-hosted runners, so this workflow starts in two ways
+# only: a push to `dev`, and a person with write access starting it by hand. There is no `pull_request` and no
+# `pull_request_target` trigger, and none may be added: a pull request from a fork must never run on our runners.
+#
+# The triggers here are half of that rule. For a pull request GitHub reads the workflow files of the pull request
+# itself, so a fork can bring a workflow of its own that asks for our labels. What stops that one is set on GitHub and
+# not in this file: the repository's Actions setting "Require approval for all external contributors", nobody
+# approving a run they have not read, and a pool registered for this repository alone. docs/OPERATING.md says how.
+name: ci
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref replaces the run that is still going.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pool's `standard` class gives a job 2 CPUs and 4GiB (templates/github-runner-pool.json). The job still sees
+  # every CPU of the pool's virtual machine, so scripts/ci-setup.sh tells cargo and the tests the real number.
+  CI_SLOT_CPUS: 2
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: [self-hosted, linux, x64, arca]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: scripts/ci-setup.sh fmt
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: [self-hosted, linux, x64, arca]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain and C compiler
+        run: scripts/ci-setup.sh build
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: [self-hosted, linux, x64, arca]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain, C compiler and test programs
+        run: scripts/ci-setup.sh test
+      - name: cargo test
+        run: cargo test --workspace
+
+  canvas:
+    name: canvas node --test
+    runs-on: [self-hosted, linux, x64, arca]
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: packages/arca-canvas-dsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The Node the package's README develops with. It lands in the runner's tool cache, which the pool keeps.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.0
+          package-manager-cache: false
+      - name: Caches
+        working-directory: .
+        run: scripts/ci-setup.sh canvas
+      - name: npm ci
+        run: npm ci
+      # The rendering tests drive the Chromium that the pinned Playwright names. Its system libraries are installed
+      # with apt, because a pool job starts from a fresh image.
+      - name: Chromium
+        run: npx playwright install --with-deps chromium
+      - name: node --test
+        run: node --test
