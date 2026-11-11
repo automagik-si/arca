@@ -32,7 +32,8 @@ what it printed.*
 - **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an Incus
   socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
   anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
-- **It installs one named release**, the one the quickstart names, at `~/.local/bin/arca`.
+- **It installs one named release**, the one its own `ARCA_VERSION` line names, at `~/.local/bin/arca`. Each release
+  sets that line to its own version.
   `sh install.sh --version <version>` names another; without it, an older release is never put over a newer program.
   The program is checked against that release's `SHA256SUMS`. That catches a download that was damaged or cut short. It
   does not catch a release that was tampered with, because the checksums come from the same release.
@@ -48,7 +49,8 @@ what it printed.*
   service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
   state.
 
-**Not yet:** the script is read from the `dev` branch, so no release's checksum covers the script itself. It is tested
+**Not yet:** the addresses above read the script from the `dev` branch, where no checksum covers it. From the next
+release on, each release carries its own `install.sh`, listed in that release's `SHA256SUMS`. It is tested
 against stand-ins for the download, the program and systemd, and it was run for real on one machine that already had
 Incus and Arca; it has not been run on a machine that never had either. There is no installer for a Mac.
 
@@ -57,16 +59,21 @@ Incus and Arca; it has not been run on a machine that never had either. There is
 **1. Download the binary and check it.**
 
 ```sh
-v=0.1.0-alpha.7
+v=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/automagik-si/arca/releases/latest | sed -n 's#.*/releases/tag/v##p')
+echo "the newest release is ${v:?none is marked Latest; pick a version on the releases page and set v to it}"
 base=https://github.com/automagik-si/arca/releases/download/v$v
 curl -fL -O "$base/arca-$v-linux-x86_64" -O "$base/SHA256SUMS"
-sha256sum --check SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 install -D -m 0755 "arca-$v-linux-x86_64" ~/.local/bin/arca
 arca --version
 ```
 
-`sha256sum` must answer `arca-0.1.0-alpha.7-linux-x86_64: OK`. `arca --version` prints
-`Automagik Arca 0.1.0-alpha.7 (<commit>, x86_64-unknown-linux-gnu)`; if the shell does not find `arca`, put
+The first two lines ask GitHub which release is the newest. GitHub answers only with a release that is not a
+pre-release: until the first such release (`0.8.0`) is out, they find nothing and say so, and you set `v` yourself to
+a version from the releases page, for example `v=0.1.0-alpha.7`. `sha256sum` must answer
+`arca-<version>-linux-x86_64: OK`: stop unless it prints that. `--ignore-missing` is there because `SHA256SUMS` also
+lists the release's `install.sh`, which this step does not download. `arca --version` prints
+`Automagik Arca <version> (<commit>, x86_64-unknown-linux-gnu)`; if the shell does not find `arca`, put
 `~/.local/bin` on your `PATH`.
 
 **2. Write the smallest config.** These five keys are the required ones. The two directories must be mode 0700.
@@ -102,7 +109,7 @@ arca serve --config ~/.config/arca/node.json
 arca call arca_status --config ~/.config/arca/node.json --token-file ~/.config/arca/assistant-1.secret
 ```
 
-The answer is one JSON object with `"mode":"watch-only"`, `"incusReachable":true` and `"version":"0.1.0-alpha.7"`.
+The answer is one JSON object with `"mode":"watch-only"`, `"incusReachable":true` and the release's `"version"`.
 `arca call watch_report ...` lists every project and instance with its owner.
 
 **4. Connect an assistant over MCP.** The node is an MCP server over streamable HTTP: `POST /mcp`, JSON answers, protocol

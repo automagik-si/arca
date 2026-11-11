@@ -1564,17 +1564,23 @@ fn a_machine_it_cannot_run_on_is_refused_with_every_reason_at_once() {
 fn the_script_is_what_the_quickstart_and_the_hard_rules_say() {
     let text = script_text();
 
-    // The release it installs is the one the quickstart downloads by hand.
+    // The release it installs is the repository's one version: scripts/version.sh writes this line with every other
+    // field, and a release whose installer names another version fails. The quickstart (docs/QUICKSTART.md, "By
+    // hand") writes no version by hand any more: it asks GitHub for the newest release.
+    assert_eq!(
+        current(),
+        env!("CARGO_PKG_VERSION"),
+        "scripts/install.sh installs the version the repository carries"
+    );
     let quickstart =
         fs::read_to_string(repo().join("docs/QUICKSTART.md")).expect("docs/QUICKSTART.md");
     let by_hand = quickstart
         .lines()
         .find_map(|line| line.strip_prefix("v="))
-        .expect("the quickstart names its release");
-    assert_eq!(
-        current(),
-        by_hand,
-        "scripts/install.sh and docs/QUICKSTART.md name one release"
+        .expect("the quickstart says which release it downloads");
+    assert!(
+        by_hand.contains("https://github.com/automagik-si/arca/releases/latest"),
+        "docs/QUICKSTART.md asks for the newest release and names none: {by_hand}"
     );
     assert!(
         quickstart.contains("scripts/install.sh"),

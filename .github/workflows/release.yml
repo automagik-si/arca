@@ -1,0 +1,562 @@
+name: Release
+
+# Cuts an Automagik Arca release from dev on every push to it. Nobody writes a version or types a tag.
+#
+# One version for the whole repository (scripts/version.sh): a full release is 0.N.0, N one above the last one, cut
+# when anything the binary is built from changed; a patch is 0.N.(P+1), cut when what changed ships but the binary
+# is not built from it; nothing is cut when everything that changed is inert (documents, tests, these workflows).
+# The lists are in scripts/version.sh and nowhere else.
+#
+# Three jobs, and the line between the first two is the point of the design:
+#
+#   cut      reads, and may write nothing. It runs everything that is the repository's or a dependency's code: the
+#            gates (cargo fmt, clippy, the tests, the canvas package's tests), scripts/version.sh, which writes the
+#            version and its CHANGELOG.md section, and scripts/release.sh, which builds the release files. It commits
+#            the version as `chore(release): v<version>`, tags it, and hands over a git bundle (that one commit and
+#            its tag) and the files. Its token is read-only and no step but the one that lists the releases sees it.
+#   publish  may write, and runs no code of the repository and none of its scripts: git, gh and sha256sum from the
+#            runner's image, on the lines written in this file. It checks what was handed over (the bundle is exactly
+#            one commit on top of dev, named as a release commit, touching only the files that state the version;
+#            the tag points at it; SHA256SUMS matches the binary and the installer; the installer is the release
+#            commit's own), pushes dev and the tag in one atomic push, and publishes the GitHub release `v<version>`
+#            with
+#              arca-<version>-linux-x86_64   the portable binary (glibc 2.34 or newer)
+#              install.sh                    scripts/install.sh as the release commit holds it: it installs this release
+#              SHA256SUMS                    the checksums of those two
+#            and that version's CHANGELOG.md section as the notes.
+#   main     moves main to the release commit. main holds released commits and nothing else.
+#
+# So a dependency that turns hostile in a build script, a test or an install script finds no token that can push to
+# dev or touch a published release. What it can put into the release commit is bounded by what publish checks before
+# it pushes, and that is exactly this:
+#   - the commit is one commit on dev's tip; its whole message is `chore(release): v<version>`; the tag is an
+#     annotated tag of that name on it, and its whole message is `Automagik Arca <version>`;
+#   - it changes six files and no other, and no file's kind or mode: Cargo.toml, Cargo.lock, CHANGELOG.md, the
+#     canvas package's package.json and package-lock.json, and scripts/install.sh;
+#   - in the four manifests and lock files, each changed line is a version line of the workspace (found in dev's
+#     own copy), going from dev's version to the new one, and nothing else changes;
+#   - in scripts/install.sh one line changes: the one ARCA_VERSION line of dev's own copy, from `ARCA_VERSION=` and
+#     dev's version to `ARCA_VERSION=` and the new one. So the installer that is published installs the release it
+#     is published with, and is otherwise dev's own, byte for byte;
+#   - in CHANGELOG.md no line is removed or changed; the added lines are the one heading `## <version> (<date>)`,
+#     right under Unreleased and outside any comment, and blank lines and list lines (`- ...`) inside that section,
+#     with no control character and no `<`.
+# Of the release files, this is checked: they are the four expected and nothing else; SHA256SUMS is two lines, the
+# binary's and then install.sh's, both files match it, and it is byte for byte what sha256sum writes (each sum, two
+# spaces, the name); install.sh is, byte for byte, scripts/install.sh of the release commit, and its one
+# ARCA_VERSION line names this version. The release fails when any of that is not so.
+# What is not checked: what a list line says (it is a commit's subject, and may hold a link), which number the
+# version is, what the binary is, and what the release notes say. Code that runs in cut can therefore still shape
+# the binary it builds, the words of the changelog lines and the release notes, and which version number the
+# release takes. This design does not stop that.
+#
+# Nothing is taken when anything before the push fails: no version, no tag. When dev moved while a run was cutting,
+# neither the commit nor the tag lands, the run ends cleanly, and the run for the newer push releases those changes
+# too. Runs queue one at a time, across all three jobs, and a run that has started is never cancelled.
+#
+# When the push landed but the publishing failed, the tag has no release (a draft does not count as one). The next
+# run, by a push or by hand, sees that first: it builds that tag again and publishes it, and takes no new version.
+# Run it again for what came after.
+#
+# The workflow's own push starts no run: GitHub starts none for a push made with the workflow token. So the release
+# commit has no CI run of its own. What covers it is this cut's own gate, which ran on its parent; the commit adds
+# only the version and the changelog section, and the release files are then built from it.
+#
+# Keep that push on the workflow token. A push made with a personal or an app token starts the workflows again, CI
+# and this one, for the release commit; do not move to such a token without a guard that stops those runs.
+#
+# Always on GitHub's hosted runners, never on a self-hosted one. A self-hosted runner keeps its cache from job to
+# job; beside this workflow's write token, that would give a pull request from a branch of this repository a way to
+# write dev.
+#
+# By hand:  gh workflow run release.yml --ref dev [--field prerelease=true]
+# It never runs for a pull request.
+#
+# GitHub keeps one waiting run for the group: a run that is still waiting is replaced by a newer one. That loses
+# nothing a push asked for, since the newer run releases everything since the last tag. It does lose a dispatch's
+# prerelease=true: when a push's run replaces a waiting dispatch, the release it makes is a normal one, shown as
+# Latest. Dispatch a prerelease when no run is waiting or in progress, and look at the run afterwards; if it was
+# replaced, it did not happen.
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Publish as a prerelease (not shown as Latest)'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+# One run at a time, all its jobs together: the next run starts only after this one's publishing and main are done.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    name: Cut v<version>
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      version: ${{ steps.cut.outputs.version || steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: What this run does
+        id: plan
+        env:
+          # Read-only: this job's token may read contents and nothing more. No other step of the job sees it.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          last=$(scripts/version.sh last)
+          # A tag whose release was never published comes first: this run finishes it and cuts nothing new. A draft
+          # is not a published release. The list must be read: an error here stops the run rather than guess.
+          published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft | not) | .tagName')
+          if [[ -n "${last}" ]] && ! grep -qxF -- "${last}" <<< "${published}"; then
+            echo "::notice::${last} was tagged and never published: this run publishes it and cuts nothing new"
+            { echo "mode=finish"; echo "version=${last#v}"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The paths decide, not the commit subjects.
+          kind=$(scripts/version.sh kind "${last}")
+          case "${kind}" in
+            full|patch)
+              echo "since ${last:-the start}: a ${kind} release"
+              { echo "mode=cut"; echo "kind=${kind}"; echo "last=${last}"; } >> "$GITHUB_OUTPUT"
+              ;;
+            none)
+              echo "nothing since ${last} ships: no release"
+              echo "mode=none" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::scripts/version.sh kind ${last} printed '${kind}', not full, patch or none"
+              exit 1
+              ;;
+          esac
+
+      - name: The Rust toolchain the repository pins
+        if: steps.plan.outputs.mode != 'none'
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          [[ -n "${channel}" ]] || { echo "::error::rust-toolchain.toml names no channel"; exit 1; }
+          rustup toolchain install "${channel}" --profile minimal --component clippy --component rustfmt --no-self-update
+          cargo --version
+
+      - name: The gates the release stands on
+        if: steps.plan.outputs.mode == 'cut'
+        run: |
+          set -euo pipefail
+          # The tests call setfattr and getfattr.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq attr
+          scripts/version.sh check
+          cargo fmt --all --check
+          cargo clippy --workspace -- -D warnings
+          cargo test --workspace
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.plan.outputs.mode == 'cut'
+        with:
+          node-version: 24.11.0
+
+      # The limit is the rule: these tests stay in the gate only while they finish well inside it.
+      - name: The canvas package's tests
+        if: steps.plan.outputs.mode == 'cut'
+        timeout-minutes: 5
+        working-directory: packages/arca-canvas-dsh
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node --test
+
+      - name: Version, commit and tag
+        id: cut
+        if: steps.plan.outputs.mode == 'cut'
+        env:
+          KIND: ${{ steps.plan.outputs.kind }}
+          LAST: ${{ steps.plan.outputs.last }}
+        run: |
+          set -euo pipefail
+          # The gates must leave the tree as they found it.
+          [[ -z "$(git status --porcelain)" ]] || { git status --short; echo "::error::the gates left files behind"; exit 1; }
+          version=$(scripts/version.sh next-for "${KIND}")
+          scripts/version.sh set "${version}"
+          scripts/version.sh check
+          # The lock must still match the manifests, or the tag's --locked build fails.
+          cargo metadata --locked --format-version 1 > /dev/null
+          scripts/version.sh changelog "${version}" "$(date -u +%Y-%m-%d)" "${LAST}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "chore(release): v${version}"
+          git tag -a "v${version}" -m "Automagik Arca ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tag that was never published
+        if: steps.plan.outputs.mode == 'finish'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: git checkout -q --detach "v${VERSION}"
+
+      # At the tag, from a clean tree: scripts/release.sh is the one way the files are built.
+      - name: Build the release files
+        if: steps.plan.outputs.mode != 'none'
+        run: scripts/release.sh
+
+      # What the publishing job gets: the four files, and for a new cut the release commit and its tag as a bundle.
+      - name: Hand over
+        if: steps.plan.outputs.mode != 'none'
+        env:
+          MODE: ${{ steps.plan.outputs.mode }}
+          VERSION: ${{ steps.cut.outputs.version || steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir handover
+          cp "dist/arca-${VERSION}-linux-x86_64" dist/install.sh dist/SHA256SUMS dist/RELEASE-NOTES.md handover/
+          if [[ "${MODE}" == "cut" ]]; then
+            git bundle create -q handover/release.bundle "refs/tags/v${VERSION}" "^HEAD~1"
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.plan.outputs.mode != 'none'
+        with:
+          name: release
+          path: handover/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Push and publish v<version>
+    needs: cut
+    if: needs.cut.outputs.mode == 'cut' || needs.cut.outputs.mode == 'finish'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      sha: ${{ steps.publish.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MODE: ${{ needs.cut.outputs.mode }}
+      VERSION: ${{ needs.cut.outputs.version }}
+      PRERELEASE: ${{ inputs.prerelease }}
+    # This job holds the token that can write. It runs nothing from the repository: no script of it, no build, no
+    # test, no package's install. Only git, gh and sha256sum, on the lines below. The installer it publishes is a
+    # file to it: compared and uploaded, never started.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: ${{ runner.temp }}/release
+
+      # Everything handed over was made beside code this job does not trust. It is read as data and checked.
+      - name: Check what was handed over
+        id: check
+        run: |
+          set -euo pipefail
+          stop() { echo "::error::$*"; exit 1; }
+          HANDOVER="${RUNNER_TEMP}/release"
+          [[ "${VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || stop "not a version: ${VERSION}"
+          [[ "${MODE}" == "cut" || "${MODE}" == "finish" ]] || stop "not a mode: ${MODE}"
+          tag="v${VERSION}"
+          asset="arca-${VERSION}-linux-x86_64"
+
+          # The installer's path inside a commit. It is read with git, as data, and compared; nothing here starts it.
+          INSTALLER="scripts/install.sh"
+
+          # Exactly the files expected, each a plain file, and nothing else.
+          expected=$'./RELEASE-NOTES.md\n./SHA256SUMS\n./install.sh\n'"./${asset}"
+          [[ "${MODE}" != "cut" ]] || expected+=$'\n./release.bundle'
+          found=$(cd "${HANDOVER}" && find . -mindepth 1 | LC_ALL=C sort)
+          [[ "${found}" == "$(LC_ALL=C sort <<< "${expected}")" ]] || stop "the handed-over files are not the expected ones: ${found//$'\n'/ }"
+          while IFS= read -r file; do
+            [[ -f "${HANDOVER}/${file}" && ! -L "${HANDOVER}/${file}" ]] || stop "${file} is not a plain file"
+          done <<< "${expected}"
+
+          # SHA256SUMS is two whole lines: the binary's, then the installer's. Each file is the one its line names,
+          # by this job's own reading of the two files, and the file is, byte for byte, what sha256sum writes for
+          # them: each sum, two spaces, the name, a line end. Checkers differ in what else they read as a line (one
+          # space, a tab, a space before the sum), so nothing else is published.
+          [[ "$(wc -l < "${HANDOVER}/SHA256SUMS")" == 2 && -z "$(tail -c 1 "${HANDOVER}/SHA256SUMS")" ]] ||
+            stop "SHA256SUMS does not hold exactly two lines"
+          { read -r sum name; read -r installer_sum installer_name; } < "${HANDOVER}/SHA256SUMS"
+          [[ "${sum}" =~ ^[0-9a-f]{64}$ && "${name}" == "${asset}" ]] || stop "SHA256SUMS does not name ${asset} with a SHA-256 on its first line"
+          [[ "${installer_sum}" =~ ^[0-9a-f]{64}$ && "${installer_name}" == "install.sh" ]] ||
+            stop "SHA256SUMS does not name install.sh with a SHA-256 on its second line"
+          written=$(cd "${HANDOVER}" && sha256sum -- "${asset}" install.sh)
+          { read -r true_sum _; read -r true_installer_sum _; } <<< "${written}"
+          [[ "${sum}" == "${true_sum}" && "${installer_sum}" == "${true_installer_sum}" ]] || stop "a release file does not match SHA256SUMS"
+          [[ "$(git hash-object --no-filters "${HANDOVER}/SHA256SUMS")" == "$(printf '%s  %s\n%s  install.sh\n' "${true_sum}" "${asset}" "${true_installer_sum}" | git hash-object --stdin)" ]] ||
+            stop "SHA256SUMS is not written as sha256sum writes it: each sum, two spaces, the name"
+          # installer <commit>: the handed-over install.sh is, byte for byte, the installer that commit holds, and
+          # that installer's one ARCA_VERSION line names this version: the installer published with a release
+          # installs that release, and is nothing the repository does not hold.
+          installer() {
+            git cat-file -e "$1:${INSTALLER}" 2> /dev/null || stop "the release commit holds no ${INSTALLER}"
+            [[ "$(git hash-object --no-filters "${HANDOVER}/install.sh")" == "$(git rev-parse "$1:${INSTALLER}")" ]] ||
+              stop "install.sh is not the release commit's ${INSTALLER}"
+            [[ "$(git show "$1:${INSTALLER}" | LC_ALL=C grep -a '^ARCA_VERSION=')" == "ARCA_VERSION=${VERSION}" ]] ||
+              stop "the release commit's ${INSTALLER} does not name ${VERSION} as the release it installs"
+          }
+
+          # The tag has no published release yet. A draft is not one.
+          published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName,isDraft \
+            --jq '.[] | select(.isDraft | not) | .tagName')
+          ! grep -qxF -- "${tag}" <<< "${published}" || stop "${tag} is already published"
+
+          git fetch -q origin dev
+          dev=$(git rev-parse origin/dev)
+          on_remote=$(git ls-remote origin "refs/tags/${tag}")
+          if [[ "${MODE}" == "finish" ]]; then
+            # The tag is already on the remote; nothing is pushed.
+            [[ -n "${on_remote}" ]] || stop "${tag} is not on the remote, so there is nothing to finish"
+            git fetch -q origin "refs/tags/${tag}:refs/tags/${tag}"
+            commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+            installer "${commit}"
+            echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          [[ -z "${on_remote}" ]] || stop "${tag} is already on the remote"
+          # The bundle holds one thing: the tag. It is an annotated tag on a commit.
+          heads=$(git bundle list-heads "${HANDOVER}/release.bundle")
+          [[ "$(wc -l <<< "${heads}")" == 1 && "${heads#* }" == "refs/tags/${tag}" ]] || stop "the bundle does not hold ${tag} alone"
+          # Its commit stands on one parent, which the bundle's own first lines name. When that parent is no longer
+          # dev's tip, dev moved while this run was cutting: nothing is pushed, and the run for the newer push
+          # releases these changes too.
+          parents=$(LC_ALL=C sed -n -e '/^$/q' -e 's/^-\([0-9a-f]\{40\}\).*$/\1/p' "${HANDOVER}/release.bundle")
+          [[ "${parents}" =~ ^[0-9a-f]{40}$ ]] || stop "the bundle does not stand on exactly one commit"
+          if [[ "${parents}" != "${dev}" ]]; then
+            git merge-base --is-ancestor "${parents}" "${dev}" 2>/dev/null || stop "the bundle does not stand on dev"
+            echo "::notice::dev moved on while this run cut ${tag}; the run for the newer push releases these changes too"
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch -q "${HANDOVER}/release.bundle" "refs/tags/${tag}:refs/tags/${tag}" || stop "the bundle cannot be read on top of dev"
+          [[ "$(git for-each-ref --format='%(objecttype) %(tag) %(*objecttype)' "refs/tags/${tag}")" == "tag ${tag} commit" ]] ||
+            stop "${tag} is not an annotated tag of that name on a commit"
+          commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+          [[ "$(git rev-list --parents -n 1 "${commit}")" == "${commit} ${dev}" ]] || stop "the release commit is not exactly one commit on top of dev"
+          # The whole message of the commit and of the tag, not their first lines alone: a line such as "Fixes #1"
+          # in a message acts on the repository when the commit reaches the default branch.
+          [[ "$(git cat-file commit "${commit}" | sed '1,/^$/d')" == "chore(release): ${tag}" ]] ||
+            stop "the commit's message is not exactly chore(release): ${tag}"
+          [[ "$(git cat-file tag "refs/tags/${tag}" | sed '1,/^$/d')" == "Automagik Arca ${VERSION}" ]] ||
+            stop "the tag's message is not exactly Automagik Arca ${VERSION}"
+          # A release commit states the version and the changelog section, and nothing else. It changes exactly the
+          # six files that state them, and in each file exactly the expected lines, checked one by one below. What a
+          # file said before is read from dev's own commit, never from the new one: a manifest or a lock file can
+          # carry code (a [patch] entry, a script, a dependency pointed somewhere else), and the installer is code.
+          files=$'CHANGELOG.md\nCargo.lock\nCargo.toml\npackages/arca-canvas-dsh/package-lock.json\npackages/arca-canvas-dsh/package.json\n'"${INSTALLER}"
+          [[ "$(git diff --name-only --no-renames "${dev}" "${commit}" | LC_ALL=C sort)" == "${files}" ]] ||
+            stop "the release commit does not change exactly the six files that state the version"
+          [[ -z "$(git diff --raw --no-renames "${dev}" "${commit}" | awk 'substr($1, 2) != $2 || $5 != "M"')" ]] ||
+            stop "the release commit changes a file's kind or mode"
+          old=$(git show "${dev}:Cargo.toml" |
+            awk '/^\[/ { inside = ($0 == "[workspace.package]") } inside && /^version = "[^"]*"$/ { gsub(/^version = "|"$/, ""); print; exit }')
+          [[ -n "${old}" && "${old}" != "${VERSION}" ]] || stop "dev's own version cannot be read, or is ${VERSION} already"
+          # changes <file>: each change in the file as "<line>:<old text> => <new text>". A change is one line
+          # replaced in place by one line; any other shape of change prints REFUSED.
+          changes() {
+            git diff -U0 --no-color --no-ext-diff --no-renames "${dev}" "${commit}" -- "$1" | awk '
+              /^@@ / {
+                if (state || $2 ~ /,/ || $3 ~ /,/ || substr($2, 2) != substr($3, 2)) bad = 1
+                at = substr($2, 2); hunks++; state = 1; next
+              }
+              !hunks && /^(diff --git |index |--- |\+\+\+ )/ { next }
+              state == 1 && /^-/ { was = substr($0, 2); state = 2; next }
+              state == 2 && /^\+/ { print at ":" was " => " substr($0, 2); state = 0; next }
+              { bad = 1 }
+              END { if (bad || state) print "REFUSED" }'
+          }
+          # where <file> <awk program>: the line numbers the program prints for dev's own copy of the file.
+          where() { git show "${dev}:$1" | awk "$2"; }
+          # wanted <file> <text before the number> <line number>...: adds to `want` the changes that file must show.
+          # At each of those lines dev's own copy must say <text>"<old version>", with or without a comma after it (a
+          # JSON line has one unless it is the last of its object), and the change puts the new version in its place.
+          # It runs here, not inside $(...), so that its refusal is the step's.
+          wanted() {
+            local file="$1" before="$2" line was
+            shift 2
+            [[ "$#" -gt 0 ]] || stop "dev's own ${file} has no version line to move"
+            for line in "$@"; do
+              was=$(git show "${dev}:${file}" | sed -n "${line}p")
+              [[ "${was}" == "${before}\"${old}\"" || "${was}" == "${before}\"${old}\"," ]] ||
+                stop "dev's own ${file} does not say ${old} at line ${line}"
+              want+="${line}:${was} => ${before}\"${VERSION}\"${was##*\"}"$'\n'
+            done
+          }
+          # Cargo.toml: the workspace's version line.
+          want=""
+          # shellcheck disable=SC2046
+          wanted Cargo.toml 'version = ' $(where Cargo.toml '/^\[/ { inside = ($0 == "[workspace.package]") } inside && /^version = / { print NR; exit }')
+          [[ "$(changes Cargo.toml)"$'\n' == "${want}" ]] || stop "Cargo.toml changes something other than the workspace version line"
+          # Cargo.lock: the version line of each package that dev's own lock holds with no source: the workspace's
+          # crates, and no dependency.
+          want=""
+          # shellcheck disable=SC2046
+          wanted Cargo.lock 'version = ' $(where Cargo.lock '
+            /^\[\[package\]\]$/ { if (line && !fetched) print line; inside = 1; line = 0; fetched = 0; next }
+            /^\[/ { if (line && !fetched) print line; inside = 0; line = 0; fetched = 0; next }
+            inside && /^version = / && !line { line = NR }
+            inside && /^source = / { fetched = 1 }
+            END { if (line && !fetched) print line }')
+          [[ "$(changes Cargo.lock)"$'\n' == "${want}" ]] || stop "Cargo.lock changes something other than the version lines of the workspace's crates"
+          # The canvas package: its version line, and in its lock the lock's own version line and the root package's.
+          want=""
+          # shellcheck disable=SC2046
+          wanted packages/arca-canvas-dsh/package.json '  "version": ' $(where packages/arca-canvas-dsh/package.json '/^  "version": / { print NR; exit }')
+          [[ "$(changes packages/arca-canvas-dsh/package.json)"$'\n' == "${want}" ]] || stop "package.json changes something other than its version line"
+          want=""
+          # shellcheck disable=SC2046
+          wanted packages/arca-canvas-dsh/package-lock.json '  "version": ' $(where packages/arca-canvas-dsh/package-lock.json '/^  "version": / { print NR; exit }')
+          # shellcheck disable=SC2046
+          wanted packages/arca-canvas-dsh/package-lock.json '      "version": ' $(where packages/arca-canvas-dsh/package-lock.json '/^    "": \{$/ { inside = 1; next } inside && /^    \}/ { exit } inside && /^      "version": / { print NR; exit }')
+          [[ "$(changes packages/arca-canvas-dsh/package-lock.json)"$'\n' == "${want}" ]] || stop "package-lock.json changes something other than its two version lines"
+          # The installer: dev's own copy has one ARCA_VERSION line, which names dev's version, and that line alone
+          # changes, to name the new one. Every other byte of the installer is dev's own. Then what was handed over
+          # as install.sh is checked to be this commit's installer.
+          at=$(where "${INSTALLER}" '/^ARCA_VERSION=/ { print NR }')
+          [[ "${at}" =~ ^[0-9]+$ ]] || stop "dev's own ${INSTALLER} does not have exactly one ARCA_VERSION line"
+          [[ "$(git show "${dev}:${INSTALLER}" | sed -n "${at}p")" == "ARCA_VERSION=${old}" ]] ||
+            stop "dev's own ${INSTALLER} does not say ARCA_VERSION=${old} at line ${at}"
+          [[ "$(changes "${INSTALLER}")" == "${at}:ARCA_VERSION=${old} => ARCA_VERSION=${VERSION}" ]] ||
+            stop "${INSTALLER} changes something other than its ARCA_VERSION line"
+          installer "${commit}"
+          # CHANGELOG.md: lines are added and none is removed or changed. One added line is the new section's
+          # heading, "## <version> (<date>)", right under "## Unreleased", above every older section and outside any
+          # comment. Every other added line is inside that section and is blank or a list line ("- ..."), with no
+          # control character and no "<": nothing added can stand as a heading, break a line, or open a tag or a
+          # comment. What a list line says is a commit's subject, and is not judged.
+          log=$(git show "${commit}:CHANGELOG.md")
+          added=$(git diff -U0 --no-color --no-ext-diff --no-renames "${dev}" "${commit}" -- CHANGELOG.md | awk '
+            /^@@ / { hunks++; split($2, was, ","); if (was[2] != "0") bad = 1; split($3, now, ","); at = substr(now[1], 2); next }
+            !hunks && /^(diff --git |index |--- |\+\+\+ )/ { next }
+            /^\+/ { print at; at++; next }
+            { bad = 1 }
+            END { if (bad || !hunks) print "REFUSED" }')
+          [[ "${added}" != *REFUSED* ]] || stop "CHANGELOG.md has a line removed or changed"
+          # Counted, not stopped at the first: a command that stops reading early fails the pipe it reads from.
+          controls=$(git diff -U0 --no-color --no-ext-diff --no-renames "${dev}" "${commit}" -- CHANGELOG.md |
+            LC_ALL=C grep -a '^+' | LC_ALL=C grep -ac '[[:cntrl:]]' || true)
+          [[ "${controls}" == 0 ]] || stop "CHANGELOG.md gains a control character"
+          read -r unreleased heading end < <(awk -v want="## ${VERSION} (" '
+            !u { if ($0 == "## Unreleased") u = NR; next }
+            !h && index($0, want) == 1 && /^## [0-9.]+ \([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)$/ { h = NR; next }
+            /^## / { e = NR; exit }
+            END { print u + 0, h + 0, (e ? e : NR + 1) }' <<< "${log}")
+          [[ "${heading}" -gt 0 ]] || stop "CHANGELOG.md has no section for ${VERSION} right under Unreleased"
+          grep -qx -- "${heading}" <<< "${added}" || stop "the section for ${VERSION} is not new"
+          comment=$(sed -n "$((unreleased + 1)),$((heading - 1))p" <<< "${log}" |
+            awk '{ opened += gsub(/<!--/, "&"); closed += gsub(/-->/, "&") } END { print (opened > closed) ? "open" : "closed" }')
+          [[ "${comment}" == "closed" ]] || stop "the new section starts inside a comment"
+          while read -r line; do
+            [[ "${line}" -gt "${unreleased}" && "${line}" -lt "${end}" ]] || stop "CHANGELOG.md gains a line outside the new section"
+            [[ "${line}" != "${heading}" ]] || continue
+            text=$(sed -n "${line}p" <<< "${log}")
+            [[ -n "${text}" ]] || continue
+            [[ "${line}" -gt "${heading}" ]] || stop "CHANGELOG.md gains a line above the new section"
+            [[ "${text}" == "- "* ]] || stop "CHANGELOG.md gains a line that is not a list line"
+            [[ "${text}" != *"<"* ]] || stop "CHANGELOG.md gains a line with a <"
+          done <<< "${added}"
+          echo "commit=${commit}" >> "$GITHUB_OUTPUT"
+
+      - name: Push dev and the tag
+        id: push
+        if: needs.cut.outputs.mode == 'cut' && steps.check.outputs.commit != ''
+        env:
+          COMMIT: ${{ steps.check.outputs.commit }}
+        run: |
+          set -euo pipefail
+          # Atomic: when dev moved meanwhile (a second push), neither lands, so no tag names a release commit dev
+          # never got. The newer push's own run (queued behind this one) then releases these changes with its
+          # own, so this run stops here, cleanly: no version, and the steps and the job after it skip.
+          if ! git push -q --atomic origin "${COMMIT}:refs/heads/dev" "refs/tags/v${VERSION}"; then
+            git fetch -q origin dev
+            if [[ "$(git rev-parse origin/dev)" != "$(git rev-parse "${COMMIT}^")" ]]; then
+              echo "::notice::dev moved on while this run cut v${VERSION}; the run for the newer push releases these changes too"
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        id: publish
+        if: steps.check.outputs.commit != '' && (needs.cut.outputs.mode == 'finish' || steps.push.outputs.pushed == 'true')
+        env:
+          COMMIT: ${{ steps.check.outputs.commit }}
+        run: |
+          set -euo pipefail
+          # A dispatched prerelease is never Latest; every other release is, full or patch: each one carries the
+          # binary.
+          flags=(--latest)
+          [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
+          cd "${RUNNER_TEMP}/release"
+          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" install.sh SHA256SUMS "${flags[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "Automagik Arca ${VERSION}" \
+            --notes-file RELEASE-NOTES.md
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${COMMIT}" >> "$GITHUB_OUTPUT"
+
+  main:
+    name: main follows
+    needs: publish
+    if: needs.publish.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ needs.publish.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: main moves to the release
+        run: |
+          set -euo pipefail
+          # Fast-forward only: main holds released commits and nothing else. The first release creates it.
+          # The full name of the branch: a pattern such as `main` would also match another branch ending in /main.
+          found=0
+          git ls-remote --exit-code origin refs/heads/main > /dev/null || found=$?
+          if [[ "${found}" == 2 ]]; then
+            git push -q origin "${SHA}:refs/heads/main"
+            echo "main created at ${SHA}"
+          elif [[ "${found}" != 0 ]]; then
+            echo "::error::could not read the remote's branches"
+            exit 1
+          else
+            git fetch -q origin "refs/heads/main:refs/remotes/origin/main"
+            if git merge-base --is-ancestor origin/main "${SHA}"; then
+              git push -q origin "${SHA}:refs/heads/main"
+            else
+              echo "main is already past ${SHA}"
+            fi
+          fi

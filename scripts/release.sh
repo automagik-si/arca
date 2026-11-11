@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Build the release assets of Automagik Arca for the tag checked out here, and print the command that would publish them.
+# The release workflow (.github/workflows/release.yml) builds every release with this script and publishes the files
+# itself; run by hand, the script is for trying a build.
 #
 #   scripts/release.sh              from a clean tree whose HEAD is the tag v<version>
 #   scripts/release.sh --rehearse   builds and checks the same files without the tag, to try the script before the
@@ -15,9 +17,12 @@
 #      when the binary needs a newer one, so the asset runs on x86_64 Linux with glibc 2.34 or newer (Enterprise Linux 9,
 #      Ubuntu 22.04, Debian 12, and newer);
 #   3. checks that the binary answers `--version` with this version and this commit;
-#   4. writes dist/arca-<version>-linux-x86_64, dist/SHA256SUMS and dist/RELEASE-NOTES.md (this version's CHANGELOG.md
-#      section);
+#   4. writes dist/arca-<version>-linux-x86_64, dist/install.sh (a copy of scripts/install.sh, the installer),
+#      dist/SHA256SUMS (the checksums of those two) and dist/RELEASE-NOTES.md (this version's CHANGELOG.md section);
 #   5. prints the `gh release create` command for those files (not with --rehearse).
+#
+# It refuses, before it builds, an installer that does not install this version: the ARCA_VERSION line of
+# scripts/install.sh must name it. scripts/version.sh set writes that line with every other.
 #
 # Run one cargo build at a time on a shared build machine: this script starts one.
 set -euo pipefail
@@ -70,6 +75,12 @@ notes="$(awk -v want="## $version" '
 [ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ] ||
     fail "CHANGELOG.md has no section headed \"## $version\""
 
+# The installer goes out with the release, so it must install this release: its one ARCA_VERSION line names it.
+[ -f scripts/install.sh ] || fail "scripts/install.sh is missing"
+installs="$(sed -n 's/^ARCA_VERSION=//p' scripts/install.sh)"
+[ "$installs" = "$version" ] ||
+    fail "scripts/install.sh installs \"$installs\", not $version: its ARCA_VERSION line must name this release (scripts/version.sh set writes it)"
+
 # The build prints its own report; the lines this script needs are read back from it.
 report="$(scripts/build-portable.sh | tee /dev/stderr)" || fail "scripts/build-portable.sh failed"
 binary="$(printf '%s\n' "$report" | sed -n 's/^binary: *//p')"
@@ -87,12 +98,16 @@ dist="$repo/dist"
 rm -rf "$dist"
 mkdir "$dist"
 install -m 0755 "$binary" "$dist/$asset"
-(cd "$dist" && sha256sum "$asset" >SHA256SUMS && sha256sum --check --quiet SHA256SUMS) ||
+# The installer as the tag holds it: the tree is clean, so this file is the commit's.
+install -m 0755 scripts/install.sh "$dist/install.sh"
+(cd "$dist" && sha256sum "$asset" install.sh >SHA256SUMS && sha256sum --check --strict --quiet SHA256SUMS) ||
     fail "could not write or check dist/SHA256SUMS"
 {
     printf '%s\n' "$notes" | sed -e '/./,$!d'
-    printf '\n`%s` is one file for x86_64 Linux. It needs glibc %s or newer. Check it with `sha256sum --check SHA256SUMS`.\n' \
-        "$asset" "$glibc"
+    printf '\n`%s` is one file for x86_64 Linux. It needs glibc %s or newer.' "$asset" "$glibc"
+    printf ' `install.sh` sets up a read-only node with this release: read it, then run `sh install.sh`.'
+    printf ' Check what you downloaded with `sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints `%s: OK`.\n' \
+        "$asset"
 } >"$dist/RELEASE-NOTES.md"
 
 echo
@@ -100,9 +115,10 @@ echo
 echo "version:  $said"
 echo "glibc:    the binary needs glibc $glibc or newer"
 echo "assets:   dist/$asset"
+echo "          dist/install.sh"
 echo "          dist/SHA256SUMS"
 echo "          dist/RELEASE-NOTES.md"
-echo "sha256:   $(cut -d ' ' -f 1 "$dist/SHA256SUMS")"
+echo "sha256:   $(sed -n 1p "$dist/SHA256SUMS" | cut -d ' ' -f 1)"
 echo
 if [ "$rehearse" = 1 ]; then
     echo "Nothing was published. This was a rehearsal, so no publish command is printed:"
@@ -111,6 +127,6 @@ if [ "$rehearse" = 1 ]; then
 fi
 echo "Nothing was published. To publish, push the tag $tag, then run:"
 echo
-echo "  gh release create $tag --repo automagik-si/arca --verify-tag --prerelease \\"
+echo "  gh release create $tag --repo automagik-si/arca --verify-tag --latest \\"
 echo "    --title \"Automagik Arca $version\" --notes-file dist/RELEASE-NOTES.md \\"
-echo "    dist/$asset dist/SHA256SUMS"
+echo "    dist/$asset dist/install.sh dist/SHA256SUMS"

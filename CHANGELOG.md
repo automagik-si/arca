@@ -4,6 +4,19 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+<!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
+Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
+
+Releases are now cut by themselves: every change that lands on `dev` and ships is released, numbered and published
+without anyone writing a version or a tag. The numbers changed with it. A release is `0.N.P`, with no `alpha` word:
+`0.8.0` follows `0.1.0-alpha.7`, a change to what the binary is built from takes the next `N`, and a change that ships
+without changing the binary takes the next `P`. The canvas package carries the same version as the binary. Arca is
+still an alpha for single hosts; the number no longer says so, `docs/OPERATING.md` does.
+
+Each release now carries `install.sh`, the installer, beside the binary. It installs the release it comes with, and
+`SHA256SUMS` lists it with the binary: check a download with `sha256sum --check --ignore-missing SHA256SUMS`, and
+stop unless it prints `arca-<version>-linux-x86_64: OK`.
+
 - A workspace's own settings are given when it is created: the `automagik-workspace` template lists `reach`,
   `publicUrl` and the three Cloudflare Access settings in `createSettings`, so `service_create` takes them in
   `settings` and no copy of the template is made. `serverImage` is not listed: the image a workspace runs stays the
@@ -22,9 +35,9 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 - An installer, `scripts/install.sh`: one command that leaves what `docs/QUICKSTART.md` leaves, a read-only node
   for the user who runs it. It checks the machine first (Linux, x86_64, glibc 2.34 or newer, `curl`, `sha256sum`, a
   runtime directory that is the user's alone, an Incus socket this user may open) and, when something is missing, says
-  what and how to fix it and changes nothing. It refuses to run as root. It downloads one named release
-  (`0.1.0-alpha.7`, or the one `--version` names; never GitHub's "latest release" address, which answers 404 while
-  every release is a pre-release), checks the program against the release's `SHA256SUMS` and puts it at
+  what and how to fix it and changes nothing. It refuses to run as root. It downloads one named release (the one its
+  own `ARCA_VERSION` line names, which is the release it was published with, or the one `--version` names; it never
+  asks GitHub which release is the latest), checks the program against the release's `SHA256SUMS` and puts it at
   `~/.local/bin/arca`; an older release is never put over a newer program unless `--version` names it. Where there is
   no config it writes the quickstart's and mints one `viewer` token; a config that exists is not changed. It runs the
   node as `arca.service`, a systemd user unit, and ends with the node's answer to `arca_status` and the two ways to
@@ -35,8 +48,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   the unit and the program, while the program is still the file it installed, and keeps the config, the tokens and
   the state. It never runs `sudo`, writes only in the user's home, never prints the token, and works from a pipe and in
   a shell with no `XDG_RUNTIME_DIR`. It refuses a user who already has the operating guide's units
-  (`arca-watch.service`, `arca-shim.service`). The script is not a release asset yet: the quickstart reads it from
-  the `dev` branch. It is tested against stand-ins, and was run for real only on a machine that already had Incus and
+  (`arca-watch.service`, `arca-shim.service`). The addresses in the quickstart still read the script from the
+  `dev` branch. It is tested against stand-ins, and was run for real only on a machine that already had Incus and
   Arca.
 - Two families of refusal have their own codes, so a caller no longer reads the sentence to tell them from any other
   refusal. `capacity`: the call would pass a cap of a tenant or of the node (instances, containers, virtual machines,
@@ -55,7 +68,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   asking too often".
 - The README is now one short page: what Arca is, how to get it, how it works and what it runs, with the Arca logo and
   one diagram (the files are in `assets/readme/`, each with one file for a light page and one for a dark page). Its
-  long sections moved into `docs/`, word for word: the quickstart is `docs/QUICKSTART.md`, with "Install with one
+  long sections moved into `docs/`: the quickstart is `docs/QUICKSTART.md`, with "Install with one
   command" above its steps by hand; the status table and "What it does today" open `docs/OPERATING.md`; the crate
   table is `docs/ARCHITECTURE.md`; "Build and test" and "Releasing" are `docs/BUILDING.md`. A link to
   `README.md#quickstart-a-read-only-node-in-five-minutes` now stops at the top of the README: the quickstart's address
