@@ -10,11 +10,13 @@
 //! read it.
 //!
 //! So this proves the script's own logic: the checks and their reasons, the one named release and its checksum, what
-//! is written where and at which mode, that a config that exists is not changed, the service's commands in order,
-//! the report, the uninstall, and that the token reaches no output. It does not prove GitHub, a real download, the
+//! is written where and at which mode, that a config that exists is not changed and that no node is started for one
+//! the script did not write, the service's commands in order, the report and how the script ends, the uninstall,
+//! and that the token reaches no output. It does not prove GitHub, a real download, the
 //! real `arca`, systemd, Incus or a machine that never had Arca.
 //!
-//! The tests need `sh`, `bash` and the usual core utilities on the machine that runs them. The token is made here.
+//! The tests need `sh`, `bash` and the usual core utilities on the machine that runs them, and a user who is not
+//! root, since the script refuses root. The token is made here.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -142,6 +144,26 @@ impl Run {
         self
     }
 
+    /// The program is installed and the script started no node: it ends with 3.
+    fn not_started(&self) -> &Run {
+        assert_eq!(
+            self.code,
+            Some(3),
+            "the installer did not end with 3:\n{}",
+            self.all()
+        );
+        self.says("This script started no node.")
+    }
+
+    fn never_says(&self, words: &str) -> &Run {
+        assert!(
+            !self.all().contains(words),
+            "the installer said \"{words}\":\n{}",
+            self.all()
+        );
+        self
+    }
+
     fn says(&self, words: &str) -> &Run {
         assert!(
             self.all().contains(words),
@@ -168,6 +190,11 @@ impl Machine {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::SeqCst)
         ));
+        assert_ne!(
+            uid(),
+            "0",
+            "the installer refuses root, so these tests cannot run as root"
+        );
         let _ = fs::remove_dir_all(&dir);
         for sub in ["bin", "home", "run", "fake", "tmp", "cwd"] {
             fs::create_dir_all(dir.join(sub)).expect("scratch");
@@ -177,6 +204,8 @@ impl Machine {
         for sub in ["tmp", "cwd"] {
             fs::set_permissions(dir.join(sub), fs::Permissions::from_mode(0o555)).expect("0555");
         }
+        // A runtime directory is its user's alone.
+        fs::set_permissions(dir.join("run"), fs::Permissions::from_mode(0o700)).expect("0700");
         let incus = UnixListener::bind(dir.join("incus.socket"))
             .expect("a unix socket; is the temporary directory's path short enough for one?");
         let machine = Machine {
@@ -209,6 +238,34 @@ impl Machine {
                 which("bash").display()
             ),
         );
+    }
+
+    /// Makes `id` say that this is another user: `-u` answers `number` and `-un` answers `name`.
+    fn id(&self, number: &str, name: &str) {
+        let path = self.dir.join("bin/id");
+        // The name is a link to the real program; the stand-in takes its place, it is not written through it.
+        fs::remove_file(&path).expect("the link to id");
+        executable(
+            &path,
+            &format!(
+                "#!{}\ncase $1 in -u) echo {number} ;; -un) echo {name} ;; *) exit 1 ;; esac\n",
+                which("bash").display()
+            ),
+        );
+    }
+
+    /// The user's runtime directory where the system keeps it, for a shell with no `XDG_RUNTIME_DIR`.
+    fn make_runtime_dir(&self) {
+        fs::create_dir_all(self.runtime_dir()).expect("the runtime directory");
+        fs::set_permissions(self.runtime_dir(), fs::Permissions::from_mode(0o700)).expect("0700");
+    }
+
+    /// How many times the installer ran `arca` with arguments that start with `prefix`.
+    fn arca_calls(&self, prefix: &str) -> usize {
+        self.log("arca")
+            .iter()
+            .filter(|line| line.starts_with(prefix))
+            .count()
     }
 
     /// What `getconf GNU_LIBC_VERSION` answers; nothing, and a failure, when `answer` is empty.
@@ -424,6 +481,18 @@ fn is_the_quickstarts_node(machine: &Machine, run: &Run, version: &str) {
     assert_eq!(config, quickstart_config(machine));
     assert_eq!(mode(&machine.home(".config/arca/tokens")), 0o700);
     assert_eq!(mode(&machine.home(".local/state/arca-node")), 0o700);
+    // What the script makes is this user's alone, but for the program and the unit, whose modes it sets.
+    for private in [
+        ".config/arca/node.json",
+        ".config/arca",
+        ".local/state/arca-install",
+    ] {
+        assert_eq!(mode(&machine.home(private)) & 0o077, 0, "{private}");
+    }
+    assert_eq!(
+        mode(&machine.home(".config/systemd/user/arca.service")),
+        0o644
+    );
 
     let secret = machine.home(".config/arca/assistant-1.secret");
     assert_eq!(
@@ -509,6 +578,29 @@ fn a_clean_install_leaves_the_quickstarts_node_as_a_service_and_never_shows_the_
             .all(|line| !line.contains("latest"))
     );
 
+    // Each download fails on an HTTP error, takes https only, and cannot hang: the flags as curl was given them.
+    for line in machine
+        .log("curl")
+        .iter()
+        .filter(|line| !line.contains("--unix-socket"))
+    {
+        let flags: Vec<&str> = line.split(' ').collect();
+        let short = |letter: char| {
+            flags.iter().any(|flag| {
+                flag.starts_with('-') && !flag.starts_with("--") && flag.contains(letter)
+            })
+        };
+        assert!(short('f'), "no -f: {line}");
+        assert!(
+            line.contains(" --proto =https "),
+            "no --proto '=https': {line}"
+        );
+        assert!(
+            line.contains(" --connect-timeout ") && line.contains(" --max-time "),
+            "{line}"
+        );
+    }
+
     // One token, minted before the node starts; the unit written, enabled and started, in that order.
     let arca = machine.log("arca");
     assert_eq!(
@@ -545,10 +637,14 @@ fn a_clean_install_leaves_the_quickstarts_node_as_a_service_and_never_shows_the_
         ".config/systemd",
         ".config/systemd/user",
         ".config/systemd/user/arca.service",
+        ".config/systemd/user/default.target.wants",
+        ".config/systemd/user/default.target.wants/arca.service",
         ".local",
         ".local/bin",
         ".local/bin/arca",
         ".local/state",
+        ".local/state/arca-install",
+        ".local/state/arca-install/program.sha256",
         ".local/state/arca-node",
     ];
     assert_eq!(names, expected);
@@ -578,8 +674,13 @@ fn a_second_run_upgrades_the_program_in_place_and_restarts_the_service() {
         .says(&format!("it was: Automagik Arca {}", current()));
     let mut after = machine.home_tree();
     let mut expected = before.clone();
-    after.remove(".local/bin/arca");
-    expected.remove(".local/bin/arca");
+    for changed in [
+        ".local/bin/arca",
+        ".local/state/arca-install/program.sha256",
+    ] {
+        after.remove(changed);
+        expected.remove(changed);
+    }
     assert_eq!(after, expected, "only the program changed");
 
     // One token in three runs, and the service started again each time.
@@ -618,7 +719,7 @@ fn a_second_run_upgrades_the_program_in_place_and_restarts_the_service() {
 }
 
 #[test]
-fn a_config_that_exists_is_not_changed_and_gets_no_token() {
+fn a_config_this_script_did_not_write_is_not_changed_and_no_node_is_started_for_it() {
     let machine = Machine::new();
     fs::create_dir_all(machine.home(".config/arca")).expect("the config directory");
     let config = machine.home(".config/arca/node.json");
@@ -630,62 +731,146 @@ fn a_config_that_exists_is_not_changed_and_gets_no_token() {
         .expect("metadata")
         .modified()
         .expect("a time");
-
-    let run = machine.run(&[]);
-    run.ok()
-        .says("kept as it was: this script changes nothing in a config that exists")
-        .says("this script mints no token for a config it did not write")
-        .says("There is no token at");
-    assert_eq!(fs::read_to_string(&config).expect("the config"), text);
-    assert_eq!(mode(&config), 0o640);
-    assert_eq!(
-        fs::metadata(&config)
-            .expect("metadata")
-            .modified()
-            .expect("a time"),
-        written
+    let start = format!(
+        "  {} serve --config {}\n",
+        machine.home(".local/bin/arca").display(),
+        config.display()
     );
-    // Nothing beside it either: no token, no token directory, no state directory.
-    let names: Vec<String> = machine
+    let untouched = |run: &Run| {
+        assert_eq!(fs::read_to_string(&config).expect("the config"), text);
+        assert_eq!(mode(&config), 0o640);
+        assert_eq!(
+            fs::metadata(&config)
+                .expect("metadata")
+                .modified()
+                .expect("a time"),
+            written
+        );
+        // No service for it, and no word that the node only reads: the script cannot know what this config does.
+        assert!(!machine.home(".config/systemd").exists(), "{}", run.all());
+        assert_eq!(machine.log("systemctl"), Vec::<String>::new());
+        run.never_says("read-only node")
+            .never_says("enabled and started")
+            .never_says(TOKEN);
+        assert_eq!(machine.arca_calls("serve"), 0);
+        machine.wrote_only_where_it_may();
+    };
+
+    // No token: the node cannot be asked what it is, so nothing is started, nothing is waited for, and the script
+    // ends with 3 and the one command.
+    let run = machine.run(&[]);
+    run.not_started()
+        .says("kept as it was: this script changes nothing in a config that exists")
+        .says("this script mints no token for a config that exists")
+        .says("No node was started or restarted")
+        .says("it starts no node it cannot ask")
+        .says(&start)
+        .says("not asked: there is no token to ask it with");
+    untouched(&run);
+    assert_eq!(
+        machine.arca_calls("call"),
+        0,
+        "the node was asked, or waited for, with no token"
+    );
+    assert_eq!(machine.arca_calls("token"), 0);
+    // Nothing beside the config either: no token, no token directory, no state directory.
+    let beside: Vec<String> = machine
         .home_names()
         .into_iter()
-        .filter(|name| !name.starts_with(".config/systemd") && !name.starts_with(".local/bin"))
+        .filter(|name| name.starts_with(".config"))
         .collect();
     assert_eq!(
-        names,
-        [
-            ".config",
-            ".config/arca",
-            ".config/arca/node.json",
-            ".local"
-        ]
+        beside,
+        [".config", ".config/arca", ".config/arca/node.json"]
     );
-    assert!(
-        !machine
-            .log("arca")
-            .iter()
-            .any(|line| line.starts_with("token"))
+    assert!(!machine.home(".local/state/arca-node").exists());
+    // The program is still this script's to install.
+    assert_eq!(
+        fs::read_to_string(machine.home(".local/bin/arca")).expect("the program"),
+        program(&current())
     );
-    // The program and the service are still this script's to install.
-    assert!(machine.home(".local/bin/arca").exists());
-    assert!(
-        machine
-            .service_calls()
-            .contains(&"--user restart arca.service".to_string())
-    );
-    machine.wrote_only_where_it_may();
 
-    // A config that says the node writes is reported as it is, not as read-only.
+    // A token under the script's own name, and no node running: one question, no waiting, still nothing started.
     let secret = machine.home(".config/arca/assistant-1.secret");
     fs::write(&secret, format!("{TOKEN}\n")).expect("a token");
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).expect("0600");
+    let run = machine.run(&[]);
+    run.not_started()
+        .says("none written: this script starts no node for a config it did not write")
+        .says("No node was started: this script did not write")
+        .says(&start)
+        .says("it has not answered `arca_status`");
+    untouched(&run);
+    assert_eq!(machine.arca_calls("call"), 1, "one question, not a wait");
+
+    // The user's own node runs, and it is one that writes: the script reports it as it is and starts nothing.
+    machine.switch("node-running", true);
     fs::write(machine.dir.join("fake/node-mode"), "kernel\n").expect("the mode");
     let run = machine.run(&[]);
     run.ok()
+        .says("none written: a node already answers for this config, and this script did not start it")
         .says("node      mode kernel")
-        .says("This node is not read-only");
+        .says("This node is not read-only")
+        .says("This script started nothing and stopped nothing.")
+        .never_says("stop that node and run this script again");
+    untouched(&run);
+}
+
+#[test]
+fn a_service_from_an_earlier_run_is_restarted_only_where_the_node_can_be_asked() {
+    let restarts = |machine: &Machine| {
+        machine
+            .service_calls()
+            .iter()
+            .filter(|line| *line == "--user restart arca.service")
+            .count()
+    };
+
+    // The user turned a listener on in the config this script wrote. The service is still this script's, so a
+    // second run puts it on the new program, and the node's own answer is the proof.
+    let machine = Machine::new();
+    machine.run(&[]).ok();
+    let config = machine.home(".config/arca/node.json");
+    let mut edited: Value =
+        serde_json::from_str(&fs::read_to_string(&config).expect("the config")).expect("JSON");
+    edited["listen"]["tailnet"] = json!("100.64.0.1:7777");
+    let text = format!("{edited:#}\n");
+    fs::write(&config, &text).expect("the edited config");
+    machine.release(NEXT);
+    let run = machine.run(&["--version", NEXT]);
+    run.ok()
+        .says("kept as it was: this script changes nothing in a config that exists")
+        .says("enabled and started")
+        .says(&format!("node      mode watch-only, version {NEXT}"))
+        .never_says("read-only node");
     assert_eq!(fs::read_to_string(&config).expect("the config"), text);
-    assert!(!run.all().contains(TOKEN));
+    assert_eq!(restarts(&machine), 2);
+
+    // The token's file is gone: the node cannot be asked, so the service is neither rewritten nor restarted.
+    fs::remove_file(machine.home(".config/arca/assistant-1.secret")).expect("the token");
+    let unit = fs::read(machine.home(".config/systemd/user/arca.service")).expect("the unit");
+    let calls = machine.log("systemctl").len();
+    let asked = machine.arca_calls("call");
+    let run = machine.run(&["--version", NEXT]);
+    run.not_started()
+        .says("No node was started or restarted")
+        .says("A node that is running still uses the program it started with.");
+    assert_eq!(
+        machine.log("systemctl").len(),
+        calls,
+        "systemctl was called"
+    );
+    assert_eq!(machine.arca_calls("call"), asked);
+    assert_eq!(
+        machine.arca_calls("token"),
+        1,
+        "no second token for a config that exists"
+    );
+    assert_eq!(
+        fs::read(machine.home(".config/systemd/user/arca.service")).expect("the unit"),
+        unit
+    );
+    assert_eq!(fs::read_to_string(&config).expect("the config"), text);
 }
 
 #[test]
@@ -822,7 +1007,7 @@ fn a_shell_with_no_runtime_directory_uses_the_users_own_or_is_refused_with_the_r
     // A coding agent's shell: no XDG_RUNTIME_DIR, and the user's runtime directory is where the system keeps it.
     let mut machine = Machine::new();
     machine.session = false;
-    fs::create_dir_all(machine.runtime_dir()).expect("the runtime directory");
+    machine.make_runtime_dir();
     let run = machine.run(&[]);
     // The stand-in for systemctl answers only when XDG_RUNTIME_DIR reached it, as the real one does.
     is_the_quickstarts_node(&machine, &run, &current());
@@ -854,6 +1039,7 @@ fn a_shell_with_no_runtime_directory_uses_the_users_own_or_is_refused_with_the_r
     let machine = Machine::new();
     let long = machine.dir.join("run").join("d".repeat(100));
     fs::create_dir_all(&long).expect("a long directory");
+    fs::set_permissions(&long, fs::Permissions::from_mode(0o700)).expect("0700");
     let mut command = machine.command("sh");
     command
         .arg(script())
@@ -865,12 +1051,160 @@ fn a_shell_with_no_runtime_directory_uses_the_users_own_or_is_refused_with_the_r
 }
 
 #[test]
+fn a_user_or_a_runtime_directory_that_is_not_the_users_own_is_refused() {
+    let nothing_changed = |machine: &Machine, run: &Run| {
+        run.refused().says("nothing was changed");
+        assert_eq!(machine.home_names(), Vec::<String>::new(), "{}", run.all());
+        assert!(
+            machine
+                .log("curl")
+                .iter()
+                .all(|line| line.contains("--unix-socket"))
+        );
+        assert_eq!(machine.log("systemctl"), Vec::<String>::new());
+    };
+
+    // A runtime directory that others may write: whoever else writes there could take the socket's place.
+    for open in [0o770, 0o707, 0o777, 0o720] {
+        let machine = Machine::new();
+        fs::set_permissions(machine.dir.join("run"), fs::Permissions::from_mode(open))
+            .expect("a mode");
+        let run = machine.run(&[]);
+        nothing_changed(&machine, &run);
+        run.says(&format!(
+            "the runtime directory {} is not this user's alone",
+            machine.dir.join("run").display()
+        ));
+    }
+    // A group or others that may only read it are no danger to the socket.
+    let machine = Machine::new();
+    fs::set_permissions(machine.dir.join("run"), fs::Permissions::from_mode(0o755)).expect("0755");
+    machine.run(&[]).ok();
+
+    // Root: the node belongs to an ordinary user.
+    let machine = Machine::new();
+    machine.id("0", "root");
+    let run = machine.run(&[]);
+    nothing_changed(&machine, &run);
+    run.says("this is root, and Arca's node belongs to an ordinary user")
+        .says("without sudo");
+
+    // Another user in this user's home and runtime directory, as under `sudo -u` with the caller's HOME kept.
+    let machine = Machine::new();
+    machine.id("4242", "somebody");
+    let run = machine.run(&[]);
+    nothing_changed(&machine, &run);
+    run.says(&format!(
+        "the home directory {} belongs to another user, not to somebody",
+        machine.dir.join("home").display()
+    ))
+    .says(&format!(
+        "the runtime directory {} is not this user's alone",
+        machine.dir.join("run").display()
+    ));
+}
+
+#[test]
+fn an_older_release_is_not_put_over_a_newer_program_unless_the_version_is_named() {
+    let version = current();
+    // Versions around the script's own, in the order of semantic versioning.
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core.to_string(), Some(pre.to_string())),
+        None => (version.clone(), None),
+    };
+    let mut newer = vec!["999.0.0".to_string()];
+    let mut older = vec!["0.0.1".to_string(), "0.0.0-alpha.1".to_string()];
+    if core.split('.').count() == 3 {
+        let (head, patch) = core.rsplit_once('.').expect("three numbers");
+        let patch: u64 = patch.parse().expect("a number");
+        newer.push(format!("{head}.{}", patch + 1));
+        newer.push(format!("{head}.{}-alpha.1", patch + 1));
+    }
+    if let Some(pre) = &pre {
+        // The release is newer than its own pre-release; `beta` is newer than `alpha`; 10 is newer than 9.
+        newer.push(core.clone());
+        newer.push(format!("{version}.1"));
+        newer.push(format!("{core}-{}", pre.replace("alpha", "beta")));
+        if let Some((word, number)) = pre.rsplit_once('.')
+            && let Ok(number) = number.parse::<u64>()
+        {
+            let digits = number.to_string().len();
+            newer.push(format!("{core}-{word}.{}", 10u64.pow(digits as u32)));
+            newer.push(format!("{core}-{word}.{}", number + 1));
+            if number > 0 {
+                older.push(format!("{core}-{word}.{}", number - 1));
+            }
+            older.push(format!("{core}-{word}"));
+        }
+    } else {
+        older.push(format!("{core}-rc.1"));
+    }
+    newer.retain(|other| *other != version);
+
+    let with = |installed: &str| {
+        let machine = Machine::new();
+        fs::create_dir_all(machine.home(".local/bin")).expect("bin");
+        executable(&machine.home(".local/bin/arca"), &program(installed));
+        machine
+    };
+
+    for installed in &newer {
+        let machine = with(installed);
+        let before = machine.home_tree();
+        machine
+            .run(&[])
+            .refused()
+            .says(&format!("is {installed}, which is newer than {version}"))
+            .says(&format!("sh install.sh --version {version}"))
+            .says("nothing was changed");
+        assert_eq!(machine.home_tree(), before, "{installed} was replaced");
+        assert!(
+            machine
+                .log("curl")
+                .iter()
+                .all(|line| line.contains("--unix-socket"))
+        );
+    }
+    for installed in older.iter().chain([&version]) {
+        let machine = with(installed);
+        let run = machine.run(&[]);
+        is_the_quickstarts_node(&machine, &run, &version);
+    }
+
+    // Named, the older release goes over the newer program, and the report says which was there.
+    let machine = with("999.0.0");
+    let run = machine.run(&["--version", &version]);
+    is_the_quickstarts_node(&machine, &run, &version);
+    run.says(&format!("replaced: Automagik Arca {version}"))
+        .says("it was: Automagik Arca 999.0.0");
+
+    // A program that does not say its version in the product's words is not taken for a newer one.
+    let machine = Machine::new();
+    fs::create_dir_all(machine.home(".local/bin")).expect("bin");
+    executable(
+        &machine.home(".local/bin/arca"),
+        &format!("#!{}\necho 'arca 999.0.0'\n", which("bash").display()),
+    );
+    let run = machine.run(&[]);
+    is_the_quickstarts_node(&machine, &run, &version);
+}
+
+#[test]
 fn uninstall_removes_the_program_and_the_unit_and_keeps_the_rest() {
+    /// What `--uninstall` takes: the program, the unit, the link that starts it, and the script's own note.
+    const GONE: [&str; 5] = [
+        ".local/bin/arca",
+        ".config/systemd/user/arca.service",
+        ".config/systemd/user/default.target.wants/arca.service",
+        ".local/state/arca-install",
+        ".local/state/arca-install/program.sha256",
+    ];
     let machine = Machine::new();
     machine.run(&[]).ok();
     let mut kept = machine.home_tree();
-    kept.remove(".local/bin/arca");
-    kept.remove(".config/systemd/user/arca.service");
+    for gone in GONE {
+        assert!(kept.remove(gone).is_some(), "{gone} was installed");
+    }
 
     let run = machine.run(&["--uninstall"]);
     run.ok()
@@ -895,7 +1229,7 @@ fn uninstall_removes_the_program_and_the_unit_and_keeps_the_rest() {
     assert_eq!(
         machine.home_tree(),
         kept,
-        "exactly the program and the unit went"
+        "exactly what the script installed went"
     );
     let calls = machine.service_calls();
     assert_eq!(
@@ -920,14 +1254,7 @@ fn uninstall_removes_the_program_and_the_unit_and_keeps_the_rest() {
     // The installer brings the same node back: the same config, the same token.
     let run = machine.run(&[]);
     is_the_quickstarts_node(&machine, &run, &current());
-    assert_eq!(
-        machine
-            .log("arca")
-            .iter()
-            .filter(|line| line.starts_with("token mint"))
-            .count(),
-        1
-    );
+    assert_eq!(machine.arca_calls("token mint"), 1);
 
     // A unit of that name that this script did not write is not its to remove, nor to replace.
     let unit = machine.home(".config/systemd/user/arca.service");
@@ -940,7 +1267,6 @@ fn uninstall_removes_the_program_and_the_unit_and_keeps_the_rest() {
         fs::read_to_string(&unit).expect("the unit"),
         "[Service]\nExecStart=/bin/true\n"
     );
-    machine.release(&current());
     machine
         .run(&[])
         .refused()
@@ -950,6 +1276,60 @@ fn uninstall_removes_the_program_and_the_unit_and_keeps_the_rest() {
         "[Service]\nExecStart=/bin/true\n"
     );
     assert!(!machine.home(".local/bin/arca").exists());
+}
+
+#[test]
+fn uninstall_takes_the_program_only_while_it_is_the_file_this_script_installed() {
+    // A program this script never installed: there is no note of it, so it stays.
+    let machine = Machine::new();
+    fs::create_dir_all(machine.home(".local/bin")).expect("bin");
+    executable(&machine.home(".local/bin/arca"), "their own build");
+    let before = machine.home_tree();
+    machine
+        .run(&["--uninstall"])
+        .ok()
+        .says("is left in place: this script has no note of having installed it");
+    assert_eq!(machine.home_tree(), before);
+
+    // A program that was replaced by hand after the install: it is no longer this script's file.
+    let machine = Machine::new();
+    machine.run(&[]).ok();
+    executable(&machine.home(".local/bin/arca"), "a build of their own");
+    machine
+        .run(&["--uninstall"])
+        .ok()
+        .says("is left in place: it is no longer the file this script installed")
+        .says("arca.service was stopped and disabled");
+    assert_eq!(
+        fs::read_to_string(machine.home(".local/bin/arca")).expect("the program"),
+        "a build of their own"
+    );
+    assert!(!machine.home(".config/systemd/user/arca.service").exists());
+
+    // No user manager to ask, as in a shell with no session: the unit goes, and so does the link that would start
+    // it at the next login.
+    let machine = Machine::new();
+    machine.run(&[]).ok();
+    let link = machine.home(".config/systemd/user/default.target.wants/arca.service");
+    assert!(fs::symlink_metadata(&link).is_ok(), "enable made the link");
+    machine.switch("no-user-manager", true);
+    machine
+        .run(&["--uninstall"])
+        .ok()
+        .says("was removed, with the link that starts it at login")
+        .says("a node that is running was not")
+        .says(&format!(
+            "{} was removed",
+            machine.home(".local/bin/arca").display()
+        ));
+    assert!(
+        fs::symlink_metadata(&link).is_err(),
+        "the link is still there"
+    );
+    assert!(!machine.home(".config/systemd/user/arca.service").exists());
+    assert!(!machine.home(".local/bin/arca").exists());
+    assert!(!machine.home(".local/state/arca-install").exists());
+    assert!(machine.home(".config/arca/node.json").exists());
 }
 
 #[test]
@@ -1003,18 +1383,14 @@ fn without_a_user_manager_it_prints_the_one_command_and_starts_nothing() {
         )
     };
     let not_started = |machine: &Machine, run: &Run| {
-        run.ok()
+        run.not_started()
             .says("The node is not running")
             .says("Start it yourself with this one command")
             .says(&start(machine))
             .says("it has not answered `arca_status`");
         assert!(!machine.home(".config/systemd").exists());
-        assert!(
-            !machine
-                .log("arca")
-                .iter()
-                .any(|line| line.starts_with("serve"))
-        );
+        assert_eq!(machine.arca_calls("serve"), 0);
+        assert_eq!(machine.arca_calls("call"), 1, "one question, not a wait");
         assert!(machine.home(".local/bin/arca").exists());
         assert!(machine.home(".config/arca/node.json").exists());
         assert!(!run.all().contains(TOKEN));
@@ -1034,14 +1410,41 @@ fn without_a_user_manager_it_prints_the_one_command_and_starts_nothing() {
     not_started(&machine, &run);
     assert_eq!(machine.service_calls(), Vec::<String>::new());
 
-    // A service that was started and a node that does not answer is a failure, with where to look.
+    // The user started it with that command: the next run finds it and ends with 0.
+    machine.switch("node-running", true);
+    machine.run(&[]).ok().says("node      mode watch-only");
+}
+
+#[test]
+fn a_started_node_that_does_not_answer_or_cannot_read_incus_is_a_failure() {
+    // A service that was started and a node that does not answer, with where to look.
     let machine = Machine::new();
     machine.switch("node-does-not-start", true);
     let run = machine.run(&[]);
     run.refused()
         .says("the node did not answer within 1 seconds")
-        .says("journalctl --user -u arca.service -n 50");
-    assert!(!run.all().contains(TOKEN));
+        .says("journalctl --user -u arca.service -n 50")
+        .never_says("Connect an assistant")
+        .never_says(TOKEN);
+
+    // A node that answers and says Incus does not answer it: it runs, and it can read nothing.
+    let machine = Machine::new();
+    machine.switch("node-cannot-reach-incus", true);
+    let run = machine.run(&[]);
+    run.refused()
+        .says("INCUS DOES NOT ANSWER THE NODE")
+        .says("Incus does not answer the node: it can read nothing")
+        .never_says("Connect an assistant")
+        .never_says(TOKEN);
+    // The same from a node this script did not start.
+    let machine = Machine::new();
+    machine.switch("no-user-manager", true);
+    machine.switch("node-running", true);
+    machine.switch("node-cannot-reach-incus", true);
+    machine
+        .run(&[])
+        .refused()
+        .says("Incus does not answer the node");
 }
 
 #[test]
@@ -1195,6 +1598,12 @@ fn the_script_is_what_the_readme_and_the_hard_rules_say() {
         }
     }
     assert!(text.contains("\nset -eu\n"), "set -eu");
+    assert!(
+        code.contains(&"umask 077"),
+        "what it makes is the user's alone"
+    );
+    // A file that is written and then renamed gets its first name from mktemp, never a fixed one.
+    assert!(!text.contains(".new"), "a fixed temporary name");
 
     // Every command that removes or replaces a file names it through ${var:?}.
     let destructive: Vec<&&str> = code

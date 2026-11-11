@@ -8,7 +8,8 @@
 #                  exists and an output file that exists; writes the hash and the secret at mode 0400; prints the id
 #                  and the scope, never the secret. The secret is $FAKE_ARCA_SECRET, so the test can look for it.
 #   call           answers `arca_status` while $FAKE_DIR/node-running is there (the fake systemctl makes it when the
-#                  unit starts), with the mode in $FAKE_DIR/node-mode (watch-only when there is no such file); it
+#                  unit starts), with the mode in $FAKE_DIR/node-mode (watch-only when there is no such file) and
+#                  `"incusReachable":false` while $FAKE_DIR/node-cannot-reach-incus is there; it
 #                  fails when no node runs, when the config is missing and when the token file is not private.
 #   serve          the installer must never start the node in the foreground: recorded, and it fails.
 #
@@ -75,8 +76,10 @@ case "${1-} ${2-}" in
     [ -e "$root/node-running" ] || fail "the node does not answer on its socket"
     mode=watch-only
     [ ! -f "$root/node-mode" ] || mode=$(cat "$root/node-mode")
-    printf '{"appliedSeq":0,"incusReachable":true,"metricsSource":"incus","metricsSourceReason":null,"mode":"%s","node":"scratch","uptimeS":1,"version":"%s"}\n' \
-      "$mode" "$version"
+    reach=true
+    [ ! -e "$root/node-cannot-reach-incus" ] || reach=false
+    printf '{"appliedSeq":0,"incusReachable":%s,"metricsSource":"incus","metricsSourceReason":null,"mode":"%s","node":"scratch","uptimeS":1,"version":"%s"}\n' \
+      "$reach" "$mode" "$version"
     ;;
   "serve "*)
     fail "the installer started the node in the foreground"

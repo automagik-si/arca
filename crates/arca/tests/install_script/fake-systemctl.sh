@@ -6,7 +6,8 @@
 # $FAKE_DIR/no-user-manager is there, as in a session with no user manager. `enable` and `restart` need the unit
 # file; `restart` needs the program and the config the unit's ExecStart names, and then the node runs: it makes
 # $FAKE_DIR/node-running, which the fake arca reads, unless $FAKE_DIR/node-does-not-start is there.
-# `disable --now` ends it. `is-active` says whether the unit was started.
+# `enable` makes the link in default.target.wants that starts the unit at login, as the real one does.
+# `disable --now` removes the link and ends the node. `is-active` says whether the unit was started.
 #
 # The installer runs on a PATH of its own listed programs; the stand-in finds its tools on $FAKE_PATH.
 set -u
@@ -27,12 +28,14 @@ shift
 [ ! -e "$root/no-user-manager" ] || refuse "Failed to connect to bus: No medium found"
 
 unit=$HOME/.config/systemd/user/arca.service
+wants=$HOME/.config/systemd/user/default.target.wants
 case $* in
   show-environment) echo "HOME=$HOME" ;;
   daemon-reload) ;;
   "enable arca.service")
     [ -f "$unit" ] || refuse "Unit arca.service does not exist"
-    : >"$root/unit-enabled"
+    mkdir -p "$wants"
+    ln -sfn "$unit" "$wants/arca.service"
     ;;
   "restart arca.service")
     [ -f "$unit" ] || refuse "Unit arca.service not found"
@@ -47,7 +50,7 @@ case $* in
     [ -e "$root/unit-active" ] || exit 3
     ;;
   "disable --now arca.service")
-    rm -f "$root/unit-enabled" "$root/unit-active" "$root/node-running"
+    rm -f "$wants/arca.service" "$root/unit-active" "$root/node-running"
     ;;
   *) refuse "the fake does not know: $*" ;;
 esac

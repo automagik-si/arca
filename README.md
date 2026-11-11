@@ -37,7 +37,8 @@ less install.sh
 sh install.sh
 ```
 
-**Or in one line.** The script runs as soon as it has arrived, so use this only when you trust the address:
+**Or in one line.** The script runs as soon as it has arrived, and until a release carries it this address follows
+the `dev` branch, so what runs is whatever that branch holds at that moment. Use this only when you trust the address:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh | sh
@@ -47,23 +48,28 @@ To hand it to a coding agent, paste this: *Download
 `https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh`, read it, run it with `sh`, and tell me
 what it printed.*
 
-- **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, and an Incus socket this user may open. When one is
-  missing it says which and how to fix it, and stops before it has changed anything. It never runs `sudo`, and it writes
-  only in your home directory.
-- **It installs one named release**, the one the quickstart names, checked against that release's `SHA256SUMS`, at
-  `~/.local/bin/arca`. `sh install.sh --version <version>` names another.
+- **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an Incus
+  socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
+  anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
+- **It installs one named release**, the one the quickstart names, at `~/.local/bin/arca`.
+  `sh install.sh --version <version>` names another; without it, an older release is never put over a newer program.
+  The program is checked against that release's `SHA256SUMS`. That catches a download that was damaged or cut short. It
+  does not catch a release that was tampered with, because the checksums come from the same release.
 - **It writes the quickstart's config and mints one `viewer` token**, only where there is no config. A config that
-  exists is not changed, and the script says so.
-- **It runs the node as a service**, `arca.service`, a systemd user unit. Where `systemctl --user` does not answer, it
-  prints the one command that starts the node and starts nothing.
+  exists is not changed.
+- **It runs the node as a service**, `arca.service`, a systemd user unit, and only for a config it wrote. For a config
+  it did not write, and where `systemctl --user` does not answer, it starts nothing, prints the one command that starts
+  the node, and ends with exit code 3: the program is installed and no node was started.
 - **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
-  token), and the two ways to connect an assistant from step 4 below.
+  token), and the two ways to connect an assistant from step 4 below. Exit code 0 means the node runs, answered, and
+  reaches Incus.
 - **A second run** replaces the program in place and restarts the service. `sh install.sh --uninstall` removes the
-  program and the service, and keeps the config, the tokens and the state.
+  service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
+  state.
 
-**Not yet:** the script is read from the `dev` branch, so no release's checksum covers it yet. It is tested against
-stand-ins for the download, the program and systemd, and it was run for real on one machine that already had Incus and
-Arca; it has not been run on a machine that never had either. There is no installer for a Mac.
+**Not yet:** the script is read from the `dev` branch, so no release's checksum covers the script itself. It is tested
+against stand-ins for the download, the program and systemd, and it was run for real on one machine that already had
+Incus and Arca; it has not been run on a machine that never had either. There is no installer for a Mac.
 
 ## Quickstart: a read-only node in five minutes
 

@@ -7,6 +7,7 @@
 # https://github.com/automagik-si/arca/releases/download/, and the file served is the one of that name under
 # $FAKE_DIR/release (`v<version>/<file>`). An address with no such file fails as `curl -f` does on a 404 (22), which
 # is what GitHub's "latest release" address answers while every release is a pre-release.
+# The log holds each call's flags as they were given, so a test can read which ones a download was made with.
 #
 # The installer runs on a PATH of its own listed programs; the stand-in finds its tools on $FAKE_PATH.
 set -u
@@ -20,7 +21,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     -o) out=$2; shift 2 ;;
     --unix-socket) socket=$2; shift 2 ;;
-    --retry | --proto | --max-time) shift 2 ;;
+    --retry | --proto | --max-time | --connect-timeout) shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
