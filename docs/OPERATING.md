@@ -2943,29 +2943,71 @@ audit line, and an SSH spend has none.
 
 ## Continuous integration
 
-The repository's gate runs on GitHub Actions, on Arca's own runner pool (the shipped `github-runner-pool` template),
-not on GitHub's machines.
+The repository's gate runs on GitHub Actions: on Arca's own runner pool (the shipped `github-runner-pool` template;
+see "A pool of GitHub Actions runners") for the events we trust, and on GitHub's hosted runners for a pull request
+from a fork.
 
-**What runs.** `.github/workflows/ci.yml` has four jobs, each on a runner of its own, so they run at the same time:
+**What runs.** `.github/workflows/ci.yml` has four jobs, each on a runner of its own:
 
-| Job | Command |
-|-----|---------|
-| `fmt` | `cargo fmt --all --check` |
-| `clippy` | `cargo clippy --workspace -- -D warnings` |
-| `test` | `cargo test --workspace` |
-| `canvas` | in `packages/arca-canvas-dsh`: `npm ci`, `npx playwright install --with-deps chromium`, `node --test` |
+| Job | Command | Pool class |
+|-----|---------|------------|
+| `fmt` | `cargo fmt --all --check` | `standard` |
+| `clippy` | `cargo clippy --workspace -- -D warnings` | `large` |
+| `test` | `cargo test --workspace` | `large` |
+| `canvas` | in `packages/arca-canvas-dsh`: `npm ci`, `npx playwright install --with-deps chromium`, `node --test` | `standard` |
+
+A fifth, `runners`, comes first and only decides where those four run (below).
 
 The Rust toolchain is the one `rust-toolchain.toml` names (1.97.1, with clippy and rustfmt), installed by rustup
 1.29.3, which `scripts/ci-setup.sh` fetches and checks by SHA-256. Node is 24.11.0, the version the canvas package's
 README develops with. The two actions, `actions/checkout` (v7.0.1) and `actions/setup-node` (v7.1.0), are named by
 commit, with the version in a comment beside it; to move one, change both together. The workflow's token can read the
 repository's contents and nothing else, a job that passes its time limit is stopped, and a newer push to the same
-branch replaces a run that is still going.
+branch or pull request replaces a run that is still going.
 
-**Where.** Every job asks for `runs-on: [self-hosted, linux, x64, arca]`, the labels of the pool's `standard` class:
-2 CPUs and 4GiB for each job. A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs
-what is missing first: the toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's
-virtual machine and not its own ceiling, so the workflow tells cargo and the tests the real number (`CI_SLOT_CPUS`).
+**Which events may use the pool.** The repository is public, a job on the pool runs whatever the commit says, and a
+job can reach the pool's GitHub credential ("Who can reach what"). So the pool's labels are used only by events that
+people with write access to this repository cause:
+
+- a push to `dev`;
+- the merge queue;
+- a person with write access starting the workflow by hand ("Actions", the workflow, "Run workflow");
+- a pull request whose branch is in this repository.
+
+A pull request from a fork runs the same four jobs on GitHub's hosted runners (`ubuntu-latest`), and so does any
+event that is later added to the workflow without being added to that list. The rule is one condition, in the
+`runners` job of `ci.yml`; the other jobs take their runner from its answer and name no label themselves. There is
+no `pull_request_target` trigger, and none may be added.
+
+That condition routes; it does not guard. For a pull request GitHub reads the workflow files of the pull request
+itself, so a fork can change the condition, or add a workflow of its own that asks for the pool's labels. Three things
+outside the workflow files stop that, and all three have to be in place:
+
+1. **Before any pool is registered for this repository**, in the repository's "Settings", "Actions", "General", under
+   "Approval for running fork pull request workflows from contributors", choose "Require approval for all external
+   contributors". With the other two choices, anyone who has had one change merged runs workflows with no approval,
+   and from the moment a runner with the pool's labels exists such a run can land on it. Check the setting again
+   whenever a pool is created or replaced.
+2. Nobody approves a waiting run without reading the pull request. One that adds or changes a file under `.github/`,
+   or that names `self-hosted` or the pool's labels, is not approved.
+3. The pool that serves this repository serves nothing else, and no client's jobs run on it. Its `settings.url` is
+   this repository, or, registered for the organisation, its runner group admits this repository alone. Such a group
+   has to admit public repositories, so the pool's status line carries its `WARNING` about them for as long as it
+   runs; for this pool that warning is expected, and this list is the answer to it.
+
+What is left if all of that fails is what the pool gives every job: one job per runner, in a virtual machine that is
+the wall between the job and the machine Arca runs on.
+
+**On the pool.** `fmt` and `canvas` ask for `[self-hosted, linux, x64, arca]`, the `standard` class (2 CPUs, 4GiB);
+`clippy` and `test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class (8 CPUs, 8GiB). The shipped
+template has one `large` slot, so with it `clippy` and `test` take turns; a pool for this repository wants two.
+
+A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs what is missing first: the
+toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's virtual machine and not its
+slot's ceiling, so the script tells cargo and the tests how many CPUs the job has. It reads the number from the job's
+own control group when the runner puts a limit there. Today's pool does not (the limit is on the slot's group, which
+the job cannot read) and gives the job no variable with it, so on the pool the script uses the class's number from
+the workflow (`CI_SLOT_CPUS`). On a hosted runner it tells them nothing.
 
 rustup, the cargo registry, the target directory, npm's cache and the test browser are kept in the pool's
 `POOL_CACHE_DIR`, and Node in the runner's tool cache, so the next job in the same slot does not start from nothing.
@@ -2973,34 +3015,9 @@ Each slot has its own, and the pool empties one that passes the slot's share of 
 prints what the cache holds; if the target directory alone comes close to that share, give the pool that serves
 this repository a larger `dependencyCache`.
 
-**When.** On a push to `dev`, and when a person with write access starts it by hand ("Actions", the workflow, "Run
-workflow"). Nothing else starts it.
-
-**Why a fork's pull request does not start it.** The repository is public, and a job on a self-hosted runner runs
-whatever the commit says. GitHub's own advice is not to use self-hosted runners with public repositories at all, for
-that reason. So neither workflow has a `pull_request` or a `pull_request_target` trigger, and none may be added: a
-change from a fork reaches our runners only after someone with write access has merged it into `dev`.
-
-That is half of the rule. For a pull request GitHub reads the workflow files of the pull request itself, so a fork
-can add a workflow of its own that asks for the pool's labels. Three things outside the workflow files stop it, and
-all three have to stay in place:
-
-1. In the repository's "Settings", "Actions", "General", under "Approval for running fork pull request workflows
-   from contributors", choose "Require approval for all external contributors". With the other two choices, anyone
-   who has had one change merged runs workflows with no approval.
-2. Nobody approves a waiting run without reading the pull request. One that adds or changes a file under `.github/`,
-   or that names `self-hosted` or the pool's labels, is not approved.
-3. The pool that serves this repository serves nothing else, and no client's jobs run on it. A job can reach the
-   pool's GitHub credential (see "A pool of GitHub Actions runners"), so whoever gets a job onto this pool gets
-   whatever that credential may do. Its `settings.url` is this repository, or, registered for the organisation, its
-   runner group allows this repository alone. Such a group must also be told to allow public repositories, which a
-   runner group does not do by default.
-
-What is left if all of that fails is what the pool gives every job: one job per runner, in a virtual machine that is
-the wall between the job and the machine Arca runs on.
-
 **Comparing with GitHub's runners.** `.github/workflows/bench.yml` is started by hand only. It runs the `test` job
 twice on one commit, on `ubuntu-latest` and on the pool, and writes for each, in the run's summary: the CPU model,
 the CPUs and memory the job sees, and the seconds the toolchain, the build and the tests took. `pool_label` chooses
-the class (`arca` or `arca-large`). With `pool_cache` off, both build from nothing, which compares the machines;
-with it on, the pool uses its kept cache as `ci.yml` does, which shows what an everyday run costs.
+the class (`arca-large`, which `test` uses, or `arca`). With `pool_cache` off, both build from nothing, which
+compares the machines; with it on, the pool uses its kept cache as `ci.yml` does, which shows what an everyday run
+costs.

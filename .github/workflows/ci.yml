@@ -1,25 +1,28 @@
-# The repository's gate, on our own runner pool (templates/github-runner-pool; docs/OPERATING.md, "Continuous
-# integration").
+# The repository's gate. It runs on our own runner pool (templates/github-runner-pool) for the events we trust, and
+# on GitHub's hosted runners for a pull request from a fork. docs/OPERATING.md, "Continuous integration".
 #
-# SAFETY. This repository is public and these jobs run on self-hosted runners, so this workflow starts in two ways
-# only: a push to `dev`, and a person with write access starting it by hand. There is no `pull_request` and no
-# `pull_request_target` trigger, and none may be added: a pull request from a fork must never run on our runners.
+# SAFETY. This repository is public, and a job on our pool runs whatever the commit says and can reach the pool's
+# GitHub credential. So the pool's labels are used only by events that people with write access to this repository
+# cause. The one condition that decides it is in the `runners` job below; every other job takes its runner from there.
+# No job names a pool label itself, and there is no `pull_request_target` trigger and none may be added.
 #
-# The triggers here are half of that rule. For a pull request GitHub reads the workflow files of the pull request
-# itself, so a fork can bring a workflow of its own that asks for our labels. What stops that one is set on GitHub and
-# not in this file: the repository's Actions setting "Require approval for all external contributors", nobody
-# approving a run they have not read, and a pool registered for this repository alone. docs/OPERATING.md says how.
+# That condition routes; it does not guard. For a pull request GitHub reads the workflow files of the pull request
+# itself, so a fork can change this file or bring a workflow of its own that asks for our labels. What stops that is
+# set on GitHub and not here: "Require approval for all external contributors" in the Actions settings, set before
+# any pool is registered, and nobody approving a run they have not read. docs/OPERATING.md says how.
 name: ci
 
 on:
   push:
     branches: [dev]
+  pull_request:
+  merge_group:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push to the same ref replaces the run that is still going.
+# A newer push to the same branch or pull request replaces the run that is still going.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -30,15 +33,56 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
-  # The pool's `standard` class gives a job 2 CPUs and 4GiB (templates/github-runner-pool.json). The job still sees
-  # every CPU of the pool's virtual machine, so scripts/ci-setup.sh tells cargo and the tests the real number.
-  CI_SLOT_CPUS: 2
 
 jobs:
+  # Decides where the other jobs run. It runs on a hosted runner itself, because it runs for every event.
+  runners:
+    name: choose the runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      standard: ${{ steps.choose.outputs.standard }}
+      large: ${{ steps.choose.outputs.large }}
+    steps:
+      - name: Our pool for the events we trust, GitHub's runners for everything else
+        id: choose
+        env:
+          # THE RULE. Our pool runs a job only for:
+          #   - a push to `dev`;
+          #   - the merge queue;
+          #   - a person with write access starting the workflow by hand;
+          #   - a pull request whose branch is in this repository, which only people with write access can push.
+          # Anything else gets GitHub's hosted runners: a pull request from a fork, and any event added to `on:`
+          # later that is not named here.
+          TRUSTED: >-
+            ${{
+            (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
+            github.event_name == 'merge_group' ||
+            github.event_name == 'workflow_dispatch' ||
+            (github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository)
+            }}
+        run: |
+          if [ "$TRUSTED" = true ]; then
+            # The labels of the pool's two classes, as templates/github-runner-pool.json ships them.
+            standard='["self-hosted", "linux", "x64", "arca"]'
+            large='["self-hosted", "linux", "x64", "arca-large"]'
+          else
+            standard='["ubuntu-latest"]'
+            large='["ubuntu-latest"]'
+          fi
+          echo "standard=$standard" >>"$GITHUB_OUTPUT"
+          echo "large=$large" >>"$GITHUB_OUTPUT"
+          echo "trusted event: $TRUSTED; small jobs on $standard, builds on $large"
+
   fmt:
     name: cargo fmt
-    runs-on: [self-hosted, linux, x64, arca]
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
     timeout-minutes: 15
+    env:
+      # The `standard` class: 2 CPUs, 4GiB. scripts/ci-setup.sh uses the number on the pool only.
+      CI_SLOT_CPUS: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,8 +94,12 @@ jobs:
 
   clippy:
     name: cargo clippy
-    runs-on: [self-hosted, linux, x64, arca]
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
     timeout-minutes: 60
+    env:
+      # The `large` class: 8 CPUs, 8GiB.
+      CI_SLOT_CPUS: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,8 +111,11 @@ jobs:
 
   test:
     name: cargo test
-    runs-on: [self-hosted, linux, x64, arca]
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
     timeout-minutes: 90
+    env:
+      CI_SLOT_CPUS: 8
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,7 +127,8 @@ jobs:
 
   canvas:
     name: canvas node --test
-    runs-on: [self-hosted, linux, x64, arca]
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
     timeout-minutes: 30
     defaults:
       run:
@@ -86,7 +138,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The Node the package's README develops with. It lands in the runner's tool cache, which the pool keeps.
+      # The Node the package's README develops with. On the pool it lands in the runner's tool cache, which is kept.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.11.0

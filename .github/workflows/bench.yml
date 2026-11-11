@@ -2,8 +2,8 @@
 # prints its machine (CPU model, CPU count, memory) and how long the toolchain, the build and the tests took, so the two
 # can be read side by side in the run's summary.
 #
-# SAFETY. Started by hand only, by a person with write access. One leg runs on self-hosted runners, so the rule of
-# ci.yml holds here too: no `pull_request` and no `pull_request_target` trigger, ever.
+# SAFETY. Started by hand only, by a person with write access, which is one of the events ci.yml trusts with our pool.
+# One leg always asks for the pool's labels, so this workflow gets no other trigger, ever.
 name: bench
 
 on:
@@ -12,8 +12,8 @@ on:
       pool_label:
         description: The pool class to measure (templates/github-runner-pool.json)
         type: choice
-        options: [arca, arca-large]
-        default: arca
+        options: [arca-large, arca]
+        default: arca-large
       pool_cache:
         description: Let the pool leg use its kept cache, as ci.yml does. Off, both legs build from nothing.
         type: boolean
@@ -42,7 +42,7 @@ jobs:
         include:
           - name: ubuntu-latest
             runs-on: '["ubuntu-latest"]'
-            # A hosted runner shows the CPUs it has, so cargo is told nothing.
+            # A hosted runner shows the CPUs it has, so cargo and the tests are told nothing.
             cpus: ''
           - name: the pool (${{ inputs.pool_label }})
             runs-on: '["self-hosted", "linux", "x64", "${{ inputs.pool_label }}"]'
@@ -60,8 +60,7 @@ jobs:
 
       - name: Machine
         run: |
-          keep='Architecture|CPU\(s\)|Model name|Thread\(s\) per core|Core\(s\) per socket|Socket\(s\)|Hypervisor vendor'
-          lscpu | grep -E "^($keep):" || true
+          lscpu | grep -E '^(CPU\(s\)|Model name|Core\(s\) per socket|Socket\(s\)|Hypervisor vendor):' || true
           echo "nproc: $(nproc)"
           grep -E '^(MemTotal|MemAvailable)' /proc/meminfo
           # The limits of the job's own control group, where the runner lets the job read them.
@@ -108,7 +107,7 @@ jobs:
             echo "| Commit | \`$COMMIT\` |"
             echo "| CPU model | ${CPU_MODEL:-not read} |"
             echo "| CPUs the job sees | ${CPU_COUNT:-not read} |"
-            echo "| CPUs cargo and the tests were told | ${CI_SLOT_CPUS:-all it sees} |"
+            echo "| CPUs cargo and the tests were told | ${CARGO_BUILD_JOBS:-all it sees} |"
             echo "| Memory the job sees | ${MEM_MIB:-not read} MiB |"
             echo "| Cache at the start | ${CI_CACHE_STATE:-not read} |"
             echo "| Toolchain and packages | $(seconds "${SETUP_SECONDS:-}") |"

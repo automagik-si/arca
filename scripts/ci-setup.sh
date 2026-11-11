@@ -22,9 +22,14 @@
 # Environment:
 #   POOL_CACHE_DIR   set by the pool; see above
 #   CI_CACHE         `off` builds from nothing even where POOL_CACHE_DIR is set
-#   CI_SLOT_CPUS     the CPUs the job really has. A pool slot has a CPU ceiling but shows the whole virtual machine's
-#                    CPUs, so cargo and the test harness would start one process or thread for each of those. When
-#                    this is set, both are told this number instead.
+#   CI_SLOT_CPUS     the CPU ceiling of the pool class the job asked for (`cpu` in the pool's template)
+#
+# CPUs. A pool slot has a CPU ceiling but shows every CPU of the pool's virtual machine, so cargo and the test harness
+# would start one process or thread for each of those inside the slot's memory limit. The script therefore tells both
+# how many CPUs the job has. It takes the number from the runner when the runner says it: the CPU limit of the job's
+# own control group. Today's pool puts the limit on the slot's group, above the job's, where the job cannot read it,
+# and gives the job no variable with it either; so on the pool (POOL_CACHE_DIR is set) CI_SLOT_CPUS is used instead.
+# On any other runner cargo and the tests are told nothing and use the CPUs they see.
 set -euo pipefail
 
 # To move the pin, change the version and the SHA-256 together. The SHA-256 is the one the Rust project publishes
@@ -62,6 +67,30 @@ else
 fi
 mkdir -p "$cache"
 
+# The CPU limit of this job's own control group, rounded up to whole CPUs. Fails when there is none to read.
+group_cpus() {
+  local quota period
+  read -r quota period 2>/dev/null </sys/fs/cgroup/cpu.max || return 1
+  case $quota in '' | *[!0-9]*) return 1 ;; esac
+  case $period in '' | 0 | *[!0-9]*) return 1 ;; esac
+  echo $(((quota + period - 1) / period))
+}
+
+# Prints the CPUs to tell cargo and the tests, or nothing when they should use what they see.
+job_cpus() {
+  local cpus
+  if cpus=$(group_cpus); then
+    say "the runner limits this job to $cpus CPUs (its control group)" >&2
+  elif [ -n "${POOL_CACHE_DIR:-}" ] && [ -n "${CI_SLOT_CPUS:-}" ]; then
+    cpus=$CI_SLOT_CPUS
+    say "the pool does not tell the job its CPUs; using the class's $cpus (CI_SLOT_CPUS)" >&2
+  else
+    return 0
+  fi
+  [ "$cpus" -ge 1 ] && [ "$cpus" -lt "$(nproc)" ] && echo "$cpus"
+  return 0
+}
+
 # Installs the packages of the programs that are missing. Arguments: program, then its package or packages.
 wanted=()
 need() {
@@ -97,6 +126,8 @@ toolchain() {
 setup_rust() {
   export RUSTUP_HOME=$cache/rustup CARGO_HOME=$cache/cargo
   export PATH=$CARGO_HOME/bin:$PATH
+  local cpus
+  cpus=$(job_cpus)
   if [ -d "$cache/target" ]; then state=warm; else state=cold; fi
   if [ "$(rustup --version 2>/dev/null | awk 'NR == 1 { print $2 }')" != "$RUSTUP_VERSION" ] ||
     [ "$(type -P rustup)" != "$CARGO_HOME/bin/rustup" ]; then
@@ -116,13 +147,14 @@ setup_rust() {
     # A checkout is new every time, so incremental data is never reused; without it the target is about half the size.
     echo "CARGO_INCREMENTAL=0"
     echo "CI_CACHE_STATE=$state"
-    if [ -n "${CI_SLOT_CPUS:-}" ]; then
-      echo "CARGO_BUILD_JOBS=$CI_SLOT_CPUS"
-      echo "RUST_TEST_THREADS=$CI_SLOT_CPUS"
+    if [ -n "$cpus" ]; then
+      echo "CARGO_BUILD_JOBS=$cpus"
+      echo "RUST_TEST_THREADS=$cpus"
     fi
   } >>"$GITHUB_ENV"
   echo "$CARGO_HOME/bin" >>"$GITHUB_PATH"
   say "$(rustc --version), $(cargo --version), rustup $RUSTUP_VERSION; the cache was $state"
+  say "cargo and the tests use ${cpus:-every CPU they see ($(nproc))}${cpus:+ of the $(nproc) CPUs the job sees}"
 }
 
 case $mode in
