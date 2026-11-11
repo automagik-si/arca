@@ -100,6 +100,19 @@ fn mcp(socket: &Path, token: &str, name: &str, arguments: Value) -> Value {
 /// Starts a server with the routes `build` adds to a viewer-token server, on a unix socket in `scratch`. The server runs on its own
 /// thread and a current-thread runtime, so only a handler that blocks that runtime can stall another request. Returns the socket and
 /// the viewer's token.
+/// The tokens every server of this suite also holds, each with a tool list: one that names the metrics verb alone, one
+/// that names the alerts verb alone, and a doctor's that names neither.
+const LISTED: [(&str, Scope, &[&str]); 3] = [
+    ("metrics-only", Scope::Viewer, &["node_metrics"]),
+    ("alerts-only", Scope::Viewer, &["alerts_list"]),
+    ("neither", Scope::Doctor, &["plan_list", "action_propose"]),
+];
+
+/// The secret of the listed token `id` of the server started in `scratch`.
+fn listed(scratch: &Scratch, id: &str) -> String {
+    fs::read_to_string(scratch.path(&format!("{id}.secret"))).expect("the secret")
+}
+
 fn start(scratch: &Scratch, build: impl FnOnce(Server) -> Server) -> (PathBuf, String) {
     let tokens = scratch.path("tokens");
     fs::create_dir(&tokens).expect("the token directory is created");
@@ -108,6 +121,15 @@ fn start(scratch: &Scratch, build: impl FnOnce(Server) -> Server) -> (PathBuf, S
     let hash = tokens.join("viewer.hash");
     fs::write(&hash, text).expect("write the hash file");
     fs::set_permissions(&hash, fs::Permissions::from_mode(0o400)).expect("mode 0400");
+    // Three more tokens, each with a tool list: their secrets are kept beside the token directory for `listed`.
+    for (id, scope, tools) in LISTED {
+        let tools: Vec<String> = tools.iter().map(|tool| tool.to_string()).collect();
+        let (secret, text) = arca_mcp::mint_with_tools(scope, Some(&tools));
+        let hash = tokens.join(format!("{id}.hash"));
+        fs::write(&hash, text).expect("write the hash file");
+        fs::set_permissions(&hash, fs::Permissions::from_mode(0o400)).expect("mode 0400");
+        fs::write(scratch.path(&format!("{id}.secret")), secret).expect("keep the secret");
+    }
     let server = build(Server::new(
         verbs(),
         TokenStore::load(&tokens).expect("the tokens load"),
@@ -363,6 +385,7 @@ fn scenario_server(scratch: &Scratch) -> (PathBuf, String) {
             )
             .get_route(
                 "/alerts",
+                "alerts_list",
                 Arc::new(AlertsExport {
                     node: NODE.to_string(),
                     store: reader,
@@ -370,6 +393,7 @@ fn scenario_server(scratch: &Scratch) -> (PathBuf, String) {
             )
             .get_route(
                 "/metrics",
+                "node_metrics",
                 Arc::new(MetricsExport {
                     node: NODE.to_string(),
                     alerts: alerts.clone(),
@@ -451,6 +475,53 @@ fn metrics_and_alerts_refuse_no_token_an_unknown_token_and_an_origin() {
     }
     let no_token_origin = "Origin: https://192.0.2.1\r\n";
     assert_eq!(send(&socket, "GET", "/metrics", no_token_origin, "").0, 403);
+}
+
+/// A GET route is its verb's reading: a token whose tool list leaves the verb out is refused the route, as it is
+/// refused the verb, whatever its scope. A token with no list is admitted to both, as before.
+#[test]
+fn metrics_and_alerts_are_held_to_the_tokens_tool_list() {
+    let scratch = Scratch::new("tool-list");
+    let (socket, viewer) = scenario_server(&scratch);
+    let get = |path: &str, token: &str| send(&socket, "GET", path, &auth(token), "").0;
+    for path in ["/metrics", "/alerts"] {
+        assert_eq!(get(path, &viewer), 200, "{path} for a token with no list");
+        assert_eq!(
+            get(path, &listed(&scratch, "neither")),
+            403,
+            "{path} for a doctor token whose list names neither verb"
+        );
+    }
+    assert_eq!(get("/metrics", &listed(&scratch, "metrics-only")), 200);
+    assert_eq!(get("/alerts", &listed(&scratch, "metrics-only")), 403);
+    assert_eq!(get("/alerts", &listed(&scratch, "alerts-only")), 200);
+    assert_eq!(get("/metrics", &listed(&scratch, "alerts-only")), 403);
+    // The refusal says nothing: no body, and the same answer for a query the route would otherwise read.
+    let (status, _, body) = send(
+        &socket,
+        "GET",
+        "/alerts?after=0",
+        &auth(&listed(&scratch, "neither")),
+        "",
+    );
+    assert_eq!(status, 403);
+    assert!(body.is_empty(), "{body}");
+    // The verbs themselves answer the same way over /mcp.
+    for (token, verb, admitted) in [
+        ("metrics-only", "node_metrics", true),
+        ("metrics-only", "alerts_list", false),
+        ("neither", "node_metrics", false),
+    ] {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": verb, "arguments": {} } })
+        .to_string();
+        let headers = format!(
+            "{}Content-Type: application/json\r\n",
+            auth(&listed(&scratch, token))
+        );
+        let status = send(&socket, "POST", "/mcp", &headers, &body).0;
+        assert_eq!(status == 403, !admitted, "{token} {verb}: {status}");
+    }
 }
 
 #[test]
@@ -580,6 +651,7 @@ fn a_page_holds_at_most_500_events_and_the_next_page_takes_the_rest() {
     let (socket, viewer) = start(&scratch, |server| {
         server.get_route(
             "/alerts",
+            "alerts_list",
             Arc::new(AlertsExport {
                 node: NODE.to_string(),
                 store: reader(&state),
@@ -655,13 +727,16 @@ fn a_held_get_route_does_not_stop_another_request() {
         release: Mutex::new(release_rx),
     };
     let (socket, viewer) = start(&scratch, |server| {
-        server.get_route("/held", Arc::new(held)).get_route(
-            "/metrics",
-            Arc::new(MetricsExport {
-                node: NODE.to_string(),
-                alerts: AlertsPublished::default(),
-            }),
-        )
+        server
+            .get_route("/held", "node_metrics", Arc::new(held))
+            .get_route(
+                "/metrics",
+                "node_metrics",
+                Arc::new(MetricsExport {
+                    node: NODE.to_string(),
+                    alerts: AlertsPublished::default(),
+                }),
+            )
     });
     let held_socket = socket.clone();
     let held_token = viewer.clone();

@@ -30,6 +30,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   `listen.services`. `serve` refuses to start while a service has the access through a socket the config no longer
   serves. `service_list` and `service_status` show it. See "A service that may talk to the kernel" in
   `docs/OPERATING.md` and Rule 69 in `docs/OWNERSHIP.md`.
+- `GET /metrics` and `GET /alerts` are held to a token's tool list, as the verbs they read are: a token minted with
+  `--tools` needs `node_metrics` for `/metrics` and `alerts_list` for `/alerts`, or the route answers 403. A token
+  with no tool list reads both, as before. **If a scraper's token has a tool list, add the verb to it.**
+- `serve` binds the services socket only where every directory above it, too, belongs to the server's user or to root
+  and cannot be written to by anyone else (a sticky directory such as `/tmp` may be above it).
 
 ## 0.1.0-alpha.7
 

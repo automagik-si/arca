@@ -149,12 +149,18 @@ approval page is never on it, on any node and whatever the config becomes: a req
 is 404, and a request that carries an `Origin` is 403. A node may serve its approval page and have this socket too; the
 two sockets are separate, and one path cannot be both.
 
-Incus connects to this socket, as root, for a service with kernel access (see "A service that may talk to the kernel").
-Root is served for that reason alone, and root can already do everything on the host. No other local user reaches the
-socket, and it has no port: nothing on the host can take a port in its place while the server is down. The directory
-that holds it must belong to the server's user or to root and be writable by its owner alone; `serve` refuses to bind
-it anywhere else, since another user could put a socket of its own at the path and be sent a service's token. The
-socket has its own limit of 64 connections, apart from every other listener's. A clean stop removes it.
+Incus connects to this socket for a service with kernel access (see "A service that may talk to the kernel"), and
+Incus's proxy helper runs as uid 0: that is why uid 0 is served. Serving uid 0 means every process of the host that runs
+as uid 0, and Incus's proxy helper acting for any instance whose device names this path. Arca gives such a device to a
+service of the node's own project alone, a tenant's project blocks proxy devices, and whoever can add one by hand
+already administers Incus. None of them gets anything from the socket without a token. No other local user reaches the
+socket, and it has no port: nothing on the host can take a port in its place while the server is down.
+
+The directory that holds the socket must belong to the server's user or to root and be writable by its owner alone, and
+so must every directory above it, except that a directory above it may be sticky instead, as `/tmp` is. `serve` refuses
+to bind the socket anywhere else, naming the directory: a user who could write there, or rename a directory on the way,
+could put a socket of their own at the path and be sent a service's token. The socket has its own limit of 64
+connections, apart from every other listener's. A clean stop removes it.
 
 ## The link
 
@@ -408,9 +414,9 @@ Incus listens inside the instance, on its loopback, and connects from the host t
 (`listen.services`). Inside the instance the kernel is `http://127.0.0.1:7461/mcp`: plain HTTP that never leaves the
 instance's loopback, so a client that allows plain HTTP on loopback alone works unchanged. Nothing crosses the bridge.
 
-The device carries bytes and no authority. Every process in the instance reaches the listener, and each one gets what the
+The device carries bytes and no authority. Every process in the instance reaches the socket, and each one gets what the
 token it sends allows: a call without a token is 401, and a token is held to its scope and its tool list
-(`arca token mint --tools`). Give the service a token whose tool list names the verbs it needs, as a service secret.
+(`arca token mint --tools`) on `POST /mcp` and on the GET routes alike. Give the service a token whose tool list names the verbs it needs, as a service secret.
 
 A create of such a template is refused, before anything is written, unless all of these hold:
 
@@ -447,7 +453,17 @@ the config has become, so a device is never left connected to a listener that co
 The device is the instance's own. It stays through a restart of the instance and of `serve` (tested against the fake
 Incus), and it is deleted with the instance by `service_remove`. That it is there again after a restart of the host is
 Incus's to keep, in its own database, and is not yet checked on a live node. A record that is lost and made again from
-the instance's marks reads the device back, so `service_list` still says the service has the access.
+the instance's marks reads the device back when it connects to this node's own `listen.services`, so `service_list`
+still says the service has the access.
+
+A `kernel` device somebody made by hand, with `incus config device add`, is not an access Arca gave. One that names
+another path is never read into a record: `service_list` shows no `kernelAccess` for it, `serve` starts as it would
+without it, and nothing of Arca listens at that path. One that names this node's own services socket, on an instance
+whose record was lost and made again from its marks, is read back as above, and `serve` then refuses to start without
+that socket, as for any service with the access. Arca does not remove such a service (it writes nothing to a record
+made this way), so the way out is the device: start `serve` with `listen.services` at the path the refusal names, take
+the device off (`incus config device remove <instance> kernel --project arcak-svc`), and call `service_list` once. The
+record follows the device at every service call, so it no longer names the access, and the config may then change.
 
 The effect journal records the create of the instance, and the digest it keeps (`op_digest`) is the digest of the create
 that carries the device; `journal_list` shows the effect, not the body. The service's record in the desired state names
@@ -460,17 +476,18 @@ What a process in the instance can and cannot do through the device:
 - It can hold connections open. The socket's own limit of 64 is then spent, which stops other services with kernel
   access from calling the kernel; the unix socket, the tailnet listener and the proxy listener are not affected.
 
-Not yet checked on a live Incus, and the first things to check there:
+Checked on a live node (Incus 7.6, SELinux enforcing): a container with a proxy device of this shape (`bind=instance`,
+`listen=tcp:127.0.0.1:<port>`, `connect=unix:<path>`, the path a socket of mode 0600 under the server user's runtime
+directory) reached the socket on the host, and the host saw the peer as uid 0, which the services socket serves.
 
-- that a proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` is accepted on a
-  container in the restricted service project and listens on the container's loopback;
-- that Incus connects to the socket as root, which is the one peer beside the server's own user the socket serves, and
-  that the confinement of Incus's proxy helper lets it reach a socket under the server's runtime directory.
+Not yet checked on a live Incus: the same device on a container of the restricted service project as Arca itself
+creates it, on an application (OCI) container, on a host confined by AppArmor in place of SELinux, and after a restart
+of the host.
 
-To check it on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus config
-device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode 0600,
-owned by the server's user; and the service's own log shows its first call to the kernel answered. If the service's
-calls are closed with no answer while `ready` is true, Incus is not connecting as root.
+To check a service on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus
+config device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode
+0600, owned by the server's user; and the service's own log shows its first call to the kernel answered. If the
+service's calls are closed with no answer while `ready` is true, Incus is not connecting as uid 0.
 
 `service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
 approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends
@@ -2132,7 +2149,9 @@ The four health components feed `service-down`. Each one is checked on every tic
 
 `GET /metrics` and `GET /alerts` are served on every listener of `serve`, and each needs a bearer token of any stored scope,
 the same token as the MCP calls. Without a valid bearer the answer is 401. A request with an `Origin` header is 403, and any
-other path is 404. Pass the token in the `Authorization` header:
+other path is 404. Each route is the reading of one verb, and a token is admitted to the route as it is to the verb:
+`/metrics` is `node_metrics` and `/alerts` is `alerts_list`. A token minted with `--tools` therefore needs that verb in
+its list, or the route answers 403 with no body; a token with no list reads both, as before. Pass the token in the `Authorization` header:
 
 ```sh
 curl --unix-socket /run/arca/arca.sock -H "Authorization: Bearer $(cat <token file>)" http://arca/metrics

@@ -321,12 +321,17 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .get_route(
             "/alerts",
+            "alerts_list",
             Arc::new(AlertsExport {
                 node: node.clone(),
                 store: reader,
             }),
         )
-        .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
+        .get_route(
+            "/metrics",
+            "node_metrics",
+            Arc::new(MetricsExport { node, alerts }),
+        );
     // A watch-only node has no device writer. A kernel-mode node writes GPU devices only in its own project family, and
     // only reads local telemetry for the VM-in-use check when the metrics source is a settled local daemon.
     let gpu: Option<Arc<dyn crate::gpu::GpuBackend>> = if kernel_mode {
