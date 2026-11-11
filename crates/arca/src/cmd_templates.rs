@@ -1,5 +1,5 @@
 //! `templates install --config <file> [--replace]`: puts the shipped service templates in `<stateDir>/templates`, each
-//! template's JSON together with the script its entrypoint reads. The files are the repository's `templates/` as this build
+//! template's JSON together with the script its entrypoint or its first boot reads. The files are the repository's `templates/` as this build
 //! holds them, so no checkout is needed and a template never arrives without its script.
 //!
 //! A file that is missing is written. A file that is already the shipped one is left. A file that differs is kept, since it
@@ -20,12 +20,14 @@ macro_rules! shipped {
     };
 }
 
-/// Every file a shipped template needs on a node: each template's JSON and the script its entrypoint names. The image build
+/// Every file a shipped template needs on a node: each template's JSON and the script its entrypoint or first boot names. The image build
 /// inputs (`automagik.build.sh`, `automagik-dsh/`) are used from a checkout and are not installed.
 pub const SHIPPED: &[(&str, &str)] = shipped![
     "automagik-server.json",
     "automagik.json",
     "cloudflare-tunnel.json",
+    "github-runner-pool.json",
+    "github-runner-pool.sh",
     "nats.json",
     "omni-api.json",
     "postgres-autopg.json",

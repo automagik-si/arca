@@ -1755,7 +1755,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_seven_templates_and_nothing_else_load_and_are_pinned() {
+fn the_eight_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -1771,6 +1771,7 @@ fn the_seven_templates_and_nothing_else_load_and_are_pinned() {
             "automagik",
             "automagik-server",
             "cloudflare-tunnel",
+            "github-runner-pool",
             "nats",
             "omni-api",
             "postgres-autopg",
@@ -2950,9 +2951,11 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         );
         let loaded = service::load_template(&dir, template).expect("the installed template loads");
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
+        service::first_boot(&loaded, &dir).expect("its first-boot script is installed with it");
     }
-    assert_eq!(templates, 7);
+    assert_eq!(templates, 8);
     assert!(installed.contains(&"postgres-autopg.sh"));
+    assert!(installed.contains(&"github-runner-pool.sh"));
     assert_eq!(
         fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
         0o700

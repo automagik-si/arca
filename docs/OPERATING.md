@@ -11,7 +11,7 @@ the recording shim, and serves the Arca MCP. Every command that needs the node r
 | `arca watch --once --json --config <file>` | every instance in every project, through Incus GET | the `watch_report` result |
 | `arca metrics --json [--sample-for <s>] --config <file>` | the host and the configured pools | the `node_metrics` result |
 | `arca store check --config <file>` | nothing from the node: it opens a scratch store in the state directory and removes it | the SQLite version and the pragmas the store reads back, as JSON; see "The store" |
-| `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
+| `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
@@ -262,13 +262,13 @@ needs is available. `service_list` and `service_status` derive state from Incus 
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
 listener. `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The seven shipped templates live in `templates/`, with their pinned
-images and vendored npm lockfile. One of them, `workspace-vm`, is a virtual machine (see
-"Bridged nodes and virtual machines" and "Mixed nodes").
+secrets redacted and a capped, truncated result. The eight shipped templates live in `templates/`, with their pinned
+images and vendored npm lockfile. Two of them, `workspace-vm` and `github-runner-pool`, are virtual machines (see
+"Bridged nodes and virtual machines", "Mixed nodes" and "A pool of GitHub Actions runners").
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
-script its entrypoint reads (`postgres-autopg.sh` for `postgres-autopg`), from the build itself, so no checkout is
-needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
+script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for
+`github-runner-pool`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
 `service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
@@ -2455,6 +2455,154 @@ What to know:
 - **The image.** The template pins `docker.io/cloudflare/cloudflared` release 2026.10.7 by digest, so it never updates
   by itself. A later Arca release moves the pin.
 
+## A pool of GitHub Actions runners
+
+The shipped `github-runner-pool` template is one virtual machine that runs your GitHub Actions jobs on your own
+hardware. Inside it a small controller keeps a set of slots. Each slot registers one runner with GitHub, runs exactly
+one job on it in a fresh container, removes it, and starts over with a new runner. The virtual machine is the wall
+between your jobs and the machine Arca runs on: nothing outside the pool changes when a job runs.
+
+You need a node that may create a virtual machine of the template's size (16 CPUs, 32GiB of memory, a 200GiB disk: the
+node's `kernel.vmLimits`, or `kernel.bridged.limits`, must allow it), the shipped templates installed
+(`arca templates install`), and a GitHub organisation, or one repository, that you administer. The Arca steps are
+Arca's own verbs: ask the assistant you use with Arca to run them. `service_create` and `instance_start` can be shown
+on the approval page; `service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope
+token, and the credential passes through that assistant's conversation.
+
+**1. The template for your organisation.** The settings are part of the template, so each pool has its own copy.
+Whoever looks after the node copies `<stateDir>/templates/github-runner-pool.json` to a new name, for example
+`example-ci.json`, sets `"name"` to `example-ci`, and sets `settings.url` to your organisation
+(`https://github.com/example-org`) or to one repository (`https://github.com/example-org/example-repo`). This is the
+one step that is a file and not a verb: Arca has no verb that edits a template. The script `github-runner-pool.sh`
+stays as it is, beside it.
+
+| Setting | Meaning |
+|---------|---------|
+| `url` | The organisation or the repository the runners belong to. |
+| `runnerGroupId` | The runner group the runners join. `1` is GitHub's default group. |
+| `classes` | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). |
+| `maxSlots` | The cap: never more than this many slots at once, whatever the classes add up to. |
+| `reserveMemory` | Memory kept back for the virtual machine itself. The slots share what is left. |
+| `dockerCache`, `dependencyCache` | The disk the Docker layer caches and the dependency caches may use, over all slots. |
+| `runnerImage`, `dockerImage` | The runner's and the Docker daemon's public images, pinned by digest. |
+
+The virtual machine's own size is the template's `limits` and `rootSize`. The shipped numbers fit together: four
+`standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are 16 CPUs and 24GiB, and 4GiB is kept
+back. That is 28GiB of the machine's 32GiB on purpose: a virtual machine sees a little less memory than its size, and
+a slot that does not fit whole is never started. Settings are
+read when the pool is created and are fixed from then on (see "What to know").
+
+**2. A credential, on GitHub.** A GitHub App is the better one: its key does not expire, and it can do nothing but
+manage runners.
+
+- Select your profile picture, then "Your organizations", then "Settings" beside the organisation, then "Developer
+  settings", "GitHub Apps" and "New GitHub App". Give it a name (for example `example-runner-pool`) and any homepage
+  URL. Under "Webhook", deselect "Active". Under "Permissions", open "Organization permissions" and set "Self-hosted
+  runners" to "Read and write" (for a pool that serves one repository: "Repository permissions", "Administration",
+  "Read and write"). Create the app.
+- On the app's page, copy its "Client ID" (it begins `Iv`). In the private keys part of the page, create a key
+  (GitHub's guide calls the button "New key"). A file in PEM form is downloaded: that is the private key. Treat it
+  like a password.
+- Select "Install App" and install it on the organisation (or on the one repository).
+
+Or a fine-grained personal access token: your own "Settings", "Developer settings", "Personal access tokens",
+"Fine-grained tokens", "Generate new token"; resource owner the organisation; organisation permission "Self-hosted
+runners", "Read and write" (for one repository: repository permission "Administration", "Read and write"). A token
+expires on the date GitHub shows, and the pool stops registering runners that day.
+
+**3. Arca: `service_create`** with `{"name": "ci-pool", "template": "example-ci"}`. The pool is created and stays
+`stopped`, because it has no credential yet.
+
+**4. Arca: `service_secret_set`**, for the App twice:
+`{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
+`{"name": "ci-pool", "key": "GITHUB_APP_PRIVATE_KEY", "value": "<the whole content of the key file>"}`. The key keeps
+its line breaks; a key pasted on one line works too. For a token, once:
+`{"name": "ci-pool", "key": "GITHUB_TOKEN", "value": "<the token>"}`. Arca answers `{"ok": true}` and no answer, list
+or log shows a value again.
+
+**5. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
+the answer names the secrets written into it. Its first boot installs Docker and downloads the two images, which
+takes a few minutes.
+
+**6. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below). On GitHub, the
+organisation's "Settings", "Actions", "Runners" lists runners named `ci-pool-standard-0-...` as idle.
+
+**7. Use it.** A job runs on the pool when its `runs-on` asks for labels that one class has all of, for example
+`runs-on: [self-hosted, linux, x64, arca]`, or `[self-hosted, linux, x64, arca-large]` for the large slot.
+
+### Reading the pool
+
+Every minute the controller writes a status block to the virtual machine's console, which is what `service_logs`
+returns, and one line when a job finishes:
+
+```
+arca-runner-pool: job slot=0 class=standard labels=self-hosted,linux,x64,arca name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4 runner=ci-pool-standard-0-1a2b3c4d
+arca-runner-pool: slot 0 standard 4096MiB/2cpu busy 41s ci-pool-standard-0-5e6f7a8b job "test"
+arca-runner-pool: slot 1 standard 4096MiB/2cpu idle 12s ci-pool-standard-1-9c0d1e2f
+arca-runner-pool: slot 4 large 8192MiB/8cpu queued (pausing 40s after a failure)
+arca-runner-pool: class standard last 412 jobs: seconds avg 130, peak memory avg 1210 MiB max 3105 MiB, cpu-seconds avg 95, cpus used avg 0.7
+arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failures=2 memory_reserved=16384MiB of 27955MiB slots_cap=5
+```
+
+| In the totals | Meaning |
+|---------------|---------|
+| `busy`, `idle` | Runners with a job, and runners registered and waiting for one. |
+| `starting` | Slots registering, starting or cleaning up. |
+| `queued` | Slots the pool wants and has not started. The slot's own line says why: the cap, memory no slot has reserved, memory that is free now, a pause after a failure, or no credential. |
+| `jobs_done` | Jobs finished since the controller started, whatever their result. |
+| `failures` | Failures of the pool itself since the controller started: GitHub refused the credential or a registration, a container did not start, a runner went away before it took a job. A job that fails its own steps is a job done, with `result=Failed`. |
+
+The same job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with
+its finish time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name.
+
+**Sizing runners from real numbers.** The `class` line is what the last 2000 jobs of a class used, beside the size the
+class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit;
+one whose `max` is at its `memory` has jobs that were cut short for memory. `cpus used avg` far below `cpu` says the
+CPU ceiling is generous. New sizes go into the template, and a pool created from it has them.
+
+### What to know
+
+- **One job per runner.** A runner is registered for one job (GitHub calls it just-in-time and ephemeral), runs in a
+  container made from the runner's public image, and is removed with everything in it. The next job gets a new
+  registration and a new container, so no job finds another's files, processes or installed packages.
+- **Admission by memory.** A slot starts only while there is memory for its whole size: memory that no other slot has
+  reserved, and memory the machine has free at that moment. A slot's memory is a hard limit with no swap, so a job that
+  passes it is stopped by the kernel and no other slot pays for it. CPU is different: each slot has a ceiling of its
+  `cpu`, and slots share the machine's CPUs.
+- **Docker, and how far jobs are apart.** Each slot has a Docker daemon of its own, started fresh for each job. A
+  job's containers, volumes and networks are removed after it; the daemon's images and build cache stay for the next
+  job of that slot. Two jobs therefore never see each other's containers or share a daemon. They are not walled off
+  from each other the way two virtual machines are: the slot's daemon runs privileged, so a job that sets out to can
+  reach the virtual machine itself, and through it the other slots, their caches and the pool's GitHub credential.
+  The pool keeps one customer's jobs tidy and apart by default; it does not defend them against each other. Run only
+  workflows you trust on it (do not let pull requests from forks use these labels), and prefer the GitHub App, whose
+  only power is managing runners. One shared daemon would have reused more cache and separated jobs less; a daemon
+  without root would separate them more and refuse the jobs that need privileged containers.
+- **Caches.** Each slot keeps its Docker layer cache, a tool cache (`RUNNER_TOOL_CACHE`, which the `setup-*` actions
+  fill) and a directory for anything else a workflow wants to keep (`POOL_CACHE_DIR`, `/var/cache/pool` in the job).
+  They are on the virtual machine's disk and survive jobs and restarts. Each slot has an equal share of `dockerCache`
+  and of `dependencyCache`; a cache that passes its share after a job is emptied, and the log says so. A cache is
+  shared by the jobs that run in the same slot one after another, so a job can leave something there for a later one.
+- **Where the credential lives.** In Arca's private `secrets/` directory, and in the virtual machine in
+  `/etc/arca-secrets`, readable by root there. It is not in Incus's config, in Arca's journals or in any log. The
+  controller makes every short-lived token from it by itself and prints none.
+- **A new credential.** `service_secret_set` again, then `instance_start` again: the start restarts nothing, writes
+  the new value into the virtual machine, and the controller uses it for the next token.
+- **Stopping and restarting.** `instance_stop` and `instance_restart` need your approval. Runners that are idle are
+  taken off GitHub first; a job that is running is lost and GitHub reports it as failed. After the machine Arca runs
+  on restarts, the pool starts by itself.
+- **Pins.** The virtual machine is `images:debian/13/cloud`, the public Debian 13 image with cloud-init, which is what
+  runs the first boot and grows the disk. It is named by its alias and not by a fingerprint: the public server
+  rebuilds it daily and keeps the last few builds only, so a fingerprint would stop resolving within days. Docker in
+  the virtual machine is Debian's own package. The runner is `ghcr.io/actions/actions-runner` 2.338.2 and the slot's
+  daemon is `docker` 29.9.3-dind, both by digest. GitHub stops giving jobs to a runner that is more than 63 days
+  behind the newest release unless it updates itself, which the runner does when a job arrives; a later Arca release
+  moves the pin.
+- **Changing a pool.** Settings, sizes and pins are read when the virtual machine is created. To change them, create a
+  second pool from the changed template, check it, and remove the first: both can serve the same labels meanwhile.
+- **The network.** The pool only calls out: to GitHub, to the image registries and to Debian's mirrors. It has no port,
+  and nothing can connect to it.
+
 ## Tenants
 
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
@@ -2571,6 +2719,32 @@ Service database and consumer creates read `devices.root.pool` from the default 
 refuses creation. The internal desired config carries that pool; each instance creates its root disk there. Database images
 must already be present in the service project's image store at the requested fingerprint.
 
+
+### The runner pool
+
+`cargo test -p arca --test runner_pool` runs the shipped controller, `templates/github-runner-pool.sh run`, unchanged,
+against a fake GitHub API (a small HTTP server in the test that checks every token and the App's signature) and a fake
+`docker` (`tests/runner_pool/fake-docker.sh`, which plays a runner that takes one job with the configuration it was
+started with). It needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. It covers
+registration with an App and with a token, one job per runner, replacement, admission by reserved and by free memory,
+the cap, the job records, the pause after failures, cleanup of what an earlier controller left, and that no
+credential is in any output, file or command line. `crates/arca/tests/services/vm_secrets.rs` covers the kernel's half
+against the fake Incus.
+
+Not proven by these tests, because they need a real virtual machine and a real GitHub organisation:
+
+- that the virtual machine boots from `images:debian/13/cloud` on a real node, that cloud-init runs the first-boot
+  script and writes the settings, and that the guest agent takes the secret files;
+- that Debian's Docker package installs, and that the two pinned images pull and start as the script starts them: the
+  slot's privileged daemon, the runner sharing its network and socket, jobs that use `container:` and `services:`;
+- that GitHub accepts the App's token and the registration requests as the fake does, lists a runner as `offline`
+  when it is, and gives a registered runner a job;
+- that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, and that the peak
+  memory and CPU seconds read from the slice are the job's;
+- that the controller's lines reach `service_logs` through the virtual machine's console;
+- the cache bounds on a real disk, a real job's cleanup, and behaviour over days (runner self-update, token renewal
+  after an hour, a host restart);
+- the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work.
 
 ### Service wiring
 

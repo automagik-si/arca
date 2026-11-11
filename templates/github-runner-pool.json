@@ -1,0 +1,25 @@
+{
+  "name": "github-runner-pool",
+  "description": "A pool of GitHub Actions runners in one virtual machine (Debian 13 cloud image; 16 CPUs, 32GiB, 200GiB). Each slot runs one job on a fresh just-in-time runner (actions/runner 2.338.2, by digest) with a Docker daemon of its own (docker 29.9.3-dind, by digest), then replaces it. Set settings.url to your organisation or repository in a copy of this template. It is created stopped: set GITHUB_APP_CLIENT_ID and GITHUB_APP_PRIVATE_KEY, or GITHUB_TOKEN, with service_secret_set, then instance_start.",
+  "kind": "virtual-machine",
+  "image": "images:debian/13/cloud",
+  "limits": { "cpu": "16", "memory": "32GiB" },
+  "rootSize": "200GiB",
+  "autostart": true,
+  "firstBoot": { "file": "github-runner-pool.sh" },
+  "secrets": ["GITHUB_APP_CLIENT_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_TOKEN"],
+  "settings": {
+    "url": "https://github.com/example-org",
+    "runnerGroupId": 1,
+    "maxSlots": 5,
+    "reserveMemory": "4GiB",
+    "classes": [
+      { "name": "standard", "labels": ["self-hosted", "linux", "x64", "arca"], "cpu": 2, "memory": "4GiB", "slots": 4 },
+      { "name": "large", "labels": ["self-hosted", "linux", "x64", "arca-large"], "cpu": 8, "memory": "8GiB", "slots": 1 }
+    ],
+    "dockerCache": "90GiB",
+    "dependencyCache": "30GiB",
+    "runnerImage": "ghcr.io/actions/actions-runner@sha256:759a1d94a15b05941aba5196974ff43fe15b4cbba29b694b35cbc32a1166b232",
+    "dockerImage": "docker.io/library/docker@sha256:08a98015fce594af7c382883bea080ea206de74402a95da9dc52b6428c8cd121"
+  }
+}
