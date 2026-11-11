@@ -306,9 +306,7 @@ a service on a host restart before its first `instance_start`, without its secre
 
 **A virtual machine.** It takes `start: false` like a container, but its secrets are not environment values: they are
 stored, and `instance_start` writes them into the guest as files once the machine has booted (see "Secrets of a
-virtual machine"). Inside a tenant they are not written yet: `instance_start` starts the machine and is refused with
-`InstanceSecretsNotWritten`, and the machine runs without them until Arca writes guest secrets inside a tenant. A
-virtual machine is never the consumer of a link.
+virtual machine"), inside a tenant as in the node's own project. A virtual machine is never the consumer of a link.
 
 Nothing else changes: the address, the firewall rules, the caps and the approval rules are those of any create, and
 the effect journal holds the instance's create as it holds any create (an intent, then the applied effect with the
@@ -2845,9 +2843,9 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
   created stopped, `service_secret_set` and `service_connect` apply to it, and `instance_start` with `tenant` starts it
   for the first time, with no approval from a token whose tool allowlist names the verb. A deploy's rules do not look
   at whether a service runs: a provisional service that is still stopped is confirmed by `deploy_confirm` and removed
-  by `deploy_rollback` like a running one. A virtual machine's secrets are files in its guest, written after it boots,
-  and inside a tenant they are not written yet: `instance_start` starts the machine and is refused with
-  `InstanceSecretsNotWritten`;
+  by `deploy_rollback` like a running one. A virtual machine's secrets are files in its guest, written after it boots:
+  `instance_start` starts the machine and writes them into that tenant's own machine, as it does for a machine of the
+  node's own;
 
 - a service's address comes from the tenant's block, and its caps are checked before Incus is asked, so a refusal names
   the cap (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`,
