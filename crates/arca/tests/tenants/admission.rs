@@ -222,10 +222,13 @@ fn the_policys_limits_refuse_in_plain_words_that_name_the_limit() {
     let rig = Rig::new(Some(tight));
     rig.create_tenant(json!({ "id": A })).expect("the first");
     rig.create_tenant(json!({ "id": B })).expect("the second");
-    let (_, message) = refusal(rig.create_tenant(json!({ "id": "cccccccc" })));
     assert_eq!(
-        message,
-        "this node holds 2 tenants, and kernel.tenants.maxTenants is 2"
+        listed(rig.create_tenant(json!({ "id": "cccccccc" }))),
+        (
+            "capacity".to_string(),
+            "this node holds 2 tenants, and kernel.tenants.maxTenants is 2".to_string(),
+            json!({ "limit": "tenants", "have": 2, "want": 1, "max": 2 })
+        )
     );
     let (_, message) = refusal(rig.create_tenant(json!({ "id": A })));
     assert_eq!(message, "tenant aaaaaaaa exists");
@@ -235,21 +238,29 @@ fn the_policys_limits_refuse_in_plain_words_that_name_the_limit() {
     tight["capacity"] = json!({ "instances": 7, "cpu": 64, "memory": "128GiB", "disk": "2TiB" });
     let rig = Rig::new(Some(tight));
     rig.create_tenant(json!({ "id": A })).expect("the first");
-    let (_, message) = refusal(rig.create_tenant(json!({ "id": B })));
+    // The amounts are caps set aside: the first tenant was promised four instances, and this one asks for four.
     assert_eq!(
-        message,
-        "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.instances): 8 with this tenant, 7 allowed"
+        listed(rig.create_tenant(json!({ "id": B }))),
+        (
+            "capacity".to_string(),
+            "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.instances): 8 with this tenant, 7 allowed".to_string(),
+            json!({ "limit": "instances", "have": 4, "want": 4, "max": 7 })
+        )
     );
     // The node's own virtual-machine cap covers the tenants' machines: four tenants of one machine each fill it.
     let rig = Rig::new(Some(policy()));
     for id in ["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"] {
         rig.create_tenant(json!({ "id": id })).expect("a tenant");
     }
-    let (_, message) = refusal(rig.create_tenant(json!({ "id": "eeeeeeee" })));
-    assert!(
-        message
-            .contains("would exceed the node's virtual-machine cap: 5 with this tenant, 4 allowed"),
-        "{message}"
+    let (code, message, fields) = listed(rig.create_tenant(json!({ "id": "eeeeeeee" })));
+    assert_eq!(code, "capacity");
+    assert_eq!(
+        message,
+        "the tenants' virtual machines (virtualMachines) together with the node's own would exceed the node's virtual-machine cap: 5 with this tenant, 4 allowed"
+    );
+    assert_eq!(
+        fields,
+        json!({ "limit": "virtualMachines", "have": 4, "want": 1, "max": 4 })
     );
     // Nothing of a refused create is left behind.
     assert!(rig.get("/1.0/projects/arcak-t-eeeeeeee").is_none());
@@ -272,18 +283,23 @@ fn the_create_rate_is_counted_from_the_journal_and_holds_across_a_restart() {
     rig.approved("tenant_remove", json!({ "id": B }))
         .expect("the removal");
     let refused = "this node creates at most 2 tenants in 3600 seconds (kernel.tenants.createRate), and 2 were created in that time; the next create is allowed at 2026-10-30T13:00:00.000Z";
-    let (_, message) = refusal(rig.create_tenant(json!({ "id": "cccccccc" })));
-    assert_eq!(message, refused);
+    // The wait is the time to the stated moment: the first create leaves the span 59 minutes from now.
+    let rate = (
+        "rate".to_string(),
+        refused.to_string(),
+        json!({ "retryAfterSeconds": 3540 }),
+    );
+    assert_eq!(listed(rig.create_tenant(json!({ "id": "cccccccc" }))), rate);
     // A restart reads the same journal, so the count is the same.
     let rig = rig.restart();
-    let (_, message) = refusal(rig.create_tenant(json!({ "id": "cccccccc" })));
-    assert_eq!(message, refused);
+    assert_eq!(listed(rig.create_tenant(json!({ "id": "cccccccc" }))), rate);
     // The owner's approval does not lift the rate either.
     let large = json!({ "instances": 12, "containers": 12, "virtualMachines": 0, "cpu": 8,
         "memory": "16GiB", "disk": "100GiB" });
-    let (_, message) =
-        refusal(rig.approved("tenant_create", json!({ "id": "cccccccc", "caps": large })));
-    assert_eq!(message, refused);
+    assert_eq!(
+        listed(rig.approved("tenant_create", json!({ "id": "cccccccc", "caps": large }))),
+        rate
+    );
     // At the stated time the oldest create has left the span.
     rig.clock.store(NOW + 3_600_000, Ordering::SeqCst);
     rig.create_tenant(json!({ "id": "cccccccc" }))

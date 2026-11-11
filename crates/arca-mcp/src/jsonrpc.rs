@@ -198,18 +198,19 @@ async fn call_tool(
         }
         Err(CallError::NotFound) => Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None))),
         Err(CallError::Invalid(why)) => Ok(Some(error_reply(id, INVALID_PARAMS, &why, None))),
-        Err(CallError::Refused { code, message }) => Ok(Some(error_reply(
-            id,
-            REFUSED,
-            &message,
-            Some(json!({ "refusal": code })),
-        ))),
-        Err(CallError::UntrustedRefused { code, message }) => Ok(Some(error_reply(
-            id,
-            REFUSED,
-            &message,
-            Some(json!({ "refusal": code, "untrusted": true })),
-        ))),
+        Err(
+            refused @ (CallError::Refused { .. }
+            | CallError::UntrustedRefused { .. }
+            | CallError::RefusedWith { .. }),
+        ) => {
+            let message = refused.refusal().map_or("", |(_, message)| message);
+            Ok(Some(error_reply(
+                id,
+                REFUSED,
+                message,
+                refused.refusal_data(),
+            )))
+        }
         Err(CallError::Internal(_)) => Ok(Some(result_reply(
             id,
             tool_failure("internal", "the tool failed"),

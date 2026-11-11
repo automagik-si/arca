@@ -7155,5 +7155,86 @@
       "x-arca-writes": true
     }
   ],
-  "openrpc": "1.3.2"
+  "openrpc": "1.3.2",
+  "x-arca-refusals": [
+    {
+      "code": "capacity",
+      "data": {
+        "properties": {
+          "have": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "enum": [
+              "instances",
+              "containers",
+              "virtualMachines",
+              "cpu",
+              "memory",
+              "disk",
+              "tenants",
+              "addresses"
+            ],
+            "type": "string"
+          },
+          "max": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refusal": {
+            "const": "capacity"
+          },
+          "want": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "refusal",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "summary": "The call would pass a cap of a tenant or of the node: a count of instances, containers, virtual machines, CPUs, tenants or addresses, or an amount of memory or disk. Nothing was written. limit names the cap; have (in use), want (asked) and max (allowed) are there when known, in bytes for memory and disk and as a count for every other cap."
+    },
+    {
+      "code": "rate",
+      "data": {
+        "properties": {
+          "refusal": {
+            "const": "rate"
+          },
+          "retryAfterSeconds": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "refusal"
+        ],
+        "type": "object"
+      },
+      "summary": "The caller asked too often, or too much of its own already waits: the same call is allowed again after a wait. retryAfterSeconds is there when the wait is known; where room can also be made sooner (a waiting request is decided), it is the longest the wait can be."
+    },
+    {
+      "code": "RateLimited",
+      "data": {
+        "properties": {
+          "refusal": {
+            "const": "RateLimited"
+          },
+          "retryAfterSeconds": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "refusal"
+        ],
+        "type": "object"
+      },
+      "summary": "One token recorded its thirty new action proposals of ten minutes. The same kind of refusal as rate, under the name it has always had. retryAfterSeconds is the wait until the window has a free place."
+    }
+  ]
 }

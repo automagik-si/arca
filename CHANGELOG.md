@@ -4,6 +4,17 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+- Two kinds of refusal have their own codes, so a caller no longer reads the sentence to tell them from any other
+  refusal. `capacity`: the call would pass a cap of a tenant or of the node (instances, containers, virtual machines,
+  CPUs, memory, disk, tenants, addresses). `rate`: the caller asked too often or already has too much waiting
+  (`kernel.tenants.createRate`, the 5 and 20 pending approval requests, the Omni pairing hold-off). Until now all of
+  these came back as `refused`. **A caller that matched `refused` for them must match the new codes.** Every sentence
+  is unchanged. Fields stand beside the code in the error's `data`: for `capacity`, `limit` and, when known, `have`,
+  `want` and `max` (bytes for memory and disk, a count otherwise); for `rate`, `retryAfterSeconds` when the wait is
+  known. `RateLimited`, the code of the proposal window, keeps its name and gains `retryAfterSeconds`;
+  `TooManyProposals` is unchanged. The approval page's 403 answers carry the same fields, and its 429 answers carry
+  `refusal: "rate"` beside `message`. The OpenRPC document lists the three codes with the schema of their `data`
+  under `x-arca-refusals`. The table is in `docs/OPERATING.md`, "Refusals for want of room and for asking too often".
 - A new shipped template, `automagik-workspace`: one Automagik workspace in its own virtual machine (2 CPUs, 4GiB,
   20GiB), published through a Cloudflare Tunnel whose connector runs inside the same machine. A keeper runs the
   Automagik server, its gate (the same image, the only door to the server) and the connector in one network

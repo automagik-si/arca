@@ -326,11 +326,12 @@ fn writes_turned_on_is_one_break() {
     );
 }
 
-/// The released document with the current read-only hint added to every method it shares with the current document, as a
-/// release made after the hint would carry it.
+/// The released document with the current read-only hint added to every method it shares with the current document, and
+/// the current list of refusals that carry fields, as a release made after the hint and the list would carry them.
 fn released_with_hints() -> Value {
     let current = openrpc();
     let mut doc = released();
+    doc["x-arca-refusals"] = current["x-arca-refusals"].clone();
     for m in doc["methods"].as_array_mut().expect("methods") {
         let hint = current["methods"]
             .as_array()

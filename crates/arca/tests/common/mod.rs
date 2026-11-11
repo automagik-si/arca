@@ -515,3 +515,35 @@ pub fn adopt_digest(config: &Path) -> String {
     .expect("a result");
     planned["digest"].as_str().expect("a digest").to_string()
 }
+
+/// A refusal for want of room or for asking too often, as a test reads it: its code, its sentence and the fields beside
+/// the code. It panics unless the call was refused with one of the codes the OpenRPC document lists under
+/// `x-arca-refusals` and the error's `data` conforms to that code's schema there. A site that goes back to the plain
+/// `refused` therefore fails every test that reads its refusal through here, whatever else the test asserts.
+pub fn listed_refusal(result: Result<Value, CallError>) -> (String, String, Value) {
+    let error = match result {
+        Err(error) => error,
+        Ok(value) => panic!("expected a refusal, got {value}"),
+    };
+    let CallError::RefusedWith {
+        code,
+        message,
+        fields,
+    } = &error
+    else {
+        panic!("expected a refusal that carries fields beside its code, got {error:?}");
+    };
+    let document = arca_api::openrpc();
+    let listed = document["x-arca-refusals"]
+        .as_array()
+        .expect("the document lists the refusals that carry fields");
+    let entry = listed
+        .iter()
+        .find(|entry| entry["code"] == code.as_str())
+        .unwrap_or_else(|| panic!("{code} is not a code the document lists: {message}"));
+    let data = error.refusal_data().expect("a refusal has data");
+    if let Err(why) = arca_api::conforms(&entry["data"], &data) {
+        panic!("{code}: the data {data} does not fit the listed schema: {why}");
+    }
+    (code.clone(), message.clone(), Value::Object(fields.clone()))
+}

@@ -506,7 +506,7 @@ async fn canvas_sign_in(State(state): State<Arc<PageState>>, body: Bytes) -> Res
         let Some(statement) = state.canvas.issue_challenge(now) else {
             return canvas_json(
                 StatusCode::TOO_MANY_REQUESTS,
-                json!({ "message": "Too many sign-in challenges" }),
+                rate_body("Too many sign-in challenges", None),
             );
         };
         return canvas_json(StatusCode::OK, json!({ "statement": statement }));
@@ -1236,6 +1236,17 @@ fn call_error_response(error: CallError) -> Response {
             Json(json!({ "refusal": code, "message": message })),
         )
             .into_response(),
+        // A refusal for want of room, or for asking too often: its fields stand beside the code, as the MCP door
+        // writes them.
+        CallError::RefusedWith {
+            code,
+            message,
+            mut fields,
+        } => {
+            fields.insert("refusal".to_string(), json!(code));
+            fields.insert("message".to_string(), json!(message));
+            (StatusCode::FORBIDDEN, Json(Value::Object(fields))).into_response()
+        }
         CallError::Invalid(_) => StatusCode::BAD_REQUEST.into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1346,10 +1357,12 @@ async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> 
     // Every request that passes the lock counts, including one refused while a code is live, so repeated clicks cannot
     // bypass the hourly bound.
     setup.requests.push(now);
-    if setup.live_if_fresh(now).is_some() {
+    if let Some(live) = setup.live_if_fresh(now) {
+        // The next code can be asked for once this one has expired.
+        let seconds = live.expires.saturating_sub(now).div_ceil(1000);
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "message": "A code is already on your screen" })),
+            Json(rate_body("A code is already on your screen", Some(seconds))),
         )
             .into_response();
     }
@@ -1359,7 +1372,10 @@ async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> 
         let seconds = (CODE_SPACING_MS - now.saturating_sub(last)).div_ceil(1000);
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "message": format!("Wait {seconds} more second(s)") })),
+            Json(rate_body(
+                format!("Wait {seconds} more second(s)"),
+                Some(seconds),
+            )),
         )
             .into_response();
     }
@@ -1612,9 +1628,21 @@ fn already_trusted() -> Response {
 fn locked(minutes: u64) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        Json(json!({ "message": format!("Setup is locked for {minutes} more minute(s)") })),
+        Json(rate_body(
+            format!("Setup is locked for {minutes} more minute(s)"),
+            Some(minutes.saturating_mul(60)),
+        )),
     )
         .into_response()
+}
+
+/// The body of a page answer that says the caller asked too often (429): the sentence as `message`, the `rate` refusal
+/// code beside it, and `retryAfterSeconds` when the wait is known. The page reads only `message` from these answers.
+fn rate_body(message: impl Into<String>, retry_after_seconds: Option<u64>) -> Value {
+    let mut body = arca_api::refusals::retry_after(retry_after_seconds);
+    body.insert("refusal".to_string(), json!(arca_api::refusals::RATE));
+    body.insert("message".to_string(), json!(message.into()));
+    Value::Object(body)
 }
 
 fn fresh_code() -> Result<String, ()> {

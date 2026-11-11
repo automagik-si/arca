@@ -6,6 +6,7 @@ mod common;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use arca_api::refusals::{Limit, RATE_LIMITED, Room, retry_after};
 use arca_api::{Scope, Verb, VerbClass, conforms, verb, verbs};
 use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_tools, serve_unix};
 use common::{
@@ -77,6 +78,10 @@ impl ToolHandler for Canned {
     }
 }
 
+const FULL: &str = "creating ws2 would exceed this node's cap on memory (kernel.vmLimits.memory): 4.0 GiB in use, 4.0 GiB asked, 6.0 GiB allowed";
+const SOON: &str = "a pairing code for wa was issued and lasts 42 s more: enter that one on the phone; never ask for codes in a loop";
+const WINDOW: &str = "too many proposals from this token; try again in ten minutes";
+
 /// Answers the write verb, and records every name it was asked to write, so a test can see whether a write ran.
 struct WriteProbe {
     log: Arc<Mutex<Vec<String>>>,
@@ -94,6 +99,17 @@ impl ToolHandler for WriteProbe {
             "quoted" => Err(CallError::UntrustedRefused {
                 code: "refused".into(),
                 message: "a service answered 500: text it wrote".into(),
+            }),
+            // One refusal of each code the OpenRPC document lists under `x-arca-refusals`.
+            "full" => Err(CallError::capacity(
+                FULL,
+                Room::of(Limit::Memory, 4 << 30, 4 << 30, 6 << 30),
+            )),
+            "soon" => Err(CallError::rate(SOON, Some(42))),
+            "window" => Err(CallError::RefusedWith {
+                code: RATE_LIMITED.into(),
+                message: WINDOW.into(),
+                fields: retry_after(Some(540)),
             }),
             "forbid" => Err(CallError::Forbidden {
                 verb: "write_probe".into(),
@@ -735,6 +751,75 @@ fn a_refusal_that_quotes_a_service_is_marked_untrusted_beside_its_code() {
         plain.json()["error"]["data"],
         json!({ "refusal": "Replayed" })
     );
+}
+
+/// The walk over the document's list. Every code under `x-arca-refusals` reaches the caller as that code, with the
+/// sentence unchanged as the error's message and with fields that fit the code's listed schema. A code the document
+/// gains has no probe here until one is written, and this test fails until then. What it does not see is a handler
+/// that answers the plain `refused` for want of room: the door carries what a handler gives it.
+#[test]
+fn every_refusal_the_document_lists_reaches_the_caller_with_its_code_its_sentence_and_its_fields() {
+    let fx = Fixture::start("refusal-fields");
+    let document = arca_api::openrpc();
+    let listed = document["x-arca-refusals"]
+        .as_array()
+        .expect("the document lists the refusals that carry fields");
+    assert!(!listed.is_empty());
+    for entry in listed {
+        let code = entry["code"].as_str().expect("a code");
+        let (probe, message, data) = match code {
+            "capacity" => (
+                "full",
+                FULL,
+                json!({ "refusal": "capacity", "limit": "memory", "have": 4u64 << 30, "want": 4u64 << 30,
+                    "max": 6u64 << 30 }),
+            ),
+            "rate" => (
+                "soon",
+                SOON,
+                json!({ "refusal": "rate", "retryAfterSeconds": 42 }),
+            ),
+            "RateLimited" => (
+                "window",
+                WINDOW,
+                json!({ "refusal": "RateLimited", "retryAfterSeconds": 540 }),
+            ),
+            other => panic!("the document lists {other}, and no probe here answers it"),
+        };
+        let reply = fx.tool_call(&fx.doctor, "write_probe", json!({ "name": probe }));
+        assert_eq!(reply.status, 200, "{code}");
+        let body = reply.json();
+        assert_eq!(body["error"]["code"], -32000, "{code}");
+        assert_eq!(body["error"]["message"], message, "{code}");
+        assert_eq!(body["error"]["data"], data, "{code}");
+        assert_eq!(
+            conforms(&entry["data"], &body["error"]["data"]),
+            Ok(()),
+            "{code}"
+        );
+        // The plain code's data fits no listed schema: a site that went back to `refused` would not pass as this one.
+        assert!(
+            conforms(&entry["data"], &json!({ "refusal": "refused" })).is_err(),
+            "{code}"
+        );
+    }
+}
+
+#[test]
+fn a_field_named_refusal_never_stands_in_for_the_code() {
+    let mut fields = retry_after(Some(5));
+    fields.insert("refusal".into(), json!("refused"));
+    let error = CallError::RefusedWith {
+        code: "rate".into(),
+        message: "wait".into(),
+        fields,
+    };
+    assert_eq!(
+        error.refusal_data(),
+        Some(json!({ "refusal": "rate", "retryAfterSeconds": 5 }))
+    );
+    assert_eq!(error.refusal(), Some(("rate", "wait")));
+    assert_eq!(CallError::NotFound.refusal_data(), None);
 }
 
 #[test]

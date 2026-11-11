@@ -392,11 +392,18 @@ fn empty_state() -> FakeState {
     }
 }
 
+/// A plain refusal: its code and its sentence. A refusal for want of room or for asking too often is not one, and is
+/// read with [`listed`].
 fn refusal(result: Result<Value, CallError>) -> (String, String) {
     match result {
         Err(CallError::Refused { code, message }) => (code, message),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// A `capacity` or `rate` refusal: its code, its sentence and its fields, checked against the document's list.
+fn listed(result: Result<Value, CallError>) -> (String, String, Value) {
+    common::listed_refusal(result)
 }
 
 /// A container template with two ports, the first of which a link opens.
@@ -443,3 +450,5 @@ mod gate;
 mod isolation;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;
+#[path = "tenants/refusal_codes.rs"]
+mod refusal_codes;

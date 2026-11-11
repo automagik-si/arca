@@ -276,16 +276,19 @@ fn g7_owner_approval_request_callers_pending_limits_and_dedupe() {
         g.ask("doctor", Scope::Doctor, delete(&format!("svc{n}")))
             .expect("within the token's limit");
     }
-    match g.ask("doctor", Scope::Doctor, delete("svc9")) {
-        Err(CallError::Refused { code, message }) => {
-            assert_eq!(code, "refused");
-            assert!(
-                message.contains("429") && message.contains("doctor has 5"),
-                "{message}"
-            );
-        }
-        other => panic!("the token's sixth pending request is refused, got {other:?}"),
-    }
+    // Both caps are `rate` refusals. The wait they tell is the longest it can be: until the first of the waiting
+    // requests expires, an hour after it was asked. Ten minutes of that hour have passed here.
+    g.at(g.now() + 600_000);
+    let wait = json!({ "retryAfterSeconds": (REQUEST_TTL_MS - 600_000) / 1000 });
+    assert_eq!(
+        common::listed_refusal(g.ask("doctor", Scope::Doctor, delete("svc9"))),
+        (
+            "rate".to_string(),
+            "too many pending requests (429): doctor has 5 waiting for the owner; wait for one to be decided or to expire".to_string(),
+            wait.clone()
+        ),
+        "the token's sixth pending request"
+    );
     // doctor 5 and operator 1 are pending; 14 more reach the kernel's 20.
     for n in 0..(PENDING_PER_KERNEL - PENDING_PER_TOKEN - 1) {
         g.ask(
@@ -295,16 +298,15 @@ fn g7_owner_approval_request_callers_pending_limits_and_dedupe() {
         )
         .expect("within the kernel's limit");
     }
-    match g.ask("late", Scope::Doctor, delete("late")) {
-        Err(CallError::Refused { code, message }) => {
-            assert_eq!(code, "refused");
-            assert!(
-                message.contains("429") && message.contains("Arca has 20"),
-                "{message}"
-            );
-        }
-        other => panic!("the kernel's 21st pending request is refused, got {other:?}"),
-    }
+    assert_eq!(
+        common::listed_refusal(g.ask("late", Scope::Doctor, delete("late"))),
+        (
+            "rate".to_string(),
+            "too many pending requests (429): Arca has 20 waiting for the owner; wait for one to be decided or to expire".to_string(),
+            wait
+        ),
+        "the kernel's 21st pending request"
+    );
 }
 
 #[test]
