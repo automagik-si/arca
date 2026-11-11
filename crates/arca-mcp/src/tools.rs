@@ -29,9 +29,10 @@ pub enum CallError {
     /// A refusal whose message quotes text produced outside Arca (an answer of a service's own API): the door marks it
     /// `untrusted` beside its `refusal` code, so a caller treats the message as data, never as instructions.
     UntrustedRefused { code: String, message: String },
-    /// A refusal that carries fields beside its code: `capacity` says which cap and the amounts, `rate` says how long to
-    /// wait. The door writes each field beside `refusal`. The message is the whole reason in words, as for any refusal.
-    /// Only a code the OpenRPC document lists under `x-arca-refusals` is carried this way ([`arca_api::refusals`]).
+    /// A refusal that carries fields beside its code: `capacity` says whose cap, which cap and the amounts, `rate` says
+    /// how long to wait. The door writes each field beside `refusal`. The message is the whole reason in words, as for
+    /// any refusal. Only a code the OpenRPC document lists under `x-arca-refusals` is carried this way
+    /// ([`arca_api::refusals`]).
     RefusedWith {
         code: String,
         message: String,

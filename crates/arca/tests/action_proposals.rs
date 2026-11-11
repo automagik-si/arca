@@ -788,10 +788,19 @@ fn the_same_digest_returns_the_same_record_and_a_ninth_is_refused() {
     let ninth = rig
         .propose("service_create", create_args("ninth"))
         .expect_err("the limit is eight");
-    match ninth {
-        CallError::Refused { code, .. } => assert_eq!(code, "TooManyProposals"),
-        other => panic!("a refusal was expected, got {other:?}"),
-    }
+    // The code it has always had, its sentence, and no field: the document lists it in the family `rate`.
+    assert_eq!(
+        common::listed_refusal(Err(ninth)),
+        (
+            "TooManyProposals".to_string(),
+            "eight action proposals already wait; approve or decline one first".to_string(),
+            json!({})
+        )
+    );
+    assert_eq!(
+        common::listed_refusal_entry("TooManyProposals").expect("listed")["family"],
+        "rate"
+    );
     assert_eq!(
         rig.propose("service_create", create_args("nats"))
             .expect("the dedupe still answers at the limit"),

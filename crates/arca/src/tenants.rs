@@ -171,7 +171,7 @@ pub(super) fn free_address(
                     "tenant {}'s address block {} has no free address",
                     scope.id, scope.config.block
                 ),
-                Room::of(Limit::Addresses, all, 1, all),
+                Room::of(Whose::Tenant, Limit::Addresses, all, 1, all),
             )
         })
 }
@@ -532,7 +532,7 @@ fn used(scope: &TenantScope, entries: &[Entry]) -> Use {
 }
 
 /// Why one more instance would pass a cap of the tenant, or `None`. The refusal names the cap, in words and as a
-/// `capacity` refusal's fields. It comes before any Incus request: Incus holds the same caps on the project and would
+/// `capacity` refusal's fields, with `scope` `tenant`: the cap is the tenant's own. It comes before any Incus request: Incus holds the same caps on the project and would
 /// refuse too, in its own words.
 fn caps_exceeded(
     scope: &TenantScope,
@@ -623,7 +623,7 @@ fn caps_exceeded(
                     },
                     show(cap)
                 ),
-                Room::of(limit, held, asked, cap),
+                Room::of(Whose::Tenant, limit, held, asked, cap),
             ));
         }
     }
@@ -762,7 +762,7 @@ fn fresh_id(taken: &[String]) -> Result<String, CallError> {
 
 /// Why the caps of a new tenant do not fit the node, or `None`: inside `capacity` with every other tenant's, and its
 /// virtual machines inside the node's own virtual-machine cap with theirs and the node's own machines. Each is a
-/// `capacity` refusal whose amounts are caps set aside, not use: `have` is what the tenants the node holds were
+/// `capacity` refusal of `scope` `node`, whose amounts are caps set aside, not use: `have` is what the tenants the node holds were
 /// promised (with the node's own machines, for virtual machines) and `want` is what this tenant asks to be promised.
 /// A node that sets no virtual-machine caps at all is a plain refusal: nothing ran out.
 fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> Option<CallError> {
@@ -776,6 +776,7 @@ fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> 
                 tenants_cfg.max_tenants
             ),
             Room::of(
+                Whose::Node,
                 Limit::Tenants,
                 held.len() as u128,
                 1,
@@ -840,7 +841,7 @@ fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> 
                     show(wanted),
                     show(cap)
                 ),
-                Room::of(limit, others, asked, cap),
+                Room::of(Whose::Node, limit, others, asked, cap),
             ));
         }
     }
@@ -863,6 +864,7 @@ fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> 
                     node.virtual_machines
                 ),
                 Room::of(
+                    Whose::Node,
                     Limit::VirtualMachines,
                     taken,
                     u128::from(caps.virtual_machines),
@@ -1500,6 +1502,7 @@ impl TenantHandler {
                         "the service subnet {cidr} has no free /{prefix} block for a tenant: every block is held by a tenant or holds an address in use"
                     ),
                     Room {
+                        scope: Whose::Node,
                         limit: Limit::Addresses,
                         have: None,
                         want: None,

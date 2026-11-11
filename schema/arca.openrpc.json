@@ -7182,8 +7182,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "proposeAgain": {
+            "const": true
+          },
           "refusal": {
             "const": "capacity"
+          },
+          "scope": {
+            "enum": [
+              "tenant",
+              "node"
+            ],
+            "type": "string"
           },
           "want": {
             "minimum": 0,
@@ -7192,16 +7202,21 @@
         },
         "required": [
           "refusal",
+          "scope",
           "limit"
         ],
         "type": "object"
       },
-      "summary": "The call would pass a cap of a tenant or of the node: a count of instances, containers, virtual machines, CPUs, tenants or addresses, or an amount of memory or disk. Nothing was written. limit names the cap; have (in use), want (asked) and max (allowed) are there when known, in bytes for memory and disk and as a count for every other cap."
+      "family": "capacity",
+      "summary": "The call would pass a cap, and nothing was written. scope says whose cap: tenant (the tenant's own caps, or its address block) or node (the node's caps, its room for tenants, or its service subnet); a call in a tenant can be refused by either. limit names the cap: a count of instances, containers, virtual machines, CPUs, tenants or addresses, or an amount of memory or disk. have (in use), want (asked) and max (allowed) are there when known, in bytes for memory and disk and as a count for every other cap; with scope node they are the node's amounts, not the tenant's. proposeAgain: true means the refusal came from running an approved action: that approval is spent, so the action is proposed again once there is room."
     },
     {
       "code": "rate",
       "data": {
         "properties": {
+          "proposeAgain": {
+            "const": true
+          },
           "refusal": {
             "const": "rate"
           },
@@ -7215,7 +7230,8 @@
         ],
         "type": "object"
       },
-      "summary": "The caller asked too often, or too much of its own already waits: the same call is allowed again after a wait. retryAfterSeconds is there when the wait is known; where room can also be made sooner (a waiting request is decided), it is the longest the wait can be."
+      "family": "rate",
+      "summary": "The caller asked too often, or too much of its own already waits: a wait ends it. retryAfterSeconds is there when the wait is known; where room can also be made sooner (a waiting request is decided), it is the longest the wait can be. After the wait the same call is allowed again, with one exception: proposeAgain: true means the refusal came from running an approved action, whose approval is spent, so after the wait the action is proposed again and approved again."
     },
     {
       "code": "RateLimited",
@@ -7234,7 +7250,24 @@
         ],
         "type": "object"
       },
+      "family": "rate",
       "summary": "One token recorded its thirty new action proposals of ten minutes. The same kind of refusal as rate, under the name it has always had. retryAfterSeconds is the wait until the window has a free place."
+    },
+    {
+      "code": "TooManyProposals",
+      "data": {
+        "properties": {
+          "refusal": {
+            "const": "TooManyProposals"
+          }
+        },
+        "required": [
+          "refusal"
+        ],
+        "type": "object"
+      },
+      "family": "rate",
+      "summary": "Eight action proposals already wait for the owner, from any token. The same kind of refusal as rate, under the name it has always had. It carries no field: room is made when one is approved or declined, or lapses fifteen minutes after it was made."
     }
   ]
 }

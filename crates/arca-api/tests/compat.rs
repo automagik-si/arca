@@ -327,7 +327,7 @@ fn writes_turned_on_is_one_break() {
 }
 
 /// The released document with the current read-only hint added to every method it shares with the current document, and
-/// the current list of refusals that carry fields, as a release made after the hint and the list would carry them.
+/// the current list of refusals, as a release made after the hint and the list would carry them.
 fn released_with_hints() -> Value {
     let current = openrpc();
     let mut doc = released();
@@ -381,6 +381,82 @@ fn a_removed_read_only_hint_is_one_break() {
             method: "arca_status".into()
         }]
     );
+}
+
+/// The list of refusals is compared by code: a code that is gone, a family that changed and a value that is gone from a
+/// field of a refusal's `data` are breaks, one each. What is added (a code, a field, a value) is not.
+#[test]
+fn a_dropped_refusal_code_family_or_listed_value_is_a_break_and_an_addition_is_none() {
+    let base = released_with_hints();
+    let refusal = |doc: &Value, code: &str| -> usize {
+        doc["x-arca-refusals"]
+            .as_array()
+            .expect("the list")
+            .iter()
+            .position(|entry| entry["code"] == code)
+            .unwrap_or_else(|| panic!("{code} is listed"))
+    };
+
+    let mut current = base.clone();
+    let at = refusal(&current, "rate");
+    current["x-arca-refusals"]
+        .as_array_mut()
+        .expect("the list")
+        .remove(at);
+    assert_eq!(
+        compatible(&base, &current),
+        [Break::RefusalRemoved {
+            code: "rate".into()
+        }]
+    );
+
+    let mut current = base.clone();
+    let at = refusal(&current, "TooManyProposals");
+    current["x-arca-refusals"][at]["family"] = json!("capacity");
+    assert_eq!(
+        compatible(&base, &current),
+        [Break::RefusalFamilyChanged {
+            code: "TooManyProposals".into()
+        }]
+    );
+
+    for (field, value) in [("limit", "disk"), ("scope", "node")] {
+        let mut current = base.clone();
+        let at = refusal(&current, "capacity");
+        current["x-arca-refusals"][at]["data"]["properties"][field]["enum"]
+            .as_array_mut()
+            .expect("the values")
+            .retain(|listed| listed != value);
+        assert_eq!(
+            compatible(&base, &current),
+            [Break::RefusalValueRemoved {
+                code: "capacity".into(),
+                field: field.into(),
+                value: value.into()
+            }],
+            "{field}"
+        );
+    }
+
+    let mut current = base.clone();
+    let at = refusal(&current, "capacity");
+    current["x-arca-refusals"][at]["data"]["properties"]["limit"]["enum"]
+        .as_array_mut()
+        .expect("the values")
+        .push(json!("gpus"));
+    current["x-arca-refusals"][at]["data"]["properties"]["zone"] = json!({ "type": "string" });
+    current["x-arca-refusals"]
+        .as_array_mut()
+        .expect("the list")
+        .push(
+            json!({ "code": "quota", "family": "capacity", "summary": "A new one.",
+            "data": { "type": "object", "required": ["refusal"],
+                "properties": { "refusal": { "const": "quota" } } } }),
+        );
+    assert!(compatible(&base, &current).is_empty(), "additions");
+
+    // A release from before the list has nothing to compare.
+    assert!(compatible(&released(), &current).is_empty());
 }
 
 #[test]

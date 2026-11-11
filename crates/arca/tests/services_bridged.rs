@@ -302,9 +302,10 @@ fn out_of_room(result: Result<Value, CallError>) -> (String, Value) {
     (message, fields)
 }
 
-/// What a `capacity` refusal says beside its sentence: the cap, what is in use, what was asked and what is allowed.
+/// What a `capacity` refusal of the node says beside its sentence: whose cap (the node's), which cap, what is in use,
+/// what was asked and what is allowed.
 fn room(limit: &str, have: u64, want: u64, max: u64) -> Value {
-    json!({ "limit": limit, "have": have, "want": want, "max": max })
+    json!({ "scope": "node", "limit": limit, "have": have, "want": want, "max": max })
 }
 
 /// A `capacity` refusal as a test states it: the sentence and its fields.

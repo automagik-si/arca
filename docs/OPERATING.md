@@ -406,18 +406,41 @@ Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_appr
 ### Refusals for want of room and for asking too often
 
 A refusal's code is `data.refusal`, and its `message` is the reason in words. Most codes say everything a caller can
-act on. Two kinds of refusal carry more: the call would pass a cap (`capacity`), or the caller asked too often or
-already has too much waiting (`rate`). For these, `data` holds fields beside the code, so a caller never has to read
-the sentence to tell them from any other refusal. The sentences are the ones these refusals always carried. Until
-this change, every one in the table except `RateLimited` came back with the plain code `refused`.
+act on. Two families of refusal are told apart from all the others, so a caller never has to read the sentence: the
+call would pass a cap (`capacity`), or the caller asked too often or already has too much waiting (`rate`). The
+sentences are the ones these refusals always carried. Until this change, the sites of `capacity` and `rate` came back
+with the plain code `refused`.
 
-| Code | When | Fields beside `refusal` |
-| --- | --- | --- |
-| `capacity` | The call would pass a cap, and nothing was written. A tenant's caps on `service_create` (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`). The node's virtual-machine caps on `service_create` (`kernel.vmLimits`, or `kernel.bridged.limits`), and a virtual-machine count set below the machines the node holds. The node's room for tenants on `tenant_create` (`kernel.tenants.maxTenants`, `kernel.tenants.capacity`, and the node's virtual-machine cap). No free address in the service subnet or in a tenant's block, and no free block for a new tenant. | `limit`: `instances`, `containers`, `virtualMachines`, `cpu`, `memory`, `disk`, `tenants` or `addresses`. `have`, `want` and `max` when known: what is in use, what the call asked for and what the cap allows. Memory and disk are bytes; every other cap is a count. |
-| `rate` | The same call is allowed again after a wait. `tenant_create` past `kernel.tenants.createRate`. `owner_approval_request` when the token already has 5 requests waiting, or Arca 20. `omni_pair` while a pairing code lasts, or inside the 60 seconds after an attempt. | `retryAfterSeconds` when the wait is known: whole seconds, rounded up, at least 1. |
-| `RateLimited` | `action_propose` when one token has recorded its thirty new proposals of ten minutes. The same kind of refusal as `rate`, under the code it has always had. | `retryAfterSeconds`: the wait until the token's oldest counted proposal leaves the window. The sentence says "ten minutes", the whole window. |
+| Code | Family | When | Fields beside `refusal` |
+| --- | --- | --- | --- |
+| `capacity` | `capacity` | The call would pass a cap, and nothing was written. A tenant's caps on `service_create` (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`), and a tenant's block with no free address. The node's virtual-machine caps on `service_create` (`kernel.vmLimits`, or `kernel.bridged.limits`), and a virtual-machine count set below the machines the node holds. The node's room for tenants on `tenant_create` (`kernel.tenants.maxTenants`, `kernel.tenants.capacity`, the node's virtual-machine cap, and no free block). No free address in the service subnet. | `scope`, always: `tenant` or `node`, whose cap it is. `limit`, always: `instances`, `containers`, `virtualMachines`, `cpu`, `memory`, `disk`, `tenants` or `addresses`. `have`, `want` and `max` when known: what is in use, what the call asked for and what the cap allows. Memory and disk are bytes; every other cap is a count. `proposeAgain: true` when the refusal came from running an approved action. |
+| `rate` | `rate` | A wait ends it. `tenant_create` past `kernel.tenants.createRate`. `owner_approval_request` when the token already has 5 requests waiting, or Arca 20. `omni_pair` while a pairing code lasts, or inside the 60 seconds after an attempt. | `retryAfterSeconds` when the wait is known: whole seconds, rounded up, at least 1. `proposeAgain: true` when the refusal came from running an approved action. |
+| `RateLimited` | `rate` | `action_propose` when one token has recorded its thirty new proposals of ten minutes. The code it has always had. | `retryAfterSeconds`: the wait until the token's oldest counted proposal leaves the window. The sentence says "ten minutes", the whole window. |
+| `TooManyProposals` | `rate` | `action_propose` when eight proposals already wait, from any token. The code it has always had. | None. Room is made when one is approved or declined, or lapses fifteen minutes after it was made. |
 
-What the fields mean in the cases that are not obvious:
+The OpenRPC document lists these four codes under `x-arca-refusals`, each with its `family`, a summary and the schema of
+its `data`. A caller that wants one check for "asked too often" reads the family from that list instead of knowing
+three names. Dropping a listed code, changing its family, or dropping a listed `limit` or `scope` value is a break
+against a released document, as a removed method is. The list is not every code a verb answers: a code outside it
+carries no field (apart from `untrusted`, for a refusal that quotes a service).
+
+`scope` is the field a billing client needs. A call in a tenant is checked against the node's caps first and against
+the tenant's own caps after, and both name the same caps. A tenant that is far under its own caps can be refused
+because the node is full: the refusal then says `scope: "node"`, and `have`, `want` and `max` are the node's amounts,
+not the tenant's. A client that serves a tenant's owner should say "the service is full", never "your plan is full",
+for `scope: "node"`, and should not show the node's amounts to the tenant.
+
+- `scope: "tenant"`: the tenant's own caps on `service_create`, and its address block with no free address.
+- `scope: "node"`: the node's virtual-machine caps, the count set below the machines the node holds, everything
+  `tenant_create` is refused for, and the service subnet with no free address.
+
+`proposeAgain: true` marks a refusal that came from running an approved action (through `action_approve` or the
+approval page; the message begins "The approval was accepted, but"). The approval was spent by the run. Waiting, or
+making room, does not make that same call pass: the action is proposed again and approved again. An approved
+`tenant_create` that runs past `kernel.tenants.createRate` is the case that happens. Without the field, a `rate`
+refusal means the same call is allowed again after the wait.
+
+What the other fields mean in the cases that are not obvious:
 
 - For `tenant_create`, the amounts of `instances`, `cpu`, `memory`, `disk` and `virtualMachines` are caps set aside, not
   use: `have` is what the tenants the node holds were promised (with the node's own machines, for
@@ -427,26 +450,25 @@ What the fields mean in the cases that are not obvious:
 - A virtual-machine count set below the machines the node holds refuses every create that would write the project,
   a container's too. It carries `have` and `max` and no `want`.
 - No free block for a new tenant carries `limit: "addresses"` and no amount.
-- For the two caps on pending approval requests, `retryAfterSeconds` is the longest the wait can be: the time until the
-  first of the waiting requests expires. A request the owner decides makes room sooner. They are `rate` and not
-  `capacity` because what is full is the caller's own queue to the owner, not the node: no instance, CPU, memory or
-  disk ran out, the remedy is to wait, and the sentence has always carried "429".
+- `retryAfterSeconds` is exact for `kernel.tenants.createRate`, the Omni hold-off and `RateLimited`. For the two caps
+  on pending approval requests it is the longest the wait can be: the time until the first of the waiting requests
+  expires. A request the owner decides makes room sooner. Those two caps are `rate` and not `capacity` because what
+  is full is the caller's own queue to the owner, not the node: no instance, CPU, memory or disk ran out, the remedy
+  is to wait, and the sentence has always carried "429".
 
-The OpenRPC document lists these three codes under `x-arca-refusals`, each with a summary and the schema of its `data`.
-That list is not every code a verb answers: a code outside it carries no field (apart from `untrusted`, for a refusal
-that quotes a service). Not in the list, and unchanged:
+Not in the list, and unchanged:
 
-- `TooManyProposals` (eight action proposals already wait) keeps its code and carries no field.
 - `FolderTooBig` (a folder does not fit the snapshot storage) keeps its code.
 - A node that sets no virtual-machine caps at all, a config that disagrees with the desired state, and a template
   whose data volume states no size are still `refused`: nothing ran out, and waiting changes nothing.
 - A create that Incus itself refuses for a project limit comes back as the create's failure, in Incus's words.
 
 The approval page answers 403 `{refusal, message}` for a refused action, and for these codes the same fields stand
-beside them. A refusal relayed from a linked machine carries its code and its message, and not the fields. The page's
-own 429 answers (a setup code asked for too soon or while one is live, a setup lock, too many sign-in challenges) carry
-`refusal: "rate"` beside `message`, and `retryAfterSeconds` when the wait is known; a setup lock rounds it up to
-whole minutes, as its sentence does. The third chat's bare 429 has no body.
+beside them. The proposals journal keeps the code and the message of a failed run, not the fields. A refusal relayed
+from a linked machine carries its code and its message, and not the fields. The page's own 429 answers (a setup code
+asked for too soon or while one is live, a setup lock, too many sign-in challenges) carry `refusal: "rate"` beside
+`message`, and `retryAfterSeconds` when the wait is known; a setup lock rounds it up to whole minutes, as its sentence
+does, so it can be up to 59 seconds over. The third chat's bare 429 has no body.
 
 ## The MCP server
 
@@ -1064,7 +1086,7 @@ The `summary` and `details` are built in the kernel from the checked fields; a c
 in a GPU row comes from the inventory at proposal time; it is kept in the kernel's private proposals journal, so a
 restart still shows it after the card is gone. A direct `gpu_attach` or `gpu_detach` call carries no usable approval: the
 handler accepts only the one-shot grant an approved proposal arms, and consumes it before the change. At most eight
-unexpired proposals wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same
+unexpired proposals wait. A ninth is refused with `TooManyProposals` (family `rate`), and the eight that wait are left alone. The same
 `argsDigest` returns the record that already waits instead of adding another; that deduplicated request records nothing.
 One token may record thirty new proposals in ten minutes, and a deduplicated or refused proposal counts nothing against
 that window; the thirty-first new proposal gets `RateLimited`, with `retryAfterSeconds` beside the code (see "Refusals
@@ -2956,7 +2978,7 @@ The verbs:
 
 | Verb | What it does |
 | --- | --- |
-| `tenant_create {id?, caps?}` | Creates a tenant. Inside the node's policy (caps at or under `defaultCaps`, room in `capacity`, `maxTenants` and `createRate`) it needs no approval, from a token whose tool allowlist names `tenant_create`. Caps above a default run only from a proposal the owner approved (`action_propose`, then the approval). A refusal names the limit; past the rate it gives the time of the next allowed create. Out of room is the refusal `capacity` and past the rate is `rate`, each with fields beside the code (see "Refusals for want of room and for asking too often"). Without `id` one is made: 8 lowercase base32 characters. |
+| `tenant_create {id?, caps?}` | Creates a tenant. Inside the node's policy (caps at or under `defaultCaps`, room in `capacity`, `maxTenants` and `createRate`) it needs no approval, from a token whose tool allowlist names `tenant_create`. Caps above a default run only from a proposal the owner approved (`action_propose`, then the approval). A refusal names the limit; past the rate it gives the time of the next allowed create. Out of room is the refusal `capacity` (always with `scope: "node"` here) and past the rate is `rate`, each with fields beside the code (see "Refusals for want of room and for asking too often"). Without `id` one is made: 8 lowercase base32 characters. |
 | `tenant_list` | Every tenant: its id, block, caps, and what its records use. |
 | `tenant_status {id}` | One tenant, with the number of instances its project holds. |
 | `tenant_usage {id}` | Per instance: `name` (the Incus instance), `service` (the service's name), `kind` (`container` or `vm`), `state`, `limitsCpu`, `limitsMemory`, `rootDiskSize`, and for an instance of a provisional deploy `provisional: true` and `deploy`. No time and no measured use. |
@@ -2991,7 +3013,8 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
 
 - a service's address comes from the tenant's block, and its caps are checked before Incus is asked, so a refusal names
   the cap (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`,
-  `limits.disk`). Its code is `capacity`, with the cap and the amounts beside it;
+  `limits.disk`). Its code is `capacity` with `scope: "tenant"`, and the cap and the amounts beside it. A create the
+  node has no room for is `capacity` with `scope: "node"`: the tenant's own caps were not the reason;
 - a link joins two services of the same tenant only;
 - a virtual machine joins the managed network only; a `bridge` is refused;
 - a template with a `lan` port or a dash is refused, and `service_publish`, `service_unpublish`, `service_import` and

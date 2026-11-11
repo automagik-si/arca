@@ -9,8 +9,9 @@
 //! method flags") says what each means to a client. `x-arca-additional-properties` records whether the params object is
 //! closed, which the table makes true for every verb.
 //!
-//! The document's own `x-arca-refusals` lists the refusals that carry fields beside their code ([`crate::refusals`]): one
-//! entry per code, with a summary and the schema of the error's `data`. It is not every code a verb answers.
+//! The document's own `x-arca-refusals` lists the refusals for want of room and for asking too often
+//! ([`crate::refusals`]): one entry per code, with its `family` (`capacity` or `rate`), a summary and the schema of the
+//! error's `data`. It is not every code a verb answers.
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -168,8 +169,8 @@ fn check(doc: &Value, hint_required: bool) -> Result<(), String> {
     check_refusals(doc, hint_required)
 }
 
-/// The `x-arca-refusals` list: every entry has a code no other entry has, a summary, and a well-formed `data` schema
-/// that requires `refusal` and pins it to the entry's code. A document released before the list existed does not carry
+/// The `x-arca-refusals` list: every entry has a code no other entry has, a family (`capacity` or `rate`), a summary,
+/// and a well-formed `data` schema that requires `refusal` and pins it to the entry's code. A document released before the list existed does not carry
 /// it and is frozen, so the list may be absent there.
 fn check_refusals(doc: &Value, list_required: bool) -> Result<(), String> {
     let list = match doc.get("x-arca-refusals") {
@@ -186,6 +187,10 @@ fn check_refusals(doc: &Value, list_required: bool) -> Result<(), String> {
             .ok_or_else(|| "a refusal has no code".to_string())?;
         if !codes.insert(code) {
             return Err(format!("refusal {code} is listed twice"));
+        }
+        let family = entry.get("family").and_then(Value::as_str);
+        if !matches!(family, Some("capacity" | "rate")) {
+            return Err(format!("refusal {code} has no legal family"));
         }
         if entry.get("summary").and_then(Value::as_str).is_none() {
             return Err(format!("refusal {code} has no summary"));
@@ -253,6 +258,13 @@ mod tests {
         assert!(
             check_document(&doc).is_err(),
             "a keyword outside the subset"
+        );
+
+        let mut doc = openrpc();
+        doc["x-arca-refusals"][0]["family"] = json!("quota");
+        assert!(
+            check_document(&doc).is_err(),
+            "a family that is not one of the two"
         );
     }
 

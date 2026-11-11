@@ -1010,7 +1010,7 @@ fn a_widening_with_a_count_below_the_machines_held_is_refused_in_words_before_an
         out_of_room(create(&handlers, json!({"name":"nats","template":"nats"}))),
         full(
             "this node holds 6 virtual machines, but kernel.bridged.limits.virtualMachines is 4: raise it to at least 6, or remove virtual machines first. Nothing was written",
-            json!({ "limit": "virtualMachines", "have": 6, "max": 4 })
+            json!({ "scope": "node", "limit": "virtualMachines", "have": 6, "max": 4 })
         )
     );
     assert_eq!(rig.fake.writes().len(), writes, "no write");

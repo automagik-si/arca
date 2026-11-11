@@ -6,7 +6,7 @@ mod common;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arca_api::refusals::{Limit, RATE_LIMITED, Room, retry_after};
+use arca_api::refusals::{Limit, RATE_LIMITED, Room, TOO_MANY_PROPOSALS, Whose, retry_after};
 use arca_api::{Scope, Verb, VerbClass, conforms, verb, verbs};
 use arca_mcp::{CallError, Caller, Server, TokenStore, ToolHandler, mint_with_tools, serve_unix};
 use common::{
@@ -81,6 +81,7 @@ impl ToolHandler for Canned {
 const FULL: &str = "creating ws2 would exceed this node's cap on memory (kernel.vmLimits.memory): 4.0 GiB in use, 4.0 GiB asked, 6.0 GiB allowed";
 const SOON: &str = "a pairing code for wa was issued and lasts 42 s more: enter that one on the phone; never ask for codes in a loop";
 const WINDOW: &str = "too many proposals from this token; try again in ten minutes";
+const EIGHT: &str = "eight action proposals already wait; approve or decline one first";
 
 /// Answers the write verb, and records every name it was asked to write, so a test can see whether a write ran.
 struct WriteProbe {
@@ -103,13 +104,17 @@ impl ToolHandler for WriteProbe {
             // One refusal of each code the OpenRPC document lists under `x-arca-refusals`.
             "full" => Err(CallError::capacity(
                 FULL,
-                Room::of(Limit::Memory, 4 << 30, 4 << 30, 6 << 30),
+                Room::of(Whose::Node, Limit::Memory, 4 << 30, 4 << 30, 6 << 30),
             )),
             "soon" => Err(CallError::rate(SOON, Some(42))),
             "window" => Err(CallError::RefusedWith {
                 code: RATE_LIMITED.into(),
                 message: WINDOW.into(),
                 fields: retry_after(Some(540)),
+            }),
+            "eight" => Err(CallError::Refused {
+                code: TOO_MANY_PROPOSALS.into(),
+                message: EIGHT.into(),
             }),
             "forbid" => Err(CallError::Forbidden {
                 verb: "write_probe".into(),
@@ -763,16 +768,26 @@ fn every_refusal_the_document_lists_reaches_the_caller_with_its_code_its_sentenc
     let document = arca_api::openrpc();
     let listed = document["x-arca-refusals"]
         .as_array()
-        .expect("the document lists the refusals that carry fields");
+        .expect("the document lists the refusals of the two families");
     assert!(!listed.is_empty());
     for entry in listed {
         let code = entry["code"].as_str().expect("a code");
+        // The family is what a caller checks: the one code for want of room, and every other code for asking too often.
+        assert_eq!(
+            entry["family"],
+            if code == "capacity" {
+                "capacity"
+            } else {
+                "rate"
+            },
+            "{code}"
+        );
         let (probe, message, data) = match code {
             "capacity" => (
                 "full",
                 FULL,
-                json!({ "refusal": "capacity", "limit": "memory", "have": 4u64 << 30, "want": 4u64 << 30,
-                    "max": 6u64 << 30 }),
+                json!({ "refusal": "capacity", "scope": "node", "limit": "memory", "have": 4u64 << 30,
+                    "want": 4u64 << 30, "max": 6u64 << 30 }),
             ),
             "rate" => (
                 "soon",
@@ -784,6 +799,7 @@ fn every_refusal_the_document_lists_reaches_the_caller_with_its_code_its_sentenc
                 WINDOW,
                 json!({ "refusal": "RateLimited", "retryAfterSeconds": 540 }),
             ),
+            "TooManyProposals" => ("eight", EIGHT, json!({ "refusal": "TooManyProposals" })),
             other => panic!("the document lists {other}, and no probe here answers it"),
         };
         let reply = fx.tool_call(&fx.doctor, "write_probe", json!({ "name": probe }));

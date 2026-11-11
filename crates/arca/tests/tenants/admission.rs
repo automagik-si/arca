@@ -227,7 +227,7 @@ fn the_policys_limits_refuse_in_plain_words_that_name_the_limit() {
         (
             "capacity".to_string(),
             "this node holds 2 tenants, and kernel.tenants.maxTenants is 2".to_string(),
-            json!({ "limit": "tenants", "have": 2, "want": 1, "max": 2 })
+            json!({ "scope": "node", "limit": "tenants", "have": 2, "want": 1, "max": 2 })
         )
     );
     let (_, message) = refusal(rig.create_tenant(json!({ "id": A })));
@@ -244,7 +244,7 @@ fn the_policys_limits_refuse_in_plain_words_that_name_the_limit() {
         (
             "capacity".to_string(),
             "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.instances): 8 with this tenant, 7 allowed".to_string(),
-            json!({ "limit": "instances", "have": 4, "want": 4, "max": 7 })
+            json!({ "scope": "node", "limit": "instances", "have": 4, "want": 4, "max": 7 })
         )
     );
     // The node's own virtual-machine cap covers the tenants' machines: four tenants of one machine each fill it.
@@ -260,7 +260,7 @@ fn the_policys_limits_refuse_in_plain_words_that_name_the_limit() {
     );
     assert_eq!(
         fields,
-        json!({ "limit": "virtualMachines", "have": 4, "want": 1, "max": 4 })
+        json!({ "scope": "node", "limit": "virtualMachines", "have": 4, "want": 1, "max": 4 })
     );
     // Nothing of a refused create is left behind.
     assert!(rig.get("/1.0/projects/arcak-t-eeeeeeee").is_none());

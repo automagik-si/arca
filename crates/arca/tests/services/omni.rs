@@ -398,23 +398,19 @@ impl OmniRig {
         );
         (message, untrusted)
     }
-    /// A pairing that is held off: a `rate` refusal whose sentence matches `pattern`, and whose `retryAfterSeconds` is
-    /// the wait that sentence tells. Returns the wait.
-    fn held_off(&self, args: Value, pattern: &str) -> u64 {
-        let (code, message, fields) = common::listed_refusal(self.call("omni_pair", args.clone()));
-        assert_eq!(code, "rate", "{args}: {message}");
-        assert!(
-            regex::Regex::new(pattern).unwrap().is_match(&message),
-            "{args}: {message:?} !~ {pattern}"
+    /// A pairing of the instance `id` that is held off for `wait` seconds: a `rate` refusal with its whole sentence,
+    /// and the same wait in `retryAfterSeconds`.
+    fn held_off(&self, id: &str, wait: u64) {
+        assert_eq!(
+            common::listed_refusal(self.call("omni_pair", json!({"name":"omni","instance":id}))),
+            (
+                "rate".to_string(),
+                format!(
+                    "a pairing code for {id} was issued and lasts {wait} s more: enter that one on the phone; never ask for codes in a loop"
+                ),
+                json!({ "retryAfterSeconds": wait })
+            )
         );
-        let told: u64 = regex::Regex::new(r"lasts (\d+) s more")
-            .unwrap()
-            .captures(&message)
-            .unwrap_or_else(|| panic!("the sentence tells the wait: {message}"))[1]
-            .parse()
-            .expect("seconds");
-        assert_eq!(fields, json!({ "retryAfterSeconds": told }), "{message}");
-        told
     }
     fn sent(&self) -> usize {
         self.omni.seen().len()
@@ -581,10 +577,8 @@ fn g6_pair_masks_the_owners_number_once_per_code_and_refuses_without_a_valid_sec
     assert_eq!(last.body, Some(json!({"phoneNumber":PHONE})));
     assert_eq!(last.url, format!("/api/v2/instances/{id}/pair"));
     let before = r.sent();
-    r.held_off(
-        json!({"name":"omni","instance":id}),
-        r"^a pairing code for .* was issued and lasts \d+ s more: enter that one on the phone; never ask for codes in a loop$",
-    );
+    // The code Omni gave lasts 60 seconds, and no time has passed.
+    r.held_off(&id, 60);
     assert_eq!(r.sent(), before, "the second ask reached nothing");
     // A Telegram instance has no pairing: Omni says so, and Arca passes it on, marked untrusted.
     r.secret("telegram_bot_token", BOT);
@@ -1020,13 +1014,7 @@ fn g6_pair_cooldown_starts_with_every_attempt_that_reaches_omni() {
         "500: PAIRING_FAILED: rate limited",
     );
     let sent = r.sent();
-    assert_eq!(
-        r.held_off(
-            json!({"name":"omni","instance":id}),
-            &format!("was issued and lasts {PAIR_COOLDOWN_S} s more"),
-        ),
-        PAIR_COOLDOWN_S
-    );
+    r.held_off(id.as_str().expect("an id"), PAIR_COOLDOWN_S);
     assert_eq!(r.sent(), sent, "the second ask reached nothing");
     // An answer without a code is an attempt too.
     r.now
@@ -1038,10 +1026,7 @@ fn g6_pair_cooldown_starts_with_every_attempt_that_reaches_omni() {
         "refused",
         "answered the pairing without a pairing code",
     );
-    r.held_off(
-        json!({"name":"omni","instance":id}),
-        r"was issued and lasts \d+ s more",
-    );
+    r.held_off(id.as_str().expect("an id"), PAIR_COOLDOWN_S);
     r.now
         .fetch_add(PAIR_COOLDOWN_S * 1000 + 1, Ordering::SeqCst);
     assert_eq!(

@@ -1,7 +1,9 @@
 //! The OpenRPC compatibility checker. A released document is frozen, so this module lists every change in a current document
 //! that would break a client built against the released one. An empty list is the only passing answer.
 //!
-//! The breaks are the eleven the API contract names, plus a changed read-only hint. Methods, parameters and result fields are matched by name. A result
+//! The breaks are the eleven the API contract names, plus a changed read-only hint and three in the list of refusals
+//! (`x-arca-refusals`): a code that is gone, a code whose family changed, and a value that is gone from a field of a
+//! refusal's `data`. Methods, parameters and result fields are matched by name. A result
 //! break names its path in the result schema: `$` is the root, `.field` a field and `[]` the items of an array, so
 //! `$.projects[].instances[].name` is the name of one instance.
 //!
@@ -60,6 +62,17 @@ pub enum Break {
     WritesTurnedOn { method: String },
     /// The method's read-only hint differs from the released one, either way, or is gone.
     ReadOnlyHintChanged { method: String },
+    /// A refusal code the released document lists under `x-arca-refusals` is gone. A client that acts on the code would
+    /// meet another one, or the plain `refused`, where it expects this one.
+    RefusalRemoved { code: String },
+    /// A listed refusal's family differs from the released one. A client tells out of room from asked too often by it.
+    RefusalFamilyChanged { code: String },
+    /// A value the released document lists for a field of a refusal's `data` (a `limit`, a `scope`) is gone.
+    RefusalValueRemoved {
+        code: String,
+        field: String,
+        value: String,
+    },
 }
 
 impl fmt::Display for Break {
@@ -91,6 +104,11 @@ impl fmt::Display for Break {
             Self::ScopeRaised { method } => write!(f, "{method}: minimum scope raised"),
             Self::WritesTurnedOn { method } => write!(f, "{method}: writes turned on"),
             Self::ReadOnlyHintChanged { method } => write!(f, "{method}: read-only hint changed"),
+            Self::RefusalRemoved { code } => write!(f, "refusal {code}: removed from the list"),
+            Self::RefusalFamilyChanged { code } => write!(f, "refusal {code}: family changed"),
+            Self::RefusalValueRemoved { code, field, value } => {
+                write!(f, "refusal {code}: {field} value {value} removed")
+            }
         }
     }
 }
@@ -137,7 +155,63 @@ pub fn compatible(released: &Value, current: &Value) -> Vec<Break> {
         params_breaks(&method, old, new, &mut out);
         results_breaks(&method, old, new, &mut out);
     }
+    refusals_breaks(released, current, &mut out);
     out
+}
+
+const REFUSALS: &str = "x-arca-refusals";
+
+/// The breaks in the list of refusals for want of room and for asking too often, in the released list's order. A code
+/// the released document lists must still be listed, in the same family, and every value the released `data` schema
+/// lists for a field (an `enum`) must still be listed for it. A new code, a new field and a new value are additions. A
+/// released document from before the list has nothing to compare.
+fn refusals_breaks(released: &Value, current: &Value, out: &mut Vec<Break>) {
+    let list = |doc: &Value| -> Vec<Value> {
+        doc.get(REFUSALS)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let now = list(current);
+    for old in list(released) {
+        let Some(code) = old.get("code").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(new) = now
+            .iter()
+            .find(|entry| entry.get("code") == old.get("code"))
+        else {
+            out.push(Break::RefusalRemoved { code: code.into() });
+            continue;
+        };
+        if old.get("family") != new.get("family") {
+            out.push(Break::RefusalFamilyChanged { code: code.into() });
+        }
+        let Some(fields) = old.pointer("/data/properties").and_then(Value::as_object) else {
+            continue;
+        };
+        for (field, schema) in fields {
+            let Some(values) = schema.get("enum").and_then(Value::as_array) else {
+                continue;
+            };
+            let kept = new
+                .pointer("/data/properties")
+                .and_then(|properties| properties.get(field))
+                .and_then(|schema| schema.get("enum"))
+                .and_then(Value::as_array);
+            for value in values {
+                if !kept.is_some_and(|kept| kept.contains(value)) {
+                    out.push(Break::RefusalValueRemoved {
+                        code: code.into(),
+                        field: field.clone(),
+                        value: value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_string),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn methods(doc: &Value) -> Vec<&Value> {

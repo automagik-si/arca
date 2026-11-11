@@ -393,7 +393,13 @@ impl ToolHandler for CountingAction {
             }),
             Some("full") => Err(CallError::capacity(
                 FULL,
-                arca_api::refusals::Room::of(arca_api::refusals::Limit::VirtualMachines, 4, 1, 4),
+                arca_api::refusals::Room::of(
+                    arca_api::refusals::Whose::Node,
+                    arca_api::refusals::Limit::VirtualMachines,
+                    4,
+                    1,
+                    4,
+                ),
             )),
             Some("broken") => Err(CallError::Internal("a detail nobody is shown".to_string())),
             _ => Ok(json!({ "created": true })),
@@ -1249,7 +1255,7 @@ fn a_passkey_approval_runs_an_action_proposal_exactly_once() {
 
 /// F4: an approval that Arca accepted, for an action that then failed, answers with the action's own message, keeps it
 /// in the proposals journal and retires the card, so the page has words to show in place of its spinner. A failure for
-/// want of room keeps its code and its fields beside the message.
+/// want of room keeps its code and its fields beside the message, and says the action must be proposed again.
 #[test]
 fn an_approved_action_that_fails_answers_its_message_and_journals_it() {
     let (rig, key) = Rig::new("page-action-failed", true);
@@ -1264,7 +1270,9 @@ fn an_approved_action_that_fails_answers_its_message_and_journals_it() {
             "full",
             "capacity",
             format!("The approval was accepted, but service_create did not complete: {FULL}"),
-            json!({ "limit": "virtualMachines", "have": 4, "want": 1, "max": 4 }),
+            // The approval is spent: the page is told the action must be proposed again.
+            json!({ "scope": "node", "limit": "virtualMachines", "have": 4, "want": 1, "max": 4,
+                "proposeAgain": true }),
         ),
         (
             "broken",
@@ -3027,10 +3035,15 @@ fn canvas_challenge_cap_is_global_and_resets_after_a_minute() {
         let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
         assert_eq!(status, 200, "challenge {index}");
     }
-    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
     assert_eq!(
         status, 429,
         "the sixty-first challenge in a minute is capped"
+    );
+    // The body names the `rate` code beside the sentence, and tells no wait.
+    assert_eq!(
+        rate_answer(&body),
+        ("Too many sign-in challenges".to_string(), None)
     );
     rig.advance(60_000);
     let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));

@@ -13,7 +13,9 @@ use arca_alerts::checks::{self, CheckTargets};
 use arca_alerts::eval::{Timed, WatchReading};
 use arca_alerts::{AlertSnapshot, Engine, TickStore, export, health, inputs};
 use arca_api::Scope;
-use arca_api::refusals::{Limit, RATE_LIMITED, Room, retry_after, seconds_until};
+use arca_api::refusals::{
+    Limit, PROPOSE_AGAIN, RATE_LIMITED, Room, TOO_MANY_PROPOSALS, Whose, retry_after, seconds_until,
+};
 use arca_approval::{ApprovalRefusal, parse_statement};
 use arca_incus::{IncusRead, UnixIncus};
 use arca_kernel::canon::{Digest, params_digest};
@@ -1650,7 +1652,7 @@ impl ToolHandler for GpuActionHandler {
 fn propose_failure(error: ProposeError) -> CallError {
     match error {
         ProposeError::TooMany => CallError::Refused {
-            code: "TooManyProposals".to_string(),
+            code: TOO_MANY_PROPOSALS.to_string(),
             message: "eight action proposals already wait; approve or decline one first"
                 .to_string(),
         },
@@ -1782,12 +1784,15 @@ pub fn run_approved_action(
                 )
             };
             let (code, why) = match error {
-                // A refusal for want of room, or for asking too often, keeps its code and its fields.
+                // A refusal for want of room, or for asking too often, keeps its code and its fields, and gains one:
+                // the approval is spent, so waiting or making room does not make this same call pass. The action is
+                // proposed again.
                 CallError::RefusedWith {
                     code,
                     message,
-                    fields,
+                    mut fields,
                 } => {
+                    fields.insert(PROPOSE_AGAIN.to_string(), json!(true));
                     return CallError::RefusedWith {
                         code,
                         message: told(&message),
@@ -2844,6 +2849,7 @@ fn count_fits(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -> Resu
             caps.virtual_machines
         ),
         Room {
+            scope: Whose::Node,
             limit: Limit::VirtualMachines,
             have: Some(held as u64),
             want: None,
@@ -3037,7 +3043,8 @@ fn instance_holds_mac(row: &Value, mac: &str) -> bool {
 }
 
 /// Why creating `name` from `template` would exceed one of the node's caps, or `None`: a `capacity` refusal that names
-/// the cap. The use counted is that of the virtual-machine records Arca holds, on the managed network and on host
+/// the cap, with `scope` `node`. A tenant's machine is checked here too, before its tenant's own caps, so a tenant
+/// under its caps is refused with the node's amounts when the node is full. The use counted is that of the virtual-machine records Arca holds, on the managed network and on host
 /// bridges alike, whether or not their machines run. No container counts.
 fn caps_refusal(
     cfg: &NodeConfig,
@@ -3144,7 +3151,7 @@ fn caps_refusal(
                     },
                     show(cap)
                 ),
-                Room::of(limit, used, asked, cap),
+                Room::of(Whose::Node, limit, used, asked, cap),
             ));
         }
     }
@@ -4375,7 +4382,7 @@ impl ServiceHandler {
             .ok_or_else(|| {
                 CallError::capacity(
                     format!("the service subnet {cidr} has no free address (.10-.239)"),
-                    Room::of(Limit::Addresses, all, 1, all),
+                    Room::of(Whose::Node, Limit::Addresses, all, 1, all),
                 )
             })
     }

@@ -525,25 +525,26 @@ pub fn listed_refusal(result: Result<Value, CallError>) -> (String, String, Valu
         Err(error) => error,
         Ok(value) => panic!("expected a refusal, got {value}"),
     };
-    let CallError::RefusedWith {
-        code,
-        message,
-        fields,
-    } = &error
-    else {
-        panic!("expected a refusal that carries fields beside its code, got {error:?}");
+    let Some((code, message)) = error.refusal() else {
+        panic!("expected a refusal, got {error:?}");
     };
-    let document = arca_api::openrpc();
-    let listed = document["x-arca-refusals"]
-        .as_array()
-        .expect("the document lists the refusals that carry fields");
-    let entry = listed
-        .iter()
-        .find(|entry| entry["code"] == code.as_str())
+    let entry = listed_refusal_entry(code)
         .unwrap_or_else(|| panic!("{code} is not a code the document lists: {message}"));
-    let data = error.refusal_data().expect("a refusal has data");
+    let mut data = error.refusal_data().expect("a refusal has data");
     if let Err(why) = arca_api::conforms(&entry["data"], &data) {
         panic!("{code}: the data {data} does not fit the listed schema: {why}");
     }
-    (code.clone(), message.clone(), Value::Object(fields.clone()))
+    let fields = data.as_object_mut().expect("the data is an object");
+    fields.remove("refusal");
+    (code.to_string(), message.to_string(), data)
+}
+
+/// The entry of `code` in the document's list of refusals for want of room and for asking too often, if it has one.
+pub fn listed_refusal_entry(code: &str) -> Option<Value> {
+    arca_api::openrpc()["x-arca-refusals"]
+        .as_array()
+        .expect("the document lists the refusals of the two families")
+        .iter()
+        .find(|entry| entry["code"] == code)
+        .cloned()
 }
