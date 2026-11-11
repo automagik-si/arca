@@ -333,14 +333,16 @@ not create as `unknown` without touching them. A row's `ports` are the container
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
 listener. A row carries `kernelAccess` only when the service's template declares it (see "A service that may talk to the
 kernel"). `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The nine shipped templates live in `templates/`, with their pinned
-images and vendored npm lockfile. Three of them, `workspace-vm`, `github-runner-pool` and `automagik-workspace`, are
-virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners" and
-"An Automagik workspace in its own virtual machine").
+secrets redacted and a capped, truncated result. The eleven shipped templates live in `templates/`, with their pinned
+images and vendored npm lockfile. Five of them, `workspace-vm`, `github-runner-pool`, `gitlab-runner-pool`,
+`gitlab-runner-pool-large` and `automagik-workspace`, are
+virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners", "A pool
+of GitLab runners" and "An Automagik workspace in its own virtual machine").
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for
-`github-runner-pool`, `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
+`github-runner-pool`, `gitlab-runner-pool.sh` for both `gitlab-runner-pool` and `gitlab-runner-pool-large`,
+`automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
 `service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
@@ -3290,6 +3292,221 @@ neither has been measured on the pool itself.
   Use the service network for a pool unless you have a reason not to. A GitHub Enterprise host or a package mirror on
   a private address cannot be reached from the service network.
 
+## A pool of GitLab runners
+
+The shipped `gitlab-runner-pool` template is one virtual machine that runs the CI jobs of one GitLab, self-hosted or
+gitlab.com, on your own hardware. Inside it runs GitLab Runner (19.5.3, its image by digest) with the docker
+executor: every job gets fresh containers from the job's own image, and they are removed when it ends. One pool
+serves up to twelve runners you created in GitLab, each with its own token, tags and size of job, under one cap of
+jobs at once.
+
+`gitlab-runner-pool-large` is the same pool in a larger machine: 32 CPUs, 64GiB and 300GiB instead of 16 CPUs, 32GiB
+and 200GiB, and 20 jobs at once by default instead of 10. Both boot the one script; nothing else differs. A
+machine's size is the template's and not a setting of a create, so a pool of yet another size is a copy of the
+template under another name with other `limits`.
+
+You need a node that may create a virtual machine of the template's size, the shipped templates installed
+(`arca templates install`), and a GitLab where you may create runners. The Arca steps are Arca's own verbs: ask the
+assistant you use with Arca to run them. `service_secret_set` cannot be proposed, so it needs an assistant that holds
+a `doctor`-scope token, and each token passes through that assistant's conversation.
+
+**1. The runners, in GitLab.** For each set of jobs the pool is to take, create a runner: "CI/CD", "Runners", "New
+runner", for the instance, a group or a project. Its tags, and whether it runs untagged jobs, are set there and
+nowhere in Arca. GitLab then shows the runner authentication token once: it begins `glrt-`. That token is all the
+pool needs; do not run the `gitlab-runner register` command GitLab shows beside it.
+
+**2. Create the pool.** `service_create` with the template and its settings:
+
+```json
+{ "name": "ci-pool", "template": "gitlab-runner-pool",
+  "settings": { "url": "https://gitlab.example.com", "concurrent": 6,
+    "runners": [ { "name": "build", "limit": 2, "jobCpu": 4, "jobMemory": "4GiB" }, { "name": "test" } ] } }
+```
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `url` | none: a create gives it | The address of the GitLab itself, `https://` and a plain host name, not of a group or a project. The tokens are sent there. |
+| `concurrent` | 10 (20 in the large pool) | Jobs at once in the whole pool, whichever runner they come through. |
+| `jobCpu`, `jobMemory` | 2, `2GiB` | The CPU ceiling and the memory cap of a job's own container. `jobMemory` is a hard cap: a job that passes it is stopped by the kernel, and there is no swap. `jobCpu` is a ceiling and reserves nothing: jobs share the machine's CPUs. |
+| `serviceMemory` | `512MiB` | The memory cap of each service container a job starts beside it (`services:`), a database for instance. |
+| `jobServices` | 1 | How many services one job may start. A job that asks for more is failed by GitLab Runner. |
+| `runners` | one, named `pool` | One entry for each runner created in step 1: its `name` (yours, for the status lines), and optionally `limit` (jobs at once through this runner; 0 for none of its own), `jobCpu` and `jobMemory` (0 and `""` for the pool's). |
+| `memoryOvercommitPercent` | 100 | 100 to 200. Above 100 the jobs' memory caps may add up to that many percent of what the machine has for jobs ("When jobs differ in size" below). |
+| `reach` | `direct` | `direct`: the machine reaches GitLab over its own network. `tailnet`: it joins your tailnet first (below). |
+| `gitlabNode` | empty | Only with `reach` `tailnet`: the name of GitLab's node on the tailnet, for a `url` whose name only the tailnet's DNS knows (below). |
+
+Not for a create: `reserveMemory` (`4GiB`, kept back for the machine, Docker and GitLab Runner), `serviceCpu` (1),
+`freeDisk` (`40GiB`), `jobNetworks`, `privileged` and the three image pins. A pool with another one of those is a copy
+of the template.
+
+**3. The tokens.** The pool is created stopped. The token of the first entry of `runners` is the secret
+`GITLAB_RUNNER_TOKEN_1`, the second entry's `GITLAB_RUNNER_TOKEN_2`, up to `GITLAB_RUNNER_TOKEN_12`: the same number
+the owner's card gives the entry (`Setting runners 2`). Set each with `service_secret_set`, then `instance_start`.
+The pool starts nothing while an entry has no token, and names it:
+`waiting for secrets: runners 2 (test) needs GITLAB_RUNNER_TOKEN_2`.
+
+**What fits.** GitLab Runner admits jobs by their number, not by memory, so the pool checks the sum itself, once, at
+its start, against what the machine really reports (less than the size it was given: a 32GiB machine reports about
+31.3GiB). A job counts as its `jobMemory` plus `jobServices` times `serviceMemory`. The worst case fills the places of
+`concurrent` with the largest jobs first, each runner up to its `limit`. When that plus `reserveMemory` is more than
+the machine has, the pool does not start and says every number on its console (`service_logs`), again every five
+minutes:
+
+```
+arca-gitlab-pool: the pool does not start: its jobs could take 69632 MiB at once (8 of pool at 8704 MiB) and the machine has 27921 MiB for jobs (the 32017 MiB it reports, less reserveMemory 4096 MiB): 41711 MiB too much. ...
+```
+
+The create itself does not refuse such a sum yet: it is the machine that says it, so read `service_logs` after the
+first `instance_start`. With the defaults of services, a 32GiB pool holds three jobs of 8GiB and the large pool about
+six.
+
+CPUs are not reserved and not summed. A job's `jobCpu` is a ceiling on what its container may use, jobs share the
+machine's CPUs, and only a `jobCpu` above the machine's own count is refused at the start. A job that needs many CPUs
+for a short while (a compile that uses fifteen cores for a minute) is best given a runner of its own with a larger
+`jobCpu`: it then bursts without the test jobs being allowed the same.
+
+**When jobs differ in size.** One cap for every job must be the largest job's, and that cap times the jobs at once
+is far more memory than a mixed load uses. The honest fix is to tell the sizes apart, in GitLab: one runner for each
+size, each with its tag, and the large jobs tagged in `.gitlab-ci.yml`. Each runner is then a lane with its own
+`limit` and `jobMemory`, and the sum counts each lane's own limit times its own size, with `concurrent` as the
+ceiling over all:
+
+```json
+"settings": { "url": "https://gitlab.example.com", "concurrent": 10,
+  "runners": [ { "name": "large", "limit": 3, "jobCpu": 8, "jobMemory": "9728MiB" },
+               { "name": "standard", "limit": 7, "jobCpu": 4, "jobMemory": "4608MiB" } ] }
+```
+
+That is three jobs of 10240MiB (9728 and a service's 512) and seven of 5120MiB: 66560MiB when every lane is full.
+The large pool has about 59938MiB for jobs, so as written it is refused, with those numbers. It starts with five
+standard jobs instead of seven (56320MiB), with `jobServices` 0 and six standard jobs (56832MiB), or as written with
+`memoryOvercommitPercent` 115, which is a small overcommit beside one cap for all.
+
+`memoryOvercommitPercent` is for a load that cannot be told apart, because nobody will tag the jobs: every job then
+gets the one large cap, and the setting lets the caps add up to more than the machine has, to at most twice. With
+150, the large pool takes eight jobs of 10240MiB (81920MiB against 59938MiB). What stays true: every container keeps
+its own hard cap, so a job that passes its cap is the one that is stopped, not its neighbours. What is given up: the
+promise that the machine itself cannot run out. If many large jobs peak together it can, and the kernel then picks
+what it stops, which may be a job that was within its cap, or Docker. The pool says the factor and this risk at its
+start and in every status block whenever the setting is not 100. Measure what your jobs really use before you set it,
+and prefer lanes.
+
+**More capacity** is a second pool, on the same node or another, created with the same runners: GitLab lets one
+runner's token serve several machines and hands each job to whichever asks first. Create it, set the same tokens,
+start it. Nothing in Arca grows a pool by the length of GitLab's queue.
+
+### What keeps jobs apart, and what does not
+
+- **Containers, in one machine.** A job is a set of containers (its own, its services', GitLab Runner's helper) on a
+  network of its own, so one job cannot connect to another job's database. No job container is privileged, none gets
+  the Docker daemon's socket or a path of the machine, and nothing a job wrote is kept for the next one: no cache
+  volume, a fresh clone every time. Jobs start as root inside their container, as GitLab's docker executor has it, so
+  `apt-get install` works.
+- **That is container isolation, no more.** All jobs of all the pool's runners share one Docker daemon and one
+  kernel. A kernel bug or a container escape gives a job the virtual machine: every runner's token in it, the other
+  jobs, and with `reach` `tailnet` the machine's place on your tailnet. The virtual machine is the wall that holds:
+  a job that takes it over has that machine and the network it is on, not the machine Arca runs on, Arca's other
+  services or Arca's secrets.
+- **So pool only what trusts each other that far.** Put runners in one pool when their projects could share a
+  runner anyway. A runner that signs or attests releases should not share a pool with jobs of merge requests: keep
+  it in a pool of its own, or outside Arca.
+- **`privileged` is off.** A job that needs Docker itself (docker-in-docker) fails in this pool. A copy of the
+  template with `"privileged": true` turns it on for every job; every status block then begins with a warning,
+  because a privileged job container can take over the machine without any bug.
+- **No disk limit per job.** A job can fill the machine's disk. When less than `freeDisk` is free the pool removes
+  the images no running job uses and says so; a disk that stays short is in the status as a warning.
+
+### Reaching a GitLab that is not on the internet
+
+Created without `bridge`, the pool is on Arca's service network, which leads to the internet and nowhere else: a
+GitLab on a private address or on a tailnet is not reached from there. Two ways:
+
+- **Through the node's own network.** Create the pool with `bridge` on a host bridge whose network leads to GitLab.
+  The machine, and every job in it, is then on that network like any machine plugged into it.
+- **`"reach": "tailnet"`.** The machine joins your tailnet itself, which works from the service network. Set the
+  secret `TAILSCALE_AUTHKEY` (an auth key from your tailnet's admin pages) beside the tokens. The pool runs a
+  Tailscale node (1.104.4, by digest) in the machine's own network; the key is handed over as a file the node is told
+  the path of, and the node keeps its identity on the pool's disk, so a one-use key is enough. Every job can then
+  reach whatever the tailnet lets this machine reach: give the key a tag whose access rule admits GitLab and nothing
+  else.
+
+The machine does not use the tailnet's own DNS, so on a tailnet the pool has to learn where GitLab is. It reads the
+tailnet's own list of nodes, and the console says which of three cases applied:
+
+| The `url` names GitLab by | What the pool does | On the console |
+|---------------------------|--------------------|----------------|
+| its full name on the tailnet (`https://gitlab.<tailnet>.ts.net`, the name a tailnet certificate is for) | Finds the node of that name and tells its address to GitLab Runner and to every job. | `the url's name ... is the name of a node of this tailnet, at ...` |
+| a name of your own domain that ordinary DNS answers with GitLab's tailnet address | Nothing more: the name resolves like any name. | `... is not the name of a node of this tailnet, so it is looked up in DNS like any name` |
+| a name of your own domain that only the tailnet's DNS knows | Needs `gitlabNode` at create: the name of GitLab's node on the tailnet (its machine name there, or its full tailnet name). Its address is told to GitLab Runner and to every job for the url's name, so GitLab's certificate is still checked against the url's name. | `settings.gitlabNode names the tailnet's node ..., at ...` |
+
+A `gitlabNode` the tailnet does not show is not passed over: the pool starts nothing, lists the nodes the tailnet
+does show, and looks again. A node is shown only when the tailnet's access rules let this machine reach it.
+
+Not reached with `reach` `tailnet`: a GitLab that is no node of the tailnet itself but sits behind one that routes a
+subnet (the pool accepts no routes), and any other name that only the tailnet's DNS knows, a registry for instance,
+which the jobs then cannot resolve.
+
+A pool that cannot reach its GitLab does not start GitLab Runner, and says which of the things in between it is, in
+one sentence each, before it tries again:
+
+| On the console | What to look at |
+|----------------|-----------------|
+| `the name ... does not resolve from this machine` | DNS: the name is known only inside a private network or a tailnet the machine is not on. A pool that is on the tailnet is told about `gitlabNode` instead. |
+| `resolves to ... and the connection to port 443 timed out` | A firewall or an access rule between the machine (or the node it goes out through) and GitLab. |
+| `resolves to ... and refuses the connection` | Nothing listens on that address and port. |
+| `its certificate is refused` | GitLab's certificate is from a private authority, or for another name. The pool trusts the public authorities only. |
+| `accepts the connection ... and did not answer`, `GitLab answered 502` | GitLab is reached and is not well. |
+| `GitLab answers and does not take GITLAB_RUNNER_TOKEN_2 (403)` | That token: reset, mistyped, or its runner deleted. The other runners run; this one is left out until a new token is set. |
+
+### Reading the pool
+
+Every minute the controller writes a status block to the machine's console, which is what `service_logs` returns,
+and one line when a job finishes:
+
+```
+arca-gitlab-pool: job runner=build project=45 job=8812 name="compile" result=success reason=- seconds=132
+arca-gitlab-pool: runner 1 build limit=2 job=4cpu/4096MiB jobs_done=41 jobs_failed=3
+arca-gitlab-pool: runner 2 test limit=none job=2cpu/2048MiB jobs_done=120 jobs_failed=9
+arca-gitlab-pool: recent job finished=2026-01-01T10:00:00Z runner=test project=45 job=8813 name="unit" result=failed reason=script_failure seconds=61
+arca-gitlab-pool: pool ci-pool for https://gitlab.example.com, reach direct, at most 6 jobs at once, 19456 MiB of the 27921 MiB the machine has for jobs (2 of build at 4608 MiB, 4 of test at 2560 MiB)
+arca-gitlab-pool: totals jobs_now=3 of 6 jobs_done=161 jobs_failed=12 runners=2 of 2 failures=0 disk_free=141202MiB
+```
+
+- `jobs_now` is the number of jobs that have a container on the machine at that moment, counted by the label GitLab
+  Runner gives its containers; `unknown` when Docker did not answer.
+- A job's line is GitLab Runner's own: the job's and the project's numbers as GitLab has them, the job's name, the
+  runner it came through, `success` or `failed` with GitLab's reason (`script_failure`, `job_canceled`,
+  `runner_system_failure` and so on) and its seconds. The pool measures nothing itself: GitLab Runner does not say
+  what a job used, so there is no memory or CPU per job here, as there is in the GitHub pool.
+- `jobs_done` and `jobs_failed` count since the controller started. `failures` are the pool's own: GitLab not
+  reached, a token refused, GitLab Runner or the tailnet node stopped.
+- A runner whose token GitLab refuses shows as `runner 2 test LEFT OUT:` with the reason, and `runners=1 of 2`.
+- All job lines are kept in the machine, in `/var/log/arca-gitlab-pool/jobs.tsv`; past 4MiB the file is set aside as
+  `jobs.tsv.1`.
+
+### What to know
+
+- **Where the tokens live.** In Arca's private `secrets/` directory, in the machine in `/etc/arca-secrets`, and in
+  GitLab Runner's `/etc/gitlab-runner/config.toml`, mode 0600 in a directory only root enters. They are never on a
+  command line and never printed: the pool does not run `gitlab-runner register`, which takes the token as an
+  argument, but writes the configuration itself and asks GitLab whether it takes each token with the token on the
+  request's body. GitLab Runner's own output inside the machine names a runner by the first characters of its token,
+  as GitLab's pages do; the pool copies none of that to the console.
+- **A new token.** `service_secret_set`, then `instance_start`: the start restarts nothing, the controller sees the
+  new value, asks GitLab about it and writes the configuration again, which GitLab Runner reads by itself. The pool
+  also asks GitLab about every token every ten minutes, so a token reset in GitLab shows in the status.
+- **Images.** A job's image is pulled when the job starts; when the registry does not answer, a copy already on the
+  machine is used. Name images by digest in `.gitlab-ci.yml`: the pool does not pin what your jobs run. A job without
+  an `image:` fails, since the pool has no default one.
+- **Stopping.** `instance_stop` and `instance_restart` need your approval. GitLab Runner is told to take no new job
+  and the jobs that run get a minute to finish; a job still running then is lost, and GitLab reports it as failed.
+- **Pins.** GitLab Runner is `registry.gitlab.com/gitlab-org/gitlab-runner` 19.5.3 and its helper is
+  `gitlab-runner-helper` `x86_64-v19.5.3`, both by digest, read from GitLab's registry when the template was written;
+  the tailnet node is `tailscale/tailscale` 1.104.4, the digest the workspace template pins. A pool keeps what it was
+  created with: for a newer GitLab Runner, create a second pool from a newer template and remove the first.
+- **Changing a pool.** Settings are read when the machine is created. To change one, create a second pool with the
+  same tokens, check it, and remove the first: both take jobs meanwhile.
+
 ## Tenants
 
 A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
@@ -3492,6 +3709,55 @@ Not proven yet, by these tests or on that node:
 - a pool inside a tenant;
 - the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work, and
   that a runner group's number is at the end of its page's address.
+
+### The GitLab pool
+
+`cargo test -p arca --test gitlab_runner_pool` runs the shipped controller, `templates/gitlab-runner-pool.sh run`,
+unchanged, against a fake GitLab (a small HTTP server in the test that answers the one call the controller makes, the
+token check) and a fake `docker` (`tests/gitlab_runner_pool/fake-docker.sh`, which keeps containers as directories
+and plays no GitLab Runner: a test writes the runner's output lines and makes the jobs' containers itself). It needs
+`bash`, `curl` and `jq`. As in the GitHub pool's tests, the controller's `PATH` holds the stand-ins and the programs
+the script declares and nothing else, no wait is without a bound, and no controller is ended with the `kill` program.
+
+It covers: every refusal of a setting, in its words; the sum of the jobs' memory against what the machine reports,
+with a runner's limit and a service's share, and the refusal with every number; which secret each entry of `runners`
+needs and that nothing starts without it; `config.toml` to the letter, with its modes, for one runner and for
+several; a token GitLab refuses, an old-kind token that is never sent, and a new secret that comes in without a
+restart of GitLab Runner; the sentences for a GitLab that cannot be reached; the status block, each finished job
+recorded once from GitLab Runner's output, and `jobs_now=unknown` when Docker does not answer; sizes too large to count with; a quote, a backslash and a line
+break in every setting that reaches the configuration; GitLab Runner started
+again when it stops; two lanes of different sizes and `memoryOvercommitPercent`, with its warning in every status; the tailnet node's
+start, a key the tailnet refuses, GitLab found by its full tailnet name in the node's own status (written as the
+real one writes it: the name with its last dot, in another case, an IPv6 address first), by the node `gitlabNode`
+names, or left to DNS, a named node the tailnet does not show, and GitLab's tailnet address told to the
+token check, to GitLab Runner and to the jobs; the disk kept free; `privileged` said in every status; that the two
+shipped definitions differ only in name, size and jobs at once and that the kernel takes a create's settings for
+them; the first boot's refusal when programs are missing; and that no token and no tailnet key is in any output, file
+or command line outside the three places they belong.
+
+Three of the sentences for an unreachable GitLab (a name that does not resolve, a connection that times out, a
+certificate that is refused) are driven by the exit status curl documents for each, which the test's curl wrapper
+ends with; a refused connection, a GitLab that takes the connection and does not answer, an answer that is not a
+GitLab's and a refused token are the real curl against the test's own server.
+
+Not proven by these tests, and not yet on any node, since the pool has not run against a real GitLab:
+
+- that GitLab Runner 19.5.3 runs from a `config.toml` it did not write itself (no `register`), takes the system id
+  the controller wrote beside it, and reads the file again when it changes;
+- that GitLab's token check answers as its documentation says (200 and 403) for a token with that system id;
+- that GitLab Runner's output has the fields the controller reads (`msg`, `job`, `job_name`, `project`,
+  `runner_name`, `job-status`, `failure_reason`, `duration_s`; read from its source at that release), and its
+  containers the labels the controller counts;
+- the limits themselves: that a job's container is capped at `jobMemory` and `jobCpu` and a service at
+  `serviceMemory`, that `services_limit` fails a job with more services, and that a job's network keeps another job
+  out;
+- a real job: pulling an image by digest, running as root, `apt-get`, artifacts passed between stages;
+- `GitLab Runner` told to finish (`docker stop --signal QUIT`) letting its jobs end;
+- everything of `reach` `tailnet` beyond the commands: that the node comes up in the machine's own network with the
+  capability and the device it is given, that containers' connections leave through it, and that the node's status
+  lists GitLab as the test's copy of it does (the fields are read from Tailscale's source at that release);
+- that the packages of `POOL_PACKAGES` bring every program of `POOL_PROGRAMS` on a real Debian 13: the first boot
+  checks it on the machine and names what is missing.
 
 ### The Automagik workspace
 

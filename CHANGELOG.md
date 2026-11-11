@@ -10,6 +10,20 @@ Write under this comment only what a reader needs beyond those lines; the releas
 - The README and `docs/QUICKSTART.md` now fetch the installer from the newest release
   (`https://github.com/automagik-si/arca/releases/latest/download/install.sh`) and no longer from the `dev` branch:
   what runs is the released `install.sh`, which that release's `SHA256SUMS` lists.
+- A new template, `gitlab-runner-pool`: one virtual machine that runs the CI jobs of one GitLab, self-hosted or
+  gitlab.com, with GitLab Runner 19.5.3 (by digest) and the docker executor. One pool serves up to twelve runners
+  created in GitLab, each with its own token (`GITLAB_RUNNER_TOKEN_1` to `GITLAB_RUNNER_TOKEN_12`), limit and size of
+  job, under one cap of jobs at once; `url`, `concurrent`, `jobCpu`, `jobMemory`, `serviceMemory`, `jobServices`,
+  `runners`, `memoryOvercommitPercent` and `reach` are given at create. Every job runs in fresh containers on a network of its own, never
+  privileged and never with the Docker daemon's socket; the virtual machine, not the container, is the boundary. The
+  pool checks the jobs' memory against what the machine reports and does not start when they do not fit, with the
+  numbers (`memoryOvercommitPercent`, 100 to 200, lets the caps add up to more than the machine has, for a mixed
+  load whose jobs cannot be told apart); it says in one sentence each why a GitLab is not reached (the name, a timeout, the certificate, a token);
+  and its status block has the jobs that run now and each finished job's result. With `reach` `tailnet` the machine
+  joins a tailnet (`TAILSCALE_AUTHKEY`) to reach a GitLab that is only there, found by its full tailnet name, by
+  ordinary DNS, or by the node `gitlabNode` names. `gitlab-runner-pool-large` is the same
+  pool in a machine of 32 CPUs and 64GiB. It has not run against a real GitLab yet: see "A pool of GitLab runners"
+  and "The GitLab pool" in `docs/OPERATING.md`.
 
 ## 0.8.0 (2026-11-11)
 

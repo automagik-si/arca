@@ -1,0 +1,37 @@
+{
+  "name": "gitlab-runner-pool",
+  "description": "GitLab CI jobs in one virtual machine (Debian 13; 16 CPUs, 32GiB, 200GiB): GitLab Runner 19.5.3 by digest, docker executor, up to 12 runners of one GitLab. A job runs in fresh, unprivileged containers on one Docker daemon: the machine is the boundary, not the container, so keep a signing or attested runner in a pool of its own or outside. More capacity is a second pool with the same tokens. Created stopped: give url and runners in settings, set GITLAB_RUNNER_TOKEN_<n>, then instance_start.",
+  "kind": "virtual-machine",
+  "image": "images:debian/13/cloud",
+  "limits": { "cpu": "16", "memory": "32GiB" },
+  "rootSize": "200GiB",
+  "autostart": true,
+  "firstBoot": { "file": "gitlab-runner-pool.sh" },
+  "secrets": [
+    "GITLAB_RUNNER_TOKEN_1", "GITLAB_RUNNER_TOKEN_2", "GITLAB_RUNNER_TOKEN_3", "GITLAB_RUNNER_TOKEN_4",
+    "GITLAB_RUNNER_TOKEN_5", "GITLAB_RUNNER_TOKEN_6", "GITLAB_RUNNER_TOKEN_7", "GITLAB_RUNNER_TOKEN_8",
+    "GITLAB_RUNNER_TOKEN_9", "GITLAB_RUNNER_TOKEN_10", "GITLAB_RUNNER_TOKEN_11", "GITLAB_RUNNER_TOKEN_12",
+    "TAILSCALE_AUTHKEY"
+  ],
+  "createSettings": ["url", "concurrent", "jobCpu", "jobMemory", "serviceMemory", "jobServices", "runners", "memoryOvercommitPercent", "reach", "gitlabNode"],
+  "settings": {
+    "url": "",
+    "concurrent": 10,
+    "jobCpu": 2,
+    "jobMemory": "2GiB",
+    "serviceMemory": "512MiB",
+    "jobServices": 1,
+    "runners": [{ "name": "pool", "limit": 0, "jobCpu": 0, "jobMemory": "" }],
+    "memoryOvercommitPercent": 100,
+    "reach": "direct",
+    "gitlabNode": "",
+    "serviceCpu": 1,
+    "reserveMemory": "4GiB",
+    "freeDisk": "40GiB",
+    "privileged": false,
+    "jobNetworks": "10.213.0.0/16",
+    "runnerImage": "registry.gitlab.com/gitlab-org/gitlab-runner@sha256:ffe21f021468d4aa1e56f05316d88597c23bf4818840e8edaa858131fabd7991",
+    "helperImage": "registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper@sha256:81cd16e217b2c45368c13c71197b11738158c435eee8a5fbb1bc2e34899ce338",
+    "tailnetImage": "docker.io/tailscale/tailscale@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c"
+  }
+}
