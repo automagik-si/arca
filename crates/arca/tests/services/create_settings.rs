@@ -363,10 +363,9 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
     let mut container = nats_template();
     container["createSettings"] = json!(["url"]);
     assert!(
-        load(container)
-            .expect_err("refused")
-            .message
-            .contains("only a virtual-machine template has a firstBoot or settings")
+        load(container).expect_err("refused").message.contains(
+            "only a virtual-machine template has a firstBoot, settings or createSettings"
+        )
     );
     // The shipped runner pool lets a create set where it registers and how it is sized, and nothing else: not its
     // pins, not its API address, not the switch for the default runner group.
@@ -637,7 +636,9 @@ fn kernel_access_and_create_settings_belong_to_two_kinds_of_template_and_neither
         load("both2", container)
             .expect_err("refused")
             .message
-            .contains("only a virtual-machine template has a firstBoot or settings")
+            .contains(
+                "only a virtual-machine template has a firstBoot, settings or createSettings"
+            )
     );
     // Each kind alone loads, and keeps what is its own.
     let mut kern = nats_template();

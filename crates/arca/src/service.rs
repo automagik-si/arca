@@ -1168,7 +1168,7 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         || !template.create_settings.is_empty()
     {
         return Err(TemplateError::refused(format!(
-            "template {name}: only a virtual-machine template has a firstBoot or settings"
+            "template {name}: only a virtual-machine template has a firstBoot, settings or createSettings"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {

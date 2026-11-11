@@ -3262,7 +3262,7 @@ Seen on a real node, on the first pool (a Debian 13 machine on a cloud node, ser
   runner-group requests and the registrations, and gives the registered runners jobs: four runners registered and
   ran this repository's gate;
 - the controller's lines reach `service_logs` through the virtual machine's console;
-- a slot's memory limit holds: a job that filled its slot stayed within it;
+- a slot's memory limit holds for what runs in the runner itself: a job that filled its slot stayed within it;
 - a slot whose runner was running a job was shown as idle, and the totals said `busy=0`. The pool asked Docker for
   the runner's processes in a form Docker refuses, so no job was ever seen as running and a job's seconds counted the
   runner's wait before it. The pool now reads the runner's own "Running job" line, which it had read correctly all
@@ -3282,8 +3282,8 @@ Not proven yet, by these tests or on that node:
 - jobs that use `container:` and `services:`;
 - that GitHub lists a runner as `offline` when it is, and answers a repository's `private` field as its
   documentation says;
-- that the CPU ceiling of a slot's slice holds for a job's own containers, and that the peak memory and CPU seconds
-  read from the slice are the job's;
+- that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, those it starts
+  through the slot's Docker daemon, and that the peak memory and CPU seconds read from the slice are the job's;
 - the cache bounds on a real disk, a real job's cleanup, and behaviour over days (token renewal after an hour, a host
   restart);
 - a pool inside a tenant;
@@ -3501,7 +3501,7 @@ the wall between the job and the machine Arca runs on.
 `test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class. The pool that serves this repository has
 two slots of each, `standard` with 2 CPUs and 4GiB and `large` with 6 CPUs and 10GiB, so all four jobs run at the
 same time once the machine has memory for all four slots ("Sizing so that every slot fits"). Those are not the
-shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the two CPU numbers
+shipped template's sizes (its two `large` slots have 6 CPUs and 9GiB). The workflow carries the two CPU numbers
 (`CI_SLOT_CPUS`); change them there when the pool's classes change.
 
 Every job has a time limit, 30 minutes for `cargo test` and 15 for the others: a job that hangs gives its slot back
