@@ -87,17 +87,16 @@ case $command in
     [ -d "$root/containers/$last" ] && echo 0 >"$root/containers/$last/exit"
     ;;
   exec)
-    # Only the tailnet node is asked anything: `tailscale --socket <path> status --json` and `... ip -4 [name]`.
+    # Only the tailnet node is asked anything, and only for its status: `tailscale --socket <path> status --json`,
+    # which the test writes as the real one answers (every node with its full name, ending with a dot, and its
+    # addresses). `tailscale ip <name>` is not played: the real one finds a node by its full name only with the last
+    # dot, so a controller that asked it would get nothing here either.
     [ -d "$root/containers/$1" ] && [ ! -e "$root/containers/$1/exit" ] || exit 1
     shift
     [ "${1-}" = tailscale ] && [ "${2-}" = --socket ] || exit 1
     shift 3
-    case "$*" in
-      'status --json') cat "$root/tailnet-status.json" 2>/dev/null || echo '{"BackendState":"Running"}' ;;
-      'ip -4') echo 100.64.0.7 ;;
-      'ip -4 '*) cat "$root/tailnet-peers/$3" 2>/dev/null || exit 1 ;;
-      *) exit 1 ;;
-    esac
+    [ "$*" = 'status --json' ] || exit 1
+    cat "$root/tailnet-status.json" 2>/dev/null || echo '{"BackendState":"Running"}'
     ;;
   image)
     case ${1-} in

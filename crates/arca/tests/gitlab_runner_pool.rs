@@ -392,6 +392,7 @@ fn settings(runners: Value, concurrent: u64) -> Value {
         "runners": runners,
         "memoryOvercommitPercent": 100,
         "reach": "direct",
+        "gitlabNode": "",
         "serviceCpu": 1,
         "reserveMemory": "4GiB",
         "freeDisk": "40GiB",
@@ -1007,7 +1008,7 @@ fn a_gitlab_that_cannot_be_reached_is_said_in_one_sentence_for_each_thing_in_bet
     exit("28");
     wait_for_words(
         &pool,
-        "arca-gitlab-pool: GitLab cannot be reached: the name gitlab.example.com does not resolve from this machine (the lookup timed out), so its DNS does not know it or does not answer. Trying again in ",
+        "arca-gitlab-pool: GitLab cannot be reached: the name gitlab.example.com does not resolve from this machine (the lookup timed out), so its DNS does not know it or does not answer. A GitLab on a private network or a tailnet has a name only that network's DNS answers: the machine's network must lead there, or the pool is created with reach \"tailnet\". Trying again in ",
     );
     fs::write(pool.dir.join("hosts/gitlab.example.com"), "192.0.2.10").expect("the name's address");
     wait_for_words(
@@ -1233,6 +1234,10 @@ fn settings_that_cannot_be_used_are_refused_in_words_and_nothing_is_started() {
     let numbers = "arca-gitlab-pool: settings: concurrent (jobs at once, 1 or more), jobCpu and serviceCpu (CPUs, 1 or more) and jobServices (services a job may start, 0 or more) are whole numbers";
     let sizes = "arca-gitlab-pool: settings: jobMemory, serviceMemory, reserveMemory and freeDisk are sizes such as 2GiB";
     let overcommit = "arca-gitlab-pool: settings: memoryOvercommitPercent is a whole number from 100 (the jobs' memory caps add up to no more than the machine has for jobs) to 200 (to twice that)";
+    let node_reach = "arca-gitlab-pool: settings: gitlabNode goes with reach \"tailnet\": it names GitLab's node on the tailnet the machine joins. With reach \"direct\" leave it empty";
+    let node_name = "arca-gitlab-pool: settings: gitlabNode is the name of GitLab's node on your tailnet (its machine name there, or its full tailnet name): letters, digits, dots and dashes";
+    let path = "arca-gitlab-pool: settings: url is the address of the GitLab itself, such as https://gitlab.example.com or https://example.com/gitlab: its path is letters, digits, dots, dashes and slashes";
+    let networks = "arca-gitlab-pool: settings: jobNetworks is the block of private addresses the jobs' own networks are cut from, such as 10.213.0.0/16: an IPv4 block of /8 to /20";
     let pinned = |key: &str| {
         format!(
             "arca-gitlab-pool: settings: {key} must name its image by digest, <name>@sha256:<64 hex digits>: the pool runs no image it cannot name exactly"
@@ -1283,6 +1288,54 @@ fn settings_that_cannot_be_used_are_refused_in_words_and_nothing_is_started() {
             with(&|s| s["jobNetworks"] = json!("10.213.0.0/24")),
             "arca-gitlab-pool: settings: jobNetworks is the block of private addresses the jobs' own networks are cut from, such as 10.213.0.0/16: an IPv4 block of /8 to /20".into(),
         ),
+        (with(&|s| s["gitlabNode"] = json!("gitlab-vm")), node_reach.into()),
+        (
+            with(&|s| {
+                s["reach"] = json!("tailnet");
+                s["gitlabNode"] = json!("gitlab vm");
+            }),
+            node_name.into(),
+        ),
+        (
+            with(&|s| {
+                s["reach"] = json!("tailnet");
+                s["gitlabNode"] = json!("gitlab\"\nvm");
+            }),
+            node_name.into(),
+        ),
+        (with(&|s| s["gitlabNode"] = json!(7)), node_name.into()),
+        // A quote, a backslash and a line break, in every setting that is written into GitLab Runner's
+        // configuration or onto a command line: each is refused by what the setting may hold, before anything runs.
+        (with(&|s| s["url"] = json!("https://gitlab.exa\"mple.com")), host.into()),
+        (with(&|s| s["url"] = json!("https://gitlab.example.com\\evil")), host.into()),
+        (with(&|s| s["url"] = json!("https://gitlab.example.com\n[[runners]]")), host.into()),
+        (with(&|s| s["url"] = json!("https://gitlab.example.com/a\"b")), path.into()),
+        (with(&|s| s["url"] = json!("https://gitlab.example.com/a\\b")), path.into()),
+        (
+            with(&|s| s["url"] = json!("https://gitlab.example.com/a\"\n[[runners]]\n  token = \"x")),
+            path.into(),
+        ),
+        (with(&|s| s["runners"] = json!([{ "name": "bu\"ild" }])), entry(1)),
+        (with(&|s| s["runners"] = json!([{ "name": "bu\\ild" }])), entry(1)),
+        (
+            with(&|s| s["runners"] = json!([{ "name": "build\"\n  token = \"x" }])),
+            entry(1),
+        ),
+        (
+            with(&|s| s["runners"] = json!([{ "name": "build", "jobMemory": "2GiB\"\n" }])),
+            entry(1),
+        ),
+        (
+            with(&|s| {
+                s["helperImage"] = json!(format!(
+                    "registry.example/helper\"\n@sha256:{}",
+                    "2".repeat(64)
+                ))
+            }),
+            pinned("helperImage"),
+        ),
+        (with(&|s| s["jobMemory"] = json!("2GiB\"")), sizes.into()),
+        (with(&|s| s["jobNetworks"] = json!("10.213.0.0/16\"")), networks.into()),
         (
             with(&|s| s["runners"] = json!([])),
             "arca-gitlab-pool: settings: runners needs at least one entry: one for each runner you created in GitLab, each with a name".into(),
@@ -1350,6 +1403,40 @@ fn jobs_that_do_not_fit_the_machine_are_refused_with_the_numbers_the_machine_rep
         &mixed(6),
         REPORTED_32GIB,
         "arca-gitlab-pool: the pool does not start: its jobs could take 29696 MiB at once (1 of large at 16896 MiB, 5 of small at 2560 MiB) and the machine has 27921 MiB for jobs (the 32017 MiB it reports, less reserveMemory 4096 MiB): 1775 MiB too much.",
+    );
+    // A size too large to count with: nine jobs of six digits of the largest unit would wrap the sum around to one
+    // that seems to fit. No size is multiplied before it is known to be at most the machine's whole memory.
+    let mut absurd = settings(one_runner(), 9);
+    absurd["jobMemory"] = json!("999999TiB");
+    absurd["jobServices"] = json!(0);
+    refused(
+        &absurd,
+        REPORTED_32GIB,
+        "arca-gitlab-pool: the pool does not start: runners 1 (pool) gives each job 1048574951424 MiB of memory (jobMemory) and the whole machine reports 32017 MiB. Give a job at most what the machine has for jobs, 27921 MiB, and create the pool again\n",
+    );
+    let mut absurd = settings(
+        json!([{ "name": "small" }, { "name": "huge", "jobMemory": "999999TiB" }]),
+        9,
+    );
+    absurd["memoryOvercommitPercent"] = json!(200);
+    refused(
+        &absurd,
+        REPORTED_32GIB,
+        "arca-gitlab-pool: the pool does not start: runners 2 (huge) gives each job 1048574951424 MiB of memory (jobMemory) and the whole machine reports 32017 MiB.",
+    );
+    let mut absurd = settings(one_runner(), 9);
+    absurd["serviceMemory"] = json!("999999TiB");
+    refused(
+        &absurd,
+        REPORTED_32GIB,
+        "arca-gitlab-pool: the pool does not start: serviceMemory gives each service 1048574951424 MiB and the whole machine reports 32017 MiB\n",
+    );
+    let mut absurd = settings(one_runner(), 9);
+    absurd["reserveMemory"] = json!("64GiB");
+    refused(
+        &absurd,
+        REPORTED_32GIB,
+        "arca-gitlab-pool: the pool does not start: reserveMemory keeps 65536 MiB back and the whole machine reports 32017 MiB, so nothing is left for jobs\n",
     );
     // More CPUs for a job than the machine has: Docker would refuse the container of every job.
     let mut wide = settings(one_runner(), 2);
@@ -1468,31 +1555,59 @@ fn jobs_that_do_not_fit_the_machine_are_refused_with_the_numbers_the_machine_rep
     assert_eq!(pool.stop(), Some(0));
 }
 
+/// What `tailscale status --json` answers on a node that is on the tailnet: itself, and every node the tailnet shows
+/// it, each with the name its machine reported (which is not what a node is found by), its full name on the tailnet,
+/// which ends with a dot, and its addresses.
+fn tailnet_status(nodes: &[(&str, &str, &[&str])]) -> String {
+    let peers: serde_json::Map<String, Value> = nodes
+        .iter()
+        .enumerate()
+        .map(|(n, (host_name, dns_name, addresses))| {
+            (
+                format!("nodekey:{n:064x}"),
+                json!({ "HostName": host_name, "DNSName": dns_name, "TailscaleIPs": addresses, "Online": true }),
+            )
+        })
+        .collect();
+    json!({
+        "BackendState": "Running",
+        "Self": {
+            "HostName": "pool1",
+            "DNSName": "pool1.tail0example.ts.net.",
+            "TailscaleIPs": ["100.64.0.7", "fd7a:115c:a1e0::7"]
+        },
+        "Peer": peers
+    })
+    .to_string()
+}
+
+const KEY: &str = "tskey-auth-synthetic0123456789-abcdefghijklmnopqrstuvwxyz";
+const SPENT_KEY: &str = "tskey-auth-spent0123456789-abcdefghijklmnopqrstuvwxyz";
+/// Another node of the tailnet, which is not GitLab.
+const DATABASE: (&str, &str, &[&str]) = ("db", "db.tail0example.ts.net.", &["100.64.0.3"]);
+
 #[test]
-fn reach_tailnet_joins_with_the_key_as_a_file_and_tells_every_job_where_gitlab_is() {
+fn reach_tailnet_joins_with_the_key_as_a_file_and_finds_gitlab_by_its_full_tailnet_name() {
     let good = token("tailnet");
-    let key = "tskey-auth-synthetic0123456789-abcdefghijklmnopqrstuvwxyz".to_string();
     let gitlab = Gitlab::start(std::slice::from_ref(&good));
+    // The url is GitLab's full name on the tailnet, the name its certificate is for.
+    let name = "gitlab.tail0example.ts.net";
+    let named = |text: String| text.replace("gitlab.example.com", name);
     let mut settings = settings(one_runner(), 4);
     settings["reach"] = json!("tailnet");
+    settings["url"] = json!(format!("https://{name}"));
     let mut pool = Pool::new(&settings, REPORTED_32GIB);
+    let status = pool.dir.join("docker/tailnet-status.json");
     pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
     // The tailnet does not take the first key.
-    fs::write(
-        pool.dir.join("docker/tailnet-status.json"),
-        r#"{"BackendState":"NeedsLogin"}"#,
-    )
-    .expect("the node's state");
+    fs::write(&status, r#"{"BackendState":"NeedsLogin"}"#).expect("the node's state");
     pool.start(&gitlab.url);
     wait_for_words(
         &pool,
         "arca-gitlab-pool: waiting for secrets: reach \"tailnet\" needs TAILSCALE_AUTHKEY. Set each with service_secret_set, then run instance_start\n",
     );
     assert!(pool.read("docker/calls.log").is_empty());
-    pool.secret(
-        "TAILSCALE_AUTHKEY",
-        "tskey-auth-spent0123456789-abcdefghijklmnopqrstuvwxyz\n",
-    );
+    pool.secret("TAILSCALE_AUTHKEY", &format!("{SPENT_KEY}\n"));
     wait_for_words(
         &pool,
         "arca-gitlab-pool: the tailnet did not take TAILSCALE_AUTHKEY: the key was used already, has expired or was revoked. Set another (service_secret_set, then instance_start); trying again in ",
@@ -1501,23 +1616,25 @@ fn reach_tailnet_joins_with_the_key_as_a_file_and_tells_every_job_where_gitlab_i
         gitlab.seen().is_empty(),
         "GitLab is not asked before the machine is on the tailnet"
     );
-    // The next key is taken, and GitLab is a node of the tailnet. The address the tailnet names for it is this
-    // test's own GitLab: curl connects where it is told, so the token check proves the address is used.
-    fs::create_dir_all(pool.dir.join("docker/tailnet-peers")).expect("the tailnet's nodes");
+    // The next key is taken, and GitLab is a node of the tailnet. The tailnet writes its full name with a dot at
+    // the end and in its own case, and lists an IPv6 address first; the name the machine itself reported is another.
+    // The address is this test's own GitLab: curl connects where it is told, so the token check proves it is used.
+    pool.secret("TAILSCALE_AUTHKEY", &format!("{KEY}\n"));
     fs::write(
-        pool.dir.join("docker/tailnet-peers/gitlab.example.com"),
-        "127.0.0.1\n",
-    )
-    .expect("GitLab's address on the tailnet");
-    pool.secret("TAILSCALE_AUTHKEY", &format!("{key}\n"));
-    fs::write(
-        pool.dir.join("docker/tailnet-status.json"),
-        r#"{"BackendState":"Running"}"#,
+        &status,
+        tailnet_status(&[
+            DATABASE,
+            (
+                "ip-10-0-0-5",
+                "GitLab.tail0example.ts.net.",
+                &["fd7a:115c:a1e0::9", "127.0.0.1"],
+            ),
+        ]),
     )
     .expect("the node's state");
     wait_for_words(
         &pool,
-        "arca-gitlab-pool: the machine is on the tailnet as 100.64.0.7; GitLab (gitlab.example.com) is the tailnet's node at 127.0.0.1, which GitLab Runner and every job are told\n",
+        "arca-gitlab-pool: the machine is on the tailnet as 100.64.0.7; the url's name gitlab.tail0example.ts.net is the name of a node of this tailnet, at 127.0.0.1: GitLab Runner and every job are told that address\n",
     );
     wait_for_runner(&pool, &[RUNNER, TAILNET]);
     // The node is in the machine's own network with the capability and the device an interface needs, and it is
@@ -1533,12 +1650,123 @@ fn reach_tailnet_joins_with_the_key_as_a_file_and_tells_every_job_where_gitlab_i
     );
     assert_eq!(
         fs::read_to_string(run.join("authkey")).expect("the key's copy"),
-        key
+        KEY
     );
     assert_eq!(mode(&run.join("authkey")), 0o400);
     assert_eq!(mode(&run), 0o700);
     assert_eq!(mode(&pool.dir.join("state/tailnet")), 0o700);
-    // GitLab's address on the tailnet is told to the token check, to GitLab Runner and to every job.
+    // The node is asked for its status and for nothing else: a name is never given to its own lookup.
+    assert!(
+        pool.read("docker/calls.log")
+            .lines()
+            .filter(|line| line.starts_with("exec "))
+            .all(|line| line
+                == format!("exec {TAILNET} tailscale --socket /tmp/tailscaled.sock status --json"))
+    );
+    // GitLab's address on the tailnet is told to the token check, to GitLab Runner and to every job, for the url's
+    // own name: the certificate is still checked against that name.
+    assert!(
+        pool.read("curl.log")
+            .lines()
+            .all(|line| line.ends_with(&format!(
+                "--data-binary @- --resolve 127.0.0.1:{}:127.0.0.1 {}/runners/verify",
+                gitlab.port, gitlab.url
+            )))
+    );
+    assert!(
+        pool.read(&format!("docker/containers/{RUNNER}/args"))
+            .contains(&format!(" --add-host {name}:127.0.0.1 "))
+    );
+    assert_eq!(
+        pool.config(),
+        named(head(4) + &section("pool", &good, 0, 2, 2048, false, Some("127.0.0.1")))
+    );
+    wait_for(&pool, "the reach in the status", || {
+        pool.read("logs/status.txt").contains(
+            "arca-gitlab-pool: pool pool1 for https://gitlab.tail0example.ts.net, reach tailnet (GitLab at 127.0.0.1 on the tailnet, a node by the url's own name), at most 4 jobs at once",
+        )
+    });
+
+    // The node stops, and GitLab is no longer a node the tailnet shows: the node is started again, the console says
+    // that the name is now left to DNS, and GitLab Runner is started again without the address.
+    fs::write(&status, tailnet_status(&[DATABASE])).expect("GitLab leaves");
+    fs::write(
+        pool.dir.join(format!("docker/containers/{TAILNET}/exit")),
+        "1",
+    )
+    .expect("the exit");
+    wait_for_words(
+        &pool,
+        "arca-gitlab-pool: the tailnet node is started again: it stopped, or TAILSCALE_AUTHKEY changed\narca-gitlab-pool: the machine is on the tailnet as 100.64.0.7; gitlab.tail0example.ts.net is not the name of a node of this tailnet, so it is looked up in DNS like any name, and must resolve there to an address this machine reaches. A name that only the tailnet's own DNS knows needs settings.gitlabNode\n",
+    );
+    wait_for(&pool, "GitLab Runner without the pinned address", || {
+        pool.read(&format!("docker/runs.{RUNNER}")) == "xx"
+            && pool.config() == named(head(4) + &section("pool", &good, 0, 2, 2048, false, None))
+    });
+    assert!(
+        !pool
+            .read(&format!("docker/containers/{RUNNER}/args"))
+            .contains("--add-host")
+    );
+    wait_for(&pool, "the reach in the status", || {
+        pool.read("logs/status.txt")
+            .contains("reach tailnet (GitLab's name looked up in DNS), at most 4 jobs at once")
+    });
+    assert_eq!(pool.stop(), Some(0));
+    no_credential(&pool, &[good, KEY.into(), SPENT_KEY.into()]);
+}
+
+#[test]
+fn a_gitlab_only_the_tailnets_dns_knows_is_found_by_the_node_the_settings_name() {
+    let good = token("node");
+    let gitlab = Gitlab::start(std::slice::from_ref(&good));
+    // The url is a name of the owner's own domain, which no node has and ordinary DNS does not answer: the settings
+    // say which node of the tailnet GitLab is, by its machine name there.
+    let mut settings = settings(one_runner(), 4);
+    settings["reach"] = json!("tailnet");
+    settings["gitlabNode"] = json!("gitlab-vm");
+    let mut pool = Pool::new(&settings, REPORTED_32GIB);
+    let status = pool.dir.join("docker/tailnet-status.json");
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    pool.secret("TAILSCALE_AUTHKEY", KEY);
+    // The tailnet does not show that node yet. A node whose machine reported that name is not it.
+    fs::write(
+        &status,
+        tailnet_status(&[
+            DATABASE,
+            ("gitlab-vm", "old-box.tail0example.ts.net.", &["100.64.0.4"]),
+        ]),
+    )
+    .expect("the node's state");
+    pool.start(&gitlab.url);
+    wait_for_words(
+        &pool,
+        "arca-gitlab-pool: the machine is on the tailnet as 100.64.0.7, and the tailnet shows it no node named gitlab-vm (settings.gitlabNode). The nodes it shows: db, old-box. The name is the node's machine name on the tailnet, or its full tailnet name; and a node is shown only when the tailnet's access rules let this machine reach it. Looking again in ",
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    // Nothing goes on without it: GitLab is not asked and GitLab Runner is not started.
+    assert!(gitlab.seen().is_empty() && pool.read("curl.log").is_empty());
+    assert_eq!(pool.containers(), [TAILNET]);
+    // The node appears. It is found without the tailnet node being started again.
+    fs::write(
+        &status,
+        tailnet_status(&[
+            DATABASE,
+            (
+                "ip-10-0-0-5",
+                "gitlab-vm.tail0example.ts.net.",
+                &["127.0.0.1", "fd7a:115c:a1e0::9"],
+            ),
+        ]),
+    )
+    .expect("the node's state");
+    wait_for_words(
+        &pool,
+        "arca-gitlab-pool: the machine is on the tailnet as 100.64.0.7; settings.gitlabNode names the tailnet's node gitlab-vm, at 127.0.0.1: GitLab Runner and every job are told that gitlab.example.com is at that address\n",
+    );
+    wait_for_runner(&pool, &[RUNNER, TAILNET]);
+    assert_eq!(pool.read(&format!("docker/runs.{TAILNET}")), "x");
+    // The address is given for the url's name, so the certificate is checked against the url's name.
     assert!(
         pool.read("curl.log")
             .lines()
@@ -1557,40 +1785,34 @@ fn reach_tailnet_joins_with_the_key_as_a_file_and_tells_every_job_where_gitlab_i
     );
     wait_for(&pool, "the reach in the status", || {
         pool.read("logs/status.txt").contains(
-            "arca-gitlab-pool: pool pool1 for https://gitlab.example.com, reach tailnet (GitLab at 127.0.0.1 on the tailnet), at most 4 jobs at once",
+            "reach tailnet (GitLab at 127.0.0.1 on the tailnet, the node settings.gitlabNode names), at most 4 jobs at once",
         )
     });
+    assert_eq!(pool.stop(), Some(0));
+    no_credential(&pool, &[good.clone(), KEY.into()]);
+    drop(pool);
 
-    // The node stops: it is started again, and GitLab Runner with it, since GitLab's address may have changed.
-    fs::remove_file(pool.dir.join("docker/tailnet-peers/gitlab.example.com"))
-        .expect("GitLab leaves");
+    // A pool on the tailnet whose url is neither a node's name nor a name DNS answers is not told to join the
+    // tailnet, which it has: it is told about settings.gitlabNode.
+    settings["gitlabNode"] = json!("");
+    let mut pool = Pool::new(&settings, REPORTED_32GIB);
+    pool.secret("GITLAB_RUNNER_TOKEN_1", &good);
+    pool.secret("TAILSCALE_AUTHKEY", KEY);
     fs::write(
-        pool.dir.join(format!("docker/containers/{TAILNET}/exit")),
-        "1",
+        pool.dir.join("docker/tailnet-status.json"),
+        tailnet_status(&[DATABASE]),
     )
-    .expect("the exit");
+    .expect("the node's state");
+    fs::write(pool.dir.join("curl-exit"), "6").expect("curl's exit status");
+    pool.start("https://gitlab.example.com/api/v4");
     wait_for_words(
         &pool,
-        "arca-gitlab-pool: the tailnet node is started again: it stopped, or TAILSCALE_AUTHKEY changed\narca-gitlab-pool: the machine is on the tailnet as 100.64.0.7; gitlab.example.com is not the name of a node of this tailnet, so it is looked up in DNS as any name\n",
+        "arca-gitlab-pool: GitLab cannot be reached: the name gitlab.example.com does not resolve from this machine, so its DNS does not know it. The machine is on the tailnet, and the name is neither the name of one of its nodes nor one that ordinary DNS answers. If only the tailnet's own DNS knows it, create the pool with settings.gitlabNode, the name of GitLab's node on the tailnet. Trying again in ",
     );
-    wait_for(&pool, "GitLab Runner without the pinned address", || {
-        pool.read(&format!("docker/runs.{RUNNER}")) == "xx"
-            && pool.config() == head(4) + &section("pool", &good, 0, 2, 2048, false, None)
-    });
-    assert!(
-        !pool
-            .read(&format!("docker/containers/{RUNNER}/args"))
-            .contains("--add-host")
-    );
+    assert!(!pool.output().contains("created with reach"));
+    assert_eq!(pool.containers(), [TAILNET]);
     assert_eq!(pool.stop(), Some(0));
-    no_credential(
-        &pool,
-        &[
-            good,
-            key,
-            "tskey-auth-spent0123456789-abcdefghijklmnopqrstuvwxyz".into(),
-        ],
-    );
+    no_credential(&pool, &[good, KEY.into()]);
 }
 
 #[test]
@@ -1702,7 +1924,8 @@ fn the_shipped_templates_are_two_sizes_of_one_pool_with_its_script_its_secrets_a
                 "jobServices",
                 "runners",
                 "memoryOvercommitPercent",
-                "reach"
+                "reach",
+                "gitlabNode"
             ]
         );
         // Both sizes boot the one script, which is the controller itself, and `arca templates install` ships it.
@@ -1726,6 +1949,7 @@ fn the_shipped_templates_are_two_sizes_of_one_pool_with_its_script_its_secrets_a
         assert_eq!(settings["url"], "");
         assert_eq!(settings["privileged"], false);
         assert_eq!(settings["memoryOvercommitPercent"], 100);
+        assert_eq!(settings["gitlabNode"], "");
         assert_eq!(settings["reach"], "direct");
         assert_eq!(settings["concurrent"], concurrent);
         for key in ["runnerImage", "helperImage", "tailnetImage"] {

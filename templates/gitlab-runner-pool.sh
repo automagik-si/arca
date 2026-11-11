@@ -75,7 +75,7 @@ TAILNET_SOCKET=/tmp/tailscaled.sock
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it. crates/arca/tests/gitlab_runner_pool.rs runs the controller with nothing else on its
 # PATH, so a program used below and not listed here fails that test.
-POOL_PROGRAMS='docker jq curl systemctl apt-get hostname getent timeout nproc df awk sed grep cat chmod cut date head
+POOL_PROGRAMS='docker jq curl systemctl apt-get hostname getent timeout nproc df awk sed grep cat chmod cut date
 install mkdir mv od rm sha256sum sleep sort stat tail tee tr'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
@@ -337,6 +337,17 @@ load_settings() {
     say "settings: reach is how the machine reaches GitLab: \"direct\" (over the machine's own network; also when it is left out) or \"tailnet\" (the machine joins your tailnet with TAILSCALE_AUTHKEY)"
     return 1
   fi
+  # With reach "tailnet": the tailnet's own name of GitLab's node, for a url whose name only the tailnet's DNS knows.
+  GITLAB_NODE=$(jq -r '.gitlabNode | if . == null then "" elif type == "string" then . else "!" end' "$POOL_SETTINGS")
+  case $GITLAB_NODE in *[!A-Za-z0-9.-]* | [.-]* | *..*) GITLAB_NODE='!' ;; esac
+  if [ "$GITLAB_NODE" = '!' ] || [ ${#GITLAB_NODE} -gt 253 ]; then
+    say "settings: gitlabNode is the name of GitLab's node on your tailnet (its machine name there, or its full tailnet name): letters, digits, dots and dashes"
+    return 1
+  fi
+  if [ -n "$GITLAB_NODE" ] && [ "$REACH" != tailnet ]; then
+    say "settings: gitlabNode goes with reach \"tailnet\": it names GitLab's node on the tailnet the machine joins. With reach \"direct\" leave it empty"
+    return 1
+  fi
   # Privileged job containers are off unless the settings say so in so many words: true, the JSON value.
   PRIVILEGED=$(jq -r '.privileged | if . == null or . == false then "false" elif . == true then "true" else "!" end' "$POOL_SETTINGS")
   if [ "$PRIVILEGED" = '!' ]; then
@@ -441,6 +452,23 @@ machine_fits() {
     stretched=", which memoryOvercommitPercent $OVERCOMMIT makes $(mib "$allowed") MiB"
     OVERCOMMIT_NOTE="WARNING: memoryOvercommitPercent is $OVERCOMMIT: the jobs' memory caps may add up to $((OVERCOMMIT / 100)).$(((OVERCOMMIT % 100) / 10))$((OVERCOMMIT % 10)) times the $(mib "$BUDGET") MiB the machine has for jobs. Every container keeps its own cap, so a job that passes its cap is the one that is stopped, not its neighbours. But if many large jobs peak together the machine itself can run out of memory, and the kernel then picks what it stops"
   fi
+  # No size is multiplied before it is known to be at most the machine's whole memory: a size of six digits of the
+  # largest unit, times the jobs at once, would pass what the shell can count, and a sum that wraps around would
+  # read as one that fits.
+  if [ "$RESERVE" -ge "$total" ]; then
+    FIT_WORDS="the pool does not start: reserveMemory keeps $(mib "$RESERVE") MiB back and the whole machine reports $(mib "$total") MiB, so nothing is left for jobs"
+    return 1
+  fi
+  for i in "${!R_NAME[@]}"; do
+    if [ "${R_MEM[$i]}" -gt "$total" ]; then
+      FIT_WORDS="the pool does not start: runners $((i + 1)) (${R_NAME[$i]}) gives each job $(mib "${R_MEM[$i]}") MiB of memory (jobMemory) and the whole machine reports $(mib "$total") MiB. Give a job at most what the machine has for jobs, $(mib "$BUDGET") MiB, and create the pool again"
+      return 1
+    fi
+  done
+  if [ "$JOB_SERVICES" -gt 0 ] && [ "$SERVICE_MEM" -gt "$total" ]; then
+    FIT_WORDS="the pool does not start: serviceMemory gives each service $(mib "$SERVICE_MEM") MiB and the whole machine reports $(mib "$total") MiB"
+    return 1
+  fi
   cpus=${POOL_CPUS:-$(nproc 2>/dev/null)}
   case $cpus in '' | *[!0-9]*) cpus=0 ;; esac
   for i in "${!R_NAME[@]}"; do
@@ -528,6 +556,16 @@ resolved_address() {
   timeout 10 getent hosts "$CHECK_HOST" 2>/dev/null | awk 'NR == 1 { printf "%s", $1 }'
 }
 
+# What to do about a name the machine's DNS does not know, for the reach the pool has. A pool that is already on the
+# tailnet is not told to join it: there the name is neither a node's own name nor one ordinary DNS answers.
+unresolved_advice() {
+  if [ "$REACH" = tailnet ]; then
+    echo "The machine is on the tailnet, and the name is neither the name of one of its nodes nor one that ordinary DNS answers. If only the tailnet's own DNS knows it, create the pool with settings.gitlabNode, the name of GitLab's node on the tailnet"
+  else
+    echo "A GitLab on a private network or a tailnet has a name only that network's DNS answers: the machine's network must lead there, or the pool is created with reach \"tailnet\""
+  fi
+}
+
 # Why GitLab could not be asked, from curl's exit status: one sentence for each thing that can stand between the
 # machine and GitLab, so the owner knows which one to look at.
 unreachable_words() {
@@ -535,7 +573,7 @@ unreachable_words() {
   address=$(resolved_address)
   case $status in
     6)
-      echo "GitLab cannot be reached: the name $CHECK_HOST does not resolve from this machine, so its DNS does not know it. A GitLab on a private network or a tailnet has a name only that network's DNS answers: the machine's network must lead there, or the pool is created with reach \"tailnet\""
+      echo "GitLab cannot be reached: the name $CHECK_HOST does not resolve from this machine, so its DNS does not know it. $(unresolved_advice)"
       ;;
     7)
       echo "GitLab cannot be reached: $CHECK_HOST resolves to ${address:-an address} and refuses the connection on port $CHECK_PORT. Nothing listens there, or a firewall answers for it"
@@ -546,7 +584,7 @@ unreachable_words() {
       elif [ -n "$address" ]; then
         echo "GitLab cannot be reached: $CHECK_HOST resolves to $address and the connection to port $CHECK_PORT timed out after $POOL_CONNECT_WAIT seconds. The name is known and nothing answers: a firewall or an access rule between this machine and GitLab drops it (on a tailnet, the rule that lets this machine, or the node it goes out through, reach GitLab)"
       else
-        echo "GitLab cannot be reached: the name $CHECK_HOST does not resolve from this machine (the lookup timed out), so its DNS does not know it or does not answer"
+        echo "GitLab cannot be reached: the name $CHECK_HOST does not resolve from this machine (the lookup timed out), so its DNS does not know it or does not answer. $(unresolved_advice)"
       fi
       ;;
     51 | 60 | 77 | 83 | 90 | 91)
@@ -775,10 +813,64 @@ ipv4() {
   [ "$count" = 4 ]
 }
 
+# The IPv4 address the tailnet gives the node named $1, read from the tailnet's own status ($2, the answer of
+# `tailscale status --json`), or nothing. The status lists every node with its full name, which ends with a dot, and
+# its addresses. A name with a dot in it is a full name and must be one, whatever its case and with or without the
+# last dot; a name without a dot is the node's machine name, the full name's first part. (`tailscale ip <name>` is
+# not asked: it takes a full name only with its last dot, which no URL has.)
+tailnet_address() {
+  printf '%s' "$2" | jq -r --arg name "$1" '
+    ($name | ascii_downcase | rtrimstr(".")) as $wanted
+    | [(.Peer // {} | .[]), (.Self // empty)]
+    | map(select(type == "object")
+        | ((.DNSName // "") | tostring | ascii_downcase | rtrimstr(".")) as $full
+        | select($full != "" and ($full == $wanted or (($wanted | contains(".") | not) and ($full | split(".") | .[0]) == $wanted))))
+    | (.[0].TailscaleIPs // []) | map(tostring | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))) | .[0] // empty' 2>/dev/null
+}
+
+# Where GitLab is, for a machine that is on the tailnet with the status $1. One of three, and the console says which:
+# - settings.gitlabNode names GitLab's node: its tailnet address is told to GitLab Runner and to every job for the
+#   url's name. This is for a url whose name only the tailnet's own DNS knows; the name stays the url's, so GitLab's
+#   certificate still matches. A node of that name that the tailnet does not show is an error: returns 1.
+# - the url's own name is a node's name on the tailnet: its address is told the same way, so nothing depends on the
+#   tailnet's DNS, which the machine does not use.
+# - neither: the name is looked up in DNS like any name. That is right for a name ordinary DNS answers with GitLab's
+#   tailnet address.
+# $LOCATE_WORDS says it; $GITLAB_PIN is the address told, or empty; $REACH_WORDS is for the status block.
+tailnet_locate() {
+  local status=$1 own pin names
+  own=$(printf '%s' "$status" | jq -r '(.Self.TailscaleIPs // []) | map(tostring | select(test("^[0-9.]+$"))) | .[0] // empty' 2>/dev/null)
+  ipv4 "$own" || own='an address it did not name'
+  GITLAB_PIN=''
+  if [ -n "$GITLAB_NODE" ]; then
+    pin=$(tailnet_address "$GITLAB_NODE" "$status")
+    if ! ipv4 "$pin"; then
+      names=$(printf '%s' "$status" | jq -r '[.Peer // {} | .[] | (.DNSName // "") | tostring | ascii_downcase | split(".") | .[0] // "" | select(. != "")] | unique | .[0:12] | join(", ")' 2>/dev/null)
+      REACH_WORDS="GitLab's node $GITLAB_NODE not found on the tailnet"
+      LOCATE_WORDS="the machine is on the tailnet as $own, and the tailnet shows it no node named $GITLAB_NODE (settings.gitlabNode). The nodes it shows: $(plain "${names:-none}"). The name is the node's machine name on the tailnet, or its full tailnet name; and a node is shown only when the tailnet's access rules let this machine reach it"
+      return 1
+    fi
+    GITLAB_PIN=$pin
+    REACH_WORDS="GitLab at $pin on the tailnet, the node settings.gitlabNode names"
+    LOCATE_WORDS="the machine is on the tailnet as $own; settings.gitlabNode names the tailnet's node $GITLAB_NODE, at $pin: GitLab Runner and every job are told that $HOST is at that address"
+    return 0
+  fi
+  pin=$(tailnet_address "$HOST" "$status")
+  if ipv4 "$pin"; then
+    GITLAB_PIN=$pin
+    REACH_WORDS="GitLab at $pin on the tailnet, a node by the url's own name"
+    LOCATE_WORDS="the machine is on the tailnet as $own; the url's name $HOST is the name of a node of this tailnet, at $pin: GitLab Runner and every job are told that address"
+  else
+    REACH_WORDS="GitLab's name looked up in DNS"
+    LOCATE_WORDS="the machine is on the tailnet as $own; $HOST is not the name of a node of this tailnet, so it is looked up in DNS like any name, and must resolve there to an address this machine reaches. A name that only the tailnet's own DNS knows needs settings.gitlabNode"
+  fi
+  return 0
+}
+
 # Brings the node up and waits until the tailnet has taken it. A key the tailnet does not take is said, and the
 # node is started again when another key is set. Returns 1 only when the controller is stopping.
 tailnet_wait() {
-  local waited backend state own pin pause=0
+  local waited backend state status pause=0
   while [ -z "$STOP" ]; do
     if ! tailnet_start; then
       say "the tailnet node could not be started; trying again in 30 seconds"
@@ -790,26 +882,31 @@ tailnet_wait() {
     while [ -z "$STOP" ] && [ "$waited" -lt "$POOL_READY_WAIT" ]; do
       state=$(container_state "$TAILNET")
       [ "${state%% *}" = true ] || break
-      backend=$(tailnet_cli status --json | jq -r '.BackendState // empty' 2>/dev/null)
+      status=$(tailnet_cli status --json)
+      backend=$(printf '%s' "$status" | jq -r '.BackendState // empty' 2>/dev/null)
       case $backend in Running | NeedsLogin) break ;; esac
       nap 1
       waited=$((waited + 1))
     done
     [ -z "$STOP" ] || return 1
     if [ "$backend" = Running ]; then
-      own=$(tailnet_cli ip -4 | head -n1)
-      ipv4 "$own" || own='an address it did not name'
-      # A GitLab that is a node of this tailnet has an address the tailnet itself names. It is pinned: GitLab Runner
-      # and every job are told it, so none of them depends on the tailnet's DNS. Any other name is looked up as usual.
-      pin=$(tailnet_cli ip -4 "$HOST" | head -n1)
-      if ipv4 "$pin"; then
-        GITLAB_PIN=$pin
-        say "the machine is on the tailnet as $own; GitLab ($HOST) is the tailnet's node at $pin, which GitLab Runner and every job are told"
-      else
-        GITLAB_PIN=''
-        say "the machine is on the tailnet as $own; $HOST is not the name of a node of this tailnet, so it is looked up in DNS as any name"
-      fi
-      return 0
+      # The node stays up while a node the settings name is looked for: it may only not have been shown yet.
+      while [ -z "$STOP" ]; do
+        if tailnet_locate "$status"; then
+          say "$LOCATE_WORDS"
+          return 0
+        fi
+        printf x >>"$POOL_RUN/failures"
+        pause=$((pause == 0 ? 5 : pause * 2))
+        [ "$pause" -gt "$POOL_BACKOFF_MAX" ] && pause=$POOL_BACKOFF_MAX
+        say "$LOCATE_WORDS. Looking again in $pause seconds"
+        nap "$pause"
+        state=$(container_state "$TAILNET")
+        [ "${state%% *}" = true ] || break
+        status=$(tailnet_cli status --json)
+      done
+      [ -z "$STOP" ] || return 1
+      continue
     fi
     printf x >>"$POOL_RUN/failures"
     pause=$((pause == 0 ? 5 : pause * 2))
@@ -942,7 +1039,7 @@ print_status() {
     # The last finished jobs again, so they stay within reach of service_logs however many status blocks follow.
     tail -n "$POOL_STATUS_JOBS" "$POOL_LOGS/jobs.tsv" 2>/dev/null | awk -F'\t' '
       $1 != "finished" { printf "arca-gitlab-pool: recent job finished=%s runner=%s project=%s job=%s name=\"%s\" result=%s reason=%s seconds=%s\n", $1, $2, $3, $4, $5, $6, $7, $8 }'
-    say "pool $POOL_NAME for $URL, reach $REACH${GITLAB_PIN:+ (GitLab at $GITLAB_PIN on the tailnet)}, $FIT_WORDS"
+    say "pool $POOL_NAME for $URL, reach $REACH${REACH_WORDS:+ ($REACH_WORDS)}, $FIT_WORDS"
     [ "$PRIVILEGED" != true ] || say "WARNING: privileged is on: a job's container can take over this machine, read every token of the pool and reach whatever the machine reaches"
     [ -z "$OVERCOMMIT_NOTE" ] || say "$OVERCOMMIT_NOTE"
     [ -z "$GITLAB_NOTE" ] || say "$GITLAB_NOTE"
@@ -980,6 +1077,7 @@ run_pool() {
   JOBS_HEADER=$(printf 'finished\trunner\tproject\tjob\tname\tresult\treason\tseconds')
   [ -s "$POOL_LOGS/jobs.tsv" ] || printf '%s\n' "$JOBS_HEADER" >"$POOL_LOGS/jobs.tsv"
   GITLAB_PIN=''
+  REACH_WORDS=''
   GITLAB_NOTE=''
   JOBS_CURSOR=$(now)
   if ! machine_fits; then

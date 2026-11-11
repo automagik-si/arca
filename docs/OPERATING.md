@@ -3333,6 +3333,7 @@ pool needs; do not run the `gitlab-runner register` command GitLab shows beside 
 | `runners` | one, named `pool` | One entry for each runner created in step 1: its `name` (yours, for the status lines), and optionally `limit` (jobs at once through this runner; 0 for none of its own), `jobCpu` and `jobMemory` (0 and `""` for the pool's). |
 | `memoryOvercommitPercent` | 100 | 100 to 200. Above 100 the jobs' memory caps may add up to that many percent of what the machine has for jobs ("When jobs differ in size" below). |
 | `reach` | `direct` | `direct`: the machine reaches GitLab over its own network. `tailnet`: it joins your tailnet first (below). |
+| `gitlabNode` | empty | Only with `reach` `tailnet`: the name of GitLab's node on the tailnet, for a `url` whose name only the tailnet's DNS knows (below). |
 
 Not for a create: `reserveMemory` (`4GiB`, kept back for the machine, Docker and GitLab Runner), `serviceCpu` (1),
 `freeDisk` (`40GiB`), `jobNetworks`, `privileged` and the three image pins. A pool with another one of those is a copy
@@ -3425,17 +3426,32 @@ GitLab on a private address or on a tailnet is not reached from there. Two ways:
 - **`"reach": "tailnet"`.** The machine joins your tailnet itself, which works from the service network. Set the
   secret `TAILSCALE_AUTHKEY` (an auth key from your tailnet's admin pages) beside the tokens. The pool runs a
   Tailscale node (1.104.4, by digest) in the machine's own network; the key is handed over as a file the node is told
-  the path of, and the node keeps its identity on the pool's disk, so a one-use key is enough. When GitLab is itself a
-  node of the tailnet, the pool asks the tailnet for its address and tells it to GitLab Runner and to every job, so
-  none of them depends on the tailnet's DNS. Every job can then reach whatever the tailnet lets this machine reach:
-  give the key a tag whose access rule admits GitLab and nothing else.
+  the path of, and the node keeps its identity on the pool's disk, so a one-use key is enough. Every job can then
+  reach whatever the tailnet lets this machine reach: give the key a tag whose access rule admits GitLab and nothing
+  else.
+
+The machine does not use the tailnet's own DNS, so on a tailnet the pool has to learn where GitLab is. It reads the
+tailnet's own list of nodes, and the console says which of three cases applied:
+
+| The `url` names GitLab by | What the pool does | On the console |
+|---------------------------|--------------------|----------------|
+| its full name on the tailnet (`https://gitlab.<tailnet>.ts.net`, the name a tailnet certificate is for) | Finds the node of that name and tells its address to GitLab Runner and to every job. | `the url's name ... is the name of a node of this tailnet, at ...` |
+| a name of your own domain that ordinary DNS answers with GitLab's tailnet address | Nothing more: the name resolves like any name. | `... is not the name of a node of this tailnet, so it is looked up in DNS like any name` |
+| a name of your own domain that only the tailnet's DNS knows | Needs `gitlabNode` at create: the name of GitLab's node on the tailnet (its machine name there, or its full tailnet name). Its address is told to GitLab Runner and to every job for the url's name, so GitLab's certificate is still checked against the url's name. | `settings.gitlabNode names the tailnet's node ..., at ...` |
+
+A `gitlabNode` the tailnet does not show is not passed over: the pool starts nothing, lists the nodes the tailnet
+does show, and looks again. A node is shown only when the tailnet's access rules let this machine reach it.
+
+Not reached with `reach` `tailnet`: a GitLab that is no node of the tailnet itself but sits behind one that routes a
+subnet (the pool accepts no routes), and any other name that only the tailnet's DNS knows, a registry for instance,
+which the jobs then cannot resolve.
 
 A pool that cannot reach its GitLab does not start GitLab Runner, and says which of the things in between it is, in
 one sentence each, before it tries again:
 
 | On the console | What to look at |
 |----------------|-----------------|
-| `the name ... does not resolve from this machine` | DNS: the name is known only inside a private network or a tailnet the machine is not on. |
+| `the name ... does not resolve from this machine` | DNS: the name is known only inside a private network or a tailnet the machine is not on. A pool that is on the tailnet is told about `gitlabNode` instead. |
 | `resolves to ... and the connection to port 443 timed out` | A firewall or an access rule between the machine (or the node it goes out through) and GitLab. |
 | `resolves to ... and refuses the connection` | Nothing listens on that address and port. |
 | `its certificate is refused` | GitLab's certificate is from a private authority, or for another name. The pool trusts the public authorities only. |
@@ -3708,9 +3724,12 @@ with a runner's limit and a service's share, and the refusal with every number; 
 needs and that nothing starts without it; `config.toml` to the letter, with its modes, for one runner and for
 several; a token GitLab refuses, an old-kind token that is never sent, and a new secret that comes in without a
 restart of GitLab Runner; the sentences for a GitLab that cannot be reached; the status block, each finished job
-recorded once from GitLab Runner's output, and `jobs_now=unknown` when Docker does not answer; GitLab Runner started
+recorded once from GitLab Runner's output, and `jobs_now=unknown` when Docker does not answer; sizes too large to count with; a quote, a backslash and a line
+break in every setting that reaches the configuration; GitLab Runner started
 again when it stops; two lanes of different sizes and `memoryOvercommitPercent`, with its warning in every status; the tailnet node's
-start, a key the tailnet refuses, and GitLab's tailnet address told to the
+start, a key the tailnet refuses, GitLab found by its full tailnet name in the node's own status (written as the
+real one writes it: the name with its last dot, in another case, an IPv6 address first), by the node `gitlabNode`
+names, or left to DNS, a named node the tailnet does not show, and GitLab's tailnet address told to the
 token check, to GitLab Runner and to the jobs; the disk kept free; `privileged` said in every status; that the two
 shipped definitions differ only in name, size and jobs at once and that the kernel takes a create's settings for
 them; the first boot's refusal when programs are missing; and that no token and no tailnet key is in any output, file
@@ -3735,8 +3754,8 @@ Not proven by these tests, and not yet on any node, since the pool has not run a
 - a real job: pulling an image by digest, running as root, `apt-get`, artifacts passed between stages;
 - `GitLab Runner` told to finish (`docker stop --signal QUIT`) letting its jobs end;
 - everything of `reach` `tailnet` beyond the commands: that the node comes up in the machine's own network with the
-  capability and the device it is given, that containers' connections leave through it, and that the tailnet names
-  GitLab's address;
+  capability and the device it is given, that containers' connections leave through it, and that the node's status
+  lists GitLab as the test's copy of it does (the fields are read from Tailscale's source at that release);
 - that the packages of `POOL_PACKAGES` bring every program of `POOL_PROGRAMS` on a real Debian 13: the first boot
   checks it on the machine and names what is missing.
 

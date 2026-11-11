@@ -13,7 +13,7 @@
     "GITLAB_RUNNER_TOKEN_9", "GITLAB_RUNNER_TOKEN_10", "GITLAB_RUNNER_TOKEN_11", "GITLAB_RUNNER_TOKEN_12",
     "TAILSCALE_AUTHKEY"
   ],
-  "createSettings": ["url", "concurrent", "jobCpu", "jobMemory", "serviceMemory", "jobServices", "runners", "memoryOvercommitPercent", "reach"],
+  "createSettings": ["url", "concurrent", "jobCpu", "jobMemory", "serviceMemory", "jobServices", "runners", "memoryOvercommitPercent", "reach", "gitlabNode"],
   "settings": {
     "url": "",
     "concurrent": 20,
@@ -24,6 +24,7 @@
     "runners": [{ "name": "pool", "limit": 0, "jobCpu": 0, "jobMemory": "" }],
     "memoryOvercommitPercent": 100,
     "reach": "direct",
+    "gitlabNode": "",
     "serviceCpu": 1,
     "reserveMemory": "4GiB",
     "freeDisk": "40GiB",

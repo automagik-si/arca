@@ -20,7 +20,8 @@ Write under this comment only what a reader needs beyond those lines; the releas
   numbers (`memoryOvercommitPercent`, 100 to 200, lets the caps add up to more than the machine has, for a mixed
   load whose jobs cannot be told apart); it says in one sentence each why a GitLab is not reached (the name, a timeout, the certificate, a token);
   and its status block has the jobs that run now and each finished job's result. With `reach` `tailnet` the machine
-  joins a tailnet (`TAILSCALE_AUTHKEY`) to reach a GitLab that is only there. `gitlab-runner-pool-large` is the same
+  joins a tailnet (`TAILSCALE_AUTHKEY`) to reach a GitLab that is only there, found by its full tailnet name, by
+  ordinary DNS, or by the node `gitlabNode` names. `gitlab-runner-pool-large` is the same
   pool in a machine of 32 CPUs and 64GiB. It has not run against a real GitLab yet: see "A pool of GitLab runners"
   and "The GitLab pool" in `docs/OPERATING.md`.
 
