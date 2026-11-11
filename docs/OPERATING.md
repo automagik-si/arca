@@ -2863,11 +2863,25 @@ beside it.
 | `runnerImage`, `dockerImage` | The runner's and the Docker daemon's public images, pinned by digest. |
 | `enterprise`, `apiUrl` | For GitHub Enterprise only. The credential is sent to the API's host, so that host is never guessed: for `github.com` it is `https://api.github.com` and no setting changes it. A `url` on another host is refused unless `enterprise` is `true`; the API is then `https://<host>/api/v3`, or `apiUrl`, which must begin `https://` and be on that host or on `api.<host>`. |
 
-The virtual machine's own size is the template's `limits` and `rootSize`. The shipped numbers fit together: four
-`standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are 16 CPUs and 24GiB, and 4GiB is kept
-back. That is 28GiB of the machine's 32GiB on purpose: a virtual machine sees a little less memory than its size, and
-a slot that does not fit whole is never started. Settings are read when the pool is created and are fixed from then
-on (see "What to know").
+The virtual machine's own size is the template's `limits` and `rootSize`. Settings are read when the pool is created
+and are fixed from then on (see "What to know").
+
+**Sizing so that every slot fits.** A slot is started only while its whole memory fits, so the rule is:
+
+    the memory of all slots together  <=  the memory the machine reports  -  reserveMemory
+
+The machine reports less memory than the size in `limits`: its kernel keeps some for itself. The first pool's machine
+of 32GiB (32768 MiB) reported 32017 MiB, which is 751 MiB, or 2.3%, less. So keep the slots and `reserveMemory`
+together under about 97% of the machine's size: leave 1GiB free for every 32GiB. Sizes that add up to exactly the
+machine's size do not fit. That first pool had two slots of 4GiB, two of 10GiB and 4GiB kept back, 32GiB in all: it
+had 27921 MiB for slots, they asked for 28672 MiB, and the fourth slot stayed `queued` beside three idle ones. The
+controller now says this at its start and in every status block, as a `WARNING` with the numbers and how much is too
+much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
+once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
+that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
+
+The shipped numbers fit: four `standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are 16
+CPUs and 24GiB (24576 MiB), with 4GiB kept back, and a 32GiB machine has about 27900 MiB for slots.
 
 **4. Arca: `service_create`** with `{"name": "ci-pool", "template": "example-ci"}`. The pool is created and stays
 `stopped`, because it has no credential yet. Leave `bridge` out, so that it joins Arca's own service network (see
@@ -2887,6 +2901,16 @@ takes a few minutes.
 **7. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
 group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
 `ci-pool-<the pool's id>-standard-0-...` as idle.
+
+The first boot, before there is a controller, writes its own lines to the machine's console, which is where
+`service_logs` reads the controller's lines from. `arca-runner-pool: first boot: installing ...` is its first line and
+`first boot done: the controller is installed and started` its last. A first boot that could not finish ends with
+`first boot failed:` and the reason: the commands that are still missing after the install, by name, or that Docker
+or the controller's service did not start. These first-boot lines have not yet been seen in `service_logs` on a real
+pool, so do not read their absence as "still starting". If a pool that is `running` shows no line of the pool after a
+few minutes, look inside the machine: `/var/log/cloud-init-output.log` holds everything the first boot printed, its
+failure line included, and what the package manager itself said, which is never on the console. A machine whose first
+boot failed has no pool; remove it with `service_remove` and create it again once the cause is gone.
 
 **8. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
@@ -2938,9 +2962,19 @@ time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seco
 twenty thousand jobs) the file is set aside as `jobs.tsv.1`, replacing the one set aside before.
 
 **Sizing runners from real numbers.** The `class` line is what the last 2000 jobs of a class used, beside the size the
-class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit;
-one whose `max` is at its `memory` has jobs that were cut short for memory. `cpus used avg` far below `cpu` says the
-CPU ceiling is generous. New sizes go into the template, and a pool created from it has them.
+class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit.
+`cpus used avg` far below `cpu` says the CPU ceiling is generous. New sizes go into the template, and a pool created
+from it has them.
+
+A `max` that is at the class's `memory` does not by itself say the jobs need more. The peak is the kernel's count for
+the slot (`memory.peak`), and that count includes the files a job read and wrote that the kernel still keeps in memory
+(page cache). A build writes many gigabytes, so it fills whatever its slot has, and the kernel gives that memory back
+when the job asks for its own. Such a job may have been held at the limit, slowed or cut short, or may only have been
+caching. To tell, look at the job's result and seconds, or run it once in a smaller class and compare. On the first
+pool this repository's `cargo test` peaked at exactly the 10240 MiB of its slot. Measured on the machine the
+repository is built on, not on the pool, the same job needs about 3.2GiB of its own and 19GB of disk, and under a
+4GiB limit it still passes, 5% slower. So the pool's peak is read as page cache, and 10GiB as enough for that class;
+neither has been measured on the pool itself.
 
 ### What to know
 
@@ -3145,25 +3179,44 @@ that GitHub tells to update itself, a token renewed before an old runner is remo
 leftovers, the API host rule, and that no credential is in any output, file or command line.
 `crates/arca/tests/services/vm_secrets.rs` covers the kernel's half against the fake Incus.
 
-Not proven by these tests, because they need a real virtual machine and a real GitHub organisation:
+The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
+(`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
+machine after its install and names what is missing. No wait in these tests is without a bound, and none
+ends a controller with the `kill` program. Given a negative number, to signal a process group, that program reads
+only the number's first digit in procps-ng up to 4.0.4: it signals another group or, when the digit is 1, every
+process of the user. A failed test once waited for ever for a controller that program had not killed. Ubuntu 24.04,
+which the pool's job image is, carries that version, and so does Debian 12; Debian 13, which the pool's own machine
+is, has the fix (4.0.4-9), as has procps-ng from 4.0.5. Nothing else in this repository signals a process group
+through that program: the scripts use their shell's own `kill`, and the other uses name one process.
+One test runs the first boot itself as far as a test can, with a
+stand-in `apt-get` and two programs left missing: it must stop, name the two, and say so on the console. No test here
+runs apt, so none can prove that the packages of `POOL_PACKAGES` bring those programs on a real Debian.
 
-- that the virtual machine boots from `images:debian/13/cloud` on a real node, that cloud-init runs the first-boot
-  script and writes the settings, and that the guest agent takes the secret files and answers a read of their
-  directory as Incus's source says;
-- that a virtual machine on the service network reaches GitHub, the registries and Debian's mirrors: the NIC rules
-  allow it (the same rules every container service has) and Incus adds its own for DNS and DHCP, but no pool has
-  made the calls;
-- that Debian's Docker package installs, and that the two pinned images pull and start as the script starts them: the
-  slot's privileged daemon, the runner sharing its network and socket, the runner's command reading its registration
-  from the mounted file, jobs that use `container:` and `services:`;
-- that GitHub accepts the App's token and the registration requests as the fake does, answers the runner-group
-  requests in the shape the fake has, lists a runner as `offline` when it is, and gives a registered runner a job;
+Seen on a real node, on the first pool (a Debian 13 machine on a cloud node, serving this repository's own CI):
+
+- the virtual machine boots from `images:debian/13/cloud`, cloud-init runs the first-boot script and writes the
+  settings, and the guest agent takes both secret files into `/etc/arca-secrets`;
+- the virtual machine reaches Debian's mirrors, the registries and GitHub;
+- Debian's `docker.io` installs and its daemon runs. That first boot then stopped: on Debian 13 the `docker` command
+  is a package of its own, `docker-cli`, which `docker.io` only recommends, and the script did not name it. With
+  `docker-cli` installed by hand and the script run again, the rest went through at the first try;
+- the two pinned images pull and start as the script starts them, GitHub accepts the App's token, answers the
+  runner-group requests and the registrations, and gives the registered runners jobs: four runners registered and
+  ran this repository's gate;
+- the controller's lines reach `service_logs` through the virtual machine's console.
+
+Not proven yet, by these tests or on that node:
+
+- that a first boot with `docker-cli` in its package list finishes by itself on a fresh machine;
+- that the first boot's own lines reach `service_logs`: they are now written to the machine's console as the
+  controller's are, and the test reads them from a file in the console's place;
+- jobs that use `container:` and `services:`;
+- that GitHub lists a runner as `offline` when it is;
 - that a real runner told to update itself completes the update inside its container and then takes its job, and
   prints the line the pool looks for: the fake plays what the runner's own source does, a replacement of its
   directories that fails on a mount;
 - that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, and that the peak
   memory and CPU seconds read from the slice are the job's;
-- that the controller's lines reach `service_logs` through the virtual machine's console;
 - the cache bounds on a real disk, a real job's cleanup, and behaviour over days (token renewal after an hour, a host
   restart);
 - the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work, and
@@ -3379,8 +3432,12 @@ the wall between the job and the machine Arca runs on.
 **On the pool.** `fmt` and `canvas` ask for `[self-hosted, linux, x64, arca]`, the `standard` class; `clippy` and
 `test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class. The pool that serves this repository has
 two slots of each, `standard` with 2 CPUs and 4GiB and `large` with 6 CPUs and 10GiB, so all four jobs run at the
-same time. Those are not the shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the
-two CPU numbers (`CI_SLOT_CPUS`); change them there when the pool's classes change.
+same time once the machine has memory for all four slots ("Sizing so that every slot fits"). Those are not the
+shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the two CPU numbers
+(`CI_SLOT_CPUS`); change them there when the pool's classes change.
+
+Every job has a time limit, 30 minutes for `cargo test` and 15 for the others: a job that hangs gives its slot back
+then, and without a limit GitHub lets it hold the slot for six hours.
 
 A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs what is missing first: the
 toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's virtual machine and not its

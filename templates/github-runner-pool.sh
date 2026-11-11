@@ -4,7 +4,8 @@
 #
 # - Run with no argument it is the machine's first-boot script: cloud-init runs it once, as root. It installs Docker and
 #   the few tools the controller uses from the distribution's own packages, copies itself to
-#   /usr/local/sbin/arca-runner-pool and starts the controller as a systemd service.
+#   /usr/local/sbin/arca-runner-pool and starts the controller as a systemd service. What it says goes to the
+#   machine's console too (service_logs); the package manager's own output stays in /var/log/cloud-init-output.log.
 # - `arca-runner-pool run` is the controller. It keeps a set of slots. Each slot registers one just-in-time runner with
 #   GitHub (ephemeral: it takes one job and is then removed), runs it in a fresh container beside a Docker daemon of its
 #   own, records what the job used, removes both and starts over with a new registration.
@@ -37,6 +38,7 @@ set -u
 : "${POOL_CGROUP:=/sys/fs/cgroup}"
 : "${POOL_MEMINFO:=/proc/meminfo}"
 : "${POOL_UNITS:=/run/systemd/system}"
+: "${POOL_CONSOLE:=/dev/console}"
 : "${POOL_TICK:=5}"            # seconds between two passes of the controller
 : "${POOL_POLL:=3}"            # seconds between two looks at a running slot
 : "${POOL_STATUS_EVERY:=60}"   # seconds between two status blocks
@@ -49,6 +51,18 @@ set -u
 : "${POOL_STATUS_JOBS:=10}"    # finished jobs repeated in each status block
 
 INSTALLED=/usr/local/sbin/arca-runner-pool
+
+# Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
+# them is missing, and names it. crates/arca/tests/runner_pool.rs runs the controller with nothing else on its PATH,
+# so a program used below and not listed here fails that test.
+POOL_PROGRAMS='docker jq curl openssl flock systemctl apt-get hostname awk sed grep find cat chmod chown cut date du
+fold head id install mkdir mv od rm sha256sum sleep stat tail tee touch tr'
+
+# The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
+# is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
+# which docker.io only recommends. The ones the image already carries are named too, so the list says what the script
+# stands on.
+POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux coreutils hostname'
 # The runner image's own user and docker group (the image fixes both).
 RUNNER_UID=1001
 DOCKER_GID=123
@@ -65,19 +79,39 @@ nap() {
 # First boot
 # ---------------------------------------------------------------------------------------------------------------------
 
+# cloud-init keeps what the first boot prints in /var/log/cloud-init-output.log, inside the machine. The machine's
+# console is what service_logs returns, so the first boot says its own lines there as well: a first boot that fails
+# must not leave a machine that is running and silent.
+boot_say() {
+  say "$*"
+  { say "$*" >>"$POOL_CONSOLE"; } 2>/dev/null
+  return 0
+}
+
+# The programs of POOL_PROGRAMS that are not on this machine, in one line.
+missing_programs() {
+  local program missing=''
+  for program in $POOL_PROGRAMS; do
+    command -v "$program" >/dev/null 2>&1 || missing="$missing $program"
+  done
+  printf '%s' "${missing# }"
+}
+
 install_pool() {
   export DEBIAN_FRONTEND=noninteractive
-  local try
+  local try missing
+  boot_say "first boot: installing $POOL_PACKAGES"
   for try in 1 2 3 4 5 6; do
-    if apt-get update -q && apt-get install -y -q --no-install-recommends \
-      docker.io curl jq openssl ca-certificates util-linux coreutils; then
+    # shellcheck disable=SC2086
+    if apt-get update -q && apt-get install -y -q --no-install-recommends $POOL_PACKAGES; then
       break
     fi
-    say "first boot: the packages could not be installed (try $try of 6); trying again in 20 seconds"
+    boot_say "first boot: the packages could not be installed (try $try of 6); trying again in 20 seconds"
     sleep 20
   done
-  if ! command -v docker >/dev/null || ! command -v jq >/dev/null; then
-    say "first boot failed: docker and jq are not installed. The machine has no pool; service_remove it and create it again once it can reach its package mirror"
+  missing=$(missing_programs)
+  if [ -n "$missing" ]; then
+    boot_say "first boot failed: these commands are missing after the install: $missing. The packages asked for were: $POOL_PACKAGES. The package manager's own words are in /var/log/cloud-init-output.log inside the machine. The machine has no pool; service_remove it and create it again once it can reach its package mirror"
     exit 1
   fi
   mkdir -p /etc/docker
@@ -107,9 +141,11 @@ StandardError=journal+console
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl restart docker
-  systemctl enable --now arca-runner-pool.service
-  say "first boot done: the controller is installed and started"
+  if ! systemctl restart docker || ! systemctl enable --now arca-runner-pool.service; then
+    boot_say "first boot failed: Docker or the controller's service did not start. Inside the machine, 'systemctl status docker arca-runner-pool' says why. The machine has no pool"
+    exit 1
+  fi
+  boot_say "first boot done: the controller is installed and started"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -838,6 +874,8 @@ print_status() {
     tail -n "$POOL_STATUS_JOBS" "$POOL_LOGS/jobs.tsv" 2>/dev/null | awk -F'\t' '
       $1 != "finished" { printf "arca-runner-pool: recent job finished=%s slot=%s class=%s name=\"%s\" result=%s seconds=%s peak_memory_mib=%d cpu_seconds=%s\n", $1, $2, $3, $5, $6, $7, $8 / 1048576, $9 }'
     say "pool $POOL_NAME id $POOL_ID for $URL, $GROUP_NOTE"
+    [ -z "$NEVER_NOTE" ] || say "$NEVER_NOTE"
+    [ -z "$FIT_NOTE" ] || say "$FIT_NOTE"
     say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
   } | tee "$POOL_LOGS/status.txt.new"
   mv "$POOL_LOGS/status.txt.new" "$POOL_LOGS/status.txt"
@@ -858,12 +896,35 @@ run_pool() {
   load_pool_id
   JOBS_HEADER=$(printf 'finished\tslot\tclass\tlabels\tjob\tresult\tseconds\tpeak_memory_bytes\tcpu_seconds\trunner')
   [ -s "$POOL_LOGS/jobs.tsv" ] || printf '%s\n' "$JOBS_HEADER" >"$POOL_LOGS/jobs.tsv"
-  local total
+  local total wanted=0 slot
   total=$(meminfo_bytes MemTotal)
   BUDGET=$((${total:-0} - RESERVE))
   GROUP_NOTE=''
   GROUP_WORDS=''
   say "pool $POOL_NAME id $POOL_ID for $URL: $SLOTS slots in ${#CLASS_NAMES[@]} classes, at most $MAX_SLOTS at once, $(mib "$BUDGET") MiB of memory for slots"
+  # Slots that the cap lets run all at once need their memory all at once. The machine reports less memory than the
+  # size it was given, so sizes that add up to the machine's size do not fit, and one slot would stay queued for ever
+  # beside idle ones. A slot that is larger than all the memory there is for slots never starts, whatever the cap.
+  # Both are said at the start and in every status block, with the numbers.
+  FIT_NOTE=''
+  NEVER_NOTE=''
+  local never=''
+  for slot in "${!SLOT_MEM[@]}"; do
+    wanted=$((wanted + SLOT_MEM[slot]))
+    [ "${SLOT_MEM[$slot]}" -gt "$BUDGET" ] || continue
+    case ", $never" in
+      *", ${SLOT_CLASS[$slot]} ("*) ;;
+      *) never="${never:+$never, }${SLOT_CLASS[$slot]} ($(mib "${SLOT_MEM[$slot]}") MiB)" ;;
+    esac
+  done
+  if [ -n "$never" ]; then
+    NEVER_NOTE="WARNING: a slot of these classes is larger than the $(mib "$BUDGET") MiB the machine has for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $never. Such a slot never starts, and the jobs that ask for its labels wait for ever. Make the class or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
+    say "$NEVER_NOTE"
+  fi
+  if [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
+    FIT_NOTE="WARNING: the $SLOTS slots ask for $(mib "$wanted") MiB together and the machine has $(mib "$BUDGET") MiB for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $(mib $((wanted - BUDGET))) MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
+    say "$FIT_NOTE"
+  fi
   write_slices
 
   local waited=0
