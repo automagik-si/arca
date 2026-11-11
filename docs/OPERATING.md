@@ -4,6 +4,51 @@ The `arca` binary is Automagik Arca's one program. It runs one node's one-shot h
 the recording shim, and serves the Arca MCP. Every command that needs the node reads one JSON config file, given with
 `--config`.
 
+## Status
+
+Automagik Arca runs your services on machines you own. Set up the way the quickstart shows, an assistant can only look and propose. You approve with your passkey.
+
+- Arca is one program. Arca is open source under the Apache-2.0 licence.
+- A fresh install only looks: it changes nothing until you tell it which parts are its own.
+- Arca is self-hosted: it runs on machines you own, and Arca itself needs no outside service to work.
+- Arca keeps an append-only journal of the changes it applies. Starts, stops and restarts are logged separately.
+
+**Status: alpha.** Arca is an alpha, for one machine at a time. Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal. The current version is on the [releases page](https://github.com/automagik-si/arca/releases).
+
+| Works today | Not yet |
+|---|---|
+| Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | The installer sets up a read-only node only: letting Arca change things is still set up by hand. |
+| Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
+| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template, or Arca takes over one that already runs on the machine. |
+| Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
+| Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair things by itself. |
+
+## What it does today
+
+- **Reads.** Every project and instance is classed by owner and drift is reported (`watch_report`); host, pool, instance
+  and per-card GPU readings (`node_metrics`); alerts with a store of their own and a Prometheus export (`alerts_list`,
+  `GET /metrics`, `GET /alerts`).
+- **Writes.** A node whose config names kernel projects runs services from templates, Postgres databases, virtual
+  machines on bridged and mixed nodes, tenants in projects of their own, GPU assignment, instance start, stop and
+  restart, and snapshots onto a disk the owner plugs in. A `viewer` token only reads and proposes: a change an assistant
+  proposes waits for the owner, who approves it with a passkey on the approval page that `arca serve` serves. A delete of
+  a network, a project or a volume needs a signed owner approval. A node with no kernel project is watch-only and
+  writes nothing.
+- **Passkeys.** Arca is its own passkey verifier (WebAuthn ES256). The first passkey is enrolled with a one-time code
+  shown on the node's own screen, and a trusted passkey adds or removes another. Until a passkey is trusted, every
+  approval fails closed.
+- **Adoption and import.** `arca adopt` takes one listed container from the default project into a kernel project of its
+  own and back, keeping its MAC and IPv4. `service_import` takes over, in place, a service another manager created.
+- **The link.** `arca link` pairs two nodes with a one-time code and carries MCP calls between them
+  (`arca call --peer <name>`).
+- **The canvas.** [`packages/arca-canvas-dsh`](../packages/arca-canvas-dsh) is a DSH plugin that draws the node's machines,
+  projects and services, with a chat and in-canvas approvals.
+- **As a service.** `deploy/systemd/` holds two user units that run `arca serve` read-only, reaching Incus only through
+  the GET-only shim, with restart and memory limits.
+
+`docs/OPERATING.md` is the reference for all of it, and [`docs/OWNERSHIP.md`](OWNERSHIP.md)
+states what the kernel may touch.
+
 ## Commands
 
 | Command | Reads | Prints |
@@ -1661,10 +1706,10 @@ Both units restart on failure after 10 seconds, at most 5 times in 10 minutes (`
 use systemd specifiers only (`%h` for the home directory, `%t` for the user's runtime directory), so they carry no
 host-specific value.
 
-`scripts/install.sh` (README, "Install with one command") installs a unit of its own instead, `arca.service`: the
-node alone, reading the Incus socket its config names, with no shim and no memory limit, and with the same restart
-rule. It is for a first read-only node. The installer refuses a user who has either of the two units above, and its
-`--uninstall` leaves the program in place for them.
+`scripts/install.sh` (`docs/QUICKSTART.md`, "Install with one command") installs a unit of its own instead,
+`arca.service`: the node alone, reading the Incus socket its config names, with no shim and no memory limit, and with
+the same restart rule. It is for a first read-only node. The installer refuses a user who has either of the two units
+above, and its `--uninstall` leaves the program in place for them.
 
 What the host needs:
 

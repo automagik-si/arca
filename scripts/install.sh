@@ -6,7 +6,7 @@
 #   sh install.sh --uninstall          remove the program and the service this script installed
 #   sh install.sh --help
 #
-# It leaves what the README's "Quickstart: a read-only node in five minutes" leaves:
+# It leaves what the quickstart, docs/QUICKSTART.md ("By hand"), leaves:
 #
 #   ~/.local/bin/arca                        the program, checked against the release's SHA256SUMS
 #   ~/.config/arca/node.json                 the quickstart's smallest config; it names no kernel project, so the node
@@ -276,7 +276,7 @@ find_runtime_dir() {
     runtime_derived=1
 }
 
-# The config of the README's quickstart, for this user and this machine.
+# The config of the quickstart (docs/QUICKSTART.md), for this user and this machine.
 config_text() {
     cat <<EOF
 {
@@ -305,7 +305,7 @@ check_machine() {
         [ "$system" = Linux ] || problem "this is $system, and Arca's published program is for Linux only." \
             "Run this on a Linux machine with Incus."
         [ "$machine" = x86_64 ] || problem "this machine is $machine, and Arca's published program is for x86_64 only." \
-            "Run this on an x86_64 machine, or build Arca from source (README, \"Build and test\")."
+            "Run this on an x86_64 machine, or build Arca from source (docs/BUILDING.md, \"Build and test\")."
     fi
 
     glibc=
@@ -407,7 +407,7 @@ check_units() {
     if guide_name=$(guide_unit); then
         problem "this user already runs Arca as a service set up by hand: $unit_dir/$guide_name is there." \
             "This script sets up a first read-only node, and it would replace the program that service runs." \
-            "Upgrade that install by hand instead: step 1 of the README's quickstart, then restart the service."
+            "Upgrade that install by hand instead: step 1 of docs/QUICKSTART.md (\"By hand\"), then restart the service."
     elif exists "$unit_file" && ! unit_is_ours; then
         problem "$unit_file exists and this script did not write it." \
             "The installer's service has that name. Move that file away or rename your unit, then run this again."
