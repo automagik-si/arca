@@ -429,7 +429,10 @@ fn a_viewer_tools_list_omits_token_list_and_every_write_verb() {
             "service_logs",
             "owner_approval_list",
             "storage_list",
-            "snapshot_list"
+            "snapshot_list",
+            "tenant_list",
+            "tenant_status",
+            "tenant_usage"
         ]
     );
 }

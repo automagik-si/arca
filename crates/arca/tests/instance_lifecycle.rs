@@ -857,15 +857,15 @@ fn through_the_mcp_door_a_doctor_starts_and_a_stop_needs_the_owners_approval() {
             json!({ "readOnlyHint": false, "destructiveHint": true })
         );
         let schema = &tool(name)["inputSchema"];
-        assert_eq!(
-            schema["required"],
-            json!(["project", "instance", "approval"])
-        );
+        // The project is named by `project` or, in a tenant, by `tenant`: the handler requires one of the two.
+        // Nothing is required by the schema: the handler asks for the instance, and outside a tenant for the approval.
+        assert!(schema["required"].as_array().is_none_or(|r| r.is_empty()));
         assert_eq!(schema["properties"]["confirm"]["type"], json!("boolean"));
     }
-    assert_eq!(
-        tool("instance_start")["inputSchema"]["required"],
-        json!(["project", "instance"])
+    assert!(
+        tool("instance_start")["inputSchema"]["required"]
+            .as_array()
+            .is_none_or(|r| r.is_empty())
     );
     // A viewer is not offered any of the three, and a call is forbidden.
     let (_, listed) = door.rpc(&door.viewer, "tools/list", json!({}));

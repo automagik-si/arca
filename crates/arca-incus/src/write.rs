@@ -162,7 +162,8 @@ impl std::fmt::Debug for Reading {
     }
 }
 
-/// The projects the kernel may write in: the names its configuration lists, and nothing else.
+/// The projects the kernel may write in: the names its configuration lists and, on a node with tenants, the project of
+/// each tenant whose entry exists ([`ProjectFamily::with_tenants`]). Nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectFamily {
     projects: BTreeSet<String>,
@@ -187,6 +188,22 @@ impl ProjectFamily {
             projects.insert(name.to_string());
         }
         Ok(Self { projects })
+    }
+
+    /// The family with the projects of the tenants whose entries exist. A name that is not a tenant project's (a tenant
+    /// prefix and a tenant id) is refused, so nothing but a tenant's project joins a family this way; a reserved project
+    /// never does.
+    pub fn with_tenants<'a>(
+        mut self,
+        tenants: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, String> {
+        for name in tenants {
+            if arca_kernel::ownership::tenant_of_project(name).is_none() || segment(name).is_err() {
+                return Err("a tenant project does not carry the tenant prefix".to_string());
+            }
+            self.projects.insert(name.to_string());
+        }
+        Ok(self)
     }
 
     /// Whether a write of `kind` may name the project. A network, a forward and an ACL are addressed in [`NETWORK_HOME`] and

@@ -436,6 +436,63 @@ fn a_node_with_kernel_projects_reports_kernel_mode_before_any_document_applies()
     assert_eq!(serve.terminate().code(), Some(0));
 }
 
+/// `snapshot_list` as `arca serve` wires it: a call that names a tenant is answered for the tenant first. Without that
+/// wiring the call would list nothing and succeed.
+#[test]
+fn the_served_snapshot_list_answers_for_its_tenant_as_every_verb_does() {
+    for (tag, tenants, expected) in [
+        (
+            "snapshot-tenant-none",
+            Value::Null,
+            "this node has no tenants",
+        ),
+        (
+            "snapshot-tenant-unknown",
+            json!({
+                "capacity": { "instances": 8, "cpu": 8, "memory": "16GiB", "disk": "100GiB" },
+                "maxTenants": 2,
+                "defaultCaps": { "instances": 2, "containers": 2, "virtualMachines": 0, "cpu": 2,
+                    "memory": "4GiB", "disk": "40GiB" },
+                "createRate": { "count": 5, "perSeconds": 3600 }
+            }),
+            "tenant abcdefgh: not found",
+        ),
+    ] {
+        let scratch = Scratch::new(tag);
+        let rig = rig(&scratch);
+        let (hash_dir, secrets) = mint_tokens(&scratch);
+        let config = write_config(&scratch, rig.fake.socket(), &hash_dir);
+        let mut cfg: Value =
+            serde_json::from_slice(&fs::read(&config).expect("config")).expect("config JSON");
+        cfg["kernel"]["projects"] = json!([arca_netproject::PROJECT]);
+        cfg["kernel"]["serviceCidr"] = json!("192.0.2.0/24");
+        if !tenants.is_null() {
+            cfg["kernel"]["tenants"] = tenants;
+        }
+        fs::write(&config, cfg.to_string()).expect("write kernel config");
+        let socket = scratch.at("arca.sock");
+        let mut serve = start_serve(&config);
+        wait_for_server(&mut serve, &socket);
+        let viewer = bearer(secret_of(&secrets, "viewer-1"));
+        let (status, text) = post(
+            &socket,
+            &[viewer.clone()],
+            &call(1, "snapshot_list", json!({ "tenant": "abcdefgh" })),
+        );
+        assert_eq!(status, 200);
+        assert!(text.contains(expected), "{tag}: {text}");
+        assert!(
+            !text.contains("\"snapshots\""),
+            "{tag}: nothing is listed: {text}"
+        );
+        // Without a tenant the same handler lists as before.
+        let (status, text) = post(&socket, &[viewer], &call(2, "snapshot_list", json!({})));
+        assert_eq!(status, 200);
+        assert_eq!(tool_result(&text)["snapshots"], json!([]), "{tag}");
+        assert_eq!(serve.terminate().code(), Some(0));
+    }
+}
+
 #[test]
 fn kernel_status_reports_the_applied_sequence_after_service_create() {
     status_after_service_create(false);

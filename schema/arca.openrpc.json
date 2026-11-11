@@ -1616,7 +1616,10 @@
                           "snapshot_delete",
                           "instance_start",
                           "instance_stop",
-                          "instance_restart"
+                          "instance_restart",
+                          "tenant_create",
+                          "tenant_remove",
+                          "deploy_remove"
                         ],
                         "type": "string"
                       },
@@ -1727,7 +1730,10 @@
               "snapshot_delete",
               "instance_start",
               "instance_stop",
-              "instance_restart"
+              "instance_restart",
+              "tenant_create",
+              "tenant_remove",
+              "deploy_remove"
             ],
             "type": "string"
           }
@@ -1762,7 +1768,10 @@
                 "snapshot_delete",
                 "instance_start",
                 "instance_stop",
-                "instance_restart"
+                "instance_restart",
+                "tenant_create",
+                "tenant_remove",
+                "deploy_remove"
               ],
               "type": "string"
             },
@@ -2108,7 +2117,10 @@
                 "snapshot_delete",
                 "instance_start",
                 "instance_stop",
-                "instance_restart"
+                "instance_restart",
+                "tenant_create",
+                "tenant_remove",
+                "deploy_remove"
               ],
               "type": "string"
             },
@@ -2551,6 +2563,15 @@
             "maxLength": 31,
             "type": "string"
           }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -2588,7 +2609,17 @@
     },
     {
       "name": "postgres_list",
-      "params": [],
+      "params": [
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -2665,6 +2696,15 @@
             "maxLength": 31,
             "type": "string"
           }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -2715,6 +2755,15 @@
           "required": true,
           "schema": {
             "maxLength": 31,
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -2768,6 +2817,15 @@
           "schema": {
             "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
             "type": "boolean"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
           }
         }
       ],
@@ -3040,11 +3098,29 @@
           }
         },
         {
+          "name": "deploy",
+          "required": false,
+          "schema": {
+            "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+            "pattern": "^[a-z0-9-]{1,64}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "mac",
           "required": false,
           "schema": {
             "description": "For a virtual-machine template on a host bridge: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one. Refused on the managed service network.",
             "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -3180,7 +3256,17 @@
     },
     {
       "name": "service_list",
-      "params": [],
+      "params": [
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -3332,6 +3418,15 @@
           "schema": {
             "description": "The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).",
             "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -3487,6 +3582,15 @@
             "minimum": 1,
             "type": "integer"
           }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -3544,6 +3648,15 @@
           "schema": {
             "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
             "type": "boolean"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
           }
         }
       ],
@@ -3838,6 +3951,15 @@
             "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
             "type": "string"
           }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
         }
       ],
       "result": {
@@ -3886,6 +4008,15 @@
           "schema": {
             "description": "The provider: the service whose first port the link opens.",
             "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -3946,6 +4077,15 @@
             "description": "The secret, 8 to 4096 characters.",
             "maxLength": 4096,
             "minLength": 8,
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -5507,6 +5647,15 @@
           }
         },
         {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        },
+        {
           "name": "unreadable",
           "required": false,
           "schema": {
@@ -5637,7 +5786,17 @@
     },
     {
       "name": "snapshot_list",
-      "params": [],
+      "params": [
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
       "result": {
         "name": "result",
         "schema": {
@@ -5747,7 +5906,7 @@
           "type": "object"
         }
       },
-      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete.",
+      "summary": "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete. With tenant, only the snapshots taken from that tenant's project; without it, none of any tenant's.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": true,
@@ -5813,6 +5972,15 @@
           "required": false,
           "schema": {
             "maxLength": 512,
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -5922,7 +6090,7 @@
       "params": [
         {
           "name": "instance",
-          "required": true,
+          "required": false,
           "schema": {
             "description": "The Incus instance name.",
             "maxLength": 63,
@@ -5933,12 +6101,30 @@
         },
         {
           "name": "project",
-          "required": true,
+          "required": false,
           "schema": {
-            "description": "The Incus project the instance is in.",
+            "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
             "maxLength": 63,
             "minLength": 1,
             "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "service",
+          "required": false,
+          "schema": {
+            "description": "Inside a tenant, the service whose instance is meant, in place of instance.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         }
@@ -5994,7 +6180,7 @@
       "params": [
         {
           "name": "approval",
-          "required": true,
+          "required": false,
           "schema": {
             "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
             "maxLength": 16384,
@@ -6003,8 +6189,16 @@
           }
         },
         {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
           "name": "instance",
-          "required": true,
+          "required": false,
           "schema": {
             "description": "The Incus instance name.",
             "maxLength": 63,
@@ -6015,9 +6209,9 @@
         },
         {
           "name": "project",
-          "required": true,
+          "required": false,
           "schema": {
-            "description": "The Incus project the instance is in.",
+            "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
             "maxLength": 63,
             "minLength": 1,
             "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
@@ -6025,11 +6219,21 @@
           }
         },
         {
-          "name": "confirm",
+          "name": "service",
           "required": false,
           "schema": {
-            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
-            "type": "boolean"
+            "description": "Inside a tenant, the service whose instance is meant, in place of instance.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
           }
         }
       ],
@@ -6072,7 +6276,7 @@
           "type": "object"
         }
       },
-      "summary": "Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused.",
+      "summary": "Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -6081,6 +6285,619 @@
     },
     {
       "name": "instance_restart",
+      "params": [
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "instance",
+          "required": false,
+          "schema": {
+            "description": "The Incus instance name.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "project",
+          "required": false,
+          "schema": {
+            "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "service",
+          "required": false,
+          "schema": {
+            "description": "Inside a tenant, the service whose instance is meant, in place of instance.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": false,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "action": {
+              "enum": [
+                "start",
+                "stop",
+                "restart"
+              ],
+              "type": "string"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "project",
+            "instance",
+            "action",
+            "status",
+            "changed",
+            "message"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "tenant_create",
+      "params": [
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "caps",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "properties": {
+              "containers": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "cpu": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "disk": {
+                "maxLength": 32,
+                "type": "string"
+              },
+              "instances": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "memory": {
+                "maxLength": 32,
+                "type": "string"
+              },
+              "virtualMachines": {
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "instances",
+              "containers",
+              "virtualMachines",
+              "cpu",
+              "memory",
+              "disk"
+            ],
+            "type": "object"
+          }
+        },
+        {
+          "name": "id",
+          "required": false,
+          "schema": {
+            "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "block": {
+              "type": "string"
+            },
+            "caps": {
+              "additionalProperties": false,
+              "properties": {
+                "containers": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpu": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "disk": {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                "instances": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "memory": {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                "virtualMachines": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "instances",
+                "containers",
+                "virtualMachines",
+                "cpu",
+                "memory",
+                "disk"
+              ],
+              "type": "object"
+            },
+            "id": {
+              "type": "string"
+            },
+            "instances": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "use": {
+              "properties": {
+                "containers": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpu": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "diskBytes": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "instances": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "virtualMachines": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "instances",
+                "containers",
+                "virtualMachines",
+                "cpu",
+                "memoryBytes",
+                "diskBytes"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "id",
+            "block",
+            "caps",
+            "use"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Create a tenant: one restricted Incus project on the node's managed service network, with its own address block and caps. Inside the node's standing policy (kernel.tenants: default caps, capacity, tenant count and create rate) it needs no approval, from a token whose tool allowlist names it. Caps above the node's defaults run only from a proposal the owner approved.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "tenant_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "tenants": {
+              "items": {
+                "properties": {
+                  "block": {
+                    "type": "string"
+                  },
+                  "caps": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "containers": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cpu": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "disk": {
+                        "maxLength": 32,
+                        "type": "string"
+                      },
+                      "instances": {
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "memory": {
+                        "maxLength": 32,
+                        "type": "string"
+                      },
+                      "virtualMachines": {
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "instances",
+                      "containers",
+                      "virtualMachines",
+                      "cpu",
+                      "memory",
+                      "disk"
+                    ],
+                    "type": "object"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "instances": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "use": {
+                    "properties": {
+                      "containers": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "cpu": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "diskBytes": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "instances": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "memoryBytes": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "virtualMachines": {
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "instances",
+                      "containers",
+                      "virtualMachines",
+                      "cpu",
+                      "memoryBytes",
+                      "diskBytes"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "id",
+                  "block",
+                  "caps",
+                  "use"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "tenants"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "List the node's tenants, each with its address block, its caps and what its records use of them.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "tenant_status",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "block": {
+              "type": "string"
+            },
+            "caps": {
+              "additionalProperties": false,
+              "properties": {
+                "containers": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpu": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "disk": {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                "instances": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "memory": {
+                  "maxLength": 32,
+                  "type": "string"
+                },
+                "virtualMachines": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "instances",
+                "containers",
+                "virtualMachines",
+                "cpu",
+                "memory",
+                "disk"
+              ],
+              "type": "object"
+            },
+            "id": {
+              "type": "string"
+            },
+            "instances": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "use": {
+              "properties": {
+                "containers": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "cpu": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "diskBytes": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "instances": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "memoryBytes": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "virtualMachines": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "instances",
+                "containers",
+                "virtualMachines",
+                "cpu",
+                "memoryBytes",
+                "diskBytes"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "id",
+            "block",
+            "caps",
+            "use"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "One tenant: its address block, its caps, what its records use of them, and how many instances its project holds.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "tenant_usage",
+      "params": [
+        {
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "instances": {
+              "items": {
+                "properties": {
+                  "deploy": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container",
+                      "vm"
+                    ],
+                    "type": "string"
+                  },
+                  "limitsCpu": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "limitsMemory": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "provisional": {
+                    "type": "boolean"
+                  },
+                  "rootDiskSize": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "service": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "state": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "state",
+                  "limitsCpu",
+                  "limitsMemory",
+                  "rootDiskSize",
+                  "service"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "instances"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "What each instance of one tenant is allowed, read from Incus: its name, its kind, its state, its CPU and memory limits and its root disk size. No time and no measured use.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "tenant_remove",
       "params": [
         {
           "name": "approval",
@@ -6093,24 +6910,111 @@
           }
         },
         {
-          "name": "instance",
+          "name": "id",
           "required": true,
           "schema": {
-            "description": "The Incus instance name.",
-            "maxLength": 63,
-            "minLength": 1,
-            "pattern": "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$",
+            "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         },
         {
-          "name": "project",
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "removed": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "removed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Remove a tenant and everything in it, only from a proposal the owner approved: each instance is deleted and confirmed gone before its firewall rules, then its secrets, and last the tenant's profile and project.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "deploy_confirm",
+      "params": [
+        {
+          "name": "deploy",
           "required": true,
           "schema": {
-            "description": "The Incus project the instance is in.",
-            "maxLength": 63,
-            "minLength": 1,
-            "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
+            "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+            "pattern": "^[a-z0-9-]{1,64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": true,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "confirmed": {
+              "type": "boolean"
+            },
+            "deploy": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "confirmed",
+            "deploy"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Confirm a deploy inside a tenant: the services created under that deploy id stop being provisional. Only the token that opened the deploy, and only while it is provisional (not rolled back, and under 15 minutes old). After it, the front reaches them and a removal needs the owner's approval.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "deploy_rollback",
+      "params": [
+        {
+          "name": "deploy",
+          "required": true,
+          "schema": {
+            "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+            "pattern": "^[a-z0-9-]{1,64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": true,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
             "type": "string"
           }
         },
@@ -6127,42 +7031,100 @@
         "name": "result",
         "schema": {
           "properties": {
-            "action": {
-              "enum": [
-                "start",
-                "stop",
-                "restart"
-              ],
+            "deploy": {
               "type": "string"
             },
-            "changed": {
+            "removed": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "rolledBack": {
               "type": "boolean"
-            },
-            "instance": {
-              "type": "string"
-            },
-            "message": {
-              "type": "string"
-            },
-            "project": {
-              "type": "string"
-            },
-            "status": {
-              "type": "string"
             }
           },
           "required": [
-            "project",
-            "instance",
-            "action",
-            "status",
-            "changed",
-            "message"
+            "rolledBack",
+            "deploy",
+            "removed"
           ],
           "type": "object"
         }
       },
-      "summary": "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
+      "summary": "Roll back a provisional deploy inside a tenant: remove exactly the services created under that deploy id, each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Only the token that opened the deploy, only before it is confirmed, and only within 15 minutes of its first create. It needs no approval.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "deploy_remove",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot execution grant an approved action proposal arms. A direct call carries none that works.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "deploy",
+          "required": true,
+          "schema": {
+            "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+            "pattern": "^[a-z0-9-]{1,64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "tenant",
+          "required": true,
+          "schema": {
+            "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+            "pattern": "^[a-z2-7]{8}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "deploy": {
+              "type": "string"
+            },
+            "parts": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "removed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "removed",
+            "deploy",
+            "parts"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Remove everything a deploy created in a tenant, once the deploy is confirmed or its 15 minutes have passed, only from a proposal the owner approved: one approval for all its services, each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Nothing else of the tenant is touched. A deploy that is still provisional is refused: its own token rolls it back.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,

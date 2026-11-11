@@ -32,7 +32,8 @@ pub struct Manifest {
     pub provides: Vec<KeySpec>,
     /// The object kinds the plugin may write, each with the class of effect it may produce for that kind.
     pub effects: Vec<(IncusKind, EffectClass)>,
-    /// The projects the plugin may write in.
+    /// The projects the plugin may write in. A tenant prefix followed by `*` names every tenant's project
+    /// ([`crate::ownership::manifest_names_project`]).
     pub projects: Vec<String>,
     /// Whether the plugin may read the host through [`Ctx::observe`].
     pub observes: bool,
@@ -344,12 +345,7 @@ impl<'a> Ctx<'a> {
         {
             return Err(EffectRefusal::NotDeclared);
         }
-        if !self
-            .manifest
-            .projects
-            .iter()
-            .any(|allowed| allowed == project)
-        {
+        if !crate::ownership::manifest_names_project(&self.manifest.projects, project) {
             return Err(EffectRefusal::ProjectNotAllowed);
         }
         if kind == IncusKind::Project && project != name {
@@ -558,6 +554,12 @@ pub trait Plugin {
     fn reconciles_when_unchanged() -> bool {
         false
     }
+    /// The class-A kinds this plugin's class-B objects use, such as the ACL an instance's NIC names. Incus refuses to delete
+    /// such an object while its user exists, so a removal retires it only after an approved plan has deleted every class-B
+    /// object of the entry and each has read back absent. The default is none: every class-A effect reverts at once.
+    fn retired_after_plan() -> &'static [IncusKind] {
+        &[]
+    }
 }
 
 /// A plugin with its config type erased, so the reconciler can hold any plugin in one collection.
@@ -569,6 +571,11 @@ pub trait ErasedPlugin: Send + Sync {
     /// Whether a converged, unchanged entry is applied again. A plugin that does not opt in keeps the reconciler's skip.
     fn reconciles_when_unchanged(&self) -> bool {
         false
+    }
+    /// The class-A kinds whose objects wait for the entry's class-B objects to be deleted (see
+    /// [`Plugin::retired_after_plan`]).
+    fn retired_after_plan(&self) -> &'static [IncusKind] {
+        &[]
     }
 }
 
@@ -610,6 +617,10 @@ impl<P: Plugin> ErasedPlugin for Erased<P> {
 
     fn reconciles_when_unchanged(&self) -> bool {
         P::reconciles_when_unchanged()
+    }
+
+    fn retired_after_plan(&self) -> &'static [IncusKind] {
+        P::retired_after_plan()
     }
 }
 

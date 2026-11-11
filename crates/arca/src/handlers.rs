@@ -1260,6 +1260,78 @@ impl ToolHandler for ActionPropose {
         } else {
             None
         };
+        // A database action that names a tenant is refused when it is proposed, in the words the verb itself uses: it
+        // is never recorded, and the owner is never shown a card for it.
+        if action == ActionKind::PostgresCreate && payload.get("tenant").is_some() {
+            let Some(node) = &self.node else {
+                return Err(tenants::no_tenants());
+            };
+            tenants::tenant_arg(node, &payload, lock(&self.kernel)?.entries())?;
+            return Err(tenants::database_route(action.as_str()));
+        }
+        // Without a tenant a snapshot action reaches nothing of any tenant: a tenant's project is named by tenant, and
+        // a snapshot taken from a tenant is that tenant's to delete.
+        if matches!(
+            action,
+            ActionKind::SnapshotCreate | ActionKind::SnapshotDelete
+        ) && payload.get("tenant").is_none()
+        {
+            let tenant_project =
+                |project: &str| arca_kernel::ownership::tenant_of_project(project).is_some();
+            if action == ActionKind::SnapshotCreate
+                && payload["project"].as_str().is_some_and(tenant_project)
+            {
+                return Err(CallError::Invalid(
+                    "args/project: a tenant's project is named by tenant, not by project"
+                        .to_string(),
+                ));
+            }
+            if action == ActionKind::SnapshotDelete
+                && let Some(storage) = storage
+            {
+                let name = payload["name"].as_str().unwrap_or_default();
+                if storage.snapshots()?.iter().any(|snapshot| {
+                    snapshot.name == name && tenant_project(&snapshot.source_project)
+                }) {
+                    return Err(service_not_found(format!("snapshot {name}: not found")));
+                }
+            }
+        }
+        // A snapshot action that names a tenant acts on that tenant's project: a create is given the project, and a
+        // delete must name a snapshot taken from it.
+        let payload = match (action, payload.get("tenant"), &self.node) {
+            (ActionKind::SnapshotCreate | ActionKind::SnapshotDelete, Some(_), Some(node)) => {
+                let entries = lock(&self.kernel)?.entries().to_vec();
+                let scope = tenants::tenant_arg(node, &payload, &entries)?
+                    .ok_or_else(tenants::no_tenants)?;
+                let mut payload = payload;
+                if action == ActionKind::SnapshotCreate {
+                    if payload
+                        .get("project")
+                        .is_some_and(|project| project.as_str() != Some(scope.project.as_str()))
+                    {
+                        return Err(CallError::Invalid(
+                            "args/project: it is not the project of the tenant the call names"
+                                .to_string(),
+                        ));
+                    }
+                    payload["project"] = json!(scope.project);
+                } else if let Some(storage) = storage {
+                    let name = payload["name"].as_str().unwrap_or_default();
+                    let own = storage.snapshots()?.iter().any(|snapshot| {
+                        snapshot.name == name && snapshot.source_project == scope.project
+                    });
+                    if !own {
+                        return Err(service_not_found(format!("snapshot {name}: not found")));
+                    }
+                }
+                payload
+            }
+            (ActionKind::SnapshotCreate | ActionKind::SnapshotDelete, Some(_), None) => {
+                return Err(tenants::no_tenants());
+            }
+            _ => payload,
+        };
         let payload = if is_gpu {
             let Some(gpu) = &self.gpu else {
                 return Err(gpu_refusal(GpuRefusal::Disabled));
@@ -1270,6 +1342,22 @@ impl ToolHandler for ActionPropose {
         } else if let (ActionKind::ServiceCreate, Some(node)) = (action, &self.node) {
             let entries = lock(&self.kernel)?.entries().to_vec();
             enrich_service_create(node, &entries, &payload)?
+        } else if let (ActionKind::TenantCreate | ActionKind::TenantRemove, Some(node)) =
+            (action, &self.node)
+        {
+            // A proposal the node would refuse is refused now, so the owner is never asked to approve it. Its
+            // arguments are recorded exactly as proposed.
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            if action == ActionKind::TenantCreate {
+                tenants::check_create(node, &entries, &payload)?;
+            } else {
+                tenants::check_remove(node, &entries, &payload)?;
+            }
+            payload
+        } else if let (ActionKind::DeployRemove, Some(node)) = (action, &self.node) {
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            tenants::check_deploy_remove(node, &entries, &payload, now)?;
+            payload
         } else {
             payload
         };
@@ -1280,7 +1368,12 @@ impl ToolHandler for ActionPropose {
             crate::storage::check_proposal(storage, action, &payload, now)?;
         }
         if action.is_lifecycle() {
-            crate::lifecycle::check_proposal(self.lifecycle.as_deref(), &payload)?;
+            // The kernel's lock is held for the lookup only: the instance read takes it again.
+            let project = {
+                let kernel = lock(&self.kernel)?;
+                crate::lifecycle::project_of(&kernel, &payload)
+            }?;
+            crate::lifecycle::check_proposal(self.lifecycle.as_deref(), &project, &payload)?;
         }
         // An import that could not run is refused now, with the check that failed, so the owner is never asked to approve it.
         if let (ActionKind::ServiceImport, Some(node)) = (action, &self.node) {
@@ -1310,6 +1403,11 @@ impl ToolHandler for ActionPropose {
             )?
             .card
             .map(|card| card.product),
+            // The card of a deploy's removal lists the deploy's parts as they stand now.
+            ActionKind::DeployRemove => {
+                let entries = lock(&self.kernel)?.entries().to_vec();
+                Some(tenants::deploy_parts(&entries, &payload))
+            }
             _ => None,
         };
         let mut kernel = lock(&self.kernel)?;
@@ -1770,6 +1868,9 @@ impl ActionExecutor {
                 | "snapshot_delete"
                 | "instance_stop"
                 | "instance_restart"
+                | "tenant_create"
+                | "tenant_remove"
+                | "deploy_remove"
         ) {
             call["approval"] = json!(grant);
         }
@@ -1782,6 +1883,14 @@ impl ActionExecutor {
             },
         )
     }
+}
+
+/// The kernel's write gate, shared by the service, database and tenant handlers and by the front pass.
+fn write_gate(kernel: &Mutex<Kernel>) -> Arc<Mutex<()>> {
+    kernel
+        .lock()
+        .map(|kernel| kernel.write_gate())
+        .unwrap_or_default()
 }
 
 fn lock(kernel: &Mutex<Kernel>) -> Result<MutexGuard<'_, Kernel>, CallError> {
@@ -2898,6 +3007,7 @@ fn caps_refusal(
     cfg: &NodeConfig,
     caps: &crate::config::BridgedLimits,
     entries: &[arca_kernel::desired::Entry],
+    own: bool,
     name: &str,
     template: &crate::service::Template,
 ) -> Option<String> {
@@ -2912,9 +3022,14 @@ fn caps_refusal(
             .and_then(|limits| crate::service::size_bytes(limits.memory.as_deref()?))
     };
     let (mut count, mut cpus, mut ram, mut disk) = (0u128, 0u128, 0u128, 0u128);
+    // Each tenant's virtual-machine cap is set aside for it: a machine of the node's own project counts them all as
+    // taken, and a tenant's machine, which is inside its tenant's cap, counts the node's own and the caps.
+    let reserved = tenants::reserved_vms(entries);
     for (_, record) in service_entries(entries) {
         let Some(vm) = &record.vm else { continue };
-        count += 1;
+        if record.tenant.is_none() {
+            count += 1;
+        }
         cpus = cpus.saturating_add(cpu(&record.limits).unwrap_or(u128::MAX));
         ram = ram.saturating_add(memory(&record.limits).unwrap_or(u128::MAX));
         disk = disk.saturating_add(crate::service::size_bytes(&vm.root_size).unwrap_or(u128::MAX));
@@ -2939,8 +3054,8 @@ fn caps_refusal(
         (
             "virtual machines",
             "virtualMachines",
-            count,
-            Some(1),
+            count + reserved,
+            Some(u128::from(own)),
             Some(u128::from(caps.virtual_machines)),
             &plain,
         ),
@@ -2976,7 +3091,7 @@ fn caps_refusal(
         // A size that cannot be read counts as over the cap: the create is refused, never let through.
         let asked = asked.unwrap_or(u128::MAX);
         let cap = cap.unwrap_or(0);
-        if used.saturating_add(asked) > cap {
+        if asked != 0 && used.saturating_add(asked) > cap {
             return Some(format!(
                 "creating {name} would exceed this node's cap on {what} ({source}.{key}): {} in use, {} asked, {} allowed",
                 show(used),
@@ -3050,7 +3165,8 @@ pub fn postgres_handlers(
     cfg: Arc<NodeConfig>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
     // Serialize secret/document transactions without blocking other kernel users during I/O.
-    let writes = Arc::new(Mutex::new(()));
+    // One gate for every handler that picks an address or a block: the kernel's own.
+    let writes = write_gate(&kernel);
     [
         "postgres_create",
         "postgres_list",
@@ -3221,6 +3337,13 @@ impl ToolHandler for PostgresHandler {
         } else {
             Some(self.writes.lock().map_err(|_| internal())?)
         };
+        // Inside a tenant a database is a service: the postgres service template, linked with service_connect. The
+        // database verbs act in the node's own project only, and write nothing for a call that names a tenant.
+        if args.get("tenant").is_some() {
+            // The tenant is answered for first, as by every verb: no tenants, a malformed id, an unknown tenant.
+            tenants::tenant_arg(&self.cfg, &args, lock(&self.kernel)?.entries())?;
+            return Err(tenants::database_route(self.verb));
+        }
         let entries = {
             let kernel = lock(&self.kernel)?;
             kernel
@@ -3440,6 +3563,9 @@ impl ToolHandler for PostgresHandler {
 mod service_omni;
 #[path = "service_wiring.rs"]
 mod service_wiring;
+#[path = "tenants.rs"]
+mod tenants;
+pub use tenants::{SnapshotListInTenant, spawn_front_sync, sync_front, tenant_handlers};
 
 // Services: one record in the desired document, plus the live Incus row for state.
 
@@ -3448,7 +3574,8 @@ pub fn service_handlers(
     clock: Clock,
     cfg: Arc<NodeConfig>,
 ) -> Vec<(&'static str, Arc<dyn ToolHandler>)> {
-    let writes = Arc::new(Mutex::new(()));
+    // One gate for every handler that picks an address or a block: the kernel's own.
+    let writes = write_gate(&kernel);
     let exec = Arc::new(crate::service_exec::ServiceExec::new(cfg.clone()));
     [
         "service_connect",
@@ -3552,6 +3679,7 @@ fn service_template_error(error: crate::service::TemplateError) -> CallError {
 fn local_image_present(
     read: &UnixIncus,
     template: &crate::service::Template,
+    project: &str,
 ) -> Result<(), CallError> {
     let Some(alias) = (template.kind == "system")
         .then(|| template.image.strip_prefix("local:"))
@@ -3559,10 +3687,7 @@ fn local_image_present(
     else {
         return Ok(());
     };
-    let Ok(images) = read.get(&format!(
-        "/1.0/images?project={}&recursion=1",
-        arca_netproject::PROJECT
-    )) else {
+    let Ok(images) = read.get(&format!("/1.0/images?project={project}&recursion=1")) else {
         return Ok(());
     };
     let Some(images) = images.as_array() else {
@@ -3579,8 +3704,7 @@ fn local_image_present(
     Err(service_refused(format!(
         "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
          A local image is built or copied into that project before the service is created; the template's description says how",
-        template.name,
-        arca_netproject::PROJECT
+        template.name, project
     )))
 }
 
@@ -3891,6 +4015,7 @@ pub(crate) fn adopted_config(
         adopted: true,
         creating: false,
         vm: None,
+        tenant: None,
     })
 }
 
@@ -4025,6 +4150,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         .map_err(service_template_error)?;
     let (environment, start) = crate::service::environment(
         parts.template,
+        parts.owner,
         parts.name,
         &parts.ipv4,
         &parts.gateway,
@@ -4059,6 +4185,7 @@ fn service_config(parts: ServiceParts<'_>) -> Result<crate::service::ServiceConf
         adopted: false,
         creating: false,
         vm: None,
+        tenant: None,
     })
 }
 
@@ -4119,10 +4246,13 @@ fn vm_service_config(
         adopted: false,
         creating: false,
         vm: Some(crate::service::Vm { root_size, mac }),
+        tenant: None,
     })
 }
 
 struct ServiceParts<'a> {
+    /// The id of the entry that will record the service: its secret files are kept under it.
+    owner: &'a str,
     name: &'a str,
     template: &'a crate::service::Template,
     ipv4: String,
@@ -4134,6 +4264,64 @@ struct ServiceParts<'a> {
 }
 
 impl ServiceHandler {
+    /// The address a new service takes: in a tenant, the lowest free address of the tenant's block; in the node's own
+    /// project, the lowest free address of the plan that no tenant's block holds. Every instance, lease and record on
+    /// the node counts as in use.
+    fn free_address(
+        &self,
+        read: &UnixIncus,
+        cidr: &str,
+        rows: &[Value],
+        entries: &[arca_kernel::desired::Entry],
+        tenant: Option<&tenants::TenantScope>,
+    ) -> Result<String, CallError> {
+        let candidates = crate::service::candidates(cidr).map_err(service_template_error)?;
+        let leases = service_leases(read)?;
+        let used = service_used(rows, &leases, entries);
+        if let Some(scope) = tenant {
+            return tenants::free_address(scope, &used);
+        }
+        let blocks = tenants::held_blocks(&self.cfg, entries);
+        let candidates = if blocks.is_empty() {
+            candidates
+        } else {
+            tenants::outside_blocks(candidates, &blocks)
+        };
+        candidates
+            .iter()
+            .find(|ip| !used.contains(ip))
+            .map(|ip| ip.to_string())
+            .ok_or_else(|| {
+                service_refused(format!(
+                    "the service subnet {cidr} has no free address (.10-.239)"
+                ))
+            })
+    }
+
+    /// Makes a new record a tenant's: its project, its tenant, and the front address the node names, if any.
+    fn place_in_tenant(
+        &self,
+        config: &mut crate::service::ServiceConfig,
+        tenant: Option<&tenants::TenantScope>,
+        entries: &[arca_kernel::desired::Entry],
+        deploy: Option<String>,
+    ) {
+        if let Some(scope) = tenant {
+            config.project = scope.project.clone();
+            config.instance = crate::service::instance_name(Some(&scope.id), &config.name);
+            config.tenant = Some(crate::service::TenantRef {
+                id: scope.id.clone(),
+                block: scope.config.block.clone(),
+                // The front admits ordinary services only: one created in a deploy waits for its confirm.
+                front: match deploy {
+                    Some(_) => None,
+                    None => tenants::front_address(&self.cfg, entries),
+                },
+                deploy,
+            });
+        }
+    }
+
     /// Proposes a create's changes and answers the new service's view. A create that left no instance is undone: its
     /// record goes and the secret files it made (`made`) are removed.
     #[allow(clippy::too_many_arguments)]
@@ -4147,7 +4335,7 @@ impl ServiceHandler {
         made: Option<(&std::path::Path, &BTreeSet<std::ffi::OsString>)>,
         now: u64,
     ) -> Result<Value, CallError> {
-        let id = format!("service-{name}");
+        let id = config.entry_id();
         let outcomes = {
             let mut kernel = lock(&self.kernel)?;
             kernel.propose(changes, now).map_err(|_| internal())?
@@ -4155,8 +4343,8 @@ impl ServiceHandler {
         let failed = service_wiring::failed_for(&outcomes, &[id.as_str()]);
         if failed {
             match read.get(&format!(
-                "/1.0/instances/{name}?project={}",
-                arca_netproject::PROJECT
+                "/1.0/instances/{}?project={}",
+                config.instance, config.project
             )) {
                 Ok(found) => {
                     // The instance exists, so its record stays: the effect journal holds the create as applied, never
@@ -4209,8 +4397,8 @@ impl ServiceHandler {
             )));
         }
         let live = match read.get(&format!(
-            "/1.0/instances/{name}/state?project={}",
-            arca_netproject::PROJECT
+            "/1.0/instances/{}/state?project={}",
+            config.instance, config.project
         )) {
             Ok(state) => Some(state),
             Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
@@ -4246,7 +4434,7 @@ fn service_name(args: &Value) -> Result<String, CallError> {
 impl ToolHandler for ServiceHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         let allowed: &[&str] = match self.verb {
-            "service_create" => &["name", "template", "bridge", "mac"],
+            "service_create" => &["name", "template", "bridge", "mac", "deploy"],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
@@ -4259,7 +4447,15 @@ impl ToolHandler for ServiceHandler {
         let object = args
             .as_object()
             .ok_or_else(|| CallError::Invalid("arguments: expected an object".into()))?;
-        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        // A publication, an import and a release act on the node and take no tenant: the field is not theirs.
+        let takes_tenant = !matches!(
+            self.verb,
+            "service_publish" | "service_unpublish" | "service_import" | "service_release"
+        );
+        if object
+            .keys()
+            .any(|key| !(takes_tenant && key == "tenant") && !allowed.contains(&key.as_str()))
+        {
             return Err(CallError::Invalid(
                 "arguments: a field the schema does not name".into(),
             ));
@@ -4320,7 +4516,18 @@ impl ToolHandler for ServiceHandler {
         // the managed network has both, whether or not it also allows host bridges.
         let bridged = self.cfg.kernel.bridged.as_ref();
         let managed = self.cfg.kernel.service_cidr.is_some();
+        // A call that names a tenant acts in that tenant's project and sees nothing outside it.
+        let tenant = match args.get("tenant") {
+            None => None,
+            Some(_) => tenants::tenant_arg(&self.cfg, &args, lock(&self.kernel)?.entries())?,
+        };
+        if tenant.is_none() && args.get("deploy").is_some() {
+            return Err(CallError::Invalid(
+                "deploy: only a call inside a tenant names a deploy".into(),
+            ));
+        }
         let (cidr, gateway) = match bridged {
+            _ if tenant.is_some() => tenants::network(&self.cfg)?,
             Some(_) if !managed => {
                 bridged_project(&self.cfg)?;
                 (String::new(), String::new())
@@ -4333,7 +4540,7 @@ impl ToolHandler for ServiceHandler {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
         };
-        if managed {
+        if managed && tenant.is_none() {
             adopt_services(
                 &self.kernel,
                 &self.cfg,
@@ -4348,6 +4555,29 @@ impl ToolHandler for ServiceHandler {
                 kernel.entries().to_vec()
             };
         }
+        // Every instance and every record on the node: the address plan and the node's caps count them all. The call
+        // itself sees its own side only. On a node that holds no tenant the two are the same.
+        let all_rows = rows;
+        let all_entries = entries;
+        let has_tenants = all_entries
+            .iter()
+            .any(|entry| entry.plugin.0 == "arca.tenant");
+        let (rows, entries) = if has_tenants || tenant.is_some() {
+            (
+                tenants::scoped_rows(&all_rows, tenant.as_ref()),
+                tenants::scoped_entries(&all_entries, tenant.as_ref()),
+            )
+        } else {
+            (all_rows.clone(), all_entries.clone())
+        };
+        let project = tenant
+            .as_ref()
+            .map_or(arca_netproject::PROJECT, |scope| scope.project.as_str());
+        let owned = |row: &Value| match &tenant {
+            Some(scope) => row["project"].as_str() == Some(scope.project.as_str()),
+            None => service_owned(row),
+        };
+        let tenant_id = tenant.as_ref().map(|scope| scope.id.as_str());
         if matches!(
             self.verb,
             "service_connect"
@@ -4364,20 +4594,20 @@ impl ToolHandler for ServiceHandler {
                 let records = service_entries(&entries);
                 let names: BTreeSet<String> = records
                     .iter()
-                    .map(|(_, config)| config.name.clone())
+                    .map(|(_, config)| config.instance.clone())
                     .collect();
                 for (_, config) in &records {
-                    let live = service_live_in(&rows, &config.project, &config.name);
+                    let live = service_live_in(&rows, &config.project, &config.instance);
                     views.push(crate::service::view(config, live));
                 }
                 for row in &rows {
                     if let Some(name) = row["name"].as_str()
                         && !names.contains(name)
-                        && service_owned(row)
+                        && owned(row)
                     {
                         let view = if row["config"][crate::service::TEMPLATE_KEY].is_string() {
                             crate::service::failed_view(row)
-                        } else if row["project"].as_str() == Some(arca_netproject::PROJECT) {
+                        } else if row["project"].as_str() == Some(project) {
                             crate::service::unknown_view(row)
                         } else {
                             None
@@ -4398,13 +4628,14 @@ impl ToolHandler for ServiceHandler {
                 if let Some((_, config)) = record {
                     return Ok(crate::service::view(
                         &config,
-                        service_live_in(&rows, &config.project, &config.name),
+                        service_live_in(&rows, &config.project, &config.instance),
                     ));
                 }
-                if let Some(row) = rows
-                    .iter()
-                    .find(|row| row["name"].as_str() == Some(name.as_str()) && service_owned(row))
-                {
+                if let Some(row) = rows.iter().find(|row| {
+                    row["name"].as_str()
+                        == Some(crate::service::instance_name(tenant_id, &name).as_str())
+                        && owned(row)
+                }) {
                     if let Some(view) = crate::service::failed_view(row) {
                         return Ok(view);
                     }
@@ -4431,42 +4662,45 @@ impl ToolHandler for ServiceHandler {
                 let Some((entry, config)) = record else {
                     return Err(service_not_found(format!("service {name}: not found")));
                 };
-                let row = service_live_in(&rows, &config.project, &name).ok_or_else(|| {
-                    service_refused(format!("service {name}: its instance is gone"))
-                })?;
+                let row =
+                    service_live_in(&rows, &config.project, &config.instance).ok_or_else(|| {
+                        service_refused(format!("service {name}: its instance is gone"))
+                    })?;
                 let path = format!(
-                    "/1.0/instances/{name}/console?project={}&type=log",
-                    config.project
+                    "/1.0/instances/{}/console?project={}&type=log",
+                    config.instance, config.project
                 );
                 // A virtual machine's log is its console: an exec needs a guest agent the image may not run.
-                let journal =
-                    if !config.adopted && config.vm.is_none() && config.source["protocol"] != "oci"
-                    {
-                        if let Some(_permit) = self.exec.journal_permit() {
-                            let target = self.exec_target(&entry, &config)?;
-                            let cmd = arca_incus::exec::ExecCommand::Journal(
-                                arca_incus::exec::JournalLines::new(lines).map_err(|_| {
-                                    CallError::Invalid("lines: expected 1 to 200".into())
-                                })?,
-                            );
-                            match self.exec.run(
-                                &target,
-                                &caller.token_id,
-                                self.verb,
-                                &cmd,
-                                &service_secret_values(&self.cfg.state_dir.join("secrets")),
-                                None,
-                            ) {
-                                Ok(text) => String::from_utf8(text).ok(),
-                                Err(error) if error.ownership() => return Err(error.call_error()),
-                                Err(_) => None,
-                            }
-                        } else {
-                            None
+                let journal = if !config.adopted
+                    && config.vm.is_none()
+                    && config.tenant.is_none()
+                    && config.source["protocol"] != "oci"
+                {
+                    if let Some(_permit) = self.exec.journal_permit() {
+                        let target = self.exec_target(&entry, &config)?;
+                        let cmd = arca_incus::exec::ExecCommand::Journal(
+                            arca_incus::exec::JournalLines::new(lines).map_err(|_| {
+                                CallError::Invalid("lines: expected 1 to 200".into())
+                            })?,
+                        );
+                        match self.exec.run(
+                            &target,
+                            &caller.token_id,
+                            self.verb,
+                            &cmd,
+                            &service_secret_values(&self.cfg.state_dir.join("secrets")),
+                            None,
+                        ) {
+                            Ok(text) => String::from_utf8(text).ok(),
+                            Err(error) if error.ownership() => return Err(error.call_error()),
+                            Err(_) => None,
                         }
                     } else {
                         None
-                    };
+                    }
+                } else {
+                    None
+                };
                 let text = match journal {
                     Some(text) => text,
                     None => read.get_text(&path).map_err(|error| match error {
@@ -4518,8 +4752,16 @@ impl ToolHandler for ServiceHandler {
                 let spent = if preapproved {
                     lock(&self.kernel)?.spend_service_removal_authorized(&id)
                 } else {
+                    // A removal in a tenant names the tenant in what the owner signs.
+                    let (target, signed) = match tenant_id {
+                        Some(tenant) => (
+                            format!("tenant.{tenant}.{name}"),
+                            json!({"name": name, "tenant": tenant}),
+                        ),
+                        None => (name.clone(), json!({"name": name})),
+                    };
                     lock(&self.kernel)?
-                        .spend_service_removal(&id, &name, approval, now)
+                        .spend_service_removal(&id, &target, &signed, approval, now)
                         .map_err(|error| match error {
                             crate::kernel::ServiceRemovalError::Approval(refusal) => {
                                 CallError::Refused {
@@ -4593,7 +4835,7 @@ impl ToolHandler for ServiceHandler {
                     "preImage": done.pre_image,
                     "service": crate::service::view(
                         &config,
-                        service_live_in(&rows, &config.project, &config.name),
+                        service_live_in(&rows, &config.project, &config.instance),
                     ),
                 }))
             }
@@ -4640,16 +4882,17 @@ impl ToolHandler for ServiceHandler {
                     .ok_or_else(|| {
                         CallError::Invalid("template: expected a template name".into())
                     })?;
-                let id = format!("service-{name}");
+                let id = crate::service::entry_id(tenant_id, &name);
                 if entries
                     .iter()
                     .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
                 {
                     return Err(service_refused(format!("service {name} exists")));
                 }
+                let instance = crate::service::instance_name(tenant_id, &name);
                 if rows
                     .iter()
-                    .any(|row| row["name"].as_str() == Some(name.as_str()))
+                    .any(|row| row["name"].as_str() == Some(instance.as_str()))
                 {
                     return Err(service_refused(format!(
                         "an instance named {name} already exists that is not a service of Arca's; it is left alone"
@@ -4663,10 +4906,21 @@ impl ToolHandler for ServiceHandler {
                         return Err(service_refused(no_vm_caps(template_name)));
                     };
                     // Every refusal below comes before any write, so a refused create leaves nothing behind.
-                    if let Some(why) = mode_refusal(&self.cfg, &entries) {
+                    if let Some(why) = mode_refusal(&self.cfg, &all_entries) {
                         return Err(service_refused(why));
                     }
-                    let network = vm_network(&self.cfg, &args)?;
+                    // A tenant's machine joins the managed service network and nothing else: a host bridge would put
+                    // it on the host's own network.
+                    if tenant.is_some() && args.get("bridge").is_some() {
+                        return Err(service_refused(
+                            "bridge: a virtual machine in a tenant joins the managed service network only, never a host bridge",
+                        ));
+                    }
+                    let network = if tenant.is_some() {
+                        VmNetwork::Managed
+                    } else {
+                        vm_network(&self.cfg, &args)?
+                    };
                     let mac = match args.get("mac") {
                         Some(value) => Some(
                             value
@@ -4701,7 +4955,20 @@ impl ToolHandler for ServiceHandler {
                             "the MAC {mac} is already held by another instance"
                         )));
                     }
-                    if let Some(why) = caps_refusal(&self.cfg, caps, &entries, &name, &template) {
+                    if let Some(why) = caps_refusal(
+                        &self.cfg,
+                        caps,
+                        &all_entries,
+                        tenant.is_none(),
+                        &name,
+                        &template,
+                    ) {
+                        return Err(service_refused(why));
+                    }
+                    if let Some(scope) = &tenant
+                        && let Some(why) =
+                            tenants::service_caps_refusal(scope, &all_entries, &name, &template)
+                    {
                         return Err(service_refused(why));
                     }
                     // A project that exists must be the one its owning entry made: the bridged entry's on a node whose
@@ -4711,9 +4978,19 @@ impl ToolHandler for ServiceHandler {
                         VmNetwork::Managed => NET_ENTRY,
                         VmNetwork::Host(_) => arca_netproject::BRIDGED_ENTRY,
                     });
-                    let project =
+                    let project_path =
                         format!("/1.0/projects/{0}?project={0}", arca_netproject::PROJECT);
-                    match read.get(&project) {
+                    // A tenant's project is its entry's own, made with the tenant; the node's project is not asked for.
+                    match read.get(&project_path).and_then(|found| {
+                        if tenant.is_some() {
+                            Err(arca_incus::IncusError::Status {
+                                code: 404,
+                                message: String::new(),
+                            })
+                        } else {
+                            Ok(found)
+                        }
+                    }) {
                         Ok(found)
                             if found["config"][arca_kernel::ownership::KERNEL_ENTRY_KEY]
                                 .as_str()
@@ -4742,28 +5019,29 @@ impl ToolHandler for ServiceHandler {
                     let place = match network {
                         VmNetwork::Host(bridge) => VmPlace::Host { bridge, mac },
                         VmNetwork::Managed => {
-                            let candidates = crate::service::candidates(&cidr)
-                                .map_err(service_template_error)?;
-                            let leases = service_leases(&read)?;
-                            let used = service_used(&rows, &leases, &entries);
-                            let ipv4 = candidates
-                                .iter()
-                                .find(|ip| !used.contains(ip))
-                                .ok_or_else(|| {
-                                    service_refused(format!(
-                                        "the service subnet {cidr} has no free address (.10-.239)"
-                                    ))
-                                })?
-                                .to_string();
+                            let ipv4 = self.free_address(
+                                &read,
+                                &cidr,
+                                &all_rows,
+                                &all_entries,
+                                tenant.as_ref(),
+                            )?;
                             VmPlace::Managed {
                                 ipv4,
                                 gateway: gateway.clone(),
                             }
                         }
                     };
-                    let mut changes =
-                        project_changes(&entries, &self.cfg, needs).map_err(no_service_project)?;
-                    let config = vm_service_config(&name, &template, place, pool, now)?;
+                    let mut changes = if tenant.is_some() {
+                        Vec::new()
+                    } else {
+                        project_changes(&all_entries, &self.cfg, needs)
+                            .map_err(no_service_project)?
+                    };
+                    let mut config = vm_service_config(&name, &template, place, pool, now)?;
+                    let deploy =
+                        tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
+                    self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);
                     changes.push(crate::desired_store::EntryChange::Put(service_entry(
                         &id,
                         "arca.service",
@@ -4787,29 +5065,34 @@ impl ToolHandler for ServiceHandler {
                         "bridge and mac: only a virtual-machine template takes them".into(),
                     ));
                 }
-                local_image_present(&read, &template)?;
-                let candidates =
-                    crate::service::candidates(&cidr).map_err(service_template_error)?;
-                let leases = service_leases(&read)?;
-                let used = service_used(&rows, &leases, &entries);
-                let ipv4 = candidates
-                    .iter()
-                    .find(|ip| !used.contains(ip))
-                    .ok_or_else(|| {
-                        service_refused(format!(
-                            "the service subnet {cidr} has no free address (.10-.239)"
-                        ))
-                    })?
-                    .to_string();
+                local_image_present(&read, &template, project)?;
+                if let Some(scope) = &tenant {
+                    if template.lan.is_some() || template.publishable {
+                        return Err(service_refused(format!(
+                            "template {template_name} opens a port on the host or publishes a dash, and nothing in a tenant does: a tenant's service is reached through the node's front service"
+                        )));
+                    }
+                    if let Some(why) =
+                        tenants::service_caps_refusal(scope, &all_entries, &name, &template)
+                    {
+                        return Err(service_refused(why));
+                    }
+                }
+                let ipv4 =
+                    self.free_address(&read, &cidr, &all_rows, &all_entries, tenant.as_ref())?;
                 let pool = service_pool(&self.cfg).map_err(|_| {
                     service_refused("the default profile does not name a storage pool")
                 })?;
-                let mut changes =
-                    ensure_netproject(&entries, &self.cfg).map_err(no_service_project)?;
+                let mut changes = if tenant.is_some() {
+                    Vec::new()
+                } else {
+                    ensure_netproject(&all_entries, &self.cfg).map_err(no_service_project)?
+                };
                 let secrets_dir = self.cfg.state_dir.join("secrets");
-                let service_secrets = secrets_dir.join(format!("service-{name}"));
+                let service_secrets = secrets_dir.join(&id);
                 let seeded = service_secret_names(&service_secrets).map_err(|_| internal())?;
-                let config = service_config(ServiceParts {
+                let mut config = service_config(ServiceParts {
+                    owner: &id,
                     name: &name,
                     template: &template,
                     ipv4,
@@ -4820,12 +5103,16 @@ impl ToolHandler for ServiceHandler {
                     templates_dir: &templates_dir,
                 })
                 .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
+                let deploy =
+                    tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)
+                        .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
+                self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);
                 changes.push(crate::desired_store::EntryChange::Put(service_entry(
                     &id,
                     "arca.service",
                     serde_json::to_value(&config).map_err(|_| internal())?,
                 )));
-                self.settle_create(
+                let made = self.settle_create(
                     &read,
                     &name,
                     template_name,
@@ -4833,7 +5120,19 @@ impl ToolHandler for ServiceHandler {
                     &config,
                     Some((service_secrets.as_path(), &seeded)),
                     now,
-                )
+                )?;
+                // The node's front was made, or made again at another address: every tenant service's ACL follows now.
+                let front = self
+                    .cfg
+                    .kernel
+                    .tenants
+                    .as_ref()
+                    .and_then(|t| t.front.as_deref());
+                if tenant.is_none() && front == Some(name.as_str()) {
+                    // This create holds the write gate already.
+                    let _ = tenants::sync_front_held(&self.kernel, &self.cfg, now);
+                }
+                Ok(made)
             }
             _ => Err(service_not_found("unknown service verb")),
         }

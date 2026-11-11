@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 47] = [
+static VERBS: [Verb; 55] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -670,7 +670,7 @@ static VERBS: [Verb; 47] = [
     },
     Verb {
         name: "snapshot_list",
-        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete.",
+        summary: "Every snapshot copy in the arcak-snapshots project: its source, pool, size and when it was made. An app copy whose clean-up never finished, or a folder copy whose counts did not match, is incomplete. With tenant, only the snapshots taken from that tenant's project; without it, none of any tenant's.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -679,7 +679,7 @@ static VERBS: [Verb; 47] = [
         output_key: None,
         summary_text: summary_snapshot_list,
         cut: no_cut,
-        params: empty_params,
+        params: snapshot_list_params,
         result: snapshot_list_result,
     },
     Verb {
@@ -712,7 +712,7 @@ static VERBS: [Verb; 47] = [
     },
     Verb {
         name: "instance_stop",
-        summary: "Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused.",
+        summary: "Stop a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. An instance that is already stopped is left stopped, and the answer says so. An instance that is not Arca's is refused.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -726,7 +726,7 @@ static VERBS: [Verb; 47] = [
     },
     Verb {
         name: "instance_restart",
-        summary: "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
+        summary: "Restart a running Incus instance that Arca owns or has adopted, gracefully, once the owner has approved it as an action proposal. Inside a tenant it needs no approval, from a token whose tool allowlist names it. A stopped instance is started instead, and the answer says so. An instance that is not Arca's is refused.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -738,7 +738,321 @@ static VERBS: [Verb; 47] = [
         params: instance_gated_params,
         result: instance_change_result,
     },
+    Verb {
+        name: "tenant_create",
+        summary: "Create a tenant: one restricted Incus project on the node's managed service network, with its own address block and caps. Inside the node's standing policy (kernel.tenants: default caps, capacity, tenant count and create rate) it needs no approval, from a token whose tool allowlist names it. Caps above the node's defaults run only from a proposal the owner approved.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant,
+        cut: no_cut,
+        params: tenant_create_params,
+        result: tenant_status_result,
+    },
+    Verb {
+        name: "tenant_list",
+        summary: "List the node's tenants, each with its address block, its caps and what its records use of them.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant_list,
+        cut: no_cut,
+        params: empty_params,
+        result: tenant_list_result,
+    },
+    Verb {
+        name: "tenant_status",
+        summary: "One tenant: its address block, its caps, what its records use of them, and how many instances its project holds.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant,
+        cut: no_cut,
+        params: tenant_id_params,
+        result: tenant_status_result,
+    },
+    Verb {
+        name: "tenant_usage",
+        summary: "What each instance of one tenant is allowed, read from Incus: its name, its kind, its state, its CPU and memory limits and its root disk size. No time and no measured use.",
+        class: VerbClass::L,
+        min_scope: Scope::Viewer,
+        writes: false,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant_usage,
+        cut: no_cut,
+        params: tenant_id_params,
+        result: tenant_usage_result,
+    },
+    Verb {
+        name: "tenant_remove",
+        summary: "Remove a tenant and everything in it, only from a proposal the owner approved: each instance is deleted and confirmed gone before its firewall rules, then its secrets, and last the tenant's profile and project.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_service_remove,
+        cut: no_cut,
+        params: tenant_remove_params,
+        result: service_remove_result,
+    },
+    Verb {
+        name: "deploy_confirm",
+        summary: "Confirm a deploy inside a tenant: the services created under that deploy id stop being provisional. Only the token that opened the deploy, and only while it is provisional (not rolled back, and under 15 minutes old). After it, the front reaches them and a removal needs the owner's approval.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_done,
+        cut: no_cut,
+        params: deploy_params,
+        result: deploy_confirm_result,
+    },
+    Verb {
+        name: "deploy_rollback",
+        summary: "Roll back a provisional deploy inside a tenant: remove exactly the services created under that deploy id, each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Only the token that opened the deploy, only before it is confirmed, and only within 15 minutes of its first create. It needs no approval.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_done,
+        cut: no_cut,
+        params: deploy_rollback_params,
+        result: deploy_rollback_result,
+    },
+    Verb {
+        name: "deploy_remove",
+        summary: "Remove everything a deploy created in a tenant, once the deploy is confirmed or its 15 minutes have passed, only from a proposal the owner approved: one approval for all its services, each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Nothing else of the tenant is touched. A deploy that is still provisional is refused: its own token rolls it back.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: true,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_done,
+        cut: no_cut,
+        params: deploy_remove_params,
+        result: deploy_remove_result,
+    },
 ];
+
+fn deploy_remove_params() -> Value {
+    with_confirm(params(vec![
+        ("tenant", true, tenant_schema()),
+        ("deploy", true, deploy_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn deploy_remove_result() -> Value {
+    result(vec![
+        ("removed", true, boolean()),
+        ("deploy", true, string()),
+        ("parts", true, array(string())),
+    ])
+}
+
+fn deploy_schema() -> Value {
+    json!({
+        "description": "A deploy id: 1 to 64 of a-z, 0-9 and \"-\". What a create inside a tenant makes under it is provisional until the same token confirms the deploy or 15 minutes pass, and that token may roll the deploy back until then.",
+        "pattern": "^[a-z0-9-]{1,64}$",
+        "type": "string"
+    })
+}
+
+/// The same params with the optional `deploy`.
+fn with_deploy(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("deploy".to_string(), deploy_schema());
+    }
+    schema
+}
+
+fn deploy_params() -> Value {
+    params(vec![
+        ("tenant", true, tenant_schema()),
+        ("deploy", true, deploy_schema()),
+    ])
+}
+
+fn deploy_rollback_params() -> Value {
+    with_confirm(deploy_params())
+}
+
+fn deploy_confirm_result() -> Value {
+    result(vec![
+        ("confirmed", true, boolean()),
+        ("deploy", true, string()),
+    ])
+}
+
+fn deploy_rollback_result() -> Value {
+    result(vec![
+        ("rolledBack", true, boolean()),
+        ("deploy", true, string()),
+        ("removed", true, array(string())),
+    ])
+}
+
+/// The optional `tenant` of a verb that may act inside one tenant.
+fn tenant_schema() -> Value {
+    json!({
+        "description": "Optional. The tenant to act in: the verb then sees and changes only that tenant's project. Left out, it acts in the node's own project. A node without kernel.tenants has no tenants.",
+        "pattern": "^[a-z2-7]{8}$",
+        "type": "string"
+    })
+}
+
+/// The params of a database verb with its `tenant`: the field is there so the refusal can say where a tenant's database
+/// is made.
+fn with_refused_tenant(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert(
+            "tenant".to_string(),
+            json!({
+                "description": "Always refused. The database verbs act in the node's own project only. Inside a tenant, a database is the postgres service template, created with service_create and linked with service_connect.",
+                "pattern": "^[a-z2-7]{8}$",
+                "type": "string"
+            }),
+        );
+    }
+    schema
+}
+
+/// The same params with the optional `tenant`.
+fn with_tenant(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("tenant".to_string(), tenant_schema());
+    }
+    schema
+}
+
+fn tenant_caps_schema() -> Value {
+    object_of(
+        vec![
+            ("instances", true, at_least(1)),
+            ("containers", true, at_least(0)),
+            ("virtualMachines", true, at_least(0)),
+            ("cpu", true, at_least(1)),
+            ("memory", true, string_max(32)),
+            ("disk", true, string_max(32)),
+        ],
+        true,
+    )
+}
+
+fn tenant_id_schema() -> Value {
+    json!({
+        "description": "The tenant's id: 8 lowercase base32 characters (a to z, 2 to 7). It is random, never a name.",
+        "pattern": "^[a-z2-7]{8}$",
+        "type": "string"
+    })
+}
+
+fn tenant_create_params() -> Value {
+    params(vec![
+        ("id", false, tenant_id_schema()),
+        ("caps", false, tenant_caps_schema()),
+        ("approval", false, approval_schema()),
+    ])
+}
+
+fn tenant_id_params() -> Value {
+    params(vec![("id", true, tenant_id_schema())])
+}
+
+fn tenant_remove_params() -> Value {
+    with_confirm(params(vec![
+        ("id", true, tenant_id_schema()),
+        ("approval", true, approval_schema()),
+    ]))
+}
+
+fn tenant_status_fields() -> Vec<Field> {
+    vec![
+        ("id", true, string()),
+        ("block", true, string()),
+        ("caps", true, tenant_caps_schema()),
+        (
+            "use",
+            true,
+            result(vec![
+                ("instances", true, at_least(0)),
+                ("containers", true, at_least(0)),
+                ("virtualMachines", true, at_least(0)),
+                ("cpu", true, at_least(0)),
+                ("memoryBytes", true, at_least(0)),
+                ("diskBytes", true, at_least(0)),
+            ]),
+        ),
+        ("instances", false, at_least(0)),
+    ]
+}
+
+fn tenant_status_result() -> Value {
+    result(tenant_status_fields())
+}
+
+fn tenant_list_result() -> Value {
+    result(vec![("tenants", true, array(tenant_status_result()))])
+}
+
+fn tenant_usage_result() -> Value {
+    result(vec![
+        ("id", true, string()),
+        (
+            "instances",
+            true,
+            array(result(vec![
+                ("name", true, string()),
+                ("kind", true, one_of(&["container", "vm"])),
+                ("state", true, string()),
+                ("limitsCpu", true, nullable(string())),
+                ("limitsMemory", true, nullable(string())),
+                ("rootDiskSize", true, nullable(string())),
+                ("service", true, nullable(string())),
+                ("provisional", false, boolean()),
+                ("deploy", false, string()),
+            ])),
+        ),
+    ])
+}
+
+pub fn summary_tenant(v: &Value) -> String {
+    format!(
+        "tenant {} on {}",
+        v["id"].as_str().unwrap_or("?"),
+        v["block"].as_str().unwrap_or("?")
+    )
+}
+
+pub fn summary_tenant_list(v: &Value) -> String {
+    format!("{} tenant(s)", v["tenants"].as_array().map_or(0, Vec::len))
+}
+
+pub fn summary_tenant_usage(v: &Value) -> String {
+    format!(
+        "tenant {}: {} instance(s)",
+        v["id"].as_str().unwrap_or("?"),
+        v["instances"].as_array().map_or(0, Vec::len)
+    )
+}
 
 /// Every verb of the table, in table order.
 pub fn verbs() -> &'static [Verb] {
@@ -962,9 +1276,12 @@ fn not_confirmed(name: &str) -> String {
         "action_approve" => "nothing was run",
         "instance_stop" => "nothing was stopped",
         "instance_restart" => "nothing was restarted",
+        "tenant_remove" => "nothing was removed",
+        "deploy_rollback" => "nothing was rolled back",
+        "deploy_remove" => "nothing was removed",
         _ => "nothing was deleted",
     };
-    let spent = if name == "postgres_delete" {
+    let spent = if name == "postgres_delete" || name == "deploy_rollback" {
         ""
     } else {
         " and no approval was spent"
@@ -1381,8 +1698,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The seventeen verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 17] = [
+/// The twenty verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 20] = [
     "service_create",
     "service_remove",
     "service_import",
@@ -1400,6 +1717,9 @@ const ACTION_NAMES: [&str; 17] = [
     "instance_start",
     "instance_stop",
     "instance_restart",
+    "tenant_create",
+    "tenant_remove",
+    "deploy_remove",
 ];
 
 /// A plan or action proposal id: a delete plan's 64 hex digits, or an action proposal's `act-` and twelve.
@@ -1649,6 +1969,10 @@ fn labels() -> Value {
 }
 
 fn postgres_create_params() -> Value {
+    with_refused_tenant(postgres_create_params_base())
+}
+
+fn postgres_create_params_base() -> Value {
     params(vec![
         ("name", true, string_max(31)),
         ("image", true, string_max(512)),
@@ -1662,6 +1986,10 @@ fn postgres_create_result() -> Value {
     ])
 }
 fn postgres_list_params() -> Value {
+    with_refused_tenant(postgres_list_params_base())
+}
+
+fn postgres_list_params_base() -> Value {
     params(vec![])
 }
 fn postgres_list_result() -> Value {
@@ -1679,6 +2007,10 @@ fn postgres_list_result() -> Value {
     )])
 }
 fn postgres_link_params() -> Value {
+    with_refused_tenant(postgres_link_params_base())
+}
+
+fn postgres_link_params_base() -> Value {
     params(vec![
         ("name", true, string_max(31)),
         ("consumer", true, string_max(63)),
@@ -1692,7 +2024,7 @@ fn postgres_link_result() -> Value {
     ])
 }
 fn postgres_unlink_params() -> Value {
-    postgres_link_params()
+    with_refused_tenant(postgres_link_params_base())
 }
 fn postgres_unlink_result() -> Value {
     result(vec![
@@ -1702,6 +2034,10 @@ fn postgres_unlink_result() -> Value {
     ])
 }
 fn postgres_delete_params() -> Value {
+    with_refused_tenant(postgres_delete_params_base())
+}
+
+fn postgres_delete_params_base() -> Value {
     with_confirm(params(vec![("name", true, string_max(31))]))
 }
 fn postgres_delete_result() -> Value {
@@ -1941,7 +2277,7 @@ pub fn summary_instance_change(v: &Value) -> String {
 /// An Incus project name, as the kernel's project family spells one.
 fn project_name_schema() -> Value {
     json!({
-        "description": "The Incus project the instance is in.",
+        "description": "The Incus project the instance is in. Required unless tenant names the tenant whose project it is.",
         "maxLength": 63,
         "minLength": 1,
         "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$",
@@ -1950,18 +2286,35 @@ fn project_name_schema() -> Value {
 }
 
 fn instance_start_params() -> Value {
+    with_tenant(instance_start_params_base())
+}
+
+/// The service whose instance an instance verb acts on, inside a tenant.
+fn instance_service_schema() -> Value {
+    service_name_schema(
+        "Inside a tenant, the service whose instance is meant, in place of instance.",
+    )
+}
+
+fn instance_start_params_base() -> Value {
     params(vec![
-        ("project", true, project_name_schema()),
-        ("instance", true, instance_name_schema()),
+        ("project", false, project_name_schema()),
+        ("instance", false, instance_name_schema()),
+        ("service", false, instance_service_schema()),
     ])
 }
 
 /// The params of `instance_stop` and `instance_restart`: the instance, and the grant of the approved proposal.
 fn instance_gated_params() -> Value {
+    with_tenant(instance_gated_params_base())
+}
+
+fn instance_gated_params_base() -> Value {
     with_confirm(params(vec![
-        ("project", true, project_name_schema()),
-        ("instance", true, instance_name_schema()),
-        ("approval", true, approval_schema()),
+        ("project", false, project_name_schema()),
+        ("instance", false, instance_name_schema()),
+        ("service", false, instance_service_schema()),
+        ("approval", false, approval_schema()),
     ]))
 }
 
@@ -1996,6 +2349,10 @@ fn service_name_schema(description: &'static str) -> Value {
 }
 
 fn service_create_params() -> Value {
+    with_deploy(with_tenant(service_create_params_base()))
+}
+
+fn service_create_params_base() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
@@ -2026,6 +2383,10 @@ fn service_create_result() -> Value {
 }
 
 fn service_list_params() -> Value {
+    with_tenant(service_list_params_base())
+}
+
+fn service_list_params_base() -> Value {
     json!({ "additionalProperties": false, "properties": {}, "required": [], "type": "object" })
 }
 
@@ -2049,6 +2410,10 @@ fn service_list_result() -> Value {
 }
 
 fn service_status_params() -> Value {
+    with_tenant(service_status_params_base())
+}
+
+fn service_status_params_base() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
@@ -2131,6 +2496,10 @@ pub fn summary_service_remove(_: &Value) -> String {
 }
 
 fn service_logs_params() -> Value {
+    with_tenant(service_logs_params_base())
+}
+
+fn service_logs_params_base() -> Value {
     json!({
         "additionalProperties": false,
         "properties": {
@@ -2164,6 +2533,10 @@ fn service_logs_result() -> Value {
 }
 
 fn service_remove_params() -> Value {
+    with_tenant(service_remove_params_base())
+}
+
+fn service_remove_params_base() -> Value {
     with_confirm(json!({
         "additionalProperties": false,
         "properties": {
@@ -2259,6 +2632,10 @@ fn service_remove_result() -> Value {
 }
 
 fn service_connect_params() -> Value {
+    with_tenant(service_connect_params_base())
+}
+
+fn service_connect_params_base() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"from":{"description":"The consumer: the service whose environment gets the provider's variables.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"to":{"description":"The provider: the service whose first port the link opens.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["from","to"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_connect_result() -> Value {
@@ -2268,6 +2645,10 @@ fn summary_service_connect(_: &Value) -> String {
     "service_connect: complete".into()
 }
 fn service_disconnect_params() -> Value {
+    with_tenant(service_disconnect_params_base())
+}
+
+fn service_disconnect_params_base() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"from":{"description":"The consumer: the service whose environment gets the provider's variables.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"to":{"description":"The provider: the service whose first port the link opens.","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"}},"required":["from","to"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_disconnect_result() -> Value {
@@ -2277,6 +2658,10 @@ fn summary_service_disconnect(_: &Value) -> String {
     "service_disconnect: complete".into()
 }
 fn service_secret_set_params() -> Value {
+    with_tenant(service_secret_set_params_base())
+}
+
+fn service_secret_set_params_base() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"key":{"description":"The secret's name, one of the template's secrets.","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","type":"string"},"name":{"description":"The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"value":{"description":"The secret, 8 to 4096 characters.","maxLength":4096,"minLength":8,"type":"string"}},"required":["name","key","value"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_secret_set_result() -> Value {
@@ -2424,6 +2809,10 @@ fn storage_add_result() -> Value {
 /// source's kind and identity, a volume's pool, and a folder's file system, size, file count and the pool's free space are
 /// resolved by the kernel when the proposal is made.
 fn snapshot_create_params() -> Value {
+    with_tenant(snapshot_create_params_base())
+}
+
+fn snapshot_create_params_base() -> Value {
     params(vec![
         (
             "project",
@@ -2481,7 +2870,15 @@ fn snapshot_create_params() -> Value {
 }
 
 /// `snapshot_delete`: the snapshot's name. Its kind, pool and source are resolved by the kernel when the proposal is made.
+fn snapshot_list_params() -> Value {
+    with_tenant(params(vec![]))
+}
+
 fn snapshot_delete_params() -> Value {
+    with_tenant(snapshot_delete_params_base())
+}
+
+fn snapshot_delete_params_base() -> Value {
     with_confirm(params(vec![
         ("name", true, plain_name_schema("The snapshot's name.")),
         ("kind", false, one_of(&["instance", "volume"])),

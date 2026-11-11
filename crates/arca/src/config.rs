@@ -245,6 +245,44 @@ pub struct KernelConfig {
     /// is imported, and no write reaches another manager's project.
     #[serde(default)]
     pub import_services: Vec<ImportService>,
+    /// Tenants: absent, the node is a single-project node and no tenant verb does anything. Present, the node may hold
+    /// tenants, each in its own restricted project on the managed service bridge.
+    #[serde(default)]
+    pub tenants: Option<TenantsConfig>,
+}
+
+/// The `kernel.tenants` key: what all tenants may hold together, how many there may be, and the caps a tenant gets when
+/// its create names none. Tenants share the node's service /24, so the key needs `kernel.serviceCidr`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenantsConfig {
+    pub capacity: TenantCapacity,
+    pub max_tenants: u32,
+    pub default_caps: arca_netproject::tenant::TenantCaps,
+    /// The one service of the node's own project whose address every tenant service admits on its declared ports, so
+    /// what a tenant deploys can be reached through it. Absent, no service of the node's project reaches a tenant.
+    #[serde(default)]
+    pub front: Option<String>,
+    /// How many tenants may be created in a span of time. It is counted from the journal, so a restart does not reset it.
+    pub create_rate: CreateRate,
+}
+
+/// The `kernel.tenants.createRate` key: at most `count` tenants are created in any `perSeconds` seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateRate {
+    pub count: u32,
+    pub per_seconds: u64,
+}
+
+/// The `kernel.tenants.capacity` key: the sum of every tenant's caps never passes it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenantCapacity {
+    pub instances: u32,
+    pub cpu: u32,
+    pub memory: String,
+    pub disk: String,
 }
 
 /// One `kernel.importServices` entry: a service another manager created, by name, the project its instance is in, and the
@@ -335,6 +373,10 @@ pub enum ConfigError {
     Bridged(&'static str),
     /// The `kernel.importServices` allowlist breaks a rule. The text names the rule, never a value.
     ImportServices(&'static str),
+    /// The `kernel.tenants` key breaks a rule. The text names the rule, never a value.
+    Tenants(&'static str),
+    /// A kernel project carries a tenant prefix: only a tenant's entry makes such a project.
+    TenantProject(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -369,6 +411,11 @@ impl fmt::Display for ConfigError {
             Self::Approval(why) => write!(f, "approval is refused: {why}"),
             Self::Bridged(why) => write!(f, "kernel.bridged is refused: {why}"),
             Self::ImportServices(why) => write!(f, "kernel.importServices is refused: {why}"),
+            Self::Tenants(why) => write!(f, "kernel.tenants is refused: {why}"),
+            Self::TenantProject(name) => write!(
+                f,
+                "kernel project {name} is refused: a name starting arcak-t- or arcak-scratch-t- is a tenant's project, which only tenant_create makes"
+            ),
             Self::ApprovalHost => write!(
                 f,
                 "approvalHost is refused: it must be a host name of letters, digits, dots and hyphens"
@@ -420,6 +467,12 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
         if FORBIDDEN_PROJECTS.contains(&name.as_str()) || kernel.droidd_projects.contains(name) {
             return Err(ConfigError::ProjectForbidden(name.clone()));
         }
+        // A tenant's project joins the family through its entry and never through the config.
+        if name.starts_with(arca_kernel::ownership::TENANT_PROJECT_PREFIX)
+            || name.starts_with(arca_kernel::ownership::SCRATCH_TENANT_PROJECT_PREFIX)
+        {
+            return Err(ConfigError::TenantProject(name.clone()));
+        }
     }
     if !kernel.projects.is_empty() && kernel.droidd_projects.is_empty() {
         return Err(ConfigError::DroiddProjectsEmpty);
@@ -436,6 +489,7 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
     check_adopt(kernel)?;
     check_bridged(kernel)?;
     check_import_services(kernel)?;
+    check_tenants(kernel)?;
     if kernel.scratch {
         for name in &kernel.projects {
             if !name.starts_with(SCRATCH_PREFIX) {
@@ -699,6 +753,68 @@ fn check_import_services(kernel: &KernelConfig) -> Result<(), ConfigError> {
         if !names.insert(&entry.name) {
             return Err(ConfigError::ImportServices("a name is listed twice"));
         }
+    }
+    Ok(())
+}
+
+/// The tenants rules: the managed service network (tenants share its /24), no adoption allowlist, a capacity with every
+/// value set, at most 30 tenants (each holds a /29 or a /28 above the gateway's), default caps a tenant may hold and that
+/// fit the capacity, a create rate, and a front that is a service name.
+fn check_tenants(kernel: &KernelConfig) -> Result<(), ConfigError> {
+    let Some(tenants) = &kernel.tenants else {
+        return Ok(());
+    };
+    if kernel.service_cidr.is_none() {
+        return Err(ConfigError::Tenants(
+            "it needs kernel.serviceCidr: every tenant holds a block of the service subnet",
+        ));
+    }
+    if !kernel.adopt.is_empty() {
+        return Err(ConfigError::Tenants(
+            "kernel.adopt must be empty on a node with tenants",
+        ));
+    }
+    let size = |text: &str| crate::service::size_bytes(text);
+    let capacity = &tenants.capacity;
+    let (Some(memory), Some(disk)) = (size(&capacity.memory), size(&capacity.disk)) else {
+        return Err(ConfigError::Tenants(
+            "capacity must set memory and disk as sizes such as 64GiB",
+        ));
+    };
+    if capacity.instances == 0 || capacity.cpu == 0 {
+        return Err(ConfigError::Tenants(
+            "capacity must set instances and cpu of at least 1",
+        ));
+    }
+    if !(1..=30).contains(&tenants.max_tenants) {
+        return Err(ConfigError::Tenants(
+            "maxTenants must be 1 to 30: each tenant holds a /29 or a /28 of the service subnet",
+        ));
+    }
+    let caps = &tenants.default_caps;
+    if !arca_netproject::tenant::caps_ok(caps, crate::service::size_ok) {
+        return Err(ConfigError::Tenants(
+            "defaultCaps must set instances of 1 to 16, containers and virtualMachines of at most that, cpu of at least 1, and memory and disk as sizes",
+        ));
+    }
+    if caps.instances > capacity.instances
+        || caps.cpu > capacity.cpu
+        || size(&caps.memory).is_none_or(|bytes| bytes > memory)
+        || size(&caps.disk).is_none_or(|bytes| bytes > disk)
+    {
+        return Err(ConfigError::Tenants("defaultCaps must fit inside capacity"));
+    }
+    if tenants.create_rate.count == 0 || tenants.create_rate.per_seconds == 0 {
+        return Err(ConfigError::Tenants(
+            "createRate must set count and perSeconds of at least 1, such as 5 per 3600",
+        ));
+    }
+    if tenants
+        .front
+        .as_deref()
+        .is_some_and(|front| !crate::service::service_name_ok(front))
+    {
+        return Err(ConfigError::Tenants("front must be a service name"));
     }
     Ok(())
 }
@@ -1223,6 +1339,101 @@ mod tests {
             ),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn the_tenants_key_is_refused_unless_every_rule_holds() {
+        use serde_json::json;
+        let caps = json!({ "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 4, "memory": "8GiB", "disk": "64GiB" });
+        let capacity = json!({ "instances": 40, "cpu": 32, "memory": "64GiB", "disk": "1TiB" });
+        let node = |tenants: serde_json::Value, extra: serde_json::Value| {
+            let mut kernel =
+                json!({ "bridged": null, "serviceCidr": "192.0.2.0/24", "tenants": tenants });
+            kernel
+                .as_object_mut()
+                .expect("kernel")
+                .extend(extra.as_object().expect("extra").clone());
+            bridged(kernel)
+        };
+        let good = json!({ "capacity": capacity, "maxTenants": 28, "defaultCaps": caps,
+            "createRate": { "count": 5, "perSeconds": 3600 } });
+        assert_eq!(node(good.clone(), json!({})), Ok(()));
+        let mut front = good.clone();
+        front["front"] = json!("edge");
+        assert_eq!(node(front, json!({})), Ok(()));
+        // The key is exactly these: a pool, or any other key, is an unknown key.
+        let mut pool = good.clone();
+        pool["pool"] = json!("a-pool-of-its-own");
+        assert!(matches!(node(pool, json!({})), Err(ConfigError::Parse(_))));
+        assert!(matches!(
+            node(good.clone(), json!({ "serviceCidr": null })),
+            Err(ConfigError::Tenants(_))
+        ));
+        assert!(matches!(
+            adopting(json!({ "serviceCidr": "192.0.2.0/24", "tenants": good.clone() })),
+            Err(ConfigError::Tenants(_))
+        ));
+        // No config lists a tenant's project, with or without the key.
+        for name in [
+            "arcak-t-aaaaaaaa",
+            "arcak-t-anything",
+            "arcak-scratch-t-aaaaaaaa",
+        ] {
+            assert_eq!(
+                bridged(
+                    json!({ "bridged": null, "serviceCidr": "192.0.2.0/24", "projects": [name] })
+                ),
+                Err(ConfigError::TenantProject(name.to_string())),
+                "{name}"
+            );
+        }
+        // A scratch run may hold tenants: their projects carry the scratch prefix.
+        assert_eq!(
+            node(
+                good.clone(),
+                json!({ "scratch": true, "projects": ["arcak-scratch-probe"] })
+            ),
+            Ok(())
+        );
+        let with = |path: &[&str], value: serde_json::Value| {
+            let mut tenants = good.clone();
+            let mut at = &mut tenants;
+            for key in &path[..path.len() - 1] {
+                at = &mut at[*key];
+            }
+            at[path[path.len() - 1]] = value;
+            tenants
+        };
+        for bad in [
+            with(&["maxTenants"], json!(0)),
+            with(&["maxTenants"], json!(31)),
+            with(&["createRate", "count"], json!(0)),
+            with(&["createRate", "perSeconds"], json!(0)),
+            with(&["capacity", "instances"], json!(0)),
+            with(&["capacity", "cpu"], json!(0)),
+            with(&["capacity", "memory"], json!("64")),
+            with(&["defaultCaps", "instances"], json!(17)),
+            with(&["defaultCaps", "instances"], json!(0)),
+            with(&["defaultCaps", "containers"], json!(5)),
+            with(&["defaultCaps", "virtualMachines"], json!(5)),
+            with(&["defaultCaps", "cpu"], json!(33)),
+            with(&["defaultCaps", "memory"], json!("65GiB")),
+            with(&["defaultCaps", "disk"], json!("2TiB")),
+            with(&["front"], json!("Not A Name")),
+        ] {
+            assert!(
+                matches!(node(bad.clone(), json!({})), Err(ConfigError::Tenants(_))),
+                "{bad}"
+            );
+        }
+        for missing in ["capacity", "maxTenants", "defaultCaps", "createRate"] {
+            let mut partial = good.clone();
+            partial.as_object_mut().expect("tenants").remove(missing);
+            assert!(
+                matches!(node(partial, json!({})), Err(ConfigError::Parse(_))),
+                "{missing} is required"
+            );
+        }
     }
 
     fn adopting(kernel: serde_json::Value) -> Result<(), ConfigError> {

@@ -492,6 +492,11 @@ impl FakeIncus {
         lock(&self.shared.reject_delete).push(prefix.to_string());
     }
 
+    /// Lifts every refusal [`FakeIncus::set_reject_delete`] armed.
+    pub fn clear_reject_delete(&self) {
+        lock(&self.shared.reject_delete).clear();
+    }
+
     pub fn set_reject_patch(&self, path_prefix: &str) {
         lock(&self.shared.reject_patch).push(path_prefix.to_string());
     }
@@ -2024,6 +2029,14 @@ fn delete(shared: &Shared, store: &mut Store, address: &Address) -> (u16, String
             Err((400, "The instance is running".to_string())),
         );
     }
+    // Incus refuses to delete an ACL that an instance's NIC still names.
+    if kind == "acl" && store.acl_in_use(&address.name) {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "Cannot delete an ACL that is in use"),
+        );
+    }
     store.objects.remove(index);
     answered(shared, store, &kind, "DELETE", Ok(()))
 }
@@ -2189,6 +2202,22 @@ impl Store {
     }
 
     /// The devices and config an instance body has in `project`: its expansion, or its own keys when it names no profiles.
+    /// Whether a NIC of any instance names the ACL `name` in its `security.acls`, on a device of its own or of a profile.
+    fn acl_in_use(&self, name: &str) -> bool {
+        self.objects
+            .iter()
+            .filter(|object| object.kind == "instance")
+            .any(|object| {
+                let (devices, _) = self.effective(&object.project, &object.body);
+                devices.values().any(|device| {
+                    device
+                        .get("security.acls")
+                        .and_then(Value::as_str)
+                        .is_some_and(|acls| acls.split(',').any(|acl| acl.trim() == name))
+                })
+            })
+    }
+
     fn effective(&self, project: &str, body: &Value) -> (Map<String, Value>, Map<String, Value>) {
         self.expansion(project, body).unwrap_or_else(|| {
             let own = |key: &str| {

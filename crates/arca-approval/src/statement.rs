@@ -42,6 +42,9 @@ pub enum ArcaAction {
     /// A service on this node may make the person showing a code one of its owners. The target is the code
     /// ([`valid_enroll_code`]); the approval changes nothing in the kernel and is spent with `enroll_confirm`.
     Enroll,
+    TenantCreate,
+    TenantRemove,
+    DeployRemove,
 }
 
 impl ArcaAction {
@@ -73,6 +76,9 @@ impl ArcaAction {
             Self::InstanceStop => "instance_stop",
             Self::InstanceRestart => "instance_restart",
             Self::Enroll => "enroll",
+            Self::TenantCreate => "tenant_create",
+            Self::TenantRemove => "tenant_remove",
+            Self::DeployRemove => "deploy_remove",
         }
     }
 
@@ -104,6 +110,9 @@ impl ArcaAction {
             "instance_stop" => Some(Self::InstanceStop),
             "instance_restart" => Some(Self::InstanceRestart),
             "enroll" => Some(Self::Enroll),
+            "tenant_create" => Some(Self::TenantCreate),
+            "tenant_remove" => Some(Self::TenantRemove),
+            "deploy_remove" => Some(Self::DeployRemove),
             _ => None,
         }
     }

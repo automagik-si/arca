@@ -125,6 +125,35 @@ fn bridge_grant_removal(entry: &EntryId, project: &str, key: &str, value: Option
         && value.is_none()
 }
 
+/// The managed service bridge every tenant's project is granted.
+const SERVICE_BRIDGE: &str = "arcak-svcbr";
+
+/// The restrictions a tenant's entry may set on its own project's create, each at its tighter value (Rule 62).
+const TENANT_RESTRICTIONS: [(&str, &str); 8] = [
+    ("restricted.devices.proxy", "block"),
+    ("restricted.devices.gpu", "block"),
+    ("restricted.devices.disk", "managed"),
+    ("restricted.devices.nic", "managed"),
+    ("restricted.containers.nesting", "block"),
+    ("restricted.containers.privilege", "unprivileged"),
+    ("restricted.containers.lowlevel", "block"),
+    ("restricted.virtual-machines.lowlevel", "block"),
+];
+
+/// Whether `entry` is a tenant's and `project` is that tenant's own project.
+fn tenant_owns(entry: &EntryId, project: &str) -> bool {
+    arca_kernel::ownership::tenant_of_entry(entry)
+        .is_some_and(|id| arca_kernel::ownership::tenant_of_project(project) == Some(id))
+}
+
+// A tenant's entry may tighten its own project at its create, and nothing else.
+fn tenant_restriction(entry: &EntryId, project: &str, key: &str, value: Option<&str>) -> bool {
+    tenant_owns(entry, project)
+        && TENANT_RESTRICTIONS
+            .iter()
+            .any(|(allowed, set)| *allowed == key && value == Some(*set))
+}
+
 /// Whether a project key is guarded: `restricted`, any `restricted.*` key, and any `features.*` key.
 fn guarded_project_key(key: &str) -> bool {
     key == RESTRICTED_KEY || key.starts_with("restricted.") || key.starts_with("features.")
@@ -178,6 +207,47 @@ impl RetainedSet {
             .read()
             .map(|set| set.clone())
             .map_err(|_| unreadable_retained_set())
+    }
+}
+
+/// The projects of the tenants whose entries exist: the part of the project family that follows the desired state. Every
+/// clone shares one set. The kernel keeps it: a tenant's project is in it from the moment its entry is in the desired
+/// state until nothing of the entry is left on the node, and no other name ever is. The names are built here from the
+/// tenants' ids, so each carries the tenant prefix (the scratch one in a scratch run).
+#[derive(Debug, Clone, Default)]
+pub struct TenantProjects {
+    scratch: bool,
+    projects: Arc<RwLock<std::collections::BTreeSet<String>>>,
+}
+
+impl TenantProjects {
+    /// The empty set of a node, for a scratch run or not.
+    pub fn new(scratch: bool) -> Self {
+        TenantProjects {
+            scratch,
+            projects: Arc::default(),
+        }
+    }
+
+    /// Replaces the set with the projects of `entries`. An entry that is not a tenant's (`tenant-<id>`) adds nothing.
+    pub fn set<'a>(&self, entries: impl IntoIterator<Item = &'a EntryId>) {
+        let next = entries
+            .into_iter()
+            .filter_map(arca_kernel::ownership::tenant_of_entry)
+            .map(|id| arca_kernel::ownership::tenant_project(id, self.scratch))
+            .collect();
+        if let Ok(mut projects) = self.projects.write() {
+            *projects = next;
+        }
+    }
+
+    /// The set as it is now. A set whose lock was poisoned is refused, never read as empty.
+    pub fn snapshot(&self) -> Result<std::collections::BTreeSet<String>, EffectRefusal> {
+        self.projects.read().map(|set| set.clone()).map_err(|_| {
+            EffectRefusal::Provider(
+                "the tenant set is unreadable, so nothing is written".to_string(),
+            )
+        })
     }
 }
 
@@ -250,9 +320,37 @@ pub struct IncusProvider {
     uid: u32,
     deadline: Option<Duration>,
     retained: RetainedSet,
+    tenants: TenantProjects,
 }
 
 impl IncusProvider {
+    /// The same provider with the tenant projects the kernel keeps. Without it no tenant project is in the family.
+    pub fn with_tenants(mut self, tenants: TenantProjects) -> Self {
+        self.tenants = tenants;
+        self
+    }
+
+    /// Whether the kernel may write in `project`: the configured family, or the project of a tenant whose entry exists.
+    /// A tenant's project carries the tenant prefix of this run and is never a reserved or a droidd project.
+    fn allows(&self, project: &str) -> bool {
+        if self.family.allows(project) {
+            return true;
+        }
+        let prefix = if self.family.scratch {
+            arca_kernel::ownership::SCRATCH_TENANT_PROJECT_PREFIX
+        } else {
+            arca_kernel::ownership::TENANT_PROJECT_PREFIX
+        };
+        project
+            .strip_prefix(prefix)
+            .is_some_and(arca_kernel::ownership::tenant_id_ok)
+            && !self.family.droidd_projects.iter().any(|p| p == project)
+            && self
+                .tenants
+                .snapshot()
+                .is_ok_and(|set| set.contains(project))
+    }
+
     /// A provider over the Incus socket at `socket`, for `family`, with secret files under `secrets_dir`, and with the entries
     /// in `retained` never written. The family is refused when it breaks a rule of [`Family`].
     pub fn new(
@@ -272,6 +370,7 @@ impl IncusProvider {
             uid,
             deadline: None,
             retained,
+            tenants: TenantProjects::default(),
         })
     }
 
@@ -284,11 +383,22 @@ impl IncusProvider {
     /// The writer for `entry`, with this provider's family, the retained set as it is now, and its deadline. A set that cannot
     /// be read refuses the write.
     fn writer(&self, entry: &EntryId) -> Result<UnixIncusWriter, EffectRefusal> {
+        let tenants = self.tenants.snapshot()?;
+        let family = self
+            .writer_family
+            .clone()
+            .with_tenants(
+                tenants
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|project| self.allows(project)),
+            )
+            .map_err(EffectRefusal::Provider)?;
         let writer = UnixIncusWriter::new(
             self.socket.clone(),
             entry.clone(),
             self.retained.snapshot()?,
-            self.writer_family.clone(),
+            family,
         );
         Ok(match self.deadline {
             Some(deadline) => writer.with_operation_deadline(deadline),
@@ -302,7 +412,7 @@ impl IncusProvider {
         let allowed = if arca_incus::write::network_home(kind) {
             project == NETWORK_HOME
         } else {
-            self.family.allows(project)
+            self.allows(project)
         };
         if allowed {
             Ok(())
@@ -320,7 +430,7 @@ impl IncusProvider {
     fn served_at(&self, entry: &EntryId, object: &ObjectRef) -> Result<ObjectRef, EffectRefusal> {
         if !arca_incus::write::network_home(object.kind)
             || object.project == NETWORK_HOME
-            || !self.family.allows(&object.project)
+            || !self.allows(&object.project)
         {
             return Ok(object.clone());
         }
@@ -497,7 +607,33 @@ impl IncusProvider {
                     let list = set.as_str().ok_or_else(|| {
                         EffectRefusal::Provider("the bridge grant is not text".to_string())
                     })?;
+                    // A tenant's project is granted the node's managed service bridge and no other. The bridge is
+                    // the network entry's, not the tenant's: it must exist and carry that entry's mark.
+                    if tenant_owns(entry, project) {
+                        if list != SERVICE_BRIDGE {
+                            return Err(EffectRefusal::Provider(
+                                "a tenant's project is granted the managed service bridge only"
+                                    .to_string(),
+                            ));
+                        }
+                        let bridge = self
+                            .reader
+                            .get(&format!(
+                                "/1.0/networks/{SERVICE_BRIDGE}?project={NETWORK_HOME}"
+                            ))
+                            .map_err(incus_refusal)?;
+                        if bridge["config"][KERNEL_ENTRY_KEY].as_str() != Some(NET_ENTRY) {
+                            return Err(EffectRefusal::Provider(
+                                "the managed service bridge is not one Arca made on this node"
+                                    .to_string(),
+                            ));
+                        }
+                        continue;
+                    }
                     self.check_network_access(entry, list)?;
+                    continue;
+                }
+                if tenant_restriction(entry, project, key, set.as_str()) {
                     continue;
                 }
                 if service_proxy_allowance(entry, project, key, set.as_str()) {
@@ -1131,7 +1267,9 @@ impl Provider for IncusProvider {
                     );
                 }
                 self.check_family(kind, project)?;
-                if kind != IncusKind::Acl && !projects.iter().any(|p| p == project) {
+                if kind != IncusKind::Acl
+                    && !arca_kernel::ownership::manifest_names_project(projects, project)
+                {
                     return Err(EffectRefusal::ProjectNotAllowed);
                 }
                 let usable = self.secrets_by_value(entry);

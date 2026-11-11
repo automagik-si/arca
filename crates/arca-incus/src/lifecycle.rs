@@ -101,6 +101,17 @@ impl StateChanger {
         self
     }
 
+    /// The same writer, with the projects of the tenants whose entries exist added to its family.
+    pub fn with_tenants<'a>(
+        &self,
+        tenants: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            family: self.family.clone().with_tenants(tenants)?,
+            ..self.clone()
+        })
+    }
+
     /// Whether the family this writer was built with holds `project`.
     pub fn allows(&self, project: &str) -> bool {
         self.family

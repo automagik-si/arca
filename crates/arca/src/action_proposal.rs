@@ -65,11 +65,14 @@ pub enum ActionKind {
     InstanceStart,
     InstanceStop,
     InstanceRestart,
+    TenantCreate,
+    TenantRemove,
+    DeployRemove,
 }
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 17] = [
+    pub const ALL: [ActionKind; 20] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceImport,
@@ -87,6 +90,9 @@ impl ActionKind {
         Self::InstanceStart,
         Self::InstanceStop,
         Self::InstanceRestart,
+        Self::TenantCreate,
+        Self::TenantRemove,
+        Self::DeployRemove,
     ];
 
     /// The verb name this action runs.
@@ -109,6 +115,9 @@ impl ActionKind {
             Self::InstanceStart => "instance_start",
             Self::InstanceStop => "instance_stop",
             Self::InstanceRestart => "instance_restart",
+            Self::TenantCreate => "tenant_create",
+            Self::TenantRemove => "tenant_remove",
+            Self::DeployRemove => "deploy_remove",
         }
     }
 
@@ -264,7 +273,7 @@ impl ActionKind {
             label: label.to_string(),
             value: value.to_string(),
         };
-        match self {
+        let rows = match self {
             Self::ServiceCreate => {
                 let mut rows = vec![row("Name", text("name")), row("Template", text("template"))];
                 // Only a virtual machine on a host bridge names these.
@@ -358,7 +367,56 @@ impl ActionKind {
                     row("Effect", &effect),
                 ]
             }
+            Self::TenantCreate => {
+                let mut rows = Vec::new();
+                if args.get("id").is_some() {
+                    rows.push(row("Tenant", text("id")));
+                }
+                let caps = &args["caps"];
+                if caps.is_object() {
+                    let number = |key: &str| caps[key].as_u64().unwrap_or(0).to_string();
+                    rows.push(row("Instances", &number("instances")));
+                    rows.push(row("Containers", &number("containers")));
+                    rows.push(row("Virtual machines", &number("virtualMachines")));
+                    rows.push(row("CPUs", &number("cpu")));
+                    rows.push(row("Memory", caps["memory"].as_str().unwrap_or_default()));
+                    rows.push(row("Disk", caps["disk"].as_str().unwrap_or_default()));
+                } else {
+                    rows.push(row("Caps", "this node's defaults"));
+                }
+                rows
+            }
+            Self::TenantRemove => vec![
+                row("Tenant", text("id")),
+                row(
+                    "Effect",
+                    "Deletes every service of this tenant, with its data, and then the tenant's project.",
+                ),
+            ],
+            Self::DeployRemove => vec![
+                row("Deploy", text("deploy")),
+                // What the deploy holds as the proposal is made: the owner sees each part he approves the removal of.
+                row("Parts", gpu_product.unwrap_or("read when the removal runs")),
+                row(
+                    "Effect",
+                    "Deletes every service this deploy created in the tenant, with its data. Nothing else of the tenant is touched.",
+                ),
+            ],
+        };
+        // An action inside a tenant says so.
+        let mut rows = rows;
+        if !matches!(self, Self::TenantCreate | Self::TenantRemove)
+            && let Some(tenant) = args.get("tenant").and_then(Value::as_str)
+        {
+            rows.push(row("Tenant", tenant));
         }
+        // A create inside a deploy says so: the deploy is part of what the approval binds.
+        if self != Self::DeployRemove
+            && let Some(deploy) = args.get("deploy").and_then(Value::as_str)
+        {
+            rows.push(row("Deploy", deploy));
+        }
+        rows
     }
 
     /// A sentence in the owner's words, built only from fields the schema has already checked. It names the arguments
@@ -371,7 +429,7 @@ impl ActionKind {
                 .map_or_else(|| text(key), |(reference, _)| reference)
                 .to_string()
         };
-        match self {
+        let sentence = match self {
             // Only a virtual machine on a host bridge names a bridge, and a proposal for one always does: a bridge left out
             // on a bridged node is filled in when the proposal is made.
             Self::ServiceCreate if args.get("bridge").is_some() => format!(
@@ -451,6 +509,20 @@ impl ActionKind {
                     text("project")
                 )
             }
+            Self::TenantCreate if args.get("caps").is_some() => {
+                "Create a tenant with caps above this node's defaults".to_string()
+            }
+            Self::TenantCreate => "Create a tenant".to_string(),
+            Self::TenantRemove => format!("Remove the tenant {} and everything in it", text("id")),
+            Self::DeployRemove => {
+                format!("Remove everything the deploy {} created", text("deploy"))
+            }
+        };
+        match args.get("tenant").and_then(Value::as_str) {
+            Some(tenant) if !matches!(self, Self::TenantCreate | Self::TenantRemove) => {
+                format!("{sentence}, in tenant {tenant}")
+            }
+            _ => sentence,
         }
     }
 }
@@ -506,6 +578,24 @@ fn loaded_words(
     stored_summary: &str,
     stored_details: &[ActionDetail],
 ) -> (String, Vec<ActionDetail>) {
+    // The parts of a deploy's removal were read from the desired state when it was proposed, and are not in its
+    // arguments either: the journal's own rows are kept when they are the rows this action writes for these arguments.
+    if action == ActionKind::DeployRemove {
+        let rebuilt = action.details(args);
+        let fits = stored_details.len() == rebuilt.len()
+            && stored_details.iter().zip(&rebuilt).all(|(stored, built)| {
+                stored.label == built.label
+                    && (stored.label == "Parts" || stored.value == built.value)
+            });
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                rebuilt
+            },
+        );
+    }
     if !matches!(action, ActionKind::GpuAttach | ActionKind::GpuDetach) {
         return (action.summary(args), action.details(args));
     }

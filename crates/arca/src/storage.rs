@@ -3823,10 +3823,27 @@ pub struct SnapshotListHandler {
 }
 
 impl ToolHandler for SnapshotListHandler {
-    fn call(&self, _args: Value, _caller: &Caller) -> Result<Value, CallError> {
+    fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
         let snapshots = self.storage.snapshots()?;
+        // With a tenant, only the snapshots taken from that tenant's project are listed.
+        let tenant = match args.get("tenant") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|id| arca_kernel::ownership::tenant_id_ok(id))
+                    .ok_or_else(|| CallError::Invalid("tenant: expected a tenant id".into()))?,
+            ),
+        };
         Ok(json!({
-            "snapshots": snapshots.iter().map(SnapshotView::to_json).collect::<Vec<_>>(),
+            "snapshots": snapshots
+                .iter()
+                // With a tenant: that tenant's snapshots. Without one: nothing of any tenant.
+                .filter(|snapshot| {
+                    arca_kernel::ownership::tenant_of_project(&snapshot.source_project) == tenant
+                })
+                .map(SnapshotView::to_json)
+                .collect::<Vec<_>>(),
         }))
     }
 }

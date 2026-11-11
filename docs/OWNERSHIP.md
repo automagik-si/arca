@@ -161,8 +161,8 @@ delete plan, and `C` is an emission that is never reverted. A plugin's manifest 
 class. The default classes this document proposes are: project `B`, instance `B`, volume `B`, bucket `B`, network `B`; ACL `A`,
 profile `A`, zone `A`, forward `A`. A network is `B` because it is a bridge the default project shares, and an instance attached
 to it must be deleted first: a plan deletes the most recent object first, while a class-`A` revert runs before any plan and would
-ask Incus to delete a bridge still in use. An ACL stays `A` although it is addressed in `default` (Rule 40), since no ACL the
-kernel makes today is named by a NIC. No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
+ask Incus to delete a bridge still in use. An ACL stays `A` although it is addressed in `default` (Rule 40); an ACL that a
+NIC of the entry's own instance names is retired after that instance, not at once (Rule 66). No Incus kind is class `C`. `Ctx::effect` refuses an effect whose planned class the
 manifest does not declare for that kind. Whether a declared class is stricter than the default is not checked.
 Source: `arca_kernel::journal::{EffectClass, removal}` partitions by class; `arca_kernel::plugin::Manifest.effects` and the
 `NotDeclared` check in `Ctx::effect`.
@@ -1038,6 +1038,167 @@ in `crates/arca-kernel/src/plugin.rs`; `ServiceHandler::settle_create` in `crate
 `crates/arca/tests/services/mixed.rs` and, for the cases that stay open,
 `a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` in `crates/arca-providers/tests/incus_provider.rs`.
 
+## Tenants
+
+A node whose config sets `kernel.tenants` is a node with tenants. A tenant is one desired-state entry, `tenant-<id>` (plugin
+`arca.tenant`), where `<id>` is 8 random lowercase base32 characters and never a name. The node's own project, `arcak-svc`,
+stays the node owner's. A node without the key runs none of the code below: every tenant verb, and every verb given a
+`tenant`, answers "this node has no tenants".
+
+**Rule 61.** A tenant's project is in the project family exactly while its entry exists, and only under the tenant prefix.
+The project is `arcak-t-<id>`, and `arcak-scratch-t-<id>` in a scratch run. The kernel keeps the set of tenant projects: the
+project of each `tenant-<id>` entry in the desired state, and of each one the journal still holds an effect for, so a tenant
+being removed stays in the family until nothing of it is left. The set is filled before the journal's intents are settled at
+start, before a new document is reconciled, and again after every reconcile and every plan run. The provider admits a project
+outside its configured family only when the name is a tenant prefix of this run followed by a tenant id, the set holds it,
+and it is not a droidd project; the writer's family is built from the same set for each write and refuses any name that is
+not a tenant project's. A plugin's manifest names tenant projects by the two prefixes followed by `*`
+(`manifest_names_project`); that admits nothing by itself. A service's `user.arca.*` keys are classed as its entry's own
+in its tenant's project only (`classify_object`), as they are in `arcak-svc`.
+Source: `TenantProjects` and `IncusProvider::{allows, writer, with_tenants}` in `crates/arca-providers/src/incus.rs`;
+`ProjectFamily::with_tenants` in `crates/arca-incus/src/write.rs`; `Kernel::{open_with_tenants, refresh_tenants}` in
+`crates/arca/src/kernel.rs`; `tenant_of_project`, `manifest_names_project` and `classify_object` in
+`crates/arca-kernel/src/ownership.rs`. Tests `removing_a_tenant_takes_everything_of_it_in_order_and_leaves_the_others_as_they_were`
+(a removed tenant's project is out of the family) in `crates/arca/tests/tenants/isolation.rs` and
+`a_scratch_run_names_its_tenant_projects_under_the_scratch_prefix_and_joins_the_bridge_it_finds` in
+`crates/arca/tests/tenants/admission.rs`.
+
+**Rule 62.** A tenant owns its project and that project's `arca-service` profile, and nothing else. It makes no bridge and
+no network: its project is granted the node's managed bridge, `restricted.networks.access=arcak-svcbr`, and no other. The
+bridge is the network entry's, so this one grant is checked differently from Rule 41: the bridge must exist in `default` and
+carry the mark `net-arcak-svc`. The project is restricted like every kernel project (Rule 30) and is created with these
+keys, each at its tighter value, which the provider admits for a tenant's entry in its own project and for nothing else:
+`restricted.devices.proxy=block`, `restricted.devices.gpu=block`, `restricted.devices.disk=managed`,
+`restricted.devices.nic=managed`, `restricted.containers.nesting=block`, `restricted.containers.privilege=unprivileged`,
+`restricted.containers.lowlevel=block` and `restricted.virtual-machines.lowlevel=block`. A scratch run never makes the
+bridge: it joins the one the node has, or the create is refused.
+Source: `Tenant::apply` and `RESTRICTIONS` in `crates/arca-netproject/src/tenant.rs`; `tenant_restriction`, `tenant_owns`
+and `prepared_create` in `crates/arca-providers/src/incus.rs`. Test
+`a_tenant_is_one_restricted_project_on_the_managed_bridge_with_its_caps_and_profile` in
+`crates/arca/tests/tenants/admission.rs`.
+
+**Rule 63.** A tenant's caps are its project's own `limits.instances`, `limits.containers`, `limits.virtual-machines`,
+`limits.cpu`, `limits.memory` and `limits.disk`. They are set at the project's create and, when the entry's caps change,
+by one journaled write of the project's whole config under the read's ETag (Rule 43). Incus enforces them. The kernel checks
+them first, from its own records, so a refusal names the cap: a container counts its template's limits or the tenant
+profile's (2 CPUs, 2GiB), a 16GiB root disk and its data volume's size; a virtual machine counts its limits and its root
+disk. `kernel.tenants.capacity` bounds the sum of every tenant's caps, and
+`kernel.tenants.maxTenants` their number. The node's virtual-machine caps (Rule 58) cover every tenant: the sum of the
+tenants' virtual-machine caps and the node's own machines stays within the node's count, and a tenant's machine is checked
+against the node's CPU, memory and disk caps with every other machine. Rules 56 and 59 apply to a tenant's machine unchanged,
+with one difference: it joins the managed network only. A host bridge in a tenant is refused.
+Source: `TenantCaps::limits` in `crates/arca-netproject/src/tenant.rs`; `caps_exceeded`, `admission_refusal` and
+`reserved_vms` in `crates/arca/src/tenants.rs`; `caps_refusal` in `crates/arca/src/handlers.rs`. Tests
+`a_tenants_caps_are_checked_before_incus_and_the_refusal_names_the_cap` and
+`a_tenants_machine_sits_on_the_managed_network_and_the_nodes_machine_cap_covers_every_tenant` in
+`crates/arca/tests/tenants/isolation.rs`, and `the_policys_limits_refuse_in_plain_words_that_name_the_limit` in
+`crates/arca/tests/tenants/admission.rs`.
+
+**Rule 64.** Tenants share the managed bridge, and each is kept to its own block of the service /24. A tenant holds a /29
+(8 addresses), or a /28 when its `instances` cap is above 8; the entry records the block with its size. Blocks are taken
+from the top of the /24 down, never inside the lowest /28 (the gateway's), never over another tenant's block, and never
+over an address in use. A block holds an address for every instance its tenant may hold: the subnet's top block lacks
+the broadcast address, so a tenant that may fill a whole block is not given it. Two limits of the shared bridge are
+known and are not closed here. The bridge sets no DHCP range, so an instance of the node's own project that reserves no
+address (a database or a consumer of the node) may be leased an address inside a tenant's block; a block is never laid
+over a lease that exists, and such an instance keeps its own ACL, but the block then holds one address fewer than its
+tenant may use. And the bridge's DNS answers forward and reverse lookups for every instance on it, so a tenant can
+learn the instance names of other tenants (`<service>-<id>`) and of the node's own services, though it can reach none
+of them. A DHCP range kept clear of the tenant blocks, and a per-tenant DNS view or instance names that carry no service
+name, are later tasks. Every instance of a tenant takes a fixed address of the block, and the node's own address plan
+skips every tenant's block. On the shared bridge the isolation is the NIC's: `security.mac_filtering` and
+`security.ipv4_filtering` are on, so an instance cannot take another's address; a tenant's NIC also sets
+`security.ipv6_filtering`, and since the bridge has no IPv6 address the NIC is given none, so Incus drops every IPv6
+frame the instance sends and no tenant reaches another over the bridge's link-local addresses. That filter is the
+second of two layers: the NIC's ACL rejects all IPv6 by itself, as a control run showed ("Assumptions to confirm"); `security.port_isolation` stays `false`,
+since it would cut links inside a tenant; and the NIC's ACL rejects by default both ways. A tenant NIC's egress rejects the
+service /24 outside its own block (the fewest CIDR ranges that cover it), and names DHCP (udp 67) and DNS (udp and tcp 53) on
+the gateway as allowed; everything else is the egress of every service: the other private ranges and the host's addresses
+rejected, the internet allowed. Ingress is a link's port (Rule 65) and, on a node that sets `kernel.tenants.front`, one
+more rule: the address of that one service of `arcak-svc`, tcp, on every port the tenant's service declares. No other
+service of the node's project is admitted. The rule follows the node: a pass (`sync_front`, every 30 seconds while the
+node serves, and at once when the front is created or a deploy is confirmed) sets each tenant service's record to the
+front's address as it is now, or to none when the node has no front or the service is provisional (Rule 67), and the
+service's ACL is patched to match. A front that is recreated at another address is followed by every tenant service; a
+pass over a node where nothing changed writes nothing.
+Source: `Block`, `blocks`, `block_prefix` and `egress_rules` in `crates/arca-netproject/src/tenant.rs`; `ingress`,
+`egress` and `Service::apply` in `crates/arca/src/service.rs`; `free_address` in `crates/arca/src/handlers.rs`. Tests
+`addresses_come_from_each_tenants_block_and_the_nodes_own_plan_skips_them`,
+`the_nodes_own_plan_never_hands_out_an_address_inside_a_tenants_block`,
+`a_tenants_nic_reaches_its_own_block_and_the_internet_and_nothing_else_of_the_subnet` and
+`the_front_reaches_every_declared_port_of_a_tenants_service_and_nothing_else_does` in
+`crates/arca/tests/tenants/isolation.rs`, `the_front_reaches_only_ordinary_services_and_follows_a_front_that_is_made_again`
+in `crates/arca/tests/tenants/deploys.rs` (`sync_front` in `crates/arca/src/tenants.rs`), and the unit tests of
+`crates/arca-netproject/src/tenant.rs`.
+
+**Rule 65.** A verb given `tenant` acts in that tenant's project and sees nothing outside it; a verb given none sees
+nothing of any tenant. A tenant's service is the entry `t-<id>-service-<name>`, so two tenants and the node may each
+hold one of a name. A database inside a tenant is a service too: the postgres service template, linked with
+`service_connect`. The `postgres_*` verbs act in the node's own project only and refuse a `tenant` in those words,
+before anything is written. Its Incus instance is named
+`<name>-<id>`: Incus refuses two instances of one name on one bridge, whatever their projects, because the name is the
+instance's DNS name there (a live host showed it). The instance verbs and `tenant_usage` name an instance by that Incus
+name. A name on another side answers "not found", exactly as a name that does not exist. A link joins two services of one side only, and a removal revokes links
+among the services of its own project only. Nothing in a tenant is published, imported or released, has a host port, or
+runs a command through the exec seam (Rule 50): a tenant's log is its console log. `service_publish`,
+`service_unpublish`, `service_import` and `service_release` take no `tenant`: the field is not in their schema. A
+snapshot verb given `tenant` takes its source from that tenant's project, lists the snapshots taken from it, and deletes
+only those; given none, it lists no tenant's snapshot, refuses a tenant's project named by `project`, and does not find
+a tenant's snapshot. Inside a tenant,
+`instance_start`, `instance_stop` and `instance_restart` need no approval, from a token whose tool allowlist names the
+verb: a stop is reversible, and each action is journaled with the token and the tenant. Outside a tenant a stop and a
+restart still run only from an approved proposal.
+Source: `scoped_entries`, `scoped_rows` and `tenant_arg` in `crates/arca/src/tenants.rs`; `ServiceHandler::call` and
+`PostgresHandler::call` (the refusal) in `crates/arca/src/handlers.rs`; `Kernel::remove_service_spent` in `crates/arca/src/kernel.rs`.
+Tests `each_side_sees_and_changes_only_its_own_services`, `a_link_joins_two_services_of_one_tenant_and_opens_one_port`
+and `the_database_verbs_refuse_a_tenant_and_name_the_service_route` in
+`crates/arca/tests/tenants/isolation.rs`, `usage_reports_what_each_instance_is_allowed_and_the_instance_verbs_act_in_one_tenant`
+there (`LifecycleHandler::call` in `crates/arca/src/lifecycle.rs`), and `snapshot_verbs_with_a_tenant_stay_inside_that_tenant`
+in `crates/arca/tests/snapshots.rs`. `crates/arca/tests/services/golden.rs` holds the request log of the services
+suite on a node without the key: no rig of it sends another request than before.
+
+**Rule 66.** A removal deletes an instance, reads it back absent, and only then deletes the ACL its NIC names. A plugin
+declares the class-A kinds its class-B objects use (`Plugin::retired_after_plan`; `arca.service` and `arca.postgres`
+declare their ACL). While the entry has a class-B object left, the reconciler does not revert such an object at once, as
+Rule 17 otherwise states: the approved plan's run retires it after every class-B object of the entry is deleted and each
+reads back absent. One the run could not retire stays live in the journal and makes the run partial, and the next
+removal pass, which finds no class-B object left, retires it; the provider checks the entry's mark on it as on every
+retirement. A tenant's removal follows the same order for everything in it, then removes the tenant's own entry: its
+secrets after its instances, then its profile, and its project last. It runs only from a proposal the owner approved, as
+a `service_remove` in a tenant does.
+Source: `Reconciler::{remove_entry, execute_plan, retire_held}` in `crates/arca-reconcile/src/lib.rs`;
+`TenantHandler::remove` in `crates/arca/src/tenants.rs`. Tests `service_remove_deletes_the_instance_and_only_then_its_acl`,
+`a_later_removal_sweeps_the_acl_an_earlier_removal_left_behind`,
+`an_instance_only_delete_rejection_is_a_partial_refusal_and_keeps_secrets` and
+`the_fake_refuses_to_delete_an_acl_a_nic_still_names_as_incus_does` in `crates/arca/tests/services.rs`, and
+`removing_a_tenant_takes_everything_of_it_in_order_and_leaves_the_others_as_they_were` and
+`a_removal_that_cannot_finish_says_what_remains_and_keeps_the_project` in `crates/arca/tests/tenants/isolation.rs`.
+
+**Rule 67.** A create inside a tenant may name a deploy, and what it makes is provisional for a while. `service_create`
+takes `deploy`, inside a tenant only. A link is not part of a deploy by itself: it goes when one of its two services
+goes, as in any removal, so `service_connect` takes no `deploy` and refuses the field. The deploy is
+recorded on the entry and in the deploy journal (`tenant-deploys.jsonl` in the state directory), with the token that made
+the call. A deploy is opened by its first create and takes more creates from that token only. It is provisional until
+that token calls `deploy_confirm`, or until 15 minutes after its first journal line, whichever comes first; the time is
+read from the journal, so a restart does not reset it. While it is provisional, that token may call `deploy_rollback`,
+which removes exactly the entries the deploy created, with no approval: each instance is deleted and read back absent
+before its ACL (Rule 66), then its secrets and volumes, and a service's links among the tenant's services are revoked as
+in any removal. The rollback is journaled with the deploy and the token. A provisional service has no front rule
+(Rule 64), and `tenant_usage` flags it. After the confirm, or the 15 minutes, the objects are ordinary: a rollback is
+refused, the front reaches them from the next pass, and a removal needs the owner's approval. `deploy_remove` is that
+removal for a whole deploy: an action proposal whose digest covers the tenant and the deploy, and whose one approval
+removes every entry the deploy created, in the same order, and nothing else. It is refused while the deploy is
+provisional and for a deploy the journal does not hold. Another token can neither add to, confirm nor roll back a
+deploy. Nothing outside a tenant names a deploy.
+Source: `open_deploy`, `deploys`, `Deploy::provisional` and `TenantHandler::deploy` in `crates/arca/src/tenants.rs`. Tests
+`a_rollback_inside_the_window_removes_exactly_the_deploys_own_things`,
+`after_a_confirm_a_rollback_is_refused_and_the_services_are_ordinary`,
+`the_fifteen_minutes_run_from_the_journal_and_a_restart_does_not_reset_them`,
+`a_deploy_is_for_a_create_inside_a_tenant_only`,
+`one_owner_approval_removes_everything_a_confirmed_deploy_created_and_nothing_else` and
+`the_front_reaches_only_ordinary_services_and_follows_a_front_that_is_made_again` in
+`crates/arca/tests/tenants/deploys.rs`.
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -1089,8 +1250,35 @@ must run before any live write.
 - Incus 7.3 has `restricted.networks.access`, and a restricted project refuses an instance NIC on a network the grant does not
   list (Rule 41). The grant is the only key this rule adds to a kernel project.
 - Incus refuses to delete a bridge that an instance still attaches to (Rule 17).
-- Incus refuses to delete an ACL that a NIC still names. An ACL is class `A`, so a revert of an ACL that an instance's NIC names
-  runs before the plan deletes the instance, and Incus keeps the ACL; the removal reports it, and nothing is lost (Rule 17).
+- Incus refuses to delete an ACL that a NIC still names. The fake refuses it too. A service's and a database's ACL is
+  therefore retired after the instance that names it (Rule 66).
+- Incus weighs an ACL's reject rule above its allow rules, whatever their order, and keeps its own rules for a bridge's DHCP
+  and DNS ahead of a NIC's ACL. So a tenant's NIC, whose ACL rejects the bridge gateway like every service's, still gets its
+  address and resolves names (Rule 64). Confirmed on Incus 7.5.1 by the scratch probe: a tenant's container and virtual
+  machine took their reserved addresses by DHCP, and the container resolved a name and reached the internet, while the
+  gateway, another tenant's instance and a service of the node's own project answered neither a ping nor a tcp connect.
+- With `limits.cpu`, `limits.memory` and `limits.disk` set on a project, Incus requires each instance to state its CPU and
+  memory limits and its root disk size, directly or through a profile, and counts them (Rule 63). A tenant's container states
+  its root disk size for that reason. On Incus 7.5.1 the scratch probe created containers and a virtual machine under such
+  caps, and Incus itself refused an instance past `limits.instances`.
+- Incus refuses a second instance of one name on one bridge, in any project: the name is its DNS name on that network. Seen
+  on Incus 7.5.1 by the scratch probe; the fake does not model it. A tenant's instance carries its tenant's id for that reason
+  (Rule 65).
+- The scratch probe (`crates/arca/tests/tenants/real_incus.rs`, ignored by default) also showed, on Incus 7.5.1: a link
+  inside a tenant opens the provider's port to the consumer and to no instance of another tenant; a source address of
+  another tenant's block, set by hand on a tenant's NIC, reaches nothing; and a removal leaves no project and no ACL
+  under the scratch tenant prefix. It did not send traffic from the front service: it read the front's rule back from the
+  ACL only.
+- IPv6 between tenants on the shared bridge, shown by the scratch probe on Incus 7.5.1. Incus accepts
+  `security.ipv6_filtering` on a tenant's NIC beside the MAC and IPv4 filters, on a bridge with no IPv6 address. Tenant
+  B's container held a link-local address, and from tenant A neither a ping nor a TCP connect to it was answered. One
+  control run took the filter off both NICs by hand and tried again: still no ping and no TCP connect, and A's neighbour
+  discovery for B's address failed. So the NIC's ACL alone blocks IPv6 between tenants (its egress rejects `::/0`, and
+  its ingress rejects by default), and the filter is a second layer (Rule 64). The control was run once, with
+  containers; a virtual machine's NIC was not tried.
+- The host's own addresses, shown by the same probe: from a tenant's container, none of the host's IPv4 addresses, as
+  its interfaces held them at the run, answered a ping or accepted a TCP connect on port 22, which the host listened
+  on (Rule 64). IPv4 only; the host's IPv6 addresses were not tried one by one, and all IPv6 is rejected by the ACL.
 - Incus 7.3 creates a project with `features.images` set to `"true"` when the create does not name it, and an image in the project's
   own store keeps Incus from deleting the project. Both were seen on a live host, which superseded the earlier assumption that a
   kernel project reads another project's image store (Rules 30, 42).

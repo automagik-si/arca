@@ -92,6 +92,10 @@ impl Plugin for Postgres {
             ],
         )
     }
+    /// The database's NIC names its ACL, so the ACL is retired after the instance.
+    fn retired_after_plan() -> &'static [IncusKind] {
+        &[IncusKind::Acl]
+    }
     fn apply(ctx: &mut Ctx<'_>, cfg: &PostgresConfig) -> Result<(), PluginError> {
         let image = fingerprint(&cfg.image)?;
         if !pool_ok(&cfg.pool) {

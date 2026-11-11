@@ -48,6 +48,8 @@ pub type Retained = Arc<dyn Fn() -> Result<RetainedEntries, String> + Send + Syn
 /// The state writer of a kernel-mode node, the ownership check in front of it, and the journal behind it.
 pub struct InstanceLifecycle {
     changer: StateChanger,
+    /// The projects of the node's tenants, when the node may hold any.
+    tenants: Option<arca_providers::incus::TenantProjects>,
     retained: Retained,
     journal: PathBuf,
     /// One action at a time. The number is the last id this process gave a journalled action.
@@ -86,10 +88,33 @@ impl InstanceLifecycle {
     ) -> InstanceLifecycle {
         InstanceLifecycle {
             changer: StateChanger::new(socket, family),
+            tenants: None,
             retained: Arc::new(retained),
             journal: state_dir.join(INSTANCE_ACTIONS_FILE),
             gate: Mutex::new(0),
         }
+    }
+
+    /// The same lifecycle, also over the projects of the tenants whose entries exist, as the kernel keeps them.
+    pub fn with_tenants(
+        mut self,
+        tenants: arca_providers::incus::TenantProjects,
+    ) -> InstanceLifecycle {
+        self.tenants = Some(tenants);
+        self
+    }
+
+    /// The state writer for this call: the configured family, and the tenant projects as they are now.
+    fn changer(&self) -> StateChanger {
+        self.tenants
+            .as_ref()
+            .and_then(|tenants| tenants.snapshot().ok())
+            .and_then(|projects| {
+                self.changer
+                    .with_tenants(projects.iter().map(String::as_str))
+                    .ok()
+            })
+            .unwrap_or_else(|| self.changer.clone())
     }
 
     /// The same lifecycle over another state writer, so a test can shorten its deadline.
@@ -101,7 +126,7 @@ impl InstanceLifecycle {
     /// Reads the instance and checks that it is Arca's: in the kernel's project family, and a kernel object by its own
     /// config at the current retained set. Anything else is refused in plain words.
     pub fn target(&self, project: &str, instance: &str) -> Result<InstanceState, CallError> {
-        if !self.changer.allows(project) {
+        if !self.changer().allows(project) {
             return Err(not_arca(
                 project,
                 instance,
@@ -109,7 +134,7 @@ impl InstanceLifecycle {
             ));
         }
         let state = self
-            .changer
+            .changer()
             .read(project, instance)
             .map_err(|error| match error {
                 IncusError::Status { code: 404, .. } => refused(
@@ -179,6 +204,7 @@ impl InstanceLifecycle {
             "proposal": proposal,
             "action": action.as_str(),
             "project": project,
+            "tenant": arca_kernel::ownership::tenant_of_project(project),
             "instance": instance,
         }))
         .map_err(|_| {
@@ -283,7 +309,7 @@ impl InstanceLifecycle {
                 });
             }
         };
-        match self.changer.change(&seen, send) {
+        match self.changer().change(&seen, send) {
             Ok(state) => Ok(Done {
                 state,
                 changed: true,
@@ -300,7 +326,7 @@ impl InstanceLifecycle {
             Err(error) => {
                 // What the instance is now is read again, so the refusal says what is true and not what was asked.
                 let now = self
-                    .changer
+                    .changer()
                     .read(project, instance)
                     .map(|state| shown_status(&state.status))
                     .unwrap_or_else(|_| "in an unknown state".to_string());
@@ -406,15 +432,70 @@ pub fn disabled() -> CallError {
 /// an instance Arca would refuse. The action checks it again when it runs.
 pub fn check_proposal(
     lifecycle: Option<&InstanceLifecycle>,
+    project: &str,
     args: &Value,
 ) -> Result<(), CallError> {
     let lifecycle = lifecycle.ok_or_else(disabled)?;
-    lifecycle
-        .target(
-            args["project"].as_str().unwrap_or_default(),
-            args["instance"].as_str().unwrap_or_default(),
-        )
-        .map(|_| ())
+    lifecycle.target(project, &instance_of(args)?).map(|_| ())
+}
+
+/// The Incus instance a call names: `instance`, or, inside a tenant, the instance of the service `service`
+/// (`<service>-<tenant id>`). Exactly one of the two is given.
+pub fn instance_of(args: &Value) -> Result<String, CallError> {
+    match (
+        args.get("instance").and_then(Value::as_str),
+        args.get("service").and_then(Value::as_str),
+        args.get("tenant").and_then(Value::as_str),
+    ) {
+        (Some(instance), None, _) => Ok(instance.to_string()),
+        (None, Some(service), Some(tenant)) => Ok(format!("{service}-{tenant}")),
+        (None, Some(_), None) => Err(CallError::Invalid(
+            "service: only a call inside a tenant names a service; name the instance".to_string(),
+        )),
+        _ => Err(CallError::Invalid(
+            "instance: name the instance, or inside a tenant its service, and not both".to_string(),
+        )),
+    }
+}
+
+/// The project a call's instance is in: the one `project` names, or the project of the tenant `tenant` names. With a
+/// tenant the call acts in that tenant's project and in no other.
+pub fn project_of(kernel: &Kernel, args: &Value) -> Result<String, CallError> {
+    let Some(tenant) = args.get("tenant").and_then(Value::as_str) else {
+        let project = args["project"].as_str().ok_or_else(|| {
+            CallError::Invalid("project: required unless tenant names a tenant".to_string())
+        })?;
+        // A tenant's project is reached by naming the tenant, so the tenant's rules always apply to it: the tool
+        // allowlist, and the journal line that names the tenant.
+        if arca_kernel::ownership::tenant_of_project(project).is_some() {
+            return Err(CallError::Invalid(
+                "project: a tenant's project is named by tenant, not by project".to_string(),
+            ));
+        }
+        return Ok(project.to_string());
+    };
+    let tenants: Vec<_> = kernel
+        .entries()
+        .iter()
+        .filter(|entry| entry.plugin.0 == "arca.tenant")
+        .collect();
+    if tenants.is_empty() {
+        return Err(refused("no_tenants", "this node has no tenants"));
+    }
+    let project = tenants
+        .iter()
+        .find(|entry| entry.id.0 == arca_kernel::ownership::tenant_entry(tenant))
+        .and_then(|entry| entry.config["project"].as_str())
+        .ok_or_else(|| refused("not_found", format!("tenant {tenant}: not found")))?;
+    if args
+        .get("project")
+        .is_some_and(|named| named.as_str() != Some(project))
+    {
+        return Err(CallError::Invalid(
+            "project: it is not the project of the tenant the call names".to_string(),
+        ));
+    }
+    Ok(project.to_string())
 }
 
 /// `instance_start`, `instance_stop` and `instance_restart`. A start runs for a doctor. A stop and a restart take the
@@ -448,21 +529,52 @@ impl ToolHandler for LifecycleHandler {
             }
         };
         let mut bare = args;
-        let grant = if state_action == StateAction::Start {
+        // Inside a tenant the three verbs need no approval, from a token whose tool allowlist names the verb: a stop
+        // is reversible, and each action is journaled with the token and the tenant. Outside a tenant nothing changes:
+        // a stop and a restart run only from an approved proposal.
+        let in_tenant = bare.get("tenant").is_some();
+        // A start takes no approval: the field is not in its schema, and stays in the call for the schema to refuse.
+        let approval = if state_action == StateAction::Start {
             None
         } else {
-            Some(
-                bare.as_object_mut()
-                    .and_then(|object| object.remove("approval"))
-                    .and_then(|value| value.as_str().map(str::to_string))
-                    .ok_or_else(|| CallError::Invalid("approval is required".to_string()))?,
-            )
+            bare.as_object_mut()
+                .and_then(|object| object.remove("approval"))
+                .and_then(|value| value.as_str().map(str::to_string))
+        };
+        let grant = match (state_action, approval) {
+            (StateAction::Start, _) if !in_tenant => None,
+            (_, Some(grant)) if state_action != StateAction::Start => Some(grant),
+            _ if in_tenant => {
+                let verb = self.action.as_str();
+                if !caller
+                    .tools
+                    .as_ref()
+                    .is_some_and(|tools| tools.iter().any(|tool| tool == verb))
+                {
+                    return Err(refused(
+                        "NotAllowed",
+                        format!(
+                            "{verb} inside a tenant is for a token whose tool allowlist names {verb}"
+                        ),
+                    ));
+                }
+                None
+            }
+            _ => return Err(CallError::Invalid("approval is required".to_string())),
         };
         let args = self
             .action
             .prepare(&bare, None)
             .map_err(CallError::Invalid)?;
         let mut proposal = None;
+        // The kernel's lock is held for the lookup only: the instance read takes it again.
+        let project = {
+            let kernel = self.kernel.lock().map_err(|_| {
+                CallError::Internal("the kernel could not complete the call".into())
+            })?;
+            project_of(&kernel, &args)
+        }?;
+        let instance = instance_of(&args)?;
         if let Some(grant) = grant {
             let mut kernel = self.kernel.lock().map_err(|_| {
                 CallError::Internal("the kernel could not complete the call".into())
@@ -477,8 +589,8 @@ impl ToolHandler for LifecycleHandler {
         }
         lifecycle.run(
             state_action,
-            args["project"].as_str().unwrap_or_default(),
-            args["instance"].as_str().unwrap_or_default(),
+            &project,
+            &instance,
             &caller.token_id,
             proposal.as_deref(),
             (self.clock)(),

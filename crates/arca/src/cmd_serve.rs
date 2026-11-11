@@ -193,18 +193,24 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     plugins
         .add::<arca_postgres::consumer::Consumer>()
         .map_err(kernel_failure)?;
+    plugins
+        .add::<arca_netproject::tenant::Tenant>()
+        .map_err(kernel_failure)?;
+    // The projects of the node's tenants: the kernel keeps the set, and every writer reads it.
+    let tenant_projects = arca_providers::incus::TenantProjects::new(cfg.kernel.scratch);
     let kernel_mode = !cfg.kernel.projects.is_empty();
     // Both checks come before the kernel opens, because opening it reconciles the desired state: a node whose mode was
     // switched must not create or repair anything of the other mode first.
     check_bridged_start(&cfg, std::path::Path::new("/sys/class/net"))?;
-    let kernel = Kernel::open(
+    let kernel = Kernel::open_with_tenants(
         &cfg.state_dir,
         key,
         plugins,
         verifier,
         host,
         cfg.kernel.postgres_image.as_deref(),
-        write_provider(&cfg, kernel_mode),
+        write_provider(&cfg, kernel_mode, tenant_projects.clone()),
+        tenant_projects.clone(),
         now_ms(),
     )
     .map_err(kernel_failure)?;
@@ -380,8 +386,12 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .handle(
             "snapshot_list",
-            Arc::new(crate::storage::SnapshotListHandler {
-                storage: Arc::clone(&storage),
+            Arc::new(crate::handlers::SnapshotListInTenant {
+                inner: Arc::new(crate::storage::SnapshotListHandler {
+                    storage: Arc::clone(&storage),
+                }),
+                kernel: Arc::clone(&kernel),
+                cfg: Arc::new(cfg.clone()),
             }),
         );
     // A watch-only node has no state writer either. A kernel-mode node starts, stops and restarts only the instances of
@@ -393,20 +403,32 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .map_err(Failure::Config)?;
         let retained_kernel = Arc::clone(&kernel);
-        Some(Arc::new(crate::lifecycle::InstanceLifecycle::new(
-            cfg.incus.socket.clone(),
-            family,
-            move || {
-                let kernel = retained_kernel
-                    .lock()
-                    .map_err(|_| "the kernel lock is poisoned".to_string())?;
-                kernel.retained_entries().map_err(|error| error.to_string())
-            },
-            &cfg.state_dir,
-        )))
+        Some(Arc::new(
+            crate::lifecycle::InstanceLifecycle::new(
+                cfg.incus.socket.clone(),
+                family,
+                move || {
+                    let kernel = retained_kernel
+                        .lock()
+                        .map_err(|_| "the kernel lock is poisoned".to_string())?;
+                    kernel.retained_entries().map_err(|error| error.to_string())
+                },
+                &cfg.state_dir,
+            )
+            .with_tenants(tenant_projects.clone()),
+        ))
     } else {
         None
     };
+    // A node with tenants keeps their front rules in step with the node's front service and with each deploy's state.
+    if kernel_mode && cfg.kernel.tenants.is_some() {
+        crate::handlers::spawn_front_sync(
+            Arc::clone(&kernel),
+            Arc::new(cfg.clone()),
+            clock.clone(),
+        )
+        .map_err(|e| Failure::Runtime(e.to_string()))?;
+    }
     let action_slot = ActionSlot::default();
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
         plan_handlers_served(
@@ -426,6 +448,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             Arc::new(cfg.clone()),
         ))
         .chain(crate::handlers::service_handlers(
+            kernel.clone(),
+            clock.clone(),
+            Arc::new(cfg.clone()),
+        ))
+        .chain(crate::handlers::tenant_handlers(
             kernel.clone(),
             clock.clone(),
             Arc::new(cfg.clone()),
@@ -852,6 +879,7 @@ fn approval_host(cfg: &NodeConfig) -> Result<String, Failure> {
 fn write_provider(
     cfg: &NodeConfig,
     kernel_mode: bool,
+    tenants: arca_providers::incus::TenantProjects,
 ) -> impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError> {
     let socket = cfg.incus.socket.clone();
     let secrets = cfg.state_dir.join(SECRETS_DIR);
@@ -864,7 +892,8 @@ fn write_provider(
     move |retained| {
         if kernel_mode {
             let provider = IncusProvider::new(socket, family, secrets, retained)
-                .map_err(|refusal| KernelError::Plugin(refusal.to_string()))?;
+                .map_err(|refusal| KernelError::Plugin(refusal.to_string()))?
+                .with_tenants(tenants);
             return Ok(Box::new(provider));
         }
         Ok(Box::new(ReadOnlyIncusProvider::new(UnixIncus::new(socket))))

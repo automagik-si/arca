@@ -1,5 +1,6 @@
 //! The reconciler: the one writer. It accepts signed desired state through the gate, applies new and changed entries through the
-//! compiled-in plugins, and reverts what a removed entry left behind. Class-A effects are reverted at once. Class-B objects are
+//! compiled-in plugins, and reverts what a removed entry left behind. Class-A effects are reverted at once, except an object
+//! the entry's class-B objects use, which its plugin declares: that one is retired after them. Class-B objects are
 //! deleted only by [`Reconciler::run_plan`], after an approval over the plan's digest; a declined plan's objects are retained,
 //! and nothing deletes them afterwards. Every effect is journalled as an intent before it runs and as its outcome after.
 //!
@@ -421,11 +422,82 @@ impl<S: JournalStore> Reconciler<S> {
         }
         if !run.partial {
             self.pending.retain(|pending| pending.plan.digest != *plan);
+            self.retire_held(&delete_plan.entry, &live, &mut run, now_ms);
             if self.revertible_live(&delete_plan.entry) == 0 {
                 self.applied_by.remove(&delete_plan.entry);
             }
         }
         Ok(run)
+    }
+
+    /// Retires the class-A objects of `entry` that waited for its class-B objects (see [`Plugin::retired_after_plan`]), most
+    /// recent first, once the plan's run has deleted every one of `deleted` and each reads back absent. An object that does
+    /// not read back absent keeps them waiting, and the run is partial. One Incus keeps is drift and makes the run partial;
+    /// its record stays live, so the next removal of the entry retries it.
+    fn retire_held(
+        &mut self,
+        entry: &EntryId,
+        deleted: &[ObjectRef],
+        run: &mut PlanRun,
+        now_ms: u64,
+    ) {
+        let held = self.held_records(entry);
+        if held.is_empty() {
+            return;
+        }
+        let gone = deleted.iter().all(|object| {
+            matches!(
+                self.provider.read_back(entry, object, None),
+                Ok(ReadBack::Absent)
+            )
+        });
+        if !gone {
+            run.partial = true;
+            return;
+        }
+        for record in held {
+            if self.blocked() {
+                run.partial = true;
+                return;
+            }
+            let Some(Inverse::IncusDelete { object }) = record.inverse.clone() else {
+                continue;
+            };
+            match self.revert_a(&record, now_ms) {
+                Ok(()) => run.deleted.push(object),
+                Err(_) => {
+                    run.drift.push(object);
+                    run.partial = true;
+                }
+            }
+        }
+    }
+
+    /// The class-A kinds of `entry` that wait for its class-B objects, as the plugin that applied it declares them.
+    fn held_kinds(&self, entry: &EntryId) -> &'static [arca_kernel::ownership::IncusKind] {
+        self.applied_by
+            .get(entry)
+            .and_then(|plugin| self.plugins.get(&plugin.0))
+            .map_or(&[], |plugin| plugin.retired_after_plan())
+    }
+
+    /// Whether `record` is the create of a class-A object of one of `kinds`.
+    fn is_held(record: &EffectRecord, kinds: &[arca_kernel::ownership::IncusKind]) -> bool {
+        record.class == EffectClass::A
+            && matches!(&record.inverse, Some(Inverse::IncusDelete { object }) if kinds.contains(&object.kind))
+    }
+
+    /// The entry's live creates of class-A objects that wait for its class-B objects, most recent first.
+    fn held_records(&self, entry: &EntryId) -> Vec<EffectRecord> {
+        let kinds = self.held_kinds(entry);
+        let mut held: Vec<EffectRecord> = self
+            .journal
+            .live(entry)
+            .into_iter()
+            .filter(|record| record.state == EffectState::Applied && Self::is_held(record, kinds))
+            .collect();
+        held.reverse();
+        held
     }
 
     /// Declines the pending plan `plan`: its objects become retained, which no later run or removal writes, and the decline is
@@ -587,9 +659,19 @@ impl<S: JournalStore> Reconciler<S> {
             self.settle_gone(id);
         }
         let split = removal(&self.journal, id, now_ms);
+        // A class-A object the entry's class-B objects use waits for them: Incus refuses to delete an ACL a NIC still
+        // names. It is retired by the plan's run, after every class-B object is gone, or here once none is left.
+        let held = if split.plan.is_some() {
+            self.held_kinds(id)
+        } else {
+            &[]
+        };
         let mut reverted = 0;
         let mut stopped = false;
         for record in &split.revert_now {
+            if Self::is_held(record, held) {
+                continue;
+            }
             if self.blocked() {
                 stopped = true;
                 break;

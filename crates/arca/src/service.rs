@@ -150,11 +150,103 @@ pub struct ServiceConfig {
     /// Present on a virtual machine. A container's record never carries the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm: Option<Vm>,
+    /// Present on a service in a tenant. A service of the node's own project never carries the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<TenantRef>,
+}
+
+/// What only a service in a tenant records: the tenant, its address block, and the address of the node's front service
+/// when the node names one.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenantRef {
+    pub id: String,
+    /// The tenant's block of the service subnet, as `a.b.c.d/29` or `a.b.c.d/28`.
+    pub block: String,
+    /// The address that reaches this service's declared ports from the node's own project (`kernel.tenants.front`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub front: Option<String>,
+    /// The deploy this service was created in, when its create named one. It is provisional until the deploy is
+    /// confirmed or 15 minutes old, and its creator may roll the deploy back until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<String>,
+}
+
+/// The name of the Incus instance of the service `name`: the service's own name, and `<name>-<id>` in tenant `id`. Incus
+/// refuses two instances of one name on one bridge, whatever their projects, since the name is the instance's DNS name
+/// there; the tenant's id keeps a tenant's instance apart from every other tenant's and from the node's own.
+pub fn instance_name(tenant: Option<&str>, name: &str) -> String {
+    match tenant {
+        Some(id) => format!("{name}-{id}"),
+        None => name.to_string(),
+    }
+}
+
+/// The id of the entry that records the service `name`: `service-<name>` in the node's own project, and
+/// `t-<id>-service-<name>` in tenant `id`, so two tenants may each hold a service of one name.
+pub fn entry_id(tenant: Option<&str>, name: &str) -> String {
+    match tenant {
+        Some(id) => format!("t-{id}-service-{name}"),
+        None => format!("service-{name}"),
+    }
 }
 
 impl ServiceConfig {
     pub fn acl(&self) -> String {
         acl_name(&self.project, &self.name)
+    }
+
+    /// The id of the entry that records this service.
+    pub fn entry_id(&self) -> String {
+        entry_id(
+            self.tenant.as_ref().map(|tenant| tenant.id.as_str()),
+            &self.name,
+        )
+    }
+
+    /// The name this service's Incus instance must have ([`instance_name`]).
+    pub fn instance_name(&self) -> String {
+        instance_name(
+            self.tenant.as_ref().map(|tenant| tenant.id.as_str()),
+            &self.name,
+        )
+    }
+
+    /// Whether the record's project is the one its place requires: the node's service project, or its tenant's project
+    /// under either tenant prefix.
+    fn project_ok(&self) -> bool {
+        match &self.tenant {
+            None => self.project == PROJECT,
+            Some(tenant) => {
+                arca_kernel::ownership::tenant_id_ok(&tenant.id)
+                    && arca_kernel::ownership::tenant_of_project(&self.project)
+                        == Some(tenant.id.as_str())
+            }
+        }
+    }
+
+    /// The tenant's block, when the service is in a tenant: `Err` unless the record's block is a tenant block of the
+    /// gateway's subnet and the service's address is inside it.
+    fn tenant_block(&self) -> Option<Result<arca_netproject::tenant::Block, ()>> {
+        let tenant = self.tenant.as_ref()?;
+        let block = self
+            .gateway
+            .parse::<Ipv4Addr>()
+            .ok()
+            .and_then(|gateway| {
+                let subnet = Ipv4Addr::from(u32::from(gateway) & 0xffff_ff00);
+                arca_netproject::tenant::parse_block(&tenant.block, &format!("{subnet}/24"))
+            })
+            .filter(|block| {
+                self.ipv4
+                    .parse::<Ipv4Addr>()
+                    .is_ok_and(|ip| block.holds(ip))
+                    && tenant
+                        .front
+                        .as_deref()
+                        .is_none_or(|front| front.parse::<Ipv4Addr>().is_ok())
+            });
+        Some(block.ok_or(()))
     }
 
     /// Whether this is a virtual machine on a host bridge: one with no address, ACL or link. A virtual machine on the
@@ -167,14 +259,20 @@ impl ServiceConfig {
 pub struct Service;
 
 pub fn manifest_for() -> Manifest {
-    manifest(
+    let mut manifest = manifest(
         Service::ID,
         vec![
             (IncusKind::Acl, EffectClass::A),
             (IncusKind::Volume, EffectClass::B),
             (IncusKind::Instance, EffectClass::B),
         ],
-    )
+    );
+    // A service may be in a tenant's project. The provider admits only the project of a tenant whose entry exists.
+    manifest.projects.extend([
+        format!("{}*", arca_kernel::ownership::TENANT_PROJECT_PREFIX),
+        format!("{}*", arca_kernel::ownership::SCRATCH_TENANT_PROJECT_PREFIX),
+    ]);
+    manifest
 }
 
 pub fn acl_name(project: &str, name: &str) -> String {
@@ -260,7 +358,7 @@ fn vm_body(cfg: &ServiceConfig, vm: &Vm) -> Value {
         nic.insert("hwaddr".into(), json!(mac));
     }
     json!({
-        "name": cfg.name,
+        "name": cfg.instance,
         "type": VM_KIND,
         "source": cfg.source,
         "profiles": [],
@@ -297,8 +395,9 @@ fn managed_vm_body(cfg: &ServiceConfig, vm: &Vm, links: &[String]) -> Value {
         "security.acls.default.ingress.action": "reject",
         "security.acls.default.egress.action": "reject"
     });
+    let nic = tenant_nic(cfg, nic);
     json!({
-        "name": cfg.name,
+        "name": cfg.instance,
         "type": VM_KIND,
         "source": cfg.source,
         "profiles": [],
@@ -325,12 +424,16 @@ fn vm_record_ok(cfg: &ServiceConfig, vm: &Vm) -> bool {
 
 /// A virtual machine on a host bridge: the instance alone. Nothing on it is changed after its create.
 fn apply_vm(ctx: &mut Ctx<'_>, cfg: &ServiceConfig, vm: &Vm) -> Result<(), PluginError> {
-    if cfg.project != PROJECT || !host_bridge_ok(&cfg.bridge) || cfg.bridge == BRIDGE {
+    if cfg.tenant.is_some()
+        || cfg.project != PROJECT
+        || !host_bridge_ok(&cfg.bridge)
+        || cfg.bridge == BRIDGE
+    {
         return Err(PluginError::Config(
             "a virtual machine is in the service project, on a host bridge".into(),
         ));
     }
-    if !service_name_ok(&cfg.name) || ctx.entry().0 != format!("service-{}", cfg.name) {
+    if !service_name_ok(&cfg.name) || ctx.entry().0 != cfg.entry_id() {
         return Err(PluginError::Config("invalid service name".into()));
     }
     if !vm_record_ok(cfg, vm) {
@@ -340,13 +443,13 @@ fn apply_vm(ctx: &mut Ctx<'_>, cfg: &ServiceConfig, vm: &Vm) -> Result<(), Plugi
     }
     match observed(
         ctx,
-        format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
+        format!("/1.0/instances/{}?project={}", cfg.instance, cfg.project),
     )? {
         None => create(
             ctx,
             IncusKind::Instance,
             &cfg.project,
-            &cfg.name,
+            &cfg.instance,
             vm_body(cfg, vm),
         ),
         Some(instance)
@@ -379,76 +482,43 @@ pub fn ingress(cfg: &ServiceConfig) -> Vec<Value> {
         rules.push(rule(json!({"action":"allow","source":format!("{}/32",grant.address),"protocol":"tcp",
             "destination_port":grant.port.to_string(),"description":format!("link from {} to port {}",grant.address,grant.port),"state":"enabled"})));
     }
+    // The node's front service reaches every port a tenant's service declares, and nothing else of it.
+    if let Some(front) = cfg.tenant.as_ref().and_then(|tenant| tenant.front.as_ref())
+        && !cfg.ports.is_empty()
+    {
+        let ports = cfg
+            .ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        rules.push(rule(json!({"action":"allow","source":format!("{front}/32"),"protocol":"tcp",
+            "destination_port":ports,"description":"the node's front service to the declared ports","state":"enabled"})));
+    }
     rules
 }
 
-/// Match Incus' complete ACL rule shape, including its empty optional fields.
-fn rule(fields: Value) -> Value {
-    let mut out = json!({"action":"", "source":"", "destination":"", "protocol":"",
-        "source_port":"", "destination_port":"", "icmp_type":"", "icmp_code":"",
-        "description":"", "state":"enabled"});
-    out.as_object_mut()
-        .unwrap()
-        .extend(fields.as_object().unwrap().clone());
-    out
+use arca_netproject::tenant::rule;
+
+/// Reject private ranges outside this service /24 before allowing internet traffic. A tenant's service also rejects
+/// the service /24 outside its tenant's block.
+pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
+    let gateway = cfg.gateway.parse::<Ipv4Addr>().expect("validated gateway");
+    let block = match cfg.tenant_block() {
+        Some(Ok(block)) => Some(block),
+        _ => None,
+    };
+    arca_netproject::tenant::egress_rules(gateway, hosts, block)
 }
 
-/// Reject private ranges outside this service /24 before allowing internet traffic.
-pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
-    let own = u32::from(cfg.gateway.parse::<Ipv4Addr>().expect("validated gateway")) & 0xffffff00;
-    let mut rejected = Vec::new();
-    for (base, prefix) in [
-        (0x0a000000u32, 8u32),
-        (0xac100000, 12),
-        (0xc0a80000, 16),
-        (0x64400000, 10),
-        (0xa9fe0000, 16),
-        (0x7f000000, 8),
-    ] {
-        if own & (u32::MAX << (32 - prefix)) == base {
-            let mut blocks = Vec::new();
-            for length in prefix + 1..=24 {
-                let size = 1u32 << (32 - length);
-                blocks.push(((own & (u32::MAX << (32 - length))) ^ size, length));
-            }
-            blocks.sort_unstable();
-            rejected.extend(
-                blocks
-                    .into_iter()
-                    .map(|(ip, length)| format!("{}/{length}", Ipv4Addr::from(ip))),
-            );
-        } else {
-            rejected.push(format!("{}/{prefix}", Ipv4Addr::from(base)));
-        }
+/// A tenant's NIC also filters IPv6. The managed bridge has no IPv6 address, so the NIC is given none, and Incus then
+/// drops every IPv6 frame the instance sends: one tenant cannot reach another over the bridge's link-local addresses.
+/// A service of the node's own project keeps the NIC it always had.
+fn tenant_nic(cfg: &ServiceConfig, mut nic: Value) -> Value {
+    if cfg.tenant.is_some() {
+        nic["security.ipv6_filtering"] = json!("true");
     }
-    let mut host4 = BTreeSet::from([cfg.gateway.parse::<Ipv4Addr>().expect("validated gateway")]);
-    host4.extend(
-        hosts
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|host| host.as_str()?.split('/').next()?.parse::<Ipv4Addr>().ok()),
-    );
-    let destinations = host4
-        .iter()
-        .map(|ip| format!("{ip}/32"))
-        .collect::<Vec<_>>()
-        .join(",");
-    vec![
-        rule(
-            json!({"action":"reject", "destination":rejected.join(","), "description":"RFC1918 outside the service subnet, CGNAT (tailnet), link-local, loopback"}),
-        ),
-        rule(
-            json!({"action":"reject", "destination":"::/0", "description":"all IPv6 (IPv4-only bridge), host addresses included"}),
-        ),
-        rule(
-            json!({"action":"reject", "destination":"224.0.0.0/4,255.255.255.255/32,0.0.0.0/8,240.0.0.0/4", "description":"multicast, broadcast, this-network, reserved (as desktops)"}),
-        ),
-        rule(
-            json!({"action":"reject", "destination":destinations, "description":"host addresses, the bridge gateway among them"}),
-        ),
-        rule(json!({"action":"allow", "description":"internet"})),
-    ]
+    nic
 }
 
 fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
@@ -516,13 +586,17 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             "connect":format!("tcp:127.0.0.1:{}", lan.port)}),
         );
     }
-    devices.insert(
-        "root".to_string(),
-        json!({ "type": "disk", "path": "/", "pool": cfg.pool }),
-    );
+    let mut root = json!({ "type": "disk", "path": "/", "pool": cfg.pool });
+    if cfg.tenant.is_some() {
+        // The tenant project's disk cap counts a root disk by its size, so a tenant's container states one.
+        root["size"] = json!(arca_netproject::tenant::CONTAINER_ROOT_SIZE);
+    }
+    devices.insert("root".to_string(), root);
     devices.insert(
         "eth0".to_string(),
-        json!({
+        tenant_nic(
+            cfg,
+            json!({
             "type": "nic",
             "name": "eth0",
             "network": cfg.bridge,
@@ -533,10 +607,11 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             "security.acls": cfg.acl(),
             "security.acls.default.ingress.action": "reject",
             "security.acls.default.egress.action": "reject"
-        }),
+            }),
+        ),
     );
     json!({
-        "name": cfg.name,
+        "name": cfg.instance,
         "type": "container",
         "source": cfg.source,
         "profiles": [PROFILE],
@@ -552,6 +627,11 @@ impl Plugin for Service {
 
     fn manifest() -> Manifest {
         manifest_for()
+    }
+
+    /// The service's NIC names its ACL, and Incus refuses to delete an ACL in use: the ACL is retired after the instance.
+    fn retired_after_plan() -> &'static [IncusKind] {
+        &[IncusKind::Acl]
     }
 
     fn apply(ctx: &mut Ctx<'_>, cfg: &ServiceConfig) -> Result<(), PluginError> {
@@ -573,13 +653,24 @@ impl Plugin for Service {
                 "invalid virtual machine pool, limits or disk size".into(),
             ));
         }
-        if cfg.project != PROJECT || cfg.bridge != BRIDGE {
+        if !cfg.project_ok() || cfg.bridge != BRIDGE {
             return Err(PluginError::Config(
                 "the service project and bridge are required".into(),
             ));
         }
-        if !service_name_ok(&cfg.name) || ctx.entry().0 != format!("service-{}", cfg.name) {
+        if !service_name_ok(&cfg.name)
+            || ctx.entry().0 != cfg.entry_id()
+            || cfg.instance != cfg.instance_name()
+        {
             return Err(PluginError::Config("invalid service name".into()));
+        }
+        // A tenant's service takes its address from the tenant's block, and has no host listener.
+        if matches!(cfg.tenant_block(), Some(Err(())))
+            || (cfg.tenant.is_some() && cfg.lan.is_some())
+        {
+            return Err(PluginError::Config(
+                "a tenant's service has an address in its tenant's block and no host port".into(),
+            ));
         }
         if cfg.ipv4.parse::<Ipv4Addr>().is_err()
             || cfg.gateway.parse::<Ipv4Addr>().is_err()
@@ -594,13 +685,20 @@ impl Plugin for Service {
         let mut guarded = cfg.clone();
         guarded.incoming.retain(|grant| {
             let Ok(value) = ctx.observe(Observe::IncusGet {
-                path: format!("/1.0/instances/{}?project={}", grant.consumer, cfg.project),
+                path: format!(
+                    "/1.0/instances/{}?project={}",
+                    instance_name(
+                        cfg.tenant.as_ref().map(|tenant| tenant.id.as_str()),
+                        &grant.consumer
+                    ),
+                    cfg.project
+                ),
             }) else {
                 return false;
             };
             let own = ctx
                 .observe(Observe::IncusGet {
-                    path: format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
+                    path: format!("/1.0/instances/{}?project={}", cfg.instance, cfg.project),
                 })
                 .ok();
             value["config"]["volatile.uuid"].as_str() == Some(grant.uuid.as_str())
@@ -695,7 +793,7 @@ impl Plugin for Service {
         }
         let instance = observed(
             ctx,
-            format!("/1.0/instances/{}?project={}", cfg.name, cfg.project),
+            format!("/1.0/instances/{}?project={}", cfg.instance, cfg.project),
         )?;
         let kind = if cfg.vm.is_some() {
             VM_KIND
@@ -718,7 +816,7 @@ impl Plugin for Service {
                 ctx,
                 IncusKind::Instance,
                 &cfg.project,
-                &cfg.name,
+                &cfg.instance,
                 instance_body(
                     cfg,
                     &cfg.links
@@ -787,7 +885,7 @@ impl Plugin for Service {
                         kind: IncusKind::Instance,
                         project: cfg.project.clone(),
                         parent: None,
-                        name: cfg.name.clone(),
+                        name: cfg.instance.clone(),
                         uuid: Some(uuid.into()),
                     },
                     config: changes,
@@ -1192,6 +1290,7 @@ pub fn candidates(cidr: &str) -> Result<Vec<Ipv4Addr>, TemplateError> {
 /// The rendered environment and whether every value the template needs is present.
 pub fn environment(
     template: &Template,
+    owner: &str,
     name: &str,
     ipv4: &str,
     gateway: &str,
@@ -1200,11 +1299,11 @@ pub fn environment(
     let mut start = true;
     let mut references = BTreeMap::new();
     for key in &template.secrets {
-        let file = secret_file(secrets_dir, name, key);
+        let file = secret_file(secrets_dir, owner, key);
         if let Some(reference) = file
             .as_ref()
             .filter(|path| path.is_file())
-            .map(|_| secret_reference(name, key))
+            .map(|_| secret_reference(owner, key))
         {
             references.insert(key.clone(), reference);
             continue;
@@ -1216,7 +1315,7 @@ pub fn environment(
                     .ok_or_else(|| TemplateError::refused("invalid secret name"))?,
                 &value,
             )?;
-            references.insert(key.clone(), secret_reference(name, key));
+            references.insert(key.clone(), secret_reference(owner, key));
         }
     }
     let mut env = BTreeMap::new();
@@ -1238,8 +1337,9 @@ pub fn environment(
     Ok((env, start))
 }
 
-pub fn secret_reference(name: &str, key: &str) -> String {
-    format!("{SECRET_PREFIX}service-{name}/{}", secret_name(key))
+/// The reference to the secret `key` of the service whose entry is `owner` ([`entry_id`]).
+pub fn secret_reference(owner: &str, key: &str) -> String {
+    format!("{SECRET_PREFIX}{owner}/{}", secret_name(key))
 }
 
 /// A secret's file name: lowercase, with `_` mapped to `-`, so it is inside the provider's secret-name alphabet.
@@ -1247,15 +1347,11 @@ pub fn secret_name(key: &str) -> String {
     key.to_ascii_lowercase().replace('_', "-")
 }
 
-pub fn secret_file(secrets_dir: &Path, name: &str, key: &str) -> Option<PathBuf> {
+pub fn secret_file(secrets_dir: &Path, owner: &str, key: &str) -> Option<PathBuf> {
     if !env_name_ok(key) {
         return None;
     }
-    Some(
-        secrets_dir
-            .join(format!("service-{name}"))
-            .join(secret_name(key)),
-    )
+    Some(secrets_dir.join(owner).join(secret_name(key)))
 }
 
 fn generated_secret(prefix: &str) -> Result<String, TemplateError> {

@@ -375,6 +375,7 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        golden::record(&self.fake);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -1851,6 +1852,11 @@ fn the_build_lockfile_pins_every_package_by_registry_integrity_and_runs_no_insta
 }
 
 fn owner_approval(key: &common::SkKey, name: &str) -> String {
+    owner_approval_with(key, name, 'a')
+}
+
+/// A second approval in one test needs a nonce of its own.
+fn owner_approval_with(key: &common::SkKey, name: &str, nonce: char) -> String {
     use arca_kernel::canon::{canonical_json, params_digest};
     let args = json!({"name": name});
     let statement = canonical_json(&json!({
@@ -1860,10 +1866,156 @@ fn owner_approval(key: &common::SkKey, name: &str) -> String {
         "paramsDigest": params_digest(&args).expect("digest"),
         "issuedAt": "2026-10-30T12:00:00.000Z",
         "expiresAt": "2026-10-30T12:05:00.000Z",
-        "nonce": "a".repeat(64)
+        "nonce": nonce.to_string().repeat(64)
     }))
     .expect("canonical");
     common::approve_statement(key, &statement)
+}
+
+fn empty_state() -> FakeState {
+    FakeState {
+        server: json!({}),
+        projects: vec![],
+        instances: vec![],
+        networks: vec![],
+        pools: vec![],
+    }
+}
+
+/// Where each DELETE the fake recorded stands in its request log, by path, with the status it was answered.
+fn deletes(rig: &Rig) -> Vec<(String, u16)> {
+    rig.fake
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "DELETE")
+        .map(|request| (request.path, request.status))
+        .collect()
+}
+
+#[test]
+fn service_remove_deletes_the_instance_and_only_then_its_acl() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        empty_state(),
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    let instance = format!("/1.0/instances/pg?project={PROJECT}");
+    let acl = format!("/1.0/network-acls/{PROJECT}-svc-pg?project=default");
+    let removed = rig
+        .call(
+            "service_remove",
+            json!({"name":"pg","approval":owner_approval(&key, "pg")}),
+        )
+        .expect("the removal is not refused");
+    assert_eq!(removed, json!({"removed":true}));
+    assert!(rig.get(&instance).is_none());
+    assert!(rig.get(&acl).is_none(), "no orphan ACL is left behind");
+    // Incus refuses to delete an ACL a NIC still names, so the instance goes first and no delete is refused.
+    let deletes = deletes(&rig);
+    let at = |path: &str| deletes.iter().position(|(found, _)| found == path);
+    assert!(
+        at(&instance).expect("the instance is deleted") < at(&acl).expect("the ACL is deleted"),
+        "{deletes:?}"
+    );
+    assert!(
+        deletes.iter().all(|(_, status)| *status < 400),
+        "{deletes:?}"
+    );
+    // The instance was read back absent between the two deletes.
+    let requests = rig.fake.requests();
+    let deleted = requests
+        .iter()
+        .position(|request| request.method == "DELETE" && request.path == instance)
+        .unwrap();
+    let acl_deleted = requests
+        .iter()
+        .position(|request| request.method == "DELETE" && request.path == acl)
+        .unwrap();
+    assert!(
+        requests[deleted..acl_deleted]
+            .iter()
+            .any(|request| request.method == "GET"
+                && request.path == instance
+                && request.status == 404),
+        "the instance is confirmed gone before its ACL is deleted"
+    );
+}
+
+#[test]
+fn the_fake_refuses_to_delete_an_acl_a_nic_still_names_as_incus_does() {
+    let rig = Rig::new();
+    rig.template("pg", stopped_service_template());
+    rig.call("service_create", json!({"name":"pg","template":"pg"}))
+        .unwrap();
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(rig.fake.socket()).unwrap();
+    write!(
+        stream,
+        "DELETE /1.0/network-acls/{PROJECT}-svc-pg?project=default HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-pg?project=default"
+        ))
+        .is_some()
+    );
+}
+
+#[test]
+fn a_later_removal_sweeps_the_acl_an_earlier_removal_left_behind() {
+    let key = common::SkKey::from_seed(9);
+    let rig = Rig::with_key(
+        empty_state(),
+        vec![PROJECT.to_string()],
+        Some("192.0.2.0/24"),
+        Some(&key),
+    );
+    rig.template("pg", stopped_service_template());
+    for name in ["pg", "other"] {
+        rig.call("service_create", json!({"name":name,"template":"pg"}))
+            .unwrap();
+    }
+    let orphan = format!("/1.0/network-acls/{PROJECT}-svc-pg?project=default");
+    rig.fake.set_reject_delete(&format!("{PROJECT}-svc-pg"));
+    let error = rig
+        .call(
+            "service_remove",
+            json!({"name":"pg","approval":owner_approval(&key, "pg")}),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused { message, .. } if message.contains("(instance removed; ACL remains)"))
+    );
+    // The orphan still carries the removed entry's mark, and nothing else of the service is left.
+    assert_eq!(
+        rig.get(&orphan).expect("the orphan")["config"][KERNEL_ENTRY_KEY],
+        "service-pg"
+    );
+    rig.fake.clear_reject_delete();
+    assert_eq!(
+        rig.call(
+            "service_remove",
+            json!({"name":"other","approval":owner_approval_with(&key, "other", 'b')}),
+        )
+        .expect("the later removal"),
+        json!({"removed":true})
+    );
+    assert!(rig.get(&orphan).is_none(), "the orphan ACL is swept");
+    assert!(
+        rig.get(&format!(
+            "/1.0/network-acls/{PROJECT}-svc-other?project=default"
+        ))
+        .is_none()
+    );
 }
 
 fn stopped_service_template() -> Value {
@@ -2098,17 +2250,25 @@ fn an_instance_only_delete_rejection_is_a_partial_refusal_and_keeps_secrets() {
         .call("service_remove", json!({"name":"pg","approval":approval}))
         .unwrap_err();
     assert!(
-        matches!(error, CallError::Refused { code, message } if code == "refused" && message == "remove service pg: partial removal (instance remains; ACL removed); the owner's approval is spent, so another try needs a new one")
+        matches!(error, CallError::Refused { code, message } if code == "refused" && message == "remove service pg: partial removal (instance remains; ACL remains); the owner's approval is spent, so another try needs a new one")
     );
     assert!(
         rig.get(&format!("/1.0/instances/pg?project={PROJECT}"))
             .is_some()
     );
+    // The ACL is not tried while its instance stands: Incus would refuse it, and the NIC still needs it.
     assert!(
         rig.get(&format!(
             "/1.0/network-acls/{PROJECT}-svc-pg?project=default"
         ))
-        .is_none()
+        .is_some()
+    );
+    assert!(
+        rig.fake
+            .requests()
+            .iter()
+            .all(|request| !(request.method == "DELETE"
+                && request.path.starts_with("/1.0/network-acls/")))
     );
     assert_eq!(
         fs::read_to_string(secrets.join("password")).unwrap(),
@@ -2379,6 +2539,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 
 #[path = "services/approval_requests.rs"]
 mod approval_requests;
+#[path = "services/golden.rs"]
+mod golden;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/tunnel.rs"]
