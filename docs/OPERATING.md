@@ -2793,29 +2793,25 @@ token passes through that assistant's conversation.
    Leave this screen open. Use a tunnel of its own for each workspace: whoever holds a tunnel's token can serve that
    tunnel's routes.
 2. **Cloudflare dashboard, "Zero Trust" > "Access" > "Applications": who may open the address.** Do this before the
-   address leads anywhere (step 7), so that it is never open to a stranger. Select "Add an application", then
+   address leads anywhere (step 6), so that it is never open to a stranger. Select "Add an application", then
    "Self-hosted". Give it a name, and as its public host name enter the address the workspace will have
    (`workspace.example.com`). Add a policy with the action "Allow" and one rule, "Emails", that lists your own
    address (`owner@example.com`) and nobody else's. Save it. Note two things, neither of them a secret: your team
    domain (`<your team>.cloudflareaccess.com`, in the Zero Trust settings) and the application's "Application
    Audience (AUD) Tag" on its overview. From now on Cloudflare asks every visitor of that address to prove one of the
    listed e-mail addresses before anything reaches the workspace.
-3. **The template for your workspace.** The settings are part of the template, so each workspace has its own copy.
-   Whoever looks after the node copies `<stateDir>/templates/automagik-workspace.json` to a new name, for example
-   `example-workspace.json`, sets `"name"` to `example-workspace`, sets `settings.publicUrl` to the address the
-   workspace will have (`https://workspace.example.com`, with no closing slash), and sets the three Access settings
-   from step 2: `accessTeamDomain`, `accessAudience` and `accessEmails` (the same addresses as the policy). This is
-   the one step that is a file and not a verb, and it is temporary: once `service_create` takes a service's own
-   settings, these are given at create and no copy is made. The script `automagik-workspace.sh` stays as it is,
-   beside it.
-4. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. The machine is created
-   and stays `stopped`, because it has no token yet. Leave `bridge` out, so that it joins Arca's own service network.
-5. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The
+3. **Arca: `service_create`**, with the workspace's own settings in the call:
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"publicUrl": "https://workspace.example.com", "accessTeamDomain": "<your team>.cloudflareaccess.com", "accessAudience": "<the audience tag>", "accessEmails": ["owner@example.com"]}}`.
+   `publicUrl` is the address the workspace will have, with no closing slash; the three Access settings are the two
+   values noted in step 2 and the same addresses as the policy. No copy of the template is made: these settings are
+   given at create, and `service_status` shows them afterwards. The machine is created and stays `stopped`, because
+   it has no token yet. Leave `bridge` out, so that it joins Arca's own service network.
+4. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The
    key is exactly `TUNNEL_TOKEN`. Arca answers `{"ok": true}`; no answer, list or log shows the token again.
-6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`. The machine starts and the
+5. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`. The machine starts and the
    answer names the secret written into it. Its first boot installs Docker and downloads the two images, which takes
    a few minutes. Back on the Cloudflare screen from step 1 the tunnel connects; select "Continue".
-7. **Cloudflare dashboard, "Networking" > "Tunnels", your tunnel, the "Routes" tab.** Only now, with the Access
+6. **Cloudflare dashboard, "Networking" > "Tunnels", your tunnel, the "Routes" tab.** Only now, with the Access
    application of step 2 in place. Select "Add route", then "Published application". Enter the subdomain
    (`workspace`), choose your domain (`example.com`) in "Domain", and in "Service URL" enter `http://127.0.0.1:3082`:
    the gate's port, not the server's 3081. That address is the loopback the connector shares with the gate. Select
@@ -2825,14 +2821,18 @@ token passes through that assistant's conversation.
    workspace: the server is never told its public name, so it refuses the requests and live connections its
    interface makes (HTTP 403), its page asks for the server's own sign-in (HTTP 401), and only its static files
    load. A page that never comes to life is that mistake: correct the port in the route.
-8. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
+7. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
    `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel is running and has registered with Cloudflare; public address https://workspace.example.com, sign-in by Cloudflare Access (team example.cloudflareaccess.com, 1 e-mail address(es))`.
    The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
    own sign-in for your e-mail address first, and then the workspace.
 
+The settings. A `service_create` may give `reach`, `publicUrl` and the three Access settings (the template lists
+them in `createSettings`); `serverImage` is the template's own, since the image a workspace runs is not for a
+create to choose.
+
 | Setting | Meaning |
 |---------|---------|
-| `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
+| `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. It ships empty, which means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16, one address in each entry). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
 | `serverImage` | The Automagik server's public image, pinned by digest. The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below). |
 
@@ -2868,16 +2868,16 @@ choose a machine name you do not mind the world reading.
    if your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it;
    treat it like a password. Decide the machine's name (for example `workspace1`) and note your tailnet's name:
    together they are the address, `https://workspace1.<tailnet>.ts.net`.
-2. **The template for your workspace**, as in step 3 above: in the copy set `settings.reach` to `tailnet` and
-   `settings.publicUrl` to that address, with no port and no closing slash. Leave the three Access settings empty;
-   with `tailnet` they are refused.
-3. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. It stays `stopped`.
-4. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TAILSCALE_AUTHKEY", "value": "<the key>"}`.
+2. **Arca: `service_create`** with
+   `{"name": "workspace1", "template": "automagik-workspace", "settings": {"reach": "tailnet", "publicUrl": "https://workspace1.<tailnet>.ts.net"}}`:
+   the reach, and that address with no port and no closing slash. Give none of the three Access settings; with
+   `tailnet` they are refused. It stays `stopped`.
+3. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TAILSCALE_AUTHKEY", "value": "<the key>"}`.
    The key is exactly `TAILSCALE_AUTHKEY`; `TUNNEL_TOKEN` is not used by this reach.
-5. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`.
-6. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
+4. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`.
+5. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
    `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tailnet node is logged in and serves https://workspace1.<tailnet>.ts.net; reach tailnet: https://workspace1.<tailnet>.ts.net, sign-in by passkey, waiting for its first claim`.
-7. **The first claim.** A new gate has no owner. It writes a claim code into its own data, good once and for
+6. **The first claim.** A new gate has no owner. It writes a claim code into its own data, good once and for
    fifteen minutes, and the first person who opens `https://workspace1.<tailnet>.ts.net/_gate/claim` from the
    tailnet with that code registers a passkey and becomes the owner. Arca does not hand that code to you yet: the
    step that shows it once, after your passkey on Arca's approval page, is not built. Until it is, the code can
@@ -2975,8 +2975,9 @@ What to know:
 - **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
 - **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
   the containers again from the token on its disk.
-- **The settings are fixed.** They are read when the machine is created. To change the public address, the Access
-  settings or an image pin, edit the template copy and create the workspace again.
+- **The settings are fixed.** They are read when the machine is created. To change the reach, the public address
+  or the Access settings, create the workspace again with other settings. To move the server's image pin, edit
+  `serverImage` in the template: workspaces created afterwards run the new build.
 
 ## A pool of GitHub Actions runners
 

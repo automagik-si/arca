@@ -4,6 +4,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+- A workspace's own settings are given when it is created: the `automagik-workspace` template lists `reach`,
+  `publicUrl` and the three Cloudflare Access settings in `createSettings`, so `service_create` takes them in
+  `settings` and no copy of the template is made. `serverImage` is not listed: the image a workspace runs stays the
+  template's to pin. `publicUrl` now ships empty, which means "not set".
 - The `automagik-workspace` template can be reached on a tailnet instead of through a Cloudflare Tunnel:
   `settings.reach` is `cloudflare` (as before, and when it is left out) or `tailnet`. With `tailnet` the machine
   runs a Tailscale node (Tailscale's own image, by digest) in a network namespace of its own, which serves HTTPS on
