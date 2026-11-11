@@ -17,10 +17,12 @@ name: Release
 #   publish  may write, and runs no code of the repository and none of its scripts: git, gh and sha256sum from the
 #            runner's image, on the lines written in this file. It checks what was handed over (the bundle is exactly
 #            one commit on top of dev, named as a release commit, touching only the files that state the version;
-#            the tag points at it; SHA256SUMS matches the binary), pushes dev and the tag in one atomic push, and
-#            publishes the GitHub release `v<version>` with
+#            the tag points at it; SHA256SUMS matches the binary and the installer; the installer is the release
+#            commit's own), pushes dev and the tag in one atomic push, and publishes the GitHub release `v<version>`
+#            with
 #              arca-<version>-linux-x86_64   the portable binary (glibc 2.34 or newer)
-#              SHA256SUMS                    its checksum
+#              install.sh                    scripts/install.sh as the release commit holds it: it installs this release
+#              SHA256SUMS                    the checksums of those two
 #            and that version's CHANGELOG.md section as the notes.
 #   main     moves main to the release commit. main holds released commits and nothing else.
 #
@@ -29,17 +31,23 @@ name: Release
 # it pushes, and that is exactly this:
 #   - the commit is one commit on dev's tip; its whole message is `chore(release): v<version>`; the tag is an
 #     annotated tag of that name on it, and its whole message is `Automagik Arca <version>`;
-#   - it changes five files and no other, and no file's kind or mode: Cargo.toml, Cargo.lock, CHANGELOG.md and the
-#     canvas package's package.json and package-lock.json;
-#   - in the four files that state the version, each changed line is a version line of the workspace (found in
-#     dev's own copy), going from dev's version to the new one, and nothing else changes;
+#   - it changes six files and no other, and no file's kind or mode: Cargo.toml, Cargo.lock, CHANGELOG.md, the
+#     canvas package's package.json and package-lock.json, and scripts/install.sh;
+#   - in the four manifests and lock files, each changed line is a version line of the workspace (found in dev's
+#     own copy), going from dev's version to the new one, and nothing else changes;
+#   - in scripts/install.sh one line changes: the one ARCA_VERSION line of dev's own copy, from `ARCA_VERSION=` and
+#     dev's version to `ARCA_VERSION=` and the new one. So the installer that is published installs the release it
+#     is published with, and is otherwise dev's own, byte for byte;
 #   - in CHANGELOG.md no line is removed or changed; the added lines are the one heading `## <version> (<date>)`,
 #     right under Unreleased and outside any comment, and blank lines and list lines (`- ...`) inside that section,
 #     with no control character and no `<`.
+# Of the release files, this is checked: they are the four expected and nothing else; SHA256SUMS is two lines, the
+# binary's and then install.sh's, and both files match it; install.sh is, byte for byte, scripts/install.sh of the
+# release commit, and its one ARCA_VERSION line names this version. The release fails when any of that is not so.
 # What is not checked: what a list line says (it is a commit's subject, and may hold a link), which number the
-# version is, and the three release files beyond the binary matching SHA256SUMS. Code that runs in cut can
-# therefore still shape the binary it builds, the words of the changelog lines and the release notes, and which
-# version number the release takes. This design does not stop that.
+# version is, what the binary is, and what the release notes say. Code that runs in cut can therefore still shape
+# the binary it builds, the words of the changelog lines and the release notes, and which version number the
+# release takes. This design does not stop that.
 #
 # Nothing is taken when anything before the push fails: no version, no tag. When dev moved while a run was cutting,
 # neither the commit nor the tag lands, the run ends cleanly, and the run for the newer push releases those changes
@@ -209,7 +217,7 @@ jobs:
         if: steps.plan.outputs.mode != 'none'
         run: scripts/release.sh
 
-      # What the publishing job gets: the three files, and for a new cut the release commit and its tag as a bundle.
+      # What the publishing job gets: the four files, and for a new cut the release commit and its tag as a bundle.
       - name: Hand over
         if: steps.plan.outputs.mode != 'none'
         env:
@@ -218,7 +226,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir handover
-          cp "dist/arca-${VERSION}-linux-x86_64" dist/SHA256SUMS dist/RELEASE-NOTES.md handover/
+          cp "dist/arca-${VERSION}-linux-x86_64" dist/install.sh dist/SHA256SUMS dist/RELEASE-NOTES.md handover/
           if [[ "${MODE}" == "cut" ]]; then
             git bundle create -q handover/release.bundle "refs/tags/v${VERSION}" "^HEAD~1"
           fi
@@ -248,7 +256,8 @@ jobs:
       VERSION: ${{ needs.cut.outputs.version }}
       PRERELEASE: ${{ inputs.prerelease }}
     # This job holds the token that can write. It runs nothing from the repository: no script of it, no build, no
-    # test, no package's install. Only git, gh and sha256sum, on the lines below.
+    # test, no package's install. Only git, gh and sha256sum, on the lines below. The installer it publishes is a
+    # file to it: compared and uploaded, never started.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -273,8 +282,11 @@ jobs:
           tag="v${VERSION}"
           asset="arca-${VERSION}-linux-x86_64"
 
+          # The installer's path inside a commit. It is read with git, as data, and compared; nothing here starts it.
+          INSTALLER="scripts/install.sh"
+
           # Exactly the files expected, each a plain file, and nothing else.
-          expected=$'./RELEASE-NOTES.md\n./SHA256SUMS\n'"./${asset}"
+          expected=$'./RELEASE-NOTES.md\n./SHA256SUMS\n./install.sh\n'"./${asset}"
           [[ "${MODE}" != "cut" ]] || expected+=$'\n./release.bundle'
           found=$(cd "${HANDOVER}" && find . -mindepth 1 | LC_ALL=C sort)
           [[ "${found}" == "$(LC_ALL=C sort <<< "${expected}")" ]] || stop "the handed-over files are not the expected ones: ${found//$'\n'/ }"
@@ -282,11 +294,24 @@ jobs:
             [[ -f "${HANDOVER}/${file}" && ! -L "${HANDOVER}/${file}" ]] || stop "${file} is not a plain file"
           done <<< "${expected}"
 
-          # SHA256SUMS names the binary alone, and the binary is the one it names.
-          [[ "$(wc -l < "${HANDOVER}/SHA256SUMS")" == 1 ]] || stop "SHA256SUMS does not hold exactly one line"
-          read -r sum name < "${HANDOVER}/SHA256SUMS"
-          [[ "${sum}" =~ ^[0-9a-f]{64}$ && "${name}" == "${asset}" ]] || stop "SHA256SUMS does not name ${asset} with a SHA-256"
-          (cd "${HANDOVER}" && sha256sum --check --strict --quiet SHA256SUMS) || stop "${asset} does not match SHA256SUMS"
+          # SHA256SUMS is two whole lines: the binary's, then the installer's. Each file is the one its line names.
+          [[ "$(wc -l < "${HANDOVER}/SHA256SUMS")" == 2 && -z "$(tail -c 1 "${HANDOVER}/SHA256SUMS")" ]] ||
+            stop "SHA256SUMS does not hold exactly two lines"
+          { read -r sum name; read -r installer_sum installer_name; } < "${HANDOVER}/SHA256SUMS"
+          [[ "${sum}" =~ ^[0-9a-f]{64}$ && "${name}" == "${asset}" ]] || stop "SHA256SUMS does not name ${asset} with a SHA-256 on its first line"
+          [[ "${installer_sum}" =~ ^[0-9a-f]{64}$ && "${installer_name}" == "install.sh" ]] ||
+            stop "SHA256SUMS does not name install.sh with a SHA-256 on its second line"
+          (cd "${HANDOVER}" && sha256sum --check --strict --quiet SHA256SUMS) || stop "a release file does not match SHA256SUMS"
+          # installer <commit>: the handed-over install.sh is, byte for byte, the installer that commit holds, and
+          # that installer's one ARCA_VERSION line names this version: the installer published with a release
+          # installs that release, and is nothing the repository does not hold.
+          installer() {
+            git cat-file -e "$1:${INSTALLER}" 2> /dev/null || stop "the release commit holds no ${INSTALLER}"
+            [[ "$(git hash-object --no-filters "${HANDOVER}/install.sh")" == "$(git rev-parse "$1:${INSTALLER}")" ]] ||
+              stop "install.sh is not the release commit's ${INSTALLER}"
+            [[ "$(git show "$1:${INSTALLER}" | LC_ALL=C grep -a '^ARCA_VERSION=')" == "ARCA_VERSION=${VERSION}" ]] ||
+              stop "the release commit's ${INSTALLER} does not name ${VERSION} as the release it installs"
+          }
 
           # The tag has no published release yet. A draft is not one.
           published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName,isDraft \
@@ -300,7 +325,9 @@ jobs:
             # The tag is already on the remote; nothing is pushed.
             [[ -n "${on_remote}" ]] || stop "${tag} is not on the remote, so there is nothing to finish"
             git fetch -q origin "refs/tags/${tag}:refs/tags/${tag}"
-            echo "commit=$(git rev-parse "refs/tags/${tag}^{commit}")" >> "$GITHUB_OUTPUT"
+            commit=$(git rev-parse "refs/tags/${tag}^{commit}")
+            installer "${commit}"
+            echo "commit=${commit}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -331,12 +358,12 @@ jobs:
           [[ "$(git cat-file tag "refs/tags/${tag}" | sed '1,/^$/d')" == "Automagik Arca ${VERSION}" ]] ||
             stop "the tag's message is not exactly Automagik Arca ${VERSION}"
           # A release commit states the version and the changelog section, and nothing else. It changes exactly the
-          # five files that state them, and in each file exactly the expected lines, checked one by one below. What a
+          # six files that state them, and in each file exactly the expected lines, checked one by one below. What a
           # file said before is read from dev's own commit, never from the new one: a manifest or a lock file can
-          # carry code (a [patch] entry, a script, a dependency pointed somewhere else).
-          files=$'CHANGELOG.md\nCargo.lock\nCargo.toml\npackages/arca-canvas-dsh/package-lock.json\npackages/arca-canvas-dsh/package.json'
+          # carry code (a [patch] entry, a script, a dependency pointed somewhere else), and the installer is code.
+          files=$'CHANGELOG.md\nCargo.lock\nCargo.toml\npackages/arca-canvas-dsh/package-lock.json\npackages/arca-canvas-dsh/package.json\n'"${INSTALLER}"
           [[ "$(git diff --name-only --no-renames "${dev}" "${commit}" | LC_ALL=C sort)" == "${files}" ]] ||
-            stop "the release commit does not change exactly the five files that state the version"
+            stop "the release commit does not change exactly the six files that state the version"
           [[ -z "$(git diff --raw --no-renames "${dev}" "${commit}" | awk 'substr($1, 2) != $2 || $5 != "M"')" ]] ||
             stop "the release commit changes a file's kind or mode"
           old=$(git show "${dev}:Cargo.toml" |
@@ -400,6 +427,16 @@ jobs:
           # shellcheck disable=SC2046
           wanted packages/arca-canvas-dsh/package-lock.json '      "version": ' $(where packages/arca-canvas-dsh/package-lock.json '/^    "": \{$/ { inside = 1; next } inside && /^    \}/ { exit } inside && /^      "version": / { print NR; exit }')
           [[ "$(changes packages/arca-canvas-dsh/package-lock.json)"$'\n' == "${want}" ]] || stop "package-lock.json changes something other than its two version lines"
+          # The installer: dev's own copy has one ARCA_VERSION line, which names dev's version, and that line alone
+          # changes, to name the new one. Every other byte of the installer is dev's own. Then what was handed over
+          # as install.sh is checked to be this commit's installer.
+          at=$(where "${INSTALLER}" '/^ARCA_VERSION=/ { print NR }')
+          [[ "${at}" =~ ^[0-9]+$ ]] || stop "dev's own ${INSTALLER} does not have exactly one ARCA_VERSION line"
+          [[ "$(git show "${dev}:${INSTALLER}" | sed -n "${at}p")" == "ARCA_VERSION=${old}" ]] ||
+            stop "dev's own ${INSTALLER} does not say ARCA_VERSION=${old} at line ${at}"
+          [[ "$(changes "${INSTALLER}")" == "${at}:ARCA_VERSION=${old} => ARCA_VERSION=${VERSION}" ]] ||
+            stop "${INSTALLER} changes something other than its ARCA_VERSION line"
+          installer "${commit}"
           # CHANGELOG.md: lines are added and none is removed or changed. One added line is the new section's
           # heading, "## <version> (<date>)", right under "## Unreleased", above every older section and outside any
           # comment. Every other added line is inside that section and is blank or a list line ("- ..."), with no
@@ -470,7 +507,7 @@ jobs:
           flags=(--latest)
           [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
           cd "${RUNNER_TEMP}/release"
-          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" SHA256SUMS "${flags[@]}" \
+          gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" install.sh SHA256SUMS "${flags[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
             --title "Automagik Arca ${VERSION}" \

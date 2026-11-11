@@ -13,6 +13,9 @@ without anyone writing a version or a tag. The numbers changed with it. A releas
 without changing the binary takes the next `P`. The canvas package carries the same version as the binary. Arca is
 still an alpha for single hosts; the number no longer says so, the README does.
 
+Each release now carries `install.sh`, the installer, beside the binary. It installs the release it comes with, and
+`SHA256SUMS` lists it with the binary: check a download with `sha256sum --check --ignore-missing SHA256SUMS`.
+
 - The `automagik-workspace` template can be reached on a tailnet instead of through a Cloudflare Tunnel:
   `settings.reach` is `cloudflare` (as before, and when it is left out) or `tailnet`. With `tailnet` the machine
   runs a Tailscale node (Tailscale's own image, by digest) in a network namespace of its own, which serves HTTPS on

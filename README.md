@@ -51,7 +51,8 @@ what it printed.*
 - **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an Incus
   socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
   anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
-- **It installs one named release**, the one the quickstart names, at `~/.local/bin/arca`.
+- **It installs one named release**, the one its own `ARCA_VERSION` line names, at `~/.local/bin/arca`. Each release
+  sets that line to its own version.
   `sh install.sh --version <version>` names another; without it, an older release is never put over a newer program.
   The program is checked against that release's `SHA256SUMS`. That catches a download that was damaged or cut short. It
   does not catch a release that was tampered with, because the checksums come from the same release.
@@ -67,7 +68,8 @@ what it printed.*
   service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
   state.
 
-**Not yet:** the script is read from the `dev` branch, so no release's checksum covers the script itself. It is tested
+**Not yet:** the addresses above read the script from the `dev` branch, where no checksum covers it. From the next
+release on, each release carries its own `install.sh`, listed in that release's `SHA256SUMS`. It is tested
 against stand-ins for the download, the program and systemd, and it was run for real on one machine that already had
 Incus and Arca; it has not been run on a machine that never had either. There is no installer for a Mac.
 
@@ -84,7 +86,7 @@ v=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/automagik-s
 echo "the newest release is ${v:?none is marked Latest; pick a version on the releases page and set v to it}"
 base=https://github.com/automagik-si/arca/releases/download/v$v
 curl -fL -O "$base/arca-$v-linux-x86_64" -O "$base/SHA256SUMS"
-sha256sum --check SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 install -D -m 0755 "arca-$v-linux-x86_64" ~/.local/bin/arca
 arca --version
 ```
@@ -92,7 +94,8 @@ arca --version
 The first two lines ask GitHub which release is the newest. GitHub answers only with a release that is not a
 pre-release: until the first such release (`0.8.0`) is out, they find nothing and say so, and you set `v` yourself to
 a version from the releases page, for example `v=0.1.0-alpha.7`. `sha256sum` must answer
-`arca-<version>-linux-x86_64: OK`. `arca --version` prints
+`arca-<version>-linux-x86_64: OK`; `--ignore-missing` is there because `SHA256SUMS` also lists the release's
+`install.sh`, which this step does not download. `arca --version` prints
 `Automagik Arca <version> (<commit>, x86_64-unknown-linux-gnu)`; if the shell does not find `arca`, put
 `~/.local/bin` on your `PATH`.
 
@@ -246,11 +249,13 @@ ships has changed:
    change that ships without changing the binary (the canvas package, the units, the schema) is a patch,
    `0.N.(P+1)`. A change to documents, tests or the workflows alone releases nothing. The lists are at the top of
    `scripts/version.sh`.
-3. It writes the version into the manifests and the lock files, writes that version's section of `CHANGELOG.md`,
-   commits both as `chore(release): v<version>`, tags the commit `v<version>`, and builds the release files at the
-   tag with `scripts/release.sh`.
+3. It writes the version into the manifests, the lock files and the installer (the `ARCA_VERSION` line of
+   `scripts/install.sh`), writes that version's section of `CHANGELOG.md`, commits them as
+   `chore(release): v<version>`, tags the commit `v<version>`, and builds the release files at the tag with
+   `scripts/release.sh`.
 4. A second job pushes `dev` and the tag together and publishes the GitHub release with
-   `arca-<version>-linux-x86_64` and `SHA256SUMS`.
+   `arca-<version>-linux-x86_64`, `install.sh` (the installer as the release commit holds it, which installs that
+   release) and `SHA256SUMS`, the checksums of those two.
 5. `main` moves to the release commit. `main` holds released commits and nothing else.
 
 Steps 1 to 3 run the repository's code and its dependencies' (build scripts, tests, a package's install), so their
@@ -260,14 +265,18 @@ release commit against `dev`'s own copy of each file, and the list is all there 
 
 - one commit on top of `dev`, whose whole message is `chore(release): v<version>`, with an annotated tag of that name
   whose whole message is `Automagik Arca <version>`;
-- five files changed and no other, none changing its kind or mode;
+- six files changed and no other, none changing its kind or mode;
 - in the manifests and lock files, only the version lines of the workspace's crates and of the canvas package, from
   the old version to the new one. A manifest or a lock file can carry code, so nothing else in them may change in a
   commit nobody reviews;
+- in `scripts/install.sh`, only its one `ARCA_VERSION` line, from the old version to the new one. Every other byte
+  of the installer is `dev`'s own;
 - in `CHANGELOG.md`, no line removed or changed, and the added lines being the one heading, right under `Unreleased`
   and outside any comment, and blank lines and list lines (`- ...`) inside that section, with no control character
   and no `<`;
-- the binary matching `SHA256SUMS`.
+- the release files being the four expected; `SHA256SUMS` holding two lines, the binary's and then `install.sh`'s,
+  and both files matching it; and `install.sh` being, byte for byte, the release commit's `scripts/install.sh`, whose
+  `ARCA_VERSION` line names the version being released. An installer at another version stops the release.
 
 What this does not stop: code that runs in the first job, a hostile dependency among it, can still shape the binary
 that job builds, the words of the changelog's list lines and of the release notes (a line may hold a link), and which
@@ -299,6 +308,7 @@ runners, never on a self-hosted one, whose kept cache beside a write token would
 
 `scripts/release.sh` is the one way the release files are built, and it publishes nothing. From a clean tree whose
 HEAD is the tag `v<version>` it runs `scripts/build-portable.sh`, checks that the binary's `--version` names that
-version and commit, and writes `dist/arca-<version>-linux-x86_64`, `dist/SHA256SUMS` and `dist/RELEASE-NOTES.md` (that
-version's section of `CHANGELOG.md`). `scripts/release.sh --rehearse` builds and checks the same files without the
-tag, to try a build by hand.
+version and commit, and writes `dist/arca-<version>-linux-x86_64`, `dist/install.sh` (a copy of
+`scripts/install.sh`), `dist/SHA256SUMS` (the checksums of those two) and `dist/RELEASE-NOTES.md` (that version's
+section of `CHANGELOG.md`). It refuses, before it builds, an installer whose `ARCA_VERSION` line does not name the
+version. `scripts/release.sh --rehearse` builds and checks the same files without the tag, to try a build by hand.

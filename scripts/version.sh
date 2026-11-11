@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Automagik Arca's one version. The whole repository carries it: the workspace's crates (Cargo.toml and Cargo.lock)
-# and the canvas package (package.json and package-lock.json). Nobody writes it by hand: the release workflow
+# Automagik Arca's one version. The whole repository carries it: the workspace's crates (Cargo.toml and Cargo.lock),
+# the canvas package (package.json and package-lock.json) and the installer (the ARCA_VERSION line of
+# scripts/install.sh, the release it installs). Nobody writes it by hand: the release workflow
 # (.github/workflows/release.yml) works out the next one from the release tags and writes it with this script.
 #
 # A release is 0.N.P, tagged v0.N.P:
@@ -46,13 +47,13 @@ INERT=(
     # them too, and they are in the patch list below.
     '^scripts/ci-[^/]+$'
 )
-# A change under one of these ships, but the binary is not built from it: a patch. scripts/build-portable.sh is not
-# here, because its flags change the binary.
+# A change under one of these ships, but the binary is not built from it: a patch. scripts/install.sh is a release
+# file of its own. scripts/build-portable.sh is not here, because its flags change the binary.
 PATCH=(
     '^packages/'
     '^deploy/'
     '^schema/'
-    '^scripts/(release|version)\.sh$'
+    '^scripts/(release|version|install)\.sh$'
 )
 # Every other path is one the binary is built from, or one nobody has classed yet: a full release.
 
@@ -104,11 +105,16 @@ fields() {
         inside && /^      "version": "[^"]*",?$/ { print NR; exit }
     ' "$root/$file")"
     echo "$file:${line:-0} packages[\"\"].version"
+    # The installer: the one line that names the release it installs, unquoted and alone on its line. Two such lines
+    # are no field: nobody could say which one the installer reads.
+    file="scripts/install.sh"
+    line="$(awk '/^ARCA_VERSION=/ { found++; at = NR; whole = ($0 ~ /^ARCA_VERSION=[0-9A-Za-z.+-]+$/) } END { if (found == 1 && whole) print at }' "$root/$file" 2>/dev/null || true)"
+    echo "$file:${line:-0} ARCA_VERSION"
 }
 
 # The version one field line carries.
 value_at() {
-    sed -n "${2}p" "$root/$1" | sed -E 's/^[^"]*("version": |version = )"([^"]*)".*$/\2/'
+    sed -n "${2}p" "$root/$1" | sed -E 's/^[^"]*("version": |version = )"([^"]*)".*$/\2/; s/^ARCA_VERSION=//'
 }
 
 workspace_version() {
@@ -148,7 +154,7 @@ set_version() {
         [ "${at##*:}" != 0 ] || fail "${at%%:*} has no $what; nothing was written"
     done <<<"$all"
     while read -r at what; do
-        sed -i -E "${at##*:}s/(\"version\": |version = )\"[^\"]*\"/\\1\"$version\"/" "$root/${at%%:*}"
+        sed -i -E "${at##*:}s/(\"version\": |version = )\"[^\"]*\"/\\1\"$version\"/; ${at##*:}s/^ARCA_VERSION=.*\$/ARCA_VERSION=$version/" "$root/${at%%:*}"
     done <<<"$all"
     echo "version: $version"
 }
