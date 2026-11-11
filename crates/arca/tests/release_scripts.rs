@@ -757,7 +757,6 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
             "curl",
             "wget",
             "eval",
-            "source ",
             "bash ",
             "sh -c",
             "make",
@@ -768,6 +767,27 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
                 !text.contains(never),
                 "the {name} job runs nothing of the repository: no {never}"
             );
+        }
+    }
+    // No line reads another file as shell: `source` and `.` at the start of a command. (The word itself is in the
+    // publishing job, as the name of a lock file's field.)
+    for name in ["publish", "main"] {
+        for line in job(&rules, name).lines() {
+            let command = line.trim_start();
+            assert!(
+                !command.starts_with("source ") && !command.starts_with(". "),
+                "the {name} job reads no file as shell: {command}"
+            );
+            for joined in [
+                "; source ",
+                "&& source ",
+                "|| source ",
+                "; . ",
+                "&& . ",
+                "|| . ",
+            ] {
+                assert!(!command.contains(joined), "the {name} job: {command}");
+            }
         }
     }
     let publish = job(&rules, "publish");
@@ -832,6 +852,275 @@ fn every_action_in_the_workflows_is_named_by_its_full_commit() {
     assert!(!lint.contains("pull_request_target") && !lint.contains("write"));
 }
 
+/// Where in a workflow file an expression stands. GitHub allows each place its own contexts and refuses the whole
+/// workflow for one that is not allowed there, before any job runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Place {
+    /// The workflow's own `env`.
+    WorkflowEnv,
+    /// The workflow's own `concurrency`, and `run-name`.
+    WorkflowConcurrency,
+    /// `on.workflow_call.inputs.<id>.default`.
+    CallDefault,
+    /// `on.workflow_call.outputs.<id>.value`.
+    CallValue,
+    JobIf,
+    JobEnv,
+    JobSecrets,
+    JobOutputs,
+    JobStrategy,
+    /// `jobs.<id>.with`, for a job that calls a workflow.
+    JobWith,
+    /// `jobs.<id>.defaults.run`.
+    JobDefaults,
+    /// A job's `name`, `runs-on`, `concurrency`, `timeout-minutes`, `continue-on-error`, `container`, `environment`,
+    /// `services`.
+    JobOther,
+    /// Anything of a step: `if`, `env`, `with`, `run`, `name`, `working-directory`, `timeout-minutes`.
+    Step,
+}
+
+impl Place {
+    /// GitHub's table of the contexts each place may read ("Context availability" in the documentation of contexts).
+    fn allows(self) -> &'static [&'static str] {
+        match self {
+            Place::WorkflowEnv => &["github", "secrets", "inputs", "vars"],
+            Place::WorkflowConcurrency | Place::CallDefault => &["github", "inputs", "vars"],
+            Place::CallValue => &["github", "jobs", "vars", "inputs"],
+            Place::JobIf | Place::JobStrategy => &["github", "needs", "vars", "inputs"],
+            Place::JobEnv | Place::JobSecrets => &[
+                "github", "needs", "strategy", "matrix", "vars", "secrets", "inputs",
+            ],
+            Place::JobWith | Place::JobOther => {
+                &["github", "needs", "strategy", "matrix", "vars", "inputs"]
+            }
+            Place::JobDefaults => &[
+                "github", "needs", "strategy", "matrix", "env", "vars", "inputs",
+            ],
+            Place::JobOutputs | Place::Step => &[
+                "github", "needs", "strategy", "matrix", "job", "runner", "env", "vars", "secrets",
+                "steps", "inputs",
+            ],
+        }
+    }
+}
+
+/// The place a line stands in, from the keys above it, outermost first. `None` is a place that takes no expression.
+fn place_of(path: &[&str]) -> Option<Place> {
+    match path {
+        ["env", ..] => Some(Place::WorkflowEnv),
+        ["concurrency", ..] | ["run-name"] => Some(Place::WorkflowConcurrency),
+        ["on", "workflow_call", "inputs", ..] => Some(Place::CallDefault),
+        ["on", "workflow_call", "outputs", ..] => Some(Place::CallValue),
+        ["jobs", _, "steps", ..] => Some(Place::Step),
+        ["jobs", _, "if"] => Some(Place::JobIf),
+        ["jobs", _, "env", ..] => Some(Place::JobEnv),
+        ["jobs", _, "secrets", ..] => Some(Place::JobSecrets),
+        ["jobs", _, "outputs", ..] => Some(Place::JobOutputs),
+        ["jobs", _, "strategy", ..] => Some(Place::JobStrategy),
+        ["jobs", _, "with", ..] => Some(Place::JobWith),
+        ["jobs", _, "defaults", ..] => Some(Place::JobDefaults),
+        [
+            "jobs",
+            _,
+            "name" | "runs-on" | "concurrency" | "timeout-minutes" | "continue-on-error"
+            | "container" | "environment" | "services",
+            ..,
+        ] => Some(Place::JobOther),
+        _ => None,
+    }
+}
+
+/// The contexts an expression reads: each name that is followed by `.` or `[` and is not inside a quoted string or
+/// part of a longer name. A function is followed by `(` and is not one.
+fn contexts(expression: &str) -> Vec<String> {
+    let bytes = expression.as_bytes();
+    let mut found = Vec::new();
+    let mut at = 0;
+    let mut after_dot = false;
+    while at < bytes.len() {
+        let c = bytes[at];
+        if c == b'\'' {
+            at += 1;
+            while at < bytes.len() && bytes[at] != b'\'' {
+                at += 1;
+            }
+            at += 1;
+            after_dot = false;
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            let start = at;
+            while at < bytes.len()
+                && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] == b'-')
+            {
+                at += 1;
+            }
+            let next = bytes.get(at).copied();
+            if !after_dot && (next == Some(b'.') || next == Some(b'[')) {
+                found.push(expression[start..at].to_string());
+            }
+            after_dot = false;
+        } else {
+            after_dot = c == b'.';
+            at += 1;
+        }
+    }
+    found
+}
+
+/// Every expression of a workflow file with the place it stands in and the line it is on: each `${{ ... }}`, and the
+/// whole value of each `if:`, which is an expression with or without the braces. The file is read by its indentation,
+/// which is how these workflows are written: block mappings, and `- ` for a step.
+fn expressions(text: &str) -> Vec<(usize, Vec<String>, String)> {
+    let mut path: Vec<(usize, String)> = Vec::new();
+    let mut found = Vec::new();
+    // A block scalar (`run: |`) holds text, not keys: its lines stay in the place of the key that opened it.
+    let mut block: Option<usize> = None;
+    for (number, raw) in text.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut indent = raw.len() - trimmed.len();
+        if let Some(opened) = block {
+            if indent > opened {
+                for inner in raw.match_indices("${{") {
+                    let rest = &raw[inner.0 + 3..];
+                    let end = rest.find("}}").unwrap_or(rest.len());
+                    let keys = path.iter().map(|(_, key)| key.clone()).collect();
+                    found.push((number + 1, keys, rest[..end].to_string()));
+                }
+                continue;
+            }
+            block = None;
+        }
+        let mut line = trimmed;
+        while let Some(item) = line.strip_prefix("- ") {
+            indent += 2;
+            line = item;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('\'').trim_matches('"');
+        while path.last().is_some_and(|(at, _)| *at >= indent) {
+            path.pop();
+        }
+        path.push((indent, key.to_string()));
+        let value = value.trim();
+        if value == "|" || value == ">" || value == "|-" || value == ">-" {
+            block = Some(indent);
+            continue;
+        }
+        let keys: Vec<String> = path.iter().map(|(_, key)| key.clone()).collect();
+        if key == "if" && !value.is_empty() {
+            let bare = value.trim_start_matches("${{").trim_end_matches("}}");
+            found.push((number + 1, keys, bare.to_string()));
+            continue;
+        }
+        for inner in value.match_indices("${{") {
+            let rest = &value[inner.0 + 3..];
+            let end = rest.find("}}").unwrap_or(rest.len());
+            found.push((number + 1, keys.clone(), rest[..end].to_string()));
+        }
+    }
+    found
+}
+
+/// Every context a workflow file reads in a place that does not allow it, as "<line>: <context> in <place>".
+fn misplaced(text: &str) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (line, keys, expression) in expressions(text) {
+        let path: Vec<&str> = keys.iter().map(String::as_str).collect();
+        // A step's own `if` is a step's place; a job's `if` is the job's.
+        let Some(place) = place_of(&path) else {
+            wrong.push(format!(
+                "{line}: an expression where none is expected ({})",
+                path.join(".")
+            ));
+            continue;
+        };
+        for context in contexts(&expression) {
+            if !place.allows().contains(&context.as_str()) {
+                wrong.push(format!("{line}: {context} in {place:?}"));
+            }
+        }
+    }
+    wrong
+}
+
+#[test]
+fn every_expression_reads_only_the_contexts_its_place_allows() {
+    // The reader finds what it must: a context GitHub refuses in a job's env, in a job's if and in the workflow's
+    // env, and none where the same context is allowed. `runner` in a job's env is the mistake this test is for:
+    // GitHub answers "Unrecognized named-value: runner" and runs nothing.
+    let sample = "\
+name: Sample
+on:
+  push:
+env:
+  A: ${{ github.sha }}
+  B: ${{ runner.temp }}
+concurrency:
+  group: x-${{ github.ref }}-${{ matrix.os }}
+jobs:
+  one:
+    if: needs.zero.outputs.go == 'true' && steps.plan.outputs.mode != 'runner.temp'
+    runs-on: ${{ matrix.os }}
+    env:
+      C: ${{ needs.zero.outputs.version || inputs.version }}
+      D: ${{ runner.temp }}/release
+      E: ${{ format('{0}', env.A) }}
+    outputs:
+      v: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v1
+        if: runner.os == 'Linux' && steps.plan.outputs.mode != 'none'
+        with:
+          path: ${{ runner.temp }}/x
+      - name: Run
+        env:
+          F: ${{ runner.temp }}
+        run: |
+          echo ${{ runner.arch }} \"${{ secrets.X }}\"
+";
+    assert_eq!(
+        misplaced(sample),
+        [
+            "6: runner in WorkflowEnv",
+            "8: matrix in WorkflowConcurrency",
+            "11: steps in JobIf",
+            "15: runner in JobEnv",
+            "16: env in JobEnv",
+        ]
+    );
+    assert_eq!(
+        contexts(
+            "fromJSON(needs.a.outputs.b)[0] == github.event.x['y.z'] && always() && !cancelled()"
+        ),
+        ["needs", "github"]
+    );
+
+    for name in ["release.yml", "commitlint.yml"] {
+        let text = workflow(name);
+        assert!(
+            !expressions(&text).is_empty(),
+            "{name} has expressions, and the reader finds them"
+        );
+        assert_eq!(
+            misplaced(&text),
+            Vec::<String>::new(),
+            "{name}: a context in a place GitHub does not allow it"
+        );
+    }
+    // The publishing job finds what was handed over from the runner's own variable, inside its scripts: the `runner`
+    // context is not allowed in a job's env.
+    let rules = release_rules();
+    let publish = job(&rules, "publish");
+    assert!(!publish.contains("HANDOVER: ${{"));
+    assert!(publish.contains("HANDOVER=\"${RUNNER_TEMP}/release\""));
+    assert!(publish.contains("          path: ${{ runner.temp }}/release\n"));
+}
+
 /// The script of one named step of the release workflow, exactly as the workflow has it.
 fn step_script(name: &str) -> String {
     let text = workflow("release.yml");
@@ -861,8 +1150,9 @@ fn step_script(name: &str) -> String {
     script
 }
 
-/// A stand-in for the two machines of a release: a bare repository as the remote, clones of it for the jobs, and a
-/// directory whose `gh` answers `release list` from `releases.txt` and writes each `release create` to `created.log`.
+/// A stand-in for the two machines of a release: a bare repository as the remote, clones of it for the jobs, a
+/// directory standing in for the publishing job's temporary directory, and a directory whose `gh` answers
+/// `release list` from `releases.txt` and writes each `release create` to `created.log`.
 struct Lab {
     scratch: Scratch,
 }
@@ -900,9 +1190,53 @@ else
 fi
 "#;
 
+/// The files of the stand-in repository that state its version, in the shapes the real ones have: a workspace manifest,
+/// a lock with one workspace crate and one dependency that happens to carry the same number, and the canvas package's
+/// manifest and lock.
+const SEED: [(&str, &str); 7] = [
+    (
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\nversion = \"0.1.0-alpha.7\"\nedition = \"2024\"\n\n[workspace.dependencies]\ndep = \"=0.1.0-alpha.7\"\n",
+    ),
+    (
+        "Cargo.lock",
+        "# This file is automatically @generated by Cargo.\nversion = 4\n\n[[package]]\nname = \"a\"\nversion = \"0.1.0-alpha.7\"\ndependencies = [\n \"dep\",\n]\n\n[[package]]\nname = \"dep\"\nversion = \"0.1.0-alpha.7\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"00\"\n",
+    ),
+    (
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion.workspace = true\n",
+    ),
+    ("crates/a/src/lib.rs", "// a\n"),
+    (
+        "packages/arca-canvas-dsh/package.json",
+        "{\n  \"name\": \"arca-canvas-dsh\",\n  \"version\": \"0.1.0-alpha.7\",\n  \"scripts\": {\n    \"test\": \"node --test\"\n  }\n}\n",
+    ),
+    (
+        "packages/arca-canvas-dsh/package-lock.json",
+        "{\n  \"name\": \"arca-canvas-dsh\",\n  \"version\": \"0.1.0-alpha.7\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.1.0-alpha.7\",\n      \"license\": \"Apache-2.0\"\n    },\n    \"node_modules/x\": {\n      \"version\": \"0.1.0-alpha.7\",\n      \"resolved\": \"https://registry.npmjs.org/x/-/x-1.0.0.tgz\",\n      \"integrity\": \"sha512-aaaa\"\n    }\n  }\n}\n",
+    ),
+    (
+        "CHANGELOG.md",
+        "# Changelog\n\n## Unreleased\n\n## 0.1.0-alpha.7\n\nThe first one.\n",
+    ),
+];
+
+fn put(dir: &Path, path: &str, content: &str) {
+    let file = dir.join(path);
+    fs::create_dir_all(file.parent().expect("a parent")).expect("a directory");
+    fs::write(file, content).expect("write");
+}
+
+/// Rewrites one file of a checkout: the first `from` becomes `to`. The text must be there.
+fn rewrite(dir: &Path, path: &str, from: &str, to: &str) {
+    let text = fs::read_to_string(dir.join(path)).expect("read");
+    assert!(text.contains(from), "{path} holds {from:?}");
+    fs::write(dir.join(path), text.replacen(from, to, 1)).expect("write");
+}
+
 impl Lab {
-    /// A remote whose dev holds the version script, a manifest, a changelog and one source file, tagged as the last
-    /// release of the old numbering, which is published.
+    /// A remote whose dev holds the version script and the files that state the version, tagged as the last release
+    /// of the old numbering, which is published.
     fn new(tag: &str) -> Lab {
         let scratch = Scratch::new(tag);
         let lab = Lab { scratch };
@@ -915,24 +1249,15 @@ impl Lab {
         let seed = lab.clone_as("seed");
         let script =
             fs::read_to_string(Path::new(REPO).join("scripts/version.sh")).expect("the script");
-        for (path, content) in [
-            ("scripts/version.sh", script.as_str()),
-            (
-                "Cargo.toml",
-                "[workspace.package]\nversion = \"0.1.0-alpha.7\"\n",
-            ),
-            ("CHANGELOG.md", "# Changelog\n\n## Unreleased\n"),
-            ("crates/a/src/lib.rs", "// a\n"),
-        ] {
-            let file = seed.join(path);
-            fs::create_dir_all(file.parent().expect("a parent")).expect("a directory");
-            fs::write(file, content).expect("write");
-        }
+        put(&seed, "scripts/version.sh", &script);
         fs::set_permissions(
             seed.join("scripts/version.sh"),
             fs::Permissions::from_mode(0o755),
         )
         .expect("mode");
+        for (path, content) in SEED {
+            put(&seed, path, content);
+        }
         git_at(&seed, &["checkout", "-q", "-B", "dev"]);
         git_at(&seed, &["add", "-A"]);
         git_at(&seed, &["commit", "-q", "-m", "feat(a): a start"]);
@@ -943,6 +1268,15 @@ impl Lab {
 
     fn dir(&self) -> &Path {
         &self.scratch.0
+    }
+
+    /// The publishing job's temporary directory; what was handed over is in its `release`.
+    fn temp(&self) -> PathBuf {
+        self.dir().join("temp")
+    }
+
+    fn handed(&self) -> PathBuf {
+        self.temp().join("release")
     }
 
     fn releases(&self, lines: &str) {
@@ -977,96 +1311,226 @@ impl Lab {
     /// Another push lands on the remote's dev.
     fn someone_pushes(&self, path: &str, subject: &str) {
         let other = self.clone_as("other");
-        let file = other.join(path);
-        fs::create_dir_all(file.parent().expect("a parent")).expect("a directory");
-        fs::write(file, format!("{subject}\n")).expect("write");
+        put(&other, path, &format!("{subject}\n"));
         git_at(&other, &["add", "-A"]);
         git_at(&other, &["commit", "-q", "-m", subject]);
         git_at(&other, &["push", "-q", "origin", "dev"]);
     }
 
-    /// What the cutting job hands over for `version`, cut from the remote's dev as it is now: the release commit and
-    /// its tag as a bundle, the binary, its checksum and the notes. `twist` names one thing done wrong.
-    fn hand_over(&self, version: &str, twist: &str) -> PathBuf {
+    /// The repository's own script, in a checkout.
+    fn version_sh(&self, checkout: &Path, args: &[&str]) {
+        let out = Command::new("bash")
+            .arg(checkout.join("scripts/version.sh"))
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("ARCA_VERSION_ROOT")
+            .output()
+            .expect("run scripts/version.sh");
+        assert!(
+            out.status.success(),
+            "version.sh {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The cutting job, for `version`, cut from the remote's dev as it is now. The version and the changelog section
+    /// are written by the repository's own script, the commit and the tag are made as the workflow makes them, and the
+    /// bundle and the files are handed over by the workflow's own "Hand over" step. `twist` names one thing done
+    /// wrong, and nothing else is: every other part is exactly a release.
+    fn hand_over(&self, version: &str, twist: &str) {
         let cut = self.clone_as("cut");
         let tag = format!("v{version}");
         if twist == "an extra commit" {
-            fs::write(cut.join("crates/a/src/lib.rs"), "// slipped in\n").expect("write");
-            git_at(&cut, &["commit", "-q", "-am", "feat(a): slipped in"]);
+            // A commit that only adds a blank line to a file a release commit may touch: nothing but the count of
+            // commits is wrong.
+            rewrite(&cut, "CHANGELOG.md", "## Unreleased\n", "## Unreleased\n\n");
+            git_at(&cut, &["commit", "-q", "-am", "docs: slipped in"]);
         }
-        fs::write(
-            cut.join("Cargo.toml"),
-            format!("[workspace.package]\nversion = \"{version}\"\n"),
-        )
-        .expect("write");
-        fs::write(
-            cut.join("CHANGELOG.md"),
-            format!("# Changelog\n\n## Unreleased\n\n## {version} (2026-11-12)\n\n- a change\n"),
-        )
-        .expect("write");
-        if twist == "another file" {
-            fs::write(cut.join("crates/a/src/lib.rs"), "// slipped in\n").expect("write");
+        self.version_sh(&cut, &["set", version]);
+        self.version_sh(&cut, &["changelog", version, "2026-11-12"]);
+        let heading = format!("## {version} (2026-11-12)\n");
+        match twist {
+            "a patch entry" => rewrite(
+                &cut,
+                "Cargo.toml",
+                "[workspace.dependencies]\n",
+                "[patch.crates-io]\ndep = { git = \"https://example.com/dep\" }\n\n[workspace.dependencies]\n",
+            ),
+            "a pin moved" => rewrite(
+                &cut,
+                "Cargo.toml",
+                "dep = \"=0.1.0-alpha.7\"",
+                "dep = \"=0.1.0-alpha.8\"",
+            ),
+            "another number in the manifest" => rewrite(
+                &cut,
+                "Cargo.toml",
+                &format!("version = \"{version}\""),
+                "version = \"0.9.9\"",
+            ),
+            "a dependency repointed" => {
+                rewrite(&cut, "Cargo.lock", "checksum = \"00\"", "checksum = \"ff\"")
+            }
+            "a dependency's version" => rewrite(
+                &cut,
+                "Cargo.lock",
+                "name = \"dep\"\nversion = \"0.1.0-alpha.7\"",
+                &format!("name = \"dep\"\nversion = \"{version}\""),
+            ),
+            "a crate at another number" => rewrite(
+                &cut,
+                "Cargo.lock",
+                &format!("name = \"a\"\nversion = \"{version}\""),
+                "name = \"a\"\nversion = \"0.9.9\"",
+            ),
+            "a script changed" => rewrite(
+                &cut,
+                "packages/arca-canvas-dsh/package.json",
+                "\"test\": \"node --test\"",
+                "\"test\": \"node --test\",\n    \"postinstall\": \"node evil.js\"",
+            ),
+            "an integrity changed" => rewrite(
+                &cut,
+                "packages/arca-canvas-dsh/package-lock.json",
+                "sha512-aaaa",
+                "sha512-bbbb",
+            ),
+            "a resolved address changed" => rewrite(
+                &cut,
+                "packages/arca-canvas-dsh/package-lock.json",
+                "https://registry.npmjs.org/x/-/x-1.0.0.tgz",
+                "https://example.com/x-1.0.0.tgz",
+            ),
+            "a dependency's lock version" => rewrite(
+                &cut,
+                "packages/arca-canvas-dsh/package-lock.json",
+                "\"node_modules/x\": {\n      \"version\": \"0.1.0-alpha.7\"",
+                &format!("\"node_modules/x\": {{\n      \"version\": \"{version}\""),
+            ),
+            "a changelog line removed" => rewrite(&cut, "CHANGELOG.md", "The first one.\n", ""),
+            "a changelog line changed" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                "The first one.",
+                "The first and best one.",
+            ),
+            "a changelog line below" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                "The first one.\n",
+                "The first one.\nAnd more.\n",
+            ),
+            "a changelog line above" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                "## Unreleased\n",
+                "## Unreleased\nSlipped in above.\n",
+            ),
+            "a second heading" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n# Another title\n"),
+            ),
+            "another section" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("## 9.9.9 (2026-01-01)\n\n- forged\n\n{heading}"),
+            ),
+            "another file" => put(&cut, "crates/a/src/lib.rs", "// slipped in\n"),
+            "a new file" => put(&cut, "build.rs", "fn main() {}\n"),
+            "a mode changed" => {
+                fs::set_permissions(cut.join("Cargo.toml"), fs::Permissions::from_mode(0o755))
+                    .expect("mode")
+            }
+            _ => {}
         }
         let subject = if twist == "another subject" {
             "feat(a): not a release commit".to_string()
         } else {
             format!("chore(release): {tag}")
         };
-        git_at(&cut, &["commit", "-q", "-am", &subject]);
+        git_at(&cut, &["add", "-A"]);
+        git_at(&cut, &["commit", "-q", "-m", &subject]);
         if twist == "a plain tag" {
             git_at(&cut, &["tag", &tag]);
         } else {
             git_at(&cut, &["tag", "-a", &tag, "-m", "Automagik Arca"]);
         }
-        let handover = self.dir().join("handover");
-        let _ = fs::remove_dir_all(&handover);
-        fs::create_dir_all(&handover).expect("the handover directory");
-        let bundle = handover.join("release.bundle");
-        let prerequisite = if twist == "an extra commit" {
-            "^HEAD~2"
-        } else {
-            "^HEAD~1"
+
+        // The build's three files, then the workflow's own step that hands everything over.
+        self.files(&cut.join("dist"), version, "");
+        let handed = self.step("Hand over", &cut, &[("MODE", "cut"), ("VERSION", version)]);
+        assert_eq!(handed.code, Some(0), "{}", handed.said);
+        let _ = fs::remove_dir_all(self.temp());
+        fs::create_dir_all(self.temp()).expect("the temporary directory");
+        fs::rename(cut.join("handover"), self.handed())
+            .expect("the handover moves to the other job");
+
+        // What is wrong with the bundle or the files themselves.
+        let bundle = self.handed().join("release.bundle");
+        let bundle_as = |refs: &[&str]| {
+            let mut args = vec!["bundle", "create", "-q", bundle.to_str().expect("a path")];
+            args.extend_from_slice(refs);
+            git_at(&cut, &args);
         };
-        git_at(
-            &cut,
-            &[
-                "bundle",
-                "create",
-                "-q",
-                bundle.to_str().expect("a path"),
-                &format!("refs/tags/{tag}"),
-                prerequisite,
-            ],
-        );
-        self.files(&handover, version, twist);
-        handover
+        let tag_ref = format!("refs/tags/{tag}");
+        match twist {
+            "an extra commit" => bundle_as(&[&tag_ref, "^HEAD~2"]),
+            "two things in the bundle" => bundle_as(&[&tag_ref, "refs/heads/dev", "^HEAD~1"]),
+            "the whole history in the bundle" => bundle_as(&[&tag_ref]),
+            "a bundle of another line" => {
+                // A release commit on a commit the remote never had.
+                git_at(&cut, &["tag", "-d", &tag]);
+                git_at(&cut, &["checkout", "-q", "--orphan", "elsewhere"]);
+                git_at(&cut, &["commit", "-q", "-m", "feat(a): another line"]);
+                rewrite(&cut, "CHANGELOG.md", "The first one.", "The first one!");
+                git_at(
+                    &cut,
+                    &["commit", "-q", "-am", &format!("chore(release): {tag}")],
+                );
+                git_at(&cut, &["tag", "-a", &tag, "-m", "Automagik Arca"]);
+                bundle_as(&[&tag_ref, "^HEAD~1"]);
+            }
+            _ => self.files(&self.handed(), version, twist),
+        }
     }
 
-    /// The three release files, as scripts/release.sh leaves them.
-    fn files(&self, handover: &Path, version: &str, twist: &str) {
-        fs::create_dir_all(handover).expect("the handover directory");
+    /// The three release files, as scripts/release.sh leaves them. `twist` names one thing wrong with them.
+    fn files(&self, dir: &Path, version: &str, twist: &str) {
+        fs::create_dir_all(dir).expect("the directory");
         let asset = format!("arca-{version}-linux-x86_64");
-        fs::write(handover.join(&asset), "a binary\n").expect("write");
+        fs::write(dir.join(&asset), "a binary\n").expect("write");
         let sums = Command::new("sha256sum")
             .arg(&asset)
-            .current_dir(handover)
+            .current_dir(dir)
             .output()
             .expect("run sha256sum");
-        fs::write(handover.join("SHA256SUMS"), sums.stdout).expect("write");
-        fs::write(handover.join("RELEASE-NOTES.md"), "- a change\n").expect("write");
+        let sums = String::from_utf8(sums.stdout).expect("text");
+        fs::write(dir.join("SHA256SUMS"), &sums).expect("write");
+        fs::write(dir.join("RELEASE-NOTES.md"), "- a change\n").expect("write");
         match twist {
-            "another binary" => {
-                fs::write(handover.join(&asset), "another binary\n").expect("write")
-            }
-            "an extra file" => fs::write(handover.join("install.sh"), "echo\n").expect("write"),
+            "another binary" => fs::write(dir.join(&asset), "another binary\n").expect("write"),
+            "an extra file" => fs::write(dir.join("install.sh"), "echo\n").expect("write"),
+            "a file missing" => fs::remove_file(dir.join("RELEASE-NOTES.md")).expect("remove"),
+            // A second line that is itself true: only the count of lines is wrong.
             "a second checksum" => {
-                let mut text = fs::read_to_string(handover.join("SHA256SUMS")).expect("read");
-                text.push_str(&text.clone().replace(&asset, "RELEASE-NOTES.md"));
-                fs::write(handover.join("SHA256SUMS"), text).expect("write");
+                let notes = Command::new("sha256sum")
+                    .arg("RELEASE-NOTES.md")
+                    .current_dir(dir)
+                    .output()
+                    .expect("run sha256sum");
+                let both = format!("{sums}{}", String::from_utf8_lossy(&notes.stdout));
+                fs::write(dir.join("SHA256SUMS"), both).expect("write");
+            }
+            "a checksum of another name" => {
+                fs::write(dir.join("SHA256SUMS"), sums.replace(&asset, "arca")).expect("write")
             }
             "a link" => {
-                fs::remove_file(handover.join("RELEASE-NOTES.md")).expect("remove");
-                std::os::unix::fs::symlink("/etc/hostname", handover.join("RELEASE-NOTES.md"))
+                fs::remove_file(dir.join("RELEASE-NOTES.md")).expect("remove");
+                std::os::unix::fs::symlink(dir.join("SHA256SUMS"), dir.join("RELEASE-NOTES.md"))
                     .expect("link");
             }
             _ => {}
@@ -1090,6 +1554,7 @@ impl Lab {
             .env("PATH", path)
             .env("GITHUB_OUTPUT", &outputs)
             .env("GITHUB_REPOSITORY", "automagik-si/arca")
+            .env("RUNNER_TEMP", self.temp())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "test")
@@ -1097,6 +1562,7 @@ impl Lab {
             .env("GIT_COMMITTER_NAME", "test")
             .env("GIT_COMMITTER_EMAIL", "test@example.com")
             .env_remove("ARCA_VERSION_ROOT")
+            .env_remove("HANDOVER")
             .envs(env.iter().copied())
             .output()
             .expect("run the step");
@@ -1118,17 +1584,14 @@ impl Lab {
         }
     }
 
-    /// The publishing job's check of what was handed over, in a fresh checkout of the remote's dev.
-    fn check(&self, mode: &str, version: &str, handover: &Path) -> (PathBuf, Ran) {
+    /// The publishing job's check of what was handed over, in a fresh checkout of the remote's dev. The job is told
+    /// only the mode and the version; where the files are it knows from the runner's temporary directory.
+    fn check(&self, mode: &str, version: &str) -> (PathBuf, Ran) {
         let publish = self.clone_as("publish");
         let ran = self.step(
             "Check what was handed over",
             &publish,
-            &[
-                ("MODE", mode),
-                ("VERSION", version),
-                ("HANDOVER", handover.to_str().expect("a path")),
-            ],
+            &[("MODE", mode), ("VERSION", version)],
         );
         (publish, ran)
     }
@@ -1138,8 +1601,8 @@ impl Lab {
 fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishes() {
     let lab = Lab::new("publish");
     let before = lab.remote(&["rev-parse", "dev"]);
-    let handover = lab.hand_over("0.8.0", "");
-    let (publish, check) = lab.check("cut", "0.8.0", &handover);
+    lab.hand_over("0.8.0", "");
+    let (publish, check) = lab.check("cut", "0.8.0");
     assert_eq!(check.code, Some(0), "{}", check.said);
     let commit = check.outputs.get("commit").expect("the commit").clone();
     assert!(!check.outputs.contains_key("moved"));
@@ -1154,7 +1617,6 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
         ("VERSION", "0.8.0"),
         ("COMMIT", commit.as_str()),
         ("PRERELEASE", "false"),
-        ("HANDOVER", handover.to_str().expect("a path")),
     ];
     let push = lab.step("Push dev and the tag", &publish, &env);
     assert_eq!(push.code, Some(0), "{}", push.said);
@@ -1163,6 +1625,16 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
     assert_eq!(lab.remote(&["rev-parse", "v0.8.0^{commit}"]), commit);
     assert_eq!(lab.remote(&["cat-file", "-t", "v0.8.0"]), "tag");
     assert_eq!(lab.remote(&["rev-parse", "dev~1"]), before);
+    // What landed is the version in every field, written by the repository's own script.
+    assert!(
+        lab.remote(&["show", "dev:Cargo.lock"])
+            .contains("name = \"a\"\nversion = \"0.8.0\"")
+    );
+    assert!(
+        lab.remote(&["show", "dev:Cargo.lock"])
+            .contains("name = \"dep\"\nversion = \"0.1.0-alpha.7\""),
+        "a dependency with the same number is not the workspace's"
+    );
 
     let done = lab.step("Publish the release", &publish, &env);
     assert_eq!(done.code, Some(0), "{}", done.said);
@@ -1188,16 +1660,33 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
             .expect("a line")
             .contains("SHA256SUMS --prerelease --latest=false --repo")
     );
+
+    // The next release stands on that one: a patch, with what someone wrote under Unreleased leading its section.
+    lab.releases("v0.8.0 published\nv0.1.0-alpha.7 published\n");
+    let other = lab.clone_as("other");
+    rewrite(
+        &other,
+        "CHANGELOG.md",
+        "## Unreleased\n",
+        "## Unreleased\n\nA note someone wrote.\n",
+    );
+    put(&other, "packages/arca-canvas-dsh/index.js", "// a card\n");
+    git_at(&other, &["add", "-A"]);
+    git_at(&other, &["commit", "-q", "-m", "feat(canvas): a card"]);
+    git_at(&other, &["push", "-q", "origin", "dev"]);
+    lab.hand_over("0.8.1", "");
+    let (_, second) = lab.check("cut", "0.8.1");
+    assert_eq!(second.code, Some(0), "{}", second.said);
 }
 
 #[test]
 fn when_dev_moved_before_the_check_nothing_is_pushed_and_the_run_ends_cleanly() {
     let lab = Lab::new("moved");
-    let handover = lab.hand_over("0.8.0", "");
+    lab.hand_over("0.8.0", "");
     lab.someone_pushes("crates/a/src/b.rs", "feat(a): a newer push");
     let newer = lab.remote(&["rev-parse", "dev"]);
 
-    let (_, check) = lab.check("cut", "0.8.0", &handover);
+    let (_, check) = lab.check("cut", "0.8.0");
     assert_eq!(check.code, Some(0), "{}", check.said);
     assert_eq!(check.outputs.get("moved").map(String::as_str), Some("true"));
     assert!(
@@ -1217,8 +1706,8 @@ fn when_dev_moved_before_the_check_nothing_is_pushed_and_the_run_ends_cleanly() 
 #[test]
 fn when_dev_moves_between_the_check_and_the_push_neither_the_commit_nor_the_tag_lands() {
     let lab = Lab::new("refused");
-    let handover = lab.hand_over("0.8.0", "");
-    let (publish, check) = lab.check("cut", "0.8.0", &handover);
+    lab.hand_over("0.8.0", "");
+    let (publish, check) = lab.check("cut", "0.8.0");
     assert_eq!(check.code, Some(0), "{}", check.said);
     let commit = check.outputs.get("commit").expect("the commit").clone();
 
@@ -1254,33 +1743,153 @@ fn when_dev_moves_between_the_check_and_the_push_neither_the_commit_nor_the_tag_
     );
 }
 
-#[test]
-fn the_publishing_job_refuses_what_is_not_exactly_a_release() {
-    for twist in [
-        "an extra commit",
-        "another file",
-        "another subject",
-        "a plain tag",
-        "another binary",
+/// Each way a handover is not exactly a release, with the words of the one check that must catch it. Every other part
+/// of each handover is right, so the words name the check that fired.
+const REFUSED: [(&str, &str); 31] = [
+    // The files.
+    (
         "an extra file",
+        "the handed-over files are not the expected ones",
+    ),
+    (
+        "a file missing",
+        "the handed-over files are not the expected ones",
+    ),
+    ("a link", "is not a plain file"),
+    (
         "a second checksum",
-        "a link",
-    ] {
+        "SHA256SUMS does not hold exactly one line",
+    ),
+    (
+        "a checksum of another name",
+        "SHA256SUMS does not name arca-0.8.0-linux-x86_64",
+    ),
+    (
+        "another binary",
+        "arca-0.8.0-linux-x86_64 does not match SHA256SUMS",
+    ),
+    // The bundle.
+    (
+        "two things in the bundle",
+        "the bundle does not hold v0.8.0 alone",
+    ),
+    (
+        "the whole history in the bundle",
+        "the bundle does not stand on exactly one commit",
+    ),
+    (
+        "a bundle of another line",
+        "the bundle does not stand on dev",
+    ),
+    // The tag and the commit.
+    (
+        "a plain tag",
+        "v0.8.0 is not an annotated tag of that name on a commit",
+    ),
+    (
+        "an extra commit",
+        "the release commit is not exactly one commit on top of dev",
+    ),
+    (
+        "another subject",
+        "the commit is not named chore(release): v0.8.0",
+    ),
+    // Which files the commit changes.
+    ("another file", "does not change exactly the five files"),
+    ("a new file", "does not change exactly the five files"),
+    ("a mode changed", "changes a file's kind or mode"),
+    // What it changes in them, line by line.
+    (
+        "a patch entry",
+        "Cargo.toml changes something other than the workspace version line",
+    ),
+    (
+        "a pin moved",
+        "Cargo.toml changes something other than the workspace version line",
+    ),
+    (
+        "another number in the manifest",
+        "Cargo.toml changes something other than the workspace version line",
+    ),
+    (
+        "a dependency repointed",
+        "Cargo.lock changes something other than the version lines",
+    ),
+    (
+        "a dependency's version",
+        "Cargo.lock changes something other than the version lines",
+    ),
+    (
+        "a crate at another number",
+        "Cargo.lock changes something other than the version lines",
+    ),
+    (
+        "a script changed",
+        "package.json changes something other than its version line",
+    ),
+    (
+        "an integrity changed",
+        "package-lock.json changes something other than its two version lines",
+    ),
+    (
+        "a resolved address changed",
+        "package-lock.json changes something other than its two version lines",
+    ),
+    (
+        "a dependency's lock version",
+        "package-lock.json changes something other than its two version lines",
+    ),
+    (
+        "a changelog line removed",
+        "CHANGELOG.md has a line removed or changed",
+    ),
+    (
+        "a changelog line changed",
+        "CHANGELOG.md has a line removed or changed",
+    ),
+    (
+        "a changelog line below",
+        "CHANGELOG.md gains a line outside the new section",
+    ),
+    (
+        "a changelog line above",
+        "CHANGELOG.md gains a line above the new section",
+    ),
+    ("a second heading", "CHANGELOG.md gains a second heading"),
+    (
+        "another section",
+        "CHANGELOG.md has no section for 0.8.0 right under Unreleased",
+    ),
+];
+
+#[test]
+fn the_publishing_job_refuses_what_is_not_exactly_a_release_and_says_which_check() {
+    for (twist, words) in REFUSED {
         let lab = Lab::new("twist");
         let before = lab.remote(&["rev-parse", "dev"]);
-        let handover = lab.hand_over("0.8.0", twist);
-        let (_, check) = lab.check("cut", "0.8.0", &handover);
+        lab.hand_over("0.8.0", twist);
+        let (_, check) = lab.check("cut", "0.8.0");
         assert_eq!(check.code, Some(1), "{twist} is refused: {}", check.said);
-        assert!(check.said.contains("::error::"), "{twist}: {}", check.said);
+        let errors: Vec<&str> = check
+            .said
+            .lines()
+            .filter(|line| line.starts_with("::error::"))
+            .collect();
+        assert!(
+            errors.last().is_some_and(|line| line.contains(words)),
+            "{twist} is caught by its own check ({words}), not: {}",
+            check.said
+        );
         assert!(!check.outputs.contains_key("commit"), "{twist}");
         assert_eq!(lab.remote(&["rev-parse", "dev"]), before, "{twist}");
         assert!(!lab.remote_has_tag("v0.8.0"), "{twist}");
     }
+}
 
-    // A version that is not one, a tag of another name than the version, a tag the remote already has, and a release
-    // that is already published.
+#[test]
+fn the_publishing_job_refuses_a_wrong_name_a_taken_tag_and_a_published_release() {
     let lab = Lab::new("names");
-    let handover = lab.hand_over("0.8.0", "");
+    lab.hand_over("0.8.0", "");
     for version in [
         "0.8",
         "v0.8.0",
@@ -1290,26 +1899,34 @@ fn the_publishing_job_refuses_what_is_not_exactly_a_release() {
         "",
         "0.08.0",
     ] {
-        let (_, check) = lab.check("cut", version, &handover);
+        let (_, check) = lab.check("cut", version);
         assert_eq!(check.code, Some(1), "{version:?}: {}", check.said);
+        assert!(check.said.contains("not a version"), "{version:?}");
     }
-    let (_, other) = lab.check("cut", "0.9.0", &handover);
-    assert_eq!(
-        other.code,
-        Some(1),
-        "the files and the bundle are 0.8.0's: {}",
-        other.said
+    let (_, other) = lab.check("cut", "0.9.0");
+    assert_eq!(other.code, Some(1), "{}", other.said);
+    assert!(
+        other
+            .said
+            .contains("the handed-over files are not the expected ones"),
+        "the files are 0.8.0's"
     );
-    let (_, mode) = lab.check("push", "0.8.0", &handover);
+    let (_, mode) = lab.check("push", "0.8.0");
     assert_eq!(mode.code, Some(1));
+    assert!(mode.said.contains("not a mode"));
+
     lab.releases("v0.8.0 published\nv0.1.0-alpha.7 published\n");
-    let (_, published) = lab.check("cut", "0.8.0", &handover);
+    let (_, published) = lab.check("cut", "0.8.0");
     assert_eq!(published.code, Some(1));
     assert!(published.said.contains("v0.8.0 is already published"));
+    // A draft is not a published release: it stops nothing.
+    lab.releases("v0.8.0 draft\nv0.1.0-alpha.7 published\n");
+    let (_, draft) = lab.check("cut", "0.8.0");
+    assert_eq!(draft.code, Some(0), "{}", draft.said);
+
     lab.releases("v0.1.0-alpha.7 published\n");
-    let cut = lab.dir().join("cut");
-    git_at(&cut, &["push", "-q", "origin", "v0.8.0"]);
-    let (_, taken) = lab.check("cut", "0.8.0", &handover);
+    git_at(&lab.dir().join("cut"), &["push", "-q", "origin", "v0.8.0"]);
+    let (_, taken) = lab.check("cut", "0.8.0");
     assert_eq!(taken.code, Some(1));
     assert!(taken.said.contains("v0.8.0 is already on the remote"));
 }
@@ -1318,7 +1935,7 @@ fn the_publishing_job_refuses_what_is_not_exactly_a_release() {
 fn a_tag_that_was_pushed_and_never_published_is_finished_and_nothing_new_is_cut() {
     let lab = Lab::new("finish");
     // An earlier run pushed the release commit and its tag, and its publishing failed.
-    let handover = lab.hand_over("0.8.0", "");
+    lab.hand_over("0.8.0", "");
     let cut = lab.dir().join("cut");
     git_at(
         &cut,
@@ -1353,9 +1970,23 @@ fn a_tag_that_was_pushed_and_never_published_is_finished_and_nothing_new_is_cut(
     );
     lab.releases("v0.1.0-alpha.7 published\n");
 
-    // The publishing job, with the files and no bundle: it pushes nothing and publishes the tag's commit.
-    fs::remove_file(handover.join("release.bundle")).expect("no bundle in a finish");
-    let (publish, check) = lab.check("finish", "0.8.0", &handover);
+    // Its cutting job checks out the tag, builds, and hands over the files with no bundle, by the workflow's own step.
+    let again = lab.clone_as("cut");
+    git_at(&again, &["checkout", "-q", "--detach", "v0.8.0"]);
+    lab.files(&again.join("dist"), "0.8.0", "");
+    let handed = lab.step(
+        "Hand over",
+        &again,
+        &[("MODE", "finish"), ("VERSION", "0.8.0")],
+    );
+    assert_eq!(handed.code, Some(0), "{}", handed.said);
+    assert!(!again.join("handover/release.bundle").exists());
+    let _ = fs::remove_dir_all(lab.temp());
+    fs::create_dir_all(lab.temp()).expect("the temporary directory");
+    fs::rename(again.join("handover"), lab.handed()).expect("the handover moves");
+
+    // The publishing job pushes nothing and publishes the tag's commit.
+    let (publish, check) = lab.check("finish", "0.8.0");
     assert_eq!(check.code, Some(0), "{}", check.said);
     assert_eq!(check.outputs.get("commit"), Some(&released));
     let done = lab.step(
@@ -1365,7 +1996,6 @@ fn a_tag_that_was_pushed_and_never_published_is_finished_and_nothing_new_is_cut(
             ("VERSION", "0.8.0"),
             ("COMMIT", released.as_str()),
             ("PRERELEASE", "false"),
-            ("HANDOVER", handover.to_str().expect("a path")),
         ],
     );
     assert_eq!(done.code, Some(0), "{}", done.said);
@@ -1379,12 +2009,22 @@ fn a_tag_that_was_pushed_and_never_published_is_finished_and_nothing_new_is_cut(
     assert_eq!(next.outputs.get("kind").map(String::as_str), Some("full"));
     assert_eq!(next.outputs.get("last").map(String::as_str), Some("v0.8.0"));
 
-    // A finish for a tag the remote does not have, or with a bundle beside the files, is refused.
-    let (_, absent) = lab.check("finish", "0.9.0", &{
-        let other = lab.dir().join("handover-9");
-        lab.files(&other, "0.9.0", "");
-        other
-    });
+    // A finish with a bundle beside the files, or for a tag the remote does not have, is refused.
+    let (_, twice) = lab.check("finish", "0.8.0");
+    assert_eq!(twice.code, Some(1));
+    assert!(twice.said.contains("v0.8.0 is already published"));
+    lab.releases("v0.1.0-alpha.7 published\n");
+    fs::write(lab.handed().join("release.bundle"), "x").expect("write");
+    let (_, bundled) = lab.check("finish", "0.8.0");
+    assert_eq!(bundled.code, Some(1));
+    assert!(
+        bundled
+            .said
+            .contains("the handed-over files are not the expected ones")
+    );
+    let _ = fs::remove_dir_all(lab.handed());
+    lab.files(&lab.handed(), "0.9.0", "");
+    let (_, absent) = lab.check("finish", "0.9.0");
     assert_eq!(absent.code, Some(1));
     assert!(absent.said.contains("v0.9.0 is not on the remote"));
 }

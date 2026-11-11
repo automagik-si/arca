@@ -192,17 +192,28 @@ ships has changed:
 
 Steps 1 to 3 run the repository's code and its dependencies' (build scripts, tests, a package's install), so their
 job may only read: it holds no token that can write. It hands the release commit, its tag and the files to the second
-job, which holds the token that can write and runs none of that code. Before it pushes, the second job checks that it
-was handed exactly one commit on top of `dev`, named as a release commit and touching only the files that state the
-version, with the tag on it, and that the binary matches `SHA256SUMS`.
+job, which holds the token that can write and runs none of that code. Before it pushes, the second job checks the
+release commit line by line against `dev`'s own copy of each file: one commit on top of `dev`, named as a release
+commit, changing only the version lines of the workspace's crates and of the canvas package, and adding lines to
+`CHANGELOG.md` inside the new section and nowhere else; the tag on it; and the binary matching `SHA256SUMS`. A
+manifest or a lock file can carry code, so nothing else in them may change in a commit nobody reviews.
+
+What this does not stop: code that runs in the first job, a hostile dependency among it, can still shape the binary
+that job builds, the text of the release notes, and which version number the release takes. The split keeps such
+code away from `dev`, `main` and every release already published; it does not make the new release's binary
+trustworthy by itself.
 
 If any step before the push fails, no version is taken. If the push landed and the publishing failed, the next run
 publishes that same tag before it does anything else; start one by hand with `gh workflow run release.yml --ref dev`.
-Add `--field prerelease=true` to publish a release that is not shown as Latest.
+Add `--field prerelease=true` to publish a release that is not shown as Latest. One run works at a time and GitHub
+keeps a single waiting run: a waiting run is replaced by a newer one. For a push that loses nothing, because the newer
+run releases everything since the last tag. A waiting dispatch with `prerelease=true` that a push's run replaces did
+not happen, and that run publishes a normal release: dispatch a prerelease when no run is waiting or in progress, and
+look at the run afterwards.
 
 **What a contributor writes.** Commit subjects in the form `type(scope): what changed`, in plain words: the release
 lists them in `CHANGELOG.md`, one line per change that landed on `dev`. A change that needs more than its line gets a
-few sentences under `## Unreleased` in `CHANGELOG.md`; the release moves them to the top of its section. Nothing else:
+few sentences under `## Unreleased` in `CHANGELOG.md`; the release puts its heading above them, so they lead its section. Nothing else:
 no version, no tag, no heading.
 
 After each release `dev` on GitHub is one commit ahead of a local `dev`, by the release commit: fast-forward before

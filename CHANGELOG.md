@@ -5,7 +5,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 ## Unreleased
 
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
-Write under this comment only what a reader needs beyond those lines; the release moves it to the top of the section. -->
+Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
 Releases are now cut by themselves: every change that lands on `dev` and ships is released, numbered and published
 without anyone writing a version or a tag. The numbers changed with it. A release is `0.N.P`, with no `alpha` word:

@@ -20,7 +20,8 @@
 #   scripts/version.sh kind [<tag>]                full | patch | none: what the changes since <tag> (default: last) need
 #   scripts/version.sh changelog <version> <date> [<tag>]
 #                                                  write the "## <version> (<date>)" section of CHANGELOG.md: the text
-#                                                  under "## Unreleased", then one line per change since <tag>
+#                                                  under "## Unreleased", then one line per change since <tag>. It
+#                                                  only adds lines; the release workflow refuses anything else
 #
 # ARCA_VERSION_ROOT names another tree to work on; the tests use it.
 set -euo pipefail
@@ -243,18 +244,12 @@ subjects() {
         sed -E 's/^merge: //; s/ \(([^()]*)?review[^()]*\)$//; s/^[[:space:]]+//; s/^#/\\#/' || true
 }
 
-# Stdin without its HTML comments (a comment starts a line with "<!--" and ends a line with "-->"), and without the
-# blank lines before and after what is left.
-without_comments() {
-    awk '
-        !inside && /^<!--/ { inside = 1 }
-        inside { if (/-->$/) inside = 0; next }
-        { print }
-    ' | sed -e '/./,$!d' | tac | sed -e '/./,$!d' | tac
-}
-
+# Writes the section of a release into CHANGELOG.md. Lines are only added: none of the file's own lines is removed,
+# changed or moved. The heading goes in above the first line someone wrote under "## Unreleased" (so that text leads
+# the section), or at the end of the Unreleased section when nothing was written; the lines for the changes go in at
+# the end of the section. The comment that explains the Unreleased heading stays where it is.
 changelog() {
-    local version="$1" date="$2" since file="$root/CHANGELOG.md" at next total written lines comment tmp
+    local version="$1" date="$2" since file="$root/CHANGELOG.md" at next total first lines before tmp
     [[ "$version" =~ $VERSION ]] || fail "not a version: $version (want $MAJOR.N.P)"
     [[ "$date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "not a date: $date (want YYYY-MM-DD)"
     if [ "$#" -ge 3 ]; then since="$3"; else since="$(last)"; fi
@@ -266,26 +261,35 @@ changelog() {
     total="$(wc -l <"$file")"
     next="$(awk -v at="$at" 'NR > at && /^## / { print NR; exit }' "$file")"
     [ -n "$next" ] || next="$((total + 1))"
-    # What someone wrote under the heading leads the new section; the comment that explains the heading stays.
-    written="$(sed -n "$((at + 1)),$((next - 1))p" "$file" | without_comments)"
-    comment="$(sed -n "$((at + 1)),$((next - 1))p" "$file" | awk '
+    # The first line someone wrote in it: not blank, and not in a comment (a comment starts a line with "<!--" and
+    # ends a line with "-->").
+    first="$(awk -v at="$at" -v end="$next" '
+        NR <= at || NR >= end { next }
         !inside && /^<!--/ { inside = 1 }
-        inside { print; if (/-->$/) inside = 0 }
-    ')"
+        inside { if (/-->$/) inside = 0; next }
+        /[^[:space:]]/ { print NR; exit }
+    ' "$file")"
     lines="$(subjects "$since" | sed -e 's/^/- /')"
-    [ -n "$written$lines" ] || lines="- No change is listed for this release."
+    [ -n "$first$lines" ] || lines="- No change is listed for this release."
+    before="$(sed -n "$((next - 1))p" "$file")"
     tmp="$(mktemp "$file.XXXXXX")"
     {
-        sed -n "1,${at}p" "$file"
-        echo
-        [ -z "$comment" ] || printf '%s\n\n' "$comment"
-        printf '## %s (%s)\n\n' "$version" "$date"
-        [ -z "$written" ] || printf '%s\n\n' "$written"
-        [ -z "$lines" ] || printf '%s\n' "$lines"
-        if [ "$next" -le "$total" ]; then
-            echo
-            sed -n "${next},\$p" "$file"
+        if [ -n "$first" ]; then
+            sed -n "1,$((first - 1))p" "$file"
+            printf '## %s (%s)\n\n' "$version" "$date"
+            sed -n "${first},$((next - 1))p" "$file"
+        else
+            sed -n "1,$((next - 1))p" "$file"
+            [ -z "$before" ] || echo
+            printf '## %s (%s)\n\n' "$version" "$date"
+            before=""
         fi
+        if [ -n "$lines" ]; then
+            [ -z "$before" ] || echo
+            printf '%s\n' "$lines"
+            [ "$next" -gt "$total" ] || echo
+        fi
+        [ "$next" -gt "$total" ] || sed -n "${next},\$p" "$file"
     } >"$tmp"
     mv "$tmp" "$file"
     echo "changelog: $version ($date)"

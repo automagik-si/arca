@@ -25,7 +25,10 @@ name: Release
 #   main     moves main to the release commit. main holds released commits and nothing else.
 #
 # So a dependency that turns hostile in a build script, a test or an install script finds no token that can push to
-# dev or touch a published release.
+# dev or touch a published release, and cannot put a line of its own into the release commit: publish checks that
+# commit line by line (the version lines, and added changelog lines inside the new section) before it pushes it.
+# What such code can still do, because it runs where the release is made: shape the binary it builds, the text of
+# the release notes, and which version number the release takes. This design does not stop that.
 #
 # Nothing is taken when anything before the push fails: no version, no tag. When dev moved while a run was cutting,
 # neither the commit nor the tag lands, the run ends cleanly, and the run for the newer push releases those changes
@@ -48,6 +51,12 @@ name: Release
 #
 # By hand:  gh workflow run release.yml --ref dev [--field prerelease=true]
 # It never runs for a pull request.
+#
+# GitHub keeps one waiting run for the group: a run that is still waiting is replaced by a newer one. That loses
+# nothing a push asked for, since the newer run releases everything since the last tag. It does lose a dispatch's
+# prerelease=true: when a push's run replaces a waiting dispatch, the release it makes is a normal one, shown as
+# Latest. Dispatch a prerelease when no run is waiting or in progress, and look at the run afterwards; if it was
+# replaced, it did not happen.
 
 on:
   push:
@@ -227,7 +236,6 @@ jobs:
       MODE: ${{ needs.cut.outputs.mode }}
       VERSION: ${{ needs.cut.outputs.version }}
       PRERELEASE: ${{ inputs.prerelease }}
-      HANDOVER: ${{ runner.temp }}/release
     # This job holds the token that can write. It runs nothing from the repository: no script of it, no build, no
     # test, no package's install. Only git, gh and sha256sum, on the lines below.
     steps:
@@ -248,6 +256,7 @@ jobs:
         run: |
           set -euo pipefail
           stop() { echo "::error::$*"; exit 1; }
+          HANDOVER="${RUNNER_TEMP}/release"
           [[ "${VERSION}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || stop "not a version: ${VERSION}"
           [[ "${MODE}" == "cut" || "${MODE}" == "finish" ]] || stop "not a mode: ${MODE}"
           tag="v${VERSION}"
@@ -305,13 +314,95 @@ jobs:
           commit=$(git rev-parse "refs/tags/${tag}^{commit}")
           [[ "$(git rev-list --parents -n 1 "${commit}")" == "${commit} ${dev}" ]] || stop "the release commit is not exactly one commit on top of dev"
           [[ "$(git log -1 --format=%s "${commit}")" == "chore(release): ${tag}" ]] || stop "the commit is not named chore(release): ${tag}"
-          # A release commit states the version and the changelog section, and touches nothing else.
-          while IFS= read -r path; do
-            case "${path}" in
-              CHANGELOG.md|Cargo.toml|Cargo.lock|packages/arca-canvas-dsh/package.json|packages/arca-canvas-dsh/package-lock.json) ;;
-              *) stop "the release commit changes ${path}" ;;
-            esac
-          done < <(git diff --name-only --no-renames "${dev}" "${commit}")
+          # A release commit states the version and the changelog section, and nothing else. It changes exactly the
+          # five files that state them, and in each file exactly the expected lines, checked one by one below. What a
+          # file said before is read from dev's own commit, never from the new one: a manifest or a lock file can
+          # carry code (a [patch] entry, a script, a dependency pointed somewhere else).
+          files=$'CHANGELOG.md\nCargo.lock\nCargo.toml\npackages/arca-canvas-dsh/package-lock.json\npackages/arca-canvas-dsh/package.json'
+          [[ "$(git diff --name-only --no-renames "${dev}" "${commit}" | LC_ALL=C sort)" == "${files}" ]] ||
+            stop "the release commit does not change exactly the five files that state the version"
+          [[ -z "$(git diff --raw --no-renames "${dev}" "${commit}" | awk 'substr($1, 2) != $2 || $5 != "M"')" ]] ||
+            stop "the release commit changes a file's kind or mode"
+          old=$(git show "${dev}:Cargo.toml" |
+            awk '/^\[/ { inside = ($0 == "[workspace.package]") } inside && /^version = "[^"]*"$/ { gsub(/^version = "|"$/, ""); print; exit }')
+          [[ -n "${old}" && "${old}" != "${VERSION}" ]] || stop "dev's own version cannot be read, or is ${VERSION} already"
+          # changes <file>: each change in the file as "<line>:<old text> => <new text>". A change is one line
+          # replaced in place by one line; any other shape of change prints REFUSED.
+          changes() {
+            git diff -U0 --no-color --no-ext-diff --no-renames "${dev}" "${commit}" -- "$1" | awk '
+              /^@@ / {
+                if (state || $2 ~ /,/ || $3 ~ /,/ || substr($2, 2) != substr($3, 2)) bad = 1
+                at = substr($2, 2); hunks++; state = 1; next
+              }
+              !hunks && /^(diff --git |index |--- |\+\+\+ )/ { next }
+              state == 1 && /^-/ { was = substr($0, 2); state = 2; next }
+              state == 2 && /^\+/ { print at ":" was " => " substr($0, 2); state = 0; next }
+              { bad = 1 }
+              END { if (bad || state) print "REFUSED" }'
+          }
+          # where <file> <awk program>: the line numbers the program prints for dev's own copy of the file.
+          where() { git show "${dev}:$1" | awk "$2"; }
+          # wanted <file> <old line> <new line> <line number>...: the changes that file must show, and no other.
+          wanted() {
+            local file="$1" was="$2" now="$3" line
+            shift 3
+            [[ "$#" -gt 0 ]] || stop "dev's own ${file} has no version line to move"
+            for line in "$@"; do
+              [[ "$(git show "${dev}:${file}" | sed -n "${line}p")" == "${was}" ]] || stop "dev's own ${file} does not say ${old} at line ${line}"
+              echo "${line}:${was} => ${now}"
+            done
+          }
+          # Cargo.toml: the workspace's version line.
+          lines=$(where Cargo.toml '/^\[/ { inside = ($0 == "[workspace.package]") } inside && /^version = / { print NR; exit }')
+          # shellcheck disable=SC2086
+          [[ "$(changes Cargo.toml)" == "$(wanted Cargo.toml "version = \"${old}\"" "version = \"${VERSION}\"" ${lines})" ]] ||
+            stop "Cargo.toml changes something other than the workspace version line"
+          # Cargo.lock: the version line of each package that dev's own lock holds with no source: the workspace's
+          # crates, and no dependency.
+          lines=$(where Cargo.lock '
+            /^\[\[package\]\]$/ { if (line && !fetched) print line; inside = 1; line = 0; fetched = 0; next }
+            /^\[/ { if (line && !fetched) print line; inside = 0; line = 0; fetched = 0; next }
+            inside && /^version = / && !line { line = NR }
+            inside && /^source = / { fetched = 1 }
+            END { if (line && !fetched) print line }')
+          # shellcheck disable=SC2086
+          [[ "$(changes Cargo.lock)" == "$(wanted Cargo.lock "version = \"${old}\"" "version = \"${VERSION}\"" ${lines})" ]] ||
+            stop "Cargo.lock changes something other than the version lines of the workspace's crates"
+          # The canvas package: its version line, and in its lock the lock's own version line and the root package's.
+          lines=$(where packages/arca-canvas-dsh/package.json '/^  "version": / { print NR; exit }')
+          # shellcheck disable=SC2086
+          [[ "$(changes packages/arca-canvas-dsh/package.json)" == "$(wanted packages/arca-canvas-dsh/package.json "  \"version\": \"${old}\"," "  \"version\": \"${VERSION}\"," ${lines})" ]] ||
+            stop "package.json changes something other than its version line"
+          lines=$(where packages/arca-canvas-dsh/package-lock.json '/^  "version": / && !top { print NR; top = 1 }')
+          root=$(where packages/arca-canvas-dsh/package-lock.json '/^    "": \{$/ { inside = 1; next } inside && /^    \}/ { exit } inside && /^      "version": / { print NR; exit }')
+          [[ -n "${lines}" && -n "${root}" ]] || stop "dev's own package-lock.json has no version line to move"
+          [[ "$(changes packages/arca-canvas-dsh/package-lock.json)" == "$(
+            wanted packages/arca-canvas-dsh/package-lock.json "  \"version\": \"${old}\"," "  \"version\": \"${VERSION}\"," "${lines}"
+            wanted packages/arca-canvas-dsh/package-lock.json "      \"version\": \"${old}\"," "      \"version\": \"${VERSION}\"," "${root}"
+          )" ]] || stop "package-lock.json changes something other than its two version lines"
+          # CHANGELOG.md: lines are added and none is removed or changed. The added lines are the new section's
+          # heading and lines inside that section, which sits right under "## Unreleased", above every older one.
+          log=$(git show "${commit}:CHANGELOG.md")
+          added=$(git diff -U0 --no-color --no-ext-diff --no-renames "${dev}" "${commit}" -- CHANGELOG.md | awk '
+            /^@@ / { hunks++; split($2, was, ","); if (was[2] != "0") bad = 1; split($3, now, ","); at = substr(now[1], 2); next }
+            !hunks && /^(diff --git |index |--- |\+\+\+ )/ { next }
+            /^\+/ { print at; at++; next }
+            { bad = 1 }
+            END { if (bad || !hunks) print "REFUSED" }')
+          [[ "${added}" != *REFUSED* ]] || stop "CHANGELOG.md has a line removed or changed"
+          read -r unreleased heading end < <(awk -v want="## ${VERSION} (" '
+            !u { if ($0 == "## Unreleased") u = NR; next }
+            !h && index($0, want) == 1 && /^## [0-9.]+ \([0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]\)$/ { h = NR; next }
+            /^## / { e = NR; exit }
+            END { print u + 0, h + 0, (e ? e : NR + 1) }' <<< "${log}")
+          [[ "${heading}" -gt 0 ]] || stop "CHANGELOG.md has no section for ${VERSION} right under Unreleased"
+          grep -qx -- "${heading}" <<< "${added}" || stop "the section for ${VERSION} is not new"
+          while read -r line; do
+            [[ "${line}" -gt "${unreleased}" && "${line}" -lt "${end}" ]] || stop "CHANGELOG.md gains a line outside the new section"
+            text=$(sed -n "${line}p" <<< "${log}")
+            [[ "${line}" -ge "${heading}" || -z "${text}" ]] || stop "CHANGELOG.md gains a line above the new section"
+            [[ "${line}" == "${heading}" || "${text}" != \#* ]] || stop "CHANGELOG.md gains a second heading"
+          done <<< "${added}"
           echo "commit=${commit}" >> "$GITHUB_OUTPUT"
 
       - name: Push dev and the tag
@@ -345,7 +436,7 @@ jobs:
           # binary.
           flags=(--latest)
           [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
-          cd "${HANDOVER}"
+          cd "${RUNNER_TEMP}/release"
           gh release create "v${VERSION}" "arca-${VERSION}-linux-x86_64" SHA256SUMS "${flags[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --verify-tag \
