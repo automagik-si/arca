@@ -2,12 +2,26 @@
 
 <a href="https://weunfold.ai/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/open-intelligence/open-intelligence-badge-ivory.svg"><img src="assets/open-intelligence/open-intelligence-badge-ink.svg" alt="Open Intelligence" width="170" height="32"></picture></a>
 
-Automagik Arca is a Rust kernel for a node's own infrastructure. The kernel reads what it owns, plans each change, and
-applies a change only after the node's owner has approved it and the change is written to a journal. Each node signs its
-own desired state with its own key. It talks to Incus over the local unix socket. The program is one binary, `arca`.
+**The infrastructure layer for agentic AI.** Agents need infrastructure. Own *yours*.
 
-**Status: `0.1.0-alpha.7`, an alpha for single hosts.** Hardening for shared or distributed hosts comes later.
-[`CHANGELOG.md`](CHANGELOG.md) says what changed since the last published release.
+Automagik Arca runs your services on machines you own. Set up the way the quickstart shows, an assistant can only look and propose. You approve with your passkey.
+
+- Arca is one program. Arca is open source under the Apache-2.0 licence.
+- A fresh install only looks: it changes nothing until you tell it which parts are its own.
+- Arca is self-hosted: it runs on machines you own and needs no outside service to work.
+- Arca keeps an append-only journal: an audit log of every change Arca applies.
+
+**Status: `0.1.0-alpha.7`.** Arca is an alpha, for one machine at a time. Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal.
+
+| Works today | Not yet |
+|---|---|
+| Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | There is no installer yet: the first setup is written by hand. |
+| Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
+| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template. |
+| Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
+| Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair things by itself. |
+
+[Start in five minutes](#quickstart-a-read-only-node-in-five-minutes) · [The full guide](docs/OPERATING.md) · [What changed](CHANGELOG.md)
 
 ## Quickstart: a read-only node in five minutes
 
