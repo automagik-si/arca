@@ -2972,9 +2972,11 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
         service::first_boot(&loaded, &dir).expect("its first-boot script is installed with it");
     }
-    assert_eq!(templates, 9);
+    assert_eq!(templates, 11);
     assert!(installed.contains(&"postgres-autopg.sh"));
     assert!(installed.contains(&"github-runner-pool.sh"));
+    // One script serves both sizes of the GitLab pool.
+    assert!(installed.contains(&"gitlab-runner-pool.sh"));
     assert!(installed.contains(&"automagik-workspace.sh"));
     assert_eq!(
         fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
