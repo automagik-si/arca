@@ -2614,7 +2614,9 @@ together under about 97% of the machine's size: leave 1GiB free for every 32GiB.
 machine's size do not fit. That first pool had two slots of 4GiB, two of 10GiB and 4GiB kept back, 32GiB in all: it
 had 27921 MiB for slots, they asked for 28672 MiB, and the fourth slot stayed `queued` beside three idle ones. The
 controller now says this at its start and in every status block, as a `WARNING` with the numbers and how much is too
-much. (It says nothing when `maxSlots` is below the number of slots: then they are not meant to run all at once.)
+much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
+once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
+that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
 
 The shipped numbers fit: four `standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are 16
 CPUs and 24GiB (24576 MiB), with 4GiB kept back, and a 32GiB machine has about 27900 MiB for slots.
@@ -2638,13 +2640,15 @@ takes a few minutes.
 group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
 `ci-pool-<the pool's id>-standard-0-...` as idle.
 
-The first boot speaks there too, before there is a controller. `arca-runner-pool: first boot: installing ...` is its
-first line and `first boot done: the controller is installed and started` its last. A first boot that could not finish
-ends with `first boot failed:` and the reason: the commands that are still missing after the install, by name, or
-that Docker or the controller's service did not start. A pool that is `running` and shows none of these lines has
-not reached its first boot yet. What the package manager itself printed is not on the console: it is inside the
-machine, in `/var/log/cloud-init-output.log`. A machine whose first boot failed has no pool; remove it with
-`service_remove` and create it again once the cause is gone.
+The first boot, before there is a controller, writes its own lines to the machine's console, which is where
+`service_logs` reads the controller's lines from. `arca-runner-pool: first boot: installing ...` is its first line and
+`first boot done: the controller is installed and started` its last. A first boot that could not finish ends with
+`first boot failed:` and the reason: the commands that are still missing after the install, by name, or that Docker
+or the controller's service did not start. These first-boot lines have not yet been seen in `service_logs` on a real
+pool, so do not read their absence as "still starting". If a pool that is `running` shows no line of the pool after a
+few minutes, look inside the machine: `/var/log/cloud-init-output.log` holds everything the first boot printed, its
+failure line included, and what the package manager itself said, which is never on the console. A machine whose first
+boot failed has no pool; remove it with `service_remove` and create it again once the cause is gone.
 
 **8. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
@@ -2705,9 +2709,10 @@ the slot (`memory.peak`), and that count includes the files a job read and wrote
 (page cache). A build writes many gigabytes, so it fills whatever its slot has, and the kernel gives that memory back
 when the job asks for its own. Such a job may have been held at the limit, slowed or cut short, or may only have been
 caching. To tell, look at the job's result and seconds, or run it once in a smaller class and compare. On the first
-pool this repository's `cargo test` peaked at exactly the 10240 MiB of its slot. Measured apart, it needs about
-3.2GiB of its own and 19GB of disk, and under a 4GiB limit it still passes, 5% slower: the peak was page cache, and
-10GiB is enough for that class.
+pool this repository's `cargo test` peaked at exactly the 10240 MiB of its slot. Measured on the machine the
+repository is built on, not on the pool, the same job needs about 3.2GiB of its own and 19GB of disk, and under a
+4GiB limit it still passes, 5% slower. So the pool's peak is read as page cache, and 10GiB as enough for that class;
+neither has been measured on the pool itself.
 
 ### What to know
 

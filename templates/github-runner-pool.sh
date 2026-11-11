@@ -62,7 +62,7 @@ fold head id install mkdir mv od rm sha256sum sleep stat tail tee touch tr'
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
 # which docker.io only recommends. The ones the image already carries are named too, so the list says what the script
 # stands on.
-POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux coreutils'
+POOL_PACKAGES='docker.io docker-cli curl jq openssl ca-certificates util-linux coreutils hostname'
 # The runner image's own user and docker group (the image fixes both).
 RUNNER_UID=1001
 DOCKER_GID=123
@@ -874,6 +874,7 @@ print_status() {
     tail -n "$POOL_STATUS_JOBS" "$POOL_LOGS/jobs.tsv" 2>/dev/null | awk -F'\t' '
       $1 != "finished" { printf "arca-runner-pool: recent job finished=%s slot=%s class=%s name=\"%s\" result=%s seconds=%s peak_memory_mib=%d cpu_seconds=%s\n", $1, $2, $3, $5, $6, $7, $8 / 1048576, $9 }'
     say "pool $POOL_NAME id $POOL_ID for $URL, $GROUP_NOTE"
+    [ -z "$NEVER_NOTE" ] || say "$NEVER_NOTE"
     [ -z "$FIT_NOTE" ] || say "$FIT_NOTE"
     say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
   } | tee "$POOL_LOGS/status.txt.new"
@@ -903,9 +904,23 @@ run_pool() {
   say "pool $POOL_NAME id $POOL_ID for $URL: $SLOTS slots in ${#CLASS_NAMES[@]} classes, at most $MAX_SLOTS at once, $(mib "$BUDGET") MiB of memory for slots"
   # Slots that the cap lets run all at once need their memory all at once. The machine reports less memory than the
   # size it was given, so sizes that add up to the machine's size do not fit, and one slot would stay queued for ever
-  # beside idle ones. That is said at the start and in every status block, with the numbers.
+  # beside idle ones. A slot that is larger than all the memory there is for slots never starts, whatever the cap.
+  # Both are said at the start and in every status block, with the numbers.
   FIT_NOTE=''
-  for slot in "${!SLOT_MEM[@]}"; do wanted=$((wanted + SLOT_MEM[slot])); done
+  NEVER_NOTE=''
+  local never=''
+  for slot in "${!SLOT_MEM[@]}"; do
+    wanted=$((wanted + SLOT_MEM[slot]))
+    [ "${SLOT_MEM[$slot]}" -gt "$BUDGET" ] || continue
+    case ", $never" in
+      *", ${SLOT_CLASS[$slot]} ("*) ;;
+      *) never="${never:+$never, }${SLOT_CLASS[$slot]} ($(mib "${SLOT_MEM[$slot]}") MiB)" ;;
+    esac
+  done
+  if [ -n "$never" ]; then
+    NEVER_NOTE="WARNING: a slot of these classes is larger than the $(mib "$BUDGET") MiB the machine has for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $never. Such a slot never starts, and the jobs that ask for its labels wait for ever. Make the class or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
+    say "$NEVER_NOTE"
+  fi
   if [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
     FIT_NOTE="WARNING: the $SLOTS slots ask for $(mib "$wanted") MiB together and the machine has $(mib "$BUDGET") MiB for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $(mib $((wanted - BUDGET))) MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
     say "$FIT_NOTE"

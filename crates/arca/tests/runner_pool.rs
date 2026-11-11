@@ -1263,6 +1263,34 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
     assert_eq!(pool.stop(), Some(0));
     drop(pool);
 
+    // A slot larger than all the memory there is for slots never starts. With more slots than places the pool says
+    // nothing about all of them together, so this is said on its own, with the class (once) and the numbers.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let big = json!({ "name": "big", "labels": ["self-hosted", "linux", "x64", "arca-large"], "cpu": 2, "memory": "16GiB", "slots": 2 });
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(1), big]),
+            1,
+            &format!("https://github.com/{ORG}"),
+        ),
+        13 * GIB,
+        12 * GIB,
+    );
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    wait_for(&pool, "the one runner that fits", || {
+        github.live().len() == 1
+    });
+    let never = "arca-runner-pool: WARNING: a slot of these classes is larger than the 11264 MiB the machine has for slots (the 13312 MiB it reports, less reserveMemory 2048 MiB): big (16384 MiB). Such a slot never starts, and the jobs that ask for its labels wait for ever. Make the class or reserveMemory smaller, or the machine larger, in the template, and create the pool again\n";
+    wait_for(&pool, "the warning in a status block", || {
+        pool.read("logs/status.txt").contains(never)
+    });
+    assert!(pool.output().matches(never).count() >= 2);
+    assert!(!pool.output().contains("slots ask for"));
+    assert_eq!(pool.stop(), Some(0));
+    drop(pool);
+
     // The cap: four slots that all fit in memory, and three places. The fourth waits for a place and takes its turn
     // when a job ends.
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
@@ -1710,6 +1738,7 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_
             "the certificates curl checks GitHub with",
         ),
         ("util-linux", "flock"),
+        ("hostname", "hostname"),
     ] {
         assert!(
             packages.iter().any(|name| name == package),
