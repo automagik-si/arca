@@ -465,13 +465,19 @@ fn scratch_probe_two_tenants_on_the_nodes_own_bridge() {
         );
         println!("VM ok: A/box holds {vm}");
         // The caps: the kernel refuses the fourth instance by name, and Incus refuses it too when asked directly.
-        let (_, message) = refusal(rig.call(
+        // A holds web, api and box, and its cap is three instances.
+        let (code, message, fields) = listed(rig.call(
             "service_create",
             json!({ "name": "extra", "template": "box", "tenant": A }),
         ));
-        assert!(
-            message.contains("cap on instances (limits.instances)"),
-            "{message}"
+        assert_eq!(code, "capacity");
+        assert_eq!(
+            message,
+            "creating extra would exceed tenant aaaaaaaa's cap on instances (limits.instances): 3 in use, 1 asked, 3 allowed"
+        );
+        assert_eq!(
+            fields,
+            json!({ "scope": "tenant", "limit": "instances", "have": 3, "want": 1, "max": 3 })
         );
         let (ok, out) = incus(&[
             "init",

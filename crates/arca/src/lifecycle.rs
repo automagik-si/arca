@@ -249,7 +249,9 @@ impl InstanceLifecycle {
                     _ => "refused",
                 },
                 "code": match &stopped.refusal {
-                    CallError::Refused { code, .. } => code.as_str(),
+                    CallError::Refused { code, .. } | CallError::RefusedWith { code, .. } => {
+                        code.as_str()
+                    }
                     CallError::Invalid(_) => "Invalid",
                     _ => "Internal",
                 },

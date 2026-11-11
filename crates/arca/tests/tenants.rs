@@ -363,6 +363,30 @@ impl Rig {
         .run(&approved.action, &approved.args, &approved.grant)
     }
 
+    /// Proposes `action`, approves it with the owner's passkey and runs it through `run_approved_action`, the path
+    /// `action_approve` and the approval page share: what comes back is what the caller of either is told.
+    fn approved_as_told(&self, action: &str, args: Value) -> Result<Value, CallError> {
+        let proposed = self.call("action_propose", json!({ "action": action, "args": args }))?;
+        let id = proposed["id"].as_str().expect("the proposal's id");
+        let digest = proposed["argsDigest"].as_str().expect("its digest");
+        let nonce = format!("{:064x}", self.nonce.fetch_add(1, Ordering::SeqCst) + 1);
+        let statement =
+            arca::handlers::action_statement("node1", id, action, digest, self.now(), &nonce)
+                .expect("the statement");
+        let approval = common::approve_statement(&self.key, &statement);
+        let executor = ActionExecutor::new(
+            self.handlers
+                .iter()
+                .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+        );
+        arca::handlers::run_approved_action(
+            &self.kernel,
+            &executor,
+            &json!({ "plan": id, "approval": approval }),
+            self.now(),
+        )
+    }
+
     /// The node config the rig serves with.
     fn config(&self) -> NodeConfig {
         node_config(&self.dir, &self.socket, &self.kernel_config, &self.node)
@@ -417,11 +441,18 @@ fn empty_state() -> FakeState {
     }
 }
 
+/// A plain refusal: its code and its sentence. A refusal for want of room or for asking too often is not one, and is
+/// read with [`listed`].
 fn refusal(result: Result<Value, CallError>) -> (String, String) {
     match result {
         Err(CallError::Refused { code, message }) => (code, message),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// A `capacity` or `rate` refusal: its code, its sentence and its fields, checked against the document's list.
+fn listed(result: Result<Value, CallError>) -> (String, String, Value) {
+    common::listed_refusal(result)
 }
 
 /// A container template with two ports, the first of which a link opens.
@@ -470,3 +501,5 @@ mod isolation;
 mod kernel_access;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;
+#[path = "tenants/refusal_codes.rs"]
+mod refusal_codes;

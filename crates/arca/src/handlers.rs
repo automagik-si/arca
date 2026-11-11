@@ -13,6 +13,9 @@ use arca_alerts::checks::{self, CheckTargets};
 use arca_alerts::eval::{Timed, WatchReading};
 use arca_alerts::{AlertSnapshot, Engine, TickStore, export, health, inputs};
 use arca_api::Scope;
+use arca_api::refusals::{
+    Limit, PROPOSE_AGAIN, RATE_LIMITED, Room, TOO_MANY_PROPOSALS, Whose, retry_after, seconds_until,
+};
 use arca_approval::{ApprovalRefusal, parse_statement};
 use arca_incus::{IncusRead, UnixIncus};
 use arca_kernel::canon::{Digest, params_digest};
@@ -1425,9 +1428,16 @@ impl ToolHandler for ActionPropose {
                 .any(|proposal| proposal.args_digest == digest && !proposal.expired(now))
         });
         if !duplicate && !self.rate.allow(&caller.token_id, now) {
-            return Err(CallError::Refused {
-                code: "RateLimited".to_string(),
+            // The code is the one this refusal has always had. The wait is the time until the token's oldest counted
+            // proposal leaves the window, which the sentence rounds up to the whole window.
+            let wait = self
+                .rate
+                .wait_ms(&caller.token_id, now)
+                .map(|ms| seconds_until(ms, 0));
+            return Err(CallError::RefusedWith {
+                code: RATE_LIMITED.to_string(),
                 message: "too many proposals from this token; try again in ten minutes".to_string(),
+                fields: retry_after(wait),
             });
         }
         let proposal = match kernel.propose_action(action, payload, now, gpu_product.as_deref()) {
@@ -1642,7 +1652,7 @@ impl ToolHandler for GpuActionHandler {
 fn propose_failure(error: ProposeError) -> CallError {
     match error {
         ProposeError::TooMany => CallError::Refused {
-            code: "TooManyProposals".to_string(),
+            code: TOO_MANY_PROPOSALS.to_string(),
             message: "eight action proposals already wait; approve or decline one first"
                 .to_string(),
         },
@@ -1767,7 +1777,28 @@ pub fn run_approved_action(
     let outcome = actions
         .run(&approved.action, &approved.args, &approved.grant)
         .map_err(|error| {
+            let told = |why: &str| {
+                format!(
+                    "{APPROVED_BUT_FAILED} {} did not complete: {why}",
+                    approved.action
+                )
+            };
             let (code, why) = match error {
+                // A refusal for want of room, or for asking too often, keeps its code and its fields, and gains one:
+                // the approval is spent, so waiting or making room does not make this same call pass. The action is
+                // proposed again.
+                CallError::RefusedWith {
+                    code,
+                    message,
+                    mut fields,
+                } => {
+                    fields.insert(PROPOSE_AGAIN.to_string(), json!(true));
+                    return CallError::RefusedWith {
+                        code,
+                        message: told(&message),
+                        fields,
+                    };
+                }
                 CallError::Refused { code, message }
                 | CallError::UntrustedRefused { code, message } => (code, message),
                 CallError::Invalid(message) => ("Invalid".to_string(), message),
@@ -1778,15 +1809,12 @@ pub fn run_approved_action(
             };
             CallError::Refused {
                 code,
-                message: format!(
-                    "{APPROVED_BUT_FAILED} {} did not complete: {why}",
-                    approved.action
-                ),
+                message: told(&why),
             }
         });
-    let (code, message) = match &outcome {
-        Err(CallError::Refused { code, message }) => (Some(code.as_str()), Some(message.as_str())),
-        _ => (None, None),
+    let (code, message) = match outcome.as_ref().err().and_then(CallError::refusal) {
+        Some((code, message)) => (Some(code), Some(message)),
+        None => (None, None),
     };
     if let Ok(mut kernel) = kernel.lock() {
         kernel.revoke_action_grant(&approved.grant);
@@ -2800,7 +2828,7 @@ pub fn project_changes(
 
 /// Refuses, in words and before any write, a write of the project owner's entry whose configured virtual-machine count is
 /// below the number of virtual machines the node holds: Incus would refuse that count for the project, and the entry would
-/// then fail on every pass.
+/// then fail on every pass. It is a `capacity` refusal: the node holds more virtual machines than its cap allows.
 fn count_fits(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -> Result<(), CallError> {
     let Some(caps) = cfg.kernel.vm_caps() else {
         return Ok(());
@@ -2817,10 +2845,19 @@ fn count_fits(cfg: &NodeConfig, entries: &[arca_kernel::desired::Entry]) -> Resu
     } else {
         "kernel.vmLimits.virtualMachines"
     };
-    Err(service_refused(format!(
-        "this node holds {held} virtual machines, but {key} is {}: raise it to at least {held}, or remove virtual machines first. Nothing was written",
-        caps.virtual_machines
-    )))
+    Err(CallError::capacity(
+        format!(
+            "this node holds {held} virtual machines, but {key} is {}: raise it to at least {held}, or remove virtual machines first. Nothing was written",
+            caps.virtual_machines
+        ),
+        Room {
+            scope: Whose::Node,
+            limit: Limit::VirtualMachines,
+            have: Some(held as u64),
+            want: None,
+            max: Some(u64::from(caps.virtual_machines)),
+        },
+    ))
 }
 
 /// Why a create has no service project to go into, in the words of the check that failed: only a missing
@@ -2829,7 +2866,7 @@ fn no_service_project(error: CallError) -> CallError {
     match error {
         CallError::Invalid(why) => service_refused(format!("no service project: {why}")),
         // A refusal in words is the reason itself.
-        refused @ CallError::Refused { .. } => refused,
+        refused @ (CallError::Refused { .. } | CallError::RefusedWith { .. }) => refused,
         _ => internal(),
     }
 }
@@ -3007,9 +3044,10 @@ fn instance_holds_mac(row: &Value, mac: &str) -> bool {
             .is_some_and(|nics| nics.values().any(|nic| same(&nic["hwaddr"])))
 }
 
-/// Why creating `name` from `template` would exceed one of the node's caps, or `None`. The use counted is that of the
-/// virtual-machine records Arca holds, on the managed network and on host bridges alike, whether or not their machines
-/// run. No container counts.
+/// Why creating `name` from `template` would exceed one of the node's caps, or `None`: a `capacity` refusal that names
+/// the cap, with `scope` `node`. A tenant's machine is checked here too, before its tenant's own caps, so a tenant
+/// under its caps is refused with the node's amounts when the node is full. The use counted is that of the virtual-machine records Arca holds, on the managed network and on host
+/// bridges alike, whether or not their machines run. No container counts.
 fn caps_refusal(
     cfg: &NodeConfig,
     caps: &crate::config::BridgedLimits,
@@ -3017,7 +3055,7 @@ fn caps_refusal(
     own: bool,
     name: &str,
     template: &crate::service::Template,
-) -> Option<String> {
+) -> Option<CallError> {
     let cpu = |limits: &Option<crate::service::Limits>| {
         limits
             .as_ref()
@@ -3048,8 +3086,9 @@ fn caps_refusal(
     };
     let gib = |bytes: u128| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
     let plain = |n: u128| n.to_string();
-    // What is capped, its config key, the use, the amount asked, the cap, and how an amount is shown.
+    // The cap, what is capped, its config key, the use, the amount asked, the cap's amount, and how an amount is shown.
     type Check<'a> = (
+        Limit,
         &'a str,
         &'a str,
         u128,
@@ -3059,6 +3098,7 @@ fn caps_refusal(
     );
     let checks: [Check<'_>; 4] = [
         (
+            Limit::VirtualMachines,
             "virtual machines",
             "virtualMachines",
             count + reserved,
@@ -3067,6 +3107,7 @@ fn caps_refusal(
             &plain,
         ),
         (
+            Limit::Cpu,
             "CPUs",
             "cpu",
             cpus,
@@ -3075,6 +3116,7 @@ fn caps_refusal(
             &plain,
         ),
         (
+            Limit::Memory,
             "memory",
             "memory",
             ram,
@@ -3083,6 +3125,7 @@ fn caps_refusal(
             &gib,
         ),
         (
+            Limit::Disk,
             "disk",
             "disk",
             disk,
@@ -3094,20 +3137,23 @@ fn caps_refusal(
             &gib,
         ),
     ];
-    for (what, key, used, asked, cap, show) in checks {
+    for (limit, what, key, used, asked, cap, show) in checks {
         // A size that cannot be read counts as over the cap: the create is refused, never let through.
         let asked = asked.unwrap_or(u128::MAX);
         let cap = cap.unwrap_or(0);
         if asked != 0 && used.saturating_add(asked) > cap {
-            return Some(format!(
-                "creating {name} would exceed this node's cap on {what} ({source}.{key}): {} in use, {} asked, {} allowed",
-                show(used),
-                if asked == u128::MAX {
-                    "an unreadable amount".to_string()
-                } else {
-                    show(asked)
-                },
-                show(cap)
+            return Some(CallError::capacity(
+                format!(
+                    "creating {name} would exceed this node's cap on {what} ({source}.{key}): {} in use, {} asked, {} allowed",
+                    show(used),
+                    if asked == u128::MAX {
+                        "an unreadable amount".to_string()
+                    } else {
+                        show(asked)
+                    },
+                    show(cap)
+                ),
+                Room::of(Whose::Node, limit, used, asked, cap),
             ));
         }
     }
@@ -3824,6 +3870,9 @@ struct ServiceHandler {
     exec: Arc<crate::service_exec::ServiceExec>,
 }
 
+/// A refusal in plain words, under the plain code `refused`. A refusal for want of room is never this one, and neither
+/// is one for asking too often: those are [`CallError::capacity`] and [`CallError::rate`], whose codes a caller can act
+/// on without reading the sentence (docs/OPERATING.md, "Refusals for want of room and for asking too often").
 fn service_refused(message: impl Into<String>) -> CallError {
     CallError::Refused {
         code: "refused".into(),
@@ -4516,14 +4565,16 @@ impl ServiceHandler {
         } else {
             tenants::outside_blocks(candidates, &blocks)
         };
+        let all = candidates.len() as u128;
         candidates
             .iter()
             .find(|ip| !used.contains(ip))
             .map(|ip| ip.to_string())
             .ok_or_else(|| {
-                service_refused(format!(
-                    "the service subnet {cidr} has no free address (.10-.239)"
-                ))
+                CallError::capacity(
+                    format!("the service subnet {cidr} has no free address (.10-.239)"),
+                    Room::of(Whose::Node, Limit::Addresses, all, 1, all),
+                )
             })
     }
 
@@ -5245,7 +5296,7 @@ impl ToolHandler for ServiceHandler {
                             "the MAC {mac} is already held by another instance"
                         )));
                     }
-                    if let Some(why) = caps_refusal(
+                    if let Some(refusal) = caps_refusal(
                         &self.cfg,
                         caps,
                         &all_entries,
@@ -5253,13 +5304,13 @@ impl ToolHandler for ServiceHandler {
                         &name,
                         &template,
                     ) {
-                        return Err(service_refused(why));
+                        return Err(refusal);
                     }
                     if let Some(scope) = &tenant
-                        && let Some(why) =
+                        && let Some(refusal) =
                             tenants::service_caps_refusal(scope, &all_entries, &name, &template)
                     {
-                        return Err(service_refused(why));
+                        return Err(refusal);
                     }
                     // A project that exists must be the one its owning entry made: the bridged entry's on a node whose
                     // first service was a virtual machine on a host bridge, the network entry's otherwise. One made by
@@ -5385,10 +5436,10 @@ impl ToolHandler for ServiceHandler {
                             "template {template_name} opens a port on the host or publishes a dash, and nothing in a tenant does: a tenant's service is reached through the node's front service"
                         )));
                     }
-                    if let Some(why) =
+                    if let Some(refusal) =
                         tenants::service_caps_refusal(scope, &all_entries, &name, &template)
                     {
-                        return Err(service_refused(why));
+                        return Err(refusal);
                     }
                 }
                 let ipv4 =

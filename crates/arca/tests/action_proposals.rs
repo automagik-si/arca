@@ -655,6 +655,20 @@ fn action_propose_succeeds_through_the_mcp_door() {
     );
 }
 
+/// The proposal window's refusal: the code it has always had, its sentence, and the wait beside the code, checked
+/// against the document's list. Returns the wait in seconds.
+fn rate_limited(result: Result<Value, CallError>) -> u64 {
+    let (code, message, fields) = common::listed_refusal(result);
+    assert_eq!(code, "RateLimited");
+    assert_eq!(
+        message,
+        "too many proposals from this token; try again in ten minutes"
+    );
+    fields["retryAfterSeconds"]
+        .as_u64()
+        .expect("the wait is told")
+}
+
 #[test]
 fn the_per_token_proposal_rate_holds_across_propose_and_decline() {
     let key = SkKey::from_seed(1);
@@ -667,13 +681,14 @@ fn the_per_token_proposal_rate_holds_across_propose_and_decline() {
         call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
             .expect("the proposal is declined");
     }
-    let error = rig
-        .propose("service_create", create_args("rate-extra"))
-        .expect_err("the token's window is full");
-    assert!(matches!(
-        error,
-        CallError::Refused { ref code, .. } if code == "RateLimited"
-    ));
+    // The sentence rounds the wait up to the whole window. The field beside the code is exact: a minute after the
+    // thirty proposals, nine minutes are left until the first of them leaves the window.
+    rig.at(NOW + 60_000);
+    assert_eq!(
+        rate_limited(rig.propose("service_create", create_args("rate-extra"))),
+        540,
+        "the token's window is full"
+    );
 }
 
 #[test]
@@ -700,13 +715,11 @@ fn a_deduplicated_proposal_does_not_consume_the_token_window() {
         call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
             .expect("the proposal is declined");
     }
-    let error = rig
-        .propose("service_create", create_args("new-extra"))
-        .expect_err("the thirty accepted proposals fill the window");
-    assert!(matches!(
-        error,
-        CallError::Refused { ref code, .. } if code == "RateLimited"
-    ));
+    assert_eq!(
+        rate_limited(rig.propose("service_create", create_args("new-extra"))),
+        600,
+        "the thirty accepted proposals fill the window"
+    );
     assert_eq!(
         rig.propose("service_create", create_args("nats"))
             .expect("a duplicate answers even with a full window"),
@@ -749,13 +762,11 @@ fn a_refused_proposal_does_not_consume_the_token_window() {
         call_verb(&rig.handlers, "plan_decline", json!({ "plan": id }))
             .expect("the proposal is declined");
     }
-    let error = rig
-        .propose("service_create", create_args("spent-extra"))
-        .expect_err("the refusals counted nothing, so thirty new proposals fill the window");
-    assert!(matches!(
-        error,
-        CallError::Refused { ref code, .. } if code == "RateLimited"
-    ));
+    assert_eq!(
+        rate_limited(rig.propose("service_create", create_args("spent-extra"))),
+        600,
+        "the refusals counted nothing, so thirty new proposals fill the window"
+    );
 }
 
 #[test]
@@ -799,10 +810,19 @@ fn the_same_digest_returns_the_same_record_and_a_ninth_is_refused() {
     let ninth = rig
         .propose("service_create", create_args("ninth"))
         .expect_err("the limit is eight");
-    match ninth {
-        CallError::Refused { code, .. } => assert_eq!(code, "TooManyProposals"),
-        other => panic!("a refusal was expected, got {other:?}"),
-    }
+    // The code it has always had, its sentence, and no field: the document lists it in the family `rate`.
+    assert_eq!(
+        common::listed_refusal(Err(ninth)),
+        (
+            "TooManyProposals".to_string(),
+            "eight action proposals already wait; approve or decline one first".to_string(),
+            json!({})
+        )
+    );
+    assert_eq!(
+        common::listed_refusal_entry("TooManyProposals").expect("listed")["family"],
+        "rate"
+    );
     assert_eq!(
         rig.propose("service_create", create_args("nats"))
             .expect("the dedupe still answers at the limit"),

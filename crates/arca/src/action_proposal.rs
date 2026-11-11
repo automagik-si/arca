@@ -1212,6 +1212,22 @@ impl ProposalRateLimiter {
         true
     }
 
+    /// How long until `token`'s window has a free place, in milliseconds: the time its oldest counted proposal still
+    /// stays in the window. `None` when the window is not full.
+    pub fn wait_ms(&self, token: &str, now: u64) -> Option<u64> {
+        let seen = self.seen.lock().ok()?;
+        let window = seen.get(token)?;
+        if window.len() < PROPOSAL_RATE_MAX {
+            return None;
+        }
+        let oldest = *window.front()?;
+        Some(
+            oldest
+                .saturating_add(PROPOSAL_RATE_WINDOW_MS)
+                .saturating_sub(now),
+        )
+    }
+
     /// Gives back the place [`Self::allow`] just reserved when the proposal was refused after all, so a refusal never
     /// counts toward the window. It removes only a place taken at `now`; an older one stays.
     pub fn refund(&self, token: &str, now: u64) {
@@ -1659,6 +1675,12 @@ mod tests {
             assert!(limiter.allow("one", 1_000 + index));
         }
         assert!(!limiter.allow("one", 1_000 + PROPOSAL_RATE_MAX as u64));
+        assert_eq!(
+            limiter.wait_ms("one", 1_000 + PROPOSAL_RATE_MAX as u64),
+            Some(PROPOSAL_RATE_WINDOW_MS - PROPOSAL_RATE_MAX as u64),
+            "the wait ends when the oldest proposal leaves the window"
+        );
+        assert_eq!(limiter.wait_ms("two", 1_000), None, "no window, no wait");
         assert!(
             limiter.allow("two", 1_000),
             "another token has its own window"

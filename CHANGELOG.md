@@ -23,6 +23,21 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   (`arca-watch.service`, `arca-shim.service`). The script is not a release asset yet: the README reads it from the
   `dev` branch. It is tested against stand-ins, and was run for real only on a machine that already had Incus and
   Arca.
+- Two families of refusal have their own codes, so a caller no longer reads the sentence to tell them from any other
+  refusal. `capacity`: the call would pass a cap of a tenant or of the node (instances, containers, virtual machines,
+  CPUs, memory, disk, tenants, addresses). `rate`: the caller asked too often or already has too much waiting
+  (`kernel.tenants.createRate`, the 5 and 20 pending approval requests, the Omni pairing hold-off). Until now all of
+  these came back as `refused`. **A caller that matched `refused` for them must match the new codes.** Every sentence
+  is unchanged. Fields stand beside the code in the error's `data`. For `capacity`: `scope` (`tenant` or `node`:
+  whose cap it is, since a tenant under its own caps can be refused because the node is full), `limit`, and when
+  known `have`, `want` and `max` (bytes for memory and disk, a count otherwise). For `rate`: `retryAfterSeconds` when
+  the wait is known. Either gains `proposeAgain: true` when it came from running an approved action, whose approval
+  is spent. `RateLimited` and `TooManyProposals`, the codes of the two proposal refusals, keep their names;
+  `RateLimited` gains `retryAfterSeconds`. The OpenRPC document lists the four codes under `x-arca-refusals`, each
+  with its `family` (`capacity` or `rate`) and the schema of its `data`, and dropping a listed code, family or value
+  is a break against a released document. The approval page's 403 answers carry the same fields, and its 429 answers
+  carry `refusal: "rate"` beside `message`. The table is in `docs/OPERATING.md`, "Refusals for want of room and for
+  asking too often".
 - A new shipped template, `automagik-workspace`: one Automagik workspace in its own virtual machine (2 CPUs, 4GiB,
   20GiB), published through a Cloudflare Tunnel whose connector runs inside the same machine. A keeper runs the
   Automagik server, its gate (the same image, the only door to the server) and the connector in one network

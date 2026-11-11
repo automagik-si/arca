@@ -384,12 +384,23 @@ struct CountingAction {
 impl ToolHandler for CountingAction {
     fn call(&self, args: Value, _caller: &Caller) -> Result<Value, CallError> {
         self.runs.fetch_add(1, Ordering::SeqCst);
-        // Two names stand for a create that fails after the approval: one refused in words, one that breaks inside.
+        // Three names stand for a create that fails after the approval: one refused in words, one refused for want
+        // of room, and one that breaks inside.
         match args["name"].as_str() {
             Some("stuck") => Err(CallError::Refused {
                 code: "refused".to_string(),
                 message: STUCK.to_string(),
             }),
+            Some("full") => Err(CallError::capacity(
+                FULL,
+                arca_api::refusals::Room::of(
+                    arca_api::refusals::Whose::Node,
+                    arca_api::refusals::Limit::VirtualMachines,
+                    4,
+                    1,
+                    4,
+                ),
+            )),
             Some("broken") => Err(CallError::Internal("a detail nobody is shown".to_string())),
             _ => Ok(json!({ "created": true })),
         }
@@ -398,6 +409,9 @@ impl ToolHandler for CountingAction {
 
 /// What the stand-in create answers for the service `stuck`: the words a real create whose start failed uses.
 const STUCK: &str = "start service stuck: the instance was created, and Incus did not start it: Incus said \"Failed starting instance\". Its instance exists and is stopped: instance_start starts it once the cause is fixed, and service_remove removes it";
+
+/// What the stand-in create answers for the service `full`: the words of a create over the node's cap.
+const FULL: &str = "creating full would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 4 in use, 1 asked, 4 allowed";
 
 const TEST_CHAT_IDLE: Duration = Duration::from_millis(600);
 const TEST_CHAT_TOTAL: Duration = Duration::from_secs(3);
@@ -1240,20 +1254,31 @@ fn a_passkey_approval_runs_an_action_proposal_exactly_once() {
 }
 
 /// F4: an approval that Arca accepted, for an action that then failed, answers with the action's own message, keeps it
-/// in the proposals journal and retires the card, so the page has words to show in place of its spinner.
+/// in the proposals journal and retires the card, so the page has words to show in place of its spinner. A failure for
+/// want of room keeps its code and its fields beside the message, and says the action must be proposed again.
 #[test]
 fn an_approved_action_that_fails_answers_its_message_and_journals_it() {
     let (rig, key) = Rig::new("page-action-failed", true);
-    for (name, code, message) in [
+    for (name, code, message, fields) in [
         (
             "stuck",
             "refused",
             format!("The approval was accepted, but service_create did not complete: {STUCK}"),
+            json!({}),
+        ),
+        (
+            "full",
+            "capacity",
+            format!("The approval was accepted, but service_create did not complete: {FULL}"),
+            // The approval is spent: the page is told the action must be proposed again.
+            json!({ "scope": "node", "limit": "virtualMachines", "have": 4, "want": 1, "max": 4,
+                "proposeAgain": true }),
         ),
         (
             "broken",
             "Internal",
             "The approval was accepted, but service_create did not complete: Arca hit an internal error while running it".to_string(),
+            json!({}),
         ),
     ] {
         rig.waiting_action_named(name);
@@ -1264,7 +1289,10 @@ fn an_approved_action_that_fails_answers_its_message_and_journals_it() {
         let (status, answer) = rig.post("/approve/approve", Some(ORIGIN), body);
         assert_eq!(status, 403, "{name}");
         let answer: Value = serde_json::from_slice(&answer).expect("a JSON answer, never an empty one");
-        assert_eq!(answer, json!({ "refusal": code, "message": message }), "{name}");
+        let mut expected = fields;
+        expected["refusal"] = json!(code);
+        expected["message"] = json!(message);
+        assert_eq!(answer, expected, "{name}");
         assert!(message.starts_with(arca::handlers::APPROVED_BUT_FAILED));
 
         // The kernel's own state directory is the scratch root, one level above the page's.
@@ -1289,7 +1317,7 @@ fn an_approved_action_that_fails_answers_its_message_and_journals_it() {
         let listed: Value = serde_json::from_slice(&listed).expect("plans JSON");
         assert_eq!(listed["plans"], json!([]), "the spent proposal is gone: {name}");
     }
-    assert_eq!(rig.action_runs.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.action_runs.load(Ordering::SeqCst), 3);
 
     // The page shows a message that begins this way in full. Its script and the handler share the words.
     let (status, page) = rig.get("/approve", None);
@@ -1521,10 +1549,12 @@ fn a_second_setup_code_is_refused_while_one_is_live_and_the_live_code_still_work
     let (rig, key) = Rig::new_empty("page-live-code");
     assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 200);
     let code = rig.last_code();
+    let (status, body) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
+    assert_eq!(status, 429, "a live code is never replaced");
+    // The answer says it was asked too soon, in words and as the `rate` code, with the wait: the code's ten minutes.
     assert_eq!(
-        rig.post_empty("/approve/setup-code", Some(ORIGIN)).0,
-        429,
-        "a live code is never replaced"
+        rate_answer(&body),
+        ("A code is already on your screen".to_string(), Some(600))
     );
     let (status, _) = rig.post(
         "/approve/register",
@@ -1543,10 +1573,11 @@ fn setup_code_spacing_survives_a_failed_display_and_the_hourly_budget_locks() {
         503,
         "no screen means no code"
     );
+    let (status, body) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
+    assert_eq!(status, 429, "the next request is spaced");
     assert_eq!(
-        rig.post_empty("/approve/setup-code", Some(ORIGIN)).0,
-        429,
-        "the next request is spaced"
+        rate_answer(&body),
+        ("Wait 60 more second(s)".to_string(), Some(60))
     );
     rig.display.fail.store(false, Ordering::SeqCst);
     rig.advance(61_000);
@@ -1558,7 +1589,24 @@ fn setup_code_spacing_survives_a_failed_display_and_the_hourly_budget_locks() {
     }
     let (status, body) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
     assert_eq!(status, 429);
-    assert!(String::from_utf8_lossy(&body).contains("locked"));
+    assert_eq!(
+        rate_answer(&body),
+        (
+            "Setup is locked for 60 more minute(s)".to_string(),
+            Some(3600)
+        )
+    );
+}
+
+/// A 429 answer of the page: its sentence, and the wait in seconds when it tells one. The body carries the `rate`
+/// refusal code beside the sentence.
+fn rate_answer(body: &[u8]) -> (String, Option<u64>) {
+    let body: Value = serde_json::from_slice(body).expect("a JSON body");
+    assert_eq!(body["refusal"], "rate", "{body}");
+    (
+        body["message"].as_str().expect("a message").to_string(),
+        body["retryAfterSeconds"].as_u64(),
+    )
 }
 
 #[test]
@@ -1784,7 +1832,9 @@ fn locked_caller_is_refused_but_another_caller_enrols_with_the_same_live_code() 
     assert!(String::from_utf8_lossy(&body).contains("wrong"));
     let (status, body) = rig.proxy_post(Some("caller-b"), "/approve/setup-code", json!({}));
     assert_eq!(status, 429);
-    assert!(String::from_utf8_lossy(&body).contains("A code is already on your screen"));
+    let (message, wait) = rate_answer(&body);
+    assert_eq!(message, "A code is already on your screen");
+    assert!(wait.is_some_and(|seconds| (1..=600).contains(&seconds)));
     let (status, body) = rig.proxy_post(
         Some("caller-a"),
         "/approve/register",
@@ -1794,7 +1844,13 @@ fn locked_caller_is_refused_but_another_caller_enrols_with_the_same_live_code() 
         status, 429,
         "the correct code cannot bypass the caller lock"
     );
-    assert!(String::from_utf8_lossy(&body).contains("Setup is locked for 60 more minute(s)"));
+    assert_eq!(
+        rate_answer(&body),
+        (
+            "Setup is locked for 60 more minute(s)".to_string(),
+            Some(3600)
+        )
+    );
     assert!(!rig.state_path().exists());
     assert_eq!(rig.kernel.lock().expect("kernel").owner_passkey_count(), 0);
     assert_eq!(
@@ -2979,10 +3035,15 @@ fn canvas_challenge_cap_is_global_and_resets_after_a_minute() {
         let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
         assert_eq!(status, 200, "challenge {index}");
     }
-    let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
+    let (status, _, body) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
     assert_eq!(
         status, 429,
         "the sixty-first challenge in a minute is capped"
+    );
+    // The body names the `rate` code beside the sentence, and tells no wait.
+    assert_eq!(
+        rate_answer(&body),
+        ("Too many sign-in challenges".to_string(), None)
     );
     rig.advance(60_000);
     let (status, _, _) = rig.post_full("/approve/canvas", Some(ORIGIN), json!({}));
