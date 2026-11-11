@@ -1,28 +1,35 @@
 #!/bin/bash
-# A stand-in for the docker command, for crates/arca/tests/automagik_workspace.rs. It keeps each container as a
-# directory under $FAKE_DOCKER_DIR/containers and writes every call's arguments to $FAKE_DOCKER_DIR/calls.log. A
-# container is running while its directory holds the file `running`; the test stops one by removing that file and
-# writing `exit`. A container that joins another's network namespace starts only while that one runs, as with Docker.
-# A container given a directory at /run/arca-tunnel records the digest of the token file it finds there, as proof
-# that the token reached it as a file; one given a directory at /run/arca-tailnet does the same for the auth key it
-# finds there. `docker exec <name> tailscale ... status --json` prints $FAKE_DOCKER_DIR/tailnet-status.json (a node
-# that is still starting when there is no such file). While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it
-# does when the daemon cannot be reached. `docker exec` plays the image's health check: it prints the code in
-# $FAKE_DOCKER_DIR/health-<name> (401 when there is no such file) and succeeds on 401. Nothing here is Docker.
+# A stand-in for the docker command, for crates/arca/tests/automagik_workspace.rs. It writes every call's arguments
+# to $FAKE_DOCKER_DIR/calls.log. Nothing here is Docker.
+#
+# - A container is a directory under $FAKE_DOCKER_DIR/containers. It is running while it holds the file `running`;
+#   the test stops one by removing that file and writing `exit`. It records the network it was made on (`netmode`:
+#   what --network said, `default` when nothing did). One that joins another's network namespace starts only while
+#   that one runs, as with Docker.
+# - A container given a directory at /run/arca-tunnel or /run/arca-tailnet records the digest of the token or auth
+#   key file it finds there, as proof that the secret reached it as a file.
+# - `docker network` keeps each network as a directory under $FAKE_DOCKER_DIR/networks. A running container that is
+#   connected to one gets the next address of 10.88.0.0/24 there, which `docker inspect` then answers.
+# - While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it does when the daemon cannot be
+#   reached; while warn-inspect is there it prints a warning beside its answer.
+# - `docker exec <name> tailscale ... status --json` prints $FAKE_DOCKER_DIR/tailnet-status.json (a node that is
+#   still starting when there is no such file). Any other `docker exec` plays the image's health check: it prints
+#   the code in $FAKE_DOCKER_DIR/health-<name> (401 when there is no such file) and succeeds on 401.
 set -u
 root=$FAKE_DOCKER_DIR
-mkdir -p "$root/containers"
+mkdir -p "$root/containers" "$root/networks"
 printf '%s\n' "$*" >>"$root/calls.log"
 command=${1-}
 [ $# -gt 0 ] && shift
 
 case $command in
   run)
-    name='' token_dir='' token_file='' joins=''
+    name='' token_dir='' token_file='' joins='' netmode=default
     while [ $# -gt 0 ]; do
       case $1 in
         --name) name=$2; shift 2 ;;
         --network)
+          netmode=$2
           case $2 in container:*) joins=${2#container:} ;; esac
           shift 2
           ;;
@@ -52,6 +59,7 @@ case $command in
     fi
     mkdir -p "$root/containers/$name"
     printf '%s\n' "${1-}" >"$root/containers/$name/image"
+    printf '%s\n' "$netmode" >"$root/containers/$name/netmode"
     : >"$root/containers/$name/log"
     [ -z "$token_dir" ] || sha256sum <"$token_dir/$token_file" | cut -d' ' -f1 >"$root/containers/$name/token.sha256"
     : >"$root/containers/$name/running"
@@ -70,12 +78,52 @@ case $command in
       echo "Error: No such object: $name" >&2
       exit 1
     }
-    [ "$format" = '{{.State.Running}} {{.State.ExitCode}}' ] || exit 2
-    if [ -e "$root/containers/$name/running" ]; then
-      echo "true 0"
-    else
-      echo "false $(cat "$root/containers/$name/exit" 2>/dev/null || echo 0)"
-    fi
+    case $format in
+      '{{.State.Running}} {{.State.ExitCode}}')
+        if [ -e "$root/containers/$name/running" ]; then
+          echo "true 0"
+        else
+          echo "false $(cat "$root/containers/$name/exit" 2>/dev/null || echo 0)"
+        fi
+        ;;
+      '{{.HostConfig.NetworkMode}}') cat "$root/containers/$name/netmode" ;;
+      '{{with index .NetworkSettings.Networks "'*'"}}{{.IPAddress}}{{end}}')
+        network=${format#*Networks \"}
+        cat "$root/containers/$name/address-${network%%\"*}" 2>/dev/null || echo
+        ;;
+      *) exit 2 ;;
+    esac
+    ;;
+  network)
+    action=${1-}
+    shift
+    case $action in
+      inspect)
+        [ -d "$root/networks/$1" ] || {
+          echo "Error response from daemon: network $1 not found" >&2
+          exit 1
+        }
+        ;;
+      create)
+        [ "${1-}" = --internal ] && shift
+        if [ -e "$root/fail-network" ]; then
+          cat "$root/fail-network" >&2
+          exit 1
+        fi
+        mkdir "$root/networks/$1"
+        ;;
+      connect)
+        [ -d "$root/networks/$1" ] && [ -e "$root/containers/$2/running" ] || {
+          echo "Error response from daemon: no such network or container" >&2
+          exit 1
+        }
+        printf '%s\n' "$2" >>"$root/networks/$1/members"
+        # Counted with bash alone: this script runs with the keeper's own short list of programs.
+        mapfile -t members <"$root/networks/$1/members"
+        echo "10.88.0.$((${#members[@]} + 1))" >"$root/containers/$2/address-$1"
+        ;;
+      *) exit 2 ;;
+    esac
     ;;
   rm)
     [ "${1-}" = -f ] && shift

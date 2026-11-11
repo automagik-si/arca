@@ -617,19 +617,10 @@ fn the_keeper_starts_the_three_parts_in_one_namespace_and_never_shows_the_token(
 
 #[test]
 fn a_new_token_replaces_the_tunnel_only_and_the_others_follow_the_server() {
-    let mut workspace = Workspace::new(&settings(URL));
+    let mut workspace = Workspace::new(&settings_with_access(URL));
     workspace.secret(TOKEN);
     workspace.start();
     says(&workspace, "the tunnel is started from");
-    says(
-        &workspace,
-        "reach cloudflare: public address https://team.example.org, with no Cloudflare Access settings, so nobody can sign in through the tunnel",
-    );
-    // Without the Access settings the gate is still the door, and none of the three names is in its environment.
-    let gate = workspace.runs("automagik-gate");
-    assert_eq!(gate.len(), 1);
-    assert!(gate[0].contains("-e AUTOMAGIK_GATE_ENABLED=1 -e AUTOMAGIK_GATE_ORIGIN=https://team.example.org -e AUTOMAGIK_GATE_PORT=3082 -v "));
-    assert!(!gate[0].contains("ACCESS"));
 
     workspace.secret(OTHER_TOKEN);
     says(
@@ -722,7 +713,7 @@ fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
 
     // Docker cannot start the server (its image cannot be pulled): Docker's last line is said, it is tried again,
     // and neither the gate nor the tunnel is started without it.
-    let mut workspace = Workspace::new(&settings(URL));
+    let mut workspace = Workspace::new(&settings_with_access(URL));
     workspace.secret(TOKEN);
     fs::write(
         workspace.dir.join("docker/fail-automagik-server"),
@@ -752,7 +743,7 @@ fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
 #[test]
 fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
     let access = |team: &str, audience: &str, emails: Value| json!({ "accessTeamDomain": team, "accessAudience": audience, "accessEmails": emails });
-    let cases: [(Value, &str); 23] = [
+    let cases: [(Value, &str); 24] = [
         (
             json!({ "serverImage": "registry.example/server:latest" }),
             "settings.serverImage is an image by digest",
@@ -850,6 +841,11 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
             },
             "the Cloudflare Access settings need settings.publicUrl",
         ),
+        // The gate takes no IP address as its origin, and no passkey belongs to one.
+        (
+            json!({ "publicUrl": "https://192.0.2.10" }),
+            "settings.publicUrl is a name, not an IP address",
+        ),
         // The reach is one of two words.
         (
             json!({ "reach": "lan" }),
@@ -928,7 +924,7 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
     workspace.start();
     says(
         &workspace,
-        "workspace team1: the server, the gate on loopback port 3082 and the tailnet node, in one network namespace; reach tailnet: https://workspace1.tail0example.ts.net, sign-in by passkey",
+        "workspace team1: the server and the gate on loopback port 3082 in one network namespace, and the tailnet node in one of its own, reaching the gate through the relay alone; reach tailnet: https://workspace1.tail0example.ts.net, sign-in by passkey",
     );
     says(
         &workspace,
@@ -954,6 +950,31 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
         )]
     );
     assert!(workspace.runs("automagik-tailnet").is_empty());
+    // The one way from the node to the workspace: a private network that is internal, the server's place on it,
+    // and the relay in the server's namespace, listening on that one address and copying bytes to the gate's
+    // loopback port. It is the server image's own node, read-only, with no capability.
+    says(
+        &workspace,
+        "the relay to the gate is started: 10.88.0.2:3082 on the private network, to the gate's loopback port",
+    );
+    let calls = workspace.read("docker/calls.log");
+    let relay = workspace.runs("automagik-relay");
+    assert_eq!(relay.len(), 1);
+    assert!(relay[0].starts_with(&format!(
+        "run -d --name automagik-relay --network container:automagik-server --restart no --read-only --cap-drop ALL --security-opt no-new-privileges:true --entrypoint /nodejs/bin/node {SERVER_IMAGE} -e const net=require(\"net\");"
+    )));
+    assert!(relay[0].ends_with(".listen(Number(port),ip) 10.88.0.2 3082"));
+    assert!(relay[0].contains("net.connect(Number(port),\"127.0.0.1\")"));
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("network c"))
+            .collect::<Vec<_>>(),
+        [
+            "network create --internal automagik-relay",
+            "network connect automagik-relay automagik-server"
+        ]
+    );
 
     // The gate, as the test plays it, has written its claim code into its own data. The status says that a first
     // claim is waited for, from the file being there; the code in it is never read.
@@ -970,11 +991,26 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
     assert_eq!(
         workspace.runs("automagik-tailnet"),
         [format!(
-            "run -d --name automagik-tailnet --network container:automagik-server --restart no --cap-drop ALL --security-opt no-new-privileges:true -e TS_AUTHKEY=file:/run/arca-tailnet/authkey -e TS_AUTH_ONCE=true -e TS_USERSPACE=true -e TS_STATE_DIR=/var/lib/tailscale -e TS_SOCKET=/tmp/tailscaled.sock -e TS_HOSTNAME=workspace1 -e TS_SERVE_CONFIG=/run/arca-tailnet/serve.json -e TS_ACCEPT_DNS=false -v {}:/var/lib/tailscale -v {}:/run/arca-tailnet:ro {}",
+            "run -d --name automagik-tailnet --network bridge --restart no --cap-drop ALL --security-opt no-new-privileges:true -e TS_AUTHKEY=file:/run/arca-tailnet/authkey -e TS_AUTH_ONCE=true -e TS_USERSPACE=true -e TS_STATE_DIR=/var/lib/tailscale -e TS_SOCKET=/tmp/tailscaled.sock -e TS_HOSTNAME=workspace1 -e TS_SERVE_CONFIG=/run/arca-tailnet/serve.json -e TS_ACCEPT_DNS=false -v {}:/var/lib/tailscale -v {}:/run/arca-tailnet:ro {}",
             workspace.dir.join("tailnet").display(),
             key_dir.display(),
             tailnet_image()
         )]
+    );
+    // The node has a network namespace of its own: it never joins the server's, where a Tailscale node in userspace
+    // networking would hand every port of the workspace's loopback to the tailnet. Its one way in is the private
+    // network, which it joins after it is made.
+    assert!(!workspace.runs("automagik-tailnet")[0].contains("container:"));
+    assert!(
+        workspace
+            .read("docker/calls.log")
+            .contains("network connect automagik-relay automagik-tailnet\n")
+    );
+    assert_eq!(
+        workspace
+            .read("docker/containers/automagik-tailnet/netmode")
+            .trim(),
+        "bridge"
     );
     // The node found the key in its file, without the line break; the file is its user's alone, and so is its
     // state, which is on the machine's disk and outlives the container.
@@ -995,12 +1031,14 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
     assert_eq!(mode("run/tailnet/authkey"), 0o400);
     assert_eq!(mode("run/tailnet"), 0o700);
     assert_eq!(mode("tailnet"), 0o700);
-    // All it serves: HTTPS on port 443 of its own tailnet name, every path to the gate. No other port, no Funnel.
+    // All it serves: HTTPS on port 443 of its own tailnet name, every path to the relay's address, which is not
+    // on any loopback. No other port, no Funnel.
     let serve = workspace.read("run/tailnet/serve.json");
     assert_eq!(
         serve,
-        "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"${TS_CERT_DOMAIN}:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:3082\"}}}}}\n"
+        "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"${TS_CERT_DOMAIN}:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://10.88.0.2:3082\"}}}}}\n"
     );
+    assert!(!serve.contains("127.0.0.1") && !serve.contains("localhost"));
     let parsed: Value = serde_json::from_str(&serve).expect("the serve file is JSON");
     assert_eq!(parsed.as_object().expect("an object").len(), 2);
     assert!(parsed.get("AllowFunnel").is_none());
@@ -1045,6 +1083,7 @@ fn with_reach_tailnet_the_node_takes_the_tunnels_place_and_the_gate_takes_its_fi
     });
     assert_eq!(workspace.runs("automagik-server").len(), 1);
     assert_eq!(workspace.runs("automagik-gate").len(), 1);
+    assert_eq!(workspace.runs("automagik-relay").len(), 1);
 
     // No connector, no published port, no host network, no Access setting; the gate's claim-only port is named
     // nowhere; the claim code's file is never read; and neither secret nor the code is in any output or command.
@@ -1098,7 +1137,7 @@ fn a_tailnet_node_that_is_not_logged_in_or_has_another_name_says_so() {
     workspace.end("automagik-tailnet", 1);
     says(
         &workspace,
-        "the tailnet node stopped (exit code 1); it is started again after a pause",
+        "the tailnet node stopped (exit code 1); it is started again after a pause. When it keeps stopping, the usual cause is a key the tailnet does not take (used already, expired or revoked): set TAILSCALE_AUTHKEY again",
     );
     wait_for(&workspace, "the second node", || {
         workspace.runs("automagik-tailnet").len() == 2
@@ -1145,6 +1184,76 @@ fn the_claim_code_has_one_reader_that_nothing_calls() {
 }
 
 #[test]
+fn without_the_access_settings_no_connector_is_started_beside_the_gate() {
+    // A gate without the Access settings signs nobody in through the tunnel, and waits for a first claim on a port
+    // of its own on the loopback a connector would share. So no connector is started, token or not: no route can
+    // then reach that port, or anything else.
+    let mut workspace = Workspace::new(&settings(URL));
+    workspace.secret(TOKEN);
+    workspace.start();
+    says(
+        &workspace,
+        "status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel is not started: without the Cloudflare Access settings nobody could sign in through it; reach cloudflare: public address https://team.example.org, with no Cloudflare Access settings, so nobody can sign in through the tunnel",
+    );
+    // The gate is still the server's only door, with none of the three Access names and no claim mode of ours.
+    let gate = workspace.runs("automagik-gate");
+    assert_eq!(gate.len(), 1);
+    assert!(gate[0].contains("-e AUTOMAGIK_GATE_ENABLED=1 -e AUTOMAGIK_GATE_ORIGIN=https://team.example.org -e AUTOMAGIK_GATE_PORT=3082 -v "));
+    assert!(!gate[0].contains("ACCESS") && !gate[0].contains("CLAIM"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(workspace.runs("automagik-tunnel").is_empty());
+    assert!(!workspace.dir.join("run/tunnel").exists());
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
+fn a_tailnet_node_outside_a_namespace_of_its_own_is_removed_and_never_called_serving() {
+    // A Tailscale node in userspace networking hands every port it does not serve to the loopback it lives on. So a
+    // node that joined the server's namespace (or the machine's) is removed on sight, with the reason, before
+    // anything is said of what it serves; no key is needed for that.
+    let mut workspace = Workspace::new(&tailnet_settings());
+    tailnet_status(&workspace, "Running", "workspace1.tail0example.ts.net.");
+    workspace.start();
+    says(&workspace, "the relay to the gate is started");
+    for mode in ["container:automagik-server", "host"] {
+        let node = workspace.dir.join("docker/containers/automagik-tailnet");
+        fs::create_dir_all(&node).expect("a node left from elsewhere");
+        fs::write(node.join("netmode"), format!("{mode}\n")).expect("its network");
+        fs::write(node.join("running"), "").expect("running");
+        says(
+            &workspace,
+            &format!(
+                "the tailnet node is not in a network namespace of its own ({mode}), where every loopback port it shares would be open to the tailnet: it is removed"
+            ),
+        );
+        wait_for(&workspace, "its removal", || !node.exists());
+    }
+    assert!(!workspace.output().contains("serves"));
+    assert!(workspace.runs("automagik-tailnet").is_empty());
+
+    // With its key the node is then started in a namespace of its own, and only that one is called serving.
+    workspace.secret_named("TAILSCALE_AUTHKEY", AUTHKEY);
+    says(
+        &workspace,
+        "the tailnet node is logged in and serves https://workspace1.tail0example.ts.net",
+    );
+    let runs = workspace.runs("automagik-tailnet");
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].contains(" --network bridge ") && !runs[0].contains("container:"));
+
+    // The relay ends: the node is logged in, and is not said to serve while its one way to the gate is down.
+    workspace.end("automagik-relay", 1);
+    says(
+        &workspace,
+        "the relay to the gate stopped (exit code 1); it is started again after a pause",
+    );
+    wait_for(&workspace, "the second relay", || {
+        workspace.runs("automagik-relay").len() == 2
+    });
+    assert_eq!(workspace.stop(), Some(0));
+}
+
+#[test]
 fn a_port_in_the_public_origin_is_taken_when_it_is_not_443() {
     let mut workspace = Workspace::new(&settings("https://team.example.org:8443"));
     workspace.start();
@@ -1158,7 +1267,7 @@ fn a_port_in_the_public_origin_is_taken_when_it_is_not_443() {
 
 #[test]
 fn a_docker_that_does_not_answer_leaves_every_running_container_alone() {
-    let mut workspace = Workspace::new(&settings(URL));
+    let mut workspace = Workspace::new(&settings_with_access(URL));
     workspace.secret(TOKEN);
     workspace.start();
     says(&workspace, "the tunnel is started from");
@@ -1204,7 +1313,7 @@ fn a_docker_that_does_not_answer_leaves_every_running_container_alone() {
 fn a_warning_beside_a_good_answer_from_docker_is_not_a_failure() {
     // Docker prints a warning on its standard error and answers all the same: the containers are seen as they
     // are, and all three start.
-    let mut workspace = Workspace::new(&settings(URL));
+    let mut workspace = Workspace::new(&settings_with_access(URL));
     fs::write(workspace.dir.join("docker/warn-inspect"), "").expect("the warning");
     workspace.secret(TOKEN);
     workspace.start();

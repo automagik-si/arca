@@ -6,13 +6,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 - The `automagik-workspace` template can be reached on a tailnet instead of through a Cloudflare Tunnel:
   `settings.reach` is `cloudflare` (as before, and when it is left out) or `tailnet`. With `tailnet` the machine
-  runs a Tailscale node (Tailscale's own image, by digest) in the server's network namespace, which serves HTTPS on
-  port 443 of the machine's tailnet name and hands every request to the gate; it serves nothing else and never
-  Funnel. Its one secret is `TAILSCALE_AUTHKEY`, handled like the tunnel's token, and the node's identity is kept
+  runs a Tailscale node (Tailscale's own image, by digest) in a network namespace of its own, which serves HTTPS on
+  port 443 of the machine's tailnet name, never Funnel, and reaches the gate through a relay on a private network
+  that leads to the gate's port alone. The node never shares the server's namespace, where it would hand every
+  loopback port of the workspace to the tailnet. Its one secret is `TAILSCALE_AUTHKEY`, handled like the tunnel's token, and the node's identity is kept
   on the machine's disk. The gate then signs its owner in itself, with passkeys, after a first claim; the keeper
   says whether the node is logged in, under which name, and whether the gate is claimed, and never reads the claim
   code. Arca does not yet hand that code to the owner. Both reaches now pin the Automagik server build that has
-  the passkey sign-in (`5fe0be6`). See "On a tailnet instead" in `docs/OPERATING.md`.
+  the passkey sign-in (`5fe0be6`). With the Cloudflare reach the connector is no longer started beside a gate that
+  has no Access settings, where nobody could sign in through it. See "On a tailnet instead" in `docs/OPERATING.md`.
 - A new shipped template, `automagik-workspace`: one Automagik workspace in its own virtual machine (2 CPUs, 4GiB,
   20GiB), published through a Cloudflare Tunnel whose connector runs inside the same machine. A keeper runs the
   Automagik server, its gate (the same image, the only door to the server) and the connector in one network

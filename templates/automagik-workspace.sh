@@ -28,11 +28,21 @@
 #   server's own sign-in (HTTP 401), and only its static files load. Nothing of the workspace can be used that way.
 #   That holds only while the route sends the visitor's own Host: a Host override to a loopback name on the route
 #   would make the server accept the request, past the gate. No route of a workspace sets one.
-#     automagik-tailnet  with reach "tailnet", in the tunnel's place: a Tailscale node, in userspace networking, that
-#                        serves HTTPS on port 443 of the machine's own tailnet name and hands every request to
-#                        http://127.0.0.1:3082, the gate. It serves nothing else: no other port, and never Funnel,
-#                        so the workspace is reachable from its tailnet alone. Its state is the machine's
-#                        /var/lib/automagik-workspace/tailnet, which keeps the node's identity across restarts.
+#   With reach "tailnet" there is no tunnel, and two containers stand in its place:
+#     automagik-tailnet  a Tailscale node, in userspace networking, IN A NETWORK NAMESPACE OF ITS OWN. It serves HTTPS
+#                        on port 443 of the machine's own tailnet name (never Funnel) and hands every request to the
+#                        relay. Its state is the machine's /var/lib/automagik-workspace/tailnet, which keeps the
+#                        node's identity across restarts.
+#     automagik-relay    the server image's node, in the server's namespace, copying bytes between one address on a
+#                        private Docker network (automagik-relay, internal, joined by the server and the node and
+#                        nothing else) and the gate's 127.0.0.1:3082. It is the only way from the node to the
+#                        workspace, and it leads to the gate's port alone.
+#   The node must never share the server's namespace. A Tailscale node in userspace networking passes every
+#   connection that reaches its tailnet address, on ANY port it does not serve itself, to 127.0.0.1 on that port (in
+#   Tailscale's source, wgengine/netstack: "case isTailscaleIP: dialIP = ipv4Loopback"). In the server's namespace
+#   that loopback is the workspace's: the server's own port, the gate's in plain http, and every loopback listener a
+#   program in the workspace opens would be open to the whole tailnet. In a namespace of its own the node's loopback
+#   holds nothing. The keeper removes a node it finds in the server's namespace and never calls such a node serving.
 #   Plain `docker run` gives this shape; Docker Compose is not installed.
 #
 #   With reach "tailnet" the gate signs its owner in itself, with passkeys. Its first owner claims it once, with a
@@ -91,6 +101,8 @@ SERVER=automagik-server
 GATE=automagik-gate
 TUNNEL=automagik-tunnel
 TAILNET=automagik-tailnet
+RELAY=automagik-relay
+RELAY_NET=automagik-relay
 
 # What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
 # them at commit 5fe0be6 (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs,
@@ -121,6 +133,11 @@ TUNNEL_IMAGE=docker.io/cloudflare/cloudflared@sha256:4955524aeaa379e154023d5a027
 TAILNET_IMAGE=docker.io/tailscale/tailscale@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
 TAILNET_STATE_DIR=/var/lib/tailscale
 TAILNET_SOCKET=/tmp/tailscaled.sock
+
+# The relay's whole program, for the server image's node: it listens on the one address and port it is given and
+# copies bytes to and from the same port on loopback. Bytes only: the visitor's Host header reaches the gate as the
+# node sent it.
+RELAY_PROGRAM='const net=require("net");const [ip,port]=process.argv.slice(1);net.createServer(c=>{const u=net.connect(Number(port),"127.0.0.1");c.on("error",()=>u.destroy());u.on("error",()=>c.destroy());c.pipe(u).pipe(c)}).listen(Number(port),ip)'
 
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
@@ -270,6 +287,9 @@ load_settings() {
   # closing slash, and a port only when it is not https's own 443.
   if [ "$url" = "$EXAMPLE_URL" ]; then
     PUBLIC_URL=''
+  elif [[ $url =~ ^https://[0-9.]+(:[0-9]*)?$ ]]; then
+    refuse "settings.publicUrl is a name, not an IP address: the gate takes none as its origin, and no passkey belongs to one"
+    return
   elif [[ $url =~ ^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:([1-9][0-9]{0,4}))?$ ]] &&
     port=${BASH_REMATCH[3]} && { [ -z "$port" ] || { [ "$port" -le 65535 ] && [ "$port" -ne 443 ]; }; }; then
     PUBLIC_URL=$url
@@ -385,9 +405,10 @@ keep_server() {
   case $state in
     running | unknown) return 0 ;;
   esac
-  docker rm -f "$GATE" "$TUNNEL" "$TAILNET" >/dev/null 2>&1
+  docker rm -f "$GATE" "$TUNNEL" "$RELAY" "$TAILNET" >/dev/null 2>&1
   rm -f "$WS_RUN/tunnel-token.sha256" "$WS_RUN/tailnet-key.sha256"
   REGISTERED=''
+  RELAY_IP=''
   if [ "$state" != absent ]; then
     say "the server stopped (exit code ${state#exited }); it is started again after a pause, and the gate and the $(reach_part) with it"
     docker rm -f "$SERVER" >/dev/null 2>&1
@@ -461,9 +482,17 @@ EMPTY_DIGEST=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 TUNNEL_TRIED=''
 REGISTERED=''
 
+# Whether a connector may run. A gate without the Access settings signs nobody in through the tunnel; it waits for
+# a first claim on a port of its own (3083) on the loopback the connector shares. No route may ever name that port,
+# so beside such a gate the connector is not started at all: there is nothing it could usefully reach.
+tunnel_has_a_door() {
+  [ -z "$PUBLIC_URL" ] || [ "$ACCESS_COUNT" -gt 0 ]
+}
+
 keep_tunnel() {
   local dir=$WS_RUN/tunnel digest state out
   [ "$REACH" = cloudflare ] || return 0
+  tunnel_has_a_door || return 0
   running "$SERVER" || return 0
   [ -e "$WS_SECRETS/TUNNEL_TOKEN" ] || return 0
   digest=$(token_digest)
@@ -512,19 +541,96 @@ keep_tunnel() {
 }
 
 TAILNET_TRIED=''
+RELAY_IP=''
 
-# The tailnet node, in the tunnel's place when settings.reach is "tailnet". It joins the server's namespace, so the
-# gate is on its loopback. Its serve file, written here, is all it serves: HTTPS on port 443 of its own tailnet name,
-# every path handed to the gate's port. There is no other port in it and no Funnel, and the gate's claim-only port
-# is never named. Tailscale's proxy keeps the visitor's Host header, which the gate needs, and carries WebSockets.
-keep_tailnet() {
-  local dir=$WS_RUN/tailnet digest state out
+# The server's address on the relay's private network; nothing when it has none.
+relay_address() {
+  docker inspect --type container -f "{{with index .NetworkSettings.Networks \"$RELAY_NET\"}}{{.IPAddress}}{{end}}" \
+    "$SERVER" 2>/dev/null | tr -cd '0-9.'
+}
+
+# The network mode Docker recorded for a container when it was made: "container:<name>" for one that joined
+# another's namespace.
+network_mode() {
+  docker inspect --type container -f '{{.HostConfig.NetworkMode}}' "$1" 2>/dev/null
+}
+
+# With reach "tailnet": the private network, the server's place on it, and the relay. The network is internal (no
+# way out of it and none in) and holds two addresses, the server's and the node's. The relay runs in the server's
+# namespace, where the gate's loopback is, and listens on the server's address on that network and nowhere else.
+keep_relay() {
+  local state out address
   [ "$REACH" = tailnet ] || return 0
   running "$SERVER" || return 0
+  state=$(state_of "$RELAY")
+  case $state in
+    unknown) return 0 ;;
+    running)
+      [ -n "$RELAY_IP" ] || RELAY_IP=$(relay_address)
+      return 0
+      ;;
+    exited*)
+      say "the relay to the gate stopped (exit code ${state#exited }); it is started again after a pause"
+      docker rm -f "$RELAY" >/dev/null 2>&1
+      failed relay
+      return 0
+      ;;
+  esac
+  due relay || return 0
+  RELAY_IP=''
+  if ! docker network inspect "$RELAY_NET" >/dev/null 2>&1 &&
+    ! out=$(docker network create --internal "$RELAY_NET" 2>&1 >/dev/null); then
+    failed relay
+    say "the relay to the gate did not start: its private network could not be made: $(last_line "$out")"
+    return 0
+  fi
+  address=$(relay_address)
+  if [ -z "$address" ]; then
+    out=$(docker network connect "$RELAY_NET" "$SERVER" 2>&1 >/dev/null)
+    address=$(relay_address)
+  fi
+  if ! [[ $address =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    failed relay
+    say "the relay to the gate did not start: the server has no address on its private network: $(last_line "${out-}")"
+    return 0
+  fi
+  say "starting the relay to the gate"
+  if out=$(docker run -d --name "$RELAY" --network "container:$SERVER" --restart no --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --entrypoint "$IMAGE_NODE" "$SERVER_IMAGE" \
+    -e "$RELAY_PROGRAM" "$address" "$GATE_PORT" 2>&1 >/dev/null); then
+    RELAY_IP=$address
+    proven relay
+    say "the relay to the gate is started: $address:$GATE_PORT on the private network, to the gate's loopback port"
+  else
+    docker rm -f "$RELAY" >/dev/null 2>&1
+    failed relay
+    say "the relay to the gate did not start: $(last_line "$out")"
+  fi
+}
+
+# The tailnet node, when settings.reach is "tailnet": in a network namespace of its own (see the head of this file
+# for why it must be), on Docker's default network for its way out to the tailnet and on the relay's private network
+# for its one way in to the workspace. Its serve file, written here, is all it serves: HTTPS on port 443 of its own
+# tailnet name, every path handed to the relay, which leads to the gate's port alone. There is no other port in it
+# and no Funnel. Tailscale's proxy keeps the visitor's Host header for such a target, which the gate needs, and
+# carries WebSockets.
+keep_tailnet() {
+  local dir=$WS_RUN/tailnet digest state out mode
+  [ "$REACH" = tailnet ] || return 0
+  running "$SERVER" || return 0
+  state=$(state_of "$TAILNET")
+  # A node that is not in a namespace of its own (one that joined the server's, or the machine's) is never left
+  # running, whatever else is true. Docker's own record of how it was made is what is asked.
+  mode=$(network_mode "$TAILNET")
+  if [ "$state" != absent ] && [ "$state" != unknown ] && [ -n "$mode" ] && [ "$mode" != bridge ]; then
+    say "the tailnet node is not in a network namespace of its own ($mode), where every loopback port it shares would be open to the tailnet: it is removed and started again in a namespace of its own"
+    docker rm -f "$TAILNET" >/dev/null 2>&1
+    rm -f "$WS_RUN/tailnet-key.sha256"
+    state=absent
+  fi
   [ -e "$WS_SECRETS/TAILSCALE_AUTHKEY" ] || return 0
   digest=$(secret_digest TAILSCALE_AUTHKEY)
   [ "$digest" != "$EMPTY_DIGEST" ] || return 0
-  state=$(state_of "$TAILNET")
   case $state in
     unknown) return 0 ;;
     running)
@@ -533,11 +639,13 @@ keep_tailnet() {
       docker rm -f "$TAILNET" >/dev/null 2>&1
       ;;
     exited*)
-      say "the tailnet node stopped (exit code ${state#exited }); it is started again after a pause"
+      say "the tailnet node stopped (exit code ${state#exited }); it is started again after a pause. When it keeps stopping, the usual cause is a key the tailnet does not take (used already, expired or revoked): set TAILSCALE_AUTHKEY again (service_secret_set, then instance_start)"
       docker rm -f "$TAILNET" >/dev/null 2>&1
       failed tailnet
       ;;
   esac
+  # The node is started only once its one way to the gate is there.
+  [ -n "$RELAY_IP" ] && running "$RELAY" || return 0
   # A key that was not tried yet does not wait for the pause its predecessor earned.
   [ "$digest" = "$TAILNET_TRIED" ] || proven tailnet
   due tailnet || return 0
@@ -548,7 +656,7 @@ keep_tailnet() {
     ! (umask 077 && tr -d '[:space:]' <"$WS_SECRETS/TAILSCALE_AUTHKEY" >"$dir/authkey.new") ||
     ! chown "$WS_TAILNET_OWNER" "$dir/authkey.new" || ! chmod 0400 "$dir/authkey.new" ||
     ! mv -f "$dir/authkey.new" "$dir/authkey" ||
-    ! (umask 077 && printf '%s\n' "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"\${TS_CERT_DOMAIN}:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:$GATE_PORT\"}}}}}" >"$dir/serve.json") ||
+    ! (umask 077 && printf '%s\n' "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"\${TS_CERT_DOMAIN}:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://$RELAY_IP:$GATE_PORT\"}}}}}" >"$dir/serve.json") ||
     ! chown "$WS_TAILNET_OWNER" "$dir/serve.json"; then
     rm -f "$dir/authkey.new"
     failed tailnet
@@ -556,13 +664,15 @@ keep_tailnet() {
     return 0
   fi
   say "starting the tailnet node (Docker downloads its image first when it is not on this machine yet)"
-  # The key is named by its file; with TS_AUTH_ONCE a node that is already logged in does not use it again.
-  if out=$(docker run -d --name "$TAILNET" --network "container:$SERVER" --restart no --cap-drop ALL \
+  # --network bridge: a namespace of its own, on Docker's default network. The key is named by its file; with
+  # TS_AUTH_ONCE a node that is already logged in does not use it again.
+  if out=$(docker run -d --name "$TAILNET" --network bridge --restart no --cap-drop ALL \
     --security-opt no-new-privileges:true \
     -e TS_AUTHKEY=file:/run/arca-tailnet/authkey -e TS_AUTH_ONCE=true -e TS_USERSPACE=true \
     -e "TS_STATE_DIR=$TAILNET_STATE_DIR" -e "TS_SOCKET=$TAILNET_SOCKET" -e "TS_HOSTNAME=$TAILNET_NAME" \
     -e TS_SERVE_CONFIG=/run/arca-tailnet/serve.json -e TS_ACCEPT_DNS=false \
-    -v "$WS_TAILNET_STATE:$TAILNET_STATE_DIR" -v "$dir:/run/arca-tailnet:ro" "$TAILNET_IMAGE" 2>&1 >/dev/null); then
+    -v "$WS_TAILNET_STATE:$TAILNET_STATE_DIR" -v "$dir:/run/arca-tailnet:ro" "$TAILNET_IMAGE" 2>&1 >/dev/null) &&
+    out=$(docker network connect "$RELAY_NET" "$TAILNET" 2>&1 >/dev/null); then
     printf '%s\n' "$digest" >"$WS_RUN/tailnet-key.sha256"
     say "the tailnet node is started from $TAILNET_IMAGE"
   else
@@ -658,13 +768,26 @@ look_at_tailnet() {
       return
       ;;
   esac
+  case $(network_mode "$TAILNET") in
+    bridge) ;;
+    '')
+      TUNNEL_STATE="Docker did not answer about the tailnet node"
+      return
+      ;;
+    *)
+      TUNNEL_STATE="the tailnet node is NOT in a network namespace of its own, so it is not serving: it is removed and started again"
+      return
+      ;;
+  esac
   status=$(docker exec "$TAILNET" tailscale --socket "$TAILNET_SOCKET" status --json 2>/dev/null)
   backend=$(printf '%s' "$status" | jq -r '.BackendState // empty' 2>/dev/null | tr -cd 'A-Za-z')
   name=$(printf '%s' "$status" | jq -r '.Self.DNSName // empty' 2>/dev/null | tr -cd 'a-z0-9.-')
   name=${name%.}
   case $backend in
     Running)
-      if [ "https://$name" = "$PUBLIC_URL" ]; then
+      if [ "https://$name" = "$PUBLIC_URL" ] && ! running "$RELAY"; then
+        TUNNEL_STATE="the tailnet node is logged in as $name, and the relay to the gate is not running"
+      elif [ "https://$name" = "$PUBLIC_URL" ]; then
         proven tailnet
         TUNNEL_STATE="the tailnet node is logged in and serves https://$name"
       else
@@ -694,6 +817,10 @@ claim_state() {
 look_at_tunnel() {
   if [ "$REACH" = tailnet ]; then
     look_at_tailnet
+    return
+  fi
+  if ! tunnel_has_a_door; then
+    TUNNEL_STATE="the tunnel is not started: without the Cloudflare Access settings nobody could sign in through it"
     return
   fi
   if [ ! -e "$WS_SECRETS/TUNNEL_TOKEN" ]; then
@@ -765,16 +892,23 @@ run_workspace() {
     nap "$WS_REFUSE_EVERY"
     [ -z "$STOP" ] || exit 0
   done
-  say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the $(reach_part), in one network namespace; $(public_state)"
+  if [ "$REACH" = tailnet ]; then
+    say "workspace $WS_NAME: the server and the gate on loopback port $GATE_PORT in one network namespace, and the tailnet node in one of its own, reaching the gate through the relay alone; $(public_state)"
+  else
+    say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the tunnel, in one network namespace; $(public_state)"
+  fi
   while [ -z "$STOP" ]; do
     keep_server
     keep_gate
+    keep_relay
     keep_tunnel
     keep_tailnet
     look_at_server
     look_at_gate
     look_at_tunnel
     state="$SERVER_STATE; $GATE_STATE; $TUNNEL_STATE; $(public_state)"
+    # A look that the stop interrupted says nothing: its answers were cut short.
+    [ -z "$STOP" ] || break
     if [ "$state" != "$last" ] || [ $(($(now) - said)) -ge "$WS_STATUS_EVERY" ]; then
       say "status: $state"
       last=$state
