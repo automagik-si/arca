@@ -14,7 +14,7 @@ command=${1-}
 
 # The name, the slice and the image of a `docker run` or `docker create`: the image is the first argument that is
 # neither an option nor an option's value.
-name='' cgroup_parent='' image='' jit_file='' tools_mounted='' command_line=''
+name='' cgroup_parent='' image='' jit_file='' tools_mounted='' home_mount='' command_line=''
 parse_run() {
   while [ $# -gt 0 ]; do
     case $1 in
@@ -24,6 +24,8 @@ parse_run() {
         case $2 in
           *:/run/arca/jitconfig:ro) jit_file=${2%:/run/arca/jitconfig:ro} ;;
           *:/home/runner/externals | *:/home/runner/externals:*) tools_mounted=1 ;;
+          *:/home/runner:ro) home_mount=${2%:/home/runner:ro} ;;
+          *:/home/runner) home_mount=${2%:/home/runner} ;;
         esac
         shift 2
         ;;
@@ -63,6 +65,8 @@ play_runner() {
         return
       fi
       echo "Runner will exit shortly for update, should be back online within 10 seconds." >>"$dir/log"
+      echo "Runner listener exit because of updating, re-launch runner after successful update" >>"$dir/log"
+      echo "Restarting runner..." >>"$dir/log"
       printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/updated" >/dev/null 2>&1
       echo "Listening for Jobs" >>"$dir/log"
       continue
@@ -97,6 +101,8 @@ case $command in
     if [ -e "$root/fail-run" ] && [ "$image" = "$(cat "$root/fail-run")" ]; then exit 125; fi
     mkdir -p "$dir"
     echo "$image" >"$dir/image"
+    # The host directory mounted as the runner's home, when one is: a real runner and its daemon share its files.
+    echo "$home_mount" >"$dir/home"
     : >"$dir/log"
     if [ -n "$cgroup_parent" ]; then
       # What the slot's slice would report after a job: a memory peak and the CPU time used.
