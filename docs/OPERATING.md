@@ -2920,8 +2920,12 @@ leftovers, the API host rule, and that no credential is in any output, file or c
 The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
 (`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
 machine after its install and names what is missing. No wait in these tests is without a bound, and none
-ends a controller with the `kill` program: the one in Ubuntu 24.04, which the pool's job image is, misreads a
-negative process number, and a failed test once waited for ever for a controller that program had not killed.
+ends a controller with the `kill` program. Given a negative number, to signal a process group, that program reads
+only the number's first digit in procps-ng up to 4.0.4: it signals another group or, when the digit is 1, every
+process of the user. A failed test once waited for ever for a controller that program had not killed. Ubuntu 24.04,
+which the pool's job image is, carries that version, and so does Debian 12; Debian 13, which the pool's own machine
+is, has the fix (4.0.4-9), as has procps-ng from 4.0.5. Nothing else in this repository signals a process group
+through that program: the scripts use their shell's own `kill`, and the other uses name one process.
 One test runs the first boot itself as far as a test can, with a
 stand-in `apt-get` and two programs left missing: it must stop, name the two, and say so on the console. No test here
 runs apt, so none can prove that the packages of `POOL_PACKAGES` bring those programs on a real Debian.

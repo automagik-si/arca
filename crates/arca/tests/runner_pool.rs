@@ -293,8 +293,11 @@ fn run_ok(command: &mut Command) {
 }
 
 /// Sends a signal to a process or, with a negative number, to a whole process group. bash's own `kill` does it and
-/// not the `kill` program: the one in Ubuntu 24.04 (procps-ng 4.0.4) reads only the first digit of a negative
-/// number, so it signals some other group, or, for a number that begins with 1, every process of the user.
+/// not the `kill` program. That program, from procps-ng up to 4.0.4, reads only the first digit of a negative number
+/// that follows a signal option: it signals some other group, or, for a number that begins with 1, every process of
+/// the user. Upstream fixed it in 4.0.5. Ubuntu 24.04, which the pool's job image is, carries it (4.0.4-4ubuntu3), and
+/// so does Debian 12 (4.0.2); Debian 13, which the pool's own machine is, does not (4.0.4-9 has the fix).
+/// It is bash and not `sh`: dash's `kill -KILL -- -<group>` refuses the `--` and signals nothing.
 fn signal(name: &str, target: i64) -> bool {
     try_finish(
         Command::new("bash")
