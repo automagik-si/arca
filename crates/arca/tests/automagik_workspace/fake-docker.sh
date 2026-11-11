@@ -8,8 +8,10 @@
 #   that one runs, as with Docker.
 # - A container given a directory at /run/arca-tunnel or /run/arca-tailnet records the digest of the token or auth
 #   key file it finds there, as proof that the secret reached it as a file.
-# - `docker network` keeps each network as a directory under $FAKE_DOCKER_DIR/networks. A running container that is
-#   connected to one gets the next address of 10.88.0.0/24 there, which `docker inspect` then answers.
+# - `docker network` keeps each network as a directory under $FAKE_DOCKER_DIR/networks, internal when it was made
+#   so. A running container that is connected to one gets the next address of 10.88.0.0/24 there, which
+#   `docker inspect` then answers.
+# - While $FAKE_DOCKER_DIR/fail-rm-<name> is there, `docker rm` leaves that container and fails.
 # - While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it does when the daemon cannot be
 #   reached; while warn-inspect is there it prints a warning beside its answer.
 # - `docker exec <name> tailscale ... status --json` prints $FAKE_DOCKER_DIR/tailnet-status.json (a node that is
@@ -99,18 +101,22 @@ case $command in
     shift
     case $action in
       inspect)
+        [ "${1-}" = -f ] && shift 2
         [ -d "$root/networks/$1" ] || {
           echo "Error response from daemon: network $1 not found" >&2
           exit 1
         }
+        if [ -e "$root/networks/$1/internal" ]; then echo true; else echo false; fi
         ;;
       create)
-        [ "${1-}" = --internal ] && shift
-        if [ -e "$root/fail-network" ]; then
-          cat "$root/fail-network" >&2
-          exit 1
-        fi
-        mkdir "$root/networks/$1"
+        internal=''
+        [ "${1-}" = --internal ] && internal=1 && shift
+        mkdir "$root/networks/$1" || exit 1
+        [ -z "$internal" ] || : >"$root/networks/$1/internal"
+        ;;
+      rm)
+        [ -d "$root/networks/$1" ] || exit 1
+        rm -rf "${root:?}/networks/$1"
         ;;
       connect)
         [ -d "$root/networks/$1" ] && [ -e "$root/containers/$2/running" ] || {
@@ -129,7 +135,14 @@ case $command in
     [ "${1-}" = -f ] && shift
     status=0
     for name in "$@"; do
-      if [ -d "$root/containers/$name" ]; then rm -rf "${root:?}/containers/$name"; else status=1; fi
+      if [ -e "$root/fail-rm-$name" ]; then
+        echo "Error response from daemon: cannot remove container \"/$name\"" >&2
+        status=1
+      elif [ -d "$root/containers/$name" ]; then
+        rm -rf "${root:?}/containers/$name"
+      else
+        status=1
+      fi
     done
     exit "$status"
     ;;

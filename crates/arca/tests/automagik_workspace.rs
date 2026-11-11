@@ -1210,42 +1210,90 @@ fn without_the_access_settings_no_connector_is_started_beside_the_gate() {
 fn a_tailnet_node_outside_a_namespace_of_its_own_is_removed_and_never_called_serving() {
     // A Tailscale node in userspace networking hands every port it does not serve to the loopback it lives on. So a
     // node that joined the server's namespace (or the machine's) is removed on sight, with the reason, before
-    // anything is said of what it serves; no key is needed for that.
+    // anything is said of what it serves.
     let mut workspace = Workspace::new(&tailnet_settings());
     tailnet_status(&workspace, "Running", "workspace1.tail0example.ts.net.");
+    // A network of the relay's name that is not internal is not the keeper's own: it is made again.
+    fs::create_dir_all(workspace.dir.join("docker/networks/automagik-relay")).expect("a network");
     workspace.start();
+    says(
+        &workspace,
+        "a Docker network named automagik-relay is there and is not internal: it is removed and made again",
+    );
     says(&workspace, "the relay to the gate is started");
-    for mode in ["container:automagik-server", "host"] {
-        let node = workspace.dir.join("docker/containers/automagik-tailnet");
+    let calls = workspace.read("docker/calls.log");
+    assert!(
+        calls.find("network rm automagik-relay\n").expect("removed")
+            < calls
+                .find("network create --internal automagik-relay\n")
+                .expect("made again")
+    );
+    assert!(
+        workspace
+            .dir
+            .join("docker/networks/automagik-relay/internal")
+            .exists()
+    );
+    let node = workspace.dir.join("docker/containers/automagik-tailnet");
+    let plant = |mode: &str| {
         fs::create_dir_all(&node).expect("a node left from elsewhere");
         fs::write(node.join("netmode"), format!("{mode}\n")).expect("its network");
         fs::write(node.join("running"), "").expect("running");
-        says(
-            &workspace,
-            &format!(
-                "the tailnet node is not in a network namespace of its own ({mode}), where every loopback port it shares would be open to the tailnet: it is removed"
-            ),
-        );
-        wait_for(&workspace, "its removal", || !node.exists());
-    }
-    assert!(!workspace.output().contains("serves"));
-    assert!(workspace.runs("automagik-tailnet").is_empty());
+    };
+    // One on the machine's own network, found before any key is there: removed.
+    plant("host");
+    says(
+        &workspace,
+        "the tailnet node is not in a network namespace of its own (host), where every loopback port it shares would be open to the tailnet: it is removed",
+    );
+    wait_for(&workspace, "its removal", || !node.exists());
 
-    // With its key the node is then started in a namespace of its own, and only that one is called serving.
+    // One in the server's namespace that Docker does not let go of, with its key there, logged in and under the
+    // right name: everything that would make a node serving. It is said to be NOT serving, for as long as it is
+    // there, and no node is started beside it.
+    fs::write(workspace.dir.join("docker/fail-rm-automagik-tailnet"), "").expect("the failure");
+    plant("container:automagik-server");
     workspace.secret_named("TAILSCALE_AUTHKEY", AUTHKEY);
+    says(
+        &workspace,
+        "the tailnet node is not in a network namespace of its own (container:automagik-server)",
+    );
+    says(
+        &workspace,
+        "the tailnet node is NOT in a network namespace of its own, so it is not serving: it is removed and started again",
+    );
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!workspace.output().contains("serves"));
+    assert!(node.exists());
+    assert!(
+        workspace
+            .runs("automagik-tailnet")
+            .iter()
+            .all(|line| line.contains(" --network bridge "))
+    );
+
+    // Docker lets go: the node is removed and started in a namespace of its own, and only that one serves.
+    fs::remove_file(workspace.dir.join("docker/fail-rm-automagik-tailnet")).expect("mended");
     says(
         &workspace,
         "the tailnet node is logged in and serves https://workspace1.tail0example.ts.net",
     );
-    let runs = workspace.runs("automagik-tailnet");
-    assert_eq!(runs.len(), 1);
-    assert!(runs[0].contains(" --network bridge ") && !runs[0].contains("container:"));
+    assert_eq!(
+        fs::read_to_string(node.join("netmode"))
+            .expect("the new node")
+            .trim(),
+        "bridge"
+    );
 
     // The relay ends: the node is logged in, and is not said to serve while its one way to the gate is down.
     workspace.end("automagik-relay", 1);
     says(
         &workspace,
         "the relay to the gate stopped (exit code 1); it is started again after a pause",
+    );
+    says(
+        &workspace,
+        "the tailnet node is logged in as workspace1.tail0example.ts.net, and the relay to the gate is not running",
     );
     wait_for(&workspace, "the second relay", || {
         workspace.runs("automagik-relay").len() == 2

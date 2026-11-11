@@ -559,7 +559,7 @@ network_mode() {
 # way out of it and none in) and holds two addresses, the server's and the node's. The relay runs in the server's
 # namespace, where the gate's loopback is, and listens on the server's address on that network and nowhere else.
 keep_relay() {
-  local state out address
+  local state out address internal
   [ "$REACH" = tailnet ] || return 0
   running "$SERVER" || return 0
   state=$(state_of "$RELAY")
@@ -578,8 +578,19 @@ keep_relay() {
   esac
   due relay || return 0
   RELAY_IP=''
-  if ! docker network inspect "$RELAY_NET" >/dev/null 2>&1 &&
-    ! out=$(docker network create --internal "$RELAY_NET" 2>&1 >/dev/null); then
+  # The network is the keeper's own making, and internal. One of that name that is not internal is not trusted to
+  # be private: it is removed and made again.
+  internal=$(docker network inspect -f '{{.Internal}}' "$RELAY_NET" 2>/dev/null)
+  if [ -n "$internal" ] && [ "$internal" != true ]; then
+    say "a Docker network named $RELAY_NET is there and is not internal: it is removed and made again"
+    if ! out=$(docker network rm "$RELAY_NET" 2>&1 >/dev/null); then
+      failed relay
+      say "the relay to the gate did not start: that network could not be removed: $(last_line "$out")"
+      return 0
+    fi
+    internal=''
+  fi
+  if [ -z "$internal" ] && ! out=$(docker network create --internal "$RELAY_NET" 2>&1 >/dev/null); then
     failed relay
     say "the relay to the gate did not start: its private network could not be made: $(last_line "$out")"
     return 0
