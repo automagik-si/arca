@@ -40,7 +40,7 @@ set -eu
 
 # The release this script installs. `--version` names another. This is not "the latest release": GitHub's address for
 # that skips pre-releases and answers 404 while every release of Arca is one.
-ARCA_VERSION=0.1.0-alpha.7
+ARCA_VERSION=0.8.0
 
 RELEASES=https://github.com/automagik-si/arca/releases
 GUIDE=https://github.com/automagik-si/arca/blob/dev/docs/OPERATING.md

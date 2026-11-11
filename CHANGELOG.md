@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.8.0 (2026-11-11)
+
 Releases are now cut by themselves: every change that lands on `dev` and ships is released, numbered and published
 without anyone writing a version or a tag. The numbers changed with it. A release is `0.N.P`, with no `alpha` word:
 `0.8.0` follows `0.1.0-alpha.7`, a change to what the binary is built from takes the next `N`, and a change that ships
@@ -104,6 +106,30 @@ stop unless it prints `arca-<version>-linux-x86_64: OK`.
   with no tool list reads both, as before. **If a scraper's token has a tool list, add the verb to it.**
 - `serve` binds the services socket only where every directory above it, too, belongs to the server's user or to root
   and cannot be written to by anyone else (a sticky directory such as `/tmp` may be above it).
+
+- the release build no longer takes the runner-pool template's /home/runner paths for a leak, and names any path it does refuse
+- versions are cut automatically: a push to dev that changes the product publishes a release with its program, its installer and their checksums
+- a short README with the logo and the diagram; the quickstart, the layout and the build notes move into docs (owner's wording, safety lines exact)
+- the workspace template takes its address, reach and sign-in settings at create, on the owner's card
+- a tenant's block filled by something else is the node's capacity, not the tenant's
+- the workspace template can be reached on a tailnet only, through a node in its own network and a relay to the gate
+- out-of-room and rate refusals have their own codes, say whose limit it was and when to try again
+- the approval card shows every element of a list setting; sizes, numbers and characters in settings are checked before approval
+- settings at create for templates that list them, the runner pool's follow-ups, and default sizes that fit
+- scripts/install.sh, one command that sets up a read-only node
+- a finished folder copy leaves the list before it is journalled; the tests that depended on a machine's speed or on downloaded crates no longer do
+- the runner pool's first boot installs the docker command and says what is missing; pool tests can no longer hang; every CI job has a limit
+- the read-only web routes follow a token's tool list; the services socket checks the directories above it; a rebuilt record follows the device (security re-check SHIP)
+- a template may give its service access to the kernel, through a socket that serves the token-protected API alone
+- automagik-workspace, one Automagik workspace in its own virtual machine behind its gate and a tunnel
+- the README opens with what Arca is, what works today and what does not yet (wording from the page's fact table)
+- a link to a project that does not exist always lands on the default project
+- Merge pull request #1 from automagik-si/fix/ci-timing-tests
+- service_create takes start: false and creates the service stopped
+- the Open Intelligence tag of we unfold, one colour, in the READMEs and in the pages' footers
+- a virtual machine in a tenant has its stored secrets written into its guest
+- the repository's own CI on Arca's runner pool for trusted events, hosted runners for the rest; a bench against GitHub's runners
+- a virtual machine takes a first-boot script, settings and secrets; github-runner-pool template
 
 ## 0.1.0-alpha.7
 
