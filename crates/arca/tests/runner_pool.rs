@@ -25,9 +25,9 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -214,13 +214,139 @@ impl Github {
     }
 }
 
+/// The seconds a helper program is given, and the seconds the whole file is given. No wait in this file is without a
+/// bound: a test that hangs holds a runner of the pool until somebody cancels the job.
+const HELPER_SECONDS: u64 = 60;
+const FILE_SECONDS: u64 = 600;
+
+/// The controllers that are running, by process id, so the bound on the whole file can end them.
+static CONTROLLERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Runs a helper program to its end and returns what it wrote, or says why not once `seconds` have passed.
+fn try_finish(command: &mut Command, seconds: u64) -> Result<Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("did not start: {error}"))?;
+    let (sender, receiver) = mpsc::channel();
+    let mut stdout = child.stdout.take().expect("the output");
+    let mut stderr = child.stderr.take().expect("the errors");
+    let errors = sender.clone();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = sender.send((true, bytes));
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        let _ = errors.send((false, bytes));
+    });
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => return Err(format!("could not be waited for: {error}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.try_wait();
+            return Err(format!("did not end within {seconds} seconds"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    for _ in 0..2 {
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok((true, bytes)) => output.stdout = bytes,
+            Ok((false, bytes)) => output.stderr = bytes,
+            Err(_) => {
+                return Err(
+                    "ended, and its output did not: something it started still holds it"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Runs a helper program to its end, or fails the test with `what` and the reason.
+fn finish(command: &mut Command, what: &str) -> Output {
+    try_finish(command, HELPER_SECONDS).unwrap_or_else(|why| panic!("{what} {why}"))
+}
+
 fn run_ok(command: &mut Command) {
-    let output = command.output().expect("the command runs");
+    let output = finish(command, &format!("{command:?}"));
     assert!(
         output.status.success(),
         "{command:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Sends a signal to a process or, with a negative number, to a whole process group. bash's own `kill` does it and
+/// not the `kill` program: the one in Ubuntu 24.04 (procps-ng 4.0.4) reads only the first digit of a negative
+/// number, so it signals some other group, or, for a number that begins with 1, every process of the user.
+fn signal(name: &str, target: i64) -> bool {
+    try_finish(
+        Command::new("bash")
+            .arg("-c")
+            .arg(format!("kill -{name} -- {target}")),
+        HELPER_SECONDS,
+    )
+    .is_ok_and(|output| output.status.success())
+}
+
+/// Ends a controller with everything in its process group, and waits for it, but not for ever.
+fn end_controller(child: &mut Child) {
+    let id = child.id();
+    signal("KILL", -i64::from(id));
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "the controller {id} was still there 10 seconds after it was killed; it is left behind"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    CONTROLLERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|pid| *pid != id);
+}
+
+/// The bound on the whole file. Every wait below has its own bound and its own words; this one is for a wait nobody
+/// thought of. It ends the controllers that are running and then the test program, and says so.
+fn bound_the_file() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(FILE_SECONDS));
+            eprintln!(
+                "the runner pool tests were still running after {FILE_SECONDS} seconds: a wait in \
+                 crates/arca/tests/runner_pool.rs has no bound. Ending the controllers and the tests"
+            );
+            let running = CONTROLLERS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for pid in running {
+                signal("KILL", -i64::from(pid));
+            }
+            std::process::exit(1);
+        });
+    });
 }
 
 fn serve(mut stream: TcpStream, state: &Mutex<State>, scratch: &Path) {
@@ -311,14 +437,16 @@ fn jwt_ok(state: &Mutex<State>, scratch: &Path, jwt: &str) -> bool {
     let signature_file = scratch.join(format!("jwt-{id}.sig"));
     fs::write(&signed, format!("{head}.{claims}")).expect("the signed text");
     fs::write(&signature_file, signature_bytes).expect("the signature");
-    let verified = Command::new("openssl")
-        .args(["dgst", "-sha256", "-verify"])
-        .arg(&public)
-        .arg("-signature")
-        .arg(&signature_file)
-        .arg(&signed)
-        .output()
-        .is_ok_and(|output| output.status.success());
+    let verified = try_finish(
+        Command::new("openssl")
+            .args(["dgst", "-sha256", "-verify"])
+            .arg(&public)
+            .arg("-signature")
+            .arg(&signature_file)
+            .arg(&signed),
+        HELPER_SECONDS,
+    )
+    .is_ok_and(|output| output.status.success());
     let _ = fs::remove_file(signed);
     let _ = fs::remove_file(signature_file);
     verified
@@ -536,11 +664,12 @@ fn script() -> PathBuf {
 
 /// Where this machine has `tool`, if it has it.
 fn on_this_machine(tool: &str) -> Option<PathBuf> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {tool}"))
-        .output()
-        .expect("sh");
+    let output = finish(
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}")),
+        "sh, asked where a program is,",
+    );
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && path.starts_with('/')).then(|| PathBuf::from(path))
 }
@@ -627,6 +756,7 @@ impl Pool {
     /// A scratch machine: the settings as cloud-init would have written them, an empty secrets directory, and the
     /// stand-ins on the controller's `PATH`. Nothing runs yet.
     fn new(settings: &Value, memory_total: u64, memory_available: u64) -> Pool {
+        bound_the_file();
         for tool in ["bash", "jq", "openssl", "flock"] {
             which(tool);
         }
@@ -740,29 +870,38 @@ impl Pool {
             .process_group(0)
             .spawn()
             .expect("the controller starts");
+        CONTROLLERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(child.id());
         self.child = Some(child);
     }
 
     /// Stops the controller as systemd does, with SIGTERM, and returns its exit code.
     fn stop(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
-        run_ok(
-            Command::new("kill")
-                .arg("-TERM")
-                .arg(child.id().to_string()),
-        );
+        let sent = signal("TERM", i64::from(child.id()));
         let deadline = Instant::now() + Duration::from_secs(20);
         let code = loop {
             if let Some(status) = child.try_wait().expect("the controller's status") {
                 break status.code();
             }
-            assert!(
-                Instant::now() < deadline,
-                "the controller did not stop:\n{}",
-                self.output()
-            );
+            if !sent || Instant::now() >= deadline {
+                // It is not left behind, and the test does not wait for it any longer.
+                end_controller(&mut child);
+                panic!(
+                    "the controller did not stop within 20 seconds of SIGTERM (signal sent: {sent}):\n{}",
+                    self.output()
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
         };
+        // What it left in its process group goes too: a pause it had started outlives it otherwise.
+        signal("KILL", -i64::from(child.id()));
+        CONTROLLERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|pid| *pid != child.id());
         let strays = self.read("not-found.log");
         assert!(
             strays.is_empty(),
@@ -831,12 +970,10 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        // A test that failed comes here with its controller still running. Nothing here may wait without a bound:
+        // this once waited for a controller that a `kill` program had not killed, and the job never ended.
         if let Some(mut child) = self.child.take() {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{}", child.id()))
-                .output();
-            let _ = child.wait();
+            end_controller(&mut child);
         }
         // A played runner ends when its container's directory is gone.
         let _ = fs::remove_dir_all(&self.dir);
@@ -1313,20 +1450,31 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
         github.queue(&["arca"], &format!("job-{n}"), 0.2);
     }
     wait_for(&pool, "eight finished jobs", || pool.jobs().len() == 8);
+    // The slot that waited gets the place a finished job frees. Whether its runner is ready before the other three
+    // have taken all eight jobs is a matter of timing, so jobs are given one at a time until it has had one.
+    let mut more = 0;
+    wait_for(&pool, "every slot to take its turn under the cap", || {
+        let mut slots: Vec<String> = pool.jobs().iter().map(|job| job[1].clone()).collect();
+        slots.sort();
+        slots.dedup();
+        if slots == ["0", "1", "2", "3"] {
+            return true;
+        }
+        if pool.jobs().len() == 8 + more {
+            github.queue(&["arca"], &format!("more-{more}"), 0.2);
+            more += 1;
+        }
+        false
+    });
+    wait_for(&pool, "the jobs that were given", || {
+        pool.jobs().len() == 8 + more
+    });
     assert_eq!(github.state().live_max, 3);
-    let mut slots: Vec<String> = pool.jobs().iter().map(|job| job[1].clone()).collect();
-    slots.sort();
-    slots.dedup();
-    assert_eq!(
-        slots,
-        ["0", "1", "2", "3"],
-        "every slot took its turn under the cap"
-    );
     // The job file is bounded: past its limit it is set aside once, with its header written again, and the summary
     // still counts the jobs in both.
+    let counted = format!("class small last {} jobs:", 8 + more);
     wait_for(&pool, "the summary over both job files", || {
-        pool.read("logs/status.txt")
-            .contains("class small last 8 jobs:")
+        pool.read("logs/status.txt").contains(&counted)
     });
     let aside = pool.read("logs/jobs.tsv.1");
     assert!(
@@ -1596,10 +1744,11 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_registered() {
         pool.secret("GITHUB_TOKEN", PAT);
         pool.start(&github);
         wait_for(&pool, why, || pool.output().contains(why));
-        assert!(
+        // Its next line, which is written a moment later: waited for, not read once.
+        wait_for(&pool, "the line that says the pool does not start", || {
             pool.output()
                 .contains("the pool does not start until its settings are right")
-        );
+        });
         pool.stop();
     }
     assert!(github.state().seen.is_empty());
@@ -1753,19 +1902,20 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_
     // The positive control of every other test in this file: bash does report a program it does not find.
     let scratch = scratch_dir();
     let record = scratch.join("not-found.log");
-    let control = Command::new(which("bash"))
-        .arg("-c")
-        .arg("no-such-program-of-this-test 2>/dev/null; true")
-        .envs(report_missing_programs(&record))
-        .output()
-        .expect("bash");
+    let control = finish(
+        Command::new(which("bash"))
+            .arg("-c")
+            .arg("no-such-program-of-this-test 2>/dev/null; true")
+            .envs(report_missing_programs(&record)),
+        "bash, asked for a program that does not exist,",
+    );
     assert!(control.status.success());
     assert_eq!(
         fs::read_to_string(&record).unwrap_or_default(),
         "no-such-program-of-this-test\n"
     );
 
-    let uid = Command::new("id").arg("-u").output().expect("id");
+    let uid = finish(Command::new("id").arg("-u"), "id");
     if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
         eprintln!(
             "as root the first boot is not run here: it would install itself on this machine"
@@ -1783,13 +1933,13 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_
         ),
     );
     let console = scratch.join("console");
-    let boot = Command::new(tools.join("bash"))
-        .arg(script())
-        .env("PATH", &tools)
-        .env("POOL_CONSOLE", &console)
-        .stdin(Stdio::null())
-        .output()
-        .expect("the first boot runs");
+    let boot = finish(
+        Command::new(tools.join("bash"))
+            .arg(script())
+            .env("PATH", &tools)
+            .env("POOL_CONSOLE", &console),
+        "the first boot",
+    );
     let said = String::from_utf8_lossy(&boot.stdout).into_owned();
     let refusal = format!(
         "arca-runner-pool: first boot failed: these commands are missing after the install: docker jq. The packages \
@@ -1821,6 +1971,7 @@ fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_
 }
 
 fn scratch_dir() -> PathBuf {
+    bound_the_file();
     let scratch = std::env::temp_dir().join(format!(
         "arca-runner-pool-gh-{}-{}",
         std::process::id(),

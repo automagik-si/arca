@@ -2919,7 +2919,10 @@ leftovers, the API host rule, and that no credential is in any output, file or c
 
 The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
 (`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
-machine after its install and names what is missing. One test runs the first boot itself as far as a test can, with a
+machine after its install and names what is missing. No wait in these tests is without a bound, and none
+ends a controller with the `kill` program: the one in Ubuntu 24.04, which the pool's job image is, misreads a
+negative process number, and a failed test once waited for ever for a controller that program had not killed.
+One test runs the first boot itself as far as a test can, with a
 stand-in `apt-get` and two programs left missing: it must stop, name the two, and say so on the console. No test here
 runs apt, so none can prove that the packages of `POOL_PACKAGES` bring those programs on a real Debian.
 
@@ -3127,6 +3130,9 @@ two slots of each, `standard` with 2 CPUs and 4GiB and `large` with 6 CPUs and 1
 same time once the machine has memory for all four slots ("Sizing so that every slot fits"). Those are not the
 shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the two CPU numbers
 (`CI_SLOT_CPUS`); change them there when the pool's classes change.
+
+Every job has a time limit, 30 minutes for `cargo test` and 15 for the others: a job that hangs gives its slot back
+then, and without a limit GitHub lets it hold the slot for six hours.
 
 A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs what is missing first: the
 toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's virtual machine and not its
