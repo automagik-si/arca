@@ -453,9 +453,50 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             .as_deref()
             .is_some_and(|text| text.contains("cloudflared 2026.10.7"))
     );
-    // The shipped address is nobody's and the Access settings ship empty. The same settings start the keeper, which
-    // starts the server alone, with nothing of them in its environment, and says that no gate is started.
-    assert_eq!(settings["publicUrl"], "https://workspace.example.com");
+    // A create gives a workspace its own reach, address and Access settings, and nothing else: the image a
+    // workspace runs is the template's to pin, never a create's to choose. The address ships empty, since a default
+    // that is an https address would hold every create to its host.
+    assert_eq!(
+        template.create_settings,
+        [
+            "reach",
+            "publicUrl",
+            "accessTeamDomain",
+            "accessAudience",
+            "accessEmails"
+        ]
+    );
+    let created = arca::service::create_settings(
+        &template,
+        Some(&json!({
+            "reach": "tailnet",
+            "publicUrl": TAILNET_URL,
+            "accessEmails": ["owner@example.com"]
+        })),
+    )
+    .expect("a create may give these")
+    .merged
+    .expect("the merged settings");
+    assert_eq!(
+        (
+            &created["reach"],
+            &created["publicUrl"],
+            &created["accessEmails"]
+        ),
+        (
+            &json!("tailnet"),
+            &json!(TAILNET_URL),
+            &json!(["owner@example.com"])
+        )
+    );
+    assert_eq!(created["serverImage"], settings["serverImage"]);
+    assert!(
+        arca::service::create_settings(&template, Some(&json!({ "serverImage": SERVER_IMAGE })))
+            .is_err()
+    );
+    // The address and the Access settings ship empty. The same settings start the keeper, which starts the server
+    // alone, with nothing of them in its environment, and says that no gate is started.
+    assert_eq!(settings["publicUrl"], "");
     assert_eq!(
         (
             &settings["accessTeamDomain"],
@@ -468,7 +509,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     workspace.start();
     says(
         &workspace,
-        "status: the server is healthy (HTTP 401 on its loopback port 3081); no gate is started, because no public address is set (settings.publicUrl is the template's example); the tunnel waits for TUNNEL_TOKEN",
+        "status: the server is healthy (HTTP 401 on its loopback port 3081); no gate is started, because no public address is set (settings.publicUrl is empty); the tunnel waits for TUNNEL_TOKEN",
     );
     assert_eq!(
         workspace.runs("automagik-server"),
@@ -743,7 +784,7 @@ fn a_part_that_is_not_healthy_and_a_start_that_fails_are_said_in_words() {
 #[test]
 fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
     let access = |team: &str, audience: &str, emails: Value| json!({ "accessTeamDomain": team, "accessAudience": audience, "accessEmails": emails });
-    let cases: [(Value, &str); 24] = [
+    let cases: [(Value, &str); 25] = [
         (
             json!({ "serverImage": "registry.example/server:latest" }),
             "settings.serverImage is an image by digest",
@@ -836,10 +877,15 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
         (
             {
                 let mut value = access(ACCESS_TEAM, ACCESS_AUDIENCE, json!(["owner@example.com"]));
-                value["publicUrl"] = json!("https://workspace.example.com");
+                value["publicUrl"] = json!("");
                 value
             },
             "the Cloudflare Access settings need settings.publicUrl",
+        ),
+        // An address that is not text is not "not set".
+        (
+            json!({ "publicUrl": 5 }),
+            "settings.publicUrl is the workspace's exact public origin",
         ),
         // The gate takes no IP address as its origin, and no passkey belongs to one.
         (
@@ -852,7 +898,8 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
             "settings.reach is how the workspace is reached: \"cloudflare\" (a Cloudflare Tunnel; also when it is left out) or \"tailnet\"",
         ),
         // On a tailnet the address is the machine's own tailnet name, on port 443 and no other, and never the
-        // template's example; and the gate signs its owner in itself, so the Access settings have no place.
+        // empty address the template ships; and the gate signs its owner in itself, so the Access settings have no
+        // place.
         (
             json!({ "reach": "tailnet" }),
             "with settings.reach \"tailnet\", settings.publicUrl is the machine's own tailnet address: https://<machine>.<tailnet>.ts.net",
@@ -862,7 +909,7 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_started() {
             "in lower case, with no port and no path",
         ),
         (
-            json!({ "reach": "tailnet", "publicUrl": "https://workspace.example.com" }),
+            json!({ "reach": "tailnet", "publicUrl": "" }),
             "settings.publicUrl is the machine's own tailnet address",
         ),
         (
