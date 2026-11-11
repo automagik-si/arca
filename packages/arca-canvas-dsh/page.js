@@ -2565,7 +2565,8 @@ ${statement}`)
       const previous = state.project ? selectDashboardProject(state.project.name) : null;
       const hashedName = parseProjectHash(location.hash);
       const hashed = hashedName ? selectDashboardProject(hashedName) : null;
-      const project = hashed ?? previous ?? state.dashboard.defaultProject ?? state.dashboard.projects[0] ?? null;
+      const shown = hashedName && !hashed ? null : previous;
+      const project = hashed ?? shown ?? state.dashboard.defaultProject ?? state.dashboard.projects[0] ?? null;
       state.project = project;
       if (project) {
         const hash = projectHash(project);
