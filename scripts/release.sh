@@ -2,7 +2,8 @@
 # Build the release assets of Automagik Arca for the tag checked out here, and print the command that would publish them.
 #
 #   scripts/release.sh              from a clean tree whose HEAD is the tag v<version>
-#   scripts/release.sh --rehearse   the same, without the tag: for trying the script before the tag exists
+#   scripts/release.sh --rehearse   builds and checks the same files without the tag, to try the script before the
+#                                   tag exists; it prints no publish command
 #
 # It publishes nothing and writes nothing to the network of its own: it does not create the tag, push, or run `gh`. The
 # only downloads are the two pinned build tools that scripts/build-portable.sh fetches on its first run.
@@ -16,7 +17,7 @@
 #   3. checks that the binary answers `--version` with this version and this commit;
 #   4. writes dist/arca-<version>-linux-x86_64, dist/SHA256SUMS and dist/RELEASE-NOTES.md (this version's CHANGELOG.md
 #      section);
-#   5. prints the `gh release create` command for those files.
+#   5. prints the `gh release create` command for those files (not with --rehearse).
 #
 # Run one cargo build at a time on a shared build machine: this script starts one.
 set -euo pipefail
@@ -103,6 +104,11 @@ echo "          dist/SHA256SUMS"
 echo "          dist/RELEASE-NOTES.md"
 echo "sha256:   $(cut -d ' ' -f 1 "$dist/SHA256SUMS")"
 echo
+if [ "$rehearse" = 1 ]; then
+    echo "Nothing was published. This was a rehearsal, so no publish command is printed:"
+    echo "run scripts/release.sh without --rehearse, at the tag $tag, to get it."
+    exit 0
+fi
 echo "Nothing was published. To publish, push the tag $tag, then run:"
 echo
 echo "  gh release create $tag --repo automagik-si/arca --verify-tag --prerelease \\"

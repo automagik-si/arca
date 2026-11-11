@@ -172,5 +172,5 @@ It prints the zig it used, the binary's path, its SHA-256 and the highest GLIBC 
 (the version is the one under `[workspace.package]` in `Cargo.toml`), it runs `scripts/build-portable.sh`, checks that the
 binary's `--version` names that version and commit, and writes `dist/arca-<version>-linux-x86_64`, `dist/SHA256SUMS` and
 `dist/RELEASE-NOTES.md` (that version's section of `CHANGELOG.md`). It then prints the `gh release create` command for
-those files and the glibc the binary needs; it does not run it. `scripts/release.sh --rehearse` does the same without the
-tag, to try the script before the tag exists.
+those files and the glibc the binary needs; it does not run it. `scripts/release.sh --rehearse` builds and checks the
+same files without the tag, to try the script before the tag exists, and prints no publish command.
