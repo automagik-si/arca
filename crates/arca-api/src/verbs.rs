@@ -2163,6 +2163,34 @@ pub fn service_view_schema() -> Value {
                 "maxItems": 16,
                 "type": "array"
             },
+            "kernelAccess": {
+                "additionalProperties": false,
+                "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
+                "properties": {
+                    "connect": {
+                        "description": "The path of the socket on the host its device connects to: the node's listen.services as it was when the service was created.",
+                        "maxLength": 100,
+                        "type": "string"
+                    },
+                    "port": {
+                        "description": "The port inside the instance, on its loopback.",
+                        "maximum": 65535,
+                        "minimum": 1024,
+                        "type": "integer"
+                    },
+                    "problem": {
+                        "description": "service_status only, when ready is false: what does not stand as recorded.",
+                        "maxLength": 512,
+                        "type": "string"
+                    },
+                    "ready": {
+                        "description": "service_status only: whether the instance carries the device as Arca made it and this server's listen.services is still the socket it connects to.",
+                        "type": "boolean"
+                    }
+                },
+                "required": ["port", "connect"],
+                "type": "object"
+            },
             "lanPort": {
                 "anyOf": [
                     { "maximum": 65535, "minimum": 1, "type": "integer" },
@@ -2371,6 +2399,15 @@ fn service_create_params_base() -> Value {
                 "description": "For a virtual-machine template on a host bridge: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one. Refused on the managed service network.",
                 "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
                 "type": "string"
+            },
+            "kernelAccess": {
+                "additionalProperties": false,
+                "description": "Only for a template that declares kernelAccess: the template's own kernelAccess. A proposal made with action_propose fills it in from the template, so the owner's approval binds it and the owner's card says it; a caller has no need to state it. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, and on a node that sets no listen.services.",
+                "properties": {
+                    "port": { "maximum": 65535, "minimum": 1024, "type": "integer" }
+                },
+                "required": ["port"],
+                "type": "object"
             },
             "start": {
                 "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, and inside a tenant they are not written yet (the start is refused with InstanceSecretsNotWritten and the machine stays running without them).",

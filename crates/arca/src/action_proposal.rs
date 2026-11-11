@@ -285,6 +285,11 @@ impl ActionKind {
                 if args.get("mac").is_some() {
                     rows.push(row("MAC address", text("mac")));
                 }
+                // The template gives this service access to the kernel. The proposal names it (it is filled in from
+                // the template when the proposal is made), so the approval binds it and the card says it in words.
+                if let Some(port) = args["kernelAccess"]["port"].as_u64() {
+                    rows.push(row("Kernel access", &kernel_access_words(port)));
+                }
                 // The row says what will happen, so the owner approves a stopped service knowingly: a create that
                 // said `start: false`, and one whose template is created stopped whatever the call says (the reason
                 // is read from the template when the proposal is made, and is not in its arguments).
@@ -529,6 +534,12 @@ impl ActionKind {
                 format!("Remove everything the deploy {} created", text("deploy"))
             }
         };
+        // A service that can call the kernel is named as one.
+        let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {
+            format!("{sentence} with access to this node's kernel")
+        } else {
+            sentence
+        };
         // A service created stopped is named as one: nothing of it runs until it is started.
         let sentence =
             if self == Self::ServiceCreate && args.get("start") == Some(&Value::Bool(false)) {
@@ -543,6 +554,13 @@ impl ActionKind {
             _ => sentence,
         }
     }
+}
+
+/// The `Kernel access` row of a `service_create` whose template declares `kernelAccess`, in the owner's words.
+pub fn kernel_access_words(port: u64) -> String {
+    format!(
+        "Yes: this service can call this node's kernel from inside, at http://127.0.0.1:{port}/mcp, with whatever token it is given. The token's scope and tool list decide what it may do, and a call without a token is refused."
+    )
 }
 
 /// What a `service_create` proposal's `start` means, in the owner's words.

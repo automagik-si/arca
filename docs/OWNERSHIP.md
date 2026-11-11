@@ -1295,6 +1295,60 @@ Source: `open_deploy`, `deploys`, `Deploy::provisional` and `TenantHandler::depl
 `the_front_reaches_only_ordinary_services_and_follows_a_front_that_is_made_again` in
 `crates/arca/tests/tenants/deploys.rs`.
 
+## A service that may talk to the kernel
+
+**Rule 69.** Only a container of the node's own service project may be given a way to the kernel's MCP, and the way
+gives no authority. A template declares it with `kernelAccess: { "port" }`. The service's record then names the port and
+the socket, and its instance is created with one device, `kernel`: a proxy that listens inside the instance
+(`bind=instance`) on `127.0.0.1:<port>` and connects from the host to the node's services socket (`listen.services`).
+No ACL rule and no NIC key changes for it, and the kernel's own unix socket is as it was: the service's NIC still
+rejects the bridge gateway, as every service's does, and the device's traffic reaches no bridge and no host port.
+
+The services socket serves the MCP routes alone, each behind a bearer token, on every node and under every config. The
+approval page, whose routes need no token, is merged into the routers of the other listeners and never into this one,
+so a device can only ever reach a listener that cannot serve the page. Three checks keep a device on that socket and on
+no other. A create takes the device's path from `listen.services` and from nowhere else. The plugin refuses a record
+that names kernel access in a tenant, in another project, on a virtual machine, on a port below 1024 or one of the
+service's own, or to anything but a plain absolute socket path, whatever wrote the record. And `serve` refuses to start
+while any service's record names a socket the config does not serve as `listen.services`.
+
+A create is refused before any write when the call names a tenant, when the node sets no `listen.services`, and when it
+does not run from a proposal the owner approved: a direct `service_create` of such a template is `NotApproved` for a
+token of any scope. The proposal states the template's `kernelAccess`, so the owner's approval binds it and the card
+says it in words; an approval given before the template declared it, or for another port, creates nothing. A tenant's
+project blocks proxy devices as well (Rule 62). The socket answers 401 to a call without a token and holds a token to
+its scope and tool list, as every listener does, so a process in the instance may do exactly what the token it holds
+allows. The device is part of the instance: it is created with it, and removed with it (Rule 66). A record made again
+from an instance's marks reads the device back, for an instance of the node's own project alone.
+
+The socket is mode 0600 in a directory only the server's user (or root) may write to, and it serves that user and
+root: Incus connects as root. No other local user reaches it, and it has no port another process could take while the
+server is down. Root is served because Incus is root, and root already holds everything the kernel guards.
+Source: `KernelAccess`, `KernelLink`, `kernel_device`, `kernel_link_of`, `kernel_connect_ok`, `Service::apply` and
+`validate_template` in `crates/arca/src/service.rs`; `ListenConfig::services`, `NodeConfig::kernel_access` and `check`
+in `crates/arca/src/config.rs`; `kernel_access_for`, `kernel_access_refusal`, `enrich_service_create`,
+`ActionExecutor::run`, `adopted_config` and the `service_create` and `service_status` arms of `ServiceHandler` in
+`crates/arca/src/handlers.rs`; `kernel_access_words` in `crates/arca/src/action_proposal.rs`; `mcp`, `serve_services`,
+`services_path_ok` and `owner_admitted` in `crates/arca-mcp/src/http.rs`; `check_bridged_start` and the
+`services_router` of `crates/arca/src/cmd_serve.rs`. Tests in `crates/arca/tests/tenants/kernel_access.rs`
+(`a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_acl_rule_for_it`,
+`an_ordinary_template_gets_no_such_device_and_cannot_ask_for_one`,
+`nothing_in_a_tenant_gets_kernel_access_and_no_verb_installs_a_template`,
+`a_node_gives_kernel_access_only_through_its_services_socket`,
+`the_device_connects_to_the_services_socket_on_a_node_that_also_serves_its_approval_page`,
+`serve_refuses_to_start_when_a_service_with_kernel_access_would_be_left_on_another_socket`,
+`a_create_states_the_access_and_the_owners_card_says_it_in_words`,
+`a_template_that_gains_kernel_access_after_its_card_was_shown_is_not_created_by_that_approval`,
+`the_access_survives_a_restart_and_goes_with_the_service`), in `crates/arca/tests/services/kernel_access.rs`
+(`the_plugin_makes_the_kernel_access_device_from_the_record_alone`,
+`the_plugin_refuses_a_record_that_gives_kernel_access_to_anything_else`,
+`a_record_made_again_from_an_instance_reads_the_kernel_access_its_device_shows`), in `crates/arca-mcp/tests/listen.rs`
+(`the_services_socket_gives_its_peer_only_what_the_token_gives_and_serves_no_approval_page`,
+`serve_services_refuses_a_path_or_a_directory_another_user_could_take`) and in `crates/arca/tests/e2e_mcp.rs`
+(`the_services_socket_of_a_node_that_serves_its_approval_page_serves_mcp_alone`,
+`a_proxy_listener_without_an_approval_origin_serves_no_page_route`). The device's behaviour on a live Incus is under
+"Assumptions to confirm".
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -1308,6 +1362,11 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
+- A proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` is accepted on a
+  container in the restricted service project (`restricted.devices.proxy=allow`), listens on the container's own
+  loopback, and connects to the unix socket at `<path>` on the host as root, which the services socket serves, with
+  the confinement of Incus's proxy helper letting it reach that path (Rule 69). The fake stores the device and models
+  none of this. Also unconfirmed: that the device is in place again after a restart of the host.
 - A virtual machine from a public cloud image (`images:debian/13/cloud`) that Arca creates runs its
   `cloud-init.user-data` once at its first boot and writes the file its `cloud-init.vendor-data` names, on a host whose
   QEMU has no virtio-9p (the config share is the `agent:config` drive of Rule 59), and its guest agent then takes a file

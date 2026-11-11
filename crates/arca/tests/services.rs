@@ -561,6 +561,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         root_size: None,
         first_boot: None,
         settings: None,
+        kernel_access: None,
     }
 }
 
@@ -2545,6 +2546,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 mod approval_requests;
 #[path = "services/golden.rs"]
 mod golden;
+#[path = "services/kernel_access.rs"]
+mod kernel_access;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/tunnel.rs"]
