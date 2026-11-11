@@ -87,6 +87,46 @@ pub struct Lan {
     pub port: u16,
 }
 
+/// A template's `kernelAccess`: the port, inside the instance, where the service finds this node's kernel on loopback.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelAccess {
+    pub port: u16,
+}
+
+/// What a service with kernel access records: the port inside its instance, and the path of the socket on the host its
+/// device connects to, which is the node's `listen.services` as it was when the service was created.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KernelLink {
+    pub port: u16,
+    pub connect: String,
+}
+
+/// The name of the device that gives a service kernel access.
+pub const KERNEL_DEVICE: &str = "kernel";
+/// The lowest port a template's `kernelAccess` may name.
+pub const KERNEL_ACCESS_PORT_MIN: u16 = 1024;
+
+/// The socket on the host a kernel access device may connect to: a path the services socket may have
+/// ([`arca_mcp::services_path_ok`]). No address of any network is one.
+pub fn kernel_connect_ok(connect: &str) -> bool {
+    arca_mcp::services_path_ok(Path::new(connect)).is_ok()
+}
+
+/// The device of a service with kernel access. Incus listens inside the instance (`bind=instance`) on its loopback and
+/// connects from the host to the kernel's services socket, so nothing of it is on the bridge or on any host port, and
+/// the instance's NIC ACL is not involved. That socket serves the MCP routes alone, so whoever connects still needs a
+/// bearer token: the device carries bytes and no authority.
+pub fn kernel_device(link: &KernelLink) -> Value {
+    json!({
+        "type": "proxy",
+        "bind": "instance",
+        "listen": format!("tcp:127.0.0.1:{}", link.port),
+        "connect": format!("unix:{}", link.connect)
+    })
+}
+
 /// The name every virtual machine's NIC is given inside the guest: the one interface the public images configure. The
 /// agent renames the NIC to it, whatever PCI slot the host's QEMU gave it.
 pub const VM_NIC_NAME: &str = "enp5s0";
@@ -103,9 +143,57 @@ pub struct Vm {
     /// The template's first-boot script, as the instance's `cloud-init.user-data`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_data: Option<String>,
-    /// The template's settings, as a `cloud-init.vendor-data` that writes them to [`GUEST_SETTINGS_PATH`].
+    /// The service's settings, as a `cloud-init.vendor-data` that writes them to [`GUEST_SETTINGS_PATH`]: the
+    /// template's, with the values its create replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_data: Option<String>,
+    /// The settings its create replaced, by key, when it replaced any. The machine got them merged into the
+    /// template's ([`Vm::guest_settings`]); they are kept apart here so the record says what was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Map<String, Value>>,
+}
+
+impl Vm {
+    /// The settings object the machine was created with, exactly as its guest reads it at
+    /// [`GUEST_SETTINGS_PATH`]: read back from the cloud-init data the create carried, so a template edited since
+    /// changes nothing here. `None` for a machine without settings.
+    pub fn guest_settings(&self) -> Option<Value> {
+        use base64::Engine as _;
+        let content = self
+            .vendor_data
+            .as_deref()?
+            .lines()
+            .find_map(|line| line.strip_prefix("  content: "))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content.trim())
+            .ok()?;
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .filter(Value::is_object)
+    }
+}
+
+/// The kernel access an instance's own devices show: its `kernel` device, when it is exactly the device Arca makes for
+/// some port and some services socket path ([`kernel_device`]). `None` for an instance with no such device, or with one
+/// of any other shape. A record made again from an instance's marks reads it, when it connects to the node's own
+/// services socket, so the record says what the instance has.
+pub fn kernel_link_of(row: &Value) -> Option<KernelLink> {
+    let device = &row["devices"][KERNEL_DEVICE];
+    let link = KernelLink {
+        port: device["listen"]
+            .as_str()?
+            .strip_prefix("tcp:127.0.0.1:")?
+            .parse()
+            .ok()?,
+        connect: device["connect"]
+            .as_str()?
+            .strip_prefix("unix:")?
+            .to_string(),
+    };
+    (link.port >= KERNEL_ACCESS_PORT_MIN
+        && kernel_connect_ok(&link.connect)
+        && *device == kernel_device(&link))
+    .then_some(link)
 }
 
 /// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
@@ -168,6 +256,10 @@ pub struct ServiceConfig {
     /// Present on a service in a tenant. A service of the node's own project never carries the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<TenantRef>,
+    /// Present on a service whose template declares `kernelAccess`. No other record carries the key, and no service in
+    /// a tenant ever does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_access: Option<KernelLink>,
 }
 
 /// What only a service in a tenant records: the tenant, its address block, and the address of the node's front service
@@ -611,6 +703,9 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
             "connect":format!("tcp:127.0.0.1:{}", lan.port)}),
         );
     }
+    if let Some(link) = &cfg.kernel_access {
+        devices.insert(KERNEL_DEVICE.into(), kernel_device(link));
+    }
     let mut root = json!({ "type": "disk", "path": "/", "pool": cfg.pool });
     if cfg.tenant.is_some() {
         // The tenant project's disk cap counts a root disk by its size, so a tenant's container states one.
@@ -646,6 +741,18 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     })
 }
 
+/// The body of the create of a service on the managed network, exactly as its record gives it. The effect journal
+/// records the digest of the create that carries it, so that digest covers every device, a kernel access device included.
+pub fn create_body(cfg: &ServiceConfig) -> Value {
+    instance_body(
+        cfg,
+        &cfg.links
+            .iter()
+            .map(|link| format!("{}:{}:{}", link.to, link.port, link.uuid))
+            .collect::<Vec<_>>(),
+    )
+}
+
 impl Plugin for Service {
     const ID: &'static str = "arca.service";
     type Config = ServiceConfig;
@@ -663,6 +770,20 @@ impl Plugin for Service {
         // An adopted instance is owned through its adopt entry. The service record never writes it.
         if cfg.adopted {
             return Ok(());
+        }
+        // Kernel access is a container's, in the node's own project: a record that says otherwise is never applied,
+        // whatever else it holds.
+        if let Some(link) = &cfg.kernel_access
+            && (cfg.tenant.is_some()
+                || cfg.project != PROJECT
+                || cfg.vm.is_some()
+                || link.port < KERNEL_ACCESS_PORT_MIN
+                || cfg.ports.contains(&link.port)
+                || !kernel_connect_ok(&link.connect))
+        {
+            return Err(PluginError::Config(
+                "kernel access is for a container of the node's own service project, on a port of 1024 or above that is not one of its own, to the kernel's services socket".into(),
+            ));
         }
         if let Some(vm) = &cfg.vm
             && cfg.on_host_bridge()
@@ -842,13 +963,7 @@ impl Plugin for Service {
                 IncusKind::Instance,
                 &cfg.project,
                 &cfg.instance,
-                instance_body(
-                    cfg,
-                    &cfg.links
-                        .iter()
-                        .map(|link| format!("{}:{}:{}", link.to, link.port, link.uuid))
-                        .collect::<Vec<_>>(),
-                ),
+                create_body(cfg),
             )?;
         } else if let Some(instance) = instance {
             let desired = instance_body(
@@ -970,6 +1085,15 @@ pub struct Template {
     /// kind sets it, and it never holds a secret.
     #[serde(default)]
     pub settings: Option<Value>,
+    /// The top-level keys of `settings` that a `service_create` may replace for one service. Each is a key of
+    /// `settings`, whose value there is the default and gives the type. No other kind sets it.
+    #[serde(default)]
+    pub create_settings: Vec<String>,
+    /// A container template whose service may talk to this node's kernel: `{ "port": <n> }`, the port inside the
+    /// instance where the kernel answers on loopback. Only a service of the node's own project is created from such a
+    /// template, never one in a tenant.
+    #[serde(default)]
+    pub kernel_access: Option<KernelAccess>,
 }
 
 impl Template {
@@ -1039,7 +1163,10 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
             "template {name}: only a virtual-machine template has a rootSize"
         )));
     }
-    if template.first_boot.is_some() || template.settings.is_some() {
+    if template.first_boot.is_some()
+        || template.settings.is_some()
+        || !template.create_settings.is_empty()
+    {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has a firstBoot or settings"
         )));
@@ -1091,6 +1218,15 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     {
         return Err(TemplateError::refused(format!(
             "template {name}: lan port is one of its ports"
+        )));
+    }
+    if let Some(access) = &template.kernel_access
+        && (access.port < KERNEL_ACCESS_PORT_MIN
+            || template.ports.contains(&access.port)
+            || template.dash_port == Some(access.port))
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: kernelAccess port is 1024..65535 and not one of the template's own ports"
         )));
     }
     if template.secrets.len() > 16 {
@@ -1192,9 +1328,10 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         || template.droidd_port.is_some()
         || template.data.is_some()
         || template.lan.is_some()
+        || template.kernel_access.is_some()
     {
         return refused(
-            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data or lan: they need a container's environment, image or devices",
+            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data, lan or kernelAccess: they need a container's environment, image or devices",
         );
     }
     if template.secrets.len() > 16 {
@@ -1220,6 +1357,20 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
             && serde_json::to_string(settings).is_ok_and(|text| text.len() <= SETTINGS_MAX))
     {
         return refused("settings is one JSON object of at most 16KiB");
+    }
+    let mut listed = BTreeSet::new();
+    if template.create_settings.len() > 32
+        || !template.create_settings.iter().all(|key| {
+            listed.insert(key.as_str())
+                && template
+                    .settings
+                    .as_ref()
+                    .is_some_and(|settings| settings.get(key).is_some())
+        })
+    {
+        return refused(
+            "createSettings lists at most 32 distinct keys of settings, each with its default there",
+        );
     }
     if let Some(description) = &template.description
         && description.chars().count() > 500
@@ -1278,20 +1429,186 @@ pub fn first_boot(template: &Template, dir: &Path) -> Result<Option<String>, Tem
 /// by every user of the guest: one `write_files` entry whose content is base64, so no setting can change the YAML
 /// around it. `None` for a template without settings.
 pub fn settings_vendor_data(template: &Template) -> Result<Option<String>, TemplateError> {
+    vendor_data_of(&template.name, template.settings.as_ref())
+}
+
+/// [`settings_vendor_data`] for one settings object: a template's own, or a service's merged one.
+pub fn vendor_data_of(
+    template: &str,
+    settings: Option<&Value>,
+) -> Result<Option<String>, TemplateError> {
     use base64::Engine as _;
-    let Some(settings) = &template.settings else {
+    let Some(settings) = settings else {
         return Ok(None);
     };
     let text = serde_json::to_string(settings)
         .ok()
         .filter(|text| settings.is_object() && text.len() <= SETTINGS_MAX)
-        .ok_or_else(|| {
-            TemplateError::refused(format!("template {}: invalid settings", template.name))
-        })?;
+        .ok_or_else(|| TemplateError::refused(format!("template {template}: invalid settings")))?;
     let content = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     Ok(Some(format!(
         "#cloud-config\nwrite_files:\n- path: {GUEST_SETTINGS_PATH}\n  permissions: '0644'\n  encoding: b64\n  content: {content}\n"
     )))
+}
+
+/// The settings of one new service, as [`create_settings`] works them out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServiceSettings {
+    /// What the guest reads: the template's settings with the create's values in place of the defaults. `None` for
+    /// a template without settings.
+    pub merged: Option<Value>,
+    /// The values the create replaced, by key. `None` when it gave none.
+    pub replaced: Option<Map<String, Value>>,
+}
+
+/// The settings of one new service: the template's, with the values its `service_create` gave in `given` put in place
+/// of the defaults. Every refusal is in plain words and names the key:
+///
+/// - only a key the template lists in `createSettings` may be given;
+/// - a value has the JSON type of the template's default, and a whole number stays a whole number;
+/// - no string or key anywhere in a value holds a control character, and a value nests at most eight deep;
+/// - where the default is an `https://` address the value is one too, with a plain host and path: no user or password
+///   (`@`), no query, no fragment, nothing percent-encoded. Such a value decides where the machine sends a
+///   credential, so it is never taken loosely;
+/// - the merged object stays within the size a template's settings may have.
+pub fn create_settings(
+    template: &Template,
+    given: Option<&Value>,
+) -> Result<ServiceSettings, TemplateError> {
+    let name = &template.name;
+    let refused = |why: String| Err(TemplateError::refused(why));
+    let unchanged = || ServiceSettings {
+        merged: template.settings.clone(),
+        replaced: None,
+    };
+    let Some(given) = given else {
+        return Ok(unchanged());
+    };
+    let Some(given) = given.as_object() else {
+        return refused("settings: expected an object of setting names and values".into());
+    };
+    if given.is_empty() {
+        return Ok(unchanged());
+    }
+    let Some(defaults) = template
+        .settings
+        .as_ref()
+        .and_then(Value::as_object)
+        .filter(|_| template.is_vm() && !template.create_settings.is_empty())
+    else {
+        return refused(format!(
+            "settings: template {name} lets a create set none (its createSettings lists none)"
+        ));
+    };
+    let mut merged = defaults.clone();
+    for (key, value) in given {
+        let Some(default) = defaults
+            .get(key)
+            .filter(|_| template.create_settings.iter().any(|listed| listed == key))
+        else {
+            let shown: String = key.chars().filter(|c| !c.is_control()).take(64).collect();
+            return refused(format!(
+                "settings.{shown}: template {name} does not let a create set it; it lets a create set {}",
+                template.create_settings.join(", ")
+            ));
+        };
+        let kind = json_kind(default);
+        if json_kind(value) != kind {
+            return refused(format!(
+                "settings.{key}: expected {kind}, the type of the template's default"
+            ));
+        }
+        if !plain_json(value, 0) {
+            return refused(format!(
+                "settings.{key}: a value holds no control character and nests at most eight deep"
+            ));
+        }
+        if default
+            .as_str()
+            .is_some_and(|default| default.starts_with("https://"))
+            && !value.as_str().is_some_and(https_address_ok)
+        {
+            return refused(format!(
+                "settings.{key}: expected an https address like the template's default, https://<host>/<path>, with a plain host name and path: no user or password (@), no query (?), no fragment (#) and nothing percent-encoded"
+            ));
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    let merged = Value::Object(merged);
+    if serde_json::to_string(&merged).map_or(true, |text| text.len() > SETTINGS_MAX) {
+        return refused(format!(
+            "settings: with these values the settings of template {name} pass 16KiB"
+        ));
+    }
+    Ok(ServiceSettings {
+        merged: Some(merged),
+        replaced: Some(given.clone()),
+    })
+}
+
+/// The JSON type of a value, in the words a refusal uses. A whole number and a number with a fraction are two types:
+/// a setting that counts something is not given `2.5`.
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "true or false",
+        Value::Number(number) if number.is_u64() || number.is_i64() => "a whole number",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Whether no string and no key in `value` holds a control character, and it nests at most eight deep.
+fn plain_json(value: &Value, depth: usize) -> bool {
+    let plain = |text: &str| !text.chars().any(char::is_control);
+    match value {
+        Value::String(text) => plain(text),
+        Value::Array(items) => depth < 8 && items.iter().all(|item| plain_json(item, depth + 1)),
+        Value::Object(map) => {
+            depth < 8
+                && map
+                    .iter()
+                    .all(|(key, item)| plain(key) && plain_json(item, depth + 1))
+        }
+        _ => true,
+    }
+}
+
+/// Whether `text` is `https://<host>[:<port>][/<path>]` with a plain host and path. The host is letters, digits, dots
+/// and dashes, beginning and ending with a letter or a digit; the path is letters, digits and `. _ ~ - /`. So there is
+/// no `@` (a user or password, which would make the part before it something else than the host), no `?`, no `#`, no
+/// `%`, no space and no backslash.
+pub fn https_address_ok(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix("https://") else {
+        return false;
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(at) => rest.split_at(at),
+        None => (rest, ""),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    let edge = |byte: Option<u8>| byte.is_some_and(|b| b.is_ascii_alphanumeric());
+    text.len() <= 2048
+        && (1..=253).contains(&host.len())
+        && edge(host.bytes().next())
+        && edge(host.bytes().last())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
+        && !host.contains("..")
+        && port.is_none_or(|port| {
+            (1..=5).contains(&port.len()) && port.bytes().all(|b| b.is_ascii_digit())
+        })
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-' | b'/'))
+        && !path.contains("//")
+        && !path.split('/').any(|part| part == ".." || part == ".")
 }
 
 /// Whether the path is the root once repeated separators and `.` segments are dropped.
@@ -1782,7 +2099,7 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
         .published
         .as_ref()
         .map(|published| json!({"reach": "tailnet", "node": published.node, "port": 8443}));
-    json!({
+    let mut view = json!({
         "name": cfg.name,
         "template": cfg.template,
         "state": state,
@@ -1792,7 +2109,12 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
         "published": published,
         // The host port only exists when the service has a lan proxy. Container ports are not host listeners.
         "lanPort": cfg.lan.as_ref().map(|lan| lan.port)
-    })
+    });
+    // Only a service with kernel access carries the key, so every other view is the one it always was.
+    if let Some(link) = &cfg.kernel_access {
+        view["kernelAccess"] = json!({ "port": link.port, "connect": link.connect });
+    }
+    view
 }
 
 /// The fingerprint of the image an instance was created from, as Incus records it on the instance

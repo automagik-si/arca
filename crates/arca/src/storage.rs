@@ -3589,10 +3589,14 @@ impl StorageActionHandler {
             (Arc::clone(&handoff), writer.clone(), copy.clone());
         let kernel = Arc::clone(&self.kernel);
         std::thread::spawn(move || {
-            let _live = live;
+            let live = live;
             let ended: Ended = thread_writer
                 .create_folder_volume(&thread_copy)
                 .map(|()| thread_writer.run_folder_copy(&thread_copy));
+            // The copy is over, so it leaves the live list before anyone is told how it ended: the caller that still
+            // waits, or the journal. Told first, a reader that lists the snapshots at once still finds it copying, for
+            // as long as the journal takes to reach the disk.
+            drop(live);
             let (lock, wake) = &*thread_handoff;
             let Ok(mut state) = lock.lock() else { return };
             if !state.abandoned {

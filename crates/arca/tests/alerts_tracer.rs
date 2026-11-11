@@ -155,6 +155,7 @@ fn a_full_pool_fires_at_60_s_and_reaches_the_store_alerts_list_and_metrics() {
         .handle("alerts_list", Arc::new(handler))
         .get_route(
             "/metrics",
+            "node_metrics",
             Arc::new(MetricsExport {
                 node: NODE.to_string(),
                 alerts: alerts.clone(),

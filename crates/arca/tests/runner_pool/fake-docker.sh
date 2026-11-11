@@ -6,6 +6,10 @@
 # what a real runner does: it replaces its own files, which fails when its tools directory is a mount. Nothing here is
 # Docker.
 set -u
+# The controller runs with only the programs its script declares on its PATH. This stand-in is not the controller: it
+# takes the machine's whole PATH back, and does not report its own programs as the controller's.
+PATH=${FAKE_PATH:-$PATH}
+unset -f command_not_found_handle 2>/dev/null
 root=$FAKE_DOCKER_DIR
 mkdir -p "$root/containers"
 printf '%s\n' "$*" >>"$root/calls.log"
@@ -14,7 +18,7 @@ command=${1-}
 
 # The name, the slice and the image of a `docker run` or `docker create`: the image is the first argument that is
 # neither an option nor an option's value.
-name='' cgroup_parent='' image='' jit_file='' tools_mounted='' command_line=''
+name='' cgroup_parent='' image='' jit_file='' tools_mounted='' home_mount='' command_line=''
 parse_run() {
   while [ $# -gt 0 ]; do
     case $1 in
@@ -24,6 +28,8 @@ parse_run() {
         case $2 in
           *:/run/arca/jitconfig:ro) jit_file=${2%:/run/arca/jitconfig:ro} ;;
           *:/home/runner/externals | *:/home/runner/externals:*) tools_mounted=1 ;;
+          *:/home/runner:ro) home_mount=${2%:/home/runner:ro} ;;
+          *:/home/runner) home_mount=${2%:/home/runner} ;;
         esac
         shift 2
         ;;
@@ -63,6 +69,8 @@ play_runner() {
         return
       fi
       echo "Runner will exit shortly for update, should be back online within 10 seconds." >>"$dir/log"
+      echo "Runner listener exit because of updating, re-launch runner after successful update" >>"$dir/log"
+      echo "Restarting runner..." >>"$dir/log"
       printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/updated" >/dev/null 2>&1
       echo "Listening for Jobs" >>"$dir/log"
       continue
@@ -71,12 +79,13 @@ play_runner() {
     if [ -n "$job" ]; then
       seconds=$(printf '%s' "$answer" | jq -r '.seconds')
       result=$(printf '%s' "$answer" | jq -r '.result')
-      echo "2026-01-01 00:00:00Z: Running job: $job" >>"$dir/log"
+      # The runner prints the time, then the job: the pool times the job from this line.
+      echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Running job: $job" >>"$dir/log"
       touch "$dir/worker"
       sleep "$seconds"
       [ -d "$dir" ] || return
       rm -f "$dir/worker"
-      echo "2026-01-01 00:00:01Z: Job $job completed with result: $result" >>"$dir/log"
+      echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Job $job completed with result: $result" >>"$dir/log"
       printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/done" >/dev/null 2>&1
       echo 0 >"$dir/exit"
       return
@@ -97,6 +106,8 @@ case $command in
     if [ -e "$root/fail-run" ] && [ "$image" = "$(cat "$root/fail-run")" ]; then exit 125; fi
     mkdir -p "$dir"
     echo "$image" >"$dir/image"
+    # The host directory mounted as the runner's home, when one is: a real runner and its daemon share its files.
+    echo "$home_mount" >"$dir/home"
     : >"$dir/log"
     if [ -n "$cgroup_parent" ]; then
       # What the slot's slice would report after a job: a memory peak and the CPU time used.
@@ -136,6 +147,13 @@ case $command in
   top)
     dir="$root/containers/$1"
     [ -d "$dir" ] || exit 1
+    # Docker finds a container's processes by their ids, so it refuses ps options that leave the id out.
+    case " $* " in
+      *pid* | *" -ef "* | *" aux "*) ;;
+      *)
+        [ $# -le 1 ] || { echo "Error response from daemon: Couldn't find PID field in ps output" >&2; exit 1; }
+        ;;
+    esac
     echo "COMMAND"
     echo "/home/runner/bin/Runner.Listener run"
     [ -e "$dir/worker" ] && echo "/home/runner/bin/Runner.Worker spawnclient"

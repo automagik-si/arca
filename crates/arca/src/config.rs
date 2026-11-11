@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 // The adoption types come from the writer, whose feature reaches this crate through `arca-providers`, the one crate that
 // enables it (docs/OWNERSHIP.md, Rule 28).
 pub use arca_incus::adopt::AdoptTarget;
-use arca_mcp::{proxy_addr_ok, tailnet_addr_ok};
+use arca_mcp::{proxy_addr_ok, services_path_ok, tailnet_addr_ok};
 use serde::Deserialize;
 use serde_json::error::Category;
 
@@ -180,7 +180,7 @@ impl IncusConfig {
     }
 }
 
-/// The listeners: the unix socket, one tailnet address when one is named, and one proxy address when one is named.
+/// The listeners: the unix socket, and one tailnet address, one proxy address and the services socket when each is named.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ListenConfig {
@@ -189,6 +189,11 @@ pub struct ListenConfig {
     pub tailnet: Option<SocketAddr>,
     #[serde(default)]
     pub proxy: Option<ProxyListen>,
+    /// The services socket: a second unix socket, mode 0600, served to the server's own user and to root, with the MCP
+    /// routes and nothing else: no approval page, and a bearer token on every call. Incus connects to it for a service
+    /// with kernel access.
+    #[serde(default)]
+    pub services: Option<PathBuf>,
 }
 
 /// The proxy listener: one fixed address outside the tailnet ranges, served to the single peer address `peer`, which is a
@@ -198,6 +203,19 @@ pub struct ListenConfig {
 pub struct ProxyListen {
     pub addr: SocketAddr,
     pub peer: IpAddr,
+}
+
+impl NodeConfig {
+    /// The socket a service with kernel access connects to: `listen.services`, which serves the MCP routes alone, each
+    /// behind a bearer token, and never the approval page. `None` on a node that names none: such a node gives no
+    /// service kernel access, whatever its other listeners are.
+    pub fn kernel_access(&self) -> Option<String> {
+        self.listen
+            .services
+            .as_deref()
+            .and_then(Path::to_str)
+            .map(str::to_string)
+    }
 }
 
 /// The directory of the hash files the server reads.
@@ -348,6 +366,8 @@ pub enum ConfigError {
     TailnetAddr(String),
     /// The proxy address fails the proxy rules, or its peer is not one address.
     ProxyAddr(String),
+    /// The services socket's path fails the path rules, or is the unix socket's own.
+    ServicesSocket(String),
     /// A kernel project is a name the kernel may never write in.
     ProjectForbidden(String),
     /// A scratch run names a project outside the scratch prefix.
@@ -386,6 +406,7 @@ impl fmt::Display for ConfigError {
             Self::Parse(why) => write!(f, "the config file is refused: {why}"),
             Self::TailnetAddr(why) => write!(f, "listen.tailnet is refused: {why}"),
             Self::ProxyAddr(why) => write!(f, "listen.proxy is refused: {why}"),
+            Self::ServicesSocket(why) => write!(f, "listen.services is refused: {why}"),
             Self::ProjectForbidden(name) => write!(
                 f,
                 "kernel project {name} is reserved: it is the host's default or bench project, or a droidd project"
@@ -459,6 +480,15 @@ pub fn check(config: &NodeConfig) -> Result<(), ConfigError> {
         if proxy.peer.to_canonical().is_unspecified() {
             return Err(ConfigError::ProxyAddr(
                 "the peer must be one address, not a wildcard".to_string(),
+            ));
+        }
+    }
+    if let Some(path) = &config.listen.services {
+        services_path_ok(path).map_err(ConfigError::ServicesSocket)?;
+        // The unix socket may serve the approval page, and this one never does: they are two sockets.
+        if *path == config.listen.unix {
+            return Err(ConfigError::ServicesSocket(
+                "it is listen.unix's path, and the two are separate sockets".to_string(),
             ));
         }
     }

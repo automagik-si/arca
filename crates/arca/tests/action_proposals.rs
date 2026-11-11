@@ -279,6 +279,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::ServiceCreate => json!({
                 "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
                 "tenant": "abcdefgh", "deploy": "d1", "start": false,
+                "settings": { "url": "https://git.example/example-org" },
+                "kernelAccess": { "port": 7461 },
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUnpublish
@@ -465,6 +467,18 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             if action == ActionKind::PostgresCreate && field == "tenant" {
                 continue;
             }
+            // The settings a create replaces have one row each, named for the setting, with its value.
+            if action == ActionKind::ServiceCreate && field == "settings" {
+                for (key, value) in prepared["settings"].as_object().expect("settings") {
+                    let row = details
+                        .iter()
+                        .find(|row| row.label == format!("Setting {key}"))
+                        .unwrap_or_else(|| panic!("{action:?} details lack the setting {key}"));
+                    assert_eq!(row.value, value.as_str().expect("a string setting"));
+                    seen += 1;
+                }
+                continue;
+            }
             let label = match (action, field.as_str()) {
                 (_, "tenant") => "Tenant",
                 (_, "deploy") => "Deploy",
@@ -478,15 +492,23 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                 (_, "bridge") => "Host bridge",
                 (_, "mac") => "MAC address",
                 (ActionKind::ServiceCreate, "start") => "Start",
+                (ActionKind::ServiceCreate, "kernelAccess") => "Kernel access",
                 _ => panic!("{action:?} field {field} has no owner label"),
             };
             let row = details
                 .iter()
                 .find(|row| row.label == label)
                 .unwrap_or_else(|| panic!("{action:?} details lack {label}"));
-            // The one field that is not a string is shown in words.
+            // The two fields that are not strings are shown in words.
+            let access: String;
             let expected = match &prepared[field.as_str()] {
                 Value::Bool(start) => arca::action_proposal::start_words(*start),
+                Value::Object(stated) => {
+                    access = arca::action_proposal::kernel_access_words(
+                        stated["port"].as_u64().expect("a port"),
+                    );
+                    access.as_str()
+                }
                 value => value.as_str().expect("a string field"),
             };
             assert_eq!(row.value, expected, "{action:?} {label}");

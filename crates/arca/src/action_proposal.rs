@@ -70,6 +70,29 @@ pub enum ActionKind {
     DeployRemove,
 }
 
+/// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
+fn shown(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if clean.chars().count() <= max {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
+/// A setting's value as a card shows it: a string as it is, anything else as compact JSON, shortened to 160
+/// characters. The whole value is what the approval covers; the card says so by the ellipsis.
+fn setting_shown(value: &Value) -> String {
+    match value {
+        Value::String(text) => shown(text, 160),
+        other => shown(&other.to_string(), 160),
+    }
+}
+
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
     pub const ALL: [ActionKind; 20] = [
@@ -285,6 +308,11 @@ impl ActionKind {
                 if args.get("mac").is_some() {
                     rows.push(row("MAC address", text("mac")));
                 }
+                // The template gives this service access to the kernel. The proposal names it (it is filled in from
+                // the template when the proposal is made), so the approval binds it and the card says it in words.
+                if let Some(port) = args["kernelAccess"]["port"].as_u64() {
+                    rows.push(row("Kernel access", &kernel_access_words(port)));
+                }
                 // The row says what will happen, so the owner approves a stopped service knowingly: a create that
                 // said `start: false`, and one whose template is created stopped whatever the call says (the reason
                 // is read from the template when the proposal is made, and is not in its arguments).
@@ -293,6 +321,14 @@ impl ActionKind {
                     (_, Some(reason)) => rows.push(row("Start", &stopped_words(reason))),
                     (Some(true), None) => rows.push(row("Start", start_words(true))),
                     (None, None) => {}
+                }
+                // One row for each setting the create replaces, with its value: a setting such as an address
+                // decides where the new machine sends its credential, so the owner sees it before approving.
+                for (key, value) in args["settings"].as_object().into_iter().flatten() {
+                    rows.push(row(
+                        &format!("Setting {}", shown(key, 64)),
+                        &setting_shown(value),
+                    ));
                 }
                 rows
             }
@@ -529,6 +565,12 @@ impl ActionKind {
                 format!("Remove everything the deploy {} created", text("deploy"))
             }
         };
+        // A service that can call the kernel is named as one.
+        let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {
+            format!("{sentence} with access to this node's kernel")
+        } else {
+            sentence
+        };
         // A service created stopped is named as one: nothing of it runs until it is started.
         let sentence =
             if self == Self::ServiceCreate && args.get("start") == Some(&Value::Bool(false)) {
@@ -543,6 +585,13 @@ impl ActionKind {
             _ => sentence,
         }
     }
+}
+
+/// The `Kernel access` row of a `service_create` whose template declares `kernelAccess`, in the owner's words.
+pub fn kernel_access_words(port: u64) -> String {
+    format!(
+        "Yes: this service can call this node's kernel from inside, at http://127.0.0.1:{port}/mcp, with whatever token it is given. The token's scope and tool list decide what it may do, and a call without a token is refused."
+    )
 }
 
 /// What a `service_create` proposal's `start` means, in the owner's words.

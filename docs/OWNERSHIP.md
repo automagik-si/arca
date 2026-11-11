@@ -1048,8 +1048,9 @@ in `crates/arca-kernel/src/plugin.rs`; `ServiceHandler::settle_create` in `crate
 `crates/arca/tests/services/mixed.rs` and, for the cases that stay open,
 `a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` in `crates/arca-providers/tests/incus_provider.rs`.
 
-**Rule 68.** A virtual-machine template may carry a first-boot script, settings and secrets. The script and the settings are
-part of the machine's create and of nothing later; the secrets never enter Incus's instance config.
+**Rule 68.** A virtual-machine template may carry a first-boot script, settings and secrets, and may let a create replace
+some of its settings. The script and the settings are part of the machine's create and of nothing later; the secrets never
+enter Incus's instance config.
 
 - `firstBoot` is `{ "file": "<name>" }`, a plain file beside the template, read as an entrypoint's file is. Its text becomes
   the instance key `cloud-init.user-data`, so it begins `#!` (cloud-init runs it once, as root, at the first boot) or
@@ -1059,6 +1060,18 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   body is built from the record; a record without them is exactly the one an earlier kernel wrote, and its create is
   unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
   script or setting applies to a machine created after the change.
+- `createSettings` lists the top-level keys of `settings` that one `service_create` may replace with its own `settings`
+  argument. The value in the template is the default and gives the type. `create_settings` refuses, before any write and
+  again when a create is proposed: a key that is not listed; a value of another JSON type than the default (a whole
+  number stays whole); a control character in any string or key, or more than eight levels; and, where the default is an
+  `https://` address, anything but `https://<host>[:<port>][/<path>]` with a plain host and path (`https_address_ok`: no
+  `@`, `?`, `#`, `%`, space or backslash), since such a setting decides where the guest sends a credential; and a merged
+  object over the settings size. The machine's `cloud-init.vendor-data` is built from the merged object; the record
+  keeps the replaced values as `vm.settings`, and a record of a create that gave none has no such key and is the record
+  of before. `service_status` answers `settings`, read back from the record's vendor data (`Vm::guest_settings`), so it
+  is what the machine got whatever the template says later; the owner's card has one row for each replaced key with its
+  value (`ActionKind::details`), control characters removed and a long value cut with an ellipsis. Settings never hold a
+  secret. Tests in `crates/arca/tests/services/create_settings.rs`.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
   machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
@@ -1099,15 +1112,21 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   the project the record names; that project must be the record's own tenant's, and the tenant's entry must exist and
   name it. The writer is the exec seam's (`writer_for`): bound to the entry, over the node's family and that one
   tenant's project, so it reads no other tenant's instance as owned. Only the two guest-secret destinations
-  (`/etc/arca-secrets` and a file in it) follow the owned instance into a tenant's project (`guest_target`). A command,
-  a recording and every other file stay in the node's own project and are refused for a tenant's instance (`target`),
-  so Rule 50's seam is as it was. The instance verbs already refuse a call that names a tenant together with another
+  (`/etc/arca-secrets` and a file in it) follow the owned instance into a tenant's project (`guest_target`). A command
+  and every other file stay in the node's own project and are refused for a tenant's instance (`target`). A recording
+  is read and deleted by a path that names the node's own project and no other, so it cannot reach a tenant's
+  instance either, and none exists there since no command runs there. Rule 50's seam is as it was. The instance verbs already refuse a call that names a tenant together with another
   project, and a tenant's project without its tenant (Rule 65), before any instance is read.
 - The guest agent is waited for, up to 120 seconds: a machine that has just started boots before it takes a file. When
   it never answers, the verb is refused with `InstanceSecretsNotWritten` and the machine stays running. The answer says
   what to do next once, and only what is true: to run `instance_start` again when the guest was not ready or a request
-  did not get through, and that running it again changes nothing when something has to be put right first (a secret
-  that cannot be read, a directory in the guest that is not private, a record that does not fit its instance).
+  did not get through (a read of the instance that timed out among them), and that running it again changes nothing
+  when something has to be put right first (a secret that cannot be read, a directory in the guest that is not
+  private, a record that does not fit its instance, an instance that is no longer the one Arca created, a kernel lock
+  that is poisoned until Arca is restarted). The place checks are one function, `misplaced` in
+  `crates/arca/src/guest_secrets.rs`, with its own tests there: a tenant entry that is missing or names another
+  project, a record in another project or with another instance than its own, and a journalled instance that is
+  missing, has no uuid, or is in another project.
 
 Source: `first_boot`, `settings_vendor_data`, `validate_vm_template` and `vm_config` in `crates/arca/src/service.rs`;
 `vm_service_config` in `crates/arca/src/handlers.rs`; `call_wiring` in `crates/arca/src/service_wiring.rs`;
@@ -1295,6 +1314,66 @@ Source: `open_deploy`, `deploys`, `Deploy::provisional` and `TenantHandler::depl
 `the_front_reaches_only_ordinary_services_and_follows_a_front_that_is_made_again` in
 `crates/arca/tests/tenants/deploys.rs`.
 
+## A service that may talk to the kernel
+
+**Rule 69.** Only a container of the node's own service project may be given a way to the kernel's MCP, and the way
+gives no authority. A template declares it with `kernelAccess: { "port" }`. The service's record then names the port and
+the socket, and its instance is created with one device, `kernel`: a proxy that listens inside the instance
+(`bind=instance`) on `127.0.0.1:<port>` and connects from the host to the node's services socket (`listen.services`).
+No ACL rule and no NIC key changes for it, and the kernel's own unix socket is as it was: the service's NIC still
+rejects the bridge gateway, as every service's does, and the device's traffic reaches no bridge and no host port.
+
+The services socket serves the MCP routes alone, each behind a bearer token, on every node and under every config. The
+approval page, whose routes need no token, is merged into the routers of the other listeners and never into this one,
+so a device can only ever reach a listener that cannot serve the page. Three checks keep a device on that socket and on
+no other. A create takes the device's path from `listen.services` and from nowhere else. The plugin refuses a record
+that names kernel access in a tenant, in another project, on a virtual machine, on a port below 1024 or one of the
+service's own, or to anything but a plain absolute socket path, whatever wrote the record. And `serve` refuses to start
+while any service's record names a socket the config does not serve as `listen.services`.
+
+A create is refused before any write when the call names a tenant, when the node sets no `listen.services`, and when it
+does not run from a proposal the owner approved: a direct `service_create` of such a template is `NotApproved` for a
+token of any scope. The proposal states the template's `kernelAccess`, so the owner's approval binds it and the card
+says it in words; an approval given before the template declared it, or for another port, creates nothing. A tenant's
+project blocks proxy devices as well (Rule 62). The socket answers 401 to a call without a token and holds a token to
+its scope and tool list, as every listener does, so a process in the instance may do exactly what the token it holds
+allows. The device is part of the instance: it is created with it, and removed with it (Rule 66). A record made again
+from an instance's marks reads the device back, for an instance of the node's own project alone and only when the
+device connects to this node's own services socket: a device made by hand for another path is in no record.
+
+The socket is mode 0600 in a directory that only the server's user (or root) may write to, under directories nobody
+else can rename, and it serves that user and uid 0. Incus's proxy helper runs as uid 0, which is why uid 0 is served:
+that admits every process of the host running as uid 0, and the proxy helper for any instance whose device names the
+path. Arca makes such a device for a service of the node's own project alone, a tenant's project blocks proxy devices
+(Rule 62), and a device added by hand is the act of someone who administers Incus. No other local user reaches the
+socket, and it has no port another process could take while the server is down. Whoever connects holds nothing without
+a token: the GET routes are held to a token's scope and tool list as the verbs they read are.
+Source: `KernelAccess`, `KernelLink`, `kernel_device`, `kernel_link_of`, `kernel_connect_ok`, `Service::apply` and
+`validate_template` in `crates/arca/src/service.rs`; `ListenConfig::services`, `NodeConfig::kernel_access` and `check`
+in `crates/arca/src/config.rs`; `kernel_access_for`, `kernel_access_refusal`, `enrich_service_create`,
+`ActionExecutor::run`, `adopted_config` and the `service_create` and `service_status` arms of `ServiceHandler` in
+`crates/arca/src/handlers.rs`; `kernel_access_words` in `crates/arca/src/action_proposal.rs`; `mcp`, `serve_get`,
+`serve_services`, `services_dir_ok`, `services_path_ok` and `owner_admitted` in `crates/arca-mcp/src/http.rs`; `check_bridged_start` and the
+`services_router` of `crates/arca/src/cmd_serve.rs`. Tests in `crates/arca/tests/tenants/kernel_access.rs`
+(`a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_acl_rule_for_it`,
+`an_ordinary_template_gets_no_such_device_and_cannot_ask_for_one`,
+`nothing_in_a_tenant_gets_kernel_access_and_no_verb_installs_a_template`,
+`a_node_gives_kernel_access_only_through_its_services_socket`,
+`the_device_connects_to_the_services_socket_on_a_node_that_also_serves_its_approval_page`,
+`serve_refuses_to_start_when_a_service_with_kernel_access_would_be_left_on_another_socket`,
+`a_create_states_the_access_and_the_owners_card_says_it_in_words`,
+`a_template_that_gains_kernel_access_after_its_card_was_shown_is_not_created_by_that_approval`,
+`the_access_survives_a_restart_and_goes_with_the_service`), in `crates/arca/tests/services/kernel_access.rs`
+(`the_plugin_makes_the_kernel_access_device_from_the_record_alone`,
+`the_plugin_refuses_a_record_that_gives_kernel_access_to_anything_else`,
+`a_record_made_again_from_an_instance_reads_the_kernel_access_its_device_shows`), in `crates/arca-mcp/tests/listen.rs`
+(`the_services_socket_gives_its_peer_only_what_the_token_gives_and_serves_no_approval_page`,
+`serve_services_refuses_a_path_or_a_directory_another_user_could_take`) and in `crates/arca/tests/e2e_mcp.rs`
+(`the_services_socket_of_a_node_that_serves_its_approval_page_serves_mcp_alone`,
+`a_proxy_listener_without_an_approval_origin_serves_no_page_route`), and
+`metrics_and_alerts_are_held_to_the_tokens_tool_list` in `crates/arca/tests/export_contract.rs`. The device's behaviour on a live Incus is under
+"Assumptions to confirm".
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -1308,6 +1387,12 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
+- A proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` on a container reaches
+  a unix socket of mode 0600 on the host, and the host sees the peer as uid 0, which the services socket serves (Rule
+  69): confirmed on a live node (Incus 7.6, SELinux enforcing). Still to confirm: the same on a container of the
+  restricted service project (`restricted.devices.proxy=allow`) as Arca creates it, on an application (OCI)
+  container, under AppArmor, and that the device is in place again after a restart of the host. The fake stores the
+  device and models none of this.
 - A virtual machine from a public cloud image (`images:debian/13/cloud`) that Arca creates runs its
   `cloud-init.user-data` once at its first boot and writes the file its `cloud-init.vendor-data` names, on a host whose
   QEMU has no virtio-9p (the config share is the `agent:config` drive of Rule 59), and its guest agent then takes a file
