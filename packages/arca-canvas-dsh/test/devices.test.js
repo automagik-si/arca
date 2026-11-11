@@ -314,7 +314,13 @@ test('a timed-out phone_status holds that phone for at least sixty seconds', asy
   const client = createDevicesClient(config);
   const state = { lastFailureAt: new Map(), cursor: 0, now: () => clock };
   const statusCalls = () => calls.filter(({ body }) => body.params?.name === 'phone_status').length;
-  const first = await collectDevices(client, AbortSignal.timeout(100), state);
+  // The deadline has to pass while phone_status is being read. A timer can pass before that read is even sent, on a
+  // machine slow enough, so the test ends the read itself once the call has arrived.
+  const deadline = new AbortController();
+  const reading = collectDevices(client, deadline.signal, state);
+  await until(() => statusCalls() === 1);
+  deadline.abort();
+  const first = await reading;
   assert.equal(first.devices, 'unreachable');
   assert.equal(statusCalls(), 1);
   assert.equal(state.lastFailureAt.has('example-phone'), true);
