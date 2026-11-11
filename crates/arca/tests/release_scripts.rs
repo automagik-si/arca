@@ -555,23 +555,42 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
         "scripts/build-portable.sh",
         &fs::read_to_string(Path::new(REPO).join("scripts/build-portable.sh")).expect("the script"),
     );
+    // The check asks cargo where a build puts its files, as a build does: a workspace, with nothing in it.
+    scratch.write(
+        "Cargo.toml",
+        "[workspace]\nmembers = []\nresolver = \"3\"\n",
+    );
+    scratch.write(
+        ".gitignore",
+        "/target/\n/clean\n/leaky\n/elsewhere\n/unread\n",
+    );
     let template = "docker run -v \"$dir/work:/home/runner/_work\" \\\n  cp -a \"$POOL-externals:/home/runner/.\" \"$RUNNER_HOME/\"\n";
     scratch.write("templates/pool.sh", template);
     scratch.git(&["add", "-A"]);
     scratch.git(&["commit", "-q", "-m", "feat(templates): a pool"]);
     let repo = scratch.0.to_str().expect("a path").to_string();
-    let check = |name: &str, content: &[u8], cargo_home: Option<&str>| {
-        let file = scratch.0.join(name);
-        fs::write(&file, content).expect("write");
+    // The toolchain stays where it is: only the home directory is another machine's.
+    let rustup = std::env::var("RUSTUP_HOME").unwrap_or_else(|_| {
+        format!(
+            "{}/.rustup",
+            std::env::var("HOME").expect("a home directory")
+        )
+    });
+    let check_file = |file: &Path, cargo_home: Option<&str>| {
         let mut command = Command::new("bash");
         command
             .arg(scratch.0.join("scripts/build-portable.sh"))
             .arg("--check-paths")
-            .arg(&file)
+            .arg(file)
             .env("HOME", "/home/runner")
+            .env("RUSTUP_HOME", &rustup)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env_remove("CARGO_HOME");
+            .env_remove("CARGO_HOME")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR")
+            .env_remove("ARCA_PORTABLE_TOOLS")
+            .env_remove("XDG_CACHE_HOME");
         if let Some(home) = cargo_home {
             command.env("CARGO_HOME", home);
         }
@@ -581,6 +600,11 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
     };
+    let check = |name: &str, content: &[u8], cargo_home: Option<&str>| {
+        let file = scratch.0.join(name);
+        fs::write(&file, content).expect("write");
+        check_file(&file, cargo_home)
+    };
     // A program as the compiler leaves it: the template's text among other bytes, and sources under their fixed names.
     let mut program = b"\x7fELF\0\0/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.8/src/lib.rs/arca/crates/arca/src/lib.rs\0".to_vec();
     program.extend_from_slice(template.as_bytes());
@@ -588,12 +612,13 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
         b"\0/rustc/sysroot/lib/rustlib/src/rust/library/core/src/option.rs\0\xff\xfe",
     );
 
-    // The repository's own text is not a path of the build machine, though it starts with the home directory.
+    // The product's own text is not a path of the build machine, though it starts with the home directory.
     let (code, said) = check("clean", &program, None);
     assert_eq!(code, Some(0), "{said}");
 
-    // Each of these is one: a registry source, a git checkout, the toolchain's sources, the checkout itself, a file the
-    // build made, and a path that only starts like the template's. Every one is refused, and named.
+    // Each of these is one: a registry source, a git checkout, the toolchain's sources, a file of the tools, a file
+    // the build made, a file of the checkout, and four that start like the template's own line and go on, through a
+    // space, a "#", a quote, or past the end of that line. Every one is refused, and named whole.
     let leaks = [
         "/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.8/src/lib.rs".to_string(),
         "/home/runner/.cargo/git/checkouts/dep-0a7fdb298878dfd0/1234abc/src/lib.rs".to_string(),
@@ -601,6 +626,11 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
         "/home/runner/.cache/arca-portable-tools/zig-0.17.1/lib/libc/glibc/x.c".to_string(),
         "/home/runner/_work/arca/arca/target/release/build/x-1/out/gen.rs".to_string(),
         format!("{repo}/crates/arca/src/lib.rs"),
+        format!("{repo}/target/release/build/x-1/out/gen.rs"),
+        "/home/runner/_work x/secret.rs".to_string(),
+        "/home/runner/_work#x/secret.rs".to_string(),
+        "/home/runner/_work\"x/secret.rs".to_string(),
+        "/home/runner/_work\" \\ and/more.rs".to_string(),
     ];
     for leak in &leaks {
         let mut with = program.clone();
@@ -610,14 +640,15 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
         assert_eq!(code, Some(1), "{leak} is refused: {said}");
         assert!(
             said.contains("names 1 path(s) of the build machine"),
-            "{said}"
+            "{leak}: {said}"
         );
         assert!(
             said.contains(&format!("\n  {leak}\n")),
             "{leak} is named: {said}"
         );
         assert!(
-            !said.contains("/home/runner/_work\n") && !said.contains("/home/runner/.\n"),
+            !said.contains("\n  /home/runner/_work\" \\\n")
+                && !said.contains("\n  /home/runner/.\" "),
             "the template's text is not named: {said}"
         );
         assert!(
@@ -633,7 +664,19 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
     let (code, said) = check("leaky", &all, None);
     assert_eq!(code, Some(1));
     assert!(
-        said.contains("names 6 path(s) of the build machine"),
+        said.contains(&format!(
+            "names {} path(s) of the build machine",
+            leaks.len()
+        )),
+        "{said}"
+    );
+    // A long one is listed by its first 200 characters.
+    let mut long = program.clone();
+    long.extend_from_slice(format!("/home/runner/{}\0", "a".repeat(400)).as_bytes());
+    let (code, said) = check("leaky", &long, None);
+    assert_eq!(code, Some(1));
+    assert!(
+        said.contains(&format!("\n  /home/runner/{}\n", "a".repeat(187))),
         "{said}"
     );
 
@@ -648,6 +691,34 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
     );
     let (code, said) = check("elsewhere", &elsewhere, None);
     assert_eq!(code, Some(0), "not a directory of this build: {said}");
+
+    // A file that cannot be searched is not a file with nothing in it. (Root reads any file, so this is shown only
+    // where the tests do not run as root.)
+    let uid = Command::new("id").arg("-u").output().expect("id");
+    if String::from_utf8_lossy(&uid.stdout).trim() != "0" {
+        let unread = scratch.0.join("unread");
+        fs::write(&unread, &program).expect("write");
+        fs::set_permissions(&unread, fs::Permissions::from_mode(0o000)).expect("mode");
+        let (code, said) = check_file(&unread, None);
+        assert_eq!(code, Some(1), "{said}");
+        assert!(said.contains("could not search"), "{said}");
+        assert!(!said.contains("names no path"), "{said}");
+    }
+
+    // A line that is only written, and not committed, is not the product's text yet.
+    let line = "mount /home/runner/cache here\n";
+    scratch.write("templates/cache.sh", line);
+    let mut newer = program.clone();
+    newer.extend_from_slice(line.as_bytes());
+    let (code, said) = check("clean", &newer, None);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(said.contains("\n  /home/runner/cache here\n"), "{said}");
+    scratch.git(&["add", "-A"]);
+    let (code, _) = check("clean", &newer, None);
+    assert_eq!(code, Some(1), "staged is not committed");
+    scratch.git(&["commit", "-q", "-m", "feat(templates): a cache"]);
+    let (code, said) = check("clean", &newer, None);
+    assert_eq!(code, Some(0), "{said}");
 
     // The text is the product's only while a file the binary is built from holds it. Once the template is gone the
     // same bytes are refused, and the same words in a test, a document or a script excuse nothing.
@@ -664,7 +735,8 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
         "{said}"
     );
     assert!(
-        said.contains("\n  /home/runner/.\n") && said.contains("\n  /home/runner/_work\n"),
+        said.contains("\n  /home/runner/.\" \"$RUNNER_HOME/\"\n")
+            && said.contains("\n  /home/runner/_work\" \\\n"),
         "{said}"
     );
     // In a source file of a crate it is the product's text again.
@@ -676,6 +748,15 @@ fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_te
     scratch.git(&["commit", "-q", "-m", "feat(a): a pool"]);
     let (code, said) = check("clean", &program, None);
     assert_eq!(code, Some(0), "{said}");
+
+    // Outside a git checkout nothing is known to be the product's text.
+    fs::remove_dir_all(scratch.0.join(".git")).expect("remove");
+    let (code, said) = check("clean", &program, None);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains("names 2 path(s) of the build machine"),
+        "{said}"
+    );
 }
 
 /// scripts/release.sh, run whole in a scratch repository whose build is a stand-in that reports a program saying the
