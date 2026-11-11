@@ -1079,22 +1079,32 @@ part of the machine's create and of nothing later; the secrets never enter Incus
   machine that Incus starts by itself after a host restart, or that restarts from inside, still has its secrets without
   Arca being asked.
 - The write is not a plugin effect, like an instance action (it is made beside one) and the exec seam (Rule 50). It is made
-  only for a record that is a virtual machine Arca created, in the service project, through a writer bound to the record's
-  entry, on the instance whose uuid the effect journal holds, and not on one with a tombstone. An adopted service and a
-  container get nothing.
-- Inside a tenant (Rule 61) a virtual machine's secrets are stored as anywhere, and are not written into its guest: the
-  file requests are made in the node's own service project only, as the exec seam's are (Rule 50). A start of such a
-  machine says so with `InstanceSecretsNotWritten`, and sends nothing. Test
-  `a_tenants_machine_keeps_its_secrets_stored_and_a_start_says_they_are_not_in_its_guest` in
-  `crates/arca/tests/tenants/isolation.rs`.
+  only for a record that is a virtual machine Arca created, through a writer bound to the record's entry, on the instance
+  the effect journal holds for that entry (its project and its uuid), and not on one with a tombstone. An adopted service
+  and a container get nothing.
+- A virtual machine in a tenant (Rule 61) is served the same way, in its tenant's project. This is the one place where a
+  file request leaves the node's own project, so where it goes is never a caller's word. The project and the instance a
+  call names only find the record: a record counts when its own project and instance are exactly those and its entry id
+  is its own. The request is then addressed to the instance the effect journal holds for that entry, which must be in
+  the project the record names; that project must be the record's own tenant's, and the tenant's entry must exist and
+  name it. The writer is the exec seam's (`writer_for`): bound to the entry, over the node's family and that one
+  tenant's project, so it reads no other tenant's instance as owned. Only the two guest-secret destinations
+  (`/etc/arca-secrets` and a file in it) follow the owned instance into a tenant's project (`guest_target`). A command,
+  a recording and every other file stay in the node's own project and are refused for a tenant's instance (`target`),
+  so Rule 50's seam is as it was. The instance verbs already refuse a call that names a tenant together with another
+  project, and a tenant's project without its tenant (Rule 65), before any instance is read.
 - The guest agent is waited for, up to 120 seconds: a machine that has just started boots before it takes a file. When
-  it never answers, the verb is refused with `InstanceSecretsNotWritten`, the machine stays running, and the answer says to
-  run `instance_start` again.
+  it never answers, the verb is refused with `InstanceSecretsNotWritten` and the machine stays running. The answer says
+  what to do next once, and only what is true: to run `instance_start` again when the guest was not ready or a request
+  did not get through, and that running it again changes nothing when something has to be put right first (a secret
+  that cannot be read, a directory in the guest that is not private, a record that does not fit its instance).
 
 Source: `first_boot`, `settings_vendor_data`, `validate_vm_template` and `vm_config` in `crates/arca/src/service.rs`;
 `vm_service_config` in `crates/arca/src/handlers.rs`; `call_wiring` in `crates/arca/src/service_wiring.rs`;
 `crates/arca/src/guest_secrets.rs`; `InstanceLifecycle::run` and `with_after_start` in `crates/arca/src/lifecycle.rs`;
-`ServiceFile::GuestSecretsDir`, `ServiceFile::GuestSecret` and `write_service_file` in `crates/arca-incus/src/exec.rs`;
+`ServiceFile::GuestSecretsDir`, `ServiceFile::GuestSecret`, `guest_target`, `guest_secrets_dir` and `write_service_file` in
+`crates/arca-incus/src/exec.rs`; `writer_for` in `crates/arca/src/service_exec.rs`; `Kernel::service_object` in
+`crates/arca/src/kernel.rs`;
 Incus's `fileSFTPPost` in `cmd/incusd/instance_file.go` for the order of create and mode. Tests, in
 `crates/arca/tests/services/vm_secrets.rs`:
 `a_vm_with_secrets_is_created_stopped_with_its_script_and_incus_never_receives_a_secret_but_as_a_guest_file` (every request
@@ -1105,7 +1115,11 @@ the fake received is read: a secret is in the body of its own file request and n
 `a_stored_secret_is_read_by_the_providers_rule_and_a_key_with_crlf_lines_is_stored_with_line_feeds`,
 `a_vm_template_takes_a_first_boot_script_settings_and_secrets_and_no_other_kind_does` and
 `the_create_requests_of_an_oci_a_system_and_a_plain_vm_template_are_the_golden_ones`, whose golden file was written by the
-kernel before this rule. The fake refuses a file for a virtual machine that is stopped or whose agent is not up, as Incus
+kernel before this rule. For a tenant, in `crates/arca/tests/tenants/isolation.rs`:
+`a_start_writes_a_tenants_machine_its_own_secrets_in_its_own_project_and_nowhere_else`,
+`a_call_in_a_tenant_cannot_send_secrets_to_another_tenants_or_the_nodes_project`,
+`the_guest_file_seam_follows_the_owned_instance_and_a_command_never_does` and
+`a_secret_that_was_not_written_says_whether_asking_again_can_help`. The fake refuses a file for a virtual machine that is stopped or whose agent is not up, as Incus
 does. That cloud-init on a public cloud image runs the two keys in a machine Arca creates, and that the agent takes the
 files, are read from Incus's and cloud-init's behaviour and not yet confirmed on a live host ("Assumptions to confirm").
 
@@ -1211,7 +1225,8 @@ before anything is written. Its Incus instance is named
 instance's DNS name there (a live host showed it). The instance verbs and `tenant_usage` name an instance by that Incus
 name. A name on another side answers "not found", exactly as a name that does not exist. A link joins two services of one side only, and a removal revokes links
 among the services of its own project only. Nothing in a tenant is published, imported or released, has a host port, or
-runs a command through the exec seam (Rule 50): a tenant's log is its console log. `service_publish`,
+runs a command through the exec seam (Rule 50): a tenant's log is its console log. The one request that does reach a
+tenant's guest is the file that carries a virtual machine's own stored secret (Rule 68). `service_publish`,
 `service_unpublish`, `service_import` and `service_release` take no `tenant`: the field is not in their schema. A
 snapshot verb given `tenant` takes its source from that tenant's project, lists the snapshots taken from it, and deletes
 only those; given none, it lists no tenant's snapshot, refuses a tenant's project named by `project`, and does not find

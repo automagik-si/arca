@@ -235,6 +235,17 @@ impl Kernel {
 
     /// Identity from the newest live class-B instance effect, never from the desired record or a fresh Incus listing.
     pub fn service_uuid(&self, entry: &EntryId, instance: &str) -> Option<String> {
+        self.service_object(entry, instance)
+            .and_then(|object| object.uuid)
+    }
+
+    /// The instance `instance` that `entry` created, as the effect journal records it: its project and its uuid. This
+    /// is Arca's own record of where the instance is; a caller's word for the project is never used in its place.
+    pub fn service_object(
+        &self,
+        entry: &EntryId,
+        instance: &str,
+    ) -> Option<arca_kernel::ownership::ObjectRef> {
         self.reconciler
             .journal()
             .live(entry)
@@ -248,7 +259,6 @@ impl Kernel {
                     && (o.project == arca_netproject::PROJECT
                         || arca_kernel::ownership::tenant_of_project(&o.project).is_some())
             })
-            .and_then(|o| o.uuid)
     }
 
     pub fn retained_entries(

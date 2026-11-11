@@ -342,6 +342,33 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
   }
 });
 
+test('the Open Intelligence tag the canvas draws is the vendored footer cut, element for element', async () => {
+  const { OPEN_INTELLIGENCE_TAG } = await import('../src/open-intelligence.js');
+  const escape = (value) => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const markup = ([tag, attrs, children]) => `<${tag}${Object.entries(attrs).map(([name, value]) => ` ${name}="${escape(value)}"`).join('')}>${
+    children.map((child) => (typeof child === 'string' ? escape(child) : markup(child))).join('')}</${tag}>`;
+  const vendored = await readFile(new URL('../../../assets/open-intelligence/open-intelligence-tag.svg', import.meta.url), 'utf8');
+  assert.equal(`${markup(OPEN_INTELLIGENCE_TAG)}\n`, vendored);
+  const [tag, attrs, children] = OPEN_INTELLIGENCE_TAG;
+  assert.equal(tag, 'svg');
+  assert.deepEqual([attrs.width, attrs.height, attrs['aria-label']], ['170', '32', 'Open Intelligence badge']);
+  assert.deepEqual(children.at(-1)[2], ['OPEN INTELLIGENCE']);
+  const flat = JSON.stringify(OPEN_INTELLIGENCE_TAG);
+  assert.doesNotMatch(flat, /"(a|script|style|foreignObject|image|use)",|"(href|xlink:href|style|on\w+)":/);
+  // The one-colour cut: every stroke of the mark is the one ivory the pill's outline and the words carry.
+  const mark = children[1][2];
+  assert.ok(mark.length > 100 && mark.every(([name, attrs]) => name === 'path' && attrs.stroke === '#ebe6da' && attrs.fill === 'none'));
+  // Plain colours as attributes; the stylesheet recolours them, so no browser has to read var() in an attribute.
+  assert.doesNotMatch(flat, /var\(/);
+  assert.deepEqual([children[0][1].fill, children[0][1].stroke, children.at(-1)[1].fill], ['#0e1017', '#ebe6da', '#ebe6da']);
+  for (const name of ['src/canvas.css', 'page.css']) {
+    const css = (await readFile(new URL(`../${name}`, import.meta.url), 'utf8')).replace(/\s+/g, ' ');
+    assert.match(css, /\.arca-foot rect \{ fill: var\(--arca-bg\); stroke: var\(--arca-ink\); \}/, name);
+    assert.match(css, /\.arca-foot text \{ fill: var\(--arca-ink\); \}/, name);
+    assert.match(css, /\.arca-foot path \{ stroke: var\(--arca-ink\); \}/, name);
+  }
+});
+
 test('a service Open link needs a configured host address and a real service port', () => {
   const dashboard = buildDashboard(fixture);
   const web = project(dashboard, 'Web1').cards[0];

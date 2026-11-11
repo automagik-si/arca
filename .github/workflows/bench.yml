@@ -1,0 +1,117 @@
+# The test job of ci.yml, run twice on one commit: on a GitHub-hosted runner and on our own runner pool. Each leg
+# prints its machine (CPU model, CPU count, memory) and how long the toolchain, the build and the tests took, so the two
+# can be read side by side in the run's summary.
+#
+# SAFETY. Started by hand only, by a person with write access, which is one of the events ci.yml trusts with our pool.
+# One leg always asks for the pool's labels, so this workflow gets no other trigger, ever.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      pool_label:
+        description: The pool class to measure (templates/github-runner-pool.json)
+        type: choice
+        options: [arca-large, arca]
+        default: arca-large
+      pool_cache:
+        description: Let the pool leg use its kept cache, as ci.yml does. Off, both legs build from nothing.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-latest
+            runs-on: '["ubuntu-latest"]'
+            # A hosted runner shows the CPUs it has, so cargo and the tests are told nothing.
+            cpus: ''
+          - name: the pool (${{ inputs.pool_label }})
+            runs-on: '["self-hosted", "linux", "x64", "${{ inputs.pool_label }}"]'
+            # The CPUs of the class on our pool, as in ci.yml: `large` 6, `standard` 2.
+            cpus: ${{ inputs.pool_label == 'arca-large' && '6' || '2' }}
+    runs-on: ${{ fromJSON(matrix.runs-on) }}
+    timeout-minutes: 120
+    env:
+      CI_SLOT_CPUS: ${{ matrix.cpus }}
+      CI_CACHE: ${{ inputs.pool_cache && 'on' || 'off' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Machine
+        run: |
+          lscpu | grep -E '^(CPU\(s\)|Model name|Core\(s\) per socket|Socket\(s\)|Hypervisor vendor):' || true
+          echo "nproc: $(nproc)"
+          grep -E '^(MemTotal|MemAvailable)' /proc/meminfo
+          # The limits of the job's own control group, where the runner lets the job read them.
+          for limit in cpu.max memory.max; do
+            if [ -r "/sys/fs/cgroup/$limit" ]; then echo "$limit: $(cat "/sys/fs/cgroup/$limit")"; fi
+          done
+          {
+            echo "CPU_MODEL=$(lscpu | sed -n 's/^Model name: *//p' | head -n1)"
+            echo "CPU_COUNT=$(nproc)"
+            echo "MEM_MIB=$(awk '$1 == "MemTotal:" { printf "%d", $2 / 1024 }' /proc/meminfo)"
+          } >>"$GITHUB_ENV"
+
+      - name: Toolchain, C compiler and test programs
+        run: |
+          SECONDS=0
+          scripts/ci-setup.sh test
+          echo "SETUP_SECONDS=$SECONDS" >>"$GITHUB_ENV"
+
+      - name: Build the tests
+        run: |
+          SECONDS=0
+          cargo test --workspace --no-run
+          echo "BUILD_SECONDS=$SECONDS" >>"$GITHUB_ENV"
+
+      - name: cargo test
+        run: |
+          SECONDS=0
+          cargo test --workspace
+          echo "TEST_SECONDS=$SECONDS" >>"$GITHUB_ENV"
+
+      - name: Result
+        if: always()
+        env:
+          LEG: ${{ matrix.name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          seconds() { if [ -n "$1" ]; then echo "$1 s"; else echo "did not finish"; fi; }
+          total=$((${SETUP_SECONDS:-0} + ${BUILD_SECONDS:-0} + ${TEST_SECONDS:-0}))
+          {
+            echo "### $LEG"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`$COMMIT\` |"
+            echo "| CPU model | ${CPU_MODEL:-not read} |"
+            echo "| CPUs the job sees | ${CPU_COUNT:-not read} |"
+            echo "| CPUs cargo and the tests were told | ${CARGO_BUILD_JOBS:-all it sees} |"
+            echo "| Memory the job sees | ${MEM_MIB:-not read} MiB |"
+            echo "| Cache at the start | ${CI_CACHE_STATE:-not read} |"
+            echo "| Toolchain and packages | $(seconds "${SETUP_SECONDS:-}") |"
+            echo "| Build (\`cargo test --workspace --no-run\`) | $(seconds "${BUILD_SECONDS:-}") |"
+            echo "| Tests (\`cargo test --workspace\`) | $(seconds "${TEST_SECONDS:-}") |"
+            echo "| The three together | $total s |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -292,6 +292,24 @@ fn target(owned: &Owned) -> Result<String, IncusError> {
     Ok(format!("/1.0/instances/{}", owned.target().name))
 }
 
+/// The instance path and the project of a guest-file request: the project is the owned instance's own, as the writer
+/// read it under its family, and is the node's service project or a tenant's project and nothing else. Only the two
+/// guest-secret destinations are sent to it. A command, a recording and every other file stay with [`target`], in the
+/// node's own project.
+fn guest_target(owned: &Owned) -> Result<(String, &str), IncusError> {
+    let object = owned.target();
+    if object.kind != IncusKind::Instance
+        || object.name.is_empty()
+        || owned.uuid().is_none()
+        || owned.tombstone().is_some()
+        || !(object.project == SERVICE_PROJECT
+            || arca_kernel::ownership::tenant_of_project(&object.project).is_some())
+    {
+        return Err(refused());
+    }
+    Ok((format!("/1.0/instances/{}", object.name), &object.project))
+}
+
 impl UnixIncusWriter {
     /// Starts only a closed command on this entry's freshly checked instance. The caller audits its returned id before waiting.
     pub fn start_service_exec(
@@ -383,11 +401,12 @@ impl UnixIncusWriter {
         }
         Ok(framed.body)
     }
-    /// Reads what is at [`GUEST_SECRETS_DIR`] in this entry's freshly checked instance: its type, mode and owner, from
+    /// Reads what is at [`GUEST_SECRETS_DIR`] in this entry's freshly checked instance, in the node's own project or in
+    /// a tenant's ([`guest_target`]): its type, mode and owner, from
     /// the answer's headers. The answer's body, a listing of names, is not read. An answer that is neither a success
     /// nor "not found" is an error: a guest whose agent does not run yet answers so.
     pub fn guest_secrets_dir(&self, owned: &Owned) -> Result<GuestSecretsDir, IncusError> {
-        let path = target(owned)?;
+        let (path, project) = guest_target(owned)?;
         if owned.entry() != self.entry() {
             return Err(refused());
         }
@@ -395,7 +414,7 @@ impl UnixIncusWriter {
         if fresh.uuid() != owned.uuid() || fresh.tombstone().is_some() {
             return Err(refused());
         }
-        let path = format!("{path}/files?project={SERVICE_PROJECT}&path={GUEST_SECRETS_DIR}");
+        let path = format!("{path}/files?project={project}&path={GUEST_SECRETS_DIR}");
         check_path(&path)?;
         let request = format!("GET {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\n\r\n");
         let framed = exchange_capped(
@@ -433,7 +452,12 @@ impl UnixIncusWriter {
         file: &ServiceFile,
         bytes: &[u8],
     ) -> Result<(), IncusError> {
-        let path = target(owned)?;
+        // A guest secret goes to the owned instance's own project, which may be a tenant's. Every other file goes to
+        // an instance of the node's own project only.
+        let (path, project) = match file {
+            ServiceFile::GuestSecretsDir | ServiceFile::GuestSecret(_) => guest_target(owned)?,
+            ServiceFile::TailnetKey | ServiceFile::Secret(_) => (target(owned)?, SERVICE_PROJECT),
+        };
         let (kind, mode) = file.kind();
         if bytes.len() > OUTPUT_CAP
             || owned.entry() != self.entry()
@@ -445,10 +469,7 @@ impl UnixIncusWriter {
         if fresh.uuid() != owned.uuid() || fresh.tombstone().is_some() {
             return Err(refused());
         }
-        let path = format!(
-            "{path}/files?project={SERVICE_PROJECT}&path={}",
-            file.path()
-        );
+        let path = format!("{path}/files?project={project}&path={}", file.path());
         check_path(&path)?;
         let mut request = format!("POST {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\nX-Incus-type: {kind}\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\nX-Incus-mode: {mode}\r\nX-Incus-write: overwrite\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
         request.extend_from_slice(bytes);

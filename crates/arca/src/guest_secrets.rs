@@ -9,20 +9,21 @@
 //! itself still has them; `instance_start` and `instance_restart` write them again, which is how a new value arrives.
 //!
 //! Nothing here is an effect of a plugin: the call is made after the instance action, for a service record whose
-//! instance is this entry's own by its journalled uuid, and its outcome is a line of the instance action journal that
-//! names the secrets and never a value.
+//! instance is this entry's own by its journalled project and uuid, and its outcome is a line of the instance action
+//! journal that names the secrets and never a value. A service in a tenant is served the same way, in its tenant's
+//! project: the project is the one the effect journal holds for the instance, never the one a call names, and the
+//! writer reaches that tenant's project and no other tenant's. Commands (the exec seam) stay in the node's own project.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arca_incus::exec::{GUEST_SECRETS_DIR, GuestSecretsDir, SecretName, ServiceFile};
-use arca_incus::{ProjectFamily, UnixIncusWriter};
-use arca_kernel::ownership::{IncusKind, ObjectRef};
 use arca_providers::incus::read_entry_secret;
 
 use crate::config::NodeConfig;
 use crate::kernel::Kernel;
 use crate::service::ServiceConfig;
+use crate::service_exec::{ExecTarget, writer_for};
 
 /// How long a start waits for the guest agent to take the first file. A new virtual machine boots before it answers.
 const AGENT_WAIT: Duration = Duration::from_secs(120);
@@ -30,6 +31,31 @@ const AGENT_WAIT: Duration = Duration::from_secs(120);
 const AGENT_PAUSE: Duration = Duration::from_secs(3);
 /// The time one file request may take.
 const REQUEST_BUDGET: Duration = Duration::from_secs(15);
+
+/// Why a virtual machine's secrets were not written into its guest. The words never hold a value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotWritten {
+    /// In plain words, what was not done and why.
+    pub why: String,
+    /// Whether the same call may succeed when it is made again with nothing else changed: the guest's agent was not up
+    /// yet, or a request did not get through. `false` when something has to be put right first.
+    pub retry: bool,
+}
+
+impl NotWritten {
+    fn later(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            retry: true,
+        }
+    }
+    fn fixed(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            retry: false,
+        }
+    }
+}
 
 /// Writes a virtual-machine service's secrets into its guest.
 pub struct GuestSecrets {
@@ -56,21 +82,30 @@ impl GuestSecrets {
         self
     }
 
-    /// Writes the stored secrets of the virtual-machine service `instance` in `project` into its guest. `Ok(None)`
-    /// when there is nothing to write: the instance is not a virtual-machine service Arca created, or none of its
-    /// secrets is set. `Ok(Some(names))` names the secrets written. An error says in plain words what was not done,
-    /// and never holds a value.
-    pub fn deliver(&self, project: &str, instance: &str) -> Result<Option<Vec<String>>, String> {
-        // The record is found by the instance it names, in the node's own project or in a tenant's.
-        let tenant = arca_kernel::ownership::tenant_of_project(project);
-        if project != arca_netproject::PROJECT && tenant.is_none() {
+    /// Writes the stored secrets of the virtual-machine service whose instance is `instance` in `project` into its
+    /// guest. `Ok(None)` when there is nothing to write: no service record of Arca's names that instance in that
+    /// project, it is not a virtual machine Arca created, or none of its secrets is set. `Ok(Some(names))` names the
+    /// secrets written.
+    ///
+    /// `project` and `instance` are the caller's words and only find the record. Where the files are sent is Arca's
+    /// own: the instance the record's entry created, as the effect journal holds it (project and uuid), which must be
+    /// the project the record names and, for a service in a tenant, that tenant's own project while the tenant's entry
+    /// exists. The writer is bound to that entry and reaches that one tenant's project and no other.
+    pub fn deliver(
+        &self,
+        project: &str,
+        instance: &str,
+    ) -> Result<Option<Vec<String>>, NotWritten> {
+        if project != arca_netproject::PROJECT
+            && arca_kernel::ownership::tenant_of_project(project).is_none()
+        {
             return Ok(None);
         }
-        let (entry, record, uuid, retained) = {
+        let (entry, record, object, retained) = {
             let kernel = self
                 .kernel
                 .lock()
-                .map_err(|_| "the kernel could not be read".to_string())?;
+                .map_err(|_| NotWritten::later("the kernel could not be read"))?;
             let Some((entry, record)) = kernel
                 .entries()
                 .iter()
@@ -91,66 +126,76 @@ impl GuestSecrets {
             if record.vm.is_none() || record.adopted || record.secret_refs.is_empty() {
                 return Ok(None);
             }
-            let uuid = kernel.service_uuid(&entry, instance);
-            (
-                entry,
-                record,
-                uuid,
-                kernel
-                    .retained_entries()
-                    .map_err(|_| "the kernel's retained set could not be read".to_string())?,
-            )
+            // The record's place: the node's own project, or the project of its own tenant, whose entry still exists
+            // and names that project.
+            let in_place = match &record.tenant {
+                None => record.project == arca_netproject::PROJECT,
+                Some(tenant) => {
+                    arca_kernel::ownership::tenant_of_project(&record.project)
+                        == Some(tenant.id.as_str())
+                        && kernel.entries().iter().any(|found| {
+                            found.plugin.0 == "arca.tenant"
+                                && found.id.0 == arca_kernel::ownership::tenant_entry(&tenant.id)
+                                && found.config["project"].as_str() == Some(record.project.as_str())
+                        })
+                }
+            };
+            if !in_place || record.instance != record.instance_name() {
+                return Err(NotWritten::fixed(
+                    "its record does not name its own project and instance; nothing was sent",
+                ));
+            }
+            let object = kernel.service_object(&entry, &record.instance);
+            let retained = kernel
+                .retained_entries()
+                .map_err(|_| NotWritten::later("the kernel's retained set could not be read"))?;
+            (entry, record, object, retained)
         };
-        // The file requests are made in the node's own service project only. A virtual machine in a tenant keeps its
-        // stored secrets, and they are not written into its guest: said in words, never passed over in silence.
-        if tenant.is_some() || record.tenant.is_some() {
-            return Err(
-                "this Arca does not yet write a virtual machine's secrets into its guest inside a tenant; they stay stored, and running instance_start again does not change that"
-                    .into(),
-            );
+        // Where the instance is comes from the effect journal, never from the call.
+        let object = object
+            .filter(|object| object.uuid.is_some())
+            .ok_or_else(|| NotWritten::fixed("its instance has no journalled uuid"))?;
+        if object.project != record.project {
+            return Err(NotWritten::fixed(
+                "the effect journal holds its instance in another project than its record names; nothing was sent",
+            ));
         }
-        if record.project != project || record.instance != instance || record.name != instance {
-            return Err("its record names another instance".into());
-        }
-        let uuid = uuid.ok_or_else(|| "its instance has no journalled uuid".to_string())?;
         // Every value is read before anything is sent, so a secret that cannot be read leaves the guest as it was. It
         // is read by the provider's own rule: this entry's secret, in private directories, a private file of this
         // process's user, and the file that was checked is the file that is read.
         let secrets = self.cfg.state_dir.join("secrets");
         let mut files = Vec::new();
         for (key, reference) in &record.secret_refs {
-            let name = SecretName::new(key)
-                .map_err(|_| format!("the secret name {key} cannot be a file name"))?;
-            let value = read_entry_secret(&secrets, &entry, reference)
-                .map_err(|why| format!("the stored secret {key} could not be read ({why})"))?;
+            let name = SecretName::new(key).map_err(|_| {
+                NotWritten::fixed(format!("the secret name {key} cannot be a file name"))
+            })?;
+            let value = read_entry_secret(&secrets, &entry, reference).map_err(|why| {
+                NotWritten::fixed(format!(
+                    "the stored secret {key} could not be read ({why}); set it again with service_secret_set"
+                ))
+            })?;
             files.push((key.clone(), name, value));
         }
-        let family = ProjectFamily::new(
-            self.cfg.kernel.projects.iter().map(String::as_str),
-            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
-        )
-        .map_err(|_| "the kernel's project family is invalid".to_string())?;
+        // The writer of the exec seam: bound to this entry, over the node's family and, for a service in a tenant,
+        // that tenant's project alone.
+        let target = ExecTarget {
+            entry: entry.clone(),
+            service: record,
+            uuid: object.uuid.clone(),
+            retained,
+        };
         let writer = || {
-            UnixIncusWriter::new(
-                self.cfg.incus.socket.clone(),
-                entry.clone(),
-                retained.clone(),
-                family.clone(),
-            )
-            .with_total_budget(REQUEST_BUDGET)
+            writer_for(&self.cfg, &target, REQUEST_BUDGET).map_err(|_| {
+                NotWritten::fixed(
+                    "its record's project is not one this node writes; nothing was sent",
+                )
+            })
         };
-        let object = ObjectRef {
-            kind: IncusKind::Instance,
-            project: project.to_string(),
-            parent: None,
-            name: instance.to_string(),
-            uuid: Some(uuid),
-        };
-        let owned = writer()
-            .read_owned(&object)
-            .map_err(|_| "its instance is no longer the one Arca created".to_string())?;
+        let owned = writer()?.read_owned(&object).map_err(|_| {
+            NotWritten::fixed("its instance is no longer the one Arca created; nothing was sent")
+        })?;
         if owned.tombstone().is_some() {
-            return Err("its instance is being removed".into());
+            return Err(NotWritten::fixed("its instance is being removed"));
         }
         // The directory first: a new file is made before its mode is set, and only root enters the directory. It is
         // read before it is made, so a directory an earlier start made is left as it is and nothing depends on how
@@ -158,15 +203,15 @@ impl GuestSecrets {
         // written under a directory another user can enter.
         let until = Instant::now() + self.wait;
         loop {
-            match writer().guest_secrets_dir(&owned) {
+            match writer()?.guest_secrets_dir(&owned) {
                 Ok(GuestSecretsDir::Private) => break,
                 Ok(GuestSecretsDir::NotPrivate) => {
-                    return Err(format!(
+                    return Err(NotWritten::fixed(format!(
                         "{GUEST_SECRETS_DIR} in the guest is not a directory that only root can enter (mode 0700, owner root), and Arca did not make it so; nothing was written"
-                    ));
+                    )));
                 }
                 Ok(GuestSecretsDir::Missing) => {
-                    if writer()
+                    if writer()?
                         .write_service_file(&owned, &ServiceFile::GuestSecretsDir, &[])
                         .is_ok()
                     {
@@ -177,21 +222,21 @@ impl GuestSecrets {
                 Err(_) => {}
             }
             if Instant::now() + self.pause > until {
-                return Err(format!(
+                return Err(NotWritten::later(format!(
                     "the guest took no file within {} seconds: its agent is not running yet, or its image has none",
                     self.wait.as_secs()
-                ));
+                )));
             }
             std::thread::sleep(self.pause);
         }
         let mut written = Vec::new();
         for (key, name, value) in files {
-            writer()
+            writer()?
                 .write_service_file(&owned, &ServiceFile::GuestSecret(name), value.as_bytes())
                 .map_err(|_| {
-                    format!(
+                    NotWritten::later(format!(
                         "the secret {key} could not be written to {GUEST_SECRETS_DIR} in the guest"
-                    )
+                    ))
                 })?;
             written.push(key);
         }

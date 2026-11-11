@@ -1,14 +1,21 @@
 # Automagik Arca canvas for DSH
 
+<a href="https://weunfold.ai/"><img src="https://raw.githubusercontent.com/automagik-si/arca/6a9e309584460ce666f2802227a5de79799157d3/assets/open-intelligence/open-intelligence-badge-ink.svg" alt="Open Intelligence" width="170" height="32"></a>
+
 A host plugin for stock DSH and an embedding DSH host. It polls Arca through a
 Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
 `GET /arca-canvas` draws a workspace from the snapshot: a top bar with the project
 picker, local clock and fleet summary; a machines strip with CPU, memory and one
 line per GPU card; the selected project's cards on a dotted canvas with curved
 SVG edges; and a Doctor panel with Chat and Steps tabs, recent Arca activity and
-waiting approvals. A machine's Details dialog names who is using each GPU and
-shows its services area. The Doctor composer is a working chat backed by a
-persisted DSH session named
+waiting approvals. Under the canvas, beside the Doctor panel, a foot carries the
+Open Intelligence tag of the we unfold movement: an inline picture 170 px wide,
+in one colour, the page's ink on the page's ground in light and dark, loaded from
+nowhere and never a link. The tag belongs to [we unfold](https://weunfold.ai/) and is not under this
+package's Apache licence; the Automagik Arca repository says where it comes from
+in `assets/open-intelligence/`. A machine's Details dialog names who is using each
+GPU and shows its services area. The Doctor composer is a working chat backed by
+a persisted DSH session named
 `Doctor` (model `deepseek-flash`). It works without a sidebar. The Doctor reads
 Arca and can record one inert action proposal; it cannot change anything. The
 owner approves a proposal with the passkey on a card inside the kernel-served

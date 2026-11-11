@@ -32,7 +32,8 @@
     "src/render.js",
     "src/page.js",
     "src/client.js",
-    "src/canvas.css"
+    "src/canvas.css",
+    "src/open-intelligence.js"
   ],
   "engines": {
     "node": ">=24.9.0",

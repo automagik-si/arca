@@ -13,6 +13,12 @@ without anyone writing a version or a tag. The numbers changed with it. A releas
 without changing the binary takes the next `P`. The canvas package carries the same version as the binary. Arca is
 still an alpha for single hosts; the number no longer says so, the README does.
 
+- Automagik Arca carries the Open Intelligence tag of the [we unfold](https://weunfold.ai/) movement, in its
+  one-colour cut with the we unfold mark: in the two READMEs, and at the foot of every page `arca serve` returns (the
+  approval page, the canvas, its sign-in page and its error page). On a page it is an inline picture 170 px wide, in
+  the page's ink on the page's ground in light and dark, loaded from nowhere and never a link. The files and where they
+  come from are in `assets/open-intelligence/`.
+
 ## 0.1.0-alpha.7
 
 The first release under the name Automagik Arca, and the first with a binary to download since `0.1.0-alpha.2`. The

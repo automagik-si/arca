@@ -308,6 +308,7 @@ body,
 
 /* main split */
 .arca-main {
+  position: relative;
   flex: 1 1 0;
   min-height: 0;
   display: flex;
@@ -318,6 +319,39 @@ body,
   min-width: 0;
   display: flex;
   flex-direction: column;
+  padding-bottom: 45px;
+}
+
+/* The foot of the canvas column, beside the Doctor panel (396px wide), so the panel and its composer keep their place. */
+.arca-foot {
+  position: absolute;
+  left: 0;
+  right: 396px;
+  bottom: 0;
+  height: 45px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-top: 1px solid var(--arca-line);
+  background: var(--arca-bg);
+}
+
+.arca-foot svg {
+  display: block;
+}
+
+/* The tag is one colour and carries ivory on night as attributes; here it takes the canvas's own ground and ink. */
+.arca-foot rect {
+  fill: var(--arca-bg);
+  stroke: var(--arca-ink);
+}
+
+.arca-foot path {
+  stroke: var(--arca-ink);
+}
+
+.arca-foot text {
+  fill: var(--arca-ink);
 }
 
 /* machines strip */
@@ -1789,6 +1823,12 @@ body,
   }
 
   .arca-left {
+    flex-basis: 100%;
+    padding-bottom: 0;
+  }
+
+  .arca-foot {
+    position: static;
     flex-basis: 100%;
   }
 

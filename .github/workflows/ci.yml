@@ -1,0 +1,166 @@
+# The repository's gate. It runs on our own runner pool (templates/github-runner-pool) for the events we trust, and
+# on GitHub's hosted runners for a pull request from a fork. docs/OPERATING.md, "Continuous integration".
+#
+# SAFETY. This repository is public, and a job on our pool runs whatever the commit says and can reach the pool's
+# GitHub credential. So the pool's labels are used only by events that people with write access to this repository
+# cause, and never by a pull request a bot opened or pushed to. The one condition that decides it is in the `runners`
+# job below; every other job takes its runner from there.
+# No job names a pool label itself, and there is no `pull_request_target` trigger and none may be added.
+#
+# That condition routes; it does not guard. For a pull request GitHub reads the workflow files of the pull request
+# itself, so a fork can change this file or bring a workflow of its own that asks for our labels. What stops that is
+# set on GitHub and not here: "Require approval for all external contributors" in the Actions settings, set before
+# any pool is registered, and nobody approving a run they have not read. docs/OPERATING.md says how.
+name: ci
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a pull request replaces that pull request's run that is still going. Nothing else is replaced:
+# every commit that reaches `dev` is checked to the end, and so is every entry of the merge queue.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Decides where the other jobs run. It runs on a hosted runner itself, because it runs for every event.
+  runners:
+    name: choose the runners
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      standard: ${{ steps.choose.outputs.standard }}
+      large: ${{ steps.choose.outputs.large }}
+    steps:
+      - name: Our pool for the events we trust, GitHub's runners for everything else
+        id: choose
+        env:
+          # THE RULE. Our pool runs a job only for:
+          #   - a push to `dev`;
+          #   - the merge queue;
+          #   - a person with write access starting the workflow by hand;
+          #   - a pull request whose branch is in this repository, opened by a person and pushed to by a person.
+          # Anything else gets GitHub's hosted runners: a pull request from a fork; a pull request that a bot or an
+          # app opened or pushed to (Dependabot, Renovate: they can push branches here too, and what they bring is
+          # other people's code); and any event added to `on:` later that is not named here.
+          TRUSTED: >-
+            ${{
+            (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
+            github.event_name == 'merge_group' ||
+            github.event_name == 'workflow_dispatch' ||
+            (github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.type != 'Bot' &&
+            !endsWith(github.actor, '[bot]'))
+            }}
+        run: |
+          if [ "$TRUSTED" = true ]; then
+            # The labels of the pool's two classes, as templates/github-runner-pool.json ships them.
+            standard='["self-hosted", "linux", "x64", "arca"]'
+            large='["self-hosted", "linux", "x64", "arca-large"]'
+          else
+            standard='["ubuntu-latest"]'
+            large='["ubuntu-latest"]'
+          fi
+          echo "standard=$standard" >>"$GITHUB_OUTPUT"
+          echo "large=$large" >>"$GITHUB_OUTPUT"
+          echo "trusted event: $TRUSTED; small jobs on $standard, builds on $large"
+
+  fmt:
+    name: cargo fmt
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
+    timeout-minutes: 15
+    env:
+      # The CPUs of our pool's `standard` class (2 CPUs, 4GiB). scripts/ci-setup.sh uses the number on the pool only.
+      CI_SLOT_CPUS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: scripts/ci-setup.sh fmt
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
+    timeout-minutes: 60
+    env:
+      # The CPUs of our pool's `large` class (6 CPUs, 10GiB).
+      CI_SLOT_CPUS: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain and C compiler
+        run: scripts/ci-setup.sh build
+      - name: cargo clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  test:
+    name: cargo test
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
+    timeout-minutes: 90
+    env:
+      CI_SLOT_CPUS: 6
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain, C compiler and test programs
+        run: scripts/ci-setup.sh test
+      - name: cargo test
+        run: cargo test --workspace
+
+  canvas:
+    name: canvas node --test
+    needs: runners
+    runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
+    timeout-minutes: 30
+    env:
+      CI_SLOT_CPUS: 2
+    defaults:
+      run:
+        shell: bash
+        working-directory: packages/arca-canvas-dsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The Node the package's README develops with. On the pool it lands in the runner's tool cache, which is kept.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.11.0
+          package-manager-cache: false
+      - name: Caches
+        working-directory: .
+        run: scripts/ci-setup.sh canvas
+      - name: npm ci
+        run: npm ci
+      # The rendering tests drive the Chromium that the pinned Playwright names. Its system libraries are installed
+      # with apt, because a pool job starts from a fresh image.
+      - name: Chromium
+        run: npx playwright install --with-deps chromium
+      # Node starts one test file for each CPU it sees, and most of these files start a Chromium. On the pool that
+      # would be one for each CPU of the whole virtual machine inside a 4GiB slot, so there the script gives the
+      # slot's own number. On a hosted runner the variable is not set and Node decides.
+      - name: node --test
+        run: node --test ${CANVAS_TEST_CONCURRENCY:+--test-concurrency="$CANVAS_TEST_CONCURRENCY"}

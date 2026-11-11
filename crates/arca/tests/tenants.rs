@@ -59,6 +59,7 @@ struct Rig {
     clock: Arc<AtomicU64>,
     kernel_config: Value,
     nonce: AtomicU64,
+    cfg: Arc<NodeConfig>,
 }
 
 impl Rig {
@@ -226,7 +227,7 @@ impl Rig {
         .into_iter()
         .chain(service_handlers(kernel.clone(), time.clone(), cfg.clone()))
         .chain(postgres_handlers(kernel.clone(), time.clone(), cfg.clone()))
-        .chain(tenant_handlers(kernel.clone(), time, cfg))
+        .chain(tenant_handlers(kernel.clone(), time, cfg.clone()))
         .collect();
         Self {
             dir,
@@ -238,6 +239,7 @@ impl Rig {
             clock,
             kernel_config,
             nonce: AtomicU64::new(0),
+            cfg,
         }
     }
 
