@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Build the release assets of Automagik Arca for the tag checked out here, and print the command that would publish them.
+# The release workflow (.github/workflows/release.yml) builds every release with this script and publishes the files
+# itself; run by hand, the script is for trying a build.
 #
 #   scripts/release.sh              from a clean tree whose HEAD is the tag v<version>
 #   scripts/release.sh --rehearse   builds and checks the same files without the tag, to try the script before the
@@ -111,6 +113,6 @@ if [ "$rehearse" = 1 ]; then
 fi
 echo "Nothing was published. To publish, push the tag $tag, then run:"
 echo
-echo "  gh release create $tag --repo automagik-si/arca --verify-tag --prerelease \\"
+echo "  gh release create $tag --repo automagik-si/arca --verify-tag --latest \\"
 echo "    --title \"Automagik Arca $version\" --notes-file dist/RELEASE-NOTES.md \\"
 echo "    dist/$asset dist/SHA256SUMS"

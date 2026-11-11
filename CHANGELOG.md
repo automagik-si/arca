@@ -2,6 +2,17 @@
 
 What changed in each release of Automagik Arca, in plain words. The newest release is first.
 
+## Unreleased
+
+<!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
+Write under this comment only what a reader needs beyond those lines; the release moves it to the top of the section. -->
+
+Releases are now cut by themselves: every change that lands on `dev` and ships is released, numbered and published
+without anyone writing a version or a tag. The numbers changed with it. A release is `0.N.P`, with no `alpha` word:
+`0.8.0` follows `0.1.0-alpha.7`, a change to what the binary is built from takes the next `N`, and a change that ships
+without changing the binary takes the next `P`. The canvas package carries the same version as the binary. Arca is
+still an alpha for single hosts; the number no longer says so, the README does.
+
 ## 0.1.0-alpha.7
 
 The first release under the name Automagik Arca, and the first with a binary to download since `0.1.0-alpha.2`. The

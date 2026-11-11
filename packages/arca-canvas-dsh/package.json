@@ -1,6 +1,6 @@
 {
   "name": "arca-canvas-dsh",
-  "version": "0.1.0",
+  "version": "0.1.0-alpha.7",
   "description": "Automagik Arca snapshots and a Doctor chat with in-canvas approvals for DSH",
   "type": "module",
   "license": "Apache-2.0",

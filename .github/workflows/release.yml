@@ -1,0 +1,256 @@
+name: Release
+
+# Cuts an Automagik Arca release from dev on every push to it. Nobody writes a version or types a tag.
+#
+# One version for the whole repository (scripts/version.sh): a full release is 0.N.0, N one above the last one, cut
+# when anything the binary is built from changed; a patch is 0.N.(P+1), cut when what changed ships but the binary
+# is not built from it; nothing is cut when everything that changed is inert (documents, tests, these workflows).
+# The lists are in scripts/version.sh and nowhere else.
+#
+# The cut, in order:
+#   1. the gates: cargo fmt, clippy and the tests, and the canvas package's tests;
+#   2. the version is written where the tree states it, with its section of CHANGELOG.md, and committed as
+#      `chore(release): v<version>` with the tag `v<version>`;
+#   3. scripts/release.sh builds the release files at that tag, the only way they are built;
+#   4. dev and the tag are pushed together, in one atomic push;
+#   5. the GitHub release `v<version>` is published with
+#        arca-<version>-linux-x86_64   the portable binary (glibc 2.34 or newer)
+#        SHA256SUMS                    its checksum
+#      and that version's CHANGELOG.md section as the notes;
+#   6. main moves to the release commit (the job below). main holds released commits and nothing else.
+#
+# Nothing is taken when a step before the push fails: no version, no tag. When dev moved while a run was cutting, its
+# push lands neither the commit nor the tag, the run ends cleanly, and the run for the newer push releases those
+# changes too. Cuts queue one at a time.
+#
+# When the push landed but the publishing failed, the tag has no release. The next run, by a push or by hand, sees
+# that first: it builds that tag again and publishes it, and takes no new version. Run it again for what came after.
+#
+# The workflow's own push starts no run: GitHub starts none for a push made with the workflow token. So the release
+# commit has no CI run of its own. What covers it is this cut's own gate, which ran on its parent; the commit adds
+# only the version and the changelog section, and the release files are then built from it.
+#
+# Keep that push on the workflow token. A push made with a personal or an app token starts the workflows again, CI
+# and this one, for the release commit; do not move to such a token without a guard that stops those runs.
+#
+# Always on GitHub's hosted runners, never on a self-hosted one. A self-hosted runner keeps its cache from job to
+# job; beside this workflow's write token, that would give a pull request from a branch of this repository a way to
+# write dev.
+#
+# By hand:  gh workflow run release.yml --ref dev [--field prerelease=true]
+# It never runs for a pull request.
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: 'Publish as a prerelease (not shown as Latest)'
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  cut:
+    name: Cut v<version> on dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: release-cut
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.publish.outputs.version }}
+      sha: ${{ steps.publish.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PRERELEASE: ${{ inputs.prerelease }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: dev
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: What this run does
+        id: plan
+        run: |
+          set -euo pipefail
+          last=$(scripts/version.sh last)
+          # A tag whose release was never published comes first: this run finishes it and cuts nothing new.
+          # The list must be read: an error here stops the run rather than guess.
+          published=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 100 --json tagName --jq '.[].tagName')
+          if [[ -n "${last}" ]] && ! grep -qxF -- "${last}" <<< "${published}"; then
+            echo "::notice::${last} was tagged and never published: this run publishes it and cuts nothing new"
+            { echo "mode=finish"; echo "version=${last#v}"; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The paths decide, not the commit subjects.
+          kind=$(scripts/version.sh kind "${last}")
+          case "${kind}" in
+            full|patch)
+              echo "since ${last:-the start}: a ${kind} release"
+              { echo "mode=cut"; echo "kind=${kind}"; echo "last=${last}"; } >> "$GITHUB_OUTPUT"
+              ;;
+            none)
+              echo "nothing since ${last} ships: no release"
+              echo "mode=none" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::scripts/version.sh kind ${last} printed '${kind}', not full, patch or none"
+              exit 1
+              ;;
+          esac
+
+      - name: The Rust toolchain the repository pins
+        if: steps.plan.outputs.mode != 'none'
+        run: |
+          set -euo pipefail
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          [[ -n "${channel}" ]] || { echo "::error::rust-toolchain.toml names no channel"; exit 1; }
+          rustup toolchain install "${channel}" --profile minimal --component clippy --component rustfmt --no-self-update
+          cargo --version
+
+      - name: The gates the release stands on
+        if: steps.plan.outputs.mode == 'cut'
+        run: |
+          set -euo pipefail
+          # The tests call setfattr and getfattr.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq attr
+          scripts/version.sh check
+          cargo fmt --all --check
+          cargo clippy --workspace -- -D warnings
+          cargo test --workspace
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        if: steps.plan.outputs.mode == 'cut'
+        with:
+          node-version: 24.11.0
+
+      # The limit is the rule: these tests stay in the gate only while they finish well inside it.
+      - name: The canvas package's tests
+        if: steps.plan.outputs.mode == 'cut'
+        timeout-minutes: 5
+        working-directory: packages/arca-canvas-dsh
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          node --test
+
+      - name: Version, commit and tag
+        id: cut
+        if: steps.plan.outputs.mode == 'cut'
+        env:
+          KIND: ${{ steps.plan.outputs.kind }}
+          LAST: ${{ steps.plan.outputs.last }}
+        run: |
+          set -euo pipefail
+          # The gates must leave the tree as they found it.
+          [[ -z "$(git status --porcelain)" ]] || { git status --short; echo "::error::the gates left files behind"; exit 1; }
+          version=$(scripts/version.sh next-for "${KIND}")
+          scripts/version.sh set "${version}"
+          scripts/version.sh check
+          # The lock must still match the manifests, or the tag's --locked build fails.
+          cargo metadata --locked --format-version 1 > /dev/null
+          scripts/version.sh changelog "${version}" "$(date -u +%Y-%m-%d)" "${LAST}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "chore(release): v${version}"
+          git tag -a "v${version}" -m "Automagik Arca ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tag that was never published
+        if: steps.plan.outputs.mode == 'finish'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: git checkout -q --detach "v${VERSION}"
+
+      # At the tag, from a clean tree, before anything is pushed: a build that fails takes no version.
+      - name: Build the release files
+        if: steps.plan.outputs.mode != 'none'
+        run: scripts/release.sh
+
+      - name: Push dev and the tag
+        id: push
+        if: steps.plan.outputs.mode == 'cut'
+        env:
+          VERSION: ${{ steps.cut.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Atomic: when dev moved meanwhile (a second push), neither lands, so no tag names a release commit dev
+          # never got. The newer push's own run (queued behind this one) then releases these changes with its
+          # own, so this run stops here, cleanly: no version, and the steps and the job after it skip.
+          if ! git push -q --atomic origin HEAD:refs/heads/dev "refs/tags/v${VERSION}"; then
+            git fetch -q origin dev
+            if [[ "$(git rev-parse origin/dev)" != "$(git rev-parse HEAD~1)" ]]; then
+              echo "::notice::dev moved on while this run cut v${VERSION}; the run for the newer push releases these changes too"
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        id: publish
+        if: steps.plan.outputs.mode == 'finish' || steps.push.outputs.pushed == 'true'
+        env:
+          VERSION: ${{ steps.cut.outputs.version || steps.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A dispatched prerelease is never Latest; every other release is, full or patch: each one carries the
+          # binary.
+          flags=(--latest)
+          [[ "${PRERELEASE}" != "true" ]] || flags=(--prerelease --latest=false)
+          gh release create "v${VERSION}" "dist/arca-${VERSION}-linux-x86_64" dist/SHA256SUMS "${flags[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "Automagik Arca ${VERSION}" \
+            --notes-file dist/RELEASE-NOTES.md
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  main:
+    name: main follows
+    needs: cut
+    if: needs.cut.outputs.version != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: release-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      SHA: ${{ needs.cut.outputs.sha }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: main moves to the release
+        run: |
+          set -euo pipefail
+          # Fast-forward only: main holds released commits and nothing else. The first release creates it.
+          found=0
+          git ls-remote --exit-code --heads origin main > /dev/null || found=$?
+          if [[ "${found}" == 2 ]]; then
+            git push -q origin "${SHA}:refs/heads/main"
+            echo "main created at ${SHA}"
+          elif [[ "${found}" != 0 ]]; then
+            echo "::error::could not read the remote's branches"
+            exit 1
+          else
+            git fetch -q origin main
+            if git merge-base --is-ancestor origin/main "${SHA}"; then
+              git push -q origin "${SHA}:refs/heads/main"
+            else
+              echo "main is already past ${SHA}"
+            fi
+          fi

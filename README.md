@@ -4,8 +4,9 @@ Automagik Arca is a Rust kernel for a node's own infrastructure. The kernel read
 applies a change only after the node's owner has approved it and the change is written to a journal. Each node signs its
 own desired state with its own key. It talks to Incus over the local unix socket. The program is one binary, `arca`.
 
-**Status: `0.1.0-alpha.7`, an alpha for single hosts.** Hardening for shared or distributed hosts comes later.
-[`CHANGELOG.md`](CHANGELOG.md) says what changed since the last published release.
+**Status: an alpha for single hosts.** Hardening for shared or distributed hosts comes later. The newest release is
+on the [releases page](https://github.com/automagik-si/arca/releases/latest), and [`CHANGELOG.md`](CHANGELOG.md) says
+what changed in each one.
 
 ## Quickstart: a read-only node in five minutes
 
@@ -16,7 +17,8 @@ names no kernel project, so the node only reads: it sends Incus nothing but GET.
 **1. Download the binary and check it.**
 
 ```sh
-v=0.1.0-alpha.7
+v=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/automagik-si/arca/releases/latest | sed -n 's#.*/releases/tag/v##p')
+echo "the newest release is ${v:?none is marked Latest; pick a version on the releases page and set v to it}"
 base=https://github.com/automagik-si/arca/releases/download/v$v
 curl -fL -O "$base/arca-$v-linux-x86_64" -O "$base/SHA256SUMS"
 sha256sum --check SHA256SUMS
@@ -24,8 +26,9 @@ install -D -m 0755 "arca-$v-linux-x86_64" ~/.local/bin/arca
 arca --version
 ```
 
-`sha256sum` must answer `arca-0.1.0-alpha.7-linux-x86_64: OK`. `arca --version` prints
-`Automagik Arca 0.1.0-alpha.7 (<commit>, x86_64-unknown-linux-gnu)`; if the shell does not find `arca`, put
+The first two lines ask GitHub which release is the newest. `sha256sum` must answer
+`arca-<version>-linux-x86_64: OK`. `arca --version` prints
+`Automagik Arca <version> (<commit>, x86_64-unknown-linux-gnu)`; if the shell does not find `arca`, put
 `~/.local/bin` on your `PATH`.
 
 **2. Write the smallest config.** These five keys are the required ones. The two directories must be mode 0700.
@@ -61,7 +64,7 @@ arca serve --config ~/.config/arca/node.json
 arca call arca_status --config ~/.config/arca/node.json --token-file ~/.config/arca/assistant-1.secret
 ```
 
-The answer is one JSON object with `"mode":"watch-only"`, `"incusReachable":true` and `"version":"0.1.0-alpha.7"`.
+The answer is one JSON object with `"mode":"watch-only"`, `"incusReachable":true` and the release's `"version"`.
 `arca call watch_report ...` lists every project and instance with its owner.
 
 **4. Connect an assistant over MCP.** The node is an MCP server over streamable HTTP: `POST /mcp`, JSON answers, protocol
@@ -168,9 +171,43 @@ It prints the zig it used, the binary's path, its SHA-256 and the highest GLIBC 
 
 ## Releasing
 
-`scripts/release.sh` builds the release assets and publishes nothing. From a clean tree whose HEAD is the tag `v<version>`
-(the version is the one under `[workspace.package]` in `Cargo.toml`), it runs `scripts/build-portable.sh`, checks that the
-binary's `--version` names that version and commit, and writes `dist/arca-<version>-linux-x86_64`, `dist/SHA256SUMS` and
-`dist/RELEASE-NOTES.md` (that version's section of `CHANGELOG.md`). It then prints the `gh release create` command for
-those files and the glibc the binary needs; it does not run it. `scripts/release.sh --rehearse` builds and checks the
-same files without the tag, to try the script before the tag exists, and prints no publish command.
+Nobody writes a version or types a tag. Every push to `dev` starts the release workflow
+([`.github/workflows/release.yml`](.github/workflows/release.yml)), which cuts a release by itself when something that
+ships has changed:
+
+1. It runs the gates: `cargo fmt`, `cargo clippy`, the tests, and the canvas package's tests.
+2. It works out the version from the release tags (`scripts/version.sh`). The whole repository carries one version,
+   `0.N.P`. A change to anything the binary is built from is a full release, `0.N.0`, with `N` one above the last. A
+   change that ships without changing the binary (the canvas package, the units, the schema) is a patch,
+   `0.N.(P+1)`. A change to documents, tests or the workflows alone releases nothing. The lists are at the top of
+   `scripts/version.sh`.
+3. It writes the version into the manifests and the lock files, writes that version's section of `CHANGELOG.md`,
+   commits both as `chore(release): v<version>` and tags the commit `v<version>`.
+4. It builds the release files at the tag with `scripts/release.sh`, pushes `dev` and the tag together, and publishes
+   the GitHub release with `arca-<version>-linux-x86_64` and `SHA256SUMS`.
+5. `main` moves to the release commit. `main` holds released commits and nothing else.
+
+If any step before the push fails, no version is taken. If the push landed and the publishing failed, the next run
+publishes that same tag before it does anything else; start one by hand with `gh workflow run release.yml --ref dev`.
+Add `--field prerelease=true` to publish a release that is not shown as Latest.
+
+**What a contributor writes.** Commit subjects in the form `type(scope): what changed`, in plain words: the release
+lists them in `CHANGELOG.md`, one line per change that landed on `dev`. A change that needs more than its line gets a
+few sentences under `## Unreleased` in `CHANGELOG.md`; the release moves them to the top of its section. Nothing else:
+no version, no tag, no heading.
+
+After each release `dev` on GitHub is one commit ahead of a local `dev`, by the release commit: fast-forward before
+the next push.
+
+The release commit has no CI run of its own: it is pushed with the workflow's own token, and GitHub starts no workflow
+for such a push. The cut's own gate covers it. It ran on the commit's parent, and the release commit adds only the
+version and the changelog section. For the same reason the push stays on the workflow's token: with a personal or an
+app token the release commit would start the workflows again. The release workflow always runs on GitHub's hosted
+runners, never on a self-hosted one, whose kept cache beside a write token would give a pull request a way to write
+`dev`.
+
+`scripts/release.sh` is the one way the release files are built, and it publishes nothing. From a clean tree whose
+HEAD is the tag `v<version>` it runs `scripts/build-portable.sh`, checks that the binary's `--version` names that
+version and commit, and writes `dist/arca-<version>-linux-x86_64`, `dist/SHA256SUMS` and `dist/RELEASE-NOTES.md` (that
+version's section of `CHANGELOG.md`). `scripts/release.sh --rehearse` builds and checks the same files without the
+tag, to try a build by hand.
