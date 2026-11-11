@@ -6,6 +6,10 @@
 # what a real runner does: it replaces its own files, which fails when its tools directory is a mount. Nothing here is
 # Docker.
 set -u
+# The controller runs with only the programs its script declares on its PATH. This stand-in is not the controller: it
+# takes the machine's whole PATH back, and does not report its own programs as the controller's.
+PATH=${FAKE_PATH:-$PATH}
+unset -f command_not_found_handle 2>/dev/null
 root=$FAKE_DOCKER_DIR
 mkdir -p "$root/containers"
 printf '%s\n' "$*" >>"$root/calls.log"

@@ -103,7 +103,7 @@ jobs:
     runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
     timeout-minutes: 60
     env:
-      # The CPUs of our pool's `large` class (6 CPUs, 10GiB).
+      # The CPUs of our pool's `large` class.
       CI_SLOT_CPUS: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

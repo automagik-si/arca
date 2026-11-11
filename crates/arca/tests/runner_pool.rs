@@ -6,6 +6,12 @@
 //! configuration it was started with, and exits). `curl` is the real one behind a wrapper that records its arguments.
 //! Paths, pauses and the machine's memory come from the environment.
 //!
+//! The controller's `PATH` holds those stand-ins and the programs the script declares in `POOL_PROGRAMS`, and nothing
+//! else. A program the script starts without declaring it is therefore not found, bash reports it to a function this
+//! test hands it, and `Pool::stop` fails on the report. The first boot checks that same list after it has installed
+//! its packages, so a program the controller needs cannot go unchecked. What no test here can prove is that the
+//! packages of `POOL_PACKAGES` bring those programs on a real Debian: the first boot's own check says so on the machine.
+//!
 //! So this proves the controller's own logic: registration, one job per runner, replacement, admission by memory, the
 //! cap, cleanup, and that no credential reaches any output or any command line. It does not prove Docker, a real
 //! runner, cgroup accounting or GitHub itself; `docs/OPERATING.md` lists what stays unproven.
@@ -528,18 +534,70 @@ fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/github-runner-pool.sh")
 }
 
-fn which(tool: &str) -> PathBuf {
+/// Where this machine has `tool`, if it has it.
+fn on_this_machine(tool: &str) -> Option<PathBuf> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {tool}"))
         .output()
         .expect("sh");
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert!(
-        output.status.success() && !path.is_empty(),
-        "this test needs bash, curl, jq, openssl and flock on this machine; {tool} is missing"
-    );
-    PathBuf::from(path)
+    (output.status.success() && path.starts_with('/')).then(|| PathBuf::from(path))
+}
+
+fn which(tool: &str) -> PathBuf {
+    on_this_machine(tool).unwrap_or_else(|| {
+        panic!(
+            "this test needs bash, curl, jq, openssl and flock on this machine; {tool} is missing"
+        )
+    })
+}
+
+/// A list the script declares as `NAME='word word ...'`: `POOL_PROGRAMS`, every program it starts, or `POOL_PACKAGES`,
+/// the packages its first boot installs.
+fn declared(list: &str) -> Vec<String> {
+    let text = fs::read_to_string(script()).expect("the script");
+    let opening = format!("\n{list}='");
+    let start = text
+        .find(&opening)
+        .unwrap_or_else(|| panic!("the script declares {list}"))
+        + opening.len();
+    let end = start + text[start..].find('\'').expect("the closing quote");
+    text[start..end]
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fills `tools` with the programs the script declares, and bash for the script itself: this machine's own program
+/// where it has one, a stand-in that does nothing where it has not. Programs in `without` and programs that `beside`
+/// already holds a stand-in for are left out.
+fn declared_programs(tools: &Path, beside: Option<&Path>, without: &[&str]) {
+    fs::create_dir_all(tools).expect("the tools directory");
+    for program in declared("POOL_PROGRAMS") {
+        if without.contains(&program.as_str())
+            || beside.is_some_and(|dir| dir.join(&program).exists())
+        {
+            continue;
+        }
+        match on_this_machine(&program) {
+            Some(real) => std::os::unix::fs::symlink(real, tools.join(&program)).expect("a link"),
+            None => executable(&tools.join(&program), "#!/bin/sh\n"),
+        }
+    }
+    std::os::unix::fs::symlink(which("bash"), tools.join("bash")).expect("a link");
+}
+
+/// The environment that makes bash write the name of every program it does not find into `record`. bash calls a
+/// function of this name for a command that is not on the `PATH`, whatever the command's own output was sent to.
+fn report_missing_programs(record: &Path) -> [(&'static str, String); 2] {
+    [
+        (
+            "BASH_FUNC_command_not_found_handle%%",
+            "() { printf '%s\\n' \"$1\" >>\"$TEST_NOT_FOUND\"; return 127\n}".to_string(),
+        ),
+        ("TEST_NOT_FOUND", record.display().to_string()),
+    ]
 }
 
 fn executable(path: &Path, text: &str) {
@@ -616,6 +674,8 @@ impl Pool {
                 curl.display()
             ),
         );
+        // Every other program the script declares, and none it does not.
+        declared_programs(&pool.dir.join("tools"), Some(&pool.dir.join("bin")), &[]);
         pool
     }
 
@@ -638,10 +698,11 @@ impl Pool {
     }
 
     fn start(&mut self, github: &Github) {
+        // The stand-ins and the declared programs only: what the script starts without declaring is not found.
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
-            std::env::var("PATH").unwrap_or_default()
+            self.dir.join("tools").display()
         );
         let out = fs::File::create(self.dir.join("out.log")).expect("the output");
         let child = Command::new("bash")
@@ -665,6 +726,8 @@ impl Pool {
             .env("POOL_BACKOFF_MAX", "1")
             .env("POOL_STOP_WAIT", "10")
             .env("POOL_REFUSE_EVERY", "1")
+            .envs(report_missing_programs(&self.dir.join("not-found.log")))
+            .env("FAKE_PATH", std::env::var("PATH").unwrap_or_default())
             .envs(self.env.iter().map(|(key, value)| (*key, value.as_str())))
             .env("FAKE_DOCKER_DIR", self.dir.join("docker"))
             .env("FAKE_CGROUP", self.dir.join("cgroup"))
@@ -689,9 +752,9 @@ impl Pool {
                 .arg(child.id().to_string()),
         );
         let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
+        let code = loop {
             if let Some(status) = child.try_wait().expect("the controller's status") {
-                return status.code();
+                break status.code();
             }
             assert!(
                 Instant::now() < deadline,
@@ -699,7 +762,14 @@ impl Pool {
                 self.output()
             );
             std::thread::sleep(Duration::from_millis(50));
-        }
+        };
+        let strays = self.read("not-found.log");
+        assert!(
+            strays.is_empty(),
+            "the controller started programs its script does not declare in POOL_PROGRAMS, so the first boot neither \
+             installs nor checks them:\n{strays}"
+        );
+        code
     }
 
     fn read(&self, file: &str) -> String {
@@ -741,7 +811,8 @@ impl Pool {
                 let path = entry.path();
                 // The secrets are Arca's files, and the run directory is the controller's private memory (mode 0700
                 // on a tmpfs in the machine): the minted token and a pasted key put back into lines live there.
-                if path.ends_with("secrets") || path.ends_with("run") {
+                // The tools directory is this machine's own programs, linked.
+                if path.ends_with("secrets") || path.ends_with("run") || path.ends_with("tools") {
                     continue;
                 }
                 if path.is_dir() {
@@ -1141,6 +1212,11 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
         status.contains("memory_reserved=8192MiB of 11264MiB slots_cap=4"),
         "{status}"
     );
+    // Sizes that can never all run at once are said with their numbers, at the start and in every status block: a
+    // machine reports less memory than its size, and a slot left queued beside idle ones is otherwise a riddle.
+    let too_much = "arca-runner-pool: WARNING: the 4 slots ask for 16384 MiB together and the machine has 11264 MiB for slots (the 13312 MiB it reports, less reserveMemory 2048 MiB): 5120 MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again\n";
+    assert!(status.contains(too_much), "{status}");
+    assert!(pool.output().matches(too_much).count() >= 2);
     // Jobs flow through the two that fit, and at no moment were more than two runners alive.
     for n in 0..6 {
         github.queue(&["arca"], &format!("job-{n}"), 0.2);
@@ -1608,6 +1684,110 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             .contains("MemoryMax=8589934592\nMemorySwapMax=0\nCPUQuota=800%")
     );
     assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+/// The first boot, as far as a test can take it: it cannot run apt or write under /etc, so a stand-in `apt-get`
+/// "installs" and two declared programs stay missing. The first boot must then stop, name exactly those two, and say
+/// so on the machine's console as well as on its own output.
+#[test]
+fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_the_docker_command()
+{
+    // What a first boot on Debian 13 taught: docker.io is the daemon alone, and recommended packages are not
+    // installed, so the package of each command has to be named.
+    let packages = declared("POOL_PACKAGES");
+    for (package, why) in [
+        ("docker.io", "the Docker daemon"),
+        (
+            "docker-cli",
+            "the docker command, which docker.io only recommends",
+        ),
+        ("jq", "jq"),
+        ("curl", "curl"),
+        ("openssl", "openssl"),
+        (
+            "ca-certificates",
+            "the certificates curl checks GitHub with",
+        ),
+        ("util-linux", "flock"),
+    ] {
+        assert!(
+            packages.iter().any(|name| name == package),
+            "the first boot installs {package} ({why}); it installs {packages:?}"
+        );
+    }
+    let programs = declared("POOL_PROGRAMS");
+    for program in ["docker", "jq", "curl", "openssl", "flock", "systemctl"] {
+        assert!(programs.iter().any(|name| name == program), "{program}");
+    }
+
+    // The positive control of every other test in this file: bash does report a program it does not find.
+    let scratch = scratch_dir();
+    let record = scratch.join("not-found.log");
+    let control = Command::new(which("bash"))
+        .arg("-c")
+        .arg("no-such-program-of-this-test 2>/dev/null; true")
+        .envs(report_missing_programs(&record))
+        .output()
+        .expect("bash");
+    assert!(control.status.success());
+    assert_eq!(
+        fs::read_to_string(&record).unwrap_or_default(),
+        "no-such-program-of-this-test\n"
+    );
+
+    let uid = Command::new("id").arg("-u").output().expect("id");
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        eprintln!(
+            "as root the first boot is not run here: it would install itself on this machine"
+        );
+        let _ = fs::remove_dir_all(scratch);
+        return;
+    }
+    let tools = scratch.join("tools");
+    declared_programs(&tools, None, &["docker", "jq", "apt-get"]);
+    executable(
+        &tools.join("apt-get"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n",
+            scratch.join("apt.log").display()
+        ),
+    );
+    let console = scratch.join("console");
+    let boot = Command::new(tools.join("bash"))
+        .arg(script())
+        .env("PATH", &tools)
+        .env("POOL_CONSOLE", &console)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the first boot runs");
+    let said = String::from_utf8_lossy(&boot.stdout).into_owned();
+    let refusal = format!(
+        "arca-runner-pool: first boot failed: these commands are missing after the install: docker jq. The packages \
+         asked for were: {}. The package manager's own words are in /var/log/cloud-init-output.log inside the \
+         machine. The machine has no pool; service_remove it and create it again once it can reach its package mirror\n",
+        packages.join(" ")
+    );
+    assert_eq!(boot.status.code(), Some(1), "{said}");
+    assert!(said.ends_with(&refusal), "{said}");
+    assert!(!said.contains("first boot done"), "{said}");
+    // The console has the first boot's own lines, all of them: that is what service_logs returns.
+    assert_eq!(fs::read_to_string(&console).expect("the console"), said);
+    assert!(
+        said.starts_with(&format!(
+            "arca-runner-pool: first boot: installing {}\n",
+            packages.join(" ")
+        )),
+        "{said}"
+    );
+    // The install names every package and takes no recommended one.
+    assert_eq!(
+        fs::read_to_string(scratch.join("apt.log")).expect("apt-get's arguments"),
+        format!(
+            "update -q\ninstall -y -q --no-install-recommends {}\n",
+            packages.join(" ")
+        )
+    );
     let _ = fs::remove_dir_all(scratch);
 }
 
