@@ -359,10 +359,14 @@ impl OmniHandler {
             let mut pairing = self.pairing.lock().map_err(|_| internal())?;
             pairing.retain(|_, until| *until > now);
             if let Some(until) = pairing.get(&slot).copied() {
-                return Err(service_refused(format!(
-                    "a pairing code for {id} was issued and lasts {} s more: enter that one on the phone; never ask for codes in a loop",
-                    (until - now).div_ceil(1000)
-                )));
+                // A `rate` refusal: the hold-off of the last attempt, with the same wait the sentence tells.
+                let wait = (until - now).div_ceil(1000);
+                return Err(CallError::rate(
+                    format!(
+                        "a pairing code for {id} was issued and lasts {wait} s more: enter that one on the phone; never ask for codes in a loop"
+                    ),
+                    Some(wait),
+                ));
             }
             // Held while this attempt runs, so a concurrent one is refused too.
             let running = u64::try_from(self.options.timeout.as_millis()).unwrap_or(u64::MAX);

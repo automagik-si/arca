@@ -2,8 +2,9 @@
 # its index in that test) and the sha256 of its log. See tests/services/golden.rs. A rig whose log depends on timing
 # is left out.
 #
-# Two rigs are compared without their waits on an operation, because the number of those waits is how long the test
-# took: wiring::g5_publication_preserves_secret_updates_made_during_its_exec#0 and
+# Three rigs are compared without their waits on an operation, because the number of those waits is how long the node
+# waited on an operation the fake held: wiring::g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change#0,
+# wiring::g5_publication_preserves_secret_updates_made_during_its_exec#0 and
 # wiring::g5_bad_removal_approval_runs_no_exec_and_other_verbs_answer_during_logout#0. Their sha256 is of the log with
 # those lines left out. See WITHOUT_WAITS in tests/services/golden.rs.
 a_create_whose_outcome_is_not_known_does_not_claim_that_nothing_was_left_behind#0 e2efdd4e0c5fcb6b9be383a242755d3416dde5b2eee9b0924e3f5581e0da3ce8
@@ -109,7 +110,7 @@ wiring::g5_exec_each_ownership_gate_refuses_before_post#8 6408f49d527d3596f57067
 wiring::g5_failed_acl_records_no_link_and_changes_no_environment#0 26bd4eb95d9ef1dc20fcd543a9da1385e6cc2735ae8e821720351ccdc6635db8
 wiring::g5_failed_link_revocation_does_not_release_the_consumers_address#0 8094734ed325a5222207ed00c40b967ac4f40ccfebcfd7f3a9eb3689ac937795
 wiring::g5_file_request_is_root_0600_and_exec_environment_adds_nothing#0 766cbeab21615e86ec22d3b79d5ce9385238dbef7dfa4bc54c643ed63afea179
-wiring::g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change#0 eafac0c298525e0bbdd83cac5b269213f1448e6e62937bd35bb524f3a3b7e9b3
+wiring::g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change#0 614860cd73db80e06fb51cc85a095560f57890189e8e9d06131fc64ac73c7b5e
 wiring::g5_image_environment_survives_secret_link_and_disconnect#0 1f54669f5b0acdd6f9402abdd77dec1d85963ede9eab2745e443f343f02af8f2
 wiring::g5_journal_reads_have_exactly_four_nonblocking_permits#0 f64fc2b0a75fe305e3da3f51d4b9ba350563e4a6605a6a12e7d3c6fdbdf99f45
 wiring::g5_key_directory_is_private_and_removed_after_join_failure#0 a1afaa3fdf86a8d568b2106a300bd6a69ea4bbd86f8a64f78d08ac400f455ea6

@@ -1072,3 +1072,221 @@ fn g8_the_doctors_16_and_the_forwards_3_each_reach_exactly_their_list() {
     }
     assert_eq!(serve.terminate().code(), Some(0));
 }
+
+/// One HTTP/1.1 request, sent whole, and the reply's status and body.
+fn raw<S: Read + Write>(mut stream: S, request: &str) -> (u16, String) {
+    stream
+        .write_all(request.as_bytes())
+        .expect("send the request");
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).expect("read the reply");
+    let status = reply
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    let body = reply
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+fn get(path: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: arca\r\nConnection: close\r\n\r\n")
+}
+
+fn post_to(path: &str, headers: &[(&str, String)], body: &str) -> String {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: arca\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    request
+}
+
+/// A connection to a unix socket, once it listens.
+fn unix(path: &Path) -> UnixStream {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => {
+                stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
+                return stream;
+            }
+            Err(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the socket listens within the deadline"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+}
+
+/// The paths of the approval page, each with the method the page uses.
+const PAGE_GETS: [&str; 4] = [
+    "/approve",
+    "/approve/plans",
+    "/approve/passkeys",
+    "/approve/canvas",
+];
+const PAGE_POSTS: [&str; 3] = [
+    "/approve/decline",
+    "/approve/approve",
+    "/approve/setup-code",
+];
+
+/// The node a service with kernel access runs on: it serves its approval page (`approvalOrigin`) and has the services
+/// socket. The page answers on the unix socket. The services socket answers the MCP routes alone: the page's paths are
+/// not there, a call without a token is 401, a request with an Origin is 403, and a call with a token is served.
+#[test]
+fn the_services_socket_of_a_node_that_serves_its_approval_page_serves_mcp_alone() {
+    let scratch = Scratch::new("services-socket");
+    let rig = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let viewer = secret_of(&secrets, "viewer-1");
+    let config = write_config(&scratch, rig.shim.socket(), &hash_dir);
+    // The socket's directory, and the one above it, are the server's own and nobody else's, as serve requires.
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let run = scratch.at("run");
+    fs::create_dir(&run).expect("the socket's directory");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    let services = run.join("services.sock");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&config).expect("read the config"))
+            .expect("the config is JSON");
+    value["approvalOrigin"] = json!("https://arca.example.com");
+    value["listen"]["services"] = json!(services.display().to_string());
+    fs::write(&config, value.to_string()).expect("write the config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+
+    // This node does serve its approval page: the unix socket answers it, with no token.
+    let (status, page) = raw(unix(&socket), &get("/approve"));
+    assert_eq!(status, 200);
+    assert!(page.contains("<html"), "the approval page is served there");
+
+    // The services socket is the server's own, mode 0600, and has none of the page, with a token or without one.
+    drop(unix(&services));
+    let meta = fs::symlink_metadata(&services).expect("stat the socket");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    for path in PAGE_GETS {
+        let (status, body) = raw(unix(&services), &get(path));
+        assert_eq!(status, 404, "GET {path}");
+        assert!(body.is_empty(), "GET {path} answers no page");
+    }
+    for path in PAGE_POSTS {
+        for headers in [vec![], vec![bearer(viewer)]] {
+            let (status, body) = raw(unix(&services), &post_to(path, &headers, "{}"));
+            assert_eq!(status, 404, "POST {path}");
+            assert!(body.is_empty(), "POST {path} answers nothing");
+        }
+        // The page's own POSTs carry its Origin: refused before the path is looked at.
+        let origin = [("Origin", "https://arca.example.com".to_string())];
+        let (status, _) = raw(unix(&services), &post_to(path, &origin, "{}"));
+        assert_eq!(status, 403, "POST {path} with the page's Origin");
+    }
+
+    // A call without a token is refused, one with an Origin is refused, and one with a token is served as on any
+    // listener.
+    let initialize = rpc(1, "initialize", json!({ "protocolVersion": "2025-11-25" }));
+    let (status, body) = raw(unix(&services), &post_to("/mcp", &[], &initialize));
+    assert_eq!(status, 401);
+    assert!(body.is_empty(), "a 401 says nothing about the node");
+    let (status, _) = raw(
+        unix(&services),
+        &post_to("/mcp", &[], &call(2, "arca_status", json!({}))),
+    );
+    assert_eq!(status, 401);
+    let with_origin = [
+        bearer(viewer),
+        ("Origin", "https://arca.example.com".to_string()),
+    ];
+    let (status, _) = raw(unix(&services), &post_to("/mcp", &with_origin, &initialize));
+    assert_eq!(status, 403);
+    let (status, body) = raw(
+        unix(&services),
+        &post_to("/mcp", &[bearer(viewer)], &initialize),
+    );
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_str(&body).expect("the reply is JSON");
+    assert_eq!(reply["result"]["protocolVersion"], "2025-11-25");
+
+    // A clean stop takes both sockets away.
+    assert_eq!(serve.terminate().code(), Some(0));
+    assert!(fs::symlink_metadata(&services).is_err());
+    assert!(fs::symlink_metadata(&socket).is_err());
+}
+
+/// A node without `approvalOrigin` serves no approval page on any listener, its proxy listener included: the page's
+/// paths are 404 there, and the MCP route still needs a token.
+#[test]
+fn a_proxy_listener_without_an_approval_origin_serves_no_page_route() {
+    let scratch = Scratch::new("proxy-no-page");
+    let rig = rig(&scratch);
+    let (hash_dir, secrets) = mint_tokens(&scratch);
+    let viewer = secret_of(&secrets, "viewer-1");
+    let config = write_config(&scratch, rig.shim.socket(), &hash_dir);
+    // A free port of 127.0.0.1, read from a probe and released for the server.
+    let at = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a probe")
+        .local_addr()
+        .expect("the probe's address");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&config).expect("read the config"))
+            .expect("the config is JSON");
+    assert!(value.get("approvalOrigin").is_none());
+    value["listen"]["proxy"] = json!({ "addr": at.to_string(), "peer": "127.0.0.1" });
+    fs::write(&config, value.to_string()).expect("write the config");
+    let socket = scratch.at("arca.sock");
+    let mut serve = start_serve(&config);
+    wait_for_server(&mut serve, &socket);
+    let proxy = || {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match std::net::TcpStream::connect(at) {
+                Ok(stream) => {
+                    stream.set_read_timeout(Some(WAIT)).expect("set a deadline");
+                    return stream;
+                }
+                Err(_) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the proxy listener listens within the deadline"
+                    );
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    };
+    for path in PAGE_GETS {
+        let (status, body) = raw(proxy(), &get(path));
+        assert_eq!(status, 404, "GET {path} on the proxy listener");
+        assert!(body.is_empty(), "GET {path} answers no page");
+        let (status, _) = raw(unix(&socket), &get(path));
+        assert_eq!(status, 404, "GET {path} on the unix socket");
+    }
+    for path in PAGE_POSTS {
+        for headers in [vec![], vec![bearer(viewer)]] {
+            let (status, body) = raw(proxy(), &post_to(path, &headers, "{}"));
+            assert_eq!(status, 404, "POST {path} on the proxy listener");
+            assert!(body.is_empty(), "POST {path} answers nothing");
+        }
+        let origin = [("Origin", "https://arca.example.com".to_string())];
+        let (status, _) = raw(proxy(), &post_to(path, &origin, "{}"));
+        assert_eq!(status, 403, "POST {path} with an Origin");
+    }
+    let initialize = rpc(1, "initialize", json!({ "protocolVersion": "2025-11-25" }));
+    let (status, _) = raw(proxy(), &post_to("/mcp", &[], &initialize));
+    assert_eq!(status, 401);
+    let (status, _) = raw(proxy(), &post_to("/mcp", &[bearer(viewer)], &initialize));
+    assert_eq!(status, 200);
+    assert_eq!(serve.terminate().code(), Some(0));
+}

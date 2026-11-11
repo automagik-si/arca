@@ -6,6 +6,12 @@
 //! configuration it was started with, and exits). `curl` is the real one behind a wrapper that records its arguments.
 //! Paths, pauses and the machine's memory come from the environment.
 //!
+//! The controller's `PATH` holds those stand-ins and the programs the script declares in `POOL_PROGRAMS`, and nothing
+//! else. A program the script starts without declaring it is therefore not found, bash reports it to a function this
+//! test hands it, and `Pool::stop` fails on the report. The first boot checks that same list after it has installed
+//! its packages, so a program the controller needs cannot go unchecked. What no test here can prove is that the
+//! packages of `POOL_PACKAGES` bring those programs on a real Debian: the first boot's own check says so on the machine.
+//!
 //! So this proves the controller's own logic: registration, one job per runner, replacement, admission by memory, the
 //! cap, cleanup, and that no credential reaches any output or any command line. It does not prove Docker, a real
 //! runner, cgroup accounting or GitHub itself; `docs/OPERATING.md` lists what stays unproven.
@@ -19,9 +25,9 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -106,6 +112,10 @@ struct State {
     /// How long an installation token is taken, when not for ever. GitHub's last an hour.
     token_life: Option<Duration>,
     minted_at: Vec<(String, Instant)>,
+    /// Whether the repository a repository-level pool serves is public.
+    repo_public: bool,
+    /// Whether a runner group is answered without its `default` field, as no real GitHub does.
+    group_without_default: bool,
 }
 
 struct Github {
@@ -208,13 +218,142 @@ impl Github {
     }
 }
 
+/// The seconds a helper program is given, and the seconds the whole file is given. No wait in this file is without a
+/// bound: a test that hangs holds a runner of the pool until somebody cancels the job.
+const HELPER_SECONDS: u64 = 60;
+const FILE_SECONDS: u64 = 600;
+
+/// The controllers that are running, by process id, so the bound on the whole file can end them.
+static CONTROLLERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Runs a helper program to its end and returns what it wrote, or says why not once `seconds` have passed.
+fn try_finish(command: &mut Command, seconds: u64) -> Result<Output, String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("did not start: {error}"))?;
+    let (sender, receiver) = mpsc::channel();
+    let mut stdout = child.stdout.take().expect("the output");
+    let mut stderr = child.stderr.take().expect("the errors");
+    let errors = sender.clone();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        let _ = sender.send((true, bytes));
+    });
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        let _ = errors.send((false, bytes));
+    });
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => return Err(format!("could not be waited for: {error}")),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.try_wait();
+            return Err(format!("did not end within {seconds} seconds"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    for _ in 0..2 {
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok((true, bytes)) => output.stdout = bytes,
+            Ok((false, bytes)) => output.stderr = bytes,
+            Err(_) => {
+                return Err(
+                    "ended, and its output did not: something it started still holds it"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// Runs a helper program to its end, or fails the test with `what` and the reason.
+fn finish(command: &mut Command, what: &str) -> Output {
+    try_finish(command, HELPER_SECONDS).unwrap_or_else(|why| panic!("{what} {why}"))
+}
+
 fn run_ok(command: &mut Command) {
-    let output = command.output().expect("the command runs");
+    let output = finish(command, &format!("{command:?}"));
     assert!(
         output.status.success(),
         "{command:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Sends a signal to a process or, with a negative number, to a whole process group. bash's own `kill` does it and
+/// not the `kill` program. That program, from procps-ng up to 4.0.4, reads only the first digit of a negative number
+/// that follows a signal option: it signals some other group, or, for a number that begins with 1, every process of
+/// the user. Upstream fixed it in 4.0.5. Ubuntu 24.04, which the pool's job image is, carries it (4.0.4-4ubuntu3), and
+/// so does Debian 12 (4.0.2); Debian 13, which the pool's own machine is, does not (4.0.4-9 has the fix).
+/// It is bash and not `sh`: dash's `kill -KILL -- -<group>` refuses the `--` and signals nothing.
+fn signal(name: &str, target: i64) -> bool {
+    try_finish(
+        Command::new("bash")
+            .arg("-c")
+            .arg(format!("kill -{name} -- {target}")),
+        HELPER_SECONDS,
+    )
+    .is_ok_and(|output| output.status.success())
+}
+
+/// Ends a controller with everything in its process group, and waits for it, but not for ever.
+fn end_controller(child: &mut Child) {
+    let id = child.id();
+    signal("KILL", -i64::from(id));
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "the controller {id} was still there 10 seconds after it was killed; it is left behind"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    CONTROLLERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|pid| *pid != id);
+}
+
+/// The bound on the whole file. Every wait below has its own bound and its own words; this one is for a wait nobody
+/// thought of. It ends the controllers that are running and then the test program, and says so.
+fn bound_the_file() {
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(FILE_SECONDS));
+            eprintln!(
+                "the runner pool tests were still running after {FILE_SECONDS} seconds: a wait in \
+                 crates/arca/tests/runner_pool.rs has no bound. Ending the controllers and the tests"
+            );
+            let running = CONTROLLERS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for pid in running {
+                signal("KILL", -i64::from(pid));
+            }
+            std::process::exit(1);
+        });
+    });
 }
 
 fn serve(mut stream: TcpStream, state: &Mutex<State>, scratch: &Path) {
@@ -305,14 +444,16 @@ fn jwt_ok(state: &Mutex<State>, scratch: &Path, jwt: &str) -> bool {
     let signature_file = scratch.join(format!("jwt-{id}.sig"));
     fs::write(&signed, format!("{head}.{claims}")).expect("the signed text");
     fs::write(&signature_file, signature_bytes).expect("the signature");
-    let verified = Command::new("openssl")
-        .args(["dgst", "-sha256", "-verify"])
-        .arg(&public)
-        .arg("-signature")
-        .arg(&signature_file)
-        .arg(&signed)
-        .output()
-        .is_ok_and(|output| output.status.success());
+    let verified = try_finish(
+        Command::new("openssl")
+            .args(["dgst", "-sha256", "-verify"])
+            .arg(&public)
+            .arg("-signature")
+            .arg(&signature_file)
+            .arg(&signed),
+        HELPER_SECONDS,
+    )
+    .is_ok_and(|output| output.status.success());
     let _ = fs::remove_file(signed);
     let _ = fs::remove_file(signature_file);
     verified
@@ -417,6 +558,14 @@ fn answer(
         json!({ "id": group.id, "name": group.name, "default": group.default,
             "visibility": group.visibility, "allows_public_repositories": group.public })
     };
+    if method == "GET" && scope.starts_with("/repos/") && path == scope {
+        return (
+            200,
+            Some(
+                json!({ "id": 5150, "full_name": &scope["/repos/".len()..], "private": !state.repo_public }),
+            ),
+        );
+    }
     if method == "GET" && scope.starts_with("/orgs/") {
         if path.starts_with(&format!("{groups}?")) {
             let listed: Vec<Value> = state.groups.iter().map(group_json).collect();
@@ -427,6 +576,9 @@ fn answer(
         }
         if let Some(id) = path.strip_prefix(&format!("{groups}/")) {
             return match state.groups.iter().find(|group| group.id.to_string() == id) {
+                Some(group) if state.group_without_default => {
+                    (200, Some(json!({ "id": group.id, "name": group.name })))
+                }
                 Some(group) => (200, Some(group_json(group))),
                 None => message(404, "Not Found"),
             };
@@ -528,18 +680,71 @@ fn script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates/github-runner-pool.sh")
 }
 
-fn which(tool: &str) -> PathBuf {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {tool}"))
-        .output()
-        .expect("sh");
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    assert!(
-        output.status.success() && !path.is_empty(),
-        "this test needs bash, curl, jq, openssl and flock on this machine; {tool} is missing"
+/// Where this machine has `tool`, if it has it.
+fn on_this_machine(tool: &str) -> Option<PathBuf> {
+    let output = finish(
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {tool}")),
+        "sh, asked where a program is,",
     );
-    PathBuf::from(path)
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && path.starts_with('/')).then(|| PathBuf::from(path))
+}
+
+fn which(tool: &str) -> PathBuf {
+    on_this_machine(tool).unwrap_or_else(|| {
+        panic!(
+            "this test needs bash, curl, jq, openssl and flock on this machine; {tool} is missing"
+        )
+    })
+}
+
+/// A list the script declares as `NAME='word word ...'`: `POOL_PROGRAMS`, every program it starts, or `POOL_PACKAGES`,
+/// the packages its first boot installs.
+fn declared(list: &str) -> Vec<String> {
+    let text = fs::read_to_string(script()).expect("the script");
+    let opening = format!("\n{list}='");
+    let start = text
+        .find(&opening)
+        .unwrap_or_else(|| panic!("the script declares {list}"))
+        + opening.len();
+    let end = start + text[start..].find('\'').expect("the closing quote");
+    text[start..end]
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Fills `tools` with the programs the script declares, and bash for the script itself: this machine's own program
+/// where it has one, a stand-in that does nothing where it has not. Programs in `without` and programs that `beside`
+/// already holds a stand-in for are left out.
+fn declared_programs(tools: &Path, beside: Option<&Path>, without: &[&str]) {
+    fs::create_dir_all(tools).expect("the tools directory");
+    for program in declared("POOL_PROGRAMS") {
+        if without.contains(&program.as_str())
+            || beside.is_some_and(|dir| dir.join(&program).exists())
+        {
+            continue;
+        }
+        match on_this_machine(&program) {
+            Some(real) => std::os::unix::fs::symlink(real, tools.join(&program)).expect("a link"),
+            None => executable(&tools.join(&program), "#!/bin/sh\n"),
+        }
+    }
+    std::os::unix::fs::symlink(which("bash"), tools.join("bash")).expect("a link");
+}
+
+/// The environment that makes bash write the name of every program it does not find into `record`. bash calls a
+/// function of this name for a command that is not on the `PATH`, whatever the command's own output was sent to.
+fn report_missing_programs(record: &Path) -> [(&'static str, String); 2] {
+    [
+        (
+            "BASH_FUNC_command_not_found_handle%%",
+            "() { printf '%s\\n' \"$1\" >>\"$TEST_NOT_FOUND\"; return 127\n}".to_string(),
+        ),
+        ("TEST_NOT_FOUND", record.display().to_string()),
+    ]
 }
 
 fn executable(path: &Path, text: &str) {
@@ -569,6 +774,7 @@ impl Pool {
     /// A scratch machine: the settings as cloud-init would have written them, an empty secrets directory, and the
     /// stand-ins on the controller's `PATH`. Nothing runs yet.
     fn new(settings: &Value, memory_total: u64, memory_available: u64) -> Pool {
+        bound_the_file();
         for tool in ["bash", "jq", "openssl", "flock"] {
             which(tool);
         }
@@ -607,6 +813,23 @@ impl Pool {
                 pool.dir.join("systemctl.log").display()
             ),
         );
+        // Layering the runner's files is a mount, which only root makes: a stand-in records it and makes the
+        // directory, or fails as a machine without overlay would.
+        executable(
+            &pool.dir.join("bin/mount"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{0}'\n[ ! -e '{1}' ] || exit 32\nfor last; do :; done\nmkdir -p \"$last\"\n",
+                pool.dir.join("mount.log").display(),
+                pool.dir.join("no-overlay").display()
+            ),
+        );
+        executable(
+            &pool.dir.join("bin/umount"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n",
+                pool.dir.join("umount.log").display()
+            ),
+        );
         // The real curl, with every argument recorded: a credential on a command line would be seen here.
         executable(
             &pool.dir.join("bin/curl"),
@@ -616,6 +839,8 @@ impl Pool {
                 curl.display()
             ),
         );
+        // Every other program the script declares, and none it does not.
+        declared_programs(&pool.dir.join("tools"), Some(&pool.dir.join("bin")), &[]);
         pool
     }
 
@@ -638,10 +863,11 @@ impl Pool {
     }
 
     fn start(&mut self, github: &Github) {
+        // The stand-ins and the declared programs only: what the script starts without declaring is not found.
         let path = format!(
             "{}:{}",
             self.dir.join("bin").display(),
-            std::env::var("PATH").unwrap_or_default()
+            self.dir.join("tools").display()
         );
         let out = fs::File::create(self.dir.join("out.log")).expect("the output");
         let child = Command::new("bash")
@@ -665,6 +891,9 @@ impl Pool {
             .env("POOL_BACKOFF_MAX", "1")
             .env("POOL_STOP_WAIT", "10")
             .env("POOL_REFUSE_EVERY", "1")
+            .env("POOL_GROUP_EVERY", "1")
+            .envs(report_missing_programs(&self.dir.join("not-found.log")))
+            .env("FAKE_PATH", std::env::var("PATH").unwrap_or_default())
             .envs(self.env.iter().map(|(key, value)| (*key, value.as_str())))
             .env("FAKE_DOCKER_DIR", self.dir.join("docker"))
             .env("FAKE_CGROUP", self.dir.join("cgroup"))
@@ -677,29 +906,45 @@ impl Pool {
             .process_group(0)
             .spawn()
             .expect("the controller starts");
+        CONTROLLERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(child.id());
         self.child = Some(child);
     }
 
     /// Stops the controller as systemd does, with SIGTERM, and returns its exit code.
     fn stop(&mut self) -> Option<i32> {
         let mut child = self.child.take()?;
-        run_ok(
-            Command::new("kill")
-                .arg("-TERM")
-                .arg(child.id().to_string()),
-        );
+        let sent = signal("TERM", i64::from(child.id()));
         let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
+        let code = loop {
             if let Some(status) = child.try_wait().expect("the controller's status") {
-                return status.code();
+                break status.code();
             }
-            assert!(
-                Instant::now() < deadline,
-                "the controller did not stop:\n{}",
-                self.output()
-            );
+            if !sent || Instant::now() >= deadline {
+                // It is not left behind, and the test does not wait for it any longer.
+                end_controller(&mut child);
+                panic!(
+                    "the controller did not stop within 20 seconds of SIGTERM (signal sent: {sent}):\n{}",
+                    self.output()
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
-        }
+        };
+        // What it left in its process group goes too: a pause it had started outlives it otherwise.
+        signal("KILL", -i64::from(child.id()));
+        CONTROLLERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|pid| *pid != child.id());
+        let strays = self.read("not-found.log");
+        assert!(
+            strays.is_empty(),
+            "the controller started programs its script does not declare in POOL_PROGRAMS, so the first boot neither \
+             installs nor checks them:\n{strays}"
+        );
+        code
     }
 
     fn read(&self, file: &str) -> String {
@@ -741,7 +986,8 @@ impl Pool {
                 let path = entry.path();
                 // The secrets are Arca's files, and the run directory is the controller's private memory (mode 0700
                 // on a tmpfs in the machine): the minted token and a pasted key put back into lines live there.
-                if path.ends_with("secrets") || path.ends_with("run") {
+                // The tools directory is this machine's own programs, linked.
+                if path.ends_with("secrets") || path.ends_with("run") || path.ends_with("tools") {
                     continue;
                 }
                 if path.is_dir() {
@@ -760,12 +1006,10 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
+        // A test that failed comes here with its controller still running. Nothing here may wait without a bound:
+        // this once waited for a controller that a `kill` program had not killed, and the job never ended.
         if let Some(mut child) = self.child.take() {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{}", child.id()))
-                .output();
-            let _ = child.wait();
+            end_controller(&mut child);
         }
         // A played runner ends when its container's directory is gone.
         let _ = fs::remove_dir_all(&self.dir);
@@ -1037,9 +1281,16 @@ fn an_app_registers_a_fresh_runner_per_job_replaces_it_and_prints_no_credential(
         assert_eq!(run.contains(RUNNER_IMAGE), !daemon, "{run}");
         assert!(run.contains("--cgroup-parent arcapool-s"), "{run}");
         assert!(run.contains("--label arca.pool=pool1"), "{run}");
-        // The runner's bundled tools are mounted into the daemon only: the runner keeps its image's own, which it
-        // can replace when GitHub tells it to update itself.
-        assert_eq!(run.contains(":/home/runner/externals"), daemon, "{run}");
+        // The runner and its daemon share one layered copy of the runner's files, at the runner's own path: the
+        // runner writes it and the daemon reads it. The tools are no mount of their own, so a runner can replace
+        // them when GitHub tells it to update itself, and the daemon then sees the new ones.
+        assert!(!run.contains(":/home/runner/externals"), "{run}");
+        assert_eq!(
+            run.contains("/layer/home:/home/runner:ro "),
+            daemon,
+            "{run}"
+        );
+        assert_eq!(run.contains("/layer/home:/home/runner "), !daemon, "{run}");
         if !daemon {
             assert!(run.contains("--network container:pool1-s"), "{run}");
             // The configuration is a file on the controller's run directory, read by the container's own command:
@@ -1060,12 +1311,46 @@ fn an_app_registers_a_fresh_runner_per_job_replaces_it_and_prints_no_credential(
         pool.read("systemctl.log")
             .contains("stop arcapool-s0.slice")
     );
+    // The layered copy: the pinned image's files below, a fresh layer for each job above, taken away after it.
+    let state_dir = pool.dir.join("state");
+    let mounts = pool.read("mount.log");
+    let first = mounts.lines().next().expect("a mount");
+    let lower = first
+        .split("lowerdir=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect("a lower layer");
+    assert!(
+        lower.starts_with(&format!("{}/runner-home/", state_dir.display())),
+        "{first}"
+    );
+    assert!(calls.contains(&format!("cp -a pool1-externals:/home/runner/. {lower}/")));
+    for slot in 0..3 {
+        let layer = format!("{}/slots/{slot}/layer", state_dir.display());
+        assert!(
+            mounts.contains(&format!(
+                "-t overlay overlay -o lowerdir={lower},upperdir={layer}/upper,workdir={layer}/work {layer}/home"
+            )),
+            "{mounts}"
+        );
+        assert!(
+            pool.read("umount.log")
+                .contains(&format!("-l {layer}/home"))
+        );
+        // While its runner waits for a job the slot's layer is there.
+        assert!(std::path::Path::new(&layer).join("home").is_dir());
+    }
+    assert_eq!(mounts.lines().count(), 7, "one fresh layer for each runner");
 
     // Stopping: the idle runners are taken off GitHub and nothing is left running.
     let idle: Vec<u64> = github.live().iter().map(|runner| runner.id).collect();
     assert_eq!(pool.stop(), Some(0));
     assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
     assert_eq!(pool.containers(), Vec::<String>::new());
+    // Every slot's layer is taken away with its runner.
+    for slot in 0..3 {
+        assert!(!state_dir.join(format!("slots/{slot}/layer")).exists());
+    }
     {
         let state = github.state();
         for id in idle {
@@ -1141,6 +1426,11 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
         status.contains("memory_reserved=8192MiB of 11264MiB slots_cap=4"),
         "{status}"
     );
+    // Sizes that can never all run at once are said with their numbers, at the start and in every status block: a
+    // machine reports less memory than its size, and a slot left queued beside idle ones is otherwise a riddle.
+    let too_much = "arca-runner-pool: WARNING: the 4 slots ask for 16384 MiB together and the machine has 11264 MiB for slots (the 13312 MiB it reports, less reserveMemory 2048 MiB): 5120 MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again\n";
+    assert!(status.contains(too_much), "{status}");
+    assert!(pool.output().matches(too_much).count() >= 2);
     // Jobs flow through the two that fit, and at no moment were more than two runners alive.
     for n in 0..6 {
         github.queue(&["arca"], &format!("job-{n}"), 0.2);
@@ -1187,6 +1477,34 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
     assert_eq!(pool.stop(), Some(0));
     drop(pool);
 
+    // A slot larger than all the memory there is for slots never starts. With more slots than places the pool says
+    // nothing about all of them together, so this is said on its own, with the class (once) and the numbers.
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().tokens.push(PAT.to_string());
+    let big = json!({ "name": "big", "labels": ["self-hosted", "linux", "x64", "arca-large"], "cpu": 2, "memory": "16GiB", "slots": 2 });
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(1), big]),
+            1,
+            &format!("https://github.com/{ORG}"),
+        ),
+        13 * GIB,
+        12 * GIB,
+    );
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    wait_for(&pool, "the one runner that fits", || {
+        github.live().len() == 1
+    });
+    let never = "arca-runner-pool: WARNING: a slot of these classes is larger than the 11264 MiB the machine has for slots (the 13312 MiB it reports, less reserveMemory 2048 MiB): big (16384 MiB). Such a slot never starts, and the jobs that ask for its labels wait for ever. Make the class or reserveMemory smaller, or the machine larger, in the template, and create the pool again\n";
+    wait_for(&pool, "the warning in a status block", || {
+        pool.read("logs/status.txt").contains(never)
+    });
+    assert!(pool.output().matches(never).count() >= 2);
+    assert!(!pool.output().contains("slots ask for"));
+    assert_eq!(pool.stop(), Some(0));
+    drop(pool);
+
     // The cap: four slots that all fit in memory, and three places. The fourth waits for a place and takes its turn
     // when a job ends.
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
@@ -1209,20 +1527,31 @@ fn a_slot_starts_only_with_memory_for_its_whole_size_and_under_the_cap() {
         github.queue(&["arca"], &format!("job-{n}"), 0.2);
     }
     wait_for(&pool, "eight finished jobs", || pool.jobs().len() == 8);
+    // The slot that waited gets the place a finished job frees. Whether its runner is ready before the other three
+    // have taken all eight jobs is a matter of timing, so jobs are given one at a time until it has had one.
+    let mut more = 0;
+    wait_for(&pool, "every slot to take its turn under the cap", || {
+        let mut slots: Vec<String> = pool.jobs().iter().map(|job| job[1].clone()).collect();
+        slots.sort();
+        slots.dedup();
+        if slots == ["0", "1", "2", "3"] {
+            return true;
+        }
+        if pool.jobs().len() == 8 + more {
+            github.queue(&["arca"], &format!("more-{more}"), 0.2);
+            more += 1;
+        }
+        false
+    });
+    wait_for(&pool, "the jobs that were given", || {
+        pool.jobs().len() == 8 + more
+    });
     assert_eq!(github.state().live_max, 3);
-    let mut slots: Vec<String> = pool.jobs().iter().map(|job| job[1].clone()).collect();
-    slots.sort();
-    slots.dedup();
-    assert_eq!(
-        slots,
-        ["0", "1", "2", "3"],
-        "every slot took its turn under the cap"
-    );
     // The job file is bounded: past its limit it is set aside once, with its header written again, and the summary
     // still counts the jobs in both.
+    let counted = format!("class small last {} jobs:", 8 + more);
     wait_for(&pool, "the summary over both job files", || {
-        pool.read("logs/status.txt")
-            .contains("class small last 8 jobs:")
+        pool.read("logs/status.txt").contains(&counted)
     });
     let aside = pool.read("logs/jobs.tsv.1");
     assert!(
@@ -1360,6 +1689,35 @@ fn failures_are_counted_said_without_the_credential_and_paused_and_leftovers_are
     wait_for(&pool, "a fresh runner in its place", || {
         github.live().iter().any(|runner| runner.id != gone.id)
     });
+    // That runner had its files layered and never reached a job. The pool cannot tell a runner GitHub removed from
+    // one that could not start that way, so the next runners start with their image's own files, and it says so
+    // once: one bad start never keeps the pool from running.
+    assert_eq!(
+        pool.output()
+            .matches("A runner stopped before its first job with its files layered. Runners start with their image's own files from now on")
+            .count(),
+        1
+    );
+    let calls = pool.read("docker/calls.log");
+    let last_runner = calls
+        .lines()
+        .filter(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
+        .next_back()
+        .expect("a runner");
+    assert!(!last_runner.contains(":/home/runner "), "{last_runner}");
+    let last_daemon = calls
+        .lines()
+        .filter(|line| line.starts_with("run ") && line.contains(DOCKER_IMAGE))
+        .next_back()
+        .expect("a daemon");
+    assert!(
+        last_daemon.contains("/externals:/home/runner/externals:ro"),
+        "{last_daemon}"
+    );
+    // A pool for one repository has no runner group: it says whether the repository is private.
+    assert!(pool.output().contains(
+        "registering runners in one private repository (a repository has no runner groups)"
+    ));
     assert_eq!(
         pool.output().matches(" failed: ").count(),
         failures_before + 1
@@ -1430,6 +1788,41 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_registered() {
             with("url", json!("https://github.com/a/b/c")),
             "settings: url names an organisation",
         ),
+        // The URL's host is where the credential goes: a plain host name, with nothing that could make another
+        // host of it.
+        (
+            with(
+                "url",
+                json!("https://github.com@elsewhere.example/example-org"),
+            ),
+            "settings: url: its host must be a plain host name (letters, digits, dots and dashes), with no user, password, query or fragment",
+        ),
+        (
+            with("url", json!("https://user:word@github.com/example-org")),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with(
+                "url",
+                json!("https://github.com#@elsewhere.example/example-org"),
+            ),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with(
+                "url",
+                json!("https://github.com?x=elsewhere.example/example-org"),
+            ),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with("url", json!("https://github.com:port/example-org")),
+            "settings: url: its host must be a plain host name",
+        ),
+        (
+            with("url", json!("https://.github.com/example-org")),
+            "settings: url: its host must be a plain host name",
+        ),
         // The credential goes to the API's host: github.com has one API, and another host is named on purpose.
         (
             with("apiUrl", json!("https://api.elsewhere.example")),
@@ -1469,6 +1862,33 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_registered() {
             with("runnerImage", Value::Null),
             "settings: runnerImage and dockerImage are required",
         ),
+        // A size no arithmetic can hold, and a size of nothing. (A class larger than the memory there is for slots is
+        // a warning, not a refusal: the other classes still run.)
+        (
+            with(
+                "classes",
+                json!([{ "name": "small", "labels": ["arca"], "cpu": 2, "memory": "8589934592GiB", "slots": 1 }]),
+            ),
+            "settings: class small needs a name",
+        ),
+        (
+            with(
+                "classes",
+                json!([{ "name": "small", "labels": ["arca"], "cpu": 2, "memory": "0GiB", "slots": 1 }]),
+            ),
+            "settings: class small needs a name",
+        ),
+        (
+            with(
+                "classes",
+                json!([{ "name": "small", "labels": ["arca"], "cpu": 2, "memory": "4GiB", "slots": "99999999999999999999" }]),
+            ),
+            "settings: class small needs a name",
+        ),
+        (
+            with("maxSlots", json!("99999999999999999999")),
+            "settings: runnerGroupId and maxSlots are whole numbers",
+        ),
         (
             with("classes", json!([])),
             "settings: classes needs at least one class",
@@ -1492,10 +1912,11 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_registered() {
         pool.secret("GITHUB_TOKEN", PAT);
         pool.start(&github);
         wait_for(&pool, why, || pool.output().contains(why));
-        assert!(
+        // Its next line, which is written a moment later: waited for, not read once.
+        wait_for(&pool, "the line that says the pool does not start", || {
             pool.output()
                 .contains("the pool does not start until its settings are right")
-        );
+        });
         pool.stop();
     }
     assert!(github.state().seen.is_empty());
@@ -1569,7 +1990,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             && description.contains("docker 29.9.3-dind")
     );
     // The default slots fit the machine: the cap admits them all, their CPUs are the machine's 16, and their memory
-    // and the reserve leave 4GiB of its 32GiB, since a virtual machine sees a little less memory than its size.
+    // fits what a 32GiB machine really has for slots once the reserve is kept back (27921MiB on the first pool).
     let bytes =
         |text: &Value| arca::service::size_bytes(text.as_str().expect("a size")).expect("bytes");
     let classes = settings["classes"].as_array().expect("classes");
@@ -1584,8 +2005,14 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert_eq!(cpus, 16);
     assert_eq!(
         memory + bytes(&settings["reserveMemory"]),
-        arca::service::size_bytes("28GiB").expect("bytes")
+        arca::service::size_bytes("30GiB").expect("bytes")
     );
+    assert!(
+        memory <= 27921 * (1 << 20),
+        "the slots fit a real 32GiB machine"
+    );
+    assert_eq!(classes.len(), 2);
+    assert_eq!(classes[1]["memory"], "9GiB");
     // The same settings start the controller: it reads them, makes its slices and waits for a credential.
     let scratch = std::env::temp_dir().join(format!(
         "arca-runner-pool-gh-{}-{}",
@@ -1594,24 +2021,131 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     ));
     fs::create_dir_all(&scratch).expect("scratch");
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
-    // What such a machine reports: a little less than 32GiB.
-    let mut pool = Pool::new(settings, 32 * GIB - 700 * (1 << 20), 30 * GIB);
+    // What such a machine reports: 27921MiB for slots after the 4GiB kept back.
+    let mut pool = Pool::new(settings, (27921 + 4096) * (1 << 20), 30 * GIB);
     pool.start(&github);
     wait_for(&pool, "the shipped settings load", || {
-        pool.output().contains("pool pool1 id abcd1234 for https://github.com/example-org: 5 slots in 2 classes, at most 5 at once, 27972 MiB of memory for slots")
+        pool.output().contains("pool pool1 id abcd1234 for https://github.com/example-org: 4 slots in 2 classes, at most 4 at once, 27921 MiB of memory for slots")
     });
     wait_for(&pool, "the wait for a credential", || {
         pool.output().contains("waiting for a credential")
     });
     assert!(
-        pool.read("units/arcapool-s4.slice")
-            .contains("MemoryMax=8589934592\nMemorySwapMax=0\nCPUQuota=800%")
+        pool.read("units/arcapool-s3.slice")
+            .contains("MemoryMax=9663676416\nMemorySwapMax=0\nCPUQuota=600%")
     );
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
 }
 
+/// The first boot, as far as a test can take it: it cannot run apt or write under /etc, so a stand-in `apt-get`
+/// "installs" and two declared programs stay missing. The first boot must then stop, name exactly those two, and say
+/// so on the machine's console as well as on its own output.
+#[test]
+fn a_first_boot_names_the_commands_that_are_missing_on_the_console_and_installs_the_docker_command()
+{
+    // What a first boot on Debian 13 taught: docker.io is the daemon alone, and recommended packages are not
+    // installed, so the package of each command has to be named.
+    let packages = declared("POOL_PACKAGES");
+    for (package, why) in [
+        ("docker.io", "the Docker daemon"),
+        (
+            "docker-cli",
+            "the docker command, which docker.io only recommends",
+        ),
+        ("jq", "jq"),
+        ("curl", "curl"),
+        ("openssl", "openssl"),
+        (
+            "ca-certificates",
+            "the certificates curl checks GitHub with",
+        ),
+        ("util-linux", "flock"),
+        ("hostname", "hostname"),
+    ] {
+        assert!(
+            packages.iter().any(|name| name == package),
+            "the first boot installs {package} ({why}); it installs {packages:?}"
+        );
+    }
+    let programs = declared("POOL_PROGRAMS");
+    for program in ["docker", "jq", "curl", "openssl", "flock", "systemctl"] {
+        assert!(programs.iter().any(|name| name == program), "{program}");
+    }
+
+    // The positive control of every other test in this file: bash does report a program it does not find.
+    let scratch = scratch_dir();
+    let record = scratch.join("not-found.log");
+    let control = finish(
+        Command::new(which("bash"))
+            .arg("-c")
+            .arg("no-such-program-of-this-test 2>/dev/null; true")
+            .envs(report_missing_programs(&record)),
+        "bash, asked for a program that does not exist,",
+    );
+    assert!(control.status.success());
+    assert_eq!(
+        fs::read_to_string(&record).unwrap_or_default(),
+        "no-such-program-of-this-test\n"
+    );
+
+    let uid = finish(Command::new("id").arg("-u"), "id");
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        eprintln!(
+            "as root the first boot is not run here: it would install itself on this machine"
+        );
+        let _ = fs::remove_dir_all(scratch);
+        return;
+    }
+    let tools = scratch.join("tools");
+    declared_programs(&tools, None, &["docker", "jq", "apt-get"]);
+    executable(
+        &tools.join("apt-get"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\n",
+            scratch.join("apt.log").display()
+        ),
+    );
+    let console = scratch.join("console");
+    let boot = finish(
+        Command::new(tools.join("bash"))
+            .arg(script())
+            .env("PATH", &tools)
+            .env("POOL_CONSOLE", &console),
+        "the first boot",
+    );
+    let said = String::from_utf8_lossy(&boot.stdout).into_owned();
+    let refusal = format!(
+        "arca-runner-pool: first boot failed: these commands are missing after the install: docker jq. The packages \
+         asked for were: {}. The package manager's own words are in /var/log/cloud-init-output.log inside the \
+         machine. The machine has no pool; service_remove it and create it again once it can reach its package mirror\n",
+        packages.join(" ")
+    );
+    assert_eq!(boot.status.code(), Some(1), "{said}");
+    assert!(said.ends_with(&refusal), "{said}");
+    assert!(!said.contains("first boot done"), "{said}");
+    // The console has the first boot's own lines, all of them: that is what service_logs returns.
+    assert_eq!(fs::read_to_string(&console).expect("the console"), said);
+    assert!(
+        said.starts_with(&format!(
+            "arca-runner-pool: first boot: installing {}\n",
+            packages.join(" ")
+        )),
+        "{said}"
+    );
+    // The install names every package and takes no recommended one.
+    assert_eq!(
+        fs::read_to_string(scratch.join("apt.log")).expect("apt-get's arguments"),
+        format!(
+            "update -q\ninstall -y -q --no-install-recommends {}\n",
+            packages.join(" ")
+        )
+    );
+    let _ = fs::remove_dir_all(scratch);
+}
+
 fn scratch_dir() -> PathBuf {
+    bound_the_file();
     let scratch = std::env::temp_dir().join(format!(
         "arca-runner-pool-gh-{}-{}",
         std::process::id(),
@@ -1686,7 +2220,7 @@ fn the_default_runner_group_is_refused_and_a_dedicated_one_is_described() {
     let mut pool = one_slot_pool(&github, |settings| settings["runnerGroupId"] = json!(8));
     pool.start(&github);
     wait_for(&pool, "the wide group described", || {
-        pool.output().contains("registering runners in runner group 8 \"wide\", WARNING: open to every repository of the organisation (all), WARNING: public repositories admitted, so a pull request from anyone can run code in this pool")
+        pool.output().contains("registering runners in runner group 8 \"wide\", WARNING: open to every repository of the organisation (all), WARNING: public repositories admitted, so a pull request from anyone, once it is approved to run, runs code in this pool")
     });
     pool.stop();
     let _ = fs::remove_dir_all(scratch);
@@ -1724,6 +2258,32 @@ fn a_runner_github_tells_to_update_updates_inside_its_container_and_then_takes_i
     });
     assert_eq!(pool.output().matches(said).count(), 2);
     assert!(totals(&pool).contains("failures=0"), "{}", totals(&pool));
+    // The runner and its daemon shared one copy of the runner's files, so the daemon saw the updated tools.
+    let calls = pool.read("docker/calls.log");
+    assert!(calls.contains("/slots/0/layer/home:/home/runner:ro "));
+    assert!(calls.contains("/slots/0/layer/home:/home/runner "));
+    // A runner that finished its update and then went away is not said to have died while updating.
+    let updated = github
+        .live()
+        .into_iter()
+        .find(|runner| runner.updated)
+        .expect("the idle, updated runner");
+    wait_for(&pool, "the update seen as finished", || {
+        pool.read("run/slots/0").starts_with("idle")
+    });
+    github
+        .state()
+        .runners
+        .iter_mut()
+        .find(|runner| runner.id == updated.id)
+        .unwrap()
+        .deleted = true;
+    wait_for(&pool, "the runner that went away after its update", || {
+        pool.output().contains("slot 0 (small) failed: its runner stopped (exit 1) after it had updated itself, before it took a job")
+    });
+    assert!(!pool.output().contains("while it was updating itself"));
+    // An updated runner that went away is no sign that layering failed.
+    assert!(!pool.output().contains("with its files layered"));
     assert_eq!(pool.stop(), Some(0));
     drop(pool);
 
@@ -1737,6 +2297,19 @@ fn a_runner_github_tells_to_update_updates_inside_its_container_and_then_takes_i
         pool.output().contains("slot 0 (small) failed: its runner stopped (exit 1) while it was updating itself, before it took a job")
     });
     assert_eq!(pool.jobs().len(), 0);
+    // The update replaces the runner's own files, and this runner had them layered: the next runners start with
+    // their image's own files, said once, as after a mount that failed.
+    wait_for(&pool, "the pool back to plain files", || {
+        pool.output().contains("A runner stopped while it was updating itself with its files layered. Runners start with their image's own files from now on")
+    });
+    wait_for(&pool, "a runner without the layer", || {
+        pool.read("docker/calls.log")
+            .lines()
+            .filter(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
+            .next_back()
+            .is_some_and(|run| !run.contains(":/home/runner "))
+    });
+    assert_eq!(pool.output().matches("with its files layered").count(), 1);
     pool.stop();
     let _ = fs::remove_dir_all(scratch);
 }
@@ -1780,5 +2353,184 @@ fn an_idle_runner_older_than_its_token_is_still_taken_off_github_when_the_pool_s
     // No request was refused for an old token.
     assert!(pool.output().ends_with("arca-runner-pool: stopped\n"));
     drop(state);
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn the_runner_group_is_read_again_and_one_that_becomes_refused_holds_new_slots() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    // An answer that does not say whether the group is the default one is no ground to start on.
+    github.state().group_without_default = true;
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.start(&github);
+    wait_for(&pool, "the answer without a default field refused", || {
+        pool.output().contains("GitHub's answer for runner group 7 does not name that group or does not say whether it is the default one")
+    });
+    assert!(github.registrations().is_empty());
+    // With a whole answer the pool starts.
+    github.state().group_without_default = false;
+    wait_for(&pool, "a runner once the answer is whole", || {
+        github.live().len() == 1
+    });
+
+    // Later the group is opened to public repositories on GitHub: the next status says so.
+    github.state().groups[1].public = true;
+    wait_for(&pool, "the warning after the group changed", || {
+        pool.read("logs/status.txt").contains("runner group 7 \"arca pool\", selected repositories only, WARNING: public repositories admitted, so a pull request from anyone, once it is approved to run, runs code in this pool")
+    });
+    // Later still it is made the organisation's default group: no new slot starts, and the pool says why.
+    github.state().groups[1].default = true;
+    wait_for(&pool, "the refusal after the group changed", || {
+        pool.output().contains(
+            "the pool does not start on the organisation's default runner group (7 \"arca pool\")",
+        )
+    });
+    let registered = github.registrations().len();
+    // The runner that waits is left; its job runs, and no runner takes its place while the group is refused.
+    github.queue(&["arca"], "the last job", 0.2);
+    wait_for(&pool, "the job of the runner that was waiting", || {
+        pool.jobs().len() == 1
+    });
+    wait_for(&pool, "the slot held", || {
+        let status = pool.read("logs/status.txt");
+        status.contains("queued (held: its runner group is refused now (see the pool line))")
+            && status.contains(
+                "REFUSED: runner group 7 \"arca pool\" is the organisation's default group",
+            )
+    });
+    assert_eq!(github.registrations().len(), registered);
+    // Put right on GitHub, the pool goes on by itself.
+    github.state().groups[1].default = false;
+    wait_for(&pool, "a new runner once the group is put right", || {
+        github.registrations().len() > registered
+    });
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_pool_for_a_public_repository_says_so_in_every_status() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, "/repos/example-org/example-repo");
+    github.state().repo_public = true;
+    github.state().tokens.push(PAT.to_string());
+    let mut pool = Pool::new(
+        &settings(
+            json!([small(1)]),
+            1,
+            "https://github.com/example-org/example-repo",
+        ),
+        64 * GIB,
+        60 * GIB,
+    );
+    pool.secret("GITHUB_TOKEN", PAT);
+    pool.start(&github);
+    let warning = "one repository, WARNING: it is public, so a pull request from anyone, once it is approved to run, runs code in this pool";
+    wait_for(&pool, "the warning at the start", || {
+        pool.output()
+            .contains(&format!("registering runners in {warning}"))
+    });
+    wait_for(&pool, "the warning in the status", || {
+        pool.read("logs/status.txt").contains(warning)
+    });
+    // A repository's runners are registered with GitHub's fixed group number, whatever the settings say.
+    wait_for(&pool, "a runner", || github.live().len() == 1);
+    let asked: Value = serde_json::from_str(&github.registrations()[0].body).expect("the request");
+    assert_eq!(asked["runner_group_id"], 1);
+    // Made private on GitHub, the next read says so.
+    github.state().repo_public = false;
+    wait_for(&pool, "the status after it is made private", || {
+        pool.read("logs/status.txt")
+            .contains("one private repository")
+    });
+    assert_eq!(pool.stop(), Some(0));
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_machine_that_cannot_layer_starts_runners_with_their_images_own_files() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    github.state().update_required = true;
+    let mut pool = one_slot_pool(&github, |_| {});
+    fs::write(pool.dir.join("no-overlay"), "").expect("the switch");
+    pool.start(&github);
+    wait_for(&pool, "the fallback said", || {
+        pool.output().contains("The runner's files could not be layered on this machine (overlay mount). Runners start with their image's own files from now on; after a runner updates itself, a job that runs in a container (container:) still gets the pinned release's bundled tools")
+    });
+    // The runner still updates itself (its tools are its image's own files, not a mount) and takes its job.
+    wait_for(&pool, "the updated runner idle", || {
+        github.live().iter().any(|runner| runner.updated)
+    });
+    github.queue(&["arca"], "a job without layering", 0.2);
+    wait_for(&pool, "the job", || pool.jobs().len() == 1);
+    wait_for(&pool, "a second runner", || {
+        github.state().runners.len() >= 2
+    });
+    assert_eq!(pool.stop(), Some(0));
+    // The mount was tried once and said once; every runner had no home mount and every daemon the pinned tools.
+    assert_eq!(pool.read("mount.log").lines().count(), 1);
+    assert_eq!(pool.output().matches("could not be layered").count(), 1);
+    let calls = pool.read("docker/calls.log");
+    for run in calls.lines().filter(|line| line.starts_with("run ")) {
+        let daemon = run.contains(DOCKER_IMAGE);
+        assert!(!run.contains(":/home/runner "), "{run}");
+        assert!(!run.contains(":/home/runner:ro"), "{run}");
+        assert_eq!(
+            run.contains("/externals:/home/runner/externals:ro"),
+            daemon,
+            "{run}"
+        );
+    }
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_running_job_is_shown_as_busy_and_is_timed_from_when_it_began() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.start(&github);
+    wait_for(&pool, "an idle runner", || github.live().len() == 1);
+    // The runner waits a while before a job comes: that wait is no part of the job.
+    std::thread::sleep(Duration::from_millis(3200));
+    github.queue(&["arca"], "a long test", 2.0);
+    // While the job runs, the slot is busy and names it, and the totals count it.
+    wait_for(&pool, "the slot shown as busy", || {
+        let state = pool.read("run/slots/0");
+        state.starts_with("busy\t") && state.contains("job \"a long test\"")
+    });
+    wait_for(&pool, "the busy slot in the totals", || {
+        totals(&pool).contains("busy=1 idle=0")
+    });
+    assert!(
+        pool.read("logs/status.txt").contains("busy")
+            && pool.read("logs/status.txt").contains("job \"a long test\""),
+        "{}",
+        pool.read("logs/status.txt")
+    );
+    wait_for(&pool, "the job", || pool.jobs().len() == 1);
+    // Timed from the runner's own "Running job" line: about two seconds, not the five since the runner started.
+    let seconds: u64 = pool.jobs()[0][6].parse().expect("seconds");
+    assert!((1..=3).contains(&seconds), "{seconds}");
+    // A job whose name holds a time and the runner's own words cannot set when it began: only the time the line
+    // starts with is read. The name is kept as the runner printed it.
+    let sneaky = "sneaky 2001-01-01 00:00:00Z: Running job: other";
+    wait_for(&pool, "a fresh runner", || github.live().len() == 1);
+    github.queue(&["arca"], sneaky, 1.0);
+    wait_for(&pool, "the second job", || pool.jobs().len() == 2);
+    let second = &pool.jobs()[1];
+    assert_eq!(second[4], sneaky);
+    let seconds: u64 = second[6].parse().expect("seconds");
+    assert!(seconds <= 3, "{seconds}");
+    assert_eq!(pool.stop(), Some(0));
+    // The pool never asks Docker for a runner's processes: it reads the runner's own lines.
+    assert!(
+        !pool
+            .read("docker/calls.log")
+            .lines()
+            .any(|call| call.starts_with("top "))
+    );
     let _ = fs::remove_dir_all(scratch);
 }

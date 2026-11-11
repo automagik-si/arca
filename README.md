@@ -2,13 +2,74 @@
 
 <a href="https://weunfold.ai/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/open-intelligence/open-intelligence-badge-ivory.svg"><img src="assets/open-intelligence/open-intelligence-badge-ink.svg" alt="Open Intelligence" width="170" height="32"></picture></a>
 
-Automagik Arca is a Rust kernel for a node's own infrastructure. The kernel reads what it owns, plans each change, and
-applies a change only after the node's owner has approved it and the change is written to a journal. Each node signs its
-own desired state with its own key. It talks to Incus over the local unix socket. The program is one binary, `arca`.
+**The infrastructure layer for agentic AI.** Agents need infrastructure. Own *yours*.
 
-**Status: an alpha for single hosts.** Hardening for shared or distributed hosts comes later. Every release is on the
-[releases page](https://github.com/automagik-si/arca/releases), and [`CHANGELOG.md`](CHANGELOG.md) says what changed
-in each one.
+Automagik Arca runs your services on machines you own. Set up the way the quickstart shows, an assistant can only look and propose. You approve with your passkey.
+
+- Arca is one program. Arca is open source under the Apache-2.0 licence.
+- A fresh install only looks: it changes nothing until you tell it which parts are its own.
+- Arca is self-hosted: it runs on machines you own, and Arca itself needs no outside service to work.
+- Arca keeps an append-only journal of the changes it applies. Starts, stops and restarts are logged separately.
+
+**Status: alpha.** Arca is an alpha, for one machine at a time. Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal. The current version is on the [releases page](https://github.com/automagik-si/arca/releases).
+
+| Works today | Not yet |
+|---|---|
+| Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | There is no installer yet: the first setup is written by hand. |
+| Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
+| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template, or Arca takes over one that already runs on the machine. |
+| Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
+| Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair things by itself. |
+
+[Start in five minutes](#quickstart-a-read-only-node-in-five-minutes) · [The full guide](docs/OPERATING.md) · [What changed](CHANGELOG.md)
+
+## Install with one command
+
+[`scripts/install.sh`](scripts/install.sh) does the quickstart below for you, for the user who runs it. It needs what
+the quickstart needs (x86_64 Linux with glibc 2.34 or newer, a running Incus that this user can reach) and `curl` and
+`sha256sum`.
+
+**Download it, read it, run it.**
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh
+less install.sh
+sh install.sh
+```
+
+**Or in one line.** The script runs as soon as it has arrived, and until a release carries it this address follows
+the `dev` branch, so what runs is whatever that branch holds at that moment. Use this only when you trust the address:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh | sh
+```
+
+To hand it to a coding agent, paste this: *Download
+`https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh`, read it, run it with `sh`, and tell me
+what it printed.*
+
+- **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, a runtime directory that is yours alone, and an Incus
+  socket this user may open. When one is missing it says which and how to fix it, and stops before it has changed
+  anything. It never runs `sudo`, it refuses to run as root, and it writes only in your home directory.
+- **It installs one named release**, the one the quickstart names, at `~/.local/bin/arca`.
+  `sh install.sh --version <version>` names another; without it, an older release is never put over a newer program.
+  The program is checked against that release's `SHA256SUMS`. That catches a download that was damaged or cut short. It
+  does not catch a release that was tampered with, because the checksums come from the same release.
+- **It writes the quickstart's config and mints one `viewer` token**, only where there is no config. A config that
+  exists is not changed.
+- **It runs the node as a service**, `arca.service`, a systemd user unit, and only for a config it wrote. For a config
+  it did not write, and where `systemctl --user` does not answer, it starts nothing, prints the one command that starts
+  the node, and ends with exit code 3: the program is installed and no node was started.
+- **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
+  token), and the two ways to connect an assistant from step 4 below. Exit code 0 means the node runs, answered, and
+  reaches Incus.
+- **A second run** replaces the program in place and restarts the service. `sh install.sh --uninstall` removes the
+  service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
+  state.
+
+**Not yet:** the script is read from the `dev` branch, so no release's checksum covers the script itself. It is tested
+against stand-ins for the download, the program and systemd, and it was run for real on one machine that already had
+Incus and Arca; it has not been run on a machine that never had either. There is no installer for a Mac.
 
 ## Quickstart: a read-only node in five minutes
 

@@ -286,16 +286,26 @@ fn the_nodes_own_plan_never_hands_out_an_address_inside_a_tenants_block() {
         .collect();
     assert_eq!(own[0], "192.0.2.10");
     assert_eq!(own[13], "192.0.2.23");
-    let (_, message) = refusal(rig.call(
-        "service_create",
-        json!({ "name": "own14", "template": "app" }),
-    ));
-    assert!(message.contains("has no free address"), "{message}");
+    // Fourteen addresses are outside every tenant's block, and the node's own project holds them all.
+    assert_eq!(
+        listed(rig.call(
+            "service_create",
+            json!({ "name": "own14", "template": "app" }),
+        )),
+        (
+            "capacity".to_string(),
+            "the service subnet 192.0.2.0/24 has no free address (.10-.239)".to_string(),
+            json!({ "scope": "node", "limit": "addresses", "have": 14, "want": 1, "max": 14 })
+        )
+    );
     // The next tenant finds one block left (.16/29 holds addresses in use), and then none.
-    let (_, message) = refusal(rig.create_tenant(json!({ "id": "bbbbbbbb" })));
-    assert!(
-        message.contains("has no free /29 block for a tenant"),
-        "{message}"
+    assert_eq!(
+        listed(rig.create_tenant(json!({ "id": "bbbbbbbb" }))),
+        (
+            "capacity".to_string(),
+            "the service subnet 192.0.2.0/24 has no free /29 block for a tenant: every block is held by a tenant or holds an address in use".to_string(),
+            json!({ "scope": "node", "limit": "addresses" })
+        )
     );
 }
 
@@ -448,31 +458,45 @@ fn a_tenants_caps_are_checked_before_incus_and_the_refusal_names_the_cap() {
     small["defaultCaps"] = json!({ "instances": 3, "containers": 2, "virtualMachines": 1, "cpu": 6,
         "memory": "8GiB", "disk": "50GiB" });
     let rig = two_tenants(small);
+    // Every one is a `capacity` refusal of the tenant's own caps (`scope` `tenant`): the sentence, and the same cap and
+    // amounts as fields (bytes for disk).
     let refused = |name: &str, template: &str, tenant: &str| {
         let writes = rig.fake().writes().len();
-        let (_, message) = refusal(rig.call(
+        let (code, message, fields) = listed(rig.call(
             "service_create",
             json!({ "name": name, "template": template, "tenant": tenant }),
         ));
+        assert_eq!(code, "capacity", "{message}");
         assert_eq!(rig.fake().writes().len(), writes, "nothing reached Incus");
-        message
+        (message, fields)
     };
+    let said = |message: &str, fields: Value| (message.to_string(), fields);
+    const GIB: u64 = 1 << 30;
     create(&rig, "one", "app", Some(A));
     create(&rig, "two", "app", Some(A));
     assert_eq!(
         refused("three", "app", A),
-        "creating three would exceed tenant aaaaaaaa's cap on containers (limits.containers): 2 in use, 1 asked, 2 allowed"
+        said(
+            "creating three would exceed tenant aaaaaaaa's cap on containers (limits.containers): 2 in use, 1 asked, 2 allowed",
+            json!({ "scope": "tenant", "limit": "containers", "have": 2, "want": 1, "max": 2 })
+        )
     );
     // Two containers hold 32 GiB of root disk: a machine of 20 GiB does not fit in 50.
     assert_eq!(
         refused("box", "vm", A),
-        "creating box would exceed tenant aaaaaaaa's cap on disk (limits.disk): 32.0 GiB in use, 20.0 GiB asked, 50.0 GiB allowed"
+        said(
+            "creating box would exceed tenant aaaaaaaa's cap on disk (limits.disk): 32.0 GiB in use, 20.0 GiB asked, 50.0 GiB allowed",
+            json!({ "scope": "tenant", "limit": "disk", "have": 32 * GIB, "want": 20 * GIB, "max": 50 * GIB })
+        )
     );
     // B is untouched by A's use: its own caps are whole.
     create(&rig, "box", "vm", Some(B));
     assert_eq!(
         refused("box2", "vm", B),
-        "creating box2 would exceed tenant bbbbbbbb's cap on virtual machines (limits.virtual-machines): 1 in use, 1 asked, 1 allowed"
+        said(
+            "creating box2 would exceed tenant bbbbbbbb's cap on virtual machines (limits.virtual-machines): 1 in use, 1 asked, 1 allowed",
+            json!({ "scope": "tenant", "limit": "virtualMachines", "have": 1, "want": 1, "max": 1 })
+        )
     );
     create(&rig, "one", "app", Some(B));
     // A tenant of one instance: the second is over its count, whatever else it has room for.
@@ -481,13 +505,21 @@ fn a_tenants_caps_are_checked_before_incus_and_the_refusal_names_the_cap() {
     rig.create_tenant(json!({ "id": "cccccccc", "caps": tiny }))
         .unwrap();
     create(&rig, "one", "app", Some("cccccccc"));
+    let one_instance =
+        json!({ "scope": "tenant", "limit": "instances", "have": 1, "want": 1, "max": 1 });
     assert_eq!(
         refused("two", "app", "cccccccc"),
-        "creating two would exceed tenant cccccccc's cap on instances (limits.instances): 1 in use, 1 asked, 1 allowed"
+        said(
+            "creating two would exceed tenant cccccccc's cap on instances (limits.instances): 1 in use, 1 asked, 1 allowed",
+            one_instance.clone()
+        )
     );
     assert_eq!(
         refused("box", "vm", "cccccccc"),
-        "creating box would exceed tenant cccccccc's cap on instances (limits.instances): 1 in use, 1 asked, 1 allowed"
+        said(
+            "creating box would exceed tenant cccccccc's cap on instances (limits.instances): 1 in use, 1 asked, 1 allowed",
+            one_instance
+        )
     );
     // CPUs and memory are counted the same way: the machine's two CPUs and 4 GiB, the container's profile defaults.
     let status = rig.call("tenant_status", json!({ "id": B })).unwrap();
@@ -499,7 +531,10 @@ fn a_tenants_caps_are_checked_before_incus_and_the_refusal_names_the_cap() {
     assert_eq!(status["instances"], 2);
     assert_eq!(
         refused("two", "app", B),
-        "creating two would exceed tenant bbbbbbbb's cap on disk (limits.disk): 36.0 GiB in use, 16.0 GiB asked, 50.0 GiB allowed"
+        said(
+            "creating two would exceed tenant bbbbbbbb's cap on disk (limits.disk): 36.0 GiB in use, 16.0 GiB asked, 50.0 GiB allowed",
+            json!({ "scope": "tenant", "limit": "disk", "have": 36 * GIB, "want": 16 * GIB, "max": 50 * GIB })
+        )
     );
 }
 
@@ -536,13 +571,16 @@ fn a_tenants_machine_sits_on_the_managed_network_and_the_nodes_machine_cap_cover
     // Rule 58: the node's cap of four machines holds the two tenants' one each, so the node's own project has two.
     create(&rig, "own1", "vm", None);
     create(&rig, "own2", "vm", None);
-    let (_, message) = refusal(rig.call(
-        "service_create",
-        json!({ "name": "own3", "template": "vm" }),
-    ));
-    assert!(
-        message.contains("would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 4 in use, 1 asked, 4 allowed"),
-        "{message}"
+    assert_eq!(
+        listed(rig.call(
+            "service_create",
+            json!({ "name": "own3", "template": "vm" }),
+        )),
+        (
+            "capacity".to_string(),
+            "creating own3 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 4 in use, 1 asked, 4 allowed".to_string(),
+            json!({ "scope": "node", "limit": "virtualMachines", "have": 4, "want": 1, "max": 4 })
+        )
     );
     // A machine of the node's own project keeps the NIC it always had: no IPv6 filter.
     let own = rig.get(instance_path(PROJECT, "own1").as_str()).unwrap();

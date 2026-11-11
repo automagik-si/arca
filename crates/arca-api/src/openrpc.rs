@@ -8,6 +8,10 @@
 //! separate because a verb can change no desired state and still not be read-only. docs/OPERATING.md ("The OpenRPC
 //! method flags") says what each means to a client. `x-arca-additional-properties` records whether the params object is
 //! closed, which the table makes true for every verb.
+//!
+//! The document's own `x-arca-refusals` lists the refusals for want of room and for asking too often
+//! ([`crate::refusals`]): one entry per code, with its `family` (`capacity` or `rate`), a summary and the schema of the
+//! error's `data`. It is not every code a verb answers.
 
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -29,7 +33,8 @@ pub fn openrpc() -> Value {
             "version": API_VERSION,
             "license": { "name": "Apache-2.0" }
         },
-        "methods": methods
+        "methods": methods,
+        "x-arca-refusals": crate::refusals::document()
     })
 }
 
@@ -161,6 +166,54 @@ fn check(doc: &Value, hint_required: bool) -> Result<(), String> {
         check_schema(result, "")
             .map_err(|e| format!("method {name} result has a malformed schema: {e}"))?;
     }
+    check_refusals(doc, hint_required)
+}
+
+/// The `x-arca-refusals` list: every entry has a code no other entry has, a family (`capacity` or `rate`), a summary,
+/// and a well-formed `data` schema that requires `refusal` and pins it to the entry's code. A document released before the list existed does not carry
+/// it and is frozen, so the list may be absent there.
+fn check_refusals(doc: &Value, list_required: bool) -> Result<(), String> {
+    let list = match doc.get("x-arca-refusals") {
+        None if !list_required => return Ok(()),
+        Some(Value::Array(list)) => list,
+        _ => return Err("x-arca-refusals must be an array".to_string()),
+    };
+    let mut codes = BTreeSet::new();
+    for entry in list {
+        let code = entry
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|code| !code.is_empty())
+            .ok_or_else(|| "a refusal has no code".to_string())?;
+        if !codes.insert(code) {
+            return Err(format!("refusal {code} is listed twice"));
+        }
+        let family = entry.get("family").and_then(Value::as_str);
+        if !matches!(family, Some("capacity" | "rate")) {
+            return Err(format!("refusal {code} has no legal family"));
+        }
+        if entry.get("summary").and_then(Value::as_str).is_none() {
+            return Err(format!("refusal {code} has no summary"));
+        }
+        let data = entry
+            .get("data")
+            .ok_or_else(|| format!("refusal {code} has no data schema"))?;
+        check_schema(data, "")
+            .map_err(|e| format!("refusal {code} has a malformed data schema: {e}"))?;
+        let names_itself = data
+            .pointer("/properties/refusal/const")
+            .and_then(Value::as_str)
+            == Some(code)
+            && data
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|name| name == "refusal"));
+        if !names_itself {
+            return Err(format!(
+                "refusal {code}: its data schema must require refusal and pin it to the code"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -171,6 +224,48 @@ mod tests {
     #[test]
     fn the_generated_document_passes_its_own_check() {
         assert_eq!(check_document(&openrpc()), Ok(()));
+    }
+
+    #[test]
+    fn the_refusal_list_is_required_and_every_entry_names_its_own_code() {
+        let mut doc = openrpc();
+        doc.as_object_mut()
+            .expect("document")
+            .remove("x-arca-refusals");
+        assert!(
+            check_document(&doc).is_err(),
+            "a current document lists them"
+        );
+        assert_eq!(
+            check_released_document(&doc),
+            Ok(()),
+            "a document released before the list has none"
+        );
+
+        let mut doc = openrpc();
+        doc["x-arca-refusals"][1]["code"] = doc["x-arca-refusals"][0]["code"].clone();
+        assert!(check_document(&doc).is_err(), "a code listed twice");
+
+        let mut doc = openrpc();
+        doc["x-arca-refusals"][0]["data"]["properties"]["refusal"] = json!({ "const": "refused" });
+        assert!(
+            check_document(&doc).is_err(),
+            "a data schema for another code"
+        );
+
+        let mut doc = openrpc();
+        doc["x-arca-refusals"][0]["data"]["format"] = json!("x");
+        assert!(
+            check_document(&doc).is_err(),
+            "a keyword outside the subset"
+        );
+
+        let mut doc = openrpc();
+        doc["x-arca-refusals"][0]["family"] = json!("quota");
+        assert!(
+            check_document(&doc).is_err(),
+            "a family that is not one of the two"
+        );
     }
 
     #[test]

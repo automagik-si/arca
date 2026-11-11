@@ -194,9 +194,9 @@ fn a_vm_template_takes_a_first_boot_script_settings_and_secrets_and_no_other_kin
         container[key] = pool_template()[key].clone();
         let error = load(container).expect_err("refused");
         assert!(
-            error
-                .message
-                .contains("only a virtual-machine template has a firstBoot or settings"),
+            error.message.contains(
+                "only a virtual-machine template has a firstBoot, settings or createSettings"
+            ),
             "{}",
             error.message
         );

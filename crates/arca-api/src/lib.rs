@@ -4,6 +4,7 @@
 pub mod check;
 pub mod compat;
 pub mod openrpc;
+pub mod refusals;
 pub mod verbs;
 
 pub use check::conforms;

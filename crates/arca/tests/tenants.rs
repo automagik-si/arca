@@ -58,8 +58,36 @@ struct Rig {
     key: common::SkKey,
     clock: Arc<AtomicU64>,
     kernel_config: Value,
+    /// What the node's config holds beside the kernel key: `proxy` and `services` are its `listen.proxy` and
+    /// `listen.services`, and `approvalOrigin` its own.
+    node: Value,
     nonce: AtomicU64,
     cfg: Arc<NodeConfig>,
+}
+
+/// The config of a rig's node: the kernel key `kernel`, and what `node` adds ([`Rig::node`]).
+fn node_config(
+    dir: &std::path::Path,
+    incus: &std::path::Path,
+    kernel: &Value,
+    node: &Value,
+) -> NodeConfig {
+    let mut config = json!({
+        "stateDir": dir,
+        "incus": {"socket": incus},
+        "listen": {"unix": dir.join("arca.sock")},
+        "tokens": {"hashDir": dir.join("tokens")},
+        "kernel": kernel
+    });
+    for key in ["proxy", "services"] {
+        if let Some(value) = node.get(key) {
+            config["listen"][key] = value.clone();
+        }
+    }
+    if let Some(origin) = node.get("approvalOrigin") {
+        config["approvalOrigin"] = origin.clone();
+    }
+    serde_json::from_value(config).expect("config")
 }
 
 impl Rig {
@@ -79,6 +107,12 @@ impl Rig {
     }
 
     fn with_kernel(kernel_config: Value, state: FakeState) -> Self {
+        Self::with_node(kernel_config, json!({}), state)
+    }
+
+    /// A node whose config also holds what `node` names: its `listen.proxy` and `listen.services`, and its
+    /// `approvalOrigin`.
+    fn with_node(kernel_config: Value, node: Value, state: FakeState) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-tenants-{}-{}",
             std::process::id(),
@@ -96,6 +130,7 @@ impl Rig {
             fake.socket().to_path_buf(),
             Some(fake),
             kernel_config,
+            node,
             common::SkKey::from_seed(9),
             Arc::new(AtomicU64::new(NOW)),
         )
@@ -115,6 +150,7 @@ impl Rig {
             socket,
             None,
             kernel_config,
+            json!({}),
             common::SkKey::from_seed(9),
             Arc::new(AtomicU64::new(now)),
         )
@@ -126,17 +162,11 @@ impl Rig {
         incus: PathBuf,
         fake: Option<FakeIncus>,
         kernel_config: Value,
+        node: Value,
         key: common::SkKey,
         clock: Arc<AtomicU64>,
     ) -> Self {
-        let cfg: NodeConfig = serde_json::from_value(json!({
-            "stateDir": dir,
-            "incus": {"socket": incus},
-            "listen": {"unix": dir.join("arca.sock")},
-            "tokens": {"hashDir": dir.join("tokens")},
-            "kernel": kernel_config
-        }))
-        .expect("config");
+        let cfg = node_config(&dir, &incus, &kernel_config, &node);
         arca::config::check(&cfg).expect("the config is one serve accepts");
         let scratch = common::Scratch::new("tenant-owner");
         let verifier = common::verifier_for(&scratch, &[&key], "tenants");
@@ -238,6 +268,7 @@ impl Rig {
             key,
             clock,
             kernel_config,
+            node,
             nonce: AtomicU64::new(0),
             cfg,
         }
@@ -250,13 +281,14 @@ impl Rig {
         let key = common::SkKey::from_seed(9);
         let clock = Arc::clone(&self.clock);
         let kernel_config = self.kernel_config.clone();
+        let node = self.node.clone();
         self.handlers.clear();
         // The state directory's lock is the old kernel's until it is dropped.
         let old = std::mem::replace(&mut self.kernel, Arc::new(Mutex::new(placeholder_kernel())));
         drop(old);
         drop(self);
         let socket = fake.socket().to_path_buf();
-        Self::open(dir, socket, Some(fake), kernel_config, key, clock)
+        Self::open(dir, socket, Some(fake), kernel_config, node, key, clock)
     }
 
     fn fake(&self) -> &FakeIncus {
@@ -331,16 +363,33 @@ impl Rig {
         .run(&approved.action, &approved.args, &approved.grant)
     }
 
+    /// Proposes `action`, approves it with the owner's passkey and runs it through `run_approved_action`, the path
+    /// `action_approve` and the approval page share: what comes back is what the caller of either is told.
+    fn approved_as_told(&self, action: &str, args: Value) -> Result<Value, CallError> {
+        let proposed = self.call("action_propose", json!({ "action": action, "args": args }))?;
+        let id = proposed["id"].as_str().expect("the proposal's id");
+        let digest = proposed["argsDigest"].as_str().expect("its digest");
+        let nonce = format!("{:064x}", self.nonce.fetch_add(1, Ordering::SeqCst) + 1);
+        let statement =
+            arca::handlers::action_statement("node1", id, action, digest, self.now(), &nonce)
+                .expect("the statement");
+        let approval = common::approve_statement(&self.key, &statement);
+        let executor = ActionExecutor::new(
+            self.handlers
+                .iter()
+                .map(|(verb, handler)| (*verb, Arc::clone(handler))),
+        );
+        arca::handlers::run_approved_action(
+            &self.kernel,
+            &executor,
+            &json!({ "plan": id, "approval": approval }),
+            self.now(),
+        )
+    }
+
     /// The node config the rig serves with.
     fn config(&self) -> NodeConfig {
-        serde_json::from_value(json!({
-            "stateDir": self.dir,
-            "incus": {"socket": self.socket},
-            "listen": {"unix": self.dir.join("arca.sock")},
-            "tokens": {"hashDir": self.dir.join("tokens")},
-            "kernel": self.kernel_config
-        }))
-        .expect("config")
+        node_config(&self.dir, &self.socket, &self.kernel_config, &self.node)
     }
 
     fn template(&self, name: &str, value: Value) {
@@ -392,11 +441,18 @@ fn empty_state() -> FakeState {
     }
 }
 
+/// A plain refusal: its code and its sentence. A refusal for want of room or for asking too often is not one, and is
+/// read with [`listed`].
 fn refusal(result: Result<Value, CallError>) -> (String, String) {
     match result {
         Err(CallError::Refused { code, message }) => (code, message),
         other => panic!("expected a refusal, got {other:?}"),
     }
+}
+
+/// A `capacity` or `rate` refusal: its code, its sentence and its fields, checked against the document's list.
+fn listed(result: Result<Value, CallError>) -> (String, String, Value) {
+    common::listed_refusal(result)
 }
 
 /// A container template with two ports, the first of which a link opens.
@@ -441,5 +497,9 @@ mod deploys;
 mod gate;
 #[path = "tenants/isolation.rs"]
 mod isolation;
+#[path = "tenants/kernel_access.rs"]
+mod kernel_access;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;
+#[path = "tenants/refusal_codes.rs"]
+mod refusal_codes;

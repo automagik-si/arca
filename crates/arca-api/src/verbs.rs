@@ -2163,6 +2163,34 @@ pub fn service_view_schema() -> Value {
                 "maxItems": 16,
                 "type": "array"
             },
+            "kernelAccess": {
+                "additionalProperties": false,
+                "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
+                "properties": {
+                    "connect": {
+                        "description": "The path of the socket on the host its device connects to: the node's listen.services as it was when the service was created.",
+                        "maxLength": 100,
+                        "type": "string"
+                    },
+                    "port": {
+                        "description": "The port inside the instance, on its loopback.",
+                        "maximum": 65535,
+                        "minimum": 1024,
+                        "type": "integer"
+                    },
+                    "problem": {
+                        "description": "service_status only, when ready is false: what does not stand as recorded.",
+                        "maxLength": 512,
+                        "type": "string"
+                    },
+                    "ready": {
+                        "description": "service_status only: whether the instance carries the device as Arca made it and this server's listen.services is still the socket it connects to.",
+                        "type": "boolean"
+                    }
+                },
+                "required": ["port", "connect"],
+                "type": "object"
+            },
             "lanPort": {
                 "anyOf": [
                     { "maximum": 65535, "minimum": 1, "type": "integer" },
@@ -2372,9 +2400,22 @@ fn service_create_params_base() -> Value {
                 "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
                 "type": "string"
             },
+            "kernelAccess": {
+                "additionalProperties": false,
+                "description": "Only for a template that declares kernelAccess: the template's own kernelAccess. A proposal made with action_propose fills it in from the template, so the owner's approval binds it and the owner's card says it; a caller has no need to state it. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, and on a node that sets no listen.services.",
+                "properties": {
+                    "port": { "maximum": 65535, "minimum": 1024, "type": "integer" }
+                },
+                "required": ["port"],
+                "type": "object"
+            },
             "start": {
-                "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, and inside a tenant they are not written yet (the start is refused with InstanceSecretsNotWritten and the machine stays running without them).",
+                "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, in a tenant's machine as in one of the node's own.",
                 "type": "boolean"
+            },
+            "settings": {
+                "description": "For a virtual-machine template that lists createSettings: the settings this one service gets in place of the template's defaults, by name. Only a listed name is taken, and a value has the type of the template's default; an address is a plain https address. Never a secret: service_status shows them. Fixed at create.",
+                "type": "object"
             }
         },
         "required": ["template", "name"],
@@ -2436,6 +2477,10 @@ fn service_status_params_base() -> Value {
 
 fn service_status_result() -> Value {
     let mut view = service_view_schema();
+    view["properties"]["settings"] = json!({
+        "description": "For a virtual machine with settings: the settings object it was created with, as its guest reads it (the template's, with the values its create replaced). Never a secret.",
+        "type": "object"
+    });
     view["properties"]["baseImage"] = json!({
         "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
         "maxLength": 64,

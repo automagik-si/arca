@@ -526,8 +526,11 @@ fn the_caps_count_virtual_machines_on_both_networks_and_no_container() {
         json!({"name":"ws3","template":"ws","bridge":"br0"}),
     ] {
         assert_eq!(
-            refusal(rig.call("service_create", args)),
-            "creating ws3 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 2 in use, 1 asked, 2 allowed"
+            out_of_room(rig.call("service_create", args)),
+            full(
+                "creating ws3 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 2 in use, 1 asked, 2 allowed",
+                room("virtualMachines", 2, 1, 2)
+            )
         );
     }
     assert_eq!(rig.entry_ids(), entries, "a refused create leaves nothing");
@@ -552,8 +555,11 @@ fn the_caps_count_virtual_machines_on_both_networks_and_no_container() {
         .call("service_create", json!({"name":"ws1","template":"ws"}))
         .expect("the first machine");
     assert_eq!(
-        refusal(managed.call("service_create", json!({"name":"ws2","template":"ws"}))),
-        "creating ws2 would exceed this node's cap on memory (kernel.vmLimits.memory): 4.0 GiB in use, 4.0 GiB asked, 6.0 GiB allowed"
+        out_of_room(managed.call("service_create", json!({"name":"ws2","template":"ws"}))),
+        full(
+            "creating ws2 would exceed this node's cap on memory (kernel.vmLimits.memory): 4.0 GiB in use, 4.0 GiB asked, 6.0 GiB allowed",
+            room("memory", 4 * GIB, 4 * GIB, 6 * GIB)
+        )
     );
 }
 
@@ -709,8 +715,11 @@ fn the_cap_incus_holds_follows_the_configured_cap_up_and_down() {
     }
     assert_eq!(project(&rig)["limits.virtual-machines"], "4");
     assert_eq!(
-        refusal(rig.call("service_create", json!({"name":"ws5","template":"ws"}))),
-        "creating ws5 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 4 in use, 1 asked, 4 allowed"
+        out_of_room(rig.call("service_create", json!({"name":"ws5","template":"ws"}))),
+        full(
+            "creating ws5 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 4 in use, 1 asked, 4 allowed",
+            room("virtualMachines", 4, 1, 4)
+        )
     );
 
     // The operator raises the cap. The fifth create writes it to the entry and the project, and only then the instance.
@@ -757,8 +766,11 @@ fn the_cap_incus_holds_follows_the_configured_cap_up_and_down() {
     // A cap lowered below the five machines the node holds is refused in words, and nothing is written.
     let (_, handlers) = rig.switched(managed_vm_kernel(caps(3)));
     assert_eq!(
-        refusal(create(&handlers, json!({"name":"ws6","template":"ws"}))),
-        "creating ws6 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 5 in use, 1 asked, 3 allowed"
+        out_of_room(create(&handlers, json!({"name":"ws6","template":"ws"}))),
+        full(
+            "creating ws6 would exceed this node's cap on virtual machines (kernel.vmLimits.virtualMachines): 5 in use, 1 asked, 3 allowed",
+            room("virtualMachines", 5, 1, 3)
+        )
     );
     assert_eq!(rig.fake.writes().len(), settled);
     assert_eq!(entry(&rig, NET_ENTRY).config["virtualMachines"], 8);
@@ -782,8 +794,11 @@ fn the_bridged_owners_caps_follow_the_config_too() {
             .expect("a machine under the caps");
     }
     assert_eq!(
-        refusal(rig.call("service_create", json!({"name":"ws5","template":"ws"}))),
-        "creating ws5 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 4 in use, 1 asked, 4 allowed"
+        out_of_room(rig.call("service_create", json!({"name":"ws5","template":"ws"}))),
+        full(
+            "creating ws5 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 4 in use, 1 asked, 4 allowed",
+            room("virtualMachines", 4, 1, 4)
+        )
     );
     let wider = json!({ "virtualMachines": 8, "cpu": 16, "memory": "32GiB", "disk": "200GiB" });
     let (_, handlers) = rig.switched(bridged_kernel(&["br0"], wider.clone()));
@@ -989,9 +1004,14 @@ fn a_widening_with_a_count_below_the_machines_held_is_refused_in_words_before_an
     let (_, handlers) = rig.switched(mixed_kernel(&["br0"], caps(4)));
     let writes = rig.fake.writes().len();
     let entries = rig.entries();
+    // A `capacity` refusal with no amount asked: the create is a container's, and what is over the cap is what the
+    // node already holds.
     assert_eq!(
-        refusal(create(&handlers, json!({"name":"nats","template":"nats"}))),
-        "this node holds 6 virtual machines, but kernel.bridged.limits.virtualMachines is 4: raise it to at least 6, or remove virtual machines first. Nothing was written"
+        out_of_room(create(&handlers, json!({"name":"nats","template":"nats"}))),
+        full(
+            "this node holds 6 virtual machines, but kernel.bridged.limits.virtualMachines is 4: raise it to at least 6, or remove virtual machines first. Nothing was written",
+            json!({ "scope": "node", "limit": "virtualMachines", "have": 6, "max": 4 })
+        )
     );
     assert_eq!(rig.fake.writes().len(), writes, "no write");
     assert_eq!(rig.entries(), entries, "no entry changed");
@@ -1020,13 +1040,19 @@ fn a_bridged_nodes_lowered_caps_are_refused_below_use_and_followed_above_it() {
     let (_, handlers) = rig.switched(lowered(1, 6));
     let writes = rig.fake.writes().len();
     assert_eq!(
-        refusal(create(&handlers, json!({"name":"ws3","template":"ws"}))),
-        "creating ws3 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 2 in use, 1 asked, 1 allowed"
+        out_of_room(create(&handlers, json!({"name":"ws3","template":"ws"}))),
+        full(
+            "creating ws3 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 2 in use, 1 asked, 1 allowed",
+            room("virtualMachines", 2, 1, 1)
+        )
     );
     let (_, handlers) = rig.switched(lowered(3, 4));
     assert_eq!(
-        refusal(create(&handlers, json!({"name":"ws3","template":"ws"}))),
-        "creating ws3 would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 4 in use, 2 asked, 4 allowed"
+        out_of_room(create(&handlers, json!({"name":"ws3","template":"ws"}))),
+        full(
+            "creating ws3 would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 4 in use, 2 asked, 4 allowed",
+            room("cpu", 4, 2, 4)
+        )
     );
     assert_eq!(
         rig.fake.writes().len(),
@@ -1064,3 +1090,6 @@ fn a_bridged_nodes_lowered_caps_are_refused_below_use_and_followed_above_it() {
 
 #[path = "vm_secrets.rs"]
 mod vm_secrets;
+
+#[path = "create_settings.rs"]
+mod create_settings;

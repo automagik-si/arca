@@ -338,6 +338,7 @@ fn refusal(error: &CallError) -> (String, String, bool) {
     match error {
         CallError::Refused { code, message } => (code.clone(), message.clone(), false),
         CallError::UntrustedRefused { code, message } => (code.clone(), message.clone(), true),
+        CallError::RefusedWith { code, message, .. } => (code.clone(), message.clone(), false),
         CallError::Invalid(why) => ("invalid".into(), why.clone(), false),
         CallError::Forbidden { verb } => ("forbidden".into(), verb.clone(), false),
         CallError::NotFound => ("not_found".into(), String::new(), false),
@@ -396,6 +397,20 @@ impl OmniRig {
             "{verb} {args}: {message:?} !~ {pattern}"
         );
         (message, untrusted)
+    }
+    /// A pairing of the instance `id` that is held off for `wait` seconds: a `rate` refusal with its whole sentence,
+    /// and the same wait in `retryAfterSeconds`.
+    fn held_off(&self, id: &str, wait: u64) {
+        assert_eq!(
+            common::listed_refusal(self.call("omni_pair", json!({"name":"omni","instance":id}))),
+            (
+                "rate".to_string(),
+                format!(
+                    "a pairing code for {id} was issued and lasts {wait} s more: enter that one on the phone; never ask for codes in a loop"
+                ),
+                json!({ "retryAfterSeconds": wait })
+            )
+        );
     }
     fn sent(&self) -> usize {
         self.omni.seen().len()
@@ -562,12 +577,8 @@ fn g6_pair_masks_the_owners_number_once_per_code_and_refuses_without_a_valid_sec
     assert_eq!(last.body, Some(json!({"phoneNumber":PHONE})));
     assert_eq!(last.url, format!("/api/v2/instances/{id}/pair"));
     let before = r.sent();
-    r.refused(
-        "omni_pair",
-        json!({"name":"omni","instance":id}),
-        "refused",
-        r"a pairing code for .* was issued and lasts \d+ s more: enter that one on the phone; never ask for codes in a loop",
-    );
+    // The code Omni gave lasts 60 seconds, and no time has passed.
+    r.held_off(&id, 60);
     assert_eq!(r.sent(), before, "the second ask reached nothing");
     // A Telegram instance has no pairing: Omni says so, and Arca passes it on, marked untrusted.
     r.secret("telegram_bot_token", BOT);
@@ -1003,12 +1014,7 @@ fn g6_pair_cooldown_starts_with_every_attempt_that_reaches_omni() {
         "500: PAIRING_FAILED: rate limited",
     );
     let sent = r.sent();
-    r.refused(
-        "omni_pair",
-        json!({"name":"omni","instance":id}),
-        "refused",
-        &format!("was issued and lasts {PAIR_COOLDOWN_S} s more"),
-    );
+    r.held_off(id.as_str().expect("an id"), PAIR_COOLDOWN_S);
     assert_eq!(r.sent(), sent, "the second ask reached nothing");
     // An answer without a code is an attempt too.
     r.now
@@ -1020,12 +1026,7 @@ fn g6_pair_cooldown_starts_with_every_attempt_that_reaches_omni() {
         "refused",
         "answered the pairing without a pairing code",
     );
-    r.refused(
-        "omni_pair",
-        json!({"name":"omni","instance":id}),
-        "refused",
-        r"was issued and lasts \d+ s more",
-    );
+    r.held_off(id.as_str().expect("an id"), PAIR_COOLDOWN_S);
     r.now
         .fetch_add(PAIR_COOLDOWN_S * 1000 + 1, Ordering::SeqCst);
     assert_eq!(

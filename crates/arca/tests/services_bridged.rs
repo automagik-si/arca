@@ -295,6 +295,26 @@ fn refusal(result: Result<Value, CallError>) -> String {
     }
 }
 
+/// A `capacity` refusal: its sentence and the fields beside its code, checked against the document's list.
+fn out_of_room(result: Result<Value, CallError>) -> (String, Value) {
+    let (code, message, fields) = common::listed_refusal(result);
+    assert_eq!(code, "capacity", "{message}");
+    (message, fields)
+}
+
+/// What a `capacity` refusal of the node says beside its sentence: whose cap (the node's), which cap, what is in use,
+/// what was asked and what is allowed.
+fn room(limit: &str, have: u64, want: u64, max: u64) -> Value {
+    json!({ "scope": "node", "limit": limit, "have": have, "want": want, "max": max })
+}
+
+/// A `capacity` refusal as a test states it: the sentence and its fields.
+fn full(message: &str, fields: Value) -> (String, Value) {
+    (message.to_string(), fields)
+}
+
+const GIB: u64 = 1 << 30;
+
 fn owner_approval(key: &common::SkKey, name: &str) -> String {
     let args = json!({"name": name});
     let statement = canonical_json(&json!({
@@ -852,22 +872,28 @@ fn the_shipped_workspace_vm_template_loads_as_a_virtual_machine() {
 #[test]
 fn a_create_that_would_exceed_a_cap_is_refused_in_plain_words_before_any_write() {
     // Each cap in turn is the one the second machine of the test template (2 CPUs, 4GiB, 20GiB) does not fit under.
-    for (limits, refused) in [
+    // The refusal is a `capacity` one: beside the sentence it names the cap and the same amounts, in bytes for memory
+    // and disk.
+    for (limits, refused, fields) in [
         (
             json!({ "virtualMachines": 1, "cpu": 8, "memory": "16GiB", "disk": "80GiB" }),
             "creating ws2 would exceed this node's cap on virtual machines (kernel.bridged.limits.virtualMachines): 1 in use, 1 asked, 1 allowed",
+            room("virtualMachines", 1, 1, 1),
         ),
         (
             json!({ "virtualMachines": 4, "cpu": 3, "memory": "16GiB", "disk": "80GiB" }),
             "creating ws2 would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 2 in use, 2 asked, 3 allowed",
+            room("cpu", 2, 2, 3),
         ),
         (
             json!({ "virtualMachines": 4, "cpu": 8, "memory": "6GiB", "disk": "80GiB" }),
             "creating ws2 would exceed this node's cap on memory (kernel.bridged.limits.memory): 4.0 GiB in use, 4.0 GiB asked, 6.0 GiB allowed",
+            room("memory", 4 * GIB, 4 * GIB, 6 * GIB),
         ),
         (
             json!({ "virtualMachines": 4, "cpu": 8, "memory": "16GiB", "disk": "30GiB" }),
             "creating ws2 would exceed this node's cap on disk (kernel.bridged.limits.disk): 20.0 GiB in use, 20.0 GiB asked, 30.0 GiB allowed",
+            room("disk", 20 * GIB, 20 * GIB, 30 * GIB),
         ),
     ] {
         let rig = Rig::with(bridged_kernel(&["br0"], limits), None, vec![]);
@@ -875,8 +901,8 @@ fn a_create_that_would_exceed_a_cap_is_refused_in_plain_words_before_any_write()
             .expect("the first machine fits");
         let writes = rig.fake.writes().len();
         assert_eq!(
-            refusal(rig.call("service_create", json!({"name":"ws2","template":"ws"}))),
-            refused
+            out_of_room(rig.call("service_create", json!({"name":"ws2","template":"ws"}))),
+            full(refused, fields)
         );
         assert_eq!(rig.fake.writes().len(), writes, "nothing was written");
         let mut ids = rig.entry_ids();
@@ -893,8 +919,11 @@ fn a_create_that_would_exceed_a_cap_is_refused_in_plain_words_before_any_write()
         vec![],
     );
     assert_eq!(
-        refusal(rig.call("service_create", json!({"name":"ws1","template":"ws"}))),
-        "creating ws1 would exceed this node's cap on memory (kernel.bridged.limits.memory): 0.0 GiB in use, 4.0 GiB asked, 2.0 GiB allowed"
+        out_of_room(rig.call("service_create", json!({"name":"ws1","template":"ws"}))),
+        full(
+            "creating ws1 would exceed this node's cap on memory (kernel.bridged.limits.memory): 0.0 GiB in use, 4.0 GiB asked, 2.0 GiB allowed",
+            room("memory", 0, 4 * GIB, 2 * GIB)
+        )
     );
     assert!(rig.fake.writes().is_empty() && rig.entry_ids().is_empty());
 }

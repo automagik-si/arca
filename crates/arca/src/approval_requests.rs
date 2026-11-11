@@ -8,7 +8,7 @@
 //!   (`action`, `target`, and the `paramsDigest` of `args`, at most 4 KiB of JSON, no `approval` key, no control or bidi
 //!   character and no string that reads as an approval, shown to the owner as data). A kind `arca` request without an
 //!   action is refused as droidd refuses it: `an arca request needs action`. An identical pending request of the same token
-//!   is the same request; beyond 5 pending per token or 20 in all the call is refused (`refused`, "429" in its message).
+//!   is the same request; beyond 5 pending per token or 20 in all the call is refused (`rate`, "429" in its message).
 //!   Kind `upgrade` is refused with `upgrade_not_here`: an identity phone's upgrade step is approved through droidd's MCP.
 //!   Action `enroll` asks the owner to let a service on this node make the person showing a code one of its owners: the
 //!   target is that code (6 to 12 uppercase letters and digits) and the args are `{service: <name>}`, nothing else.
@@ -365,21 +365,37 @@ impl ApprovalRequests {
             .filter(pending)
             .filter(|row| row.requester == caller.token_id)
             .count();
+        // Both caps are `rate` refusals: what is full is the caller's own queue to the owner, not the node, and waiting
+        // ends it. The wait told is the longest it can be, until the first of the waiting requests expires; one that
+        // is decided makes room sooner.
+        let first_to_expire = |rows: &mut dyn Iterator<Item = &Row>| {
+            rows.map(|row| row.expires_at)
+                .min()
+                .map(|at| arca_api::refusals::seconds_until(at, now))
+        };
         if mine >= PENDING_PER_TOKEN {
-            return Err(refused(
-                "refused",
+            let wait = first_to_expire(
+                &mut inner
+                    .rows
+                    .iter()
+                    .filter(pending)
+                    .filter(|row| row.requester == caller.token_id),
+            );
+            return Err(CallError::rate(
                 format!(
                     "too many pending requests (429): {} has {PENDING_PER_TOKEN} waiting for the owner; wait for one to be decided or to expire",
                     caller.token_id
                 ),
+                wait,
             ));
         }
         if inner.rows.iter().filter(pending).count() >= PENDING_PER_KERNEL {
-            return Err(refused(
-                "refused",
+            let wait = first_to_expire(&mut inner.rows.iter().filter(pending));
+            return Err(CallError::rate(
                 format!(
                     "too many pending requests (429): Arca has {PENDING_PER_KERNEL} waiting for the owner; wait for one to be decided or to expire"
                 ),
+                wait,
             ));
         }
         let row = Row {

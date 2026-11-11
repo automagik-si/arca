@@ -137,6 +137,7 @@ struct Rig {
     handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
     fail_observe: Arc<Mutex<Option<String>>>,
     unknown_create: Arc<Mutex<bool>>,
+    cfg: Arc<NodeConfig>,
 }
 
 impl Rig {
@@ -189,6 +190,18 @@ impl Rig {
         verifier: Option<ApprovalVerifier<OwnerKeys, FileNonces>>,
         pause: Option<RemovalPause>,
     ) -> Self {
+        Self::with_services(state, projects, cidr, verifier, pause, None)
+    }
+
+    /// The same rig on a node whose config names `services` as its `listen.services`.
+    fn with_services(
+        state: FakeState,
+        projects: Vec<String>,
+        cidr: Option<&str>,
+        verifier: Option<ApprovalVerifier<OwnerKeys, FileNonces>>,
+        pause: Option<RemovalPause>,
+        services: Option<&str>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-service-{}-{}",
             std::process::id(),
@@ -211,7 +224,7 @@ impl Rig {
         let cfg: NodeConfig = serde_json::from_value(json!({
             "stateDir": dir,
             "incus": {"socket": fake.socket()},
-            "listen": {"unix": dir.join("arca.sock")},
+            "listen": {"unix": dir.join("arca.sock"), "services": services},
             "tokens": {"hashDir": dir.join("tokens")},
             "kernel": kernel_config
         }))
@@ -268,7 +281,7 @@ impl Rig {
             .expect("kernel"),
         ));
         let cfg = Arc::new(cfg);
-        let handlers = service_handlers(kernel.clone(), Arc::new(|| NOW), cfg)
+        let handlers = service_handlers(kernel.clone(), Arc::new(|| NOW), cfg.clone())
             .into_iter()
             .collect();
         Self {
@@ -278,6 +291,7 @@ impl Rig {
             handlers,
             fail_observe,
             unknown_create,
+            cfg,
         }
     }
 
@@ -561,6 +575,8 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         root_size: None,
         first_boot: None,
         settings: None,
+        create_settings: Vec::new(),
+        kernel_access: None,
     }
 }
 
@@ -1755,7 +1771,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_eight_templates_and_nothing_else_load_and_are_pinned() {
+fn the_nine_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -1770,6 +1786,7 @@ fn the_eight_templates_and_nothing_else_load_and_are_pinned() {
         vec![
             "automagik",
             "automagik-server",
+            "automagik-workspace",
             "cloudflare-tunnel",
             "github-runner-pool",
             "nats",
@@ -2544,6 +2561,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 mod approval_requests;
 #[path = "services/golden.rs"]
 mod golden;
+#[path = "services/kernel_access.rs"]
+mod kernel_access;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/tunnel.rs"]
@@ -2953,9 +2972,10 @@ fn templates_install_puts_every_shipped_template_and_its_script_in_place_in_one_
         service::entrypoint(&loaded, &dir).expect("its entrypoint script is installed with it");
         service::first_boot(&loaded, &dir).expect("its first-boot script is installed with it");
     }
-    assert_eq!(templates, 8);
+    assert_eq!(templates, 9);
     assert!(installed.contains(&"postgres-autopg.sh"));
     assert!(installed.contains(&"github-runner-pool.sh"));
+    assert!(installed.contains(&"automagik-workspace.sh"));
     assert_eq!(
         fs::metadata(&dir).expect("dir").permissions().mode() & 0o777,
         0o700

@@ -123,9 +123,9 @@ impl From<ConfigError> for Failure {
 pub fn call_failure(error: CallError) -> Failure {
     match error {
         CallError::Internal(text) => Failure::Runtime(text),
-        CallError::Refused { message, .. } | CallError::UntrustedRefused { message, .. } => {
-            Failure::Runtime(message)
-        }
+        CallError::Refused { message, .. }
+        | CallError::UntrustedRefused { message, .. }
+        | CallError::RefusedWith { message, .. } => Failure::Runtime(message),
         _ => Failure::Runtime("the read failed".to_string()),
     }
 }

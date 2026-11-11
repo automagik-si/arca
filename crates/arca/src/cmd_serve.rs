@@ -1,5 +1,5 @@
-//! `serve --config <file>`: the Arca MCP server on the unix socket, and on the tailnet and proxy addresses when the config
-//! names them.
+//! `serve --config <file>`: the Arca MCP server on the unix socket, and on the tailnet and proxy addresses and the services
+//! socket when the config names them.
 //! The server runs until SIGTERM or SIGINT, then removes its own socket and exits 0.
 
 use std::collections::BTreeSet;
@@ -28,7 +28,9 @@ use arca_incus::{ProjectFamily, UnixIncus};
 use arca_kernel::KernelError;
 use arca_kernel::identity::NodeKey;
 use arca_kernel::plugin::Provider;
-use arca_mcp::{Server, TokenStore, TokenStoreError, serve_proxy, serve_tailnet, serve_unix};
+use arca_mcp::{
+    Server, TokenStore, TokenStoreError, serve_proxy, serve_services, serve_tailnet, serve_unix,
+};
 use arca_metrics::ProbeTarget;
 use arca_providers::ReadOnlyIncusProvider;
 use arca_providers::incus::{Family, IncusProvider, RetainedSet};
@@ -109,7 +111,8 @@ pub fn watch_kernel_handler(cfg: &NodeConfig, kernel: Arc<Mutex<Kernel>>) -> Wat
 }
 
 /// Refuses a start whose config would leave a half-state under the desired state (a network dropped from under what
-/// lives on it), and a start that names a host bridge this host does not have. A node that holds containers and virtual
+/// lives on it, or the services socket moved or taken from under a service with kernel access), and a start that names
+/// a host bridge this host does not have. A node that holds containers and virtual
 /// machines together starts. The desired document is read under the state directory's lock, which is released before the kernel takes it.
 pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> {
     if let Some(bridged) = &cfg.kernel.bridged {
@@ -131,6 +134,11 @@ pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> 
             .map(|signed| signed.document.entries.clone())
             .unwrap_or_default()
     };
+    // A service whose device connects to a socket this config does not serve as the services socket: see
+    // `kernel_access_refusal`.
+    if let Some(why) = crate::handlers::kernel_access_refusal(cfg, &entries) {
+        return Err(Failure::Config(why));
+    }
     match crate::handlers::mode_refusal(cfg, &entries) {
         Some(why) => Err(Failure::Config(why)),
         None => Ok(()),
@@ -313,12 +321,17 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .get_route(
             "/alerts",
+            "alerts_list",
             Arc::new(AlertsExport {
                 node: node.clone(),
                 store: reader,
             }),
         )
-        .get_route("/metrics", Arc::new(MetricsExport { node, alerts }));
+        .get_route(
+            "/metrics",
+            "node_metrics",
+            Arc::new(MetricsExport { node, alerts }),
+        );
     // A watch-only node has no device writer. A kernel-mode node writes GPU devices only in its own project family, and
     // only reads local telemetry for the VM-in-use check when the metrics source is a settled local daemon.
     let gpu: Option<Arc<dyn crate::gpu::GpuBackend>> = if kernel_mode {
@@ -525,6 +538,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             None => page,
         }
     });
+    // The services socket serves the MCP routes alone: a service with kernel access connects to it, and it never
+    // carries the approval page, whose routes need no token. It is taken here, before the page is merged anywhere.
+    let services_router = router.clone();
     let proxy_router = match &page {
         Some(page) => router.clone().merge(page.router(true)),
         None => router.clone(),
@@ -586,10 +602,17 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 None => std::future::pending().await,
             }
         };
+        let services = async {
+            match &cfg.listen.services {
+                Some(path) => serve_services(services_router.clone(), path).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             result = serve_unix(router.clone(), &unix_path) => result,
             result = tailnet => result,
             result = proxy => result,
+            result = services => result,
             () = stop => Ok(()),
         }
     });
@@ -597,6 +620,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
     match outcome {
         Ok(()) => {
             remove_own_socket(&cfg.listen.unix);
+            if let Some(path) = &cfg.listen.services {
+                remove_own_socket(path);
+            }
             Ok(None)
         }
         Err(e) => Err(Failure::Runtime(format!("the server stopped: {e}"))),

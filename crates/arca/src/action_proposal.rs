@@ -70,6 +70,58 @@ pub enum ActionKind {
     DeployRemove,
 }
 
+/// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
+fn shown(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if clean.chars().count() <= max {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
+/// The most characters one card row shows of a setting. A proposal whose setting would need more in one row is
+/// refused when it is made ([`ActionKind::prepare`]), so a card never cuts what the owner approves.
+pub const SETTING_ROW_MAX: usize = 160;
+
+/// The card rows of one setting a create replaces: its name and its value in plain words. A list has one row for each
+/// element, numbered from one, so a long list is shown whole; an element that is an object is shown as its fields.
+pub fn setting_rows(key: &str, value: &Value) -> Vec<(String, String)> {
+    let label = format!("Setting {}", shown(key, 64));
+    match value {
+        Value::Array(items) if items.is_empty() => vec![(label, "(an empty list)".to_string())],
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (format!("{label} {}", index + 1), setting_words(item)))
+            .collect(),
+        other => vec![(label, setting_words(other))],
+    }
+}
+
+/// A setting's value in words: a string as it is, an object as `key: value; key: value`, a list as its elements with
+/// commas between, and anything else as JSON writes it.
+fn setting_words(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(setting_words)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| format!("{key}: {}", setting_words(item)))
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
+    }
+}
+
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
     pub const ALL: [ActionKind; 20] = [
@@ -219,6 +271,18 @@ impl ActionKind {
                         })?;
                     args["mac"] = Value::String(normalized);
                 }
+                // The owner approves what the card shows, so a setting the card could not show whole is refused
+                // here, before a proposal exists. A list is shown one element to a row.
+                for (key, value) in args["settings"].as_object().into_iter().flatten() {
+                    for (label, words) in setting_rows(key, value) {
+                        let length = words.chars().count();
+                        if length > SETTING_ROW_MAX {
+                            return Err(format!(
+                                "args/settings: the owner's card shows a setting in rows of at most {SETTING_ROW_MAX} characters, and \"{label}\" needs {length}: shorten it, or give a list more and shorter elements"
+                            ));
+                        }
+                    }
+                }
             }
             Self::ServicePublish => {
                 if args["reach"].as_str() != Some("tailnet") {
@@ -285,6 +349,11 @@ impl ActionKind {
                 if args.get("mac").is_some() {
                     rows.push(row("MAC address", text("mac")));
                 }
+                // The template gives this service access to the kernel. The proposal names it (it is filled in from
+                // the template when the proposal is made), so the approval binds it and the card says it in words.
+                if let Some(port) = args["kernelAccess"]["port"].as_u64() {
+                    rows.push(row("Kernel access", &kernel_access_words(port)));
+                }
                 // The row says what will happen, so the owner approves a stopped service knowingly: a create that
                 // said `start: false`, and one whose template is created stopped whatever the call says (the reason
                 // is read from the template when the proposal is made, and is not in its arguments).
@@ -293,6 +362,15 @@ impl ActionKind {
                     (_, Some(reason)) => rows.push(row("Start", &stopped_words(reason))),
                     (Some(true), None) => rows.push(row("Start", start_words(true))),
                     (None, None) => {}
+                }
+                // One row for each setting the create replaces, with its value: a setting such as an address
+                // decides where the new machine sends its credential, so the owner sees it before approving.
+                for (key, value) in args["settings"].as_object().into_iter().flatten() {
+                    for (label, words) in setting_rows(key, value) {
+                        // A proposal never holds a longer value (`prepare` refuses one); the cut is for arguments
+                        // that did not come through it.
+                        rows.push(row(&label, &shown(&words, SETTING_ROW_MAX)));
+                    }
                 }
                 rows
             }
@@ -529,6 +607,12 @@ impl ActionKind {
                 format!("Remove everything the deploy {} created", text("deploy"))
             }
         };
+        // A service that can call the kernel is named as one.
+        let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {
+            format!("{sentence} with access to this node's kernel")
+        } else {
+            sentence
+        };
         // A service created stopped is named as one: nothing of it runs until it is started.
         let sentence =
             if self == Self::ServiceCreate && args.get("start") == Some(&Value::Bool(false)) {
@@ -543,6 +627,13 @@ impl ActionKind {
             _ => sentence,
         }
     }
+}
+
+/// The `Kernel access` row of a `service_create` whose template declares `kernelAccess`, in the owner's words.
+pub fn kernel_access_words(port: u64) -> String {
+    format!(
+        "Yes: this service can call this node's kernel from inside, at http://127.0.0.1:{port}/mcp, with whatever token it is given. The token's scope and tool list decide what it may do, and a call without a token is refused."
+    )
 }
 
 /// What a `service_create` proposal's `start` means, in the owner's words.
@@ -1121,6 +1212,22 @@ impl ProposalRateLimiter {
         true
     }
 
+    /// How long until `token`'s window has a free place, in milliseconds: the time its oldest counted proposal still
+    /// stays in the window. `None` when the window is not full.
+    pub fn wait_ms(&self, token: &str, now: u64) -> Option<u64> {
+        let seen = self.seen.lock().ok()?;
+        let window = seen.get(token)?;
+        if window.len() < PROPOSAL_RATE_MAX {
+            return None;
+        }
+        let oldest = *window.front()?;
+        Some(
+            oldest
+                .saturating_add(PROPOSAL_RATE_WINDOW_MS)
+                .saturating_sub(now),
+        )
+    }
+
     /// Gives back the place [`Self::allow`] just reserved when the proposal was refused after all, so a refusal never
     /// counts toward the window. It removes only a place taken at `now`; an older one stays.
     pub fn refund(&self, token: &str, now: u64) {
@@ -1568,6 +1675,12 @@ mod tests {
             assert!(limiter.allow("one", 1_000 + index));
         }
         assert!(!limiter.allow("one", 1_000 + PROPOSAL_RATE_MAX as u64));
+        assert_eq!(
+            limiter.wait_ms("one", 1_000 + PROPOSAL_RATE_MAX as u64),
+            Some(PROPOSAL_RATE_WINDOW_MS - PROPOSAL_RATE_MAX as u64),
+            "the wait ends when the oldest proposal leaves the window"
+        );
+        assert_eq!(limiter.wait_ms("two", 1_000), None, "no window, no wait");
         assert!(
             limiter.allow("two", 1_000),
             "another token has its own window"

@@ -153,22 +153,29 @@ pub(super) fn outside_blocks(candidates: Vec<Ipv4Addr>, blocks: &[block::Block])
         .collect()
 }
 
-/// The free address a new instance of the tenant takes: the lowest of its block that nothing uses.
+/// The free address a new instance of the tenant takes: the lowest of its block that nothing uses. A block with none
+/// left is a `capacity` refusal of `scope` `node`, not `tenant`. The tenant's own caps are checked before an address is
+/// looked for, and a block holds an address for every instance the caps allow, so a tenant that gets here is under its
+/// instance cap: its block is full because something else holds addresses in it (a lease on the bridge that is not
+/// one of its services). The tenant's plan is not what is full, and nothing the tenant removes makes room.
 pub(super) fn free_address(
     scope: &TenantScope,
     used: &BTreeSet<Ipv4Addr>,
 ) -> Result<String, CallError> {
-    scope
-        .block
-        .addresses()
+    let addresses = scope.block.addresses();
+    let all = addresses.len() as u128;
+    addresses
         .into_iter()
         .find(|ip| !used.contains(ip))
         .map(|ip| ip.to_string())
         .ok_or_else(|| {
-            service_refused(format!(
-                "tenant {}'s address block {} has no free address",
-                scope.id, scope.config.block
-            ))
+            CallError::capacity(
+                format!(
+                    "tenant {}'s address block {} has no free address",
+                    scope.id, scope.config.block
+                ),
+                Room::of(Whose::Node, Limit::Addresses, all, 1, all),
+            )
         })
 }
 
@@ -527,14 +534,21 @@ fn used(scope: &TenantScope, entries: &[Entry]) -> Use {
     total
 }
 
-/// Why one more instance would pass a cap of the tenant, or `None`. The refusal names the cap. It comes before any Incus
-/// request: Incus holds the same caps on the project and would refuse too, in its own words.
-fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use) -> Option<String> {
+/// Why one more instance would pass a cap of the tenant, or `None`. The refusal names the cap, in words and as a
+/// `capacity` refusal's fields, with `scope` `tenant`: the cap is the tenant's own. It comes before any Incus request: Incus holds the same caps on the project and would
+/// refuse too, in its own words.
+fn caps_exceeded(
+    scope: &TenantScope,
+    entries: &[Entry],
+    name: &str,
+    asked: Use,
+) -> Option<CallError> {
     let caps = &scope.config.caps;
     let held = used(scope, entries);
     let gib = |bytes: u128| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
     let plain = |n: u128| n.to_string();
     type Check<'a> = (
+        Limit,
         &'a str,
         &'a str,
         u128,
@@ -544,6 +558,7 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
     );
     let checks: [Check<'_>; 6] = [
         (
+            Limit::Instances,
             "instances",
             "limits.instances",
             held.containers + held.virtual_machines,
@@ -552,6 +567,7 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
             &plain,
         ),
         (
+            Limit::Containers,
             "containers",
             "limits.containers",
             held.containers,
@@ -560,6 +576,7 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
             &plain,
         ),
         (
+            Limit::VirtualMachines,
             "virtual machines",
             "limits.virtual-machines",
             held.virtual_machines,
@@ -568,6 +585,7 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
             &plain,
         ),
         (
+            Limit::Cpu,
             "CPUs",
             "limits.cpu",
             held.cpu,
@@ -576,6 +594,7 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
             &plain,
         ),
         (
+            Limit::Memory,
             "memory",
             "limits.memory",
             held.memory,
@@ -584,6 +603,7 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
             &gib,
         ),
         (
+            Limit::Disk,
             "disk",
             "limits.disk",
             held.disk,
@@ -592,31 +612,35 @@ fn caps_exceeded(scope: &TenantScope, entries: &[Entry], name: &str, asked: Use)
             &gib,
         ),
     ];
-    for (what, key, held, asked, cap, show) in checks {
+    for (limit, what, key, held, asked, cap, show) in checks {
         if asked != 0 && held.saturating_add(asked) > cap {
-            return Some(format!(
-                "creating {name} would exceed tenant {}'s cap on {what} ({key}): {} in use, {} asked, {} allowed",
-                scope.id,
-                show(held),
-                if asked == u128::MAX {
-                    "an unreadable amount".to_string()
-                } else {
-                    show(asked)
-                },
-                show(cap)
+            return Some(CallError::capacity(
+                format!(
+                    "creating {name} would exceed tenant {}'s cap on {what} ({key}): {} in use, {} asked, {} allowed",
+                    scope.id,
+                    show(held),
+                    if asked == u128::MAX {
+                        "an unreadable amount".to_string()
+                    } else {
+                        show(asked)
+                    },
+                    show(cap)
+                ),
+                Room::of(Whose::Tenant, limit, held, asked, cap),
             ));
         }
     }
     None
 }
 
-/// Why creating the service `name` from `template` would pass a cap of the tenant, or `None`.
+/// Why creating the service `name` from `template` would pass a cap of the tenant, or `None`. A cap that would be
+/// passed is a `capacity` refusal. A template whose data volume cannot be counted is a plain one: nothing ran out.
 pub(super) fn service_caps_refusal(
     scope: &TenantScope,
     entries: &[Entry],
     name: &str,
     template: &crate::service::Template,
-) -> Option<String> {
+) -> Option<CallError> {
     let asked = if template.is_vm() {
         vm_use(
             &template.limits,
@@ -628,10 +652,10 @@ pub(super) fn service_caps_refusal(
             .as_ref()
             .is_some_and(|data| data.size.is_none())
         {
-            return Some(format!(
+            return Some(service_refused(format!(
                 "template {}: its data volume states no size, so it cannot be counted against tenant {}'s cap on disk (limits.disk)",
                 template.name, scope.id
-            ));
+            )));
         }
         container_use(
             &template.limits,
@@ -662,8 +686,9 @@ fn within(caps: &TenantCaps, default: &TenantCaps) -> bool {
 
 /// Why one more tenant would pass `kernel.tenants.createRate`, or `None`. The creates are counted from the effect
 /// journal (each tenant's project create, whether or not the tenant still exists), so a restart does not reset the count.
-/// A journal that cannot be read refuses the create.
-fn create_rate_refusal(cfg: &NodeConfig, now: u64) -> Option<String> {
+/// A journal that cannot be read refuses the create, as a plain refusal: no wait is known to end it. A rate that is
+/// passed is a `rate` refusal, with the wait until the next create is allowed.
+fn create_rate_refusal(cfg: &NodeConfig, now: u64) -> Option<CallError> {
     let rate = cfg.kernel.tenants.as_ref()?.create_rate;
     let window = rate.per_seconds.saturating_mul(1000);
     let path = cfg.state_dir.join(crate::kernel::JOURNAL_FILE);
@@ -671,10 +696,9 @@ fn create_rate_refusal(cfg: &NodeConfig, now: u64) -> Option<String> {
         Ok((records, _)) => records,
         Err(_) if !path.exists() => Vec::new(),
         Err(_) => {
-            return Some(
-                "the journal could not be read, so the tenant create rate (kernel.tenants.createRate) cannot be checked"
-                    .to_string(),
-            );
+            return Some(service_refused(
+                "the journal could not be read, so the tenant create rate (kernel.tenants.createRate) cannot be checked",
+            ));
         }
     };
     let mut created: BTreeMap<u64, u64> = BTreeMap::new();
@@ -699,12 +723,16 @@ fn create_rate_refusal(cfg: &NodeConfig, now: u64) -> Option<String> {
     let mut times: Vec<u64> = created.into_values().collect();
     times.sort_unstable();
     let leaving = times[times.len() - rate.count as usize];
-    Some(format!(
-        "this node creates at most {} tenants in {} seconds (kernel.tenants.createRate), and {} were created in that time; the next create is allowed at {}",
-        rate.count,
-        rate.per_seconds,
-        times.len(),
-        iso_utc(leaving.saturating_add(window))
+    let allowed_at = leaving.saturating_add(window);
+    Some(CallError::rate(
+        format!(
+            "this node creates at most {} tenants in {} seconds (kernel.tenants.createRate), and {} were created in that time; the next create is allowed at {}",
+            rate.count,
+            rate.per_seconds,
+            times.len(),
+            iso_utc(allowed_at)
+        ),
+        Some(seconds_until(allowed_at, now)),
     ))
 }
 
@@ -736,77 +764,115 @@ fn fresh_id(taken: &[String]) -> Result<String, CallError> {
 }
 
 /// Why the caps of a new tenant do not fit the node, or `None`: inside `capacity` with every other tenant's, and its
-/// virtual machines inside the node's own virtual-machine cap with theirs and the node's own machines.
-fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> Option<String> {
+/// virtual machines inside the node's own virtual-machine cap with theirs and the node's own machines. Each is a
+/// `capacity` refusal of `scope` `node`, whose amounts are caps set aside, not use: `have` is what the tenants the node holds were
+/// promised (with the node's own machines, for virtual machines) and `want` is what this tenant asks to be promised.
+/// A node that sets no virtual-machine caps at all is a plain refusal: nothing ran out.
+fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> Option<CallError> {
     let tenants_cfg = cfg.kernel.tenants.as_ref()?;
     let held = tenants(entries);
     if held.len() as u64 >= u64::from(tenants_cfg.max_tenants) {
-        return Some(format!(
-            "this node holds {} tenants, and kernel.tenants.maxTenants is {}",
-            held.len(),
-            tenants_cfg.max_tenants
+        return Some(CallError::capacity(
+            format!(
+                "this node holds {} tenants, and kernel.tenants.maxTenants is {}",
+                held.len(),
+                tenants_cfg.max_tenants
+            ),
+            Room::of(
+                Whose::Node,
+                Limit::Tenants,
+                held.len() as u128,
+                1,
+                u128::from(tenants_cfg.max_tenants),
+            ),
         ));
     }
     let capacity = &tenants_cfg.capacity;
-    let sum = |pick: &dyn Fn(&TenantCaps) -> u128| -> u128 {
-        held.iter()
+    // What the tenants the node holds were promised, and what this one asks for.
+    let promised = |pick: &dyn Fn(&TenantCaps) -> u128| -> (u128, u128) {
+        let others = held
+            .iter()
             .map(|(_, config)| pick(&config.caps))
-            .fold(pick(caps), u128::saturating_add)
+            .fold(0, u128::saturating_add);
+        (others, pick(caps))
     };
     let gib = |bytes: u128| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
     let plain = |n: u128| n.to_string();
-    type Check<'a> = (&'a str, u128, u128, &'a dyn Fn(u128) -> String);
+    type Check<'a> = (
+        Limit,
+        &'a str,
+        (u128, u128),
+        u128,
+        &'a dyn Fn(u128) -> String,
+    );
     let checks: [Check<'_>; 4] = [
         (
+            Limit::Instances,
             "instances",
-            sum(&|caps| u128::from(caps.instances)),
+            promised(&|caps| u128::from(caps.instances)),
             u128::from(capacity.instances),
             &plain,
         ),
         (
+            Limit::Cpu,
             "cpu",
-            sum(&|caps| u128::from(caps.cpu)),
+            promised(&|caps| u128::from(caps.cpu)),
             u128::from(capacity.cpu),
             &plain,
         ),
         (
+            Limit::Memory,
             "memory",
-            sum(&|caps| bytes(&caps.memory)),
+            promised(&|caps| bytes(&caps.memory)),
             crate::service::size_bytes(&capacity.memory).unwrap_or(0),
             &gib,
         ),
         (
+            Limit::Disk,
             "disk",
-            sum(&|caps| bytes(&caps.disk)),
+            promised(&|caps| bytes(&caps.disk)),
             crate::service::size_bytes(&capacity.disk).unwrap_or(0),
             &gib,
         ),
     ];
-    for (key, wanted, cap, show) in checks {
+    for (limit, key, (others, asked), cap, show) in checks {
+        let wanted = others.saturating_add(asked);
         if wanted > cap {
-            return Some(format!(
-                "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.{key}): {} with this tenant, {} allowed",
-                show(wanted),
-                show(cap)
+            return Some(CallError::capacity(
+                format!(
+                    "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.{key}): {} with this tenant, {} allowed",
+                    show(wanted),
+                    show(cap)
+                ),
+                Room::of(Whose::Node, limit, others, asked, cap),
             ));
         }
     }
     if caps.virtual_machines != 0 {
         let Some(node) = cfg.kernel.vm_caps() else {
-            return Some(
-                "the caps allow virtual machines (virtualMachines), and this node sets no virtual-machine caps (kernel.vmLimits, or kernel.bridged with its limits)"
-                    .to_string(),
-            );
+            return Some(service_refused(
+                "the caps allow virtual machines (virtualMachines), and this node sets no virtual-machine caps (kernel.vmLimits, or kernel.bridged with its limits)",
+            ));
         };
         let own = service_entries(entries)
             .iter()
             .filter(|(_, record)| record.vm.is_some() && record.tenant.is_none())
             .count() as u128;
-        let wanted = reserved_vms(entries) + u128::from(caps.virtual_machines) + own;
+        let taken = reserved_vms(entries) + own;
+        let wanted = taken + u128::from(caps.virtual_machines);
         if wanted > u128::from(node.virtual_machines) {
-            return Some(format!(
-                "the tenants' virtual machines (virtualMachines) together with the node's own would exceed the node's virtual-machine cap: {wanted} with this tenant, {} allowed",
-                node.virtual_machines
+            return Some(CallError::capacity(
+                format!(
+                    "the tenants' virtual machines (virtualMachines) together with the node's own would exceed the node's virtual-machine cap: {wanted} with this tenant, {} allowed",
+                    node.virtual_machines
+                ),
+                Room::of(
+                    Whose::Node,
+                    Limit::VirtualMachines,
+                    taken,
+                    u128::from(caps.virtual_machines),
+                    u128::from(node.virtual_machines),
+                ),
             ));
         }
     }
@@ -939,8 +1005,8 @@ fn create_args(
             "caps: instances of 1 to 16, containers and virtualMachines of at most that, cpu of at least 1, and memory and disk as sizes such as 8GiB".into(),
         ));
     }
-    if let Some(why) = admission_refusal(cfg, entries, &caps) {
-        return Err(service_refused(why));
+    if let Some(refusal) = admission_refusal(cfg, entries, &caps) {
+        return Err(refusal);
     }
     Ok((id, caps))
 }
@@ -1394,8 +1460,8 @@ impl TenantHandler {
         now: u64,
     ) -> Result<Value, CallError> {
         let (id, caps) = create_args(&self.cfg, entries, args)?;
-        if let Some(why) = create_rate_refusal(&self.cfg, now) {
-            return Err(service_refused(why));
+        if let Some(refusal) = create_rate_refusal(&self.cfg, now) {
+            return Err(refusal);
         }
         let taken: Vec<String> = tenants(entries)
             .into_iter()
@@ -1433,9 +1499,19 @@ impl TenantHandler {
                     && !in_use.iter().any(|ip| candidate.holds(*ip))
             })
             .ok_or_else(|| {
-                service_refused(format!(
-                    "the service subnet {cidr} has no free /{prefix} block for a tenant: every block is held by a tenant or holds an address in use"
-                ))
+                // No amount is told: what ran out is whole blocks, and the caps count addresses.
+                CallError::capacity(
+                    format!(
+                        "the service subnet {cidr} has no free /{prefix} block for a tenant: every block is held by a tenant or holds an address in use"
+                    ),
+                    Room {
+                        scope: Whose::Node,
+                        limit: Limit::Addresses,
+                        have: None,
+                        want: None,
+                        max: None,
+                    },
+                )
             })?;
         let pool = service_pool(&self.cfg)
             .map_err(|_| service_refused("the default profile does not name a storage pool"))?;

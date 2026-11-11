@@ -69,6 +69,7 @@ refused without the value being echoed back.
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
 | `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. See below. |
+| `listen.services` | no | The path of a second unix socket, or `null`: the services socket. It serves the MCP routes alone, never the approval page, to the server's own user and to root. A service with kernel access connects to it. See below, and "A service that may talk to the kernel". |
 | `tokens.hashDir` | yes | The directory of hash files. See below. |
 | `kernel.projects` | no | The project family the kernel may write in. With projects named, the writer serves only those projects. With none, the kernel is watch-only: the reconciler's provider reads only, service writes are refused, no GPU device writer exists, and a removal cannot reach Incus. |
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
@@ -100,6 +101,8 @@ The config is refused, with exit 2, when:
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
   `listen.proxy.peer` is missing or a wildcard; or `listen.proxy` carries any other key;
+- `listen.services` is not an absolute file path of at most 100 bytes made of letters, digits, `/`, `.`, `_` and `-`
+  with no `..` part, or it is `listen.unix`'s path;
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
 - `kernel.projects` is not empty and `kernel.droiddProjects` is empty;
 - `kernel.scratch` is `true` and a kernel project does not start with `arcak-scratch-`.
@@ -136,6 +139,28 @@ any other bind error, such as a port in use, stops it at once.
 
 The connection is plain HTTP on the bridge, and a host that can take the peer's address can reach the listener; the bearer
 token is still required. Serving on a proxy address is a separate step, approved by the owner like the tailnet listener.
+
+### Services socket
+
+`listen.services` is the path of a second unix socket, for example `/run/arca/services.sock` beside `listen.unix`. It
+is bound as the first one is (mode 0600, renamed into place) and serves the server's own user and root, and nobody else.
+It serves the MCP routes and nothing else: `POST /mcp` and the read-only GET routes, each behind a bearer token. The
+approval page is never on it, on any node and whatever the config becomes: a request for `/approve` or anything under it
+is 404, and a request that carries an `Origin` is 403. A node may serve its approval page and have this socket too; the
+two sockets are separate, and one path cannot be both.
+
+Incus connects to this socket for a service with kernel access (see "A service that may talk to the kernel"), and
+Incus's proxy helper runs as uid 0: that is why uid 0 is served. Serving uid 0 means every process of the host that runs
+as uid 0, and Incus's proxy helper acting for any instance whose device names this path. Arca gives such a device to a
+service of the node's own project alone, a tenant's project blocks proxy devices, and whoever can add one by hand
+already administers Incus. None of them gets anything from the socket without a token. No other local user reaches the
+socket, and it has no port: nothing on the host can take a port in its place while the server is down.
+
+The directory that holds the socket must belong to the server's user or to root and be writable by its owner alone, and
+so must every directory above it, except that a directory above it may be sticky instead, as `/tmp` is. `serve` refuses
+to bind the socket anywhere else, naming the directory: a user who could write there, or rename a directory on the way,
+could put a socket of their own at the path and be sent a service's token. The socket has its own limit of 64
+connections, apart from every other listener's. A clean stop removes it.
 
 ## The link
 
@@ -261,14 +286,16 @@ service profile and NIC ACL, records the desired entry, and starts the container
 needs is available; with `start: false` it never starts it (see "Creating a service stopped" below). `service_list` and `service_status` derive state from Incus and report instances that Arca did
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
-listener. `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The eight shipped templates live in `templates/`, with their pinned
-images and vendored npm lockfile. Two of them, `workspace-vm` and `github-runner-pool`, are virtual machines (see
-"Bridged nodes and virtual machines", "Mixed nodes" and "A pool of GitHub Actions runners").
+listener. A row carries `kernelAccess` only when the service's template declares it (see "A service that may talk to the
+kernel"). `service_logs` returns console lines as untrusted text with stored
+secrets redacted and a capped, truncated result. The nine shipped templates live in `templates/`, with their pinned
+images and vendored npm lockfile. Three of them, `workspace-vm`, `github-runner-pool` and `automagik-workspace`, are
+virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners" and
+"An Automagik workspace in its own virtual machine").
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for
-`github-runner-pool`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
+`github-runner-pool`, `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
 `service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
@@ -306,9 +333,7 @@ a service on a host restart before its first `instance_start`, without its secre
 
 **A virtual machine.** It takes `start: false` like a container, but its secrets are not environment values: they are
 stored, and `instance_start` writes them into the guest as files once the machine has booted (see "Secrets of a
-virtual machine"). Inside a tenant they are not written yet: `instance_start` starts the machine and is refused with
-`InstanceSecretsNotWritten`, and the machine runs without them until Arca writes guest secrets inside a tenant. A
-virtual machine is never the consumer of a link.
+virtual machine"), inside a tenant as in the node's own project. A virtual machine is never the consumer of a link.
 
 Nothing else changes: the address, the firewall rules, the caps and the approval rules are those of any create, and
 the effect journal holds the instance's create as it holds any create (an intent, then the applied effect with the
@@ -366,6 +391,102 @@ restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 
+### A service that may talk to the kernel
+
+A service's NIC ACL rejects the bridge gateway, so a service cannot reach the kernel's MCP over the network, and the
+unix socket serves the server's own uid alone and may carry the approval page. A container template may declare that its service talks to the kernel:
+
+```json
+"kernelAccess": { "port": 7461 }
+```
+
+`port` is a port inside the instance, 1024 to 65535, that is none of the template's own `ports` and not its `dashPort`.
+The service's instance then carries one more device, named `kernel`, and nothing else changes: its NIC, its ACL and the
+unix socket are as they are for every service.
+
+```json
+"kernel": { "type": "proxy", "bind": "instance", "listen": "tcp:127.0.0.1:7461", "connect": "unix:<listen.services>" }
+```
+
+Incus listens inside the instance, on its loopback, and connects from the host to the kernel's services socket
+(`listen.services`). Inside the instance the kernel is `http://127.0.0.1:7461/mcp`: plain HTTP that never leaves the
+instance's loopback, so a client that allows plain HTTP on loopback alone works unchanged. Nothing crosses the bridge.
+
+The device carries bytes and no authority. Every process in the instance reaches the socket, and each one gets what the
+token it sends allows: a call without a token is 401, and a token is held to its scope and its tool list
+(`arca token mint --tools`) on `POST /mcp` and on the GET routes alike. Give the service a token whose tool list names the verbs it needs, as a service secret.
+
+A create of such a template is refused, before anything is written, unless all of these hold:
+
+- **The service is the node's own.** In a tenant the create is refused, and so is its proposal, so the owner is never
+  shown a card for it. No verb installs a template: a tenant names a template that is already in
+  `<stateDir>/templates`, and one that declares `kernelAccess` is refused there. Beneath that, a tenant's project blocks
+  every proxy device (`restricted.devices.proxy=block`).
+- **The node has the socket.** `listen.services` must be set. When it is not, the refusal says what to set:
+  `"listen": { "services": "/run/arca/services.sock" }` (a path beside `listen.unix`) in the node's config, then restart
+  `serve`. No other listener stands in for it: the unix socket, the tailnet listener and `listen.proxy` may carry the
+  approval page, whose routes need no token, so no device is ever pointed at one of them. A node that serves its
+  approval page and has `listen.services` gives kernel access like any other.
+- **The owner approved it.** Such a service is created only from a proposal: `action_propose` with `service_create`,
+  then the owner's approval. A direct `service_create` of such a template is refused with `NotApproved`, whatever the
+  token's scope. The proposal carries the template's key, `"kernelAccess": { "port": 7461 }`, filled in from the
+  template, so the approval binds it, and the owner's card carries a `Kernel access` row: "Yes: this service can call
+  this node's kernel from inside, at http://127.0.0.1:7461/mcp, with whatever token it is given. The token's scope and
+  tool list decide what it may do, and a call without a token is refused." A template that gains the key, or changes
+  its port, after its card was shown is not created by that approval. A call that states the key for a template
+  without it is an invalid call.
+
+Only a container template takes the key: a virtual machine has no device that listens inside it.
+
+`service_list` and `service_status` carry `kernelAccess: { "port", "connect" }` for such a service and no such key for
+any other. `connect` is the socket the device was made for. `service_status` also answers `ready`, and `problem` when
+it is false: the instance does not carry the device as Arca made it, or the node's `listen.services` is no longer the
+socket the device connects to.
+
+The device keeps the path it was made with. `serve` therefore refuses to start (exit 2, naming the service and the
+path) while any service's record names kernel access through a socket the config does not serve as `listen.services`:
+one that is no longer set, or one at another path. Set it back, or remove the service first. This holds whatever else
+the config has become, so a device is never left connected to a listener that could carry the approval page.
+
+The device is the instance's own. It stays through a restart of the instance and of `serve` (tested against the fake
+Incus), and it is deleted with the instance by `service_remove`. That it is there again after a restart of the host is
+Incus's to keep, in its own database, and is not yet checked on a live node. A record that is lost and made again from
+the instance's marks reads the device back when it connects to this node's own `listen.services`, so `service_list`
+still says the service has the access.
+
+A `kernel` device somebody made by hand, with `incus config device add`, is not an access Arca gave. One that names
+another path is never read into a record: `service_list` shows no `kernelAccess` for it, `serve` starts as it would
+without it, and nothing of Arca listens at that path. One that names this node's own services socket, on an instance
+whose record was lost and made again from its marks, is read back as above, and `serve` then refuses to start without
+that socket, as for any service with the access. Arca does not remove such a service (it writes nothing to a record
+made this way), so the way out is the device: start `serve` with `listen.services` at the path the refusal names, take
+the device off (`incus config device remove <instance> kernel --project arcak-svc`), and call `service_list` once. The
+record follows the device at every service call, so it no longer names the access, and the config may then change.
+
+The effect journal records the create of the instance, and the digest it keeps (`op_digest`) is the digest of the create
+that carries the device; `journal_list` shows the effect, not the body. The service's record in the desired state names
+both ends of the access, and a proposal's journal line keeps the card's row.
+
+What a process in the instance can and cannot do through the device:
+
+- With no token, nothing: every MCP route answers 401, and no other route exists on the socket.
+- With the service's token, what that token allows. Any process in the instance that can read the token can use it.
+- It can hold connections open. The socket's own limit of 64 is then spent, which stops other services with kernel
+  access from calling the kernel; the unix socket, the tailnet listener and the proxy listener are not affected.
+
+Checked on a live node (Incus 7.6, SELinux enforcing): a container with a proxy device of this shape (`bind=instance`,
+`listen=tcp:127.0.0.1:<port>`, `connect=unix:<path>`, the path a socket of mode 0600 under the server user's runtime
+directory) reached the socket on the host, and the host saw the peer as uid 0, which the services socket serves.
+
+Not yet checked on a live Incus: the same device on a container of the restricted service project as Arca itself
+creates it, on an application (OCI) container, on a host confined by AppArmor in place of SELinux, and after a restart
+of the host.
+
+To check a service on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus
+config device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode
+0600, owned by the server's user; and the service's own log shows its first call to the kernel answered. If the
+service's calls are closed with no answer while `ready` is true, Incus is not connecting as uid 0.
+
 `service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
 approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends
 that service-action approval once, then removes the desired entry and runs its pending delete plan under one kernel
@@ -401,6 +522,79 @@ The 0.1.0 release predates `x-arca-read-only-hint`, so its methods carry only `x
 `tools/call` answers a success with a short summary text block and `structuredContent` that carries the result, the untrusted note when the verb is untrusted, and `truncated` only when the result was cut; `_meta` carries `droidd/untrusted` and `droidd/truncated`. A refusal is a JSON-RPC error with `data.refusal`. A tool-level failure that is not a refusal is `isError: true` with `<code>: <message>` and `_meta` `droidd/error`.
 
 Every destructive verb (`destructiveHint: true`: `approval_submit`, `action_approve`, `postgres_delete`, `service_remove`, `service_import`, `service_release`, `gpu_detach`, `storage_add`, `snapshot_delete`, `instance_stop`, `instance_restart`) takes an optional boolean `confirm`: absent or `true` runs the call as without it, `false` is refused (`NotConfirmed`, "confirm is false: nothing was removed and no approval was spent") before the handler runs, and the door takes it out first, so it never enters a statement's `paramsDigest`, a plan, a proposal, the journal or the desired state.
+
+### Refusals for want of room and for asking too often
+
+A refusal's code is `data.refusal`, and its `message` is the reason in words. Most codes say everything a caller can
+act on. Two families of refusal are told apart from all the others, so a caller never has to read the sentence: the
+call would pass a cap (`capacity`), or the caller asked too often or already has too much waiting (`rate`). The
+sentences are the ones these refusals always carried. Until this change, the sites of `capacity` and `rate` came back
+with the plain code `refused`.
+
+| Code | Family | When | Fields beside `refusal` |
+| --- | --- | --- | --- |
+| `capacity` | `capacity` | The call would pass a cap, and nothing was written. A tenant's caps on `service_create` (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`). A tenant's block with no free address. The node's virtual-machine caps on `service_create` (`kernel.vmLimits`, or `kernel.bridged.limits`), and a virtual-machine count set below the machines the node holds. The node's room for tenants on `tenant_create` (`kernel.tenants.maxTenants`, `kernel.tenants.capacity`, the node's virtual-machine cap, and no free block). No free address in the service subnet. | `scope`, always: `tenant` or `node`, whose cap it is. `limit`, always: `instances`, `containers`, `virtualMachines`, `cpu`, `memory`, `disk`, `tenants` or `addresses`. `have`, `want` and `max` when known: what is in use, what the call asked for and what the cap allows. Memory and disk are bytes; every other cap is a count. `proposeAgain: true` when the refusal came from running an approved action. |
+| `rate` | `rate` | A wait ends it. `tenant_create` past `kernel.tenants.createRate`. `owner_approval_request` when the token already has 5 requests waiting, or Arca 20. `omni_pair` while a pairing code lasts, or inside the 60 seconds after an attempt. | `retryAfterSeconds` when the wait is known: whole seconds, rounded up, at least 1. `proposeAgain: true` when the refusal came from running an approved action. |
+| `RateLimited` | `rate` | `action_propose` when one token has recorded its thirty new proposals of ten minutes. The code it has always had. | `retryAfterSeconds`: the wait until the token's oldest counted proposal leaves the window. The sentence says "ten minutes", the whole window. |
+| `TooManyProposals` | `rate` | `action_propose` when eight proposals already wait, from any token. The code it has always had. | None. Room is made when one is approved or declined, or lapses fifteen minutes after it was made. |
+
+The OpenRPC document lists these four codes under `x-arca-refusals`, each with its `family`, a summary and the schema of
+its `data`. A caller that wants one check for "asked too often" reads the family from that list instead of knowing
+three names. Dropping a listed code, changing its family, or dropping a listed `limit` or `scope` value is a break
+against a released document, as a removed method is. The list is not every code a verb answers: a code outside it
+carries no field (apart from `untrusted`, for a refusal that quotes a service).
+
+`scope` is the field a billing client needs. A call in a tenant is checked against the node's caps first and against
+the tenant's own caps after, and both name the same caps. A tenant that is far under its own caps can be refused
+because the node is full: the refusal then says `scope: "node"`, and `have`, `want` and `max` are the node's amounts,
+not the tenant's. A client that serves a tenant's owner should say "the service is full", never "your plan is full",
+for `scope: "node"`, and should not show the node's amounts to the tenant.
+
+- `scope: "tenant"`: the tenant's own caps on `service_create`.
+- `scope: "node"`: the node's virtual-machine caps, the count set below the machines the node holds, everything
+  `tenant_create` is refused for, the service subnet with no free address, and a tenant's block with no free address.
+
+A tenant's block with no free address is the node's, although the sentence names the tenant. A block holds an address
+for every instance the tenant's caps allow, and those caps are checked first, so the tenant is under its instance cap
+when this is answered: the block is full because something else holds addresses in it, such as a lease on the bridge
+that is not one of the tenant's services. Nothing the tenant removes makes room, so its plan is not what is full.
+`have` and `max` are the block's addresses.
+
+`proposeAgain: true` marks a refusal that came from running an approved action (through `action_approve` or the
+approval page; the message begins "The approval was accepted, but"). The approval was spent by the run. Waiting, or
+making room, does not make that same call pass: the action is proposed again and approved again. An approved
+`tenant_create` that runs past `kernel.tenants.createRate` is the case that happens. Without the field, a `rate`
+refusal means the same call is allowed again after the wait.
+
+What the other fields mean in the cases that are not obvious:
+
+- For `tenant_create`, the amounts of `instances`, `cpu`, `memory`, `disk` and `virtualMachines` are caps set aside, not
+  use: `have` is what the tenants the node holds were promised (with the node's own machines, for
+  `virtualMachines`), and `want` is what the new tenant asks to be promised.
+- An amount that could not be read (a template whose size is not a size) counts as more than any cap. The sentence says
+  "an unreadable amount", and `want` is left out.
+- A virtual-machine count set below the machines the node holds refuses every create that would write the project,
+  a container's too. It carries `have` and `max` and no `want`.
+- No free block for a new tenant carries `limit: "addresses"` and no amount.
+- `retryAfterSeconds` is exact for `kernel.tenants.createRate`, the Omni hold-off and `RateLimited`. For the two caps
+  on pending approval requests it is the longest the wait can be: the time until the first of the waiting requests
+  expires. A request the owner decides makes room sooner. Those two caps are `rate` and not `capacity` because what
+  is full is the caller's own queue to the owner, not the node: no instance, CPU, memory or disk ran out, the remedy
+  is to wait, and the sentence has always carried "429".
+
+Not in the list, and unchanged:
+
+- `FolderTooBig` (a folder does not fit the snapshot storage) keeps its code.
+- A node that sets no virtual-machine caps at all, a config that disagrees with the desired state, and a template
+  whose data volume states no size are still `refused`: nothing ran out, and waiting changes nothing.
+- A create that Incus itself refuses for a project limit comes back as the create's failure, in Incus's words.
+
+The approval page answers 403 `{refusal, message}` for a refused action, and for these codes the same fields stand
+beside them. The proposals journal keeps the code and the message of a failed run, not the fields. A refusal relayed
+from a linked machine carries its code and its message, and not the fields. The page's own 429 answers (a setup code
+asked for too soon or while one is live, a setup lock, too many sign-in challenges) carry `refusal: "rate"` beside
+`message`, and `retryAfterSeconds` when the wait is known; a setup lock rounds it up to whole minutes, as its sentence
+does, so it can be up to 59 seconds over. The third chat's bare 429 has no body.
 
 ## The MCP server
 
@@ -459,7 +653,8 @@ its request is read.
   sign; nothing written) or `changed`. No line is echoed. It is a doctor verb that writes, served only by a kernel whose
   `approval.peerKeys` is set; see "Approving on another machine".
 
-`serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
+`serve` listens on the unix socket, and on the tailnet and proxy addresses and the services socket when the config names
+them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
 SIGHUP reloads the bearer token store only; it does not reread the node config or the owner passkeys.
 A socket that another server answers on is left alone.
@@ -1018,10 +1213,11 @@ The `summary` and `details` are built in the kernel from the checked fields; a c
 in a GPU row comes from the inventory at proposal time; it is kept in the kernel's private proposals journal, so a
 restart still shows it after the card is gone. A direct `gpu_attach` or `gpu_detach` call carries no usable approval: the
 handler accepts only the one-shot grant an approved proposal arms, and consumes it before the change. At most eight
-unexpired proposals wait. A ninth is refused with `TooManyProposals`, and the eight that wait are left alone. The same
+unexpired proposals wait. A ninth is refused with `TooManyProposals` (family `rate`), and the eight that wait are left alone. The same
 `argsDigest` returns the record that already waits instead of adding another; that deduplicated request records nothing.
 One token may record thirty new proposals in ten minutes, and a deduplicated or refused proposal counts nothing against
-that window; the thirty-first new proposal gets `RateLimited`. A proposal lapses fifteen minutes after it was made. The
+that window; the thirty-first new proposal gets `RateLimited`, with `retryAfterSeconds` beside the code (see "Refusals
+for want of room and for asking too often"). A proposal lapses fifteen minutes after it was made. The
 journal writes `proposed` when the record is made, `approved` when its proof verifies, `declined` on a decline, and `result`
 after the one run. On start every `proposed` record is validated again: the verb's parameter schema without `approval`, its
 semantic checks, and the kernel's configured `kernel.postgresImage`, never the image the file itself carries. A record that
@@ -1464,6 +1660,11 @@ Both units restart on failure after 10 seconds, at most 5 times in 10 minutes (`
 `MemoryHigh=192M` and `MemoryMax=256M`, and `arca-shim` has `48M` and `64M`. The binary is `~/.local/bin/arca`. The units
 use systemd specifiers only (`%h` for the home directory, `%t` for the user's runtime directory), so they carry no
 host-specific value.
+
+`scripts/install.sh` (README, "Install with one command") installs a unit of its own instead, `arca.service`: the
+node alone, reading the Incus socket its config names, with no shim and no memory limit, and with the same restart
+rule. It is for a first read-only node. The installer refuses a user who has either of the two units above, and its
+`--uninstall` leaves the program in place for them.
 
 What the host needs:
 
@@ -2025,7 +2226,9 @@ The four health components feed `service-down`. Each one is checked on every tic
 
 `GET /metrics` and `GET /alerts` are served on every listener of `serve`, and each needs a bearer token of any stored scope,
 the same token as the MCP calls. Without a valid bearer the answer is 401. A request with an `Origin` header is 403, and any
-other path is 404. Pass the token in the `Authorization` header:
+other path is 404. Each route is the reading of one verb, and a token is admitted to the route as it is to the verb:
+`/metrics` is `node_metrics` and `/alerts` is `alerts_list`. A token minted with `--tools` therefore needs that verb in
+its list, or the route answers 403 with no body; a token with no list reads both, as before. Pass the token in the `Authorization` header:
 
 ```sh
 curl --unix-socket /run/arca/arca.sock -H "Authorization: Bearer $(cat <token file>)" http://arca/metrics
@@ -2368,6 +2571,44 @@ Where a virtual machine's secret is, and is not:
   the effect journal, in `instance-actions.jsonl` (which names the secrets written), in `exec-audit.jsonl`, or in any
   answer or refusal. `service_logs` replaces a stored value with `[secret]` when it fits on one line.
 
+**Settings for one service.** A template may let a create replace some of its settings, so that two services of one
+template differ without a second template file. It lists their names in `createSettings`, each a key of its
+`settings`, whose value there is the default:
+
+```json
+"settings": { "url": "https://github.com/example-org", "maxSlots": 5, "pin": "registry.example/tool@sha256:..." },
+"createSettings": ["url", "maxSlots"]
+```
+
+`service_create` then takes `settings`, an object with the values for this one service:
+`{"name": "ci", "template": "example-vm", "settings": {"url": "https://github.com/another-org"}}`. The machine reads
+the template's settings with those values in place of the defaults, at `/etc/arca/settings.json` as before. What is
+refused, before anything is created, and in words that name the setting:
+
+- a name the template does not list (here `pin`), or any `settings` for a template that lists none;
+- a value of another shape than the template's default, at every level: text for a number, `2.5` for a whole number,
+  a list for an object; in a list, an element unlike the default's first one; in an object, a key the default does
+  not have. The refusal names the place, such as `settings.classes[2].memory`;
+- a number that would not read back the same when the create is approved: `2.0` for a whole number, or a whole
+  number of 2^53 or more; and a negative number where the default is not negative;
+- a control character anywhere in a value, a character that reorders or hides text (a right-to-left override, a
+  zero-width space), and a value nested more than eight deep;
+- for a setting whose default is an `https://` address, anything but a plain `https://<host>/<path>` on the
+  default's own host: no user or password (`@`), no query (`?`), no fragment (`#`), nothing percent-encoded, and no
+  other host or port. A create changes the path only. Such a setting decides where the machine sends a credential,
+  so a template for another host is a template of its own;
+- for a setting whose default is a size such as `4GiB`, anything but a size above zero of at most six digits, and
+  under a key named `memory` more than the machine's own memory (the template's `limits.memory`);
+- settings that pass 16KiB once merged.
+
+Settings are fixed at create, like the rest of a virtual machine's first boot: to change one, create the service
+again. They never hold a secret, and Arca shows them: `service_status` answers `settings`, the object the machine
+was created with, and when a create is proposed the owner's card has one row for each setting it replaces, with its
+value in words, so an address is seen before it is approved. A list has one row for each element (`Setting classes
+1`, `Setting classes 2`), each with its fields, so a long list is shown whole. The card cuts nothing: a proposal whose
+setting would need a row of more than 160 characters is refused when it is made, naming the row, and nothing is asked
+of the owner. The service's record keeps the replaced values as `vm.settings`.
+
 **Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the
 instance when it created it, so the build can be looked up, and two machines compared, afterwards.
@@ -2519,6 +2760,224 @@ What to know:
 - **The image.** The template pins `docker.io/cloudflare/cloudflared` release 2026.10.7 by digest, so it never updates
   by itself. A later Arca release moves the pin.
 
+## An Automagik workspace in its own virtual machine
+
+The shipped `automagik-workspace` template is one virtual machine that holds one Automagik workspace and publishes it
+on the internet under your own domain, for example `https://workspace.example.com`. Inside it a small keeper runs
+three containers, in the shape of Automagik's own `server/compose.gate.yml`:
+
+| Container | What it is | Where it listens |
+|-----------|------------|------------------|
+| `automagik-server` | The Automagik server image. Its state is in `/data`. | Its own loopback, port 3081. It has a network namespace of its own and no published port. |
+| `automagik-gate` | The same image by the same digest, started with the gate's entrypoint. The only door to the server: it signs the owner in, and it holds the server's own sign-in credential, which never leaves the machine. | The same loopback, port 3082: it joins the server's network namespace. |
+| `automagik-tunnel` (or `automagik-tailnet`, see "On a tailnet instead") | Cloudflare's connector (`cloudflared`). It calls out to Cloudflare; nothing calls in. | Nothing but its metrics, put on that loopback too. It joins the same namespace and hands visitors to the gate's port. |
+
+The three share one loopback that belongs to none of the machine's own addresses. Nothing listens on the machine's
+address, on the service network or on the host: the template has no port, no link and no host listener. The virtual
+machine is the wall around the workspace: its agents run commands, and they run them there.
+
+This is not the `automagik-server` template with a tunnel linked to it. That server refuses every request whose
+`Host` is not its own loopback or a name it was told to trust, and it binds loopback only, so a connector in another
+service cannot use it. Here the connector shares the loopback of the gate and the server.
+
+You need a Cloudflare account with your domain already added to it, a node that may create a virtual machine of the
+template's size (2 CPUs, 4GiB of memory, a 20GiB disk: the node's `kernel.vmLimits`, or `kernel.bridged.limits`, must
+allow it), and the shipped templates installed (`arca templates install`). The Arca steps are Arca's own verbs: ask
+the assistant you use with Arca to run them. `service_create` and `instance_start` can be shown on the approval page;
+`service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope token, and the tunnel's
+token passes through that assistant's conversation.
+
+1. **Cloudflare dashboard, "Networking" > "Tunnels".** Select "Create a tunnel", enter a name (for example
+   `workspace`) and select "Create Tunnel". The next screen shows an installation command. Do not run it anywhere.
+   Copy only the long text at its end, which begins with `eyJ`: that is the tunnel's token. Treat it like a password.
+   Leave this screen open. Use a tunnel of its own for each workspace: whoever holds a tunnel's token can serve that
+   tunnel's routes.
+2. **Cloudflare dashboard, "Zero Trust" > "Access" > "Applications": who may open the address.** Do this before the
+   address leads anywhere (step 7), so that it is never open to a stranger. Select "Add an application", then
+   "Self-hosted". Give it a name, and as its public host name enter the address the workspace will have
+   (`workspace.example.com`). Add a policy with the action "Allow" and one rule, "Emails", that lists your own
+   address (`owner@example.com`) and nobody else's. Save it. Note two things, neither of them a secret: your team
+   domain (`<your team>.cloudflareaccess.com`, in the Zero Trust settings) and the application's "Application
+   Audience (AUD) Tag" on its overview. From now on Cloudflare asks every visitor of that address to prove one of the
+   listed e-mail addresses before anything reaches the workspace.
+3. **The template for your workspace.** The settings are part of the template, so each workspace has its own copy.
+   Whoever looks after the node copies `<stateDir>/templates/automagik-workspace.json` to a new name, for example
+   `example-workspace.json`, sets `"name"` to `example-workspace`, sets `settings.publicUrl` to the address the
+   workspace will have (`https://workspace.example.com`, with no closing slash), and sets the three Access settings
+   from step 2: `accessTeamDomain`, `accessAudience` and `accessEmails` (the same addresses as the policy). This is
+   the one step that is a file and not a verb, and it is temporary: once `service_create` takes a service's own
+   settings, these are given at create and no copy is made. The script `automagik-workspace.sh` stays as it is,
+   beside it.
+4. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. The machine is created
+   and stays `stopped`, because it has no token yet. Leave `bridge` out, so that it joins Arca's own service network.
+5. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The
+   key is exactly `TUNNEL_TOKEN`. Arca answers `{"ok": true}`; no answer, list or log shows the token again.
+6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`. The machine starts and the
+   answer names the secret written into it. Its first boot installs Docker and downloads the two images, which takes
+   a few minutes. Back on the Cloudflare screen from step 1 the tunnel connects; select "Continue".
+7. **Cloudflare dashboard, "Networking" > "Tunnels", your tunnel, the "Routes" tab.** Only now, with the Access
+   application of step 2 in place. Select "Add route", then "Published application". Enter the subdomain
+   (`workspace`), choose your domain (`example.com`) in "Domain", and in "Service URL" enter `http://127.0.0.1:3082`:
+   the gate's port, not the server's 3081. That address is the loopback the connector shares with the gate. Select
+   "Add route". Leave the route's "HTTP Host Header" setting empty, here and always: a Host override to a
+   loopback name would make the server accept requests it otherwise refuses, and a route to its port would then
+   pass the gate by. A route that names 3081 by mistake, without such an override, does not give anyone the
+   workspace: the server is never told its public name, so it refuses the requests and live connections its
+   interface makes (HTTP 403), its page asks for the server's own sign-in (HTTP 401), and only its static files
+   load. A page that never comes to life is that mistake: correct the port in the route.
+8. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
+   `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel is running and has registered with Cloudflare; public address https://workspace.example.com, sign-in by Cloudflare Access (team example.cloudflareaccess.com, 1 e-mail address(es))`.
+   The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
+   own sign-in for your e-mail address first, and then the workspace.
+
+| Setting | Meaning |
+|---------|---------|
+| `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it, and a name, never an IP address: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
+| `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16, one address in each entry). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
+| `serverImage` | The Automagik server's public image, pinned by digest. The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below). |
+
+| `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
+
+Three things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image
+is fixed in the script at the digest the `cloudflare-tunnel` template pins, and the tailnet node's at a digest of
+Tailscale's own image (`docker.io/tailscale/tailscale`, release 1.104.4).
+
+### On a tailnet instead
+
+With `settings.reach` set to `tailnet` the workspace is reachable from your own tailnet and from nowhere else: no
+Cloudflare Tunnel, no Cloudflare Access. Two containers stand in the connector's place:
+
+| Container | What it is | Where it lives |
+|-----------|------------|----------------|
+| `automagik-tailnet` | A Tailscale node (userspace networking: no device, no capability). It serves HTTPS on port 443 of the machine's own tailnet name, `https://<machine>.<tailnet>.ts.net`, never Funnel, and hands every request to the relay with the visitor's `Host` header as it came. | A network namespace of its own. |
+| `automagik-relay` | The server image's `node`, copying bytes between one address and the gate's `127.0.0.1:3082`. | The server's namespace; it listens on the server's address on a private Docker network (`automagik-relay`, internal) that only the server and the node join. |
+
+The node is kept out of the server's namespace on purpose. A Tailscale node in userspace networking passes every
+connection that reaches its tailnet address, on any port it does not serve itself, to `127.0.0.1` on that port.
+Inside the server's namespace that would open the workspace's whole loopback to the tailnet: the server's own port
+past the gate, the gate in plain http, and any port a program in the workspace opens for itself. In a namespace of
+its own the node's loopback holds nothing, and the relay is its one way to the workspace, to the gate's port alone.
+The keeper removes a node it finds anywhere else and never says that such a node serves. The gate signs its owner
+in itself, with passkeys.
+
+You need a tailnet with MagicDNS and HTTPS certificates turned on (Tailscale's admin console, "DNS"), since the gate
+takes nothing but an exact `https://` address. A certificate's name is published in the public certificate logs, so
+choose a machine name you do not mind the world reading.
+
+1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved
+   if your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it;
+   treat it like a password. Decide the machine's name (for example `workspace1`) and note your tailnet's name:
+   together they are the address, `https://workspace1.<tailnet>.ts.net`.
+2. **The template for your workspace**, as in step 3 above: in the copy set `settings.reach` to `tailnet` and
+   `settings.publicUrl` to that address, with no port and no closing slash. Leave the three Access settings empty;
+   with `tailnet` they are refused.
+3. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. It stays `stopped`.
+4. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TAILSCALE_AUTHKEY", "value": "<the key>"}`.
+   The key is exactly `TAILSCALE_AUTHKEY`; `TUNNEL_TOKEN` is not used by this reach.
+5. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`.
+6. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
+   `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tailnet node is logged in and serves https://workspace1.<tailnet>.ts.net; reach tailnet: https://workspace1.<tailnet>.ts.net, sign-in by passkey, waiting for its first claim`.
+7. **The first claim.** A new gate has no owner. It writes a claim code into its own data, good once and for
+   fifteen minutes, and the first person who opens `https://workspace1.<tailnet>.ts.net/_gate/claim` from the
+   tailnet with that code registers a passkey and becomes the owner. Arca does not hand that code to you yet: the
+   step that shows it once, after your passkey on Arca's approval page, is not built. Until it is, the code can
+   only be read on the machine itself, with the command Automagik's server documentation gives for the gate's
+   container. That is a step for the person who looks after the node, at a terminal, and never one for an
+   assistant: the keeper does not read the code, does not print it, and no Arca verb returns it. After the claim
+   the status line says `claimed`.
+
+What to know about this reach:
+
+- **What the status line can say of the node.** `logged in and serves https://<name>` when all is well.
+  `NOT logged in` when the tailnet did not take the key (used already, expired or revoked), or when the node waits
+  for approval in the admin console. `logged in as <another name>, which is NOT the name in settings.publicUrl`
+  when the name was already taken on the tailnet and Tailscale gave the node another: the gate refuses every
+  request under a name that is not its own, so free the name or create the workspace again.
+- **Claimed or not** is read from one thing: the claim code's file is in the gate's data until the first claim and
+  gone after it. The keeper looks at whether the file is there and how old it is, from the machine's side of the
+  gate's data, and never at what is in it. A code past its fifteen minutes is said too; a new one is made by
+  Automagik's `gate-control.mjs renew-claim` inside the gate's container, or by a restart of an unclaimed gate.
+- **The first claim is protected by the code alone.** Everyone who can reach the node's port 443 on your tailnet
+  can open the claim page; only the code lets them claim. Claim soon after the start.
+- **Your tailnet's access rules are a second lock, not the first.** Limit who reaches the node's tag, and to port
+  443, in your tailnet policy. The workspace does not depend on it: what a tailnet device can reach on the node is
+  decided by the node having a namespace of its own.
+- **A key the tailnet does not take** (used already, expired or revoked) makes the node stop soon after its start.
+  The status then says that the node stopped, with its exit code and this likeliest cause; a node that stays up
+  without a login says `NOT logged in`. Either way: `service_secret_set` with a new key, then `instance_start`.
+- **The auth key** is handled like the tunnel's token: Arca's private `secrets/` directory, the machine's
+  `/etc/arca-secrets/TAILSCALE_AUTHKEY` (root's, mode 0600), and a copy in the machine's memory
+  (`/run/automagik-workspace/tailnet/authkey`, mode 0400) that the node is pointed at by path. It is in no
+  environment value, on no command line and in no output; the keeper keeps only its digest. The node uses the key
+  once: afterwards its identity is in its state.
+- **The node's state** is the machine's `/var/lib/automagik-workspace/tailnet`. It is the node's identity on your
+  tailnet and survives restarts of the container and of the machine. `service_remove` deletes it with the machine;
+  remove the node in Tailscale's admin console as well. A snapshot carries the identity: do not run a restored
+  copy beside the original.
+- **A new key** (`service_secret_set`, then `instance_start`) starts the node again; a node that is already
+  logged in keeps its identity and does not need the new key.
+
+What to know:
+
+- **The pinned server image.** `settings.serverImage` is the build of the Automagik server from the Automagik
+  repository's commit `5fe0be6`. It has the gate, its Cloudflare Access sign-in, and the gate's own sign-in with
+  passkeys, which the tailnet reach uses; both reaches run it. Nothing of the Access sign-in changed between the
+  build pinned before (`8fb2e6f`) and this one. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
+  tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
+  (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
+  `automagik-workspace.sh`, as that commit has them; check the block when you move the pin to a later build.
+- **The first sign-in.** The server signs a browser in with a link that it writes once into its own data. Arca
+  never reads that link, the keeper never reads the server's or the gate's data, and the keeper never copies their
+  output to the console, so the link is in no `service_logs` answer and reaches no assistant. The way in is
+  Cloudflare Access: the gate checks the proof Cloudflare attaches to each request of a signed-in visitor (that it
+  is signed by your team, is for this application, has not expired and names one of the listed addresses), keeps
+  the server's link to itself and signs that visitor in. No link leaves the machine. The sign-in happens when a
+  page is opened; the workspace's live connections then ride on the gate's own session. Without the three Access
+  settings the gate is still the only door, and nobody can sign in through the tunnel: the gate then waits for a
+  first claim on a port of its own (3083). A route in Cloudflare must never name port 3083. So that none can, the
+  keeper does not start the connector at all beside a gate that has no Access settings, and the status line says
+  why.
+- **Access is the lock on the address.** Keep the Access policy to the addresses in `accessEmails`, and add the
+  route only after it. The gate refuses a visitor Cloudflare did not sign in; the policy keeps strangers from
+  reaching the gate at all. To check a proof the gate fetches your team's public keys from
+  `https://<team>.cloudflareaccess.com`, an outgoing call the service network allows like any other.
+- **All three Access settings, or none.** The gate does not start with one or two. The first boot checks the
+  settings and says on the console what is wrong, and the keeper repeats it; nothing is started with settings that
+  cannot be used. Settings are fixed when the machine is created, so the cure is a corrected template and a new
+  machine.
+- **Where the token lives.** In Arca's private `secrets/` directory, in the machine's `/etc/arca-secrets/TUNNEL_TOKEN`
+  (root's, mode 0600), and in a copy in the machine's memory (`/run/automagik-workspace/tunnel/token`) that only the
+  connector's user reads. The connector reads that file; the token is not in its environment, on any command line or
+  in Docker's record of the container, and the keeper prints nothing of it.
+- **A new token.** `service_secret_set` again, then `instance_start` again. The keeper sees the new file and starts
+  the connector again with it; the server and the gate keep running.
+- **Where to look when it does not come up.** `service_logs` first. The first boot says there what it installs and,
+  when it fails, which command is missing or which service did not start. The keeper says each change: a part
+  started, healthy, not answering yet, or answering something other than 401; the tunnel waiting for its token,
+  running, registered with Cloudflare, or stopped with its exit code. Health is the image's own check, run inside
+  the server's and the gate's containers: HTTP 401 on the loopback port, the answer to a visitor who has not signed
+  in. A part that stops is started again after a pause that doubles up to five minutes. A tunnel that keeps
+  stopping usually has a token Cloudflare does not accept. When the server's container is replaced, the gate and
+  the connector are started again beside it, since they live in its network namespace. When Docker itself does not
+  answer, the keeper says so and touches nothing: a container is only removed or started once Docker has said that
+  it stopped or is not there. A keeper that cannot start at all (a missing command, settings that cannot be used)
+  stays up and repeats the reason every five minutes.
+- **The data.** The server's `/data` is the machine's `/var/lib/automagik-workspace/data` and the gate's is
+  `/var/lib/automagik-workspace/gate`, both on the machine's own disk and owned by uid 1000, the image's user. The
+  gate reads the server's data read-only; the server never sees the gate's. Both live and die with the machine:
+  `service_remove` deletes them. Take a snapshot (`snapshot_create`) before a change you may want to undo. A
+  snapshot carries the token's file too.
+- **No Docker Compose.** The keeper starts the three containers with `docker run`, with the same image, entrypoint,
+  environment, volumes, shared network namespace and restrictions (read-only file system, no capability, no new
+  privileges) that Automagik's compose file gives the gate, and gives the server no environment, as that file
+  does. The connector gets the same three restrictions. The first boot installs `docker.io` and `docker-cli`
+  (on Debian 13 the `docker` command is a package of its own) and no compose package.
+- **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
+- **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
+  the containers again from the token on its disk.
+- **The settings are fixed.** They are read when the machine is created. To change the public address, the Access
+  settings or an image pin, edit the template copy and create the workspace again.
+
 ## A pool of GitHub Actions runners
 
 The shipped `github-runner-pool` template is one virtual machine that runs your GitHub Actions jobs on your own
@@ -2555,8 +3014,9 @@ allowed repository can ask for any label.
 The pool refuses to start on the organisation's default runner group, which the shipped template names
 (`runnerGroupId: 1`): every repository that group admits could send its jobs to the pool. The refusal, in
 `service_logs`, lists the groups to choose from. A settings key, `allowDefaultRunnerGroup: true`, starts it there
-anyway, and every status then carries a warning. A pool for one repository has no runner group: only that
-repository's workflows reach it.
+anyway, and every status then carries a warning. A pool for one repository has no runner group: that repository's
+workflows reach it, and so do the pull requests to it that are approved to run. The pool reads whether the repository
+is public and warns in every status when it is.
 
 **2. A credential, on GitHub.** The pool registers its runners with it. Know what each kind can do in the wrong
 hands before you choose:
@@ -2582,53 +3042,84 @@ For a token instead: your own "Settings", "Developer settings", "Personal access
 "Generate new token"; resource owner the organisation; organisation permission "Self-hosted runners", "Read and
 write".
 
-**3. The template for your organisation.** The settings are part of the template, so each pool has its own copy.
-Whoever looks after the node copies `<stateDir>/templates/github-runner-pool.json` to a new name, for example
-`example-ci.json`, sets `"name"` to `example-ci`, sets `settings.url` to your organisation
-(`https://github.com/example-org`) and `settings.runnerGroupId` to the number from step 1. This is the one step that
-is a file and not a verb: Arca has no verb that edits a template. The script `github-runner-pool.sh` stays as it is,
-beside it.
+**3. Arca: `service_create`**, with the settings of this pool:
 
-| Setting | Meaning |
-|---------|---------|
-| `url` | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). |
-| `runnerGroupId` | The number of the runner group the runners join (step 1). Not used for a repository. |
-| `allowDefaultRunnerGroup` | `true` lets the pool start on the organisation's default runner group. Leave it out. |
-| `classes` | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). |
-| `maxSlots` | The cap: never more than this many slots at once, whatever the classes add up to. |
-| `reserveMemory` | Memory kept back for the virtual machine itself. The slots share what is left. |
-| `dockerCache`, `dependencyCache` | The disk the Docker layer caches and the dependency caches may use, over all slots. |
-| `runnerImage`, `dockerImage` | The runner's and the Docker daemon's public images, pinned by digest. |
-| `enterprise`, `apiUrl` | For GitHub Enterprise only. The credential is sent to the API's host, so that host is never guessed: for `github.com` it is `https://api.github.com` and no setting changes it. A `url` on another host is refused unless `enterprise` is `true`; the API is then `https://<host>/api/v3`, or `apiUrl`, which must begin `https://` and be on that host or on `api.<host>`. |
+```json
+{ "name": "ci-pool", "template": "github-runner-pool",
+  "settings": { "url": "https://github.com/example-org", "runnerGroupId": 7 } }
+```
 
-The virtual machine's own size is the template's `limits` and `rootSize`. The shipped numbers fit together: four
-`standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are 16 CPUs and 24GiB, and 4GiB is kept
-back. That is 28GiB of the machine's 32GiB on purpose: a virtual machine sees a little less memory than its size, and
-a slot that does not fit whole is never started. Settings are read when the pool is created and are fixed from then
-on (see "What to know").
+`url` is your organisation and `runnerGroupId` the number from step 1. The pool is created and stays `stopped`,
+because it has no credential yet. Leave `bridge` out, so that it joins Arca's own service network (see "The network"
+below). When the create is proposed for your approval, the card shows each setting with its value: check the address,
+since it is where the pool's credential will be used.
 
-**4. Arca: `service_create`** with `{"name": "ci-pool", "template": "example-ci"}`. The pool is created and stays
-`stopped`, because it has no credential yet. Leave `bridge` out, so that it joins Arca's own service network (see
-"The network" below).
+| Setting | At create | Meaning |
+|---------|-----------|---------|
+| `url` | yes | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). A plain `https` address on the template's own host, `github.com`: a create changes the path only, and Arca refuses another host, a port, a user name, a query or a fragment, as the pool does. |
+| `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
+| `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
+| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. |
+| `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
+| `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
+| `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
+| `runnerImage`, `dockerImage` | no | The runner's and the Docker daemon's public images, pinned by digest. |
+| `enterprise`, `apiUrl` | no | For GitHub Enterprise only. The credential is sent to the API's host, so that host is never guessed: for `github.com` it is `https://api.github.com` and no setting changes it. A `url` on another host is refused unless `enterprise` is `true`; the API is then `https://<host>/api/v3`, or `apiUrl`, which must begin `https://` and be on that host or on `api.<host>`. |
 
-**5. Arca: `service_secret_set`**, for the App twice:
+A setting marked "no" is the template's own: to change one, whoever looks after the node copies
+`<stateDir>/templates/github-runner-pool.json` to a new name, sets `"name"` to it and edits the value, and the pool is
+created from that template. The virtual machine's own size is the template's `limits` and `rootSize` and changes the
+same way.
+
+The shipped numbers fit together: two `standard` slots of 2 CPUs and 4GiB and two `large` slots of 6 CPUs and 9GiB are
+16 CPUs and 26GiB, and 4GiB is kept back. A virtual machine sees less memory than its size: a 32GiB machine has
+27921MiB for slots after the 4GiB kept back, the four slots take 26624MiB of it, and a slot that does not fit whole
+is never started (two slots of 10GiB beside the two small ones would not fit). Give a class the memory its heaviest
+job needs: a full `cargo test` of a large workspace has been seen to fill a 10GiB slot. Settings are read when the pool is created and are fixed from then on (see "What to
+know").
+
+**Sizing so that every slot fits.** A slot is started only while its whole memory fits, so the rule is:
+
+    the memory of all slots together  <=  the memory the machine reports  -  reserveMemory
+
+The machine reports less memory than the size in `limits`: its kernel keeps some for itself. The first pool's machine
+of 32GiB (32768 MiB) reported 32017 MiB, which is 751 MiB, or 2.3%, less. So keep the slots and `reserveMemory`
+together under about 97% of the machine's size: leave 1GiB free for every 32GiB. Sizes that add up to exactly the
+machine's size do not fit. That first pool had two slots of 4GiB, two of 10GiB and 4GiB kept back, 32GiB in all: it
+had 27921 MiB for slots, they asked for 28672 MiB, and the fourth slot stayed `queued` beside three idle ones. The
+controller now says this at its start and in every status block, as a `WARNING` with the numbers and how much is too
+much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
+once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
+that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
+
+**4. Arca: `service_secret_set`**, for the App twice:
 `{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
 `{"name": "ci-pool", "key": "GITHUB_APP_PRIVATE_KEY", "value": "<the whole content of the key file>"}`. The key keeps
 its line breaks; a key pasted on one line works too. For a token, once:
 `{"name": "ci-pool", "key": "GITHUB_TOKEN", "value": "<the token>"}`. Arca answers `{"ok": true}` and no answer, list
 or log shows a value again. When the App's two secrets and a token are all set, the pool uses the App and says so.
 
-**6. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
+**5. Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "ci-pool"}`. The virtual machine starts and
 the answer names the secrets written into it. Its first boot installs Docker and downloads the two images, which
 takes a few minutes.
 
-**7. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
+**6. Check.** `service_logs` with `{"name": "ci-pool"}` shows the pool's own lines (below), among them the runner
 group it registers in. On GitHub, the organisation's "Settings", "Actions", "Runners" lists runners named
 `ci-pool-<the pool's id>-standard-0-...` as idle.
 
-**8. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
+The first boot, before there is a controller, writes its own lines to the machine's console, which is where
+`service_logs` reads the controller's lines from. `arca-runner-pool: first boot: installing ...` is its first line and
+`first boot done: the controller is installed and started` its last. A first boot that could not finish ends with
+`first boot failed:` and the reason: the commands that are still missing after the install, by name, or that Docker
+or the controller's service did not start. These first-boot lines have not yet been seen in `service_logs` on a real
+pool, so do not read their absence as "still starting". If a pool that is `running` shows no line of the pool after a
+few minutes, look inside the machine: `/var/log/cloud-init-output.log` holds everything the first boot printed, its
+failure line included, and what the package manager itself said, which is never on the console. A machine whose first
+boot failed has no pool; remove it with `service_remove` and create it again once the cause is gone.
+
+**7. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
-`[self-hosted, linux, x64, arca-large]` for the large slot.
+`[self-hosted, linux, x64, arca-large]` for a large slot.
 
 ### Who can reach what
 
@@ -2652,11 +3143,11 @@ returns, and one line when a job finishes:
 arca-runner-pool: job slot=0 class=standard labels=self-hosted,linux,x64,arca name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4 runner=ci-pool-1a2b3c4d-standard-0-5e6f7a8b
 arca-runner-pool: slot 0 standard 4096MiB/2cpu busy 41s ci-pool-1a2b3c4d-standard-0-9c0d1e2f job "test"
 arca-runner-pool: slot 1 standard 4096MiB/2cpu idle 12s ci-pool-1a2b3c4d-standard-1-0a1b2c3d
-arca-runner-pool: slot 4 large 8192MiB/8cpu queued (pausing 40s after a failure)
+arca-runner-pool: slot 3 large 9216MiB/6cpu queued (pausing 40s after a failure)
 arca-runner-pool: class standard last 412 jobs: seconds avg 130, peak memory avg 1210 MiB max 3105 MiB, cpu-seconds avg 95, cpus used avg 0.7
 arca-runner-pool: recent job finished=2026-01-01T10:00:00Z slot=0 class=standard name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4
 arca-runner-pool: pool ci-pool id 1a2b3c4d for https://github.com/example-org, runner group 7 "arca-pool", selected repositories only, public repositories off
-arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failures=2 runner_updates=0 memory_reserved=16384MiB of 27955MiB slots_cap=5
+arca-runner-pool: totals busy=2 idle=1 starting=0 queued=1 jobs_done=412 failures=2 runner_updates=0 memory_reserved=17408MiB of 27921MiB slots_cap=4
 ```
 
 | In the totals | Meaning |
@@ -2669,16 +3160,30 @@ arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failure
 | `runner_updates` | Runners that GitHub told to update themselves before their job (see "Pins" below). Above zero means the pool's pinned runner is behind. |
 
 The `pool` line names the runner group the pool registers in and how GitHub has it set; a group open to every
-repository, one that admits public repositories, and the default group each show as `WARNING` there. The last ten
+repository, one that admits public repositories, and the default group each show as `WARNING` there, and so does a
+public repository for a pool that serves one. The pool reads this again every ten minutes, so a change made on GitHub
+after the pool started shows up. If the group has become one the pool refuses (it was made the default group, or
+deleted), the line begins `REFUSED`, the runners that already wait or work are left, and no new slot starts
+(`queued (held: ...)`) until it is put right on GitHub; the pool then goes on by itself. The last ten
 finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
 job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
 time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some
 twenty thousand jobs) the file is set aside as `jobs.tsv.1`, replacing the one set aside before.
 
 **Sizing runners from real numbers.** The `class` line is what the last 2000 jobs of a class used, beside the size the
-class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit;
-one whose `max` is at its `memory` has jobs that were cut short for memory. `cpus used avg` far below `cpu` says the
-CPU ceiling is generous. New sizes go into the template, and a pool created from it has them.
+class gives them. A class whose peak memory stays far below its `memory` can be given less, and more slots then fit.
+`cpus used avg` far below `cpu` says the CPU ceiling is generous. New sizes go into the template, and a pool created
+from it has them.
+
+A `max` that is at the class's `memory` does not by itself say the jobs need more. The peak is the kernel's count for
+the slot (`memory.peak`), and that count includes the files a job read and wrote that the kernel still keeps in memory
+(page cache). A build writes many gigabytes, so it fills whatever its slot has, and the kernel gives that memory back
+when the job asks for its own. Such a job may have been held at the limit, slowed or cut short, or may only have been
+caching. To tell, look at the job's result and seconds, or run it once in a smaller class and compare. On the first
+pool this repository's `cargo test` peaked at exactly the 10240 MiB of its slot. Measured on the machine the
+repository is built on, not on the pool, the same job needs about 3.2GiB of its own and 19GB of disk, and under a
+4GiB limit it still passes, 5% slower. So the pool's peak is read as page cache, and 10GiB as enough for that class;
+neither has been measured on the pool itself.
 
 ### What to know
 
@@ -2722,10 +3227,13 @@ CPU ceiling is generous. New sizes go into the template, and a pool created from
   pin in the shipped template and does not reach a pool that exists. Once GitHub has a newer runner it tells each
   runner to update itself before it gives it a job. The pool's runners can: each updates inside its own fresh
   container and then takes its job. The cost is a download before every job, since every runner starts from the
-  pinned image again; the log says so once per runner and `runner_updates` counts them. A job that itself runs in a
-  container (`container:`) still gets the pinned release's bundled tools. To end this, create a second pool from a
-  template with a newer `runnerImage` (after an Arca release: `arca templates install --replace`, then copy it as in
-  step 3), check it, and remove the first.
+  pinned image again; the log says so once per runner and `runner_updates` counts them. A runner and its slot's
+  Docker daemon share one fresh copy of the runner's files for each job (the pinned image's files with a layer on top
+  that lives for that job), so a job that itself runs in a container (`container:`) gets the updated runner's bundled
+  tools too. If the machine cannot layer files, or a runner once fails to start that way, the pool says so once and
+  starts runners with their image's own files from then on; a `container:` job then gets the pinned release's tools
+  after an update. To end the updates, create a second pool from a template with a newer `runnerImage` (after an Arca
+  release: `arca templates install --replace`), check it, and remove the first.
 - **Changing a pool.** Settings, sizes and pins are read when the virtual machine is created. To change them, create a
   second pool from the changed template, check it, and remove the first: both can serve the same labels meanwhile.
 - **The network.** The pool only calls out: to GitHub, to the image registries and to Debian's mirrors. It has no port,
@@ -2773,7 +3281,7 @@ The verbs:
 
 | Verb | What it does |
 | --- | --- |
-| `tenant_create {id?, caps?}` | Creates a tenant. Inside the node's policy (caps at or under `defaultCaps`, room in `capacity`, `maxTenants` and `createRate`) it needs no approval, from a token whose tool allowlist names `tenant_create`. Caps above a default run only from a proposal the owner approved (`action_propose`, then the approval). A refusal names the limit; past the rate it gives the time of the next allowed create. Without `id` one is made: 8 lowercase base32 characters. |
+| `tenant_create {id?, caps?}` | Creates a tenant. Inside the node's policy (caps at or under `defaultCaps`, room in `capacity`, `maxTenants` and `createRate`) it needs no approval, from a token whose tool allowlist names `tenant_create`. Caps above a default run only from a proposal the owner approved (`action_propose`, then the approval). A refusal names the limit; past the rate it gives the time of the next allowed create. Out of room is the refusal `capacity` (always with `scope: "node"` here) and past the rate is `rate`, each with fields beside the code (see "Refusals for want of room and for asking too often"). Without `id` one is made: 8 lowercase base32 characters. |
 | `tenant_list` | Every tenant: its id, block, caps, and what its records use. |
 | `tenant_status {id}` | One tenant, with the number of instances its project holds. |
 | `tenant_usage {id}` | Per instance: `name` (the Incus instance), `service` (the service's name), `kind` (`container` or `vm`), `state`, `limitsCpu`, `limitsMemory`, `rootDiskSize`, and for an instance of a provisional deploy `provisional: true` and `deploy`. No time and no measured use. |
@@ -2802,13 +3310,14 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
   created stopped, `service_secret_set` and `service_connect` apply to it, and `instance_start` with `tenant` starts it
   for the first time, with no approval from a token whose tool allowlist names the verb. A deploy's rules do not look
   at whether a service runs: a provisional service that is still stopped is confirmed by `deploy_confirm` and removed
-  by `deploy_rollback` like a running one. A virtual machine's secrets are files in its guest, written after it boots,
-  and inside a tenant they are not written yet: `instance_start` starts the machine and is refused with
-  `InstanceSecretsNotWritten`;
+  by `deploy_rollback` like a running one. A virtual machine's secrets are files in its guest, written after it boots:
+  `instance_start` starts the machine and writes them into that tenant's own machine, as it does for a machine of the
+  node's own;
 
 - a service's address comes from the tenant's block, and its caps are checked before Incus is asked, so a refusal names
   the cap (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`,
-  `limits.disk`);
+  `limits.disk`). Its code is `capacity` with `scope: "tenant"`, and the cap and the amounts beside it. A create the
+  node has no room for is `capacity` with `scope: "node"`: the tenant's own caps were not the reason;
 - a link joins two services of the same tenant only;
 - a virtual machine joins the managed network only; a `bridge` is refused;
 - a template with a `lan` port or a dash is refused, and `service_publish`, `service_unpublish`, `service_import` and
@@ -2878,34 +3387,135 @@ against a fake GitHub API (a small HTTP server in the test that checks every tok
 `docker` (`tests/runner_pool/fake-docker.sh`, which plays a runner that takes one job with the configuration it was
 started with). It needs `bash`, `curl`, `jq`, `openssl` and `flock` on the machine that runs it. It covers
 registration with an App and with a token, one job per runner, replacement, admission by reserved and by free memory,
-the cap, the job records and their bound, the pause after failures, the refusal of the default runner group, a runner
-that GitHub tells to update itself, a token renewed before an old runner is removed, cleanup of exactly this pool's
-leftovers, the API host rule, and that no credential is in any output, file or command line.
-`crates/arca/tests/services/vm_secrets.rs` covers the kernel's half against the fake Incus.
+the cap, the job records and their bound, the pause after failures, the refusal of the default runner group at the
+start and after a later change on GitHub, a public repository's warning, a runner that GitHub tells to update itself,
+the shared layer of the runner's files and both ways back from it, a token renewed before an old runner is removed,
+cleanup of exactly this pool's leftovers, the URL and API host rules, and that no credential is in any output, file
+or command line. `crates/arca/tests/services/vm_secrets.rs` and `create_settings.rs` cover the kernel's half against
+the fake Incus.
 
-Not proven by these tests, because they need a real virtual machine and a real GitHub organisation:
+The controller runs in these tests with nothing on its `PATH` but the stand-ins and the programs the script declares
+(`POOL_PROGRAMS`), so a program it starts without declaring fails them; the first boot checks that same list on the
+machine after its install and names what is missing. No wait in these tests is without a bound, and none
+ends a controller with the `kill` program. Given a negative number, to signal a process group, that program reads
+only the number's first digit in procps-ng up to 4.0.4: it signals another group or, when the digit is 1, every
+process of the user. A failed test once waited for ever for a controller that program had not killed. Ubuntu 24.04,
+which the pool's job image is, carries that version, and so does Debian 12; Debian 13, which the pool's own machine
+is, has the fix (4.0.4-9), as has procps-ng from 4.0.5. Nothing else in this repository signals a process group
+through that program: the scripts use their shell's own `kill`, and the other uses name one process.
+One test runs the first boot itself as far as a test can, with a
+stand-in `apt-get` and two programs left missing: it must stop, name the two, and say so on the console. No test here
+runs apt, so none can prove that the packages of `POOL_PACKAGES` bring those programs on a real Debian.
 
-- that the virtual machine boots from `images:debian/13/cloud` on a real node, that cloud-init runs the first-boot
-  script and writes the settings, and that the guest agent takes the secret files and answers a read of their
-  directory as Incus's source says;
-- that a virtual machine on the service network reaches GitHub, the registries and Debian's mirrors: the NIC rules
-  allow it (the same rules every container service has) and Incus adds its own for DNS and DHCP, but no pool has
-  made the calls;
-- that Debian's Docker package installs, and that the two pinned images pull and start as the script starts them: the
-  slot's privileged daemon, the runner sharing its network and socket, the runner's command reading its registration
-  from the mounted file, jobs that use `container:` and `services:`;
-- that GitHub accepts the App's token and the registration requests as the fake does, answers the runner-group
-  requests in the shape the fake has, lists a runner as `offline` when it is, and gives a registered runner a job;
-- that a real runner told to update itself completes the update inside its container and then takes its job, and
-  prints the line the pool looks for: the fake plays what the runner's own source does, a replacement of its
-  directories that fails on a mount;
-- that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, and that the peak
-  memory and CPU seconds read from the slice are the job's;
-- that the controller's lines reach `service_logs` through the virtual machine's console;
+Seen on a real node, on the first pool (a Debian 13 machine on a cloud node, serving this repository's own CI):
+
+- the virtual machine boots from `images:debian/13/cloud`, cloud-init runs the first-boot script and writes the
+  settings, and the guest agent takes both secret files into `/etc/arca-secrets`;
+- the virtual machine reaches Debian's mirrors, the registries and GitHub;
+- Debian's `docker.io` installs and its daemon runs. That first boot then stopped: on Debian 13 the `docker` command
+  is a package of its own, `docker-cli`, which `docker.io` only recommends, and the script did not name it. With
+  `docker-cli` installed by hand and the script run again, the rest went through at the first try;
+- the two pinned images pull and start as the script starts them, GitHub accepts the App's token, answers the
+  runner-group requests and the registrations, and gives the registered runners jobs: four runners registered and
+  ran this repository's gate;
+- the controller's lines reach `service_logs` through the virtual machine's console;
+- a slot's memory limit holds for what runs in the runner itself: a job that filled its slot stayed within it;
+- a slot whose runner was running a job was shown as idle, and the totals said `busy=0`. The pool asked Docker for
+  the runner's processes in a form Docker refuses, so no job was ever seen as running and a job's seconds counted the
+  runner's wait before it. The pool now reads the runner's own "Running job" line, which it had read correctly all
+  along for the job's name.
+
+Not proven yet, by these tests or on that node:
+
+- that a first boot with `docker-cli` in its package list finishes by itself on a fresh machine;
+- that the first boot's own lines reach `service_logs`: they are now written to the machine's console as the
+  controller's are, and the test reads them from a file in the console's place;
+- a real runner told to update itself, inside its container, with its just-in-time registration: that it replaces
+  its directories, comes back and takes its job, and prints the lines the pool looks for. The fake plays what the
+  runner's own source does (`update.sh.template`, `run-helper.sh.template`);
+- the shared layer of the runner's files on a real machine: the overlay mount, the runner starting with its home
+  mounted, and the daemon seeing the updated tools. A machine where it does not work falls back by itself, which is
+  tested; that the layered start works is not;
+- jobs that use `container:` and `services:`;
+- that GitHub lists a runner as `offline` when it is, and answers a repository's `private` field as its
+  documentation says;
+- that the memory limit and the CPU ceiling of a slot's slice hold for a job's own containers, those it starts
+  through the slot's Docker daemon, and that the peak memory and CPU seconds read from the slice are the job's;
 - the cache bounds on a real disk, a real job's cleanup, and behaviour over days (token renewal after an hour, a host
   restart);
+- a pool inside a tenant;
 - the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work, and
   that a runner group's number is at the end of its page's address.
+
+### The Automagik workspace
+
+`cargo test -p arca --test automagik_workspace` runs the shipped script, `templates/automagik-workspace.sh`,
+unchanged, against a fake `docker` (`tests/automagik_workspace/fake-docker.sh`, which keeps each container as a
+directory, refuses a container that joins the network namespace of one that is not running, and plays the image's
+health check). The script's `PATH` holds the programs it lists for itself and nothing else. It needs `bash` and `jq`
+on the machine that runs it. It covers what each of the three containers is started with (no published port and no
+host network, a server that is never given its public name, the gate and the connector in the server's namespace,
+the gate's entrypoint, restrictions, environment and volumes, the token as a file, the metrics listener on
+loopback), a server alone when no public address is set, a Docker that does not answer (nothing is removed or
+started), a keeper that cannot start (it stays up and says why), the wait for the token, an empty token, a new token replacing the connector only, each part
+stopping, the gate and the connector following a replaced server, the health words for 401, 200, another code and
+no answer, a start that Docker refuses, the settings that are refused (by the keeper and, on the console, by the
+first boot), the first boot's packages, unit and console lines, its three failures, and that the token is in no
+output, no file outside the machine's memory and no command line.
+
+For the tailnet reach it covers the node's exact command line (a namespace of its own, never the server's,
+userspace networking, the key as a file's path, the state directory), the private network and the relay's command
+line, the serve file (port 443 to the relay's address, nothing on a loopback, no Funnel), a node found in the
+server's or the machine's namespace being removed before anything is said of what it serves, a gate
+started with the remote claim and none of the Access settings, that port 3083 is named nowhere, the key's file
+modes, a new key replacing the node only, a node that is not logged in, one that waits for approval, one under
+another name, the claim state said from the code file's presence and age, and that neither the key nor the claim
+code is in any output or command line. One test holds the script to its one reader of the claim code, which
+nothing calls.
+
+Not proven for the tailnet reach, because it needs a real tailnet. The first of these is the one that matters most,
+and no test here can stand in for it: the fake `docker` cannot show what a tailnet device reaches.
+
+- **From a second device on the tailnet, against the node's tailnet address: port 443 answers, and ports 3081,
+  3082 and any other (try 9229, and a port a program in the workspace has opened on its loopback) are refused.**
+  This is what the node's own namespace is for; a node in the server's namespace would answer on all of them;
+- that the relay carries the gate through the private network (a request with the public `Host` to the relay's
+  address reaches the gate), and that nothing but the server and the node is on that network;
+
+- that Tailscale's image starts as the script starts it (userspace networking with no capability, the key read
+  from `TS_AUTHKEY=file:<path>`, `TS_AUTH_ONCE`, the state directory) and logs in with a tagged key;
+- that its serve file is applied: HTTPS on 443 with a certificate for the tailnet name, every request handed to
+  the relay with the visitor's `Host` header unchanged (Tailscale's proxy keeps it for such a target and replaces
+  it for a unix-socket one, which is why the relay has an address), and WebSockets carried;
+- that `tailscale status --json` on the socket the script names gives `BackendState` and `Self.DNSName` as the
+  keeper reads them;
+- that the node keeps its identity across a restart of the container and of the machine;
+- the gate's claim and passkey sign-in under a `ts.net` name, end to end, and that the claim code's file is there
+  and gone as the keeper expects;
+- the Tailscale screens named in the steps, which follow Tailscale's documentation and were not walked through.
+
+Not proven by these tests, because they need a real virtual machine, the images and a Cloudflare account:
+
+- that the machine boots from `images:debian/13/cloud`, that cloud-init runs the script and writes the settings, and
+  that the keeper's lines reach `service_logs` through the console;
+- that Debian's `docker.io` and `docker-cli` install and that the pinned images pull and start as the script starts
+  them: the server writing to the mounted `/data` as uid 1000, the gate on a read-only file system with no
+  capability, the connector as uid 65532 on a read-only file system with no capability, reading its token with
+  `--token-file` and keeping its metrics on `127.0.0.1:20241` (those three restrictions are the ones Cloudflare's
+  own Helm chart gives the connector; they were not run here), and two containers joining the first one's network
+  namespace;
+- anything of the gate on the real image: the pinned build was not pulled or run. The entrypoint path, the health
+  check's behaviour in the gate's container, the answer 401, the variable names and the rules the gate applies to
+  the Access settings were read from the Automagik repository at commit `8fb2e6f`, the pinned build's;
+- that nothing in the machine listens beyond loopback (the image's own services were not listed on a live machine);
+- that the connector says `Registered tunnel connection`, the line the keeper looks for, and that a route to
+  `http://127.0.0.1:3082` carries the workspace's pages, WebSockets and long-lived streams through Cloudflare;
+- what a route to the server's port 3081 gets (403 for the interface's requests and connections, 401 for the page,
+  the static files loading): that is the server's own behaviour for a `Host` it was not told to trust, as its
+  makers report it for the pinned build; it was not exercised here;
+- the sign-in through Cloudflare Access, end to end;
+- the Cloudflare screens named in the steps, which follow the tunnel section above and Cloudflare's documentation
+  and were not walked through in this work.
 
 ### Service wiring
 
@@ -2937,7 +3547,7 @@ string in a result or an error is redacted of the three secrets: the number in a
 WhatsApp JID, and with or without a Brazilian mobile's ninth digit. Any Omni key or bot token is redacted too. A refusal
 that quotes Omni carries `untrusted: true` beside its `refusal` code. Another pairing code for the same instance is refused
 while one lasts. Any attempt that reached Omni holds the next one off for 60 seconds, even a failed one; an attempt that
-reached nothing does not. The verbs read the service record and its secrets only. They change no desired state, send
+reached nothing does not. Either refusal is `rate`, with the wait in `retryAfterSeconds`. The verbs read the service record and its secrets only. They change no desired state, send
 nothing to Incus and run no process. An adopted service, or a service of another template, is refused.
 
 The exec audit is local, private and separate from `journal_list`. A crash can leave a key in the private tmpfs key directory
@@ -2956,7 +3566,7 @@ argument that reads as an approval string. A target that names a delete plan (`p
 is approved through its own card on the passkey page. Everything a request keeps must come back through
 `owner_approval_list` as that verb's result allows, so a request the list could not show is refused when it is made.
 Kind `upgrade` is an identity phone's step: it is refused with `upgrade_not_here` and approved through droidd's MCP.
-A token keeps at most 5 pending requests and Arca at most 20; an identical pending request from the same token is the same
+A token keeps at most 5 pending requests and Arca at most 20 (past either, the refusal is `rate`); an identical pending request from the same token is the same
 request. The request names the passkey page in `dashboard`. Requests and statuses are a doctor's or an operator's, and
 `owner_approval_list` is a viewer's too. The list's arguments and fields are untrusted, because the assistant wrote them.
 
@@ -3078,8 +3688,12 @@ the wall between the job and the machine Arca runs on.
 **On the pool.** `fmt` and `canvas` ask for `[self-hosted, linux, x64, arca]`, the `standard` class; `clippy` and
 `test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class. The pool that serves this repository has
 two slots of each, `standard` with 2 CPUs and 4GiB and `large` with 6 CPUs and 10GiB, so all four jobs run at the
-same time. Those are not the shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the
-two CPU numbers (`CI_SLOT_CPUS`); change them there when the pool's classes change.
+same time once the machine has memory for all four slots ("Sizing so that every slot fits"). Those are not the
+shipped template's sizes (its two `large` slots have 6 CPUs and 9GiB). The workflow carries the two CPU numbers
+(`CI_SLOT_CPUS`); change them there when the pool's classes change.
+
+Every job has a time limit, 30 minutes for `cargo test` and 15 for the others: a job that hangs gives its slot back
+then, and without a limit GitHub lets it hold the slot for six hours.
 
 A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs what is missing first: the
 toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's virtual machine and not its
