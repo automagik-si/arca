@@ -522,3 +522,222 @@ fn scratch_probe_two_tenants_on_the_nodes_own_bridge() {
         "the kernel's removal left objects; they were removed by force"
     );
 }
+
+/// The environment the first process of a running container was started with, one `NAME=value` a line.
+fn first_environment(project: &str, name: &str) -> String {
+    let (ok, out) = inside(project, name, "tr '\\0' '\\n' < /proc/1/environ");
+    assert!(ok, "the environment of {project}/{name}: {out}");
+    out
+}
+
+fn status(project: &str, name: &str) -> String {
+    incus(&["list", "--project", project, name, "-f", "csv", "-c", "s"])
+        .1
+        .trim()
+        .to_string()
+}
+
+/// The create-stopped probe: one tenant on a real Incus, with two containers created stopped in a deploy. Their
+/// secrets and their link are set while they are stopped, `instance_start` starts each for the first time, and the
+/// environment its first process was given is read from inside it. It makes and removes tenant `aaaaaaaa` only:
+///
+/// ```sh
+/// ARCA_TENANT_PROBE_SOCKET=/var/lib/incus/unix.socket ARCA_TENANT_PROBE_CIDR=<the node's serviceCidr> \
+///   cargo test -p arca --test tenants -- --ignored --nocapture created_stopped_probe
+/// ```
+#[test]
+#[ignore = "writes to a real Incus: set ARCA_TENANT_PROBE_SOCKET and ARCA_TENANT_PROBE_CIDR"]
+fn created_stopped_probe_the_first_start_holds_every_secret_and_link() {
+    let socket = std::env::var("ARCA_TENANT_PROBE_SOCKET").expect("ARCA_TENANT_PROBE_SOCKET");
+    let cidr = std::env::var("ARCA_TENANT_PROBE_CIDR").expect("ARCA_TENANT_PROBE_CIDR");
+    let droidd: Vec<String> = std::env::var("ARCA_TENANT_PROBE_DROIDD")
+        .unwrap_or_else(|_| "droid".into())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        leftovers(),
+        Vec::<String>::new(),
+        "an earlier probe left objects behind"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let rig = Rig::real(
+        socket.into(),
+        json!({
+            "projects": ["arcak-scratch-probe"],
+            "droiddProjects": droidd,
+            "scratch": true,
+            "serviceCidr": cidr,
+            "vmLimits": { "virtualMachines": 2, "cpu": 8, "memory": "8GiB", "disk": "40GiB" },
+            // The policy of the two-tenant probe, which this host has carried.
+            "tenants": {
+                "capacity": { "instances": 8, "cpu": 16, "memory": "16GiB", "disk": "100GiB" },
+                "maxTenants": 2,
+                "defaultCaps": { "instances": 3, "containers": 3, "virtualMachines": 1, "cpu": 6,
+                    "memory": "6GiB", "disk": "45GiB" },
+                "createRate": { "count": 4, "perSeconds": 3600 }
+            }
+        }),
+        now,
+    );
+    // Both templates make their secrets, so a default create would start each at once, before the link exists, and
+    // both set autostart.
+    rig.template(
+        "db",
+        json!({
+            "name": "db", "kind": "system", "image": "images:alpine/edge", "ports": [5432],
+            "env": { "DB_PASSWORD": "{{secret:DB_PASSWORD}}" },
+            "secrets": ["DB_PASSWORD"], "generate": { "DB_PASSWORD": "pg_" },
+            "provides": { "env": {
+                "DATABASE_URL": "postgresql://app:{{secret:DB_PASSWORD}}@{{host}}:{{port}}/app"
+            } },
+            "autostart": true,
+            "publishable": false
+        }),
+    );
+    rig.template(
+        "web",
+        json!({
+            "name": "web", "kind": "system", "image": "images:alpine/edge", "ports": [8080],
+            "env": { "ADMIN_PASSWORD": "{{secret:ADMIN_PASSWORD}}" },
+            "secrets": ["ADMIN_PASSWORD"], "generate": { "ADMIN_PASSWORD": "adm_" },
+            "autostart": true,
+            "publishable": false
+        }),
+    );
+    let (db, web) = ("db-aaaaaaaa", "web-aaaaaaaa");
+    let pa = "arcak-scratch-t-aaaaaaaa";
+    let (db_password, admin_password) = ("synthetic-database-password", "synthetic-admin-password");
+    let cloud = |verb: &str, args: Value| {
+        rig.call_token("cloud", verb, args, &super::create_stopped::TOOLS)
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let made = rig.create_tenant(json!({ "id": A })).expect("tenant");
+        println!("tenant {A}: block {}", made["block"]);
+        let mut address = String::new();
+        for name in ["db", "web"] {
+            let made = cloud(
+                "service_create",
+                json!({ "name": name, "template": name, "tenant": A, "deploy": "p1", "start": false }),
+            )
+            .unwrap_or_else(|error| panic!("create {name}: {error:?}"));
+            println!("{A}/{name}: {} {}", made["ipv4"], made["state"]);
+            assert_eq!(made["state"], "stopped", "{name}");
+            if name == "db" {
+                address = made["ipv4"].as_str().unwrap().to_string();
+            }
+        }
+        // The kernel lists every instance on the host before it acts, and a live host can fail that read for a moment
+        // while another instance changes: the call is refused before any write, so it is tried again.
+        let again = |verb: &str, args: Value| -> Value {
+            for attempt in 1..=3 {
+                match cloud(verb, args.clone()) {
+                    Ok(answer) => return answer,
+                    Err(error) => {
+                        println!("{verb} attempt {attempt}: {error:?}");
+                        std::thread::sleep(Duration::from_secs(3));
+                    }
+                }
+            }
+            panic!("{verb} was refused three times");
+        };
+        again(
+            "service_connect",
+            json!({ "from": "web", "to": "db", "tenant": A }),
+        );
+        again(
+            "service_secret_set",
+            json!({ "name": "db", "key": "DB_PASSWORD", "value": db_password, "tenant": A }),
+        );
+        again(
+            "service_secret_set",
+            json!({ "name": "web", "key": "ADMIN_PASSWORD", "value": admin_password, "tenant": A }),
+        );
+        // Both templates set autostart, and neither instance carries the key: Incus then restores the last state
+        // when the host restarts, and the last state of an instance that never ran is stopped.
+        let autostart = |name: &str| {
+            incus(&["config", "get", "--project", pa, name, "boot.autostart"])
+                .1
+                .trim()
+                .to_string()
+        };
+        for name in [db, web] {
+            assert_eq!(status(pa, name), "STOPPED", "{name} before its first start");
+            assert_eq!(autostart(name), "", "{name} carries boot.autostart");
+        }
+        println!(
+            "stopped ok: both hold their secrets and the link, neither has run, and neither carries boot.autostart"
+        );
+        for name in ["db", "web"] {
+            let started = again("instance_start", json!({ "tenant": A, "service": name }));
+            println!("{A}/{name}: {}", started["message"]);
+            assert_eq!(started["changed"], true, "{name}");
+        }
+        for name in [db, web] {
+            wait_for(&format!("{name} to run"), Duration::from_secs(60), || {
+                status(pa, name) == "RUNNING"
+            });
+        }
+        // What each first process was given: the secret set while it was stopped, never the one the template made,
+        // and for the consumer the link's variable with the provider's password, address and port.
+        let seen = first_environment(pa, db);
+        assert!(
+            seen.lines()
+                .any(|line| line == format!("DB_PASSWORD={db_password}")),
+            "the database's first start did not hold its password"
+        );
+        let seen = first_environment(pa, web);
+        assert!(
+            seen.lines()
+                .any(|line| line == format!("ADMIN_PASSWORD={admin_password}")),
+            "the application's first start did not hold its admin password"
+        );
+        let url = format!("DATABASE_URL=postgresql://app:{db_password}@{address}:5432/app");
+        assert!(
+            seen.lines().any(|line| line == url),
+            "the application's first start did not hold its link variable"
+        );
+        println!(
+            "first start ok: {A}/db saw DB_PASSWORD; {A}/web saw ADMIN_PASSWORD and DATABASE_URL (@{address}:5432)"
+        );
+        let confirmed = again("deploy_confirm", json!({ "tenant": A, "deploy": "p1" }));
+        assert_eq!(confirmed["confirmed"], true);
+        for name in [db, web] {
+            assert_eq!(
+                autostart(name),
+                "",
+                "{name} carries boot.autostart after its start"
+            );
+        }
+        println!("deploy ok: p1 confirmed");
+    }));
+    // Whatever happened, everything the probe made is removed, and what is left is listed.
+    let removed = match rig.approved("tenant_remove", json!({ "id": A })) {
+        Ok(answer) => {
+            println!("tenant {A} removed: {answer}");
+            true
+        }
+        Err(error) => {
+            println!("tenant {A} NOT removed: {error:?}");
+            false
+        }
+    };
+    let after_removal = leftovers();
+    println!("left behind by the kernel's removal: {after_removal:?}");
+    if !removed || !after_removal.is_empty() {
+        force_cleanup();
+    }
+    let left = leftovers();
+    println!("left behind: {left:?}");
+    assert_eq!(left, Vec::<String>::new(), "objects are left on the host");
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(
+        removed && after_removal.is_empty(),
+        "the kernel's removal left objects; they were removed by force"
+    );
+}

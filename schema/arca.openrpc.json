@@ -3116,6 +3116,14 @@
           }
         },
         {
+          "name": "start",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, and inside a tenant they are not written yet (the start is refused with InstanceSecretsNotWritten and the machine stays running without them).",
+            "type": "boolean"
+          }
+        },
+        {
           "name": "tenant",
           "required": false,
           "schema": {
@@ -3228,6 +3236,11 @@
               ],
               "type": "string"
             },
+            "stoppedBecause": {
+              "description": "Present when the service was created stopped: why, in words that name a secret and never show one. Either the call said start: false, or its template is created stopped whatever the call says.",
+              "maxLength": 4096,
+              "type": "string"
+            },
             "template": {
               "description": "Its template (empty for an instance droidd did not create).",
               "maxLength": 40,
@@ -3247,7 +3260,7 @@
           "type": "object"
         }
       },
-      "summary": "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows.",
+      "summary": "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows. With start: false it is created stopped, so service_secret_set and service_connect put its secrets and links in place before instance_start starts it for the first time.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
