@@ -1168,7 +1168,7 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
         || !template.create_settings.is_empty()
     {
         return Err(TemplateError::refused(format!(
-            "template {name}: only a virtual-machine template has a firstBoot or settings"
+            "template {name}: only a virtual-machine template has a firstBoot, settings or createSettings"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {
@@ -1462,14 +1462,20 @@ pub struct ServiceSettings {
 }
 
 /// The settings of one new service: the template's, with the values its `service_create` gave in `given` put in place
-/// of the defaults. Every refusal is in plain words and names the key:
+/// of the defaults. Every refusal is in plain words and names the setting, down to the element of a list:
 ///
 /// - only a key the template lists in `createSettings` may be given;
-/// - a value has the JSON type of the template's default, and a whole number stays a whole number;
-/// - no string or key anywhere in a value holds a control character, and a value nests at most eight deep;
-/// - where the default is an `https://` address the value is one too, with a plain host and path: no user or password
-///   (`@`), no query, no fragment, nothing percent-encoded. Such a value decides where the machine sends a
-///   credential, so it is never taken loosely;
+/// - a value has the shape of the template's default ([`setting_refusal`]): the same JSON type at every level, each
+///   element of a list like the default's first element, and no key the default does not have;
+/// - a number is one that reads back the same from the canonical form an approval is made over: a whole number
+///   below 2^53 written without a fraction, or a number with a fraction. A whole number whose default is not negative
+///   is not negative;
+/// - no string or key holds a control character or a character that reorders or hides text (the bidirectional
+///   controls, zero-width characters), and a value nests at most eight deep;
+/// - where the default is an `https://` address the value is one too, with a plain host and path, on the default's
+///   own host: a create changes the path only. Such a value decides where the machine sends a credential;
+/// - where the default is a size such as `4GiB` the value is one too, above zero and of at most six digits, and under
+///   a key named `memory` at most the machine's own memory (the template's `limits.memory`);
 /// - the merged object stays within the size a template's settings may have.
 pub fn create_settings(
     template: &Template,
@@ -1506,31 +1512,20 @@ pub fn create_settings(
             .get(key)
             .filter(|_| template.create_settings.iter().any(|listed| listed == key))
         else {
-            let shown: String = key.chars().filter(|c| !c.is_control()).take(64).collect();
+            let shown: String = key
+                .chars()
+                .filter(|c| plain_text(&c.to_string()))
+                .take(64)
+                .collect();
             return refused(format!(
                 "settings.{shown}: template {name} does not let a create set it; it lets a create set {}",
                 template.create_settings.join(", ")
             ));
         };
-        let kind = json_kind(default);
-        if json_kind(value) != kind {
-            return refused(format!(
-                "settings.{key}: expected {kind}, the type of the template's default"
-            ));
-        }
-        if !plain_json(value, 0) {
-            return refused(format!(
-                "settings.{key}: a value holds no control character and nests at most eight deep"
-            ));
-        }
-        if default
-            .as_str()
-            .is_some_and(|default| default.starts_with("https://"))
-            && !value.as_str().is_some_and(https_address_ok)
+        if let Some(why) =
+            setting_refusal(&format!("settings.{key}"), key, value, default, template, 0)
         {
-            return refused(format!(
-                "settings.{key}: expected an https address like the template's default, https://<host>/<path>, with a plain host name and path: no user or password (@), no query (?), no fragment (#) and nothing percent-encoded"
-            ));
+            return refused(why);
         }
         merged.insert(key.clone(), value.clone());
     }
@@ -1560,17 +1555,181 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-/// Whether no string and no key in `value` holds a control character, and it nests at most eight deep.
+/// Why `value` cannot stand in place of `default` in a template's settings, or `None`. `at` names the place for the
+/// refusal (`settings.classes[2].memory`) and `key` is the name the value is under. See [`create_settings`] for the
+/// rules; each is checked here at every level of the value.
+fn setting_refusal(
+    at: &str,
+    key: &str,
+    value: &Value,
+    default: &Value,
+    template: &Template,
+    depth: usize,
+) -> Option<String> {
+    if depth > 8 {
+        return Some(format!("{at}: a value nests at most eight deep"));
+    }
+    let kind = json_kind(default);
+    if json_kind(value) != kind {
+        return Some(format!(
+            "{at}: expected {kind}, the type of the template's default"
+        ));
+    }
+    match (value, default) {
+        (Value::Number(number), Value::Number(default)) => {
+            if !number_reads_back(number) {
+                return Some(format!(
+                    "{at}: a number is a whole number below 2^53 written without a fraction, or a number with a fraction: anything else does not read back the same when the create is approved"
+                ));
+            }
+            if default.as_i64().is_some_and(|default| default >= 0) && number.as_u64().is_none() {
+                return Some(format!("{at}: expected a whole number of 0 or more"));
+            }
+            None
+        }
+        (Value::String(text), Value::String(default)) => {
+            if !plain_text(text) {
+                return Some(format!(
+                    "{at}: a value holds no control character and no character that reorders or hides text"
+                ));
+            }
+            if default.starts_with("https://") {
+                if !https_address_ok(text) {
+                    return Some(format!(
+                        "{at}: expected an https address like the template's default, https://<host>/<path>, with a plain host name and path: no user or password (@), no query (?), no fragment (#) and nothing percent-encoded"
+                    ));
+                }
+                let host = |address: &str| {
+                    address["https://".len()..]
+                        .split('/')
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                };
+                if host(text) != host(default) {
+                    return Some(format!(
+                        "{at}: its host is {}, as in the template's default: a create changes the path only, since the machine sends its credential to that host",
+                        host(default)
+                    ));
+                }
+            }
+            if size_ok(default) {
+                let machine = template
+                    .limits
+                    .as_ref()
+                    .and_then(|limits| limits.memory.as_deref())
+                    .filter(|_| key == "memory");
+                let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+                let fits = size_ok(text)
+                    && digits <= 6
+                    && size_bytes(text).is_some_and(|bytes| {
+                        machine
+                            .and_then(size_bytes)
+                            .is_none_or(|machine| bytes <= machine)
+                    });
+                if !fits {
+                    return Some(match machine {
+                        Some(machine) => format!(
+                            "{at}: expected a size such as {default}, above zero and at most the machine's memory ({machine})"
+                        ),
+                        None => format!(
+                            "{at}: expected a size such as {default}, above zero and of at most six digits"
+                        ),
+                    });
+                }
+            }
+            None
+        }
+        (Value::Array(items), Value::Array(defaults)) => {
+            items.iter().enumerate().find_map(|(index, item)| {
+                let at = format!("{at}[{}]", index + 1);
+                match defaults.first() {
+                    // Every element is like the default's first one.
+                    Some(default) => setting_refusal(&at, key, item, default, template, depth + 1),
+                    // A default with no element says nothing about one: the element is still plain.
+                    None => (!plain_json(item, depth + 1)).then(|| {
+                        format!(
+                            "{at}: a value holds no control character and no character that reorders or hides text, a number that reads back the same, and nests at most eight deep"
+                        )
+                    }),
+                }
+            })
+        }
+        (Value::Object(map), Value::Object(defaults)) => map.iter().find_map(|(name, item)| {
+            if !plain_text(name) {
+                return Some(format!(
+                    "{at}: a key holds no control character and no character that reorders or hides text"
+                ));
+            }
+            match defaults.get(name) {
+                Some(default) => setting_refusal(
+                    &format!("{at}.{name}"),
+                    name,
+                    item,
+                    default,
+                    template,
+                    depth + 1,
+                ),
+                None => Some(format!(
+                    "{at}.{name}: the template's default has no such key (it has {})",
+                    defaults.keys().cloned().collect::<Vec<_>>().join(", ")
+                )),
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Whether a number reads back the same from the canonical JSON an approval's digest is made over. That form writes a
+/// number as JavaScript does: `2.0` is written `2` and reads back as a whole number, and a whole number of 2^53 or
+/// more is rounded to a double. Either would make the approved arguments differ from the proposed ones.
+fn number_reads_back(number: &serde_json::Number) -> bool {
+    const SAFE: u64 = (1 << 53) - 1;
+    if let Some(whole) = number.as_u64() {
+        return whole <= SAFE;
+    }
+    if let Some(whole) = number.as_i64() {
+        return whole.unsigned_abs() <= SAFE;
+    }
+    number
+        .as_f64()
+        .is_some_and(|float| float.is_finite() && float.fract() != 0.0)
+}
+
+/// Whether `text` holds no control character and no character that reorders, joins or hides the text around it: the
+/// bidirectional marks, embeddings, overrides and isolates, the zero-width characters, the line and paragraph
+/// separators, the byte-order mark and the invisible operators. An owner reads these values on a card before
+/// approving, so what is shown must be what is there.
+fn plain_text(text: &str) -> bool {
+    !text.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{061C}'
+                    | '\u{180E}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}'
+                    | '\u{FEFF}'
+                    | '\u{FFF9}'..='\u{FFFB}'
+                    | '\u{E0000}'..='\u{E007F}'
+            )
+    })
+}
+
+/// Whether every string and key in `value` is [`plain_text`], every number reads back the same, and it nests at most
+/// eight deep.
 fn plain_json(value: &Value, depth: usize) -> bool {
-    let plain = |text: &str| !text.chars().any(char::is_control);
     match value {
-        Value::String(text) => plain(text),
+        Value::String(text) => plain_text(text),
+        Value::Number(number) => number_reads_back(number),
         Value::Array(items) => depth < 8 && items.iter().all(|item| plain_json(item, depth + 1)),
         Value::Object(map) => {
             depth < 8
                 && map
                     .iter()
-                    .all(|(key, item)| plain(key) && plain_json(item, depth + 1))
+                    .all(|(key, item)| plain_text(key) && plain_json(item, depth + 1))
         }
         _ => true,
     }

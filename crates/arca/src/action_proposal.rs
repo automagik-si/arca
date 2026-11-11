@@ -84,12 +84,41 @@ fn shown(text: &str, max: usize) -> String {
     cut
 }
 
-/// A setting's value as a card shows it: a string as it is, anything else as compact JSON, shortened to 160
-/// characters. The whole value is what the approval covers; the card says so by the ellipsis.
-fn setting_shown(value: &Value) -> String {
+/// The most characters one card row shows of a setting. A proposal whose setting would need more in one row is
+/// refused when it is made ([`ActionKind::prepare`]), so a card never cuts what the owner approves.
+pub const SETTING_ROW_MAX: usize = 160;
+
+/// The card rows of one setting a create replaces: its name and its value in plain words. A list has one row for each
+/// element, numbered from one, so a long list is shown whole; an element that is an object is shown as its fields.
+pub fn setting_rows(key: &str, value: &Value) -> Vec<(String, String)> {
+    let label = format!("Setting {}", shown(key, 64));
     match value {
-        Value::String(text) => shown(text, 160),
-        other => shown(&other.to_string(), 160),
+        Value::Array(items) if items.is_empty() => vec![(label, "(an empty list)".to_string())],
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (format!("{label} {}", index + 1), setting_words(item)))
+            .collect(),
+        other => vec![(label, setting_words(other))],
+    }
+}
+
+/// A setting's value in words: a string as it is, an object as `key: value; key: value`, a list as its elements with
+/// commas between, and anything else as JSON writes it.
+fn setting_words(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(setting_words)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| format!("{key}: {}", setting_words(item)))
+            .collect::<Vec<_>>()
+            .join("; "),
+        other => other.to_string(),
     }
 }
 
@@ -242,6 +271,18 @@ impl ActionKind {
                         })?;
                     args["mac"] = Value::String(normalized);
                 }
+                // The owner approves what the card shows, so a setting the card could not show whole is refused
+                // here, before a proposal exists. A list is shown one element to a row.
+                for (key, value) in args["settings"].as_object().into_iter().flatten() {
+                    for (label, words) in setting_rows(key, value) {
+                        let length = words.chars().count();
+                        if length > SETTING_ROW_MAX {
+                            return Err(format!(
+                                "args/settings: the owner's card shows a setting in rows of at most {SETTING_ROW_MAX} characters, and \"{label}\" needs {length}: shorten it, or give a list more and shorter elements"
+                            ));
+                        }
+                    }
+                }
             }
             Self::ServicePublish => {
                 if args["reach"].as_str() != Some("tailnet") {
@@ -325,10 +366,11 @@ impl ActionKind {
                 // One row for each setting the create replaces, with its value: a setting such as an address
                 // decides where the new machine sends its credential, so the owner sees it before approving.
                 for (key, value) in args["settings"].as_object().into_iter().flatten() {
-                    rows.push(row(
-                        &format!("Setting {}", shown(key, 64)),
-                        &setting_shown(value),
-                    ));
+                    for (label, words) in setting_rows(key, value) {
+                        // A proposal never holds a longer value (`prepare` refuses one); the cut is for arguments
+                        // that did not come through it.
+                        rows.push(row(&label, &shown(&words, SETTING_ROW_MAX)));
+                    }
                 }
                 rows
             }
