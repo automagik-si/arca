@@ -4,6 +4,25 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+- An installer, `scripts/install.sh`: one command that leaves what the README's quickstart leaves, a read-only node
+  for the user who runs it. It checks the machine first (Linux, x86_64, glibc 2.34 or newer, `curl`, `sha256sum`, a
+  runtime directory that is the user's alone, an Incus socket this user may open) and, when something is missing, says
+  what and how to fix it and changes nothing. It refuses to run as root. It downloads one named release
+  (`0.1.0-alpha.7`, or the one `--version` names; never GitHub's "latest release" address, which answers 404 while
+  every release is a pre-release), checks the program against the release's `SHA256SUMS` and puts it at
+  `~/.local/bin/arca`; an older release is never put over a newer program unless `--version` names it. Where there is
+  no config it writes the quickstart's and mints one `viewer` token; a config that exists is not changed. It runs the
+  node as `arca.service`, a systemd user unit, and ends with the node's answer to `arca_status` and the two ways to
+  connect an assistant. It starts a node only for a config it wrote, or through its own service from an earlier run,
+  and only where it can ask the node afterwards: for any other config, and where `systemctl --user` does not answer,
+  it starts nothing, prints the one command that starts the node and ends with exit code 3. A node that answers and
+  cannot reach Incus is a failure. A second run replaces the program and restarts the service; `--uninstall` removes
+  the unit and the program, while the program is still the file it installed, and keeps the config, the tokens and
+  the state. It never runs `sudo`, writes only in the user's home, never prints the token, and works from a pipe and in
+  a shell with no `XDG_RUNTIME_DIR`. It refuses a user who already has the operating guide's units
+  (`arca-watch.service`, `arca-shim.service`). The script is not a release asset yet: the README reads it from the
+  `dev` branch. It is tested against stand-ins, and was run for real only on a machine that already had Incus and
+  Arca.
 - A new shipped template, `automagik-workspace`: one Automagik workspace in its own virtual machine (2 CPUs, 4GiB,
   20GiB), published through a Cloudflare Tunnel whose connector runs inside the same machine. A keeper runs the
   Automagik server, its gate (the same image, the only door to the server) and the connector in one network
