@@ -172,7 +172,7 @@ pub fn refusals() -> &'static [RefusalCode] {
         RefusalCode {
             code: CAPACITY,
             family: Family::Capacity,
-            summary: "The call would pass a cap, and nothing was written. scope says whose cap: tenant (the tenant's own caps, or its address block) or node (the node's caps, its room for tenants, or its service subnet); a call in a tenant can be refused by either. limit names the cap: a count of instances, containers, virtual machines, CPUs, tenants or addresses, or an amount of memory or disk. have (in use), want (asked) and max (allowed) are there when known, in bytes for memory and disk and as a count for every other cap; with scope node they are the node's amounts, not the tenant's. proposeAgain: true means the refusal came from running an approved action: that approval is spent, so the action is proposed again once there is room.",
+            summary: "The call would pass a cap, and nothing was written. scope says whose cap: tenant (the tenant's own caps) or node (the node's caps, its room for tenants, its service subnet, or a tenant's address block that something else has filled); a call in a tenant can be refused by either. limit names the cap: a count of instances, containers, virtual machines, CPUs, tenants or addresses, or an amount of memory or disk. have (in use), want (asked) and max (allowed) are there when known, in bytes for memory and disk and as a count for every other cap; with scope node they are the node's amounts, not the tenant's. proposeAgain: true means the refusal came from running an approved action: that approval is spent, so the action is proposed again once there is room.",
             data: capacity_data,
         },
         RefusalCode {

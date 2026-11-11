@@ -222,14 +222,18 @@ fn a_tenant_under_its_own_caps_refused_by_the_nodes_cap_is_told_the_cap_is_the_n
     );
 }
 
-/// A tenant's block with every address in use, while the tenant is under its instance cap: the refusal is the
-/// tenant's (`scope: "tenant"`), for addresses.
+/// A tenant's block with every address in use, while the tenant is under its instance cap. The tenant's caps allow
+/// four instances and it holds none, so its plan is not what is full: something else holds the addresses. The refusal
+/// names the tenant's block in its sentence and says `scope: "node"`, never `tenant`.
 #[test]
-fn a_tenants_block_with_no_free_address_is_a_capacity_refusal_of_the_tenant() {
+fn a_tenants_block_filled_by_something_else_is_a_capacity_refusal_of_the_node() {
     let rig = Rig::new(Some(policy()));
     rig.template("app", app_template("app"));
     let made = rig.create_tenant(json!({ "id": A })).expect("the tenant");
     assert_eq!(made["block"], "192.0.2.248/29");
+    let tenant = rig.call("tenant_status", json!({ "id": A })).unwrap();
+    assert_eq!(tenant["caps"]["instances"], 4);
+    assert_eq!(tenant["use"]["instances"], 0, "the tenant holds nothing");
     // The top /29 holds seven addresses an instance may take. Something else on the bridge holds a lease on each.
     for last in 248..=254u8 {
         rig.fake().set_lease(
@@ -246,9 +250,22 @@ fn a_tenants_block_with_no_free_address_is_a_capacity_refusal_of_the_tenant() {
         (
             "capacity".to_string(),
             "tenant aaaaaaaa's address block 192.0.2.248/29 has no free address".to_string(),
-            json!({ "scope": "tenant", "limit": "addresses", "have": 7, "want": 1, "max": 7 })
+            json!({ "scope": "node", "limit": "addresses", "have": 7, "want": 1, "max": 7 })
         )
     );
+    // Once the stray leases are gone the same create passes: the tenant's own caps were never the reason.
+    for last in 248..=254u8 {
+        rig.fake().set_lease(
+            "arcak-svcbr",
+            &format!("10:66:6a:00:00:{last:02x}"),
+            "192.0.2.9",
+        );
+    }
+    rig.call(
+        "service_create",
+        json!({ "name": "web", "template": "app", "tenant": A }),
+    )
+    .expect("the create with the block free again");
 }
 
 /// An approved action that is refused when it runs has spent its approval. The caller of `action_approve`, and the

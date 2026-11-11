@@ -533,7 +533,7 @@ with the plain code `refused`.
 
 | Code | Family | When | Fields beside `refusal` |
 | --- | --- | --- | --- |
-| `capacity` | `capacity` | The call would pass a cap, and nothing was written. A tenant's caps on `service_create` (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`), and a tenant's block with no free address. The node's virtual-machine caps on `service_create` (`kernel.vmLimits`, or `kernel.bridged.limits`), and a virtual-machine count set below the machines the node holds. The node's room for tenants on `tenant_create` (`kernel.tenants.maxTenants`, `kernel.tenants.capacity`, the node's virtual-machine cap, and no free block). No free address in the service subnet. | `scope`, always: `tenant` or `node`, whose cap it is. `limit`, always: `instances`, `containers`, `virtualMachines`, `cpu`, `memory`, `disk`, `tenants` or `addresses`. `have`, `want` and `max` when known: what is in use, what the call asked for and what the cap allows. Memory and disk are bytes; every other cap is a count. `proposeAgain: true` when the refusal came from running an approved action. |
+| `capacity` | `capacity` | The call would pass a cap, and nothing was written. A tenant's caps on `service_create` (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`, `limits.disk`). A tenant's block with no free address. The node's virtual-machine caps on `service_create` (`kernel.vmLimits`, or `kernel.bridged.limits`), and a virtual-machine count set below the machines the node holds. The node's room for tenants on `tenant_create` (`kernel.tenants.maxTenants`, `kernel.tenants.capacity`, the node's virtual-machine cap, and no free block). No free address in the service subnet. | `scope`, always: `tenant` or `node`, whose cap it is. `limit`, always: `instances`, `containers`, `virtualMachines`, `cpu`, `memory`, `disk`, `tenants` or `addresses`. `have`, `want` and `max` when known: what is in use, what the call asked for and what the cap allows. Memory and disk are bytes; every other cap is a count. `proposeAgain: true` when the refusal came from running an approved action. |
 | `rate` | `rate` | A wait ends it. `tenant_create` past `kernel.tenants.createRate`. `owner_approval_request` when the token already has 5 requests waiting, or Arca 20. `omni_pair` while a pairing code lasts, or inside the 60 seconds after an attempt. | `retryAfterSeconds` when the wait is known: whole seconds, rounded up, at least 1. `proposeAgain: true` when the refusal came from running an approved action. |
 | `RateLimited` | `rate` | `action_propose` when one token has recorded its thirty new proposals of ten minutes. The code it has always had. | `retryAfterSeconds`: the wait until the token's oldest counted proposal leaves the window. The sentence says "ten minutes", the whole window. |
 | `TooManyProposals` | `rate` | `action_propose` when eight proposals already wait, from any token. The code it has always had. | None. Room is made when one is approved or declined, or lapses fifteen minutes after it was made. |
@@ -550,9 +550,15 @@ because the node is full: the refusal then says `scope: "node"`, and `have`, `wa
 not the tenant's. A client that serves a tenant's owner should say "the service is full", never "your plan is full",
 for `scope: "node"`, and should not show the node's amounts to the tenant.
 
-- `scope: "tenant"`: the tenant's own caps on `service_create`, and its address block with no free address.
+- `scope: "tenant"`: the tenant's own caps on `service_create`.
 - `scope: "node"`: the node's virtual-machine caps, the count set below the machines the node holds, everything
-  `tenant_create` is refused for, and the service subnet with no free address.
+  `tenant_create` is refused for, the service subnet with no free address, and a tenant's block with no free address.
+
+A tenant's block with no free address is the node's, although the sentence names the tenant. A block holds an address
+for every instance the tenant's caps allow, and those caps are checked first, so the tenant is under its instance cap
+when this is answered: the block is full because something else holds addresses in it, such as a lease on the bridge
+that is not one of the tenant's services. Nothing the tenant removes makes room, so its plan is not what is full.
+`have` and `max` are the block's addresses.
 
 `proposeAgain: true` marks a refusal that came from running an approved action (through `action_approve` or the
 approval page; the message begins "The approval was accepted, but"). The approval was spent by the run. Waiting, or

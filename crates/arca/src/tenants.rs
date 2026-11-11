@@ -154,7 +154,10 @@ pub(super) fn outside_blocks(candidates: Vec<Ipv4Addr>, blocks: &[block::Block])
 }
 
 /// The free address a new instance of the tenant takes: the lowest of its block that nothing uses. A block with none
-/// left is a `capacity` refusal.
+/// left is a `capacity` refusal of `scope` `node`, not `tenant`. The tenant's own caps are checked before an address is
+/// looked for, and a block holds an address for every instance the caps allow, so a tenant that gets here is under its
+/// instance cap: its block is full because something else holds addresses in it (a lease on the bridge that is not
+/// one of its services). The tenant's plan is not what is full, and nothing the tenant removes makes room.
 pub(super) fn free_address(
     scope: &TenantScope,
     used: &BTreeSet<Ipv4Addr>,
@@ -171,7 +174,7 @@ pub(super) fn free_address(
                     "tenant {}'s address block {} has no free address",
                     scope.id, scope.config.block
                 ),
-                Room::of(Whose::Tenant, Limit::Addresses, all, 1, all),
+                Room::of(Whose::Node, Limit::Addresses, all, 1, all),
             )
         })
 }
