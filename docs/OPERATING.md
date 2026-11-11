@@ -1118,8 +1118,8 @@ minutes, is single use, and has one global cap of 60 a minute; it never uses the
 detail. This view is tailnet-only behind the existing `/approve/*` proxy route.
 
 Every page `serve` returns here (the approval page, the canvas, its sign-in page and its error page) closes with the
-Open Intelligence tag of the we unfold movement: an inline picture 170 px wide, drawn on the page's own ground in light
-and dark, loaded from nowhere and never a link (`assets/open-intelligence/`).
+Open Intelligence tag of the we unfold movement: an inline picture 170 px wide, in one colour (the page's ink on the
+page's ground, light and dark), loaded from nowhere and never a link (`assets/open-intelligence/`).
 
 `POST /approve/canvas/chat` is one Doctor chat turn and costs model tokens only for the signed-in owner. The session is
 checked before the request body is read, so an unsigned or invalid chat gets 401 with no connection and before any body

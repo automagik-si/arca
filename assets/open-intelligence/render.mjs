@@ -28,18 +28,22 @@ const file = (name, markup) => writeFileSync(
 );
 const NIGHT = { ground: '#0e1017', color: '#ebe6da' }; // the components' own defaults, written out
 const DAY = { ground: '#ffffff', color: '#11141c' }; // the light page of the components' READMEs
-const INK = { ...DAY, ink: DAY.color }; // one colour
+const INK = { ...DAY, ink: DAY.color }; // one colour: ink on white
+const IVORY = { ...NIGHT, ink: NIGHT.color }; // the same one-colour cut for a dark ground: ivory on night
 file('badge-dark', badge(NIGHT));
 file('badge-light', badge(DAY));
 file('badge-ink', badge(INK));
+file('badge-ivory', badge(IVORY));
 file('badge-footer', badge({ width: 170, ...DAY }));
 file('seal-dark', draw('Stamp', { size: 280, ...NIGHT, subColor: '#a7abb9' }));
 file('seal-light', draw('Stamp', { size: 280, ...DAY, subColor: '#4a4f5e' }));
 file('seal-ink', draw('Stamp', { size: 280, ...INK, subColor: INK.color }));
 
-// The footer badge again, on the ground and ink of the page it sits in, with the component's defaults as fallback.
-// It is the cut the pages carry inline; it has no namespace and reads page tokens, so it is not a file for an <img>.
-const tag = badge({ width: 170, ground: `var(--arca-bg, ${NIGHT.ground})`, color: `var(--arca-ink, ${NIGHT.color})` });
+// The footer badge as the pages carry it inline: the one-colour cut, no namespace, ivory on night as plain attributes.
+// Each page's own stylesheet recolours the pill, the mark and the words from the page's ground and ink (a stylesheet
+// rule wins over an attribute), so no browser has to read var() inside an attribute, and a page without those rules
+// still shows a badge.
+const tag = badge({ width: 170, ...IVORY });
 writeFileSync(join(here, 'open-intelligence-tag.svg'), `${tag}\n`);
 
 // The pages the binary serves carry that cut inline, byte for byte.

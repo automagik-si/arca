@@ -4,10 +4,11 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
-- Automagik Arca carries the Open Intelligence tag of the [we unfold](https://weunfold.ai/) movement: in the two
-  READMEs, and at the foot of every page `arca serve` returns (the approval page, the canvas, its sign-in page and its
-  error page). On a page it is an inline picture 170 px wide, drawn on the page's own ground in light and dark, loaded
-  from nowhere and never a link. The files and where they come from are in `assets/open-intelligence/`.
+- Automagik Arca carries the Open Intelligence tag of the [we unfold](https://weunfold.ai/) movement, in its
+  one-colour cut with the we unfold mark: in the two READMEs, and at the foot of every page `arca serve` returns (the
+  approval page, the canvas, its sign-in page and its error page). On a page it is an inline picture 170 px wide, in
+  the page's ink on the page's ground in light and dark, loaded from nowhere and never a link. The files and where they
+  come from are in `assets/open-intelligence/`.
 
 ## 0.1.0-alpha.7
 

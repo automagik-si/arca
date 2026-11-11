@@ -1192,6 +1192,8 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
               box: svg.getBoundingClientRect().toJSON(),
               foot: document.querySelector('.arca-foot').getBoundingClientRect().toJSON(),
               ground: pill.fill, line: pill.stroke, ink: getComputedStyle(words).fill, words: words.textContent,
+              mark: [...new Set([...svg.querySelectorAll('path')].map((path) => getComputedStyle(path).stroke))],
+              paths: svg.querySelectorAll('path').length,
               wordsRight: words.getBoundingClientRect().right,
               link: Boolean(svg.closest('a, button')), anchors: document.querySelectorAll('.arca-foot a, .arca-foot button').length,
             };
@@ -1230,6 +1232,8 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       assert.equal(actual.tag.ground, expected.bg, `${theme} tag ground`);
       assert.equal(actual.tag.line, expected.ink, `${theme} tag outline`);
       assert.equal(actual.tag.ink, expected.ink, `${theme} tag words`);
+      assert.ok(actual.tag.paths > 100, 'the mark is in the tag');
+      assert.deepEqual(actual.tag.mark, [expected.ink], `${theme} tag mark is one colour, the page's ink`);
       assert.equal(actual.tag.words, 'OPEN INTELLIGENCE');
       assert.ok(actual.tag.wordsRight < actual.tag.box.right, 'the words stay inside the pill');
       assert.deepEqual([actual.tag.link, actual.tag.anchors], [false, 0]);

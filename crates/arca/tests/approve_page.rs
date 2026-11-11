@@ -3418,8 +3418,17 @@ fn every_inline_page_carries_the_open_intelligence_tag_once_as_a_picture_and_nev
         "the words are OPEN INTELLIGENCE"
     );
     assert!(
-        tag.contains(r#"fill="var(--arca-bg, #0e1017)" stroke="var(--arca-ink, #ebe6da)""#),
-        "the pill takes the ground and ink of the page it sits in"
+        tag.contains(r##"fill="#0e1017" stroke="#ebe6da""##) && !tag.contains("var("),
+        "the tag carries plain colours as attributes: no browser has to read var() in an attribute"
+    );
+    assert_eq!(
+        tag.matches("stroke=\"").count(),
+        tag.matches("stroke=\"#ebe6da\"").count(),
+        "the tag is the one-colour cut: the pill's outline and every stroke of the mark share one colour"
+    );
+    assert!(
+        tag.matches("<path ").count() > 100,
+        "the mark is in the tag"
     );
     for (label, html) in [
         ("approval", include_str!("../src/approve_page.html")),
@@ -3459,9 +3468,25 @@ fn every_inline_page_carries_the_open_intelligence_tag_once_as_a_picture_and_nev
             "{label}: the page has no link, so the tag is not one"
         );
         assert!(!html.contains("style=\""), "{label}: no style attribute");
+        // The colours come from the page's own stylesheet, which the CSP hash covers: the pill takes the page's ground
+        // and ink, the words its ink, in light and dark.
+        let style = &html[html.find("<style>").expect("a style block")
+            ..html.find("</style>").expect("a closed style block")];
+        let scope = if label == "approval" {
+            ".open-intelligence"
+        } else {
+            "footer"
+        };
         assert!(
-            html.contains("--arca-bg:") && html.contains("--arca-ink:"),
-            "{label}: the page defines the two tokens the tag reads"
+            style.contains(&format!(
+                "{scope} rect {{ fill: var(--arca-bg); stroke: var(--arca-ink); }}"
+            )) && style.contains(&format!("{scope} path {{ stroke: var(--arca-ink); }}"))
+                && style.contains(&format!("{scope} text {{ fill: var(--arca-ink); }}")),
+            "{label}: the stylesheet colours the pill, the mark and the words from the page's tokens"
+        );
+        assert!(
+            style.contains("--arca-bg:") && style.contains("--arca-ink:"),
+            "{label}: the page defines the two tokens the tag takes"
         );
     }
 }

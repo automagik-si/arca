@@ -3,6 +3,9 @@
 The Open Intelligence tag is the slogan and stamp of [we unfold](https://weunfold.ai/), a movement for open
 intelligence: AI that belongs to humanity, built in the open, by anyone, for everyone. Automagik Arca carries it.
 
+Carrying it says "we support open intelligence". So the tag always holds the we unfold mark, never Automagik Arca's own
+logo, and Automagik Arca uses its one-colour cut.
+
 ## Where it comes from
 
 The files here are drawn by the `Badge` and `Stamp` components of the we unfold design system: the public repository
@@ -15,20 +18,26 @@ not under this repository's Apache licence, and nothing here gives a right to ch
 
 ## The files
 
-| File | What it is |
-| --- | --- |
-| `open-intelligence-badge-dark.svg` | The badge on a dark ground, the default (ground `#0e1017`, text `#ebe6da`). For READMEs, sites and decks. |
-| `open-intelligence-badge-light.svg` | The badge for a light page (ground `#ffffff`, text `#11141c`). |
-| `open-intelligence-badge-ink.svg` | The badge in one colour (`#11141c` on white), for print and one-ink uses. |
-| `open-intelligence-badge-footer.svg` | The badge at its footer size, 170 px wide, on a light page. |
-| `open-intelligence-seal-dark.svg` | The round seal on a dark ground: the mark inside two rings, OPEN INTELLIGENCE above and BUILT TOGETHER · FOR EVERYONE below. |
-| `open-intelligence-seal-light.svg` | The seal on a light ground. |
-| `open-intelligence-seal-ink.svg` | The seal in one colour, for rubber stamps, engraving and embroidery. |
-| `open-intelligence-tag.svg` | The footer badge as the pages `arca serve` returns and the canvas carry it inline. It reads the page's `--arca-bg` and `--arca-ink`, so it is not a file for an `<img>`. |
-| `render.mjs` | The script that draws all of the above from the components. |
+| File | What it is | Used here |
+| --- | --- | --- |
+| `open-intelligence-badge-ink.svg` | The badge in one colour: ink `#11141c` on white. | `README.md` on a light page; the canvas package README |
+| `open-intelligence-badge-ivory.svg` | The same one-colour badge for a dark ground: ivory `#ebe6da` on night `#0e1017`. | `README.md` on a dark page |
+| `open-intelligence-tag.svg` | The one-colour badge at its footer size, 170 px wide, as the pages `arca serve` returns and the canvas carry it inline. It has no SVG namespace, so it is not a file for an `<img>`. It carries ivory on night as attributes; each page's stylesheet recolours the pill, the mark and the words to the page's own ink on its own ground. | the pages and the canvas |
+| `open-intelligence-badge-dark.svg` | The badge with the mark in colour, on a dark ground (ground `#0e1017`, text `#ebe6da`). | no |
+| `open-intelligence-badge-light.svg` | The badge with the mark in colour, for a light page (ground `#ffffff`, text `#11141c`). | no |
+| `open-intelligence-badge-footer.svg` | The badge with the mark in colour at its footer size, 170 px wide, on a light page. | no |
+| `open-intelligence-seal-dark.svg` | The round seal on a dark ground: the mark inside two rings, OPEN INTELLIGENCE above and BUILT TOGETHER · FOR EVERYONE below. | no |
+| `open-intelligence-seal-light.svg` | The seal on a light ground. | no |
+| `open-intelligence-seal-ink.svg` | The seal in one colour, for rubber stamps, engraving and embroidery. | no |
+| `render.mjs` | The script that draws all of the above from the components. | |
 
-Automagik Arca itself shows the badge in its two READMEs and the footer badge on its pages. The seals are here so that
-the set is whole; nothing in this repository shows them yet.
+The files marked "no" are kept so that the set we unfold publishes is whole in one place: the badges with the mark in
+colour and the three seals. Nothing in this repository shows them. Use the one-colour badge unless we unfold's rules
+call for another.
+
+The design system's kit shows the one-colour badge once, as ink on white. The ivory file is the same component drawn
+with the same one-colour setting (`ink`), given ivory instead of ink and the component's own dark ground; the design
+system names ivory as the one colour for dark grounds.
 
 Nothing is drawn by hand. `render.mjs` loads the design system's bundle, renders `WeUnfold.Badge` and `WeUnfold.Stamp`
 with React and writes the markup out unchanged; a file for an `<img>` only gains the SVG namespace. The same run writes
@@ -44,17 +53,33 @@ The words are text, as the components write them: IBM Plex Mono, weight 600 (500
 
 ## The rules that travel with it
 
-These are the design system's, not ours:
+These are the design system's own words, copied from it, not ours.
 
-- The words stay OPEN INTELLIGENCE, uppercase. Do not translate or rename them, or put a product name in the pill.
-- The tag is never bigger than the mark or the wordmark beside it. In a footer it is 170 px wide; below that, use the
-  mark alone.
-- Dark ground by default; the light variant on light pages.
-- Never redraw it by hand, stretch it, outline it, recolour it or add shadows or effects.
-- The seal prints from 24 mm and reads on a screen from 84 px. Never change its words, its ring weights or the
-  position of the mark.
+From its `README.md`:
+
+> - Open Intelligence is never bigger than the mark or the wordmark.
+> - Never add yellow to the mark (gold is a UI accent, outside the mark), recolour single seeds, rings or arms, or
+>   reorder the colours.
+> - Never redraw by hand, stretch, outline, add shadows or effects. Anything that cannot be traced back to the
+>   formulas is not part of the mark.
+
+From `components/Badge/README.md`:
+
+> - Provide `width` (default 340 px; 170 px in a footer). Below 170 px use the mark alone.
+> - Dark ground by default; pass `ground: '#ffffff'` and `color: '#11141c'` on light pages, and `ink` for a
+>   one-colour badge.
+> - The words stay OPEN INTELLIGENCE, uppercase; do not translate, rename or add a product name inside the pill.
+
+From `components/Stamp/README.md`:
+
+> - Provide `size`; it prints from 24 mm and reads on screen from 84 px (pinned to an avatar).
+> - Never change the words, the ring weights or the position of the mark.
 
 ## Drawing it again
+
+`render.mjs` is a maintainer's tool. The build and the tests never run it. Running it executes we unfold's
+`components/bundle.js` as ordinary JavaScript, with every right your Node process has, and reads a checkout that lives
+outside this repository. Read the bundle you point it at before you run it.
 
 In a folder where `react` and `react-dom` 18.3.1 are installed:
 

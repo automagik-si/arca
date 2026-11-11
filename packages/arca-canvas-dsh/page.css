@@ -311,6 +311,16 @@ body,
 .arca-foot svg {
   display: block;
 }
+.arca-foot rect {
+  fill: var(--arca-bg);
+  stroke: var(--arca-ink);
+}
+.arca-foot path {
+  stroke: var(--arca-ink);
+}
+.arca-foot text {
+  fill: var(--arca-ink);
+}
 .arca-machines {
   flex: none;
   padding: 10px 16px 12px;

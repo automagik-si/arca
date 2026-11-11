@@ -340,6 +340,20 @@ body,
   display: block;
 }
 
+/* The tag is one colour and carries ivory on night as attributes; here it takes the canvas's own ground and ink. */
+.arca-foot rect {
+  fill: var(--arca-bg);
+  stroke: var(--arca-ink);
+}
+
+.arca-foot path {
+  stroke: var(--arca-ink);
+}
+
+.arca-foot text {
+  fill: var(--arca-ink);
+}
+
 /* machines strip */
 .arca-machines {
   flex: none;
