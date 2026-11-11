@@ -195,15 +195,23 @@ ships has changed:
 Steps 1 to 3 run the repository's code and its dependencies' (build scripts, tests, a package's install), so their
 job may only read: it holds no token that can write. It hands the release commit, its tag and the files to the second
 job, which holds the token that can write and runs none of that code. Before it pushes, the second job checks the
-release commit line by line against `dev`'s own copy of each file: one commit on top of `dev`, named as a release
-commit, changing only the version lines of the workspace's crates and of the canvas package, and adding lines to
-`CHANGELOG.md` inside the new section and nowhere else; the tag on it; and the binary matching `SHA256SUMS`. A
-manifest or a lock file can carry code, so nothing else in them may change in a commit nobody reviews.
+release commit against `dev`'s own copy of each file, and the list is all there is:
+
+- one commit on top of `dev`, whose whole message is `chore(release): v<version>`, with an annotated tag of that name
+  whose whole message is `Automagik Arca <version>`;
+- five files changed and no other, none changing its kind or mode;
+- in the manifests and lock files, only the version lines of the workspace's crates and of the canvas package, from
+  the old version to the new one. A manifest or a lock file can carry code, so nothing else in them may change in a
+  commit nobody reviews;
+- in `CHANGELOG.md`, no line removed or changed, and the added lines being the one heading, right under `Unreleased`
+  and outside any comment, and blank lines and list lines (`- ...`) inside that section, with no control character
+  and no `<`;
+- the binary matching `SHA256SUMS`.
 
 What this does not stop: code that runs in the first job, a hostile dependency among it, can still shape the binary
-that job builds, the text of the release notes, and which version number the release takes. The split keeps such
-code away from `dev`, `main` and every release already published; it does not make the new release's binary
-trustworthy by itself.
+that job builds, the words of the changelog's list lines and of the release notes (a line may hold a link), and which
+version number the release takes. The split keeps such code away from `dev`, `main` and every release already
+published; it does not make the new release's binary trustworthy by itself.
 
 If any step before the push fails, no version is taken. If the push landed and the publishing failed, the next run
 publishes that same tag before it does anything else; start one by hand with `gh workflow run release.yml --ref dev`.

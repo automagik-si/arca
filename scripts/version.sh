@@ -234,14 +234,16 @@ kind() {
 #
 # A subject is text someone else wrote, and it goes into CHANGELOG.md and the release notes. It is never run or
 # expanded. Its control characters are removed (a bare carriage return would be shown as a line break, and what
-# follows it as a line of its own), and a leading "#" is escaped, so no subject can stand as a heading.
+# follows it as a line of its own), a leading "#" is escaped, so no subject can stand as a heading, and each "<" is
+# written as "&lt;", so no subject can open a tag or a comment. The release workflow refuses a changelog line that
+# holds a control character or a "<".
 subjects() {
     local range="HEAD"
     [ -z "${1-}" ] || range="$1..HEAD"
     git -C "$root" log --first-parent --format=%s "$range" |
         LC_ALL=C tr -d '\000-\011\013-\037\177' |
         grep -vE '^(chore\(release\)|ci|docs|test)(\([^)]*\))?!?: ' |
-        sed -E 's/^merge: //; s/ \(([^()]*)?review[^()]*\)$//; s/^[[:space:]]+//; s/^#/\\#/' || true
+        sed -E 's/^merge: //; s/ \(([^()]*)?review[^()]*\)$//; s/^[[:space:]]+//; s/^#/\\#/; s/</\&lt;/g' || true
 }
 
 # Writes the section of a release into CHANGELOG.md. Lines are only added: none of the file's own lines is removed,
@@ -258,9 +260,15 @@ changelog() {
     [ -n "$at" ] || fail "CHANGELOG.md has no \"## Unreleased\" heading"
     ! grep -qE "^## ${version//./\\.}( |\$)" "$file" || fail "CHANGELOG.md already has a section for $version"
     # The Unreleased section runs to the next "## " heading, or to the end of the file.
-    total="$(wc -l <"$file")"
+    # The file's lines are counted as awk reads them, so a last line with no newline after it is one of them.
+    total="$(awk 'END { print NR }' "$file")"
     next="$(awk -v at="$at" 'NR > at && /^## / { print NR; exit }' "$file")"
     [ -n "$next" ] || next="$((total + 1))"
+    # Lines go in after the file's last line only when that line is ended. Ending it here would change it, and this
+    # command only adds lines.
+    if [ "$next" -gt "$total" ] && [ -n "$(tail -c 1 "$file")" ]; then
+        fail "CHANGELOG.md does not end with a newline and its Unreleased section is the last one: end the last line"
+    fi
     # The first line someone wrote in it: not blank, and not in a comment (a comment starts a line with "<!--" and
     # ends a line with "-->").
     first="$(awk -v at="$at" -v end="$next" '

@@ -556,12 +556,58 @@ fn a_release_with_nothing_to_list_says_so() {
 }
 
 #[test]
+fn a_changelog_whose_last_line_is_not_ended_loses_no_line() {
+    // The older section's last line has no newline after it: the new section goes in above it, and that line stays as
+    // it is, byte for byte.
+    let scratch = Scratch::new("unended");
+    scratch.write(
+        "CHANGELOG.md",
+        "# Changelog\n\n## Unreleased\n\n## 0.8.0\n\nThe last line, not ended",
+    );
+    scratch.git(&["add", "-A"]);
+    scratch.git(&["commit", "-q", "-m", "docs: a changelog"]);
+    scratch.tag("v0.8.0");
+    scratch.commit("crates/a/src/lib.rs", "feat(a): a change");
+    scratch.answer(&["changelog", "0.8.1", "2026-11-13"]);
+    assert_eq!(
+        scratch.read("CHANGELOG.md"),
+        "# Changelog\n\n## Unreleased\n\n## 0.8.1 (2026-11-13)\n\n- feat(a): a change\n\n## 0.8.0\n\nThe last line, not ended"
+    );
+
+    // The older heading is itself the last line, not ended.
+    scratch.write("CHANGELOG.md", "# Changelog\n\n## Unreleased\n\n## 0.8.0");
+    scratch.answer(&["changelog", "0.8.1", "2026-11-13"]);
+    assert_eq!(
+        scratch.read("CHANGELOG.md"),
+        "# Changelog\n\n## Unreleased\n\n## 0.8.1 (2026-11-13)\n\n- feat(a): a change\n\n## 0.8.0"
+    );
+
+    // The Unreleased section is the last one and its last line is not ended: lines could only go in after it by
+    // ending it, which changes it. The command says so and writes nothing.
+    for text in [
+        "# Changelog\n\n## Unreleased\n\nWritten, and not ended",
+        "# Changelog\n\n## Unreleased",
+    ] {
+        scratch.write("CHANGELOG.md", text);
+        let out = scratch.version(&["changelog", "0.8.1", "2026-11-13"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("does not end with a newline"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(scratch.read("CHANGELOG.md"), text, "nothing was written");
+    }
+}
+
+#[test]
 fn this_checkout_s_changelog_has_the_heading_the_release_writes_under() {
     let text = fs::read_to_string(Path::new(REPO).join("CHANGELOG.md")).expect("CHANGELOG.md");
     assert_eq!(
         text.lines().filter(|line| *line == "## Unreleased").count(),
         1
     );
+    assert!(text.ends_with('\n'), "its last line is ended");
 }
 
 #[test]
@@ -613,11 +659,14 @@ fn a_hostile_subject_is_listed_as_one_plain_line_and_is_never_run() {
     empty("\r\t \x1b[31m## after controls");
     // Text a shell would expand or run.
     empty("feat(a): uses `touch pwned-1` and $(touch pwned-2) and ${HOME} and ; touch pwned-3");
+    // Text that would open a tag or a comment on a page.
+    empty("feat(a): takes <file>, hides the rest <!-- and <img src=x onerror=y>");
 
     scratch.answer(&["changelog", "0.8.1", "2026-11-13"]);
     assert_eq!(
         scratch.read("CHANGELOG.md"),
         "# Changelog\n\n## Unreleased\n\n## 0.8.1 (2026-11-13)\n\n\
+         - feat(a): takes &lt;file>, hides the rest &lt;!-- and &lt;img src=x onerror=y>\n\
          - feat(a): uses `touch pwned-1` and $(touch pwned-2) and ${HOME} and ; touch pwned-3\n\
          - [31m## after controls\n\
          - \\## 0.9.9 a heading\n\
@@ -627,6 +676,7 @@ fn a_hostile_subject_is_listed_as_one_plain_line_and_is_never_run() {
     let text = scratch.read("CHANGELOG.md");
     assert_eq!(text.lines().filter(|line| line.starts_with('#')).count(), 3);
     assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+    assert!(!text.contains('<'), "no subject opens a tag or a comment");
     for n in 1..=3 {
         assert!(!scratch.0.join(format!("pwned-{n}")).exists());
     }
@@ -1217,7 +1267,7 @@ const SEED: [(&str, &str); 7] = [
     ),
     (
         "CHANGELOG.md",
-        "# Changelog\n\n## Unreleased\n\n## 0.1.0-alpha.7\n\nThe first one.\n",
+        "# Changelog\n\n## Unreleased\n\n<!-- Write here.\nThe release puts its heading above it. -->\n\n## 0.1.0-alpha.7\n\nThe first one.\n",
     ),
 ];
 
@@ -1334,11 +1384,29 @@ impl Lab {
         );
     }
 
+    /// Someone lands a change on the remote's dev: `change` edits a checkout of it.
+    fn dev_changes(&self, subject: &str, change: impl FnOnce(&Path)) {
+        let other = self.clone_as("other");
+        change(&other);
+        git_at(&other, &["add", "-A"]);
+        git_at(&other, &["commit", "-q", "-m", subject]);
+        git_at(&other, &["push", "-q", "origin", "dev"]);
+    }
+
     /// The cutting job, for `version`, cut from the remote's dev as it is now. The version and the changelog section
     /// are written by the repository's own script, the commit and the tag are made as the workflow makes them, and the
     /// bundle and the files are handed over by the workflow's own "Hand over" step. `twist` names one thing done
     /// wrong, and nothing else is: every other part is exactly a release.
     fn hand_over(&self, version: &str, twist: &str) {
+        self.hand_over_written(version, twist, |cut| {
+            self.version_sh(cut, &["set", version]);
+            self.version_sh(cut, &["changelog", version, "2026-11-12"]);
+        });
+    }
+
+    /// The same, with the version and the changelog written by `write` instead of the repository's script: for a dev
+    /// whose own files the script would refuse.
+    fn hand_over_written(&self, version: &str, twist: &str, write: impl FnOnce(&Path)) {
         let cut = self.clone_as("cut");
         let tag = format!("v{version}");
         if twist == "an extra commit" {
@@ -1347,9 +1415,9 @@ impl Lab {
             rewrite(&cut, "CHANGELOG.md", "## Unreleased\n", "## Unreleased\n\n");
             git_at(&cut, &["commit", "-q", "-am", "docs: slipped in"]);
         }
-        self.version_sh(&cut, &["set", version]);
-        self.version_sh(&cut, &["changelog", version, "2026-11-12"]);
+        write(&cut);
         let heading = format!("## {version} (2026-11-12)\n");
+        let section = format!("{heading}\n- No change is listed for this release.\n\n");
         match twist {
             "a patch entry" => rewrite(
                 &cut,
@@ -1433,6 +1501,63 @@ impl Lab {
                 &heading,
                 &format!("{heading}\n# Another title\n"),
             ),
+            "an indented heading" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n ## 0.7.9 (2026-01-01)\n"),
+            ),
+            "an underlined heading" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\nA title\n---\n"),
+            ),
+            "a paragraph" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\nRead https://example.com first.\n"),
+            ),
+            "a carriage return in a line" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n- x\r## 0.7.9\n"),
+            ),
+            "a tab before a heading" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n\t## 0.7.9\n"),
+            ),
+            "an escape code in a line" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n- \x1b[2J gone\n"),
+            ),
+            "an unclosed comment" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n- <!--\n"),
+            ),
+            "a tag in a line" => rewrite(
+                &cut,
+                "CHANGELOG.md",
+                &heading,
+                &format!("{heading}\n- <img src=x>\n"),
+            ),
+            "the heading inside the comment" => {
+                rewrite(&cut, "CHANGELOG.md", &section, "");
+                rewrite(
+                    &cut,
+                    "CHANGELOG.md",
+                    "<!-- Write here.\n",
+                    &format!("<!-- Write here.\n{section}"),
+                );
+            }
             "another section" => rewrite(
                 &cut,
                 "CHANGELOG.md",
@@ -1445,19 +1570,43 @@ impl Lab {
                 fs::set_permissions(cut.join("Cargo.toml"), fs::Permissions::from_mode(0o755))
                     .expect("mode")
             }
+            "a file turned into a link" => {
+                fs::remove_file(cut.join("Cargo.toml")).expect("remove");
+                std::os::unix::fs::symlink("Cargo.lock", cut.join("Cargo.toml")).expect("link");
+            }
             _ => {}
         }
-        let subject = if twist == "another subject" {
-            "feat(a): not a release commit".to_string()
-        } else {
-            format!("chore(release): {tag}")
-        };
         git_at(&cut, &["add", "-A"]);
-        git_at(&cut, &["commit", "-q", "-m", &subject]);
+        if twist == "a file turned into a submodule entry" {
+            // The path stays, and what it names is a commit of another repository instead of a file.
+            let path = "packages/arca-canvas-dsh/package.json";
+            let head = git_at(&cut, &["rev-parse", "HEAD"]);
+            git_at(&cut, &["rm", "-q", "--cached", path]);
+            git_at(
+                &cut,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("160000,{head},{path}"),
+                ],
+            );
+        }
+        let message = match twist {
+            "another subject" => "feat(a): not a release commit".to_string(),
+            "a body in the commit's message" => format!("chore(release): {tag}\n\nFixes #1"),
+            _ => format!("chore(release): {tag}"),
+        };
+        git_at(&cut, &["commit", "-q", "-m", &message]);
+        let tag_message = match twist {
+            "a body in the tag's message" => format!("Automagik Arca {version}\n\nFixes #1"),
+            "another tag message" => "A release".to_string(),
+            _ => format!("Automagik Arca {version}"),
+        };
         if twist == "a plain tag" {
             git_at(&cut, &["tag", &tag]);
         } else {
-            git_at(&cut, &["tag", "-a", &tag, "-m", "Automagik Arca"]);
+            git_at(&cut, &["tag", "-a", &tag, "-m", &tag_message]);
         }
 
         // The build's three files, then the workflow's own step that hands everything over.
@@ -1481,6 +1630,11 @@ impl Lab {
             "an extra commit" => bundle_as(&[&tag_ref, "^HEAD~2"]),
             "two things in the bundle" => bundle_as(&[&tag_ref, "refs/heads/dev", "^HEAD~1"]),
             "the whole history in the bundle" => bundle_as(&[&tag_ref]),
+            "a bundle cut short" => {
+                // Its first lines are whole, so it names its tag and its parent; what follows them is not.
+                let bytes = fs::read(&bundle).expect("read the bundle");
+                fs::write(&bundle, &bytes[..bytes.len() - 20]).expect("write");
+            }
             "a bundle of another line" => {
                 // A release commit on a commit the remote never had.
                 git_at(&cut, &["tag", "-d", &tag]);
@@ -1491,7 +1645,7 @@ impl Lab {
                     &cut,
                     &["commit", "-q", "-am", &format!("chore(release): {tag}")],
                 );
-                git_at(&cut, &["tag", "-a", &tag, "-m", "Automagik Arca"]);
+                git_at(&cut, &["tag", "-a", &tag, "-m", &tag_message]);
                 bundle_as(&[&tag_ref, "^HEAD~1"]);
             }
             _ => self.files(&self.handed(), version, twist),
@@ -1667,8 +1821,8 @@ fn the_publishing_job_checks_what_it_was_handed_pushes_both_at_once_and_publishe
     rewrite(
         &other,
         "CHANGELOG.md",
-        "## Unreleased\n",
-        "## Unreleased\n\nA note someone wrote.\n",
+        "its heading above it. -->\n",
+        "its heading above it. -->\n\nA note someone wrote.\n",
     );
     put(&other, "packages/arca-canvas-dsh/index.js", "// a card\n");
     git_at(&other, &["add", "-A"]);
@@ -1745,7 +1899,7 @@ fn when_dev_moves_between_the_check_and_the_push_neither_the_commit_nor_the_tag_
 
 /// Each way a handover is not exactly a release, with the words of the one check that must catch it. Every other part
 /// of each handover is right, so the words name the check that fired.
-const REFUSED: [(&str, &str); 31] = [
+const REFUSED: [(&str, &str); 46] = [
     // The files.
     (
         "an extra file",
@@ -1781,7 +1935,11 @@ const REFUSED: [(&str, &str); 31] = [
         "a bundle of another line",
         "the bundle does not stand on dev",
     ),
-    // The tag and the commit.
+    (
+        "a bundle cut short",
+        "the bundle cannot be read on top of dev",
+    ),
+    // The tag and the commit, and the whole of their messages.
     (
         "a plain tag",
         "v0.8.0 is not an annotated tag of that name on a commit",
@@ -1792,12 +1950,29 @@ const REFUSED: [(&str, &str); 31] = [
     ),
     (
         "another subject",
-        "the commit is not named chore(release): v0.8.0",
+        "the commit's message is not exactly chore(release): v0.8.0",
     ),
-    // Which files the commit changes.
+    (
+        "a body in the commit's message",
+        "the commit's message is not exactly chore(release): v0.8.0",
+    ),
+    (
+        "a body in the tag's message",
+        "the tag's message is not exactly Automagik Arca 0.8.0",
+    ),
+    (
+        "another tag message",
+        "the tag's message is not exactly Automagik Arca 0.8.0",
+    ),
+    // Which files the commit changes, and what kind of thing each is.
     ("another file", "does not change exactly the five files"),
     ("a new file", "does not change exactly the five files"),
     ("a mode changed", "changes a file's kind or mode"),
+    ("a file turned into a link", "changes a file's kind or mode"),
+    (
+        "a file turned into a submodule entry",
+        "changes a file's kind or mode",
+    ),
     // What it changes in them, line by line.
     (
         "a patch entry",
@@ -1839,6 +2014,7 @@ const REFUSED: [(&str, &str); 31] = [
         "a dependency's lock version",
         "package-lock.json changes something other than its two version lines",
     ),
+    // The changelog: nothing removed or changed, one heading in its place, and list lines.
     (
         "a changelog line removed",
         "CHANGELOG.md has a line removed or changed",
@@ -1855,11 +2031,44 @@ const REFUSED: [(&str, &str); 31] = [
         "a changelog line above",
         "CHANGELOG.md gains a line above the new section",
     ),
-    ("a second heading", "CHANGELOG.md gains a second heading"),
     (
         "another section",
         "CHANGELOG.md has no section for 0.8.0 right under Unreleased",
     ),
+    (
+        "the heading inside the comment",
+        "the new section starts inside a comment",
+    ),
+    (
+        "a second heading",
+        "CHANGELOG.md gains a line that is not a list line",
+    ),
+    (
+        "an indented heading",
+        "CHANGELOG.md gains a line that is not a list line",
+    ),
+    (
+        "an underlined heading",
+        "CHANGELOG.md gains a line that is not a list line",
+    ),
+    (
+        "a paragraph",
+        "CHANGELOG.md gains a line that is not a list line",
+    ),
+    (
+        "a carriage return in a line",
+        "CHANGELOG.md gains a control character",
+    ),
+    (
+        "a tab before a heading",
+        "CHANGELOG.md gains a control character",
+    ),
+    (
+        "an escape code in a line",
+        "CHANGELOG.md gains a control character",
+    ),
+    ("an unclosed comment", "CHANGELOG.md gains a line with a <"),
+    ("a tag in a line", "CHANGELOG.md gains a line with a <"),
 ];
 
 #[test]
@@ -1929,6 +2138,319 @@ fn the_publishing_job_refuses_a_wrong_name_a_taken_tag_and_a_published_release()
     let (_, taken) = lab.check("cut", "0.8.0");
     assert_eq!(taken.code, Some(1));
     assert!(taken.said.contains("v0.8.0 is already on the remote"));
+}
+
+/// The four version lines of the stand-in repository, moved by hand from the old numbering to `version`.
+fn bump_by_hand(cut: &Path, version: &str) {
+    let lock = "packages/arca-canvas-dsh/package-lock.json";
+    rewrite(
+        cut,
+        "Cargo.toml",
+        "version = \"0.1.0-alpha.7\"",
+        &format!("version = \"{version}\""),
+    );
+    rewrite(
+        cut,
+        "Cargo.lock",
+        "name = \"a\"\nversion = \"0.1.0-alpha.7\"",
+        &format!("name = \"a\"\nversion = \"{version}\""),
+    );
+    rewrite(
+        cut,
+        "packages/arca-canvas-dsh/package.json",
+        "  \"version\": \"0.1.0-alpha.7\"",
+        &format!("  \"version\": \"{version}\""),
+    );
+    rewrite(
+        cut,
+        lock,
+        "  \"version\": \"0.1.0-alpha.7\"",
+        &format!("  \"version\": \"{version}\""),
+    );
+    rewrite(
+        cut,
+        lock,
+        "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.1.0-alpha.7\"",
+        &format!("\"name\": \"arca-canvas-dsh\",\n      \"version\": \"{version}\""),
+    );
+}
+
+#[test]
+fn when_dev_s_own_files_are_not_as_expected_the_publishing_job_says_which_and_why() {
+    let package = "packages/arca-canvas-dsh/package.json";
+    let lock = "packages/arca-canvas-dsh/package-lock.json";
+    let refused = |lab: &Lab, words: &str| {
+        let before = lab.remote(&["rev-parse", "dev"]);
+        let (_, check) = lab.check("cut", "0.8.0");
+        assert_eq!(check.code, Some(1), "{}", check.said);
+        let last = check
+            .said
+            .lines()
+            .filter(|line| line.starts_with("::error::"))
+            .last()
+            .unwrap_or("");
+        assert!(
+            last.contains(words),
+            "wanted {words:?}, not: {}",
+            check.said
+        );
+        assert_eq!(lab.remote(&["rev-parse", "dev"]), before);
+        assert!(!lab.remote_has_tag("v0.8.0"));
+    };
+
+    // dev's own manifest states the version in a way the check does not read.
+    let lab = Lab::new("unread");
+    lab.dev_changes("chore: quotes", |dev| {
+        rewrite(
+            dev,
+            "Cargo.toml",
+            "version = \"0.1.0-alpha.7\"",
+            "version = '0.1.0-alpha.7'",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "Cargo.toml",
+            "version = '0.1.0-alpha.7'",
+            "version = '0.8.0'",
+        );
+        rewrite(
+            cut,
+            "Cargo.lock",
+            "name = \"a\"\nversion = \"0.1.0-alpha.7\"",
+            "name = \"a\"\nversion = \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            package,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            lock,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own version cannot be read, or is 0.8.0 already",
+    );
+
+    // dev's own manifest already states the version that was handed over.
+    let lab = Lab::new("already");
+    lab.dev_changes("chore: a number by hand", |dev| {
+        rewrite(
+            dev,
+            "Cargo.toml",
+            "version = \"0.1.0-alpha.7\"",
+            "version = \"0.8.0\"",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "Cargo.toml",
+            "version = \"0.8.0\"",
+            "version = \"0.8.0\" ",
+        );
+        rewrite(
+            cut,
+            "Cargo.lock",
+            "name = \"a\"\nversion = \"0.1.0-alpha.7\"",
+            "name = \"a\"\nversion = \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            package,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            lock,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own version cannot be read, or is 0.8.0 already",
+    );
+
+    // dev's own package.json has no version line.
+    let lab = Lab::new("noline");
+    lab.dev_changes("chore: no version", |dev| {
+        rewrite(dev, package, "  \"version\": \"0.1.0-alpha.7\",\n", "")
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "Cargo.toml",
+            "version = \"0.1.0-alpha.7\"",
+            "version = \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            "Cargo.lock",
+            "name = \"a\"\nversion = \"0.1.0-alpha.7\"",
+            "name = \"a\"\nversion = \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            package,
+            "  \"scripts\": {",
+            "  \"version\": \"0.8.0\",\n  \"scripts\": {",
+        );
+        rewrite(
+            cut,
+            lock,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            lock,
+            "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.1.0-alpha.7\"",
+            "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.8.0\"",
+        );
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own packages/arca-canvas-dsh/package.json has no version line to move",
+    );
+
+    // dev's own lock states another number for the root package than the workspace's.
+    let lab = Lab::new("drift");
+    lab.dev_changes("chore: a drifted lock", |dev| {
+        rewrite(
+            dev,
+            lock,
+            "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.1.0-alpha.7\"",
+            "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.0.1\"",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            lock,
+            "      \"version\": \"0.0.1\"",
+            "      \"version\": \"0.1.0-alpha.7\"",
+        );
+        bump_by_hand(cut, "0.8.0");
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own packages/arca-canvas-dsh/package-lock.json does not say 0.1.0-alpha.7 at line 8",
+    );
+
+    // dev's own lock has no version line for the root package.
+    let lab = Lab::new("noroot");
+    lab.dev_changes("chore: a lock without its root's version", |dev| {
+        rewrite(
+            dev,
+            lock,
+            "\"name\": \"arca-canvas-dsh\",\n      \"version\": \"0.1.0-alpha.7\",\n",
+            "\"name\": \"arca-canvas-dsh\",\n",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        rewrite(
+            cut,
+            "Cargo.toml",
+            "version = \"0.1.0-alpha.7\"",
+            "version = \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            "Cargo.lock",
+            "name = \"a\"\nversion = \"0.1.0-alpha.7\"",
+            "name = \"a\"\nversion = \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            package,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        rewrite(
+            cut,
+            lock,
+            "  \"version\": \"0.1.0-alpha.7\"",
+            "  \"version\": \"0.8.0\"",
+        );
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+    });
+    refused(
+        &lab,
+        "dev's own packages/arca-canvas-dsh/package-lock.json has no version line to move",
+    );
+
+    // dev's own changelog already has the section: the release adds a line to it, and no heading.
+    let lab = Lab::new("oldsection");
+    lab.dev_changes("docs: a section by hand", |dev| {
+        rewrite(
+            dev,
+            "CHANGELOG.md",
+            "## 0.1.0-alpha.7\n",
+            "## 0.8.0 (2026-11-12)\n\n- An older line.\n\n## 0.1.0-alpha.7\n",
+        )
+    });
+    lab.hand_over_written("0.8.0", "", |cut| {
+        bump_by_hand(cut, "0.8.0");
+        rewrite(
+            cut,
+            "CHANGELOG.md",
+            "- An older line.\n",
+            "- An older line.\n- A new line.\n",
+        );
+    });
+    refused(&lab, "the section for 0.8.0 is not new");
+}
+
+#[test]
+fn a_package_json_whose_version_is_its_last_key_is_released_like_any_other() {
+    let lab = Lab::new("lastkey");
+    let package = "packages/arca-canvas-dsh/package.json";
+    lab.dev_changes("chore: the version last", |dev| {
+        put(
+            dev,
+            package,
+            "{\n  \"name\": \"arca-canvas-dsh\",\n  \"scripts\": {\n    \"test\": \"node --test\"\n  },\n  \"version\": \"0.1.0-alpha.7\"\n}\n",
+        )
+    });
+    // The repository's own script writes that shape, and the check reads it: no comma after the last key.
+    lab.hand_over("0.8.0", "");
+    let (publish, check) = lab.check("cut", "0.8.0");
+    assert_eq!(check.code, Some(0), "{}", check.said);
+    let commit = check.outputs.get("commit").expect("the commit").clone();
+    assert!(
+        git_at(&publish, &["show", &format!("{commit}:{package}")])
+            .contains("  \"version\": \"0.8.0\"\n}")
+    );
+    // The same handover with the comma put in is a change to more than the number, and is refused.
+    lab.hand_over_written("0.8.0", "", |cut| {
+        lab.version_sh(cut, &["set", "0.8.0"]);
+        lab.version_sh(cut, &["changelog", "0.8.0", "2026-11-12"]);
+        rewrite(
+            cut,
+            package,
+            "  \"version\": \"0.8.0\"\n",
+            "  \"version\": \"0.8.0\",\n  \"x\": 1\n",
+        );
+    });
+    let (_, more) = lab.check("cut", "0.8.0");
+    assert_eq!(more.code, Some(1));
+    assert!(
+        more.said
+            .contains("package.json changes something other than its version line")
+    );
 }
 
 #[test]
