@@ -2934,3 +2934,219 @@ fn the_helpers_root_disk_is_on_a_regular_pool_and_never_on_snapshot_storage() {
     assert_eq!(refused_code(propose(&storage)), "HelperPoolMissing");
     assert!(rig.incus.writes().is_empty());
 }
+
+/// A snapshot verb that names a tenant acts on that tenant's project and on nothing of another tenant's.
+#[test]
+fn snapshot_verbs_with_a_tenant_stay_inside_that_tenant() {
+    use arca::handlers::plan_handlers_served;
+    let key = SkKey::from_seed(1);
+    let rig = Rig::new("snapshot-tenant", &key);
+    rig.add_snapshot_pool("usb1");
+    let (a, b) = ("aaaaaaaa", "bbbbbbbb");
+    let project = |id: &str| format!("arcak-t-{id}");
+    // Two tenants, each with an instance of its `web` service, and the node's own `web` in `shop`.
+    let source = rig.incus.instance("shop", "web").expect("the fixture app");
+    for (n, id) in [a, b].into_iter().enumerate() {
+        rig.incus
+            .add_project(&project(id), json!({ "features.networks": "false" }));
+        let mut instance = source.clone();
+        instance["name"] = json!(format!("web-{id}"));
+        instance["project"] = json!(project(id));
+        let uuid = format!("00000000-0000-4000-8000-0000000000b{n}");
+        instance["config"]["volatile.uuid"] = json!(uuid);
+        instance["expanded_config"]["volatile.uuid"] = json!(uuid);
+        rig.incus.add_instance(instance);
+        let block = format!("192.0.2.{}/29", 248 - 8 * n);
+        rig.kernel
+            .lock()
+            .expect("the kernel lock")
+            .propose(
+                vec![arca::desired_store::EntryChange::Put(
+                    arca::handlers::service_entry(
+                        &format!("tenant-{id}"),
+                        "arca.tenant",
+                        json!({ "id": id, "project": project(id), "bridge": "arcak-svcbr",
+                            "cidr": "192.0.2.0/24", "block": block, "pool": "fast",
+                            "caps": { "instances": 4, "containers": 4, "virtualMachines": 0, "cpu": 8,
+                                "memory": "16GiB", "disk": "100GiB" },
+                            "created": NOW }),
+                    ),
+                )],
+                NOW,
+            )
+            .expect("the tenant's entry is recorded");
+    }
+    let node: arca::config::NodeConfig = serde_json::from_value(json!({
+        "stateDir": rig._scratch.dir,
+        "incus": { "socket": rig.incus.socket() },
+        "listen": { "unix": rig._scratch.path("arca.sock") },
+        "tokens": { "hashDir": rig._scratch.path("tokens") },
+        "kernel": {
+            "projects": ["arcak-svc"], "droiddProjects": ["droid"], "serviceCidr": "192.0.2.0/24",
+            "tenants": {
+                "capacity": { "instances": 40, "cpu": 64, "memory": "128GiB", "disk": "2TiB" },
+                "maxTenants": 6,
+                "defaultCaps": { "instances": 4, "containers": 4, "virtualMachines": 0, "cpu": 8,
+                    "memory": "16GiB", "disk": "100GiB" },
+                "createRate": { "count": 5, "perSeconds": 3600 }
+            }
+        }
+    }))
+    .expect("the node config");
+    let node = Arc::new(node);
+    let handlers: std::collections::HashMap<&'static str, Arc<dyn ToolHandler>> =
+        plan_handlers_served(
+            Arc::clone(&rig.kernel),
+            Arc::new(|| NOW),
+            None,
+            None,
+            Some(Arc::clone(&rig.storage)),
+            None,
+            ActionSlot::default(),
+            Some(Arc::clone(&node)),
+        )
+        .into_iter()
+        .collect();
+    let propose = |action: &str, args: Value| {
+        call_verb(
+            &handlers,
+            "action_propose",
+            json!({ "action": action, "args": args }),
+        )
+    };
+    // The listing as a node with tenants serves it: a named tenant must be one the node holds.
+    let served = |node: Arc<arca::config::NodeConfig>| arca::handlers::SnapshotListInTenant {
+        inner: Arc::new(SnapshotListHandler {
+            storage: Arc::clone(&rig.storage),
+        }),
+        kernel: Arc::clone(&rig.kernel),
+        cfg: node,
+    };
+    let listing = served(Arc::clone(&node));
+    let list = |args: Value| -> Vec<String> {
+        listing
+            .call(args, &caller(arca_api::Scope::Viewer))
+            .expect("snapshot_list answers")["snapshots"]
+            .as_array()
+            .expect("snapshots")
+            .iter()
+            .map(|row| row["name"].as_str().expect("a name").to_string())
+            .collect()
+    };
+    // A create that names a tenant is given that tenant's project, and the owner's card says so.
+    let mut names = Vec::new();
+    for id in [a, b] {
+        let proposed = propose(
+            "snapshot_create",
+            json!({ "tenant": id, "instance": format!("web-{id}"), "pool": "usb1" }),
+        )
+        .expect("a snapshot in the tenant may be proposed");
+        assert_eq!(proposed["args"]["project"], json!(project(id)));
+        assert_eq!(proposed["args"]["tenant"], json!(id));
+        assert_eq!(row(&proposed["details"], "Tenant"), id);
+        rig.approve_and_run(&key, &proposed).expect("the copy runs");
+        names.push(
+            proposed["args"]["name"]
+                .as_str()
+                .expect("a name")
+                .to_string(),
+        );
+    }
+    let own = propose(
+        "snapshot_create",
+        json!({ "project": "shop", "instance": "web", "pool": "usb1" }),
+    )
+    .expect("the node's own snapshot");
+    rig.approve_and_run(&key, &own).expect("the copy runs");
+    let own = own["args"]["name"].as_str().expect("a name").to_string();
+    // A tenant's instance is not reached under another tenant's name, and no other project is named beside a tenant.
+    assert_eq!(
+        refused_code(propose(
+            "snapshot_create",
+            json!({ "tenant": a, "instance": format!("web-{b}"), "pool": "usb1" }),
+        )),
+        "SourceUnknown"
+    );
+    assert!(matches!(
+        propose(
+            "snapshot_create",
+            json!({ "tenant": a, "project": project(b), "instance": format!("web-{b}"), "pool": "usb1" }),
+        ),
+        Err(CallError::Invalid(_))
+    ));
+    assert_eq!(
+        refused_code(propose(
+            "snapshot_create",
+            json!({ "tenant": "cccccccc", "instance": "web", "pool": "usb1" }),
+        )),
+        "not_found"
+    );
+    // The listing with a tenant holds that tenant's snapshots only.
+    assert_eq!(list(json!({ "tenant": a })), vec![names[0].clone()]);
+    assert_eq!(list(json!({ "tenant": b })), vec![names[1].clone()]);
+    // A tenant the node does not hold is not found, and a node without the key has no tenants: neither lists anything.
+    assert_eq!(
+        refused_code(listing.call(
+            json!({ "tenant": "cccccccc" }),
+            &caller(arca_api::Scope::Viewer)
+        )),
+        "not_found"
+    );
+    let mut plain = (*node).clone();
+    plain.kernel.tenants = None;
+    assert_eq!(
+        refused_code(
+            served(Arc::new(plain)).call(json!({ "tenant": a }), &caller(arca_api::Scope::Viewer))
+        ),
+        "no_tenants"
+    );
+    // Without a tenant the verbs see nothing of any tenant: the listing holds the node's own snapshot only, a
+    // tenant's project is not named by project, and a tenant's snapshot is not found.
+    assert_eq!(list(json!({})), vec![own.clone()]);
+    assert!(matches!(
+        propose(
+            "snapshot_create",
+            json!({ "project": project(b), "instance": format!("web-{b}"), "pool": "usb1" }),
+        ),
+        Err(CallError::Invalid(_))
+    ));
+    let waiting_before = rig.kernel.lock().expect("lock").action_proposals().len();
+    for name in &names {
+        assert_eq!(
+            refused_code(propose("snapshot_delete", json!({ "name": name }))),
+            "not_found"
+        );
+    }
+    assert_eq!(
+        rig.kernel.lock().expect("lock").action_proposals().len(),
+        waiting_before
+    );
+    // A delete under a tenant reaches that tenant's snapshots only: another tenant's, and the node's own, are not
+    // found, and nothing is proposed for them.
+    let waiting = |kernel: &Mutex<Kernel>| kernel.lock().expect("lock").action_proposals().len();
+    let before = waiting(&rig.kernel);
+    for name in [&names[1], &own] {
+        assert_eq!(
+            refused_code(propose(
+                "snapshot_delete",
+                json!({ "tenant": a, "name": name })
+            )),
+            "not_found"
+        );
+    }
+    assert_eq!(waiting(&rig.kernel), before);
+    let proposed = propose("snapshot_delete", json!({ "tenant": a, "name": names[0] }))
+        .expect("the tenant's own snapshot may be deleted");
+    rig.approve_and_run(&key, &proposed)
+        .expect("the delete runs");
+    assert_eq!(list(json!({ "tenant": a })), Vec::<String>::new());
+    assert_eq!(list(json!({ "tenant": b })), vec![names[1].clone()]);
+    assert_eq!(list(json!({})), vec![own.clone()]);
+    // The node's own snapshot is the node's to delete, without a tenant.
+    let proposed = propose("snapshot_delete", json!({ "name": own })).expect("the node's own");
+    rig.approve_and_run(&key, &proposed)
+        .expect("the delete runs");
+    assert_eq!(list(json!({})), Vec::<String>::new());
+    assert_eq!(list(json!({ "tenant": b })), vec![names[1].clone()]);
+    assert_write_family(&rig.incus);
+}

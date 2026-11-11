@@ -375,6 +375,7 @@ impl Rig {
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        golden::record(&self.fake);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -2537,6 +2538,8 @@ fn service_remove_deletes_a_running_service_with_owner_approval() {
 
 #[path = "services/approval_requests.rs"]
 mod approval_requests;
+#[path = "services/golden.rs"]
+mod golden;
 #[path = "services/omni.rs"]
 mod omni;
 #[path = "services/wiring.rs"]

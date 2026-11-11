@@ -142,6 +142,19 @@ impl ServiceExec {
             self.cfg.kernel.droidd_projects.iter().map(String::as_str),
         )
         .map_err(|_| ExecError::Refused("target"))?;
+        // A tenant's service is read in its own tenant's project, and in no other tenant's.
+        let family = match &target.service.tenant {
+            Some(tenant)
+                if arca_kernel::ownership::tenant_of_project(&target.service.project)
+                    == Some(tenant.id.as_str()) =>
+            {
+                family
+                    .with_tenants([target.service.project.as_str()])
+                    .map_err(|_| ExecError::Refused("target"))?
+            }
+            Some(_) => return Err(ExecError::Refused("target")),
+            None => family,
+        };
         Ok(UnixIncusWriter::new(
             self.cfg.incus.socket.clone(),
             target.entry.clone(),

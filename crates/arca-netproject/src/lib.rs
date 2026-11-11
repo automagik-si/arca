@@ -2,6 +2,8 @@
 //! the node's first service used the managed network, [`BridgedProject`] when it was a virtual machine on a host bridge.
 //! A node that later gains the other network keeps the one project, and its owner widens it (Rules 54 and 55 of the
 //! ownership document).
+pub mod tenant;
+
 use arca_kernel::{
     desired::PluginId,
     journal::EffectClass,
@@ -141,7 +143,7 @@ const BRIDGED_ONLY_LIMITS: [&str; 4] = [
     "limits.disk",
 ];
 
-fn project_ref(project: &str) -> arca_kernel::ownership::ObjectRef {
+pub(crate) fn project_ref(project: &str) -> arca_kernel::ownership::ObjectRef {
     arca_kernel::ownership::ObjectRef {
         kind: IncusKind::Project,
         project: project.into(),

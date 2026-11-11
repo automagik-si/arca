@@ -77,6 +77,7 @@ refused without the value being echoed back.
 | `kernel.adopt` | no | `[{ "instance": "<name>", "to": "arcak-adopt-<name>" }]`: the containers `arca adopt` may take from the default project, each with its adoption project. A config that lists one is for `arca adopt` alone, and `serve` refuses it. |
 | `kernel.attachNetworks` | no | The bridges in the default project an adoption project's grant may name, though they carry no kernel mark. Nothing writes them. An adoption whose `eth0` is on a bridge this list leaves out plans that bridge's grant as an allowance. |
 | `kernel.bridged` | no | Bridged mode: `{ "bridges": ["<host bridge>", ...], "pool": "<Incus storage pool>", "limits": { "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" } }`, every key required. The host bridges, which already exist, that a virtual machine's NIC may join. Without `kernel.serviceCidr` the node is bridged: it runs virtual machines only and Arca creates no Incus network on it. With `kernel.serviceCidr` the node is mixed. See "Bridged nodes and virtual machines" and "Mixed nodes". |
+| `kernel.tenants` | no | `{ "capacity", "maxTenants", "defaultCaps", "createRate", "front"? }`: the node may hold tenants. It needs `kernel.serviceCidr` and is refused beside `kernel.adopt`. See "Tenants". |
 | `kernel.vmLimits` | no | `{ "virtualMachines": n, "cpu": n, "memory": "<size>", "disk": "<size>" }`, every key required: the virtual-machine caps of a node that has `kernel.serviceCidr` and no `kernel.bridged`. Without it such a node creates no virtual machine. It is refused beside `kernel.bridged`, which states the same caps in its `limits`. See "Mixed nodes". |
 | `kernel.importServices` | no | `[{ "name": "<service>", "project": "<project>", "cidr": "<ipv4-network>/24" }]`: the services another manager created that `service_import` may take over where they stand. Each `project` must be listed in `kernel.droiddProjects`, and `cidr` is that project's service subnet. Empty by default: nothing is imported and nothing is written in another manager's project. See "Importing a service another manager created". |
 | `link` | no | The node link: `name`, `forward` and `pairMinutes`. See "The link". |
@@ -2328,6 +2329,95 @@ that accepts them, so a new service gets no address. This is the operator's step
 managed network has created the bridge:
 `firewall-cmd --zone=trusted --change-interface=arcak-svcbr --permanent` and `firewall-cmd --reload`. Arca cannot do
 it: it holds no rights over the host firewall.
+
+## Tenants
+
+A node may hold tenants: each is one restricted Incus project of its own, on the node's managed service network, with its
+own caps and its own block of addresses. The node's own project, `arcak-svc`, stays the node owner's. The rules are 61 to
+67 of `docs/OWNERSHIP.md`.
+
+`kernel.tenants` turns it on. Without the key the node behaves exactly as before, and every tenant verb, and every verb
+given a `tenant`, answers "this node has no tenants". The key needs `kernel.serviceCidr` and is refused beside
+`kernel.adopt`.
+
+```json
+"tenants": {
+  "capacity": { "instances": 40, "cpu": 64, "memory": "128GiB", "disk": "2TiB" },
+  "maxTenants": 28,
+  "defaultCaps": { "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8, "memory": "16GiB", "disk": "100GiB" },
+  "createRate": { "count": 5, "perSeconds": 3600 },
+  "front": "edge"
+}
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `capacity` | yes | What all tenants may hold together. The sum of every tenant's caps never passes it. |
+| `maxTenants` | yes | How many tenants the node holds, 1 to 30. |
+| `defaultCaps` | yes | The caps of a tenant whose create names none: `instances` (1 to 16), `containers`, `virtualMachines`, `cpu`, `memory`, `disk`. They must fit inside `capacity`. |
+| `createRate` | yes | At most `count` tenants are created in any `perSeconds` seconds. The creates are counted from the journal, so a restart does not reset the count, and a tenant that was removed still counts. |
+| `front` | no | The name of one service in `arcak-svc`. Every ordinary tenant service admits that service's address on the ports its template declares, and nothing else of the node's project. The rule follows the front: when it is created, removed or recreated at another address, every tenant service's firewall rules follow within 30 seconds. Without the key no service of the node's project reaches a tenant. |
+
+Each tenant gets a block of the service /24: a /29 (8 addresses), or a /28 when its `instances` cap is above 8, taken from
+the top of the subnet down. The node's own services keep `.10` to `.239` without the tenants' blocks. About 28 small
+tenants fit a node. In a scratch run (`kernel.scratch`) a tenant's project is `arcak-scratch-t-<id>`, and the kernel
+joins the managed bridge the node already has instead of making one.
+
+The verbs:
+
+| Verb | What it does |
+| --- | --- |
+| `tenant_create {id?, caps?}` | Creates a tenant. Inside the node's policy (caps at or under `defaultCaps`, room in `capacity`, `maxTenants` and `createRate`) it needs no approval, from a token whose tool allowlist names `tenant_create`. Caps above a default run only from a proposal the owner approved (`action_propose`, then the approval). A refusal names the limit; past the rate it gives the time of the next allowed create. Without `id` one is made: 8 lowercase base32 characters. |
+| `tenant_list` | Every tenant: its id, block, caps, and what its records use. |
+| `tenant_status {id}` | One tenant, with the number of instances its project holds. |
+| `tenant_usage {id}` | Per instance: `name` (the Incus instance), `service` (the service's name), `kind` (`container` or `vm`), `state`, `limitsCpu`, `limitsMemory`, `rootDiskSize`, and for an instance of a provisional deploy `provisional: true` and `deploy`. No time and no measured use. |
+| `deploy_confirm {tenant, deploy}` | Makes a deploy's services ordinary. Only the token that opened the deploy, while it is provisional. |
+| `deploy_rollback {tenant, deploy}` | Removes exactly what a provisional deploy created, with no approval: each instance deleted and confirmed gone before its firewall rules, then its secrets and volumes. Only the token that opened the deploy, before a confirm, within 15 minutes of its first create. |
+| `deploy_remove {tenant, deploy}` | Removes everything a deploy created, once it is confirmed or its 15 minutes have passed, only from a proposal the owner approved: one approval for all its parts, in the same order. Nothing else of the tenant is touched. A provisional deploy is refused (its token rolls it back), and so is an unknown deploy id. |
+| `tenant_remove {id}` | Removes the tenant and everything in it, only from a proposal the owner approved: each instance is deleted and confirmed gone before its firewall rules, then its secrets, and last the tenant's profile and project. A removal that cannot finish says what remains. |
+
+`service_create`, `service_list`, `service_status`, `service_logs`, `service_remove`, `service_connect`,
+`service_disconnect`, `service_secret_set`, `snapshot_create`, `snapshot_list`, `snapshot_delete`, `instance_start`,
+`instance_stop` and `instance_restart` take an optional `tenant`. With it the verb acts in that tenant's project and sees nothing else: a
+name that only another tenant, or the node's own project, holds is "not found". Without it the verb acts in the node's own
+project and sees nothing of any tenant. The instance verbs take `tenant` in place of `project`. A tenant's Incus instance
+is named `<service>-<tenant id>` (one bridge holds one instance of a name). `tenant_usage` reports that name as `name`
+beside the `service`, and the instance verbs take either `instance` or, in a tenant, `service`. In a tenant:
+
+- `instance_start`, `instance_stop` and `instance_restart` need no approval, from a token whose tool allowlist names the
+  verb. Each is written to `instance-actions.jsonl` with the token and the tenant. Outside a tenant a stop and a restart
+  still need an approved proposal;
+- `service_create` takes `deploy`, an id of 1 to 64 of `a-z`, `0-9` and `-`. What
+  is created under it is provisional until the same token calls `deploy_confirm`, or 15 minutes after the deploy's first
+  create (counted from `tenant-deploys.jsonl`, so a restart does not reset it). Until then that token may call
+  `deploy_rollback`. A provisional service is not reached by the front and is flagged in `tenant_usage`. Afterwards it
+  is an ordinary service, and its removal needs the owner's approval;
+
+- a service's address comes from the tenant's block, and its caps are checked before Incus is asked, so a refusal names
+  the cap (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`,
+  `limits.disk`);
+- a link joins two services of the same tenant only;
+- a virtual machine joins the managed network only; a `bridge` is refused;
+- a template with a `lan` port or a dash is refused, and `service_publish`, `service_unpublish`, `service_import` and
+  `service_release` take no `tenant`: a tenant's service is reached through the front;
+- the snapshot verbs with no `tenant` see nothing of any tenant: `snapshot_list` lists no tenant's snapshot, and a
+  tenant's project or snapshot is reached only by naming the tenant;
+- a container template's data volume must state its size, so it counts against the disk cap;
+- `service_remove` needs the owner's approval as everywhere; proposed with `action_propose`, the proposal names the tenant.
+  A direct call's statement names the target `tenant.<id>.<name>` and the arguments `{"name", "tenant"}`;
+- a database is a service: the postgres service template, created with `service_create` and linked with
+  `service_connect`. The `postgres_*` verbs act in the node's own project only, and refuse a `tenant` in those words;
+- `service_logs` answers the console log.
+
+The real-Incus probe is an ignored test. It runs a scratch kernel (`kernel.scratch`) beside the node's own, on the node's
+managed bridge, makes two tenants, checks DHCP, DNS, the internet, the isolation, a link, a spoofed address, a virtual
+machine and the caps, and removes everything it made:
+
+```sh
+ARCA_TENANT_PROBE_SOCKET=/var/lib/incus/unix.socket ARCA_TENANT_PROBE_CIDR=<the node's serviceCidr> \
+ARCA_TENANT_PROBE_DROIDD=<the node's droiddProjects, comma-separated> ARCA_TENANT_PROBE_FRONT=<a service, optional> \
+  cargo test -p arca --test tenants -- --ignored --nocapture scratch_probe
+```
 
 ## When an approved action fails
 

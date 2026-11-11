@@ -21,6 +21,14 @@ fn record(entries: &[Entry], name: &str) -> Result<(Entry, ServiceConfig), CallE
         .find(|(_, c)| c.name == name)
         .ok_or_else(|| service_not_found(format!("service {name}: not found")))
 }
+/// The record of `cfg`'s service as the kernel holds it now, found by its own entry.
+fn record_in(entries: &[Entry], cfg: &ServiceConfig) -> Result<(Entry, ServiceConfig), CallError> {
+    let id = cfg.entry_id();
+    service_entries(entries)
+        .into_iter()
+        .find(|(entry, _)| entry.id.0 == id)
+        .ok_or_else(|| service_not_found(format!("service {}: not found", cfg.name)))
+}
 fn arg_name(args: &Value, key: &str) -> Result<String, CallError> {
     args[key]
         .as_str()
@@ -30,7 +38,7 @@ fn arg_name(args: &Value, key: &str) -> Result<String, CallError> {
 }
 fn change(config: &ServiceConfig) -> Result<crate::desired_store::EntryChange, CallError> {
     Ok(crate::desired_store::EntryChange::Put(service_entry(
-        &format!("service-{}", config.name),
+        &config.entry_id(),
         "arca.service",
         serde_json::to_value(config).map_err(|_| internal())?,
     )))
@@ -115,9 +123,9 @@ pub(super) fn secret_reference_in(
     key: &str,
 ) -> Option<String> {
     cfg.secret_refs.get(key).cloned().or_else(|| {
-        service::secret_file(&node.state_dir.join("secrets"), &cfg.name, key)
+        service::secret_file(&node.state_dir.join("secrets"), &cfg.entry_id(), key)
             .filter(|f| f.is_file())
-            .map(|_| service::secret_reference(&cfg.name, key))
+            .map(|_| service::secret_reference(&cfg.entry_id(), key))
     })
 }
 /// The value a secret reference names: a private regular file under the secrets directory, never a link.
@@ -164,7 +172,7 @@ impl ServiceHandler {
             .map_err(|_| internal())?;
         let ids = configs
             .iter()
-            .map(|config| format!("service-{}", config.name))
+            .map(ServiceConfig::entry_id)
             .collect::<Vec<_>>();
         let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
         if failed_for(&outcomes, &ids) {
@@ -181,7 +189,13 @@ impl ServiceHandler {
         entry: &Entry,
         cfg: &ServiceConfig,
     ) -> Result<arca_incus::Owned, CallError> {
-        if cfg.project != arca_netproject::PROJECT || cfg.instance != cfg.name {
+        let in_place = match &cfg.tenant {
+            None => cfg.project == arca_netproject::PROJECT,
+            Some(tenant) => {
+                arca_kernel::ownership::tenant_of_project(&cfg.project) == Some(tenant.id.as_str())
+            }
+        };
+        if !in_place || cfg.instance != cfg.instance_name() || entry.id.0 != cfg.entry_id() {
             return Err(service_refused("service target mismatch"));
         }
         let target = self.exec_target(entry, cfg)?;
@@ -229,19 +243,15 @@ impl ServiceHandler {
         }
         Ok(values)
     }
-    fn store_value(&self, name: &str, value: &str) -> Result<String, CallError> {
+    /// Stores `value` as a file of the service whose entry is `owner`, and answers its reference.
+    fn store_value(&self, owner: &str, value: &str) -> Result<String, CallError> {
         let file = format!("v-{}", Digest::of(value.as_bytes()).to_hex());
-        let path = self
-            .cfg
-            .state_dir
-            .join("secrets")
-            .join(format!("service-{name}"))
-            .join(&file);
+        let path = self.cfg.state_dir.join("secrets").join(owner).join(&file);
         if !path.exists() {
             service::write_secret(&path, value).map_err(service_template_error)?;
         }
         Ok(format!(
-            "{}service-{name}/{file}",
+            "{}{owner}/{file}",
             arca_providers::incus::SECRET_PREFIX
         ))
     }
@@ -355,7 +365,8 @@ impl ServiceHandler {
                     )
                 })?;
             self.live_owned(&entry, &cfg)?;
-            let reference = self.store_value(&name, value)?;
+            let owner = cfg.entry_id();
+            let reference = self.store_value(&owner, value)?;
             cfg.secret_refs.insert(key.into(), reference);
             let mut values = BTreeMap::from([(key.to_owned(), value.to_owned())]);
             let affected = t
@@ -384,7 +395,7 @@ impl ServiceHandler {
                     &values,
                 ) {
                     cfg.environment
-                        .insert(env.clone(), self.store_value(&name, &rendered)?);
+                        .insert(env.clone(), self.store_value(&owner, &rendered)?);
                 }
             }
             self.put(std::slice::from_ref(&cfg), now)?;
@@ -394,7 +405,7 @@ impl ServiceHandler {
                 }
                 if let Some(link) = consumer.links.iter().find(|l| l.to == name).cloned() {
                     self.live_owned(&consumer_entry, &consumer)?;
-                    let env = self.provided(&cfg, &t, &consumer.name, link.port)?;
+                    let env = self.provided(&cfg, &t, &consumer.entry_id(), link.port)?;
                     consumer.environment_patch = Some(env.keys().cloned().collect());
                     consumer.environment.extend(env);
                     self.put(&[consumer], now)?;
@@ -461,7 +472,7 @@ impl ServiceHandler {
                     template.ports.first().copied(),
                     &values,
                 ) {
-                    remaining.insert(key.clone(), self.store_value(&consumer.name, &value)?);
+                    remaining.insert(key.clone(), self.store_value(&consumer.entry_id(), &value)?);
                 }
             }
             for link in &consumer.links {
@@ -469,7 +480,7 @@ impl ServiceHandler {
                 remaining.extend(self.provided(
                     &other,
                     &self.template(&other)?,
-                    &consumer.name,
+                    &consumer.entry_id(),
                     link.port,
                 )?);
             }
@@ -489,7 +500,7 @@ impl ServiceHandler {
             .first()
             .copied()
             .ok_or_else(|| service_refused("provider has no port"))?;
-        let env = self.provided(&provider, &t, &from, port)?;
+        let env = self.provided(&provider, &t, &consumer.entry_id(), port)?;
         let names = env.keys().cloned().collect::<Vec<_>>();
         consumer.links.retain(|l| l.to != to);
         consumer.links.push(ServiceLink {
@@ -589,7 +600,7 @@ impl ServiceHandler {
             self.take_off(&target, caller, None)
                 .map_err(|e| e.call_error())?;
             let _write = self.writes.lock().map_err(|_| internal())?;
-            let (_, mut latest) = record(lock(&self.kernel)?.entries(), &cfg.name)?;
+            let (_, mut latest) = record_in(lock(&self.kernel)?.entries(), cfg)?;
             latest.published = None;
             latest.environment_patch = Some(BTreeSet::new());
             self.put(&[latest], now)?;
@@ -735,7 +746,7 @@ impl ServiceHandler {
             reach: "tailnet".into(),
         });
         let _write = self.writes.lock().map_err(|_| internal())?;
-        let (_, mut latest) = record(lock(&self.kernel)?.entries(), &cfg.name)?;
+        let (_, mut latest) = record_in(lock(&self.kernel)?.entries(), cfg)?;
         latest.published = cfg.published.clone();
         latest.environment_patch = Some(BTreeSet::new());
         let recorded = self.put(&[latest], now);

@@ -99,6 +99,24 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             json!({ "project": "arcak-svc", "instance": "web", "action": "restart", "status": "Running", "changed": true, "message": "restarted the instance web in project arcak-svc" }),
             "confirm is false: nothing was restarted and no approval was spent",
         ),
+        (
+            "tenant_remove",
+            json!({ "id": "abcdefgh", "approval": "x.y" }),
+            json!({ "removed": true }),
+            "confirm is false: nothing was removed and no approval was spent",
+        ),
+        (
+            "deploy_rollback",
+            json!({ "tenant": "abcdefgh", "deploy": "d1" }),
+            json!({ "rolledBack": true, "deploy": "d1", "removed": ["web"] }),
+            "confirm is false: nothing was rolled back",
+        ),
+        (
+            "deploy_remove",
+            json!({ "tenant": "abcdefgh", "deploy": "d1", "approval": "x.y" }),
+            json!({ "removed": true, "deploy": "d1", "parts": ["web"] }),
+            "confirm is false: nothing was removed and no approval was spent",
+        ),
     ]
 }
 

@@ -32,7 +32,8 @@ pub struct Manifest {
     pub provides: Vec<KeySpec>,
     /// The object kinds the plugin may write, each with the class of effect it may produce for that kind.
     pub effects: Vec<(IncusKind, EffectClass)>,
-    /// The projects the plugin may write in.
+    /// The projects the plugin may write in. A tenant prefix followed by `*` names every tenant's project
+    /// ([`crate::ownership::manifest_names_project`]).
     pub projects: Vec<String>,
     /// Whether the plugin may read the host through [`Ctx::observe`].
     pub observes: bool,
@@ -344,12 +345,7 @@ impl<'a> Ctx<'a> {
         {
             return Err(EffectRefusal::NotDeclared);
         }
-        if !self
-            .manifest
-            .projects
-            .iter()
-            .any(|allowed| allowed == project)
-        {
+        if !crate::ownership::manifest_names_project(&self.manifest.projects, project) {
             return Err(EffectRefusal::ProjectNotAllowed);
         }
         if kind == IncusKind::Project && project != name {

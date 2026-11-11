@@ -18,7 +18,7 @@ use arca_kernel::identity::NodeKey;
 use arca_kernel::journal::{DeletePlan, FileJournal, Journal};
 use arca_kernel::ownership::ObjectRef;
 use arca_kernel::plugin::Provider;
-use arca_providers::incus::RetainedSet;
+use arca_providers::incus::{RetainedSet, TenantProjects};
 use arca_reconcile::{Outcome, PlanRun, PluginSet, Reconciler};
 use serde_json::{Value, json};
 
@@ -54,6 +54,11 @@ pub struct Kernel {
     applied_seq: AppliedSeq,
     reconciler: Reconciler<FileJournal>,
     retained: RetainedSet,
+    tenants: TenantProjects,
+    /// The one gate every handler that reads the node's records and then writes holds across both: a service, a
+    /// database or a tenant create picks its address or block and records it under it, so no two pick from the same
+    /// reading.
+    writes: Arc<std::sync::Mutex<()>>,
     verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
     host: String,
     action_proposals: ActionProposalStore,
@@ -129,11 +134,50 @@ impl Kernel {
         provider: impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError>,
         now_ms: u64,
     ) -> Result<Self, KernelError> {
+        Self::open_with_tenants(
+            state_dir,
+            key,
+            plugins,
+            verifier,
+            host,
+            postgres_image,
+            provider,
+            TenantProjects::default(),
+            now_ms,
+        )
+    }
+
+    /// As [`Kernel::open`], keeping `tenants`: the set of tenant projects the provider admits, which the caller also gave
+    /// the provider. It holds the project of each tenant whose entry is in the desired state or still has an effect in
+    /// the journal, from before the journal's intents are settled and after every change of either.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_tenants(
+        state_dir: &Path,
+        key: NodeKey,
+        plugins: PluginSet,
+        verifier: ApprovalVerifier<OwnerKeys, FileNonces>,
+        host: String,
+        postgres_image: Option<&str>,
+        provider: impl FnOnce(RetainedSet) -> Result<Box<dyn Provider + Send>, KernelError>,
+        tenants: TenantProjects,
+        now_ms: u64,
+    ) -> Result<Self, KernelError> {
         let mut store = DesiredStore::open(state_dir, key)?;
         let action_proposals = ActionProposalStore::open(state_dir, now_ms, postgres_image);
         let retained = RetainedSet::new(store.retained().clone());
         let provider = provider(retained.clone())?;
         let journal = Journal::open(FileJournal::open(&state_dir.join(JOURNAL_FILE))?)?;
+        {
+            let mut held: BTreeSet<EntryId> = journal.live_entries().into_iter().collect();
+            held.extend(
+                store
+                    .current()
+                    .into_iter()
+                    .flat_map(|signed| signed.document.entries.iter())
+                    .map(|entry| entry.id.clone()),
+            );
+            tenants.set(&held);
+        }
         let gate = DesiredStateGate::new(store.signer(), store.applied().cloned());
         let mut reconciler = Reconciler::open_resuming(
             gate,
@@ -163,6 +207,8 @@ impl Kernel {
             applied_seq,
             reconciler,
             retained,
+            tenants,
+            writes: Arc::default(),
             verifier,
             host,
             action_proposals,
@@ -199,7 +245,8 @@ impl Kernel {
             .find(|o| {
                 o.kind == arca_kernel::ownership::IncusKind::Instance
                     && o.name == instance
-                    && o.project == arca_netproject::PROJECT
+                    && (o.project == arca_netproject::PROJECT
+                        || arca_kernel::ownership::tenant_of_project(&o.project).is_some())
             })
             .and_then(|o| o.uuid)
     }
@@ -211,6 +258,11 @@ impl Kernel {
         KernelError,
     > {
         self.retained.entries().map_err(retained_failure)
+    }
+
+    /// The gate of this kernel's writing handlers. It is taken before the kernel's own lock, never after it.
+    pub fn write_gate(&self) -> Arc<std::sync::Mutex<()>> {
+        Arc::clone(&self.writes)
     }
 
     /// The host name every approval statement of this kernel names.
@@ -679,7 +731,11 @@ impl Kernel {
     ) -> Result<Vec<Outcome>, KernelError> {
         let signed = self.store.propose(changes, now_ms)?;
         self.applied_seq.publish(Some(signed.document.seq));
+        // A tenant the document adds is in the family before its entry applies; one it removes stays until its removal
+        // has left nothing in the journal.
+        self.refresh_tenants();
         let outcomes = self.reconciler.reconcile(&signed, now_ms);
+        self.refresh_tenants();
         self.save()?;
         Ok(outcomes)
     }
@@ -749,25 +805,23 @@ impl Kernel {
         approval: &str,
         now_ms: u64,
     ) -> Result<ServiceRemoval, ServiceRemovalError> {
-        let spent = self.spend_service_removal(entry, name, approval, now_ms)?;
+        let spent =
+            self.spend_service_removal(entry, name, &json!({ "name": name }), approval, now_ms)?;
         self.remove_service_spent(spent, now_ms)
     }
 
+    /// Checks and spends the owner's approval of a removal: a `delete` over `target` with the arguments `args`. For a
+    /// service of the node's own project those are its name and `{"name": name}`.
     pub fn spend_service_removal(
         &mut self,
         entry: &EntryId,
-        name: &str,
+        target: &str,
+        args: &Value,
         approval: &str,
         now_ms: u64,
     ) -> Result<SpentServiceRemoval, ServiceRemovalError> {
-        self.check_approval(
-            ArcaAction::Delete,
-            name,
-            &json!({ "name": name }),
-            approval,
-            now_ms,
-        )
-        .map_err(ServiceRemovalError::Approval)?;
+        self.check_approval(ArcaAction::Delete, target, args, approval, now_ms)
+            .map_err(ServiceRemovalError::Approval)?;
         Ok(SpentServiceRemoval {
             entry: entry.clone(),
         })
@@ -787,7 +841,21 @@ impl Kernel {
         now_ms: u64,
     ) -> Result<ServiceRemoval, ServiceRemovalError> {
         let entry = &spent.entry;
-        let name = entry.0.strip_prefix("service-").unwrap_or("");
+        // The removed service's name and project, from its record: a link is revoked only among the services of one
+        // project, so a removal in one tenant never touches a service of the same name elsewhere.
+        let removed = self
+            .entries()
+            .iter()
+            .find(|found| &found.id == entry)
+            .and_then(|found| {
+                serde_json::from_value::<crate::service::ServiceConfig>(found.config.clone()).ok()
+            });
+        let name = removed.as_ref().map_or_else(
+            || entry.0.strip_prefix("service-").unwrap_or("").to_string(),
+            |record| record.name.clone(),
+        );
+        let name = name.as_str();
+        let project = removed.map(|record| record.project);
         let mut changes = Vec::new();
         for other in self.entries() {
             if &other.id == entry || other.plugin.0 != "arca.service" {
@@ -798,7 +866,11 @@ impl Kernel {
             else {
                 continue;
             };
-            if cfg.adopted {
+            if cfg.adopted
+                || project
+                    .as_ref()
+                    .is_some_and(|project| *project != cfg.project)
+            {
                 continue;
             }
             let incoming = cfg.incoming.len();
@@ -871,7 +943,9 @@ impl Kernel {
         plan: &Digest,
         now_ms: u64,
     ) -> Result<arca_reconcile::PlanRun, ApprovalRefusal> {
-        self.reconciler.run_plan_authorized(plan, now_ms)
+        let run = self.reconciler.run_plan_authorized(plan, now_ms);
+        self.refresh_tenants();
+        run
     }
 
     /// Checks `approval` for the plan with `plan` and, when the plan waits, runs its delete. A plan that waits nowhere is still
@@ -890,9 +964,25 @@ impl Kernel {
                 .check(ArcaAction::Delete, &target, &args, approval, now_ms)?;
             return Ok(None);
         }
-        self.reconciler
+        let run = self
+            .reconciler
             .run_plan(plan, approval, &mut self.verifier, now_ms)
-            .map(Some)
+            .map(Some);
+        self.refresh_tenants();
+        run
+    }
+
+    /// Sets the tenant projects the provider admits: those of the tenant entries in the desired state, and of the ones
+    /// the journal still holds an effect for.
+    fn refresh_tenants(&mut self) {
+        let mut held: BTreeSet<EntryId> = self
+            .reconciler
+            .journal()
+            .live_entries()
+            .into_iter()
+            .collect();
+        held.extend(self.entries().iter().map(|entry| entry.id.clone()));
+        self.tenants.set(&held);
     }
 
     fn is_pending(&self, plan: &Digest) -> bool {

@@ -278,14 +278,20 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
         match action {
             ActionKind::ServiceCreate => json!({
                 "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
+                "tenant": "abcdefgh", "deploy": "d1",
             }),
-            ActionKind::ServiceRemove
-            | ActionKind::ServiceUnpublish
+            ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
+            ActionKind::ServiceUnpublish
             | ActionKind::ServiceImport
             | ActionKind::ServiceRelease => json!({ "name": "nats" }),
+            ActionKind::TenantCreate => json!({ "id": "abcdefgh", "caps": {
+                "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8,
+                "memory": "16GiB", "disk": "100GiB" } }),
+            ActionKind::TenantRemove => json!({ "id": "abcdefgh" }),
+            ActionKind::DeployRemove => json!({ "tenant": "abcdefgh", "deploy": "d1" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
             ActionKind::ServiceConnect | ActionKind::ServiceDisconnect => {
-                json!({ "from": "api", "to": "nats" })
+                json!({ "from": "api", "to": "nats", "tenant": "abcdefgh" })
             }
             ActionKind::PostgresCreate => json!({ "name": "orders" }),
             ActionKind::GpuAttach | ActionKind::GpuDetach => json!({
@@ -385,7 +391,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     .as_object()
                     .expect("properties")
                     .keys()
-                    .all(|field| ["project", "instance"].contains(&field.as_str())),
+                    .all(|field| ["project", "instance", "service", "tenant"]
+                        .contains(&field.as_str())),
                 "{action:?} has a field the card does not show"
             );
             continue;
@@ -409,11 +416,58 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             );
             continue;
         }
+        if action == ActionKind::TenantCreate {
+            // Every cap the owner approves is on the card, with the tenant's id.
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(
+                shown,
+                [
+                    ("Tenant", "abcdefgh"),
+                    ("Instances", "4"),
+                    ("Containers", "4"),
+                    ("Virtual machines", "1"),
+                    ("CPUs", "8"),
+                    ("Memory", "16GiB"),
+                    ("Disk", "100GiB"),
+                ]
+            );
+            continue;
+        }
+        if action == ActionKind::DeployRemove {
+            let shown: Vec<(&str, &str)> = details
+                .iter()
+                .map(|row| (row.label.as_str(), row.value.as_str()))
+                .collect();
+            assert_eq!(shown[0], ("Deploy", "d1"));
+            assert_eq!(shown[1].0, "Parts");
+            assert_eq!(shown[2].0, "Effect");
+            assert!(shown[2].1.contains("with its data"));
+            assert_eq!(shown[3], ("Tenant", "abcdefgh"));
+            assert_eq!(shown.len(), 4);
+            continue;
+        }
+        if action == ActionKind::TenantRemove {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Tenant", "Effect"]);
+            assert_eq!(details[0].value, "abcdefgh");
+            assert!(details[1].value.contains("with its data"));
+            continue;
+        }
         let schema = action.params_schema();
         let fields = schema["properties"].as_object().expect("properties");
         let mut seen = 0;
         for field in fields.keys() {
+            // A database proposal that names a tenant is refused when it is proposed, so no card ever shows one: the
+            // field is in the schema only to carry that refusal.
+            if action == ActionKind::PostgresCreate && field == "tenant" {
+                continue;
+            }
             let label = match (action, field.as_str()) {
+                (_, "tenant") => "Tenant",
+                (_, "deploy") => "Deploy",
                 (ActionKind::PostgresCreate, "name") => "Database",
                 (_, "name") => "Name",
                 (_, "template") => "Template",

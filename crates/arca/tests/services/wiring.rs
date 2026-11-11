@@ -788,6 +788,7 @@ fn service_remove_logs_a_running_services_node_out_before_it_deletes_it() {
             rig.kernel.lock().unwrap().spend_service_removal(
                 &EntryId("service-dash".into()),
                 "dash",
+                &json!({"name": "dash"}),
                 &owner_approval(&key, "dash"),
                 NOW
             ),
