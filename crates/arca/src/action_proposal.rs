@@ -70,6 +70,29 @@ pub enum ActionKind {
     DeployRemove,
 }
 
+/// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
+fn shown(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if clean.chars().count() <= max {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
+/// A setting's value as a card shows it: a string as it is, anything else as compact JSON, shortened to 160
+/// characters. The whole value is what the approval covers; the card says so by the ellipsis.
+fn setting_shown(value: &Value) -> String {
+    match value {
+        Value::String(text) => shown(text, 160),
+        other => shown(&other.to_string(), 160),
+    }
+}
+
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
     pub const ALL: [ActionKind; 20] = [
@@ -293,6 +316,14 @@ impl ActionKind {
                     (_, Some(reason)) => rows.push(row("Start", &stopped_words(reason))),
                     (Some(true), None) => rows.push(row("Start", start_words(true))),
                     (None, None) => {}
+                }
+                // One row for each setting the create replaces, with its value: a setting such as an address
+                // decides where the new machine sends its credential, so the owner sees it before approving.
+                for (key, value) in args["settings"].as_object().into_iter().flatten() {
+                    rows.push(row(
+                        &format!("Setting {}", shown(key, 64)),
+                        &setting_shown(value),
+                    ));
                 }
                 rows
             }

@@ -294,7 +294,8 @@ fn target(owned: &Owned) -> Result<String, IncusError> {
 
 /// The instance path and the project of a guest-file request: the project is the owned instance's own, as the writer
 /// read it under its family, and is the node's service project or a tenant's project and nothing else. Only the two
-/// guest-secret destinations are sent to it. A command, a recording and every other file stay with [`target`], in the
+/// guest-secret destinations are sent to it. A command and every other file stay with [`target`], and a recording is
+/// read and deleted by its own fixed path ([`UnixIncusWriter::service_output`]): all three name the
 /// node's own project.
 fn guest_target(owned: &Owned) -> Result<(String, &str), IncusError> {
     let object = owned.target();
