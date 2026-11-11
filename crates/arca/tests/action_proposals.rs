@@ -279,6 +279,7 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::ServiceCreate => json!({
                 "name": "nats", "template": "nats", "bridge": "br0", "mac": "02:aa:bb:00:00:01",
                 "tenant": "abcdefgh", "deploy": "d1", "start": false,
+                "settings": { "url": "https://git.example/example-org" },
             }),
             ActionKind::ServiceRemove => json!({ "name": "nats", "tenant": "abcdefgh" }),
             ActionKind::ServiceUnpublish
@@ -463,6 +464,18 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             // A database proposal that names a tenant is refused when it is proposed, so no card ever shows one: the
             // field is in the schema only to carry that refusal.
             if action == ActionKind::PostgresCreate && field == "tenant" {
+                continue;
+            }
+            // The settings a create replaces have one row each, named for the setting, with its value.
+            if action == ActionKind::ServiceCreate && field == "settings" {
+                for (key, value) in prepared["settings"].as_object().expect("settings") {
+                    let row = details
+                        .iter()
+                        .find(|row| row.label == format!("Setting {key}"))
+                        .unwrap_or_else(|| panic!("{action:?} details lack the setting {key}"));
+                    assert_eq!(row.value, value.as_str().expect("a string setting"));
+                    seen += 1;
+                }
                 continue;
             }
             let label = match (action, field.as_str()) {

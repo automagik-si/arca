@@ -4247,9 +4247,9 @@ fn vm_service_config(
     let root_size = template.root_size.clone().ok_or_else(internal)?;
     let user_data =
         crate::service::first_boot(template, templates_dir).map_err(service_template_error)?;
-    let (merged, replaced) =
+    let settings =
         crate::service::create_settings(template, settings).map_err(service_template_error)?;
-    let vendor_data = crate::service::vendor_data_of(&template.name, merged.as_ref())
+    let vendor_data = crate::service::vendor_data_of(&template.name, settings.merged.as_ref())
         .map_err(service_template_error)?;
     let (bridge, mac, ipv4, gateway, ports) = match place {
         VmPlace::Host { bridge, mac } => (bridge, mac, String::new(), String::new(), Vec::new()),
@@ -4293,7 +4293,7 @@ fn vm_service_config(
             mac,
             user_data,
             vendor_data,
-            settings: replaced,
+            settings: settings.replaced,
         }),
         tenant: None,
     })

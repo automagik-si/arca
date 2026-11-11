@@ -1346,9 +1346,18 @@ pub fn vendor_data_of(
     )))
 }
 
+/// The settings of one new service, as [`create_settings`] works them out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServiceSettings {
+    /// What the guest reads: the template's settings with the create's values in place of the defaults. `None` for
+    /// a template without settings.
+    pub merged: Option<Value>,
+    /// The values the create replaced, by key. `None` when it gave none.
+    pub replaced: Option<Map<String, Value>>,
+}
+
 /// The settings of one new service: the template's, with the values its `service_create` gave in `given` put in place
-/// of the defaults. Returns the merged object (what the guest reads) and the replaced values by key (`None` when the
-/// create gave none). Every refusal is in plain words and names the key:
+/// of the defaults. Every refusal is in plain words and names the key:
 ///
 /// - only a key the template lists in `createSettings` may be given;
 /// - a value has the JSON type of the template's default, and a whole number stays a whole number;
@@ -1360,17 +1369,21 @@ pub fn vendor_data_of(
 pub fn create_settings(
     template: &Template,
     given: Option<&Value>,
-) -> Result<(Option<Value>, Option<Map<String, Value>>), TemplateError> {
+) -> Result<ServiceSettings, TemplateError> {
     let name = &template.name;
     let refused = |why: String| Err(TemplateError::refused(why));
+    let unchanged = || ServiceSettings {
+        merged: template.settings.clone(),
+        replaced: None,
+    };
     let Some(given) = given else {
-        return Ok((template.settings.clone(), None));
+        return Ok(unchanged());
     };
     let Some(given) = given.as_object() else {
         return refused("settings: expected an object of setting names and values".into());
     };
     if given.is_empty() {
-        return Ok((template.settings.clone(), None));
+        return Ok(unchanged());
     }
     let Some(defaults) = template
         .settings
@@ -1422,7 +1435,10 @@ pub fn create_settings(
             "settings: with these values the settings of template {name} pass 16KiB"
         ));
     }
-    Ok((Some(merged), Some(given.clone())))
+    Ok(ServiceSettings {
+        merged: Some(merged),
+        replaced: Some(given.clone()),
+    })
 }
 
 /// The JSON type of a value, in the words a refusal uses. A whole number and a number with a fraction are two types:
