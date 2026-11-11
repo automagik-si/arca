@@ -8,16 +8,16 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
 
 - Arca is one program. Arca is open source under the Apache-2.0 licence.
 - A fresh install only looks: it changes nothing until you tell it which parts are its own.
-- Arca is self-hosted: it runs on machines you own and needs no outside service to work.
-- Arca keeps an append-only journal: an audit log of every change Arca applies.
+- Arca is self-hosted: it runs on machines you own, and Arca itself needs no outside service to work.
+- Arca keeps an append-only journal of the changes it applies. Starts, stops and restarts are logged separately.
 
-**Status: `0.1.0-alpha.7`.** Arca is an alpha, for one machine at a time. Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal.
+**Status: alpha.** Arca is an alpha, for one machine at a time. Today it needs a Linux machine (x86_64) with Incus, and a person comfortable with a terminal. The current version is on the [releases page](https://github.com/automagik-si/arca/releases).
 
 | Works today | Not yet |
 |---|---|
 | Ready to run today: Postgres, NATS, Omni, Automagik, a Cloudflare tunnel and a workspace virtual machine. | There is no installer yet: the first setup is written by hand. |
 | Arca can save snapshots of a service onto a disk you plug in. | Arca cannot yet restore a snapshot for you: restoring is done by hand with Incus. |
-| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template. |
+| Arca speaks MCP, so an assistant can ask it questions and propose changes. | Arca cannot yet run any app or container image you name: a service comes from a ready template, or Arca takes over one that already runs on the machine. |
 | Two machines can be paired with a one-time code. | The ChatGPT and Claude apps cannot connect to Arca in one click yet. |
 | Arca checks passkeys itself; no outside sign-in service is involved. | Arca does not repair things by itself. |
 
