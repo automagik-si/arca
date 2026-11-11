@@ -42,8 +42,9 @@ name: Release
 #     right under Unreleased and outside any comment, and blank lines and list lines (`- ...`) inside that section,
 #     with no control character and no `<`.
 # Of the release files, this is checked: they are the four expected and nothing else; SHA256SUMS is two lines, the
-# binary's and then install.sh's, and both files match it; install.sh is, byte for byte, scripts/install.sh of the
-# release commit, and its one ARCA_VERSION line names this version. The release fails when any of that is not so.
+# binary's and then install.sh's, both files match it, and it is byte for byte what sha256sum writes (each sum, two
+# spaces, the name); install.sh is, byte for byte, scripts/install.sh of the release commit, and its one
+# ARCA_VERSION line names this version. The release fails when any of that is not so.
 # What is not checked: what a list line says (it is a commit's subject, and may hold a link), which number the
 # version is, what the binary is, and what the release notes say. Code that runs in cut can therefore still shape
 # the binary it builds, the words of the changelog lines and the release notes, and which version number the
@@ -294,14 +295,21 @@ jobs:
             [[ -f "${HANDOVER}/${file}" && ! -L "${HANDOVER}/${file}" ]] || stop "${file} is not a plain file"
           done <<< "${expected}"
 
-          # SHA256SUMS is two whole lines: the binary's, then the installer's. Each file is the one its line names.
+          # SHA256SUMS is two whole lines: the binary's, then the installer's. Each file is the one its line names,
+          # by this job's own reading of the two files, and the file is, byte for byte, what sha256sum writes for
+          # them: each sum, two spaces, the name, a line end. Checkers differ in what else they read as a line (one
+          # space, a tab, a space before the sum), so nothing else is published.
           [[ "$(wc -l < "${HANDOVER}/SHA256SUMS")" == 2 && -z "$(tail -c 1 "${HANDOVER}/SHA256SUMS")" ]] ||
             stop "SHA256SUMS does not hold exactly two lines"
           { read -r sum name; read -r installer_sum installer_name; } < "${HANDOVER}/SHA256SUMS"
           [[ "${sum}" =~ ^[0-9a-f]{64}$ && "${name}" == "${asset}" ]] || stop "SHA256SUMS does not name ${asset} with a SHA-256 on its first line"
           [[ "${installer_sum}" =~ ^[0-9a-f]{64}$ && "${installer_name}" == "install.sh" ]] ||
             stop "SHA256SUMS does not name install.sh with a SHA-256 on its second line"
-          (cd "${HANDOVER}" && sha256sum --check --strict --quiet SHA256SUMS) || stop "a release file does not match SHA256SUMS"
+          written=$(cd "${HANDOVER}" && sha256sum -- "${asset}" install.sh)
+          { read -r true_sum _; read -r true_installer_sum _; } <<< "${written}"
+          [[ "${sum}" == "${true_sum}" && "${installer_sum}" == "${true_installer_sum}" ]] || stop "a release file does not match SHA256SUMS"
+          [[ "$(git hash-object --no-filters "${HANDOVER}/SHA256SUMS")" == "$(printf '%s  %s\n%s  install.sh\n' "${true_sum}" "${asset}" "${true_installer_sum}" | git hash-object --stdin)" ]] ||
+            stop "SHA256SUMS is not written as sha256sum writes it: each sum, two spaces, the name"
           # installer <commit>: the handed-over install.sh is, byte for byte, the installer that commit holds, and
           # that installer's one ARCA_VERSION line names this version: the installer published with a release
           # installs that release, and is nothing the repository does not hold.

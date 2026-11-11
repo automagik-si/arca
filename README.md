@@ -275,7 +275,7 @@ release commit against `dev`'s own copy of each file, and the list is all there 
   and outside any comment, and blank lines and list lines (`- ...`) inside that section, with no control character
   and no `<`;
 - the release files being the four expected; `SHA256SUMS` holding two lines, the binary's and then `install.sh`'s,
-  and both files matching it; and `install.sh` being, byte for byte, the release commit's `scripts/install.sh`, whose
+  written as `sha256sum` writes them (the sum, two spaces, the name), and both files matching it; and `install.sh` being, byte for byte, the release commit's `scripts/install.sh`, whose
   `ARCA_VERSION` line names the version being released. An installer at another version stops the release.
 
 What this does not stop: code that runs in the first job, a hostile dependency among it, can still shape the binary

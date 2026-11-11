@@ -106,7 +106,8 @@ install -m 0755 scripts/install.sh "$dist/install.sh"
     printf '%s\n' "$notes" | sed -e '/./,$!d'
     printf '\n`%s` is one file for x86_64 Linux. It needs glibc %s or newer.' "$asset" "$glibc"
     printf ' `install.sh` sets up a read-only node with this release: read it, then run `sh install.sh`.'
-    printf ' Check what you downloaded with `sha256sum --check --ignore-missing SHA256SUMS`.\n'
+    printf ' Check what you downloaded with `sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints `%s: OK`.\n' \
+        "$asset"
 } >"$dist/RELEASE-NOTES.md"
 
 echo

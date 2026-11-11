@@ -655,7 +655,13 @@ fn the_release_files_carry_the_installer_and_an_installer_at_another_version_sto
     assert!(checked.status.success());
     let notes = scratch.read("dist/RELEASE-NOTES.md");
     assert!(notes.starts_with("- a change\n"), "{notes}");
-    assert!(notes.contains("`sha256sum --check --ignore-missing SHA256SUMS`"));
+    assert!(
+        notes.contains(
+            "`sha256sum --check --ignore-missing SHA256SUMS`, and stop unless it prints \
+             `arca-0.8.0-linux-x86_64: OK`.\n"
+        ),
+        "{notes}"
+    );
     let said = String::from_utf8_lossy(&built.stdout);
     assert!(
         said.contains("dist/arca-0.8.0-linux-x86_64 dist/install.sh dist/SHA256SUMS"),
@@ -1112,7 +1118,15 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
     ));
     assert_eq!(rules.matches("refs/heads/dev").count(), 1);
     assert_eq!(rules.matches("gh release create").count(), 1);
-    assert!(publish.contains("sha256sum --check --strict --quiet SHA256SUMS"));
+    // The checksums are this job's own reading of the two files, and SHA256SUMS is compared with them byte for byte:
+    // no checker's own way of reading a line decides what is published.
+    assert!(
+        publish.contains("written=$(cd \"${HANDOVER}\" && sha256sum -- \"${asset}\" install.sh)")
+    );
+    assert!(publish.contains(
+        "printf '%s  %s\\n%s  install.sh\\n' \"${true_sum}\" \"${asset}\" \"${true_installer_sum}\" | git hash-object --stdin"
+    ));
+    assert!(!publish.contains("sha256sum --check"));
     // The installer is published as the release commit holds it, and the cutting job hands it over with the rest.
     assert!(publish.contains(
         "gh release create \"v${VERSION}\" \"arca-${VERSION}-linux-x86_64\" install.sh SHA256SUMS \"${flags[@]}\""
@@ -2000,6 +2014,23 @@ impl Lab {
             "a checksum of another name" => {
                 fs::write(dir.join("SHA256SUMS"), sums.replace(&asset, "arca")).expect("write")
             }
+            // Lines that sha256sum itself reads as true, and that are not written as it writes them.
+            "one space in a checksum line" => {
+                fs::write(dir.join("SHA256SUMS"), sums.replacen("  ", " ", 1)).expect("write")
+            }
+            "a tab in the installer's checksum line" => fs::write(
+                dir.join("SHA256SUMS"),
+                sums.replace("  install.sh", "\tinstall.sh"),
+            )
+            .expect("write"),
+            "a space before a checksum" => {
+                fs::write(dir.join("SHA256SUMS"), format!(" {sums}")).expect("write")
+            }
+            "a space at the end of a checksum line" => fs::write(
+                dir.join("SHA256SUMS"),
+                sums.replace("install.sh\n", "install.sh \n"),
+            )
+            .expect("write"),
             "the checksums the other way round" => {
                 fs::write(dir.join("SHA256SUMS"), sums_of(&["install.sh", &asset])).expect("write")
             }
@@ -2256,7 +2287,7 @@ fn when_dev_moves_between_the_check_and_the_push_neither_the_commit_nor_the_tag_
 
 /// Each way a handover is not exactly a release, with the words of the one check that must catch it. Every other part
 /// of each handover is right, so the words name the check that fired.
-const REFUSED: [(&str, &str); 60] = [
+const REFUSED: [(&str, &str); 64] = [
     // The files.
     (
         "an extra file",
@@ -2303,6 +2334,22 @@ const REFUSED: [(&str, &str); 60] = [
     (
         "an installer that is not the one its checksum names",
         "a release file does not match SHA256SUMS",
+    ),
+    (
+        "one space in a checksum line",
+        "SHA256SUMS is not written as sha256sum writes it",
+    ),
+    (
+        "a tab in the installer's checksum line",
+        "SHA256SUMS is not written as sha256sum writes it",
+    ),
+    (
+        "a space before a checksum",
+        "SHA256SUMS is not written as sha256sum writes it",
+    ),
+    (
+        "a space at the end of a checksum line",
+        "SHA256SUMS is not written as sha256sum writes it",
     ),
     // The installer that would be published is not the one the release commit holds.
     (
