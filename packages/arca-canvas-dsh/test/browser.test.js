@@ -1286,3 +1286,71 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
   assert.ok(stacked.panel.top >= stacked.stage.bottom - 1, 'panel stacks below the canvas');
   assert.ok(stacked.stage.top >= stacked.machines.bottom - 1, 'canvas follows the machines strip');
 });
+
+test('a hash that names no project goes to the default project when a poll lands before its event', async (t) => {
+  const snapshot = { ...fixture, approvalUrl: '' };
+  const server = createServer((req, res) => {
+    const path = new URL(req.url, 'http://local').pathname;
+    if (path === '/arca-canvas') { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(html); return; }
+    if (path === '/arca-canvas/page.js') { res.writeHead(200, { 'Content-Type': 'text/javascript' }); res.end(pageJs); return; }
+    if (path === '/arca-canvas/page.css') { res.writeHead(200, { 'Content-Type': 'text/css' }); res.end(pageCss); return; }
+    if (path === '/arca-canvas/snapshot') { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(snapshot)); return; }
+    if (path === '/arca-canvas/chat/history') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        session: { id: 'session-doctor', name: 'Doctor' }, messages: [],
+        usage: { day: '2026-11-08', dailyTokens: 0, dailyBudget: 1_000_000 },
+        limits: { toolCallsPerTurn: 40, outputTokensPerTurn: 64_000 },
+      }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => { server.closeAllConnections?.(); server.close(resolve); }));
+  const browser = await chromium.launch({ headless: true });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  // The test decides when a snapshot poll is answered. A held poll is answered inside one task, with a body that is
+  // already there, so everything the page does with it runs before any event that task has queued.
+  await page.addInitScript(() => {
+    const real = window.fetch.bind(window);
+    window.__held = [];
+    window.__holdPolls = false;
+    window.fetch = (input, init) => {
+      const url = String(input?.url ?? input);
+      if (!window.__holdPolls || !url.endsWith('/snapshot')) return real(input, init);
+      return new Promise((resolve) => { window.__held.push(resolve); });
+    };
+  });
+  await page.goto(`http://127.0.0.1:${server.address().port}/arca-canvas`);
+  await page.waitForFunction(() => location.hash === '#project/Studio');
+  await page.locator('.arca-project-select').selectOption('Automation');
+  await page.waitForFunction(() => document.querySelector('.arca-canvas-title')?.textContent === 'Automation');
+
+  await page.evaluate(async () => {
+    window.__snapshot = await (await fetch('/arca-canvas/snapshot')).json();
+    window.__holdPolls = true;
+  });
+  await page.waitForFunction(() => window.__held.length === 1);
+  await page.evaluate(() => {
+    // This listener runs before the page's own: it sees the hash as the poll left it.
+    window.addEventListener('hashchange', () => { window.__hashAtEvent = location.hash; }, { capture: true, once: true });
+    window.addEventListener('hashchange', () => { window.__eventHandled = true; }, { once: true });
+    location.hash = '#project/does-not-exist';
+    window.__holdPolls = false;
+    window.__held.shift()({ ok: true, json: () => Promise.resolve(window.__snapshot) });
+  });
+  await page.waitForFunction(() => window.__eventHandled === true);
+
+  const seen = await page.evaluate(() => ({
+    hashAtEvent: window.__hashAtEvent,
+    hash: location.hash,
+    title: document.querySelector('.arca-canvas-title')?.textContent,
+    picked: document.querySelector('.arca-project-select')?.value,
+  }));
+  assert.notEqual(seen.hashAtEvent, '#project/does-not-exist', 'the poll was handled before the hash event');
+  assert.deepEqual(seen, {
+    hashAtEvent: '#project/Studio', hash: '#project/Studio', title: 'Studio', picked: 'Studio',
+  });
+});

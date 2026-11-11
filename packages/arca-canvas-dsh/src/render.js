@@ -2003,7 +2003,11 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
     const previous = state.project ? selectDashboardProject(state.project.name) : null;
     const hashedName = parseProjectHash(location.hash);
     const hashed = hashedName ? selectDashboardProject(hashedName) : null;
-    const project = hashed ?? previous ?? state.dashboard.defaultProject ?? state.dashboard.projects[0] ?? null;
+    // A hash that names no project goes to the default project, here as in onHash. A snapshot can arrive between a
+    // hash change and its event; if it kept the project already shown it would write that project back into the
+    // hash, and the event would then find a valid hash and stay there.
+    const shown = hashedName && !hashed ? null : previous;
+    const project = hashed ?? shown ?? state.dashboard.defaultProject ?? state.dashboard.projects[0] ?? null;
     state.project = project;
     if (project) {
       const hash = projectHash(project);

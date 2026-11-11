@@ -1,5 +1,5 @@
 //! The HTTP surface: the `POST /mcp` route, the read-only GET routes, the unix socket listener, the tailnet listener with
-//! its peer filter, and the proxy listener with its exact-peer filter.
+//! its peer filter, the proxy listener with its exact-peer filter, and the services socket.
 //!
 //! A request carrying any `Origin` header is refused `403` before its body is read, whatever its method or path: a browser
 //! page is never a client. The unix socket is bound inside a fresh private directory, chmodded 0600 and renamed into place,
@@ -7,8 +7,10 @@
 //! listener binds one address that lies in the tailnet ranges, and every TCP peer is checked against the same ranges; a
 //! peer outside them is dropped before any byte is read or written. The proxy listener binds one fixed address outside the
 //! tailnet ranges for a reverse proxy on the same host, and serves exactly one peer address; any other peer is dropped the
-//! same way. The proxy address may not be assigned yet when the server starts, so its bind is tried again for a while. Each
-//! listener serves at most [`MAX_CONNECTIONS`] connections at once.
+//! same way. The proxy address may not be assigned yet when the server starts, so its bind is tried again for a while. The
+//! services socket is a second unix socket, bound the same way as the first, that also serves root: Incus connects to it
+//! for a service with kernel access. Each listener serves at most [`MAX_CONNECTIONS`] connections at once, counted for
+//! that listener alone.
 
 use std::collections::HashMap;
 use std::fs;
@@ -35,7 +37,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::auth::{Caller, TokenStore};
-use crate::fresh::fresh_dir;
+use crate::fresh::{fresh_dir, process_uid};
 use crate::jsonrpc;
 use crate::tools::{CallError, ToolHandler};
 
@@ -225,6 +227,37 @@ pub async fn serve_unix(router: Router, path: &Path) -> io::Result<()> {
     let listener = OwnerListener {
         listener,
         uid,
+        root: false,
+        permits: permits(),
+    };
+    axum::serve(listener, router).await
+}
+
+/// Serves `router` on a second unix socket at `path`, the services socket: mode 0600, bound as [`serve_unix`] binds
+/// its own, and served to peers of this process's uid and to root. Incus connects to it, as root, for a service whose
+/// device forwards the instance's loopback to it. The caller passes the MCP router alone, whose every route needs a
+/// bearer token, so the socket gives its peer no authority. The directory that holds the socket must belong to this
+/// process's uid or to root and be writable by its owner alone, so no other user can put a socket of its own at the
+/// path while the server is down.
+pub async fn serve_services(router: Router, path: &Path) -> io::Result<()> {
+    services_path_ok(path).map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
+    let parent = path.parent().unwrap_or(Path::new("/"));
+    let held = fs::metadata(parent)?;
+    if !held.is_dir()
+        || !(held.uid() == process_uid()? || held.uid() == 0)
+        || held.mode() & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the directory of the services socket must belong to the server's user or to root and be writable by its owner alone",
+        ));
+    }
+    clear_stale_socket(path)?;
+    let (listener, uid) = bind_staged(path)?;
+    let listener = OwnerListener {
+        listener,
+        uid,
+        root: true,
         permits: permits(),
     };
     axum::serve(listener, router).await
@@ -480,11 +513,13 @@ where
     }
 }
 
-/// The listener of the unix socket: it serves only a peer whose credentials carry `uid`, at most [`MAX_CONNECTIONS`] at
-/// once.
+/// The listener of a unix socket: it serves only a peer whose credentials carry `uid`, and root when `root` is set, at
+/// most [`MAX_CONNECTIONS`] at once.
 struct OwnerListener {
     listener: UnixListener,
     uid: u32,
+    /// Whether root is served too: the services socket alone.
+    root: bool,
     permits: Arc<Semaphore>,
 }
 
@@ -497,7 +532,11 @@ impl axum::serve::Listener for OwnerListener {
             let permit = take_permit(&self.permits).await;
             match self.listener.accept().await {
                 Ok((stream, peer))
-                    if owner_admitted(stream.peer_cred().ok().map(|cred| cred.uid()), self.uid) =>
+                    if owner_admitted(
+                        stream.peer_cred().ok().map(|cred| cred.uid()),
+                        self.uid,
+                        self.root,
+                    ) =>
                 {
                     return (
                         Permitted {
@@ -521,10 +560,10 @@ impl axum::serve::Listener for OwnerListener {
     }
 }
 
-/// Whether a peer whose credentials read `peer_uid` is served by a server of `server_uid`. Credentials that cannot be read
-/// admit nobody.
-fn owner_admitted(peer_uid: Option<u32>, server_uid: u32) -> bool {
-    peer_uid == Some(server_uid)
+/// Whether a peer whose credentials read `peer_uid` is served by a server of `server_uid`: the same uid, and root when
+/// `root` says the listener serves it. Credentials that cannot be read admit nobody.
+fn owner_admitted(peer_uid: Option<u32>, server_uid: u32, root: bool) -> bool {
+    peer_uid == Some(server_uid) || (root && peer_uid == Some(0))
 }
 
 /// Whether `addr` may be the tailnet listener: a fixed, unreserved port, not a wildcard, and an address in the tailnet's
@@ -566,6 +605,36 @@ pub fn proxy_addr_ok(addr: &SocketAddr) -> Result<(), String> {
     }
     if in_tailnet(&ip) {
         return Err("a tailnet address is never a proxy listener".into());
+    }
+    Ok(())
+}
+
+/// Whether `path` may be the services socket: an absolute path of at most 100 bytes, made of letters, digits, `/`, `.`,
+/// `_` and `-`, with no `..` part and a file name at its end. The path is written into an Incus device, so it holds
+/// nothing a device value could read as anything else.
+pub fn services_path_ok(path: &Path) -> Result<(), String> {
+    let Some(text) = path.to_str() else {
+        return Err("the path is not text".into());
+    };
+    if !text.starts_with('/') {
+        return Err("the path must be absolute".into());
+    }
+    if text.len() > 100 {
+        return Err("the path is longer than 100 bytes".into());
+    }
+    if !text
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return Err("the path holds a character other than letters, digits, /, ., _ and -".into());
+    }
+    if text.ends_with('/')
+        || text
+            .split('/')
+            .skip(1)
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err("the path must name a file, with no empty, . or .. part".into());
     }
     Ok(())
 }
@@ -693,11 +762,16 @@ mod tests {
 
     #[test]
     fn a_peer_is_admitted_only_with_the_servers_own_uid() {
-        assert!(owner_admitted(Some(1000), 1000));
-        assert!(!owner_admitted(Some(1001), 1000));
-        assert!(!owner_admitted(Some(0), 1000));
+        assert!(owner_admitted(Some(1000), 1000, false));
+        assert!(!owner_admitted(Some(1001), 1000, false));
+        assert!(!owner_admitted(Some(0), 1000, false));
+        // The services socket serves root too, and still no other user.
+        assert!(owner_admitted(Some(1000), 1000, true));
+        assert!(owner_admitted(Some(0), 1000, true));
+        assert!(!owner_admitted(Some(1001), 1000, true));
+        assert!(!owner_admitted(None, 1000, true));
         assert!(
-            !owner_admitted(None, 1000),
+            !owner_admitted(None, 1000, false),
             "unreadable credentials admit nobody"
         );
     }

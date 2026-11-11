@@ -2,8 +2,8 @@
 //!
 //! Every request is refused `403` when it carries an `Origin` header. Otherwise it must carry a bearer token of a stored
 //! scope, or it is refused `401`. The server keeps only SHA-256 digests of the tokens, read from `<id>.hash` files.
-//! It listens on a unix socket (mode 0600) and, optionally, on one tailnet address and on one proxy address that serves a
-//! single peer.
+//! It listens on a unix socket (mode 0600) and, optionally, on one tailnet address, on one proxy address that serves a
+//! single peer, and on a second unix socket for the node's own services.
 
 pub mod auth;
 mod fresh;
@@ -14,7 +14,7 @@ pub mod tools;
 pub use auth::{Caller, TokenStore, TokenStoreError, mint, mint_with_tools};
 pub use http::{
     GetHandler, GetReply, Server, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy,
-    serve_tailnet, serve_unix, tailnet_addr_ok,
+    serve_services, serve_tailnet, serve_unix, services_path_ok, tailnet_addr_ok,
 };
 pub use tools::{CallError, ToolHandler};
 

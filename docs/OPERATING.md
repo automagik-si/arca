@@ -69,6 +69,7 @@ refused without the value being echoed back.
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
 | `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. See below. |
+| `listen.services` | no | The path of a second unix socket, or `null`: the services socket. It serves the MCP routes alone, never the approval page, to the server's own user and to root. A service with kernel access connects to it. See below, and "A service that may talk to the kernel". |
 | `tokens.hashDir` | yes | The directory of hash files. See below. |
 | `kernel.projects` | no | The project family the kernel may write in. With projects named, the writer serves only those projects. With none, the kernel is watch-only: the reconciler's provider reads only, service writes are refused, no GPU device writer exists, and a removal cannot reach Incus. |
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
@@ -100,6 +101,8 @@ The config is refused, with exit 2, when:
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
   `listen.proxy.peer` is missing or a wildcard; or `listen.proxy` carries any other key;
+- `listen.services` is not an absolute file path of at most 100 bytes made of letters, digits, `/`, `.`, `_` and `-`
+  with no `..` part, or it is `listen.unix`'s path;
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
 - `kernel.projects` is not empty and `kernel.droiddProjects` is empty;
 - `kernel.scratch` is `true` and a kernel project does not start with `arcak-scratch-`.
@@ -136,6 +139,22 @@ any other bind error, such as a port in use, stops it at once.
 
 The connection is plain HTTP on the bridge, and a host that can take the peer's address can reach the listener; the bearer
 token is still required. Serving on a proxy address is a separate step, approved by the owner like the tailnet listener.
+
+### Services socket
+
+`listen.services` is the path of a second unix socket, for example `/run/arca/services.sock` beside `listen.unix`. It
+is bound as the first one is (mode 0600, renamed into place) and serves the server's own user and root, and nobody else.
+It serves the MCP routes and nothing else: `POST /mcp` and the read-only GET routes, each behind a bearer token. The
+approval page is never on it, on any node and whatever the config becomes: a request for `/approve` or anything under it
+is 404, and a request that carries an `Origin` is 403. A node may serve its approval page and have this socket too; the
+two sockets are separate, and one path cannot be both.
+
+Incus connects to this socket, as root, for a service with kernel access (see "A service that may talk to the kernel").
+Root is served for that reason alone, and root can already do everything on the host. No other local user reaches the
+socket, and it has no port: nothing on the host can take a port in its place while the server is down. The directory
+that holds it must belong to the server's user or to root and be writable by its owner alone; `serve` refuses to bind
+it anywhere else, since another user could put a socket of its own at the path and be sent a service's token. The
+socket has its own limit of 64 connections, apart from every other listener's. A clean stop removes it.
 
 ## The link
 
@@ -261,14 +280,16 @@ service profile and NIC ACL, records the desired entry, and starts the container
 needs is available; with `start: false` it never starts it (see "Creating a service stopped" below). `service_list` and `service_status` derive state from Incus and report instances that Arca did
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
-listener. `service_logs` returns console lines as untrusted text with stored
-secrets redacted and a capped, truncated result. The eight shipped templates live in `templates/`, with their pinned
-images and vendored npm lockfile. Two of them, `workspace-vm` and `github-runner-pool`, are virtual machines (see
-"Bridged nodes and virtual machines", "Mixed nodes" and "A pool of GitHub Actions runners").
+listener. A row carries `kernelAccess` only when the service's template declares it (see "A service that may talk to the
+kernel"). `service_logs` returns console lines as untrusted text with stored
+secrets redacted and a capped, truncated result. The nine shipped templates live in `templates/`, with their pinned
+images and vendored npm lockfile. Three of them, `workspace-vm`, `github-runner-pool` and `automagik-workspace`, are
+virtual machines (see "Bridged nodes and virtual machines", "Mixed nodes", "A pool of GitHub Actions runners" and
+"An Automagik workspace in its own virtual machine").
 
 `arca templates install --config <file>` installs the shipped templates in one step: each template's JSON and the
 script its entrypoint or its first boot reads (`postgres-autopg.sh` for `postgres-autopg`, `github-runner-pool.sh` for
-`github-runner-pool`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
+`github-runner-pool`, `automagik-workspace.sh` for `automagik-workspace`), from the build itself, so no checkout is needed. An entrypoint's `{ "file": "<name>" }` names a plain file in the templates directory: letters, digits, dots,
 dashes and underscores, not starting with a dot, so no path. A template whose script is missing is refused by
 `service_create` with the file it looked for (`templates/<name>`). A template whose `image` is `local:<alias>`
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
@@ -364,6 +385,91 @@ restrictions retain Incus' managed default.
 The `automagik-server` template pins the OCI server image, mounts `/data` owned by uid/gid 1000, overrides the profile to
 4 CPU / 4GiB, enables autostart, and exposes port 3081 through this proxy.
 
+### A service that may talk to the kernel
+
+A service's NIC ACL rejects the bridge gateway, so a service cannot reach the kernel's MCP over the network, and the
+unix socket serves the server's own uid alone and may carry the approval page. A container template may declare that its service talks to the kernel:
+
+```json
+"kernelAccess": { "port": 7461 }
+```
+
+`port` is a port inside the instance, 1024 to 65535, that is none of the template's own `ports` and not its `dashPort`.
+The service's instance then carries one more device, named `kernel`, and nothing else changes: its NIC, its ACL and the
+unix socket are as they are for every service.
+
+```json
+"kernel": { "type": "proxy", "bind": "instance", "listen": "tcp:127.0.0.1:7461", "connect": "unix:<listen.services>" }
+```
+
+Incus listens inside the instance, on its loopback, and connects from the host to the kernel's services socket
+(`listen.services`). Inside the instance the kernel is `http://127.0.0.1:7461/mcp`: plain HTTP that never leaves the
+instance's loopback, so a client that allows plain HTTP on loopback alone works unchanged. Nothing crosses the bridge.
+
+The device carries bytes and no authority. Every process in the instance reaches the listener, and each one gets what the
+token it sends allows: a call without a token is 401, and a token is held to its scope and its tool list
+(`arca token mint --tools`). Give the service a token whose tool list names the verbs it needs, as a service secret.
+
+A create of such a template is refused, before anything is written, unless all of these hold:
+
+- **The service is the node's own.** In a tenant the create is refused, and so is its proposal, so the owner is never
+  shown a card for it. No verb installs a template: a tenant names a template that is already in
+  `<stateDir>/templates`, and one that declares `kernelAccess` is refused there. Beneath that, a tenant's project blocks
+  every proxy device (`restricted.devices.proxy=block`).
+- **The node has the socket.** `listen.services` must be set. When it is not, the refusal says what to set:
+  `"listen": { "services": "/run/arca/services.sock" }` (a path beside `listen.unix`) in the node's config, then restart
+  `serve`. No other listener stands in for it: the unix socket, the tailnet listener and `listen.proxy` may carry the
+  approval page, whose routes need no token, so no device is ever pointed at one of them. A node that serves its
+  approval page and has `listen.services` gives kernel access like any other.
+- **The owner approved it.** Such a service is created only from a proposal: `action_propose` with `service_create`,
+  then the owner's approval. A direct `service_create` of such a template is refused with `NotApproved`, whatever the
+  token's scope. The proposal carries the template's key, `"kernelAccess": { "port": 7461 }`, filled in from the
+  template, so the approval binds it, and the owner's card carries a `Kernel access` row: "Yes: this service can call
+  this node's kernel from inside, at http://127.0.0.1:7461/mcp, with whatever token it is given. The token's scope and
+  tool list decide what it may do, and a call without a token is refused." A template that gains the key, or changes
+  its port, after its card was shown is not created by that approval. A call that states the key for a template
+  without it is an invalid call.
+
+Only a container template takes the key: a virtual machine has no device that listens inside it.
+
+`service_list` and `service_status` carry `kernelAccess: { "port", "connect" }` for such a service and no such key for
+any other. `connect` is the socket the device was made for. `service_status` also answers `ready`, and `problem` when
+it is false: the instance does not carry the device as Arca made it, or the node's `listen.services` is no longer the
+socket the device connects to.
+
+The device keeps the path it was made with. `serve` therefore refuses to start (exit 2, naming the service and the
+path) while any service's record names kernel access through a socket the config does not serve as `listen.services`:
+one that is no longer set, or one at another path. Set it back, or remove the service first. This holds whatever else
+the config has become, so a device is never left connected to a listener that could carry the approval page.
+
+The device is the instance's own. It stays through a restart of the instance and of `serve` (tested against the fake
+Incus), and it is deleted with the instance by `service_remove`. That it is there again after a restart of the host is
+Incus's to keep, in its own database, and is not yet checked on a live node. A record that is lost and made again from
+the instance's marks reads the device back, so `service_list` still says the service has the access.
+
+The effect journal records the create of the instance, and the digest it keeps (`op_digest`) is the digest of the create
+that carries the device; `journal_list` shows the effect, not the body. The service's record in the desired state names
+both ends of the access, and a proposal's journal line keeps the card's row.
+
+What a process in the instance can and cannot do through the device:
+
+- With no token, nothing: every MCP route answers 401, and no other route exists on the socket.
+- With the service's token, what that token allows. Any process in the instance that can read the token can use it.
+- It can hold connections open. The socket's own limit of 64 is then spent, which stops other services with kernel
+  access from calling the kernel; the unix socket, the tailnet listener and the proxy listener are not affected.
+
+Not yet checked on a live Incus, and the first things to check there:
+
+- that a proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` is accepted on a
+  container in the restricted service project and listens on the container's loopback;
+- that Incus connects to the socket as root, which is the one peer beside the server's own user the socket serves, and
+  that the confinement of Incus's proxy helper lets it reach a socket under the server's runtime directory.
+
+To check it on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus config
+device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode 0600,
+owned by the server's user; and the service's own log shows its first call to the kernel answered. If the service's
+calls are closed with no answer while `ready` is true, Incus is not connecting as root.
+
 `service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
 approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends
 that service-action approval once, then removes the desired entry and runs its pending delete plan under one kernel
@@ -457,7 +563,8 @@ its request is read.
   sign; nothing written) or `changed`. No line is echoed. It is a doctor verb that writes, served only by a kernel whose
   `approval.peerKeys` is set; see "Approving on another machine".
 
-`serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
+`serve` listens on the unix socket, and on the tailnet and proxy addresses and the services socket when the config names
+them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
 SIGHUP reloads the bearer token store only; it does not reread the node config or the owner passkeys.
 A socket that another server answers on is left alone.
@@ -2545,6 +2652,142 @@ What to know:
 - **The image.** The template pins `docker.io/cloudflare/cloudflared` release 2026.10.7 by digest, so it never updates
   by itself. A later Arca release moves the pin.
 
+## An Automagik workspace in its own virtual machine
+
+The shipped `automagik-workspace` template is one virtual machine that holds one Automagik workspace and publishes it
+on the internet under your own domain, for example `https://workspace.example.com`. Inside it a small keeper runs
+three containers, in the shape of Automagik's own `server/compose.gate.yml`:
+
+| Container | What it is | Where it listens |
+|-----------|------------|------------------|
+| `automagik-server` | The Automagik server image. Its state is in `/data`. | Its own loopback, port 3081. It has a network namespace of its own and no published port. |
+| `automagik-gate` | The same image by the same digest, started with the gate's entrypoint. The only door to the server: it signs the owner in, and it holds the server's own sign-in credential, which never leaves the machine. | The same loopback, port 3082: it joins the server's network namespace. |
+| `automagik-tunnel` | Cloudflare's connector (`cloudflared`). It calls out to Cloudflare; nothing calls in. | Nothing but its metrics, put on that loopback too. It joins the same namespace and hands visitors to the gate's port. |
+
+The three share one loopback that belongs to none of the machine's own addresses. Nothing listens on the machine's
+address, on the service network or on the host: the template has no port, no link and no host listener. The virtual
+machine is the wall around the workspace: its agents run commands, and they run them there.
+
+This is not the `automagik-server` template with a tunnel linked to it. That server refuses every request whose
+`Host` is not its own loopback or a name it was told to trust, and it binds loopback only, so a connector in another
+service cannot use it. Here the connector shares the loopback of the gate and the server.
+
+You need a Cloudflare account with your domain already added to it, a node that may create a virtual machine of the
+template's size (2 CPUs, 4GiB of memory, a 20GiB disk: the node's `kernel.vmLimits`, or `kernel.bridged.limits`, must
+allow it), and the shipped templates installed (`arca templates install`). The Arca steps are Arca's own verbs: ask
+the assistant you use with Arca to run them. `service_create` and `instance_start` can be shown on the approval page;
+`service_secret_set` cannot be proposed, so it needs an assistant that holds a `doctor`-scope token, and the tunnel's
+token passes through that assistant's conversation.
+
+1. **Cloudflare dashboard, "Networking" > "Tunnels".** Select "Create a tunnel", enter a name (for example
+   `workspace`) and select "Create Tunnel". The next screen shows an installation command. Do not run it anywhere.
+   Copy only the long text at its end, which begins with `eyJ`: that is the tunnel's token. Treat it like a password.
+   Leave this screen open. Use a tunnel of its own for each workspace: whoever holds a tunnel's token can serve that
+   tunnel's routes.
+2. **Cloudflare dashboard, "Zero Trust" > "Access" > "Applications": who may open the address.** Do this before the
+   address leads anywhere (step 7), so that it is never open to a stranger. Select "Add an application", then
+   "Self-hosted". Give it a name, and as its public host name enter the address the workspace will have
+   (`workspace.example.com`). Add a policy with the action "Allow" and one rule, "Emails", that lists your own
+   address (`owner@example.com`) and nobody else's. Save it. Note two things, neither of them a secret: your team
+   domain (`<your team>.cloudflareaccess.com`, in the Zero Trust settings) and the application's "Application
+   Audience (AUD) Tag" on its overview. From now on Cloudflare asks every visitor of that address to prove one of the
+   listed e-mail addresses before anything reaches the workspace.
+3. **The template for your workspace.** The settings are part of the template, so each workspace has its own copy.
+   Whoever looks after the node copies `<stateDir>/templates/automagik-workspace.json` to a new name, for example
+   `example-workspace.json`, sets `"name"` to `example-workspace`, sets `settings.publicUrl` to the address the
+   workspace will have (`https://workspace.example.com`, with no closing slash), and sets the three Access settings
+   from step 2: `accessTeamDomain`, `accessAudience` and `accessEmails` (the same addresses as the policy). This is
+   the one step that is a file and not a verb, and it is temporary: once `service_create` takes a service's own
+   settings, these are given at create and no copy is made. The script `automagik-workspace.sh` stays as it is,
+   beside it.
+4. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. The machine is created
+   and stays `stopped`, because it has no token yet. Leave `bridge` out, so that it joins Arca's own service network.
+5. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TUNNEL_TOKEN", "value": "<the token>"}`. The
+   key is exactly `TUNNEL_TOKEN`. Arca answers `{"ok": true}`; no answer, list or log shows the token again.
+6. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`. The machine starts and the
+   answer names the secret written into it. Its first boot installs Docker and downloads the two images, which takes
+   a few minutes. Back on the Cloudflare screen from step 1 the tunnel connects; select "Continue".
+7. **Cloudflare dashboard, "Networking" > "Tunnels", your tunnel, the "Routes" tab.** Only now, with the Access
+   application of step 2 in place. Select "Add route", then "Published application". Enter the subdomain
+   (`workspace`), choose your domain (`example.com`) in "Domain", and in "Service URL" enter `http://127.0.0.1:3082`:
+   the gate's port, not the server's 3081. That address is the loopback the connector shares with the gate. Select
+   "Add route". Leave the route's "HTTP Host Header" setting empty, here and always: a Host override to a
+   loopback name would make the server accept requests it otherwise refuses, and a route to its port would then
+   pass the gate by. A route that names 3081 by mistake, without such an override, does not give anyone the
+   workspace: the server is never told its public name, so it refuses the requests and live connections its
+   interface makes (HTTP 403), its page asks for the server's own sign-in (HTTP 401), and only its static files
+   load. A page that never comes to life is that mistake: correct the port in the route.
+8. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
+   `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel is running and has registered with Cloudflare; public address https://workspace.example.com, sign-in by Cloudflare Access (team example.cloudflareaccess.com, 1 e-mail address(es))`.
+   The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
+   own sign-in for your e-mail address first, and then the workspace.
+
+| Setting | Meaning |
+|---------|---------|
+| `publicUrl` | The workspace's exact public origin, as a browser writes it: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
+| `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16, one address in each entry). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
+| `serverImage` | The Automagik server's public image, pinned by digest. The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below). |
+
+Two things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image is
+fixed in the script at the digest the `cloudflare-tunnel` template pins.
+
+What to know:
+
+- **The pinned server image.** `settings.serverImage` is build `3.128.0-8fb2e6f0` of the Automagik server, from
+  the Automagik repository's commit `8fb2e6f`: the first with the gate and its Cloudflare Access sign-in. An older
+  build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
+  tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
+  (three paths, the two ports and the six variable names) is in one block at the top of `automagik-workspace.sh`,
+  as that commit has them; check the block when you move the pin to a later build.
+- **The first sign-in.** The server signs a browser in with a link that it writes once into its own data. Arca
+  never reads that link, the keeper never reads the server's or the gate's data, and the keeper never copies their
+  output to the console, so the link is in no `service_logs` answer and reaches no assistant. The way in is
+  Cloudflare Access: the gate checks the proof Cloudflare attaches to each request of a signed-in visitor (that it
+  is signed by your team, is for this application, has not expired and names one of the listed addresses), keeps
+  the server's link to itself and signs that visitor in. No link leaves the machine. The sign-in happens when a
+  page is opened; the workspace's live connections then ride on the gate's own session. Without the three Access
+  settings the gate is still the only door, and it has no sign-in to offer: nobody gets in.
+- **Access is the lock on the address.** Keep the Access policy to the addresses in `accessEmails`, and add the
+  route only after it. The gate refuses a visitor Cloudflare did not sign in; the policy keeps strangers from
+  reaching the gate at all. To check a proof the gate fetches your team's public keys from
+  `https://<team>.cloudflareaccess.com`, an outgoing call the service network allows like any other.
+- **All three Access settings, or none.** The gate does not start with one or two. The first boot checks the
+  settings and says on the console what is wrong, and the keeper repeats it; nothing is started with settings that
+  cannot be used. Settings are fixed when the machine is created, so the cure is a corrected template and a new
+  machine.
+- **Where the token lives.** In Arca's private `secrets/` directory, in the machine's `/etc/arca-secrets/TUNNEL_TOKEN`
+  (root's, mode 0600), and in a copy in the machine's memory (`/run/automagik-workspace/tunnel/token`) that only the
+  connector's user reads. The connector reads that file; the token is not in its environment, on any command line or
+  in Docker's record of the container, and the keeper prints nothing of it.
+- **A new token.** `service_secret_set` again, then `instance_start` again. The keeper sees the new file and starts
+  the connector again with it; the server and the gate keep running.
+- **Where to look when it does not come up.** `service_logs` first. The first boot says there what it installs and,
+  when it fails, which command is missing or which service did not start. The keeper says each change: a part
+  started, healthy, not answering yet, or answering something other than 401; the tunnel waiting for its token,
+  running, registered with Cloudflare, or stopped with its exit code. Health is the image's own check, run inside
+  the server's and the gate's containers: HTTP 401 on the loopback port, the answer to a visitor who has not signed
+  in. A part that stops is started again after a pause that doubles up to five minutes. A tunnel that keeps
+  stopping usually has a token Cloudflare does not accept. When the server's container is replaced, the gate and
+  the connector are started again beside it, since they live in its network namespace. When Docker itself does not
+  answer, the keeper says so and touches nothing: a container is only removed or started once Docker has said that
+  it stopped or is not there. A keeper that cannot start at all (a missing command, settings that cannot be used)
+  stays up and repeats the reason every five minutes.
+- **The data.** The server's `/data` is the machine's `/var/lib/automagik-workspace/data` and the gate's is
+  `/var/lib/automagik-workspace/gate`, both on the machine's own disk and owned by uid 1000, the image's user. The
+  gate reads the server's data read-only; the server never sees the gate's. Both live and die with the machine:
+  `service_remove` deletes them. Take a snapshot (`snapshot_create`) before a change you may want to undo. A
+  snapshot carries the token's file too.
+- **No Docker Compose.** The keeper starts the three containers with `docker run`, with the same image, entrypoint,
+  environment, volumes, shared network namespace and restrictions (read-only file system, no capability, no new
+  privileges) that Automagik's compose file gives the gate, and gives the server no environment, as that file
+  does. The connector gets the same three restrictions. The first boot installs `docker.io` and `docker-cli`
+  (on Debian 13 the `docker` command is a package of its own) and no compose package.
+- **No model key.** The template declares no model secret. Sign-ins to model providers happen inside the workspace.
+- **After a restart of the node** the machine starts by itself (the template sets `autostart`), and the keeper starts
+  the containers again from the token on its disk.
+- **The settings are fixed.** They are read when the machine is created. To change the public address, the Access
+  settings or an image pin, edit the template copy and create the workspace again.
+
 ## A pool of GitHub Actions runners
 
 The shipped `github-runner-pool` template is one virtual machine that runs your GitHub Actions jobs on your own
@@ -2949,6 +3192,45 @@ Still not proven, by the tests or on that node:
 - a pool inside a tenant;
 - the GitHub screens named above, which follow GitHub's documentation and were not walked through in this work, and
   that a runner group's number is at the end of its page's address.
+
+### The Automagik workspace
+
+`cargo test -p arca --test automagik_workspace` runs the shipped script, `templates/automagik-workspace.sh`,
+unchanged, against a fake `docker` (`tests/automagik_workspace/fake-docker.sh`, which keeps each container as a
+directory, refuses a container that joins the network namespace of one that is not running, and plays the image's
+health check). The script's `PATH` holds the programs it lists for itself and nothing else. It needs `bash` and `jq`
+on the machine that runs it. It covers what each of the three containers is started with (no published port and no
+host network, a server that is never given its public name, the gate and the connector in the server's namespace,
+the gate's entrypoint, restrictions, environment and volumes, the token as a file, the metrics listener on
+loopback), a server alone when no public address is set, a Docker that does not answer (nothing is removed or
+started), a keeper that cannot start (it stays up and says why), the wait for the token, an empty token, a new token replacing the connector only, each part
+stopping, the gate and the connector following a replaced server, the health words for 401, 200, another code and
+no answer, a start that Docker refuses, the settings that are refused (by the keeper and, on the console, by the
+first boot), the first boot's packages, unit and console lines, its three failures, and that the token is in no
+output, no file outside the machine's memory and no command line.
+
+Not proven by these tests, because they need a real virtual machine, the images and a Cloudflare account:
+
+- that the machine boots from `images:debian/13/cloud`, that cloud-init runs the script and writes the settings, and
+  that the keeper's lines reach `service_logs` through the console;
+- that Debian's `docker.io` and `docker-cli` install and that the pinned images pull and start as the script starts
+  them: the server writing to the mounted `/data` as uid 1000, the gate on a read-only file system with no
+  capability, the connector as uid 65532 on a read-only file system with no capability, reading its token with
+  `--token-file` and keeping its metrics on `127.0.0.1:20241` (those three restrictions are the ones Cloudflare's
+  own Helm chart gives the connector; they were not run here), and two containers joining the first one's network
+  namespace;
+- anything of the gate on the real image: the pinned build was not pulled or run. The entrypoint path, the health
+  check's behaviour in the gate's container, the answer 401, the variable names and the rules the gate applies to
+  the Access settings were read from the Automagik repository at commit `8fb2e6f`, the pinned build's;
+- that nothing in the machine listens beyond loopback (the image's own services were not listed on a live machine);
+- that the connector says `Registered tunnel connection`, the line the keeper looks for, and that a route to
+  `http://127.0.0.1:3082` carries the workspace's pages, WebSockets and long-lived streams through Cloudflare;
+- what a route to the server's port 3081 gets (403 for the interface's requests and connections, 401 for the page,
+  the static files loading): that is the server's own behaviour for a `Host` it was not told to trust, as its
+  makers report it for the pinned build; it was not exercised here;
+- the sign-in through Cloudflare Access, end to end;
+- the Cloudflare screens named in the steps, which follow the tunnel section above and Cloudflare's documentation
+  and were not walked through in this work.
 
 ### Service wiring
 

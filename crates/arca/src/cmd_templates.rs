@@ -24,6 +24,8 @@ macro_rules! shipped {
 /// inputs (`automagik.build.sh`, `automagik-dsh/`) are used from a checkout and are not installed.
 pub const SHIPPED: &[(&str, &str)] = shipped![
     "automagik-server.json",
+    "automagik-workspace.json",
+    "automagik-workspace.sh",
     "automagik.json",
     "cloudflare-tunnel.json",
     "github-runner-pool.json",

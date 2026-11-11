@@ -444,3 +444,101 @@ fn the_owners_card_shows_each_replaced_setting_and_a_proposal_with_a_refused_one
     assert_eq!(got["note"], json!(long));
     assert_eq!(got["pin"], pool_template()["settings"]["pin"]);
 }
+
+/// Kernel access is a container template's and settings at create are a virtual machine's: no template has both, and
+/// each argument is refused in words for the other kind of template, before anything is written. A node holds a
+/// service of each kind's template side by side.
+#[test]
+fn kernel_access_and_create_settings_belong_to_two_kinds_of_template_and_neither_takes_the_others_argument()
+ {
+    let rig = rig();
+    let dir = rig.dir.join("templates");
+    let load = |name: &str, value: Value| {
+        let mut value = value;
+        value["name"] = json!(name);
+        rig.template(name, value);
+        service::load_template(&dir, name)
+    };
+    // A virtual-machine template with kernel access, and a container template that lists settings for a create.
+    let mut machine = pool_template();
+    machine["kernelAccess"] = json!({ "port": 7461 });
+    assert!(
+        load("both1", machine)
+            .expect_err("refused")
+            .message
+            .contains("or kernelAccess: they need a container's environment, image or devices")
+    );
+    let mut container = nats_template();
+    container["kernelAccess"] = json!({ "port": 7461 });
+    container["settings"] = json!({ "url": "https://git.example/example-org" });
+    container["createSettings"] = json!(["url"]);
+    assert!(
+        load("both2", container)
+            .expect_err("refused")
+            .message
+            .contains("only a virtual-machine template has a firstBoot or settings")
+    );
+    // Each kind alone loads, and keeps what is its own.
+    let mut kern = nats_template();
+    kern["kernelAccess"] = json!({ "port": 7461 });
+    let kern = load("kern", kern).expect("a container template with kernel access");
+    assert!(kern.kernel_access.is_some() && kern.create_settings.is_empty());
+    let pool = service::load_template(&dir, "pool").expect("the settings template");
+    assert!(pool.kernel_access.is_none() && !pool.create_settings.is_empty());
+
+    let before = rig.fake.writes().len();
+    // The machine's create does not take the container's argument, with or without its own.
+    for args in [
+        json!({ "name": "p1", "template": "pool", "kernelAccess": { "port": 7461 } }),
+        json!({ "name": "p1", "template": "pool", "kernelAccess": { "port": 7461 },
+            "settings": { "url": "https://git.example/another-org" } }),
+    ] {
+        assert!(matches!(
+            rig.call("service_create", args),
+            Err(CallError::Invalid(why))
+                if why == "kernelAccess: template pool gives its service no access to the kernel"
+        ));
+    }
+    // The container's template does not take the machine's argument: its check says so, and a create with it is
+    // refused before anything is written (on this node already for the kernel access it has no socket for).
+    assert_eq!(
+        service::create_settings(&kern, Some(&json!({ "url": "https://git.example/x" })))
+            .expect_err("refused")
+            .message,
+        "settings: template kern lets a create set none (its createSettings lists none)"
+    );
+    assert!(
+        refusal(rig.call(
+            "service_create",
+            json!({ "name": "k1", "template": "kern", "settings": { "url": "https://git.example/x" } })
+        ))
+        .starts_with("template kern gives its service access to this node's kernel, and this node has no socket for it")
+    );
+    assert_eq!(rig.fake.writes().len(), before, "no refusal wrote anything");
+
+    // Side by side on one node: the machine with its settings, and beside it a container of a template with
+    // kernel access, which this node (it sets no services socket) refuses for that reason and no other.
+    create_with(
+        &rig,
+        "p1",
+        json!({ "url": "https://git.example/another-org" }),
+    )
+    .expect("the machine");
+    assert_eq!(
+        guest_settings(&rig, "p1")["url"],
+        "https://git.example/another-org"
+    );
+    let why = refusal(rig.call(
+        "service_create",
+        json!({ "name": "k1", "template": "kern" }),
+    ));
+    assert!(
+        why.starts_with("template kern gives its service access to this node's kernel, and this node has no socket for it"),
+        "{why}"
+    );
+    // The machine's status shows its settings and no kernel access.
+    let status = rig
+        .call("service_status", json!({ "name": "p1" }))
+        .expect("status");
+    assert!(status.get("settings").is_some() && status.get("kernelAccess").is_none());
+}
