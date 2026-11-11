@@ -2638,11 +2638,11 @@ A setting marked "no" is the template's own: to change one, whoever looks after 
 created from that template. The virtual machine's own size is the template's `limits` and `rootSize` and changes the
 same way.
 
-The shipped numbers fit together: four `standard` slots of 2 CPUs and 4GiB and one `large` slot of 8 CPUs and 8GiB are
-16 CPUs and 24GiB, and 4GiB is kept back. That is 28GiB of the machine's 32GiB on purpose: a virtual machine sees less
-memory than its size (a 32GiB machine has 27921MiB for slots after the 4GiB kept back), and a slot that does not fit
-whole is never started. Give a class the memory its heaviest job needs: a full `cargo test` of a large workspace has
-been seen to fill a 10GiB slot. Settings are read when the pool is created and are fixed from then on (see "What to
+The shipped numbers fit together: two `standard` slots of 2 CPUs and 4GiB and two `large` slots of 6 CPUs and 9GiB are
+16 CPUs and 26GiB, and 4GiB is kept back. A virtual machine sees less memory than its size: a 32GiB machine has
+27921MiB for slots after the 4GiB kept back, the four slots take 26624MiB of it, and a slot that does not fit whole
+is never started (two slots of 10GiB beside the two small ones would not fit). Give a class the memory its heaviest
+job needs: a full `cargo test` of a large workspace has been seen to fill a 10GiB slot. Settings are read when the pool is created and are fixed from then on (see "What to
 know").
 
 **4. Arca: `service_secret_set`**, for the App twice:
@@ -2662,7 +2662,7 @@ group it registers in. On GitHub, the organisation's "Settings", "Actions", "Run
 
 **7. Use it.** A job runs on the pool when its repository is in the runner group and its `runs-on` asks for labels
 that one class has all of, for example `runs-on: [self-hosted, linux, x64, arca]`, or
-`[self-hosted, linux, x64, arca-large]` for the large slot.
+`[self-hosted, linux, x64, arca-large]` for a large slot.
 
 ### Who can reach what
 
@@ -2686,11 +2686,11 @@ returns, and one line when a job finishes:
 arca-runner-pool: job slot=0 class=standard labels=self-hosted,linux,x64,arca name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4 runner=ci-pool-1a2b3c4d-standard-0-5e6f7a8b
 arca-runner-pool: slot 0 standard 4096MiB/2cpu busy 41s ci-pool-1a2b3c4d-standard-0-9c0d1e2f job "test"
 arca-runner-pool: slot 1 standard 4096MiB/2cpu idle 12s ci-pool-1a2b3c4d-standard-1-0a1b2c3d
-arca-runner-pool: slot 4 large 8192MiB/8cpu queued (pausing 40s after a failure)
+arca-runner-pool: slot 3 large 9216MiB/6cpu queued (pausing 40s after a failure)
 arca-runner-pool: class standard last 412 jobs: seconds avg 130, peak memory avg 1210 MiB max 3105 MiB, cpu-seconds avg 95, cpus used avg 0.7
 arca-runner-pool: recent job finished=2026-01-01T10:00:00Z slot=0 class=standard name="build" result=Succeeded seconds=132 peak_memory_mib=1832 cpu_seconds=201.4
 arca-runner-pool: pool ci-pool id 1a2b3c4d for https://github.com/example-org, runner group 7 "arca-pool", selected repositories only, public repositories off
-arca-runner-pool: totals busy=3 idle=1 starting=0 queued=1 jobs_done=412 failures=2 runner_updates=0 memory_reserved=16384MiB of 27921MiB slots_cap=5
+arca-runner-pool: totals busy=2 idle=1 starting=0 queued=1 jobs_done=412 failures=2 runner_updates=0 memory_reserved=17408MiB of 27921MiB slots_cap=4
 ```
 
 | In the totals | Meaning |
@@ -2930,8 +2930,11 @@ Seen since on a real node, with a real GitHub organisation (the first pool): the
 `images:debian/13/cloud`, cloud-init runs the first-boot script and writes the settings, the guest agent takes the
 secret files, the machine reaches GitHub, the registries and Debian's mirrors from the service network, both pinned
 images pull and start as the script starts them, the App's token, the runner-group read and the registrations are
-accepted, jobs run, a slot's memory limit holds, and the controller's lines reach `service_logs`. One fault was found
-there and fixed apart from this work: Debian 13 ships the Docker command-line client as a package of its own.
+accepted, jobs run, a slot's memory limit holds, and the controller's lines reach `service_logs`. Two faults were found
+there. Debian 13 ships the Docker command-line client as a package of its own (fixed apart from this work). And a
+slot whose runner was running a job was shown as idle: the pool asked Docker for the runner's processes in a form
+Docker refuses, so no job was ever seen as running and a job's seconds counted the runner's wait before it. The pool
+now reads the runner's own "Running job" line, which it had read correctly all along for the job's name.
 
 Still not proven, by the tests or on that node:
 

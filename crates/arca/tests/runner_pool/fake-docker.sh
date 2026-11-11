@@ -75,12 +75,13 @@ play_runner() {
     if [ -n "$job" ]; then
       seconds=$(printf '%s' "$answer" | jq -r '.seconds')
       result=$(printf '%s' "$answer" | jq -r '.result')
-      echo "2026-01-01 00:00:00Z: Running job: $job" >>"$dir/log"
+      # The runner prints the time, then the job: the pool times the job from this line.
+      echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Running job: $job" >>"$dir/log"
       touch "$dir/worker"
       sleep "$seconds"
       [ -d "$dir" ] || return
       rm -f "$dir/worker"
-      echo "2026-01-01 00:00:01Z: Job $job completed with result: $result" >>"$dir/log"
+      echo "$(date -u '+%Y-%m-%d %H:%M:%S')Z: Job $job completed with result: $result" >>"$dir/log"
       printf '%s' "$jit" | "$FAKE_REAL_CURL" -sS -m 5 -X POST --data-binary @- "$FAKE_GITHUB/_fake/done" >/dev/null 2>&1
       echo 0 >"$dir/exit"
       return
@@ -142,6 +143,13 @@ case $command in
   top)
     dir="$root/containers/$1"
     [ -d "$dir" ] || exit 1
+    # Docker finds a container's processes by their ids, so it refuses ps options that leave the id out.
+    case " $* " in
+      *pid* | *" -ef "* | *" aux "*) ;;
+      *)
+        [ $# -le 1 ] || { echo "Error response from daemon: Couldn't find PID field in ps output" >&2; exit 1; }
+        ;;
+    esac
     echo "COMMAND"
     echo "/home/runner/bin/Runner.Listener run"
     [ -e "$dir/worker" ] && echo "/home/runner/bin/Runner.Worker spawnclient"

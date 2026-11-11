@@ -462,6 +462,15 @@ set_state() {
 # Text from a job, made safe for one line of a console and one field of a tab-separated file.
 plain() { printf '%s' "$1" | tr -c 'A-Za-z0-9 ._:/()#@+,=-' '?' | cut -c1-120; }
 
+# When the job a runner's output names began, as seconds: the runner prints the time before "Running job:". Now, when
+# the time cannot be read.
+job_began() {
+  local stamp at
+  stamp=$(printf '%s\n' "$1" | sed -n 's/.*\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\)Z: Running job: .*/\1/p' | head -n1)
+  at=$(date -u -d "$stamp UTC" +%s 2>/dev/null) || at=''
+  case $at in '' | *[!0-9]*) now ;; *) echo "$at" ;; esac
+}
+
 # A failure that is the pool's own, not a job's: it is counted, said, and makes every slot pause longer before the
 # next registration, up to POOL_BACKOFF_MAX.
 slot_failed() {
@@ -510,7 +519,7 @@ slot_reap() {
 slot_cycle() {
   local slot=$1
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
-  local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=()
+  local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
   ABORT=''
   trap 'ABORT=1' TERM INT
   dir=$(slot_dir "$slot")
@@ -613,22 +622,27 @@ slot_cycle() {
   while [ -z "$ABORT" ]; do
     state=$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$runner" 2>/dev/null) || state='false 255'
     [ "${state%% *}" = true ] || break
-    # A runner that has taken its job runs a worker process.
-    if [ -z "$busy_since" ] && docker top "$runner" -eo args 2>/dev/null | grep -q 'Runner\.Worker'; then
-      busy_since=$(now)
-      job=$(plain "$(docker logs "$runner" 2>&1 | sed -n 's/.*Running job: //p' | head -n1)")
+    # A runner that has taken its job says so in its own output, with the job's name and the time: "Running job:".
+    # That line is what marks the slot busy. (The slot was once asked for the runner's processes instead, in a form
+    # Docker refuses, so a running job was shown as idle.) The output is read only until the job has begun.
+    lines=''
+    [ -n "$busy_since" ] || lines=$(docker logs "$runner" 2>&1)
+    case $lines in *'Running job: '*)
+      busy_since=$(job_began "$lines")
+      job=$(plain "$(printf '%s\n' "$lines" | sed -n 's/.*Running job: //p' | head -n1)")
       set_state "$slot" busy "$name ${job:+job \"$job\"}"
-    fi
+      ;;
+    esac
     # GitHub tells a runner older than its newest release to update itself before it takes a job. It does so inside
     # its own container; the pool says it once per runner, because every fresh runner will until the pin moves.
-    if [ -z "$updating" ] && [ -z "$busy_since" ] && docker logs "$runner" 2>&1 | grep -q 'Runner update in progress'; then
+    if [ -z "$updating" ] && [ -z "$busy_since" ] && [[ $lines == *'Runner update in progress'* ]]; then
       updating=1
       printf x >>"$POOL_RUN/updates"
       set_state "$slot" updating "$name"
       say "slot $slot: GitHub told this runner to update itself, because the pool's pinned runner is older than GitHub's newest. It updates inside its own container and then takes its job; every new runner of this pool does the same, at the cost of a download each, until a pool is created with a newer runnerImage"
     fi
     # The runner's own wrapper says when it starts the updated runner: from then on the update is over.
-    if [ "$updating" = 1 ] && docker logs "$runner" 2>&1 | grep -q 'Restarting runner'; then
+    if [ "$updating" = 1 ] && [[ $lines == *'Restarting runner'* ]]; then
       updating=finished
       [ -n "$busy_since" ] || set_state "$slot" idle "$name"
     fi
@@ -647,15 +661,21 @@ slot_cycle() {
 
   code=${state##* }
   finished=$(now)
-  # A job shorter than one look is still found in the runner's own lines.
-  [ -n "$job" ] || job=$(plain "$(docker logs "$runner" 2>&1 | sed -n 's/.*Running job: //p' | head -n1)")
-  result=$(docker logs "$runner" 2>&1 | sed -n 's/.*completed with result: \([A-Za-z]*\).*/\1/p' | tail -n1)
+  # A job shorter than one look is still found in the runner's own lines, with the time it began.
+  lines=$(docker logs "$runner" 2>&1)
+  if [ -z "$busy_since" ] && [[ $lines == *'Running job: '* ]]; then
+    busy_since=$(job_began "$lines")
+    job=$(plain "$(printf '%s\n' "$lines" | sed -n 's/.*Running job: //p' | head -n1)")
+  fi
+  result=$(printf '%s\n' "$lines" | sed -n 's/.*completed with result: \([A-Za-z]*\).*/\1/p' | tail -n1)
+  lines=''
   peak=$(cat "$cgroup/memory.peak" 2>/dev/null)
   cpu=$(awk '$1 == "usage_usec" { print $2 }' "$cgroup/cpu.stat" 2>/dev/null)
   case $peak in '' | *[!0-9]*) peak=0 ;; esac
   case $cpu in '' | *[!0-9]*) cpu=0 ;; esac
   if [ -n "$busy_since" ] || [ -n "$job" ]; then
     seconds=$((finished - ${busy_since:-$started}))
+    [ "$seconds" -ge 0 ] || seconds=0
     : "${result:=unknown}"
     : "${job:=unknown}"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s.%s\t%s\n' \

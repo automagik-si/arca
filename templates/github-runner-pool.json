@@ -12,11 +12,11 @@
   "settings": {
     "url": "https://github.com/example-org",
     "runnerGroupId": 1,
-    "maxSlots": 5,
+    "maxSlots": 4,
     "reserveMemory": "4GiB",
     "classes": [
-      { "name": "standard", "labels": ["self-hosted", "linux", "x64", "arca"], "cpu": 2, "memory": "4GiB", "slots": 4 },
-      { "name": "large", "labels": ["self-hosted", "linux", "x64", "arca-large"], "cpu": 8, "memory": "8GiB", "slots": 1 }
+      { "name": "standard", "labels": ["self-hosted", "linux", "x64", "arca"], "cpu": 2, "memory": "4GiB", "slots": 2 },
+      { "name": "large", "labels": ["self-hosted", "linux", "x64", "arca-large"], "cpu": 6, "memory": "9GiB", "slots": 2 }
     ],
     "dockerCache": "90GiB",
     "dependencyCache": "30GiB",

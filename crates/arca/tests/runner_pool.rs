@@ -1707,7 +1707,7 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
             && description.contains("docker 29.9.3-dind")
     );
     // The default slots fit the machine: the cap admits them all, their CPUs are the machine's 16, and their memory
-    // and the reserve leave 4GiB of its 32GiB, since a virtual machine sees a little less memory than its size.
+    // fits what a 32GiB machine really has for slots once the reserve is kept back (27921MiB on the first pool).
     let bytes =
         |text: &Value| arca::service::size_bytes(text.as_str().expect("a size")).expect("bytes");
     let classes = settings["classes"].as_array().expect("classes");
@@ -1722,8 +1722,14 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     assert_eq!(cpus, 16);
     assert_eq!(
         memory + bytes(&settings["reserveMemory"]),
-        arca::service::size_bytes("28GiB").expect("bytes")
+        arca::service::size_bytes("30GiB").expect("bytes")
     );
+    assert!(
+        memory <= 27921 * (1 << 20),
+        "the slots fit a real 32GiB machine"
+    );
+    assert_eq!(classes.len(), 2);
+    assert_eq!(classes[1]["memory"], "9GiB");
     // The same settings start the controller: it reads them, makes its slices and waits for a credential.
     let scratch = std::env::temp_dir().join(format!(
         "arca-runner-pool-gh-{}-{}",
@@ -1732,18 +1738,18 @@ fn the_shipped_template_is_a_virtual_machine_with_its_script_its_secrets_and_pin
     ));
     fs::create_dir_all(&scratch).expect("scratch");
     let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
-    // What such a machine reports: a little less than 32GiB.
-    let mut pool = Pool::new(settings, 32 * GIB - 700 * (1 << 20), 30 * GIB);
+    // What such a machine reports: 27921MiB for slots after the 4GiB kept back.
+    let mut pool = Pool::new(settings, (27921 + 4096) * (1 << 20), 30 * GIB);
     pool.start(&github);
     wait_for(&pool, "the shipped settings load", || {
-        pool.output().contains("pool pool1 id abcd1234 for https://github.com/example-org: 5 slots in 2 classes, at most 5 at once, 27972 MiB of memory for slots")
+        pool.output().contains("pool pool1 id abcd1234 for https://github.com/example-org: 4 slots in 2 classes, at most 4 at once, 27921 MiB of memory for slots")
     });
     wait_for(&pool, "the wait for a credential", || {
         pool.output().contains("waiting for a credential")
     });
     assert!(
-        pool.read("units/arcapool-s4.slice")
-            .contains("MemoryMax=8589934592\nMemorySwapMax=0\nCPUQuota=800%")
+        pool.read("units/arcapool-s3.slice")
+            .contains("MemoryMax=9663676416\nMemorySwapMax=0\nCPUQuota=600%")
     );
     assert_eq!(pool.stop(), Some(0));
     let _ = fs::remove_dir_all(scratch);
@@ -2074,5 +2080,44 @@ fn a_machine_that_cannot_layer_starts_runners_with_their_images_own_files() {
             "{run}"
         );
     }
+    let _ = fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_running_job_is_shown_as_busy_and_is_timed_from_when_it_began() {
+    let scratch = scratch_dir();
+    let github = Github::start(&scratch, &format!("/orgs/{ORG}"));
+    let mut pool = one_slot_pool(&github, |_| {});
+    pool.start(&github);
+    wait_for(&pool, "an idle runner", || github.live().len() == 1);
+    // The runner waits a while before a job comes: that wait is no part of the job.
+    std::thread::sleep(Duration::from_millis(3200));
+    github.queue(&["arca"], "a long test", 2.0);
+    // While the job runs, the slot is busy and names it, and the totals count it.
+    wait_for(&pool, "the slot shown as busy", || {
+        let state = pool.read("run/slots/0");
+        state.starts_with("busy\t") && state.contains("job \"a long test\"")
+    });
+    wait_for(&pool, "the busy slot in the totals", || {
+        totals(&pool).contains("busy=1 idle=0")
+    });
+    assert!(
+        pool.read("logs/status.txt").contains("busy")
+            && pool.read("logs/status.txt").contains("job \"a long test\""),
+        "{}",
+        pool.read("logs/status.txt")
+    );
+    wait_for(&pool, "the job", || pool.jobs().len() == 1);
+    // Timed from the runner's own "Running job" line: about two seconds, not the five since the runner started.
+    let seconds: u64 = pool.jobs()[0][6].parse().expect("seconds");
+    assert!((1..=3).contains(&seconds), "{seconds}");
+    assert_eq!(pool.stop(), Some(0));
+    // The pool never asks Docker for a runner's processes: it reads the runner's own lines.
+    assert!(
+        !pool
+            .read("docker/calls.log")
+            .lines()
+            .any(|call| call.starts_with("top "))
+    );
     let _ = fs::remove_dir_all(scratch);
 }
