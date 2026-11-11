@@ -91,14 +91,29 @@ pub struct Lan {
 /// agent renames the NIC to it, whatever PCI slot the host's QEMU gave it.
 pub const VM_NIC_NAME: &str = "enp5s0";
 
-/// What only a virtual-machine service records: its root disk size and the fixed MAC the request gave, if any.
+/// What only a virtual-machine service records: its root disk size, the fixed MAC the request gave, if any, and what
+/// its template gave cloud-init for the first boot. A record without the last two is exactly the one an earlier kernel
+/// wrote.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Vm {
     pub root_size: String,
     #[serde(default)]
     pub mac: Option<String>,
+    /// The template's first-boot script, as the instance's `cloud-init.user-data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_data: Option<String>,
+    /// The template's settings, as a `cloud-init.vendor-data` that writes them to [`GUEST_SETTINGS_PATH`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor_data: Option<String>,
 }
+
+/// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
+pub const GUEST_SETTINGS_PATH: &str = "/etc/arca/settings.json";
+/// The largest first-boot script a template may carry, in bytes.
+const FIRST_BOOT_MAX: usize = 256 * 1024;
+/// The largest `settings` object a template may carry, as compact JSON, in bytes.
+const SETTINGS_MAX: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -330,6 +345,16 @@ fn vm_config(cfg: &ServiceConfig) -> Map<String, Value> {
         config.insert("boot.autostart".into(), json!("true"));
     }
     config.insert("agent.nic_config".into(), json!("true"));
+    // What cloud-init reads at the first boot. Neither value ever holds a secret: a virtual machine's secrets go into
+    // its guest as files at each start, and never into its config.
+    if let Some(vm) = &cfg.vm {
+        if let Some(user_data) = &vm.user_data {
+            config.insert("cloud-init.user-data".into(), json!(user_data));
+        }
+        if let Some(vendor_data) = &vm.vendor_data {
+            config.insert("cloud-init.vendor-data".into(), json!(vendor_data));
+        }
+    }
     config
 }
 
@@ -937,6 +962,14 @@ pub struct Template {
     /// The root disk size of a virtual-machine template, such as `20GiB`. No other kind sets it.
     #[serde(default)]
     pub root_size: Option<String>,
+    /// A virtual-machine template's first-boot script: `{ "file": "name.sh" }`, a file beside the template that
+    /// cloud-init runs once, at the machine's first boot. No other kind sets it.
+    #[serde(default)]
+    pub first_boot: Option<Value>,
+    /// A virtual-machine template's settings: one JSON object the guest reads at [`GUEST_SETTINGS_PATH`]. No other
+    /// kind sets it, and it never holds a secret.
+    #[serde(default)]
+    pub settings: Option<Value>,
 }
 
 impl Template {
@@ -1004,6 +1037,11 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     if template.root_size.is_some() {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has a rootSize"
+        )));
+    }
+    if template.first_boot.is_some() || template.settings.is_some() {
+        return Err(TemplateError::refused(format!(
+            "template {name}: only a virtual-machine template has a firstBoot or settings"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {
@@ -1118,8 +1156,9 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
 
 /// A virtual-machine template: a system image, both limits and a root disk size. It may declare `ports` and `provides`,
 /// which a link from a container opens in the NIC ACL of the managed service network; a create on a host bridge refuses
-/// such a template. A lan proxy, a tailnet dash, environment and secrets depend on a container's devices, image or
-/// environment, and no virtual machine has them.
+/// such a template. It may carry a first-boot script and settings, which cloud-init reads at the first boot, and
+/// declare `secrets`, which are written into the guest as files at each start. A lan proxy, a tailnet dash, environment
+/// and generated secrets depend on a container's devices, image or environment, and no virtual machine has them.
 fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
     let name = &template.name;
     let refused = |why: &str| Err(TemplateError::refused(format!("template {name}: {why}")));
@@ -1146,7 +1185,6 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         return refused("provides needs a port to offer");
     }
     if !template.env.is_empty()
-        || !template.secrets.is_empty()
         || !template.generate.is_empty()
         || template.entrypoint.is_some()
         || template.publishable
@@ -1156,8 +1194,32 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         || template.lan.is_some()
     {
         return refused(
-            "a virtual machine has no env, secrets, generate, entrypoint, publishable, dashPort, droiddPort, data or lan: they need a container's environment, image or devices",
+            "a virtual machine has no env, generate, entrypoint, publishable, dashPort, droiddPort, data or lan: they need a container's environment, image or devices",
         );
+    }
+    if template.secrets.len() > 16 {
+        return refused("at most 16 secrets");
+    }
+    let mut named = BTreeSet::new();
+    if !template
+        .secrets
+        .iter()
+        .all(|key| env_name_ok(key) && named.insert(key.as_str()))
+    {
+        return refused("invalid secret name");
+    }
+    if let Some(first_boot) = &template.first_boot
+        && first_boot_file(first_boot).is_none()
+    {
+        return refused(
+            "firstBoot is { \"file\": \"name\" }, a plain file name in the templates directory: letters, digits, dots, dashes and underscores, not starting with a dot",
+        );
+    }
+    if let Some(settings) = &template.settings
+        && !(settings.is_object()
+            && serde_json::to_string(settings).is_ok_and(|text| text.len() <= SETTINGS_MAX))
+    {
+        return refused("settings is one JSON object of at most 16KiB");
     }
     if let Some(description) = &template.description
         && description.chars().count() > 500
@@ -1165,6 +1227,71 @@ fn validate_vm_template(template: &Template) -> Result<(), TemplateError> {
         return refused("description is at most 500 characters");
     }
     source(template).map(|_| ())
+}
+
+/// The file a `firstBoot` value names, when it is `{ "file": "<a plain file name>" }` and nothing else.
+fn first_boot_file(first_boot: &Value) -> Option<&str> {
+    let object = first_boot.as_object().filter(|object| object.len() == 1)?;
+    object
+        .get("file")
+        .and_then(Value::as_str)
+        .filter(|file| script_name_ok(file))
+}
+
+/// A virtual-machine template's first-boot script, read from the template directory as an entrypoint script is: the
+/// text cloud-init is given as user data, so it begins `#!` (a script, run once at the first boot) or `#cloud-config`.
+/// `None` for a template without one.
+pub fn first_boot(template: &Template, dir: &Path) -> Result<Option<String>, TemplateError> {
+    let Some(first_boot) = &template.first_boot else {
+        return Ok(None);
+    };
+    let name = &template.name;
+    let file = first_boot_file(first_boot)
+        .ok_or_else(|| TemplateError::refused(format!("template {name}: invalid firstBoot")))?;
+    let script = std::fs::read_to_string(dir.join(file)).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            TemplateError::refused(format!(
+                "template {name}: its first-boot script is not installed (templates/{file} does not exist). \
+                 The script belongs beside templates/{name}.json in the state directory; for a template Arca ships, \
+                 `arca templates install --config <file>` puts the template and its script there"
+            ))
+        } else {
+            TemplateError::refused(format!(
+                "template {name}: its first-boot script templates/{file} cannot be read ({})",
+                error.kind()
+            ))
+        }
+    })?;
+    if script.len() > FIRST_BOOT_MAX
+        || script.contains('\0')
+        || !(script.starts_with("#!") || script.starts_with("#cloud-config"))
+        || script.starts_with(SECRET_PREFIX)
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: its first-boot script templates/{file} is not cloud-init user data: it begins #! or #cloud-config and is at most 256KiB"
+        )));
+    }
+    Ok(Some(script))
+}
+
+/// The cloud-init vendor data that writes a virtual-machine template's `settings` to [`GUEST_SETTINGS_PATH`], readable
+/// by every user of the guest: one `write_files` entry whose content is base64, so no setting can change the YAML
+/// around it. `None` for a template without settings.
+pub fn settings_vendor_data(template: &Template) -> Result<Option<String>, TemplateError> {
+    use base64::Engine as _;
+    let Some(settings) = &template.settings else {
+        return Ok(None);
+    };
+    let text = serde_json::to_string(settings)
+        .ok()
+        .filter(|text| settings.is_object() && text.len() <= SETTINGS_MAX)
+        .ok_or_else(|| {
+            TemplateError::refused(format!("template {}: invalid settings", template.name))
+        })?;
+    let content = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    Ok(Some(format!(
+        "#cloud-config\nwrite_files:\n- path: {GUEST_SETTINGS_PATH}\n  permissions: '0644'\n  encoding: b64\n  content: {content}\n"
+    )))
 }
 
 /// Whether the path is the root once repeated separators and `.` segments are dropped.
@@ -1615,6 +1742,14 @@ pub fn view(cfg: &ServiceConfig, live: Option<&Value>) -> Value {
         // The host port only exists when the service has a lan proxy. Container ports are not host listeners.
         "lanPort": cfg.lan.as_ref().map(|lan| lan.port)
     })
+}
+
+/// The fingerprint of the image an instance was created from, as Incus records it on the instance
+/// (`volatile.base_image`): 64 hex digits. `None` when the row carries none.
+pub fn base_image(row: &Value) -> Option<&str> {
+    row["config"]["volatile.base_image"]
+        .as_str()
+        .filter(|image| image.len() == 64 && image.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A project instance with no service record.

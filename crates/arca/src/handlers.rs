@@ -4198,16 +4198,23 @@ enum VmPlace {
 }
 
 /// The record of a virtual machine. On a host bridge it has no address, gateway or port; on the managed service network
-/// it has those of a container. Neither has an environment or a secret.
+/// it has those of a container. Neither has an environment. Its template's first-boot script and settings are recorded
+/// as cloud-init reads them. One whose template declares secrets is created stopped: `service_secret_set` stores them
+/// and `instance_start` starts it and writes them into the guest, so they are never in its config.
 fn vm_service_config(
     name: &str,
     template: &crate::service::Template,
+    templates_dir: &std::path::Path,
     place: VmPlace,
     pool: String,
     now: u64,
 ) -> Result<crate::service::ServiceConfig, CallError> {
     let source = crate::service::source(template).map_err(service_template_error)?;
     let root_size = template.root_size.clone().ok_or_else(internal)?;
+    let user_data =
+        crate::service::first_boot(template, templates_dir).map_err(service_template_error)?;
+    let vendor_data =
+        crate::service::settings_vendor_data(template).map_err(service_template_error)?;
     let (bridge, mac, ipv4, gateway, ports) = match place {
         VmPlace::Host { bridge, mac } => (bridge, mac, String::new(), String::new(), Vec::new()),
         VmPlace::Managed { ipv4, gateway } => (
@@ -4242,10 +4249,15 @@ fn vm_service_config(
         autostart: template.autostart,
         data: None,
         lan: None,
-        start: true,
+        start: template.secrets.is_empty(),
         adopted: false,
         creating: false,
-        vm: Some(crate::service::Vm { root_size, mac }),
+        vm: Some(crate::service::Vm {
+            root_size,
+            mac,
+            user_data,
+            vendor_data,
+        }),
         tenant: None,
     })
 }
@@ -4626,10 +4638,14 @@ impl ToolHandler for ServiceHandler {
                     .into_iter()
                     .find(|(_, config)| config.name == name);
                 if let Some((_, config)) = record {
-                    return Ok(crate::service::view(
-                        &config,
-                        service_live_in(&rows, &config.project, &config.instance),
-                    ));
+                    let live = service_live_in(&rows, &config.project, &config.instance);
+                    let mut view = crate::service::view(&config, live);
+                    // The image the instance was made from, as Incus recorded it: a template that names an image
+                    // by an alias does not say which build that was.
+                    if let Some(image) = live.and_then(crate::service::base_image) {
+                        view["baseImage"] = json!(image);
+                    }
+                    return Ok(view);
                 }
                 if let Some(row) = rows.iter().find(|row| {
                     row["name"].as_str()
@@ -5038,7 +5054,8 @@ impl ToolHandler for ServiceHandler {
                         project_changes(&all_entries, &self.cfg, needs)
                             .map_err(no_service_project)?
                     };
-                    let mut config = vm_service_config(&name, &template, place, pool, now)?;
+                    let mut config =
+                        vm_service_config(&name, &template, &templates_dir, place, pool, now)?;
                     let deploy =
                         tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
                     self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);

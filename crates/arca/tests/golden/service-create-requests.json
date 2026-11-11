@@ -1,0 +1,180 @@
+{
+  "c1": {
+    "config": {
+      "boot.autostart": "true",
+      "environment.MODE": "plain",
+      "environment.URL": "http://192.0.2.10:8080/c1",
+      "limits.cpu": "1",
+      "limits.memory": "1GiB",
+      "oci.entrypoint": "/bin/server --port 8080",
+      "user.arca.address": "192.0.2.10",
+      "user.arca.envkeys": "MODE,URL",
+      "user.arca.ports": "8080",
+      "user.arca.template": "oci",
+      "user.arcakernel.entry": "service-c1"
+    },
+    "devices": {
+      "eth0": {
+        "ipv4.address": "192.0.2.10",
+        "name": "eth0",
+        "network": "arcak-svcbr",
+        "security.acls": "arcak-svc-svc-c1",
+        "security.acls.default.egress.action": "reject",
+        "security.acls.default.ingress.action": "reject",
+        "security.ipv4_filtering": "true",
+        "security.mac_filtering": "true",
+        "security.port_isolation": "false",
+        "type": "nic"
+      },
+      "root": {
+        "path": "/",
+        "pool": "pool1",
+        "type": "disk"
+      },
+      "web": {
+        "connect": "tcp:127.0.0.1:8080",
+        "listen": "tcp:0.0.0.0:8080",
+        "type": "proxy"
+      }
+    },
+    "name": "c1",
+    "profiles": [
+      "arca-service"
+    ],
+    "source": {
+      "alias": "library/example@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "mode": "pull",
+      "protocol": "oci",
+      "server": "https://docker.io",
+      "type": "image"
+    },
+    "start": true,
+    "type": "container"
+  },
+  "s1": {
+    "config": {
+      "user.arca.address": "192.0.2.11",
+      "user.arca.ports": "22",
+      "user.arca.template": "sys",
+      "user.arcakernel.entry": "service-s1"
+    },
+    "devices": {
+      "eth0": {
+        "ipv4.address": "192.0.2.11",
+        "name": "eth0",
+        "network": "arcak-svcbr",
+        "security.acls": "arcak-svc-svc-s1",
+        "security.acls.default.egress.action": "reject",
+        "security.acls.default.ingress.action": "reject",
+        "security.ipv4_filtering": "true",
+        "security.mac_filtering": "true",
+        "security.port_isolation": "false",
+        "type": "nic"
+      },
+      "root": {
+        "path": "/",
+        "pool": "pool1",
+        "type": "disk"
+      }
+    },
+    "name": "s1",
+    "profiles": [
+      "arca-service"
+    ],
+    "source": {
+      "alias": "debian/13",
+      "mode": "pull",
+      "protocol": "simplestreams",
+      "server": "https://images.linuxcontainers.org",
+      "type": "image"
+    },
+    "start": true,
+    "type": "container"
+  },
+  "v1": {
+    "config": {
+      "agent.nic_config": "true",
+      "boot.autostart": "true",
+      "limits.cpu": "2",
+      "limits.memory": "4GiB",
+      "user.arca.address": "192.0.2.12",
+      "user.arca.template": "ws",
+      "user.arcakernel.entry": "service-v1"
+    },
+    "devices": {
+      "agent": {
+        "source": "agent:config",
+        "type": "disk"
+      },
+      "eth0": {
+        "ipv4.address": "192.0.2.12",
+        "name": "enp5s0",
+        "network": "arcak-svcbr",
+        "security.acls": "arcak-svc-svc-v1",
+        "security.acls.default.egress.action": "reject",
+        "security.acls.default.ingress.action": "reject",
+        "security.ipv4_filtering": "true",
+        "security.mac_filtering": "true",
+        "security.port_isolation": "false",
+        "type": "nic"
+      },
+      "root": {
+        "path": "/",
+        "pool": "vmpool",
+        "size": "20GiB",
+        "type": "disk"
+      }
+    },
+    "name": "v1",
+    "profiles": [],
+    "source": {
+      "alias": "debian/13",
+      "mode": "pull",
+      "protocol": "simplestreams",
+      "server": "https://images.linuxcontainers.org",
+      "type": "image"
+    },
+    "start": true,
+    "type": "virtual-machine"
+  },
+  "v2": {
+    "config": {
+      "agent.nic_config": "true",
+      "boot.autostart": "true",
+      "limits.cpu": "2",
+      "limits.memory": "4GiB",
+      "user.arca.template": "ws",
+      "user.arcakernel.entry": "service-v2"
+    },
+    "devices": {
+      "agent": {
+        "source": "agent:config",
+        "type": "disk"
+      },
+      "eth0": {
+        "hwaddr": "02:aa:bb:00:00:02",
+        "name": "enp5s0",
+        "nictype": "bridged",
+        "parent": "br0",
+        "type": "nic"
+      },
+      "root": {
+        "path": "/",
+        "pool": "vmpool",
+        "size": "20GiB",
+        "type": "disk"
+      }
+    },
+    "name": "v2",
+    "profiles": [],
+    "source": {
+      "alias": "debian/13",
+      "mode": "pull",
+      "protocol": "simplestreams",
+      "server": "https://images.linuxcontainers.org",
+      "type": "image"
+    },
+    "start": true,
+    "type": "virtual-machine"
+  }
+}

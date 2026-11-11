@@ -45,6 +45,11 @@ const MAX_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 /// The kernel's current retained set, read at each call.
 pub type Retained = Arc<dyn Fn() -> Result<RetainedEntries, String> + Send + Sync>;
 
+/// What follows a start or a restart that left the instance running, given its project and name: the secrets of a
+/// virtual-machine service are written into its guest (`crate::guest_secrets`). `Ok(None)` when the instance has
+/// none, the names written otherwise, or in plain words what was not done. No answer holds a value.
+pub type AfterStart = Arc<dyn Fn(&str, &str) -> Result<Option<Vec<String>>, String> + Send + Sync>;
+
 /// The state writer of a kernel-mode node, the ownership check in front of it, and the journal behind it.
 pub struct InstanceLifecycle {
     changer: StateChanger,
@@ -54,6 +59,7 @@ pub struct InstanceLifecycle {
     journal: PathBuf,
     /// One action at a time. The number is the last id this process gave a journalled action.
     gate: Mutex<u64>,
+    after_start: Option<AfterStart>,
 }
 
 impl std::fmt::Debug for InstanceLifecycle {
@@ -92,6 +98,7 @@ impl InstanceLifecycle {
             retained: Arc::new(retained),
             journal: state_dir.join(INSTANCE_ACTIONS_FILE),
             gate: Mutex::new(0),
+            after_start: None,
         }
     }
 
@@ -115,6 +122,12 @@ impl InstanceLifecycle {
                     .ok()
             })
             .unwrap_or_else(|| self.changer.clone())
+    }
+
+    /// The same lifecycle with what follows a start or a restart. Without one, nothing follows.
+    pub fn with_after_start(mut self, after_start: AfterStart) -> InstanceLifecycle {
+        self.after_start = Some(after_start);
+        self
     }
 
     /// The same lifecycle over another state writer, so a test can shorten its deadline.
@@ -242,17 +255,57 @@ impl InstanceLifecycle {
         if self.append(&end).is_err() {
             eprintln!("arca: the end of instance action {id} was not journalled");
         }
-        match outcome {
-            Ok(done) => Ok(json!({
-                "project": done.state.project,
-                "instance": done.state.name,
-                "action": action.as_str(),
-                "status": done.state.status,
-                "changed": done.changed,
-                "message": done.message,
-            })),
-            Err(stopped) => Err(stopped.refusal),
+        // The gate is not held while a guest is waited for: another instance's action need not wait for it.
+        drop(last);
+        let mut done = match outcome {
+            Ok(done) => done,
+            Err(stopped) => return Err(stopped.refusal),
+        };
+        if action != StateAction::Stop
+            && done.state.status == "Running"
+            && let Some(after_start) = &self.after_start
+        {
+            let followed = after_start(project, instance);
+            // The journal names the secrets written, or that they were not. It never holds a value or a reason.
+            if !matches!(followed, Ok(None)) {
+                let row = json!({
+                    "kind": "guest_secrets",
+                    "id": id,
+                    "outcome": if followed.is_ok() { "written" } else { "failed" },
+                    "secrets": followed.as_ref().ok().and_then(Option::as_ref),
+                });
+                if self.append(&row).is_err() {
+                    eprintln!("arca: the secrets of instance action {id} were not journalled");
+                }
+            }
+            match followed {
+                Ok(None) => {}
+                Ok(Some(names)) => {
+                    done.message = format!(
+                        "{}. {}",
+                        done.message,
+                        crate::guest_secrets::written_words(&names)
+                    );
+                }
+                Err(why) => {
+                    return Err(refused(
+                        "InstanceSecretsNotWritten",
+                        format!(
+                            "{}. It is running, but its secrets were not written into the guest: {why}. Run instance_start for it again to write them; that never restarts it",
+                            done.message
+                        ),
+                    ));
+                }
+            }
         }
+        Ok(json!({
+            "project": done.state.project,
+            "instance": done.state.name,
+            "action": action.as_str(),
+            "status": done.state.status,
+            "changed": done.changed,
+            "message": done.message,
+        }))
     }
 
     fn act(&self, action: StateAction, project: &str, instance: &str) -> Result<Done, Stopped> {

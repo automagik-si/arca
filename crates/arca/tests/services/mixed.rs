@@ -407,7 +407,7 @@ fn a_container_links_to_a_virtual_machine_and_the_other_verbs_are_refused_in_wor
             "service_secret_set",
             json!({"name":"db","key":"TOKEN","value":"12345678"})
         )),
-        "service db is a virtual machine: it has no template secrets or environment for Arca to set"
+        "template does not declare that secret: this virtual machine's template declares none"
     );
 
     // A machine on the host bridge keeps the bridged node's refusals.
@@ -1061,3 +1061,6 @@ fn a_bridged_nodes_lowered_caps_are_refused_below_use_and_followed_above_it() {
     assert_eq!(config["limits.disk"], "60GiB");
     no_open_intent(&rig);
 }
+
+#[path = "vm_secrets.rs"]
+mod vm_secrets;

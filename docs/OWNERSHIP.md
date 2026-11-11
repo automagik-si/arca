@@ -959,7 +959,7 @@ is kept, and the rest is refused in words:
 | `service_connect` to it | allowed when its template declares `ports` | A link is a rule in the provider's NIC ACL plus values for the consumer; both hold for a virtual machine. |
 | `service_connect` from it | refused | The consumer's values are container environment, which a virtual machine's programs never read. |
 | `service_publish` | refused | A dash's tailnet node runs inside an Arca-built container image; no virtual-machine image carries it. |
-| `service_secret_set` | refused | A virtual-machine template has no secrets or environment. |
+| `service_secret_set` | allowed for a secret its template declares | The value is stored and written into the guest at the next `instance_start`, never into its config (Rule 68). |
 | `mac` on `service_create` | refused | The address is reserved by Arca's plan; a fixed MAC is for a host bridge whose own network hands out addresses. |
 | a template with `ports` or `provides`, on a host bridge | refused | Ports are opened by the managed network's ACL, which a host bridge does not have. |
 
@@ -1037,6 +1037,77 @@ in `crates/arca-kernel/src/plugin.rs`; `ServiceHandler::settle_create` in `crate
 `after_a_create_that_did_not_start_instance_start_retries_it_and_service_remove_removes_it` in
 `crates/arca/tests/services/mixed.rs` and, for the cases that stay open,
 `a_create_whose_read_back_finds_an_object_is_unresolved_not_failed` in `crates/arca-providers/tests/incus_provider.rs`.
+
+**Rule 68.** A virtual-machine template may carry a first-boot script, settings and secrets. The script and the settings are
+part of the machine's create and of nothing later; the secrets never enter Incus's instance config.
+
+- `firstBoot` is `{ "file": "<name>" }`, a plain file beside the template, read as an entrypoint's file is. Its text becomes
+  the instance key `cloud-init.user-data`, so it begins `#!` (cloud-init runs it once, as root, at the first boot) or
+  `#cloud-config`. `settings` is one JSON object of at most 16KiB. It becomes `cloud-init.vendor-data`: a `#cloud-config`
+  with one `write_files` entry that writes the object to `/etc/arca/settings.json`, its content base64, so no setting can
+  change the YAML around it. Both are recorded in the service's record (`vm.userData`, `vm.vendorData`), because the create
+  body is built from the record; a record without them is exactly the one an earlier kernel wrote, and its create is
+  unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
+  script or setting applies to a machine created after the change.
+- `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
+  `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
+  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
+  carriage return before a line feed is dropped, and a carriage return alone is refused. A virtual machine whose template
+  declares secrets is created stopped. That fails closed and is not a guarantee that it never boots without them: a
+  machine with `boot.autostart` that Incus starts by itself before the first `instance_start` boots with no secret file,
+  and what runs in it must wait for the file.
+- The channel is Incus's file request, which Incus hands to the guest agent: after `instance_start` or `instance_restart`
+  has left the machine running, Arca reads each stored value and sends `POST /1.0/instances/<name>/files?path=...` with the
+  value as the request body. First `/etc/arca-secrets`, a directory of root's with mode 0700; then one file per secret in
+  it, named by the secret, of root's with mode 0600. The directory comes first because Incus makes a new file before it
+  sets its mode, and only root enters the directory. The directory is read before it is made (`GET` of the same path:
+  its type, mode and owner are in the answer's headers), so one an earlier start made is left alone and nothing depends
+  on how Incus answers a request to make a directory that exists. Anything else at the path, a file, a link, or a
+  directory with another mode or owner, refuses the start's secrets in words and nothing is written under it. A start of
+  a machine that already runs writes the files again and restarts nothing, which is how a new value arrives without an
+  approval.
+- Each stored value is read by the provider's own rule for a secret file and by nothing looser
+  (`arca_providers::incus::read_entry_secret`): the reference names this entry's secret or a shared one, the secrets
+  directory and every directory on the way are real, private and this process's own, the file is a regular file of this
+  process's with mode 0600 and at most 64KiB, and the file that was checked is the file that is read.
+- Why it is safe: the value is in two places at rest, Arca's secret store and the guest's own disk, and passes through
+  Incus as a request body, which Incus neither stores nor logs (its lifecycle event names the path). It is not in the
+  instance config, the desired state, the effect journal, the exec audit or any answer. The instance action journal gets
+  one line, `{"kind":"guest_secrets","outcome":"written","secrets":[<names>]}`, or `"failed"` with no reason. A refusal uses
+  fixed words and names a secret, never a value. What this does not hide: root inside the guest reads the files, and a
+  snapshot or a copy of the machine's disk carries them. The guest's disk was chosen over memory (`/run`) so that a
+  machine that Incus starts by itself after a host restart, or that restarts from inside, still has its secrets without
+  Arca being asked.
+- The write is not a plugin effect, like an instance action (it is made beside one) and the exec seam (Rule 50). It is made
+  only for a record that is a virtual machine Arca created, in the service project, through a writer bound to the record's
+  entry, on the instance whose uuid the effect journal holds, and not on one with a tombstone. An adopted service and a
+  container get nothing.
+- Inside a tenant (Rule 61) a virtual machine's secrets are stored as anywhere, and are not written into its guest: the
+  file requests are made in the node's own service project only, as the exec seam's are (Rule 50). A start of such a
+  machine says so with `InstanceSecretsNotWritten`, and sends nothing. Test
+  `a_tenants_machine_keeps_its_secrets_stored_and_a_start_says_they_are_not_in_its_guest` in
+  `crates/arca/tests/tenants/isolation.rs`.
+- The guest agent is waited for, up to 120 seconds: a machine that has just started boots before it takes a file. When
+  it never answers, the verb is refused with `InstanceSecretsNotWritten`, the machine stays running, and the answer says to
+  run `instance_start` again.
+
+Source: `first_boot`, `settings_vendor_data`, `validate_vm_template` and `vm_config` in `crates/arca/src/service.rs`;
+`vm_service_config` in `crates/arca/src/handlers.rs`; `call_wiring` in `crates/arca/src/service_wiring.rs`;
+`crates/arca/src/guest_secrets.rs`; `InstanceLifecycle::run` and `with_after_start` in `crates/arca/src/lifecycle.rs`;
+`ServiceFile::GuestSecretsDir`, `ServiceFile::GuestSecret` and `write_service_file` in `crates/arca-incus/src/exec.rs`;
+Incus's `fileSFTPPost` in `cmd/incusd/instance_file.go` for the order of create and mode. Tests, in
+`crates/arca/tests/services/vm_secrets.rs`:
+`a_vm_with_secrets_is_created_stopped_with_its_script_and_incus_never_receives_a_secret_but_as_a_guest_file` (every request
+the fake received is read: a secret is in the body of its own file request and nowhere else),
+`a_secret_set_on_a_running_vm_applies_at_its_next_start_which_never_restarts_it`,
+`a_guest_agent_that_is_not_up_yet_is_waited_for_and_one_that_never_answers_is_said_in_words`,
+`the_guest_directory_is_read_before_it_is_made_and_one_that_is_not_private_is_refused`,
+`a_stored_secret_is_read_by_the_providers_rule_and_a_key_with_crlf_lines_is_stored_with_line_feeds`,
+`a_vm_template_takes_a_first_boot_script_settings_and_secrets_and_no_other_kind_does` and
+`the_create_requests_of_an_oci_a_system_and_a_plain_vm_template_are_the_golden_ones`, whose golden file was written by the
+kernel before this rule. The fake refuses a file for a virtual machine that is stopped or whose agent is not up, as Incus
+does. That cloud-init on a public cloud image runs the two keys in a machine Arca creates, and that the agent takes the
+files, are read from Incus's and cloud-init's behaviour and not yet confirmed on a live host ("Assumptions to confirm").
 
 ## Tenants
 
@@ -1212,6 +1283,16 @@ possible.
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
 
+- A virtual machine from a public cloud image (`images:debian/13/cloud`) that Arca creates runs its
+  `cloud-init.user-data` once at its first boot and writes the file its `cloud-init.vendor-data` names, on a host whose
+  QEMU has no virtio-9p (the config share is the `agent:config` drive of Rule 59), and its guest agent then takes a file
+  request for `/etc/arca-secrets` with the mode and owner asked for (Rule 68). The fake models the agent only as ready or
+  not ready.
+- A file `GET` of a directory in a virtual machine's guest answers 200 with `X-Incus-type: directory` and the directory's
+  `X-Incus-mode`, `X-Incus-uid` and `X-Incus-gid`, and 404 when nothing is at the path; a guest whose agent is not up
+  answers neither (Rule 68). Read from `fileSFTPGet` in Incus 7.6's `cmd/incusd/instance_file.go`. A directory `POST`
+  for a path that exists is answered with success there (`fileSFTPPost`); Arca no longer sends one, and the fake can
+  refuse it to show that.
 - An instance's config PATCH that names one `user.*` key leaves every other key, device and profile as it was, does not
   restart the instance, and is refused with 412 under a stale `If-Match` (Rule 52). The adoption's Mark step relies on the same
   behaviour for a stopped instance; the import sends it to a running one.

@@ -201,7 +201,17 @@ impl Rig {
                 },
                 &dir,
             )
-            .with_tenants(tenants),
+            .with_tenants(tenants)
+            .with_after_start({
+                // As `arca serve` wires it: a start writes a virtual machine's stored secrets into its guest.
+                let secrets =
+                    arca::guest_secrets::GuestSecrets::new(Arc::clone(&cfg), Arc::clone(&kernel))
+                        .with_wait(
+                            std::time::Duration::from_millis(200),
+                            std::time::Duration::from_millis(10),
+                        );
+                Arc::new(move |project, instance| secrets.deliver(project, instance))
+            }),
         );
         let handlers = plan_handlers_served(
             kernel.clone(),

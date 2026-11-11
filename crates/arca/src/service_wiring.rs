@@ -310,28 +310,18 @@ impl ServiceHandler {
             }
             return Err(adopted(&name));
         }
-        if cfg.on_host_bridge() {
+        // A virtual machine takes its template's secrets on either network: they are stored here and written into its
+        // guest at its next start (`crate::guest_secrets`). It is never published.
+        if cfg.on_host_bridge() && self.verb != "service_secret_set" {
             return Err(bridged_refusal(
                 &name,
-                match self.verb {
-                    "service_secret_set" => {
-                        "it has no template secrets or environment for Arca to set"
-                    }
-                    _ => "it cannot be published from here; reach it on its bridge's own network",
-                },
+                "it cannot be published from here; reach it on its bridge's own network",
             ));
         }
-        if cfg.vm.is_some() {
+        if cfg.vm.is_some() && self.verb != "service_secret_set" {
             return Err(vm_refusal(
                 &name,
-                match self.verb {
-                    "service_secret_set" => {
-                        "it has no template secrets or environment for Arca to set"
-                    }
-                    _ => {
-                        "a dash is published by a tailnet node inside an Arca-built container image, and no virtual-machine image carries one"
-                    }
-                },
+                "a dash is published by a tailnet node inside an Arca-built container image, and no virtual-machine image carries one",
             ));
         }
         if self.verb == "service_secret_set" {
@@ -352,17 +342,38 @@ impl ServiceHandler {
             }
             let t = self.template(&cfg)?;
             if !t.secrets.iter().any(|k| k == key) {
-                return Err(service_refused("template does not declare that secret"));
+                return Err(service_refused(
+                    if cfg.vm.is_some() && t.secrets.is_empty() {
+                        "template does not declare that secret: this virtual machine's template declares none"
+                    } else {
+                        "template does not declare that secret"
+                    },
+                ));
             }
-            let value = args["value"]
-                .as_str()
+            // A virtual machine's secret is a file in its guest, never an environment value, so it may have line
+            // breaks: a private key in PEM form is several lines.
+            // A key file saved on another system ends each line with a carriage return and a line feed: the
+            // pair is stored as one line feed.
+            let lines = cfg.vm.is_some();
+            let given = args["value"].as_str().map(|given| {
+                if lines {
+                    given.replace("\r\n", "\n")
+                } else {
+                    given.to_owned()
+                }
+            });
+            let value = given
+                .as_deref()
                 .filter(|s| {
-                    (8..=4096).contains(&s.chars().count()) && !s.chars().any(char::is_control)
+                    (8..=4096).contains(&s.chars().count())
+                        && !s.chars().any(|c| c.is_control() && !(lines && c == '\n'))
                 })
                 .ok_or_else(|| {
-                    CallError::Invalid(
-                        "a secret is 8 to 4096 characters without control characters".into(),
-                    )
+                    CallError::Invalid(if lines {
+                        "a secret is 8 to 4096 characters; a virtual machine's may have line breaks, and no other control character".into()
+                    } else {
+                        "a secret is 8 to 4096 characters without control characters".into()
+                    })
                 })?;
             self.live_owned(&entry, &cfg)?;
             let owner = cfg.entry_id();
