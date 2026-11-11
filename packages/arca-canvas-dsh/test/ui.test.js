@@ -342,6 +342,21 @@ test('committed browser artifacts equal a fresh build and use no external CSS', 
   }
 });
 
+test('the Open Intelligence tag the canvas draws is the vendored footer cut, element for element', async () => {
+  const { OPEN_INTELLIGENCE_TAG } = await import('../src/open-intelligence.js');
+  const escape = (value) => value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const markup = ([tag, attrs, children]) => `<${tag}${Object.entries(attrs).map(([name, value]) => ` ${name}="${escape(value)}"`).join('')}>${
+    children.map((child) => (typeof child === 'string' ? escape(child) : markup(child))).join('')}</${tag}>`;
+  const vendored = await readFile(new URL('../../../assets/open-intelligence/open-intelligence-tag.svg', import.meta.url), 'utf8');
+  assert.equal(`${markup(OPEN_INTELLIGENCE_TAG)}\n`, vendored);
+  const [tag, attrs, children] = OPEN_INTELLIGENCE_TAG;
+  assert.equal(tag, 'svg');
+  assert.deepEqual([attrs.width, attrs.height, attrs['aria-label']], ['170', '32', 'Open Intelligence badge']);
+  assert.deepEqual(children.at(-1)[2], ['OPEN INTELLIGENCE']);
+  const flat = JSON.stringify(OPEN_INTELLIGENCE_TAG);
+  assert.doesNotMatch(flat, /"(a|script|style|foreignObject|image|use)",|"(href|xlink:href|style|on\w+)":/);
+});
+
 test('a service Open link needs a configured host address and a real service port', () => {
   const dashboard = buildDashboard(fixture);
   const web = project(dashboard, 'Web1').cards[0];

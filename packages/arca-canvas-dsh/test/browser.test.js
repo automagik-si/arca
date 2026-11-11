@@ -1183,6 +1183,19 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
             '.arca-topbar', '.arca-machines', '.arca-stage', '.arca-panel',
             '.arca-world', '.arca-node-project', '.arca-node-instance', '.arca-wire', '.arca-composer',
           ].map((selector) => [selector, document.querySelector(selector).getBoundingClientRect().toJSON()])),
+          tag: (() => {
+            const svg = document.querySelector('.arca-foot svg[aria-label="Open Intelligence badge"]');
+            const pill = getComputedStyle(svg.querySelector('rect'));
+            const words = svg.querySelector('text');
+            return {
+              count: document.querySelectorAll('svg[aria-label="Open Intelligence badge"]').length,
+              box: svg.getBoundingClientRect().toJSON(),
+              foot: document.querySelector('.arca-foot').getBoundingClientRect().toJSON(),
+              ground: pill.fill, line: pill.stroke, ink: getComputedStyle(words).fill, words: words.textContent,
+              wordsRight: words.getBoundingClientRect().right,
+              link: Boolean(svg.closest('a, button')), anchors: document.querySelectorAll('.arca-foot a, .arca-foot button').length,
+            };
+          })(),
           nodes: {
             project: document.querySelectorAll('.arca-node-project').length,
             instances: document.querySelectorAll('.arca-node-instance').length,
@@ -1210,6 +1223,20 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
       assert.equal(Math.round(topbar.bottom), Math.round(panel.top));
       assert.ok(actual.rectangles['.arca-node-instance'].width >= 300);
       assert.equal(Math.round(actual.rectangles['.arca-composer'].bottom), 900);
+      // The Open Intelligence tag: one picture, 170 px, on this theme's ground and ink, at the foot of the canvas
+      // column; the Doctor panel and its composer keep the place asserted above.
+      assert.equal(actual.tag.count, 1);
+      assert.deepEqual([actual.tag.box.width, actual.tag.box.height], [170, 32]);
+      assert.equal(actual.tag.ground, expected.bg, `${theme} tag ground`);
+      assert.equal(actual.tag.line, expected.ink, `${theme} tag outline`);
+      assert.equal(actual.tag.ink, expected.ink, `${theme} tag words`);
+      assert.equal(actual.tag.words, 'OPEN INTELLIGENCE');
+      assert.ok(actual.tag.wordsRight < actual.tag.box.right, 'the words stay inside the pill');
+      assert.deepEqual([actual.tag.link, actual.tag.anchors], [false, 0]);
+      assert.equal(Math.round(actual.tag.foot.bottom), 900);
+      assert.equal(Math.round(actual.tag.foot.right), Math.round(panel.left));
+      assert.equal(Math.round(actual.tag.foot.top), Math.round(stage.bottom));
+      assert.ok(actual.tag.box.width < topbar.width && actual.tag.box.height < topbar.height);
       const contrast = (Math.max(luminance(actual.muted), luminance(actual.panel)) + 0.05)
         / (Math.min(luminance(actual.muted), luminance(actual.panel)) + 0.05);
       assert.ok(contrast >= 4.5, `${theme} muted contrast ${contrast}`);
@@ -1247,7 +1274,11 @@ test('v28 layout binds both hosts, the Doctor chat, the approval cards and the a
     machines: document.querySelector('.arca-machines').getBoundingClientRect().toJSON(),
     stage: document.querySelector('.arca-stage').getBoundingClientRect().toJSON(),
     panel: document.querySelector('.arca-panel').getBoundingClientRect().toJSON(),
+    foot: document.querySelector('.arca-foot').getBoundingClientRect().toJSON(),
+    tag: document.querySelector('.arca-foot svg').getBoundingClientRect().toJSON(),
   }));
+  assert.ok(stacked.foot.top >= stacked.panel.bottom - 1, 'the Open Intelligence tag closes the stacked page');
+  assert.deepEqual([stacked.tag.width, stacked.tag.height], [170, 32]);
   assert.ok(stacked.panel.top >= stacked.stage.bottom - 1, 'panel stacks below the canvas');
   assert.ok(stacked.stage.top >= stacked.machines.bottom - 1, 'canvas follows the machines strip');
 });
