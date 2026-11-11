@@ -899,7 +899,16 @@ fn the_services_socket_gives_its_peer_only_what_the_token_gives_and_serves_no_ap
         "the socket is 0600"
     );
     assert_eq!(meta.uid(), own_uid(scratch.path()));
-    assert_eq!(names_in(scratch.path()), ["services.sock", "tokens"]);
+    // The staging directory is removed right after the rename, so the listing settles a moment after the path appears.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while names_in(scratch.path()) != ["services.sock", "tokens"] {
+        assert!(
+            Instant::now() < deadline,
+            "a staging entry was left beside the socket: {:?}",
+            names_in(scratch.path())
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let call = |name: &str| {
         rpc(
             json!(1),
