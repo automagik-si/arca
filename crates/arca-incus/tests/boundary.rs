@@ -119,24 +119,53 @@ fn the_detector_flags_every_way_of_enabling_the_feature() {
     assert!(enables_write(
         "[features]\nincus-write = [\"arca-incus/write\"]\n"
     ));
+    // A dependency for one platform only is not in another platform's resolved graph, so this check has to see it.
+    assert!(enables_write(
+        "[target.'cfg(windows)'.dependencies]\narca-incus = { workspace = true, features = [\"write\"] }\n"
+    ));
+    assert!(enables_write(
+        "[target.'cfg(windows)'.dependencies.arca-incus]\nworkspace = true\nfeatures = [\"write\"]\n"
+    ));
     assert!(!enables_write(
         "[dependencies]\narca-incus.workspace = true\nserde.workspace = true\n"
     ));
 }
 
+/// The platform this test runs on, as cargo names it.
+fn host(cargo: &std::ffi::OsStr) -> String {
+    let output = Command::new(cargo)
+        .arg("-vV")
+        .output()
+        .expect("cargo prints its version");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("cargo names its host")
+        .trim()
+        .to_string()
+}
+
 /// The workspace's resolved graph, as `cargo metadata` prints it. Each dependency keeps its real package name, and every
 /// package's features are already resolved, so no manifest is parsed here.
+///
+/// It is the graph of the platform the test runs on. `cargo metadata` reads the manifest of every package it lists, and
+/// without the filter it lists the packages of every platform the lock file names. A machine that has only built the
+/// workspace holds the crates of its own platform, so there the unfiltered call has to download the others and, offline,
+/// fails. The filter leaves out one thing: a dependency on `arca-incus` declared for another platform only. The manifest
+/// check above reads those tables too, and `the_detector_flags_every_way_of_enabling_the_feature` holds it to that.
 fn resolved_graph() -> Value {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let manifest = crates_dir().join("..").join("Cargo.toml");
-    let output = Command::new(cargo)
+    let output = Command::new(&cargo)
         .args([
             "metadata",
             "--format-version",
             "1",
             "--offline",
-            "--manifest-path",
+            "--filter-platform",
         ])
+        .arg(host(&cargo))
+        .arg("--manifest-path")
         .arg(&manifest)
         .output()
         .expect("cargo metadata runs");
