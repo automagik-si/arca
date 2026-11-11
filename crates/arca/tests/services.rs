@@ -1771,7 +1771,7 @@ fn refuses_to_read_or_remove_an_unmarked_instance_before_sending_a_log_or_delete
 }
 
 #[test]
-fn the_nine_templates_and_nothing_else_load_and_are_pinned() {
+fn the_eleven_templates_and_nothing_else_load_and_are_pinned() {
     use std::path::Path;
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
     let mut names: Vec<String> = std::fs::read_dir(&dir)
@@ -1789,6 +1789,8 @@ fn the_nine_templates_and_nothing_else_load_and_are_pinned() {
             "automagik-workspace",
             "cloudflare-tunnel",
             "github-runner-pool",
+            "gitlab-runner-pool",
+            "gitlab-runner-pool-large",
             "nats",
             "omni-api",
             "postgres-autopg",
@@ -1806,6 +1808,39 @@ fn the_nine_templates_and_nothing_else_load_and_are_pinned() {
             );
         }
         assert!(!template.image.to_lowercase().contains("redis"));
+        // A virtual machine's own image is the public Debian by its alias; what it runs inside is named in its
+        // settings. Both sizes of the GitLab pool name every image there by digest: all three, and nothing by a tag.
+        if name.starts_with("gitlab-runner-pool") {
+            assert!(template.is_vm() && template.digest.is_none());
+            let settings = template.settings.as_ref().expect("settings");
+            let images: Vec<(&String, &str)> = settings
+                .as_object()
+                .expect("an object")
+                .iter()
+                .filter(|(key, _)| key.ends_with("Image"))
+                .map(|(key, image)| (key, image.as_str().expect("an image")))
+                .collect();
+            assert_eq!(
+                images
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                ["helperImage", "runnerImage", "tailnetImage"]
+            );
+            for (key, image) in images {
+                let digest = image
+                    .split_once("@sha256:")
+                    .map(|(_, digest)| digest)
+                    .unwrap_or_else(|| panic!("{name}: {key} is not named by digest: {image}"));
+                assert!(
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "{name}: {key}: {image}"
+                );
+            }
+        }
     }
     let automagik = service::load_template(&dir, "automagik").unwrap();
     assert_eq!(
