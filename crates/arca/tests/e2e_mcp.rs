@@ -1152,7 +1152,8 @@ fn the_services_socket_of_a_node_that_serves_its_approval_page_serves_mcp_alone(
     let (hash_dir, secrets) = mint_tokens(&scratch);
     let viewer = secret_of(&secrets, "viewer-1");
     let config = write_config(&scratch, rig.shim.socket(), &hash_dir);
-    // The socket's directory is the server's own and nobody else's, as serve requires.
+    // The socket's directory, and the one above it, are the server's own and nobody else's, as serve requires.
+    fs::set_permissions(&scratch.0, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
     let run = scratch.at("run");
     fs::create_dir(&run).expect("the socket's directory");
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).expect("chmod 0700");

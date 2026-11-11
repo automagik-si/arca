@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use arca_api::{Scope, Verb};
+use arca_api::{Scope, Verb, may_call};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -62,7 +62,8 @@ pub struct Server {
     pub(crate) verbs: &'static [Verb],
     pub(crate) tokens: TokenStore,
     pub(crate) handlers: HashMap<&'static str, Arc<dyn ToolHandler>>,
-    gets: Vec<(&'static str, Arc<dyn GetHandler>)>,
+    /// Each GET route: its path, the verb whose scope and tool list admit a caller to it, and its handler.
+    gets: Vec<(&'static str, &'static str, Arc<dyn GetHandler>)>,
 }
 
 /// Answers one GET route with a body. The server runs it on a blocking thread, after the bearer check.
@@ -115,18 +116,30 @@ impl Server {
         self
     }
 
-    /// Answers `GET <path>` with `h`, behind the same bearer check and `Origin` refusal as `/mcp`, for a token of any
-    /// stored scope. A request without a valid bearer is 401, and one with an `Origin` is 403.
+    /// Answers `GET <path>` with `h`, behind the same bearer check and `Origin` refusal as `/mcp`, for a caller who may
+    /// call the verb `tool`: the route gives the same reading that verb gives, so a token's scope and tool list admit it
+    /// to the route exactly as to the verb. A request without a valid bearer is 401, one with an `Origin` is 403, and
+    /// one from a token the verb does not admit is 403.
     ///
     /// # Panics
     ///
-    /// Panics when `path` is `/mcp`, does not start with `/`, or already has a route: a wiring error, found at start.
-    pub fn get_route(mut self, path: &'static str, h: Arc<dyn GetHandler>) -> Self {
+    /// Panics when `path` is `/mcp`, does not start with `/`, or already has a route, and when the table has no verb
+    /// named `tool`: a wiring error, found at start.
+    pub fn get_route(
+        mut self,
+        path: &'static str,
+        tool: &'static str,
+        h: Arc<dyn GetHandler>,
+    ) -> Self {
         assert!(
-            path.starts_with('/') && path != "/mcp" && self.gets.iter().all(|(p, _)| *p != path),
+            path.starts_with('/') && path != "/mcp" && self.gets.iter().all(|(p, _, _)| *p != path),
             "the GET route {path} is not a new path"
         );
-        self.gets.push((path, h));
+        assert!(
+            self.verbs.iter().any(|v| v.name == tool),
+            "the verb table has no verb named {tool}"
+        );
+        self.gets.push((path, tool, h));
         self
     }
 
@@ -134,12 +147,12 @@ impl Server {
     /// body is read.
     pub fn router(mut self) -> Router {
         let mut router = Router::new().route("/mcp", post(mcp));
-        for (path, handler) in std::mem::take(&mut self.gets) {
+        for (path, tool, handler) in std::mem::take(&mut self.gets) {
             router = router.route(
                 path,
                 get(
                     move |state: State<Arc<Server>>, uri: Uri, headers: HeaderMap| {
-                        serve_get(state, handler, uri, headers)
+                        serve_get(state, handler, tool, uri, headers)
                     },
                 ),
             );
@@ -180,12 +193,23 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
 async fn serve_get(
     State(server): State<Arc<Server>>,
     handler: Arc<dyn GetHandler>,
+    tool: &'static str,
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
     let Some(caller) = bearer(&headers).and_then(|token| server.tokens.lookup(token)) else {
         return unauthorized();
     };
+    // The route is its verb's reading over GET: a token the verb does not admit, by scope or by tool list, is refused
+    // here as a `tools/call` of the verb is.
+    let admitted = server
+        .verbs
+        .iter()
+        .find(|verb| verb.name == tool)
+        .is_some_and(|verb| may_call(caller.scope, verb) && caller.allows_tool(verb.name));
+    if !admitted {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let query = uri.query().map(str::to_string);
     let outcome = tokio::task::spawn_blocking(move || handler.get(query.as_deref(), &caller)).await;
     match outcome {
@@ -236,22 +260,12 @@ pub async fn serve_unix(router: Router, path: &Path) -> io::Result<()> {
 /// Serves `router` on a second unix socket at `path`, the services socket: mode 0600, bound as [`serve_unix`] binds
 /// its own, and served to peers of this process's uid and to root. Incus connects to it, as root, for a service whose
 /// device forwards the instance's loopback to it. The caller passes the MCP router alone, whose every route needs a
-/// bearer token, so the socket gives its peer no authority. The directory that holds the socket must belong to this
-/// process's uid or to root and be writable by its owner alone, so no other user can put a socket of its own at the
-/// path while the server is down.
+/// bearer token, so the socket gives its peer no authority. The directory that holds the socket, and every directory
+/// above it, must be one no other user can change ([`services_dir_ok`]), so no other user can put a socket of its own
+/// at the path while the server is down.
 pub async fn serve_services(router: Router, path: &Path) -> io::Result<()> {
     services_path_ok(path).map_err(|why| io::Error::new(io::ErrorKind::InvalidInput, why))?;
-    let parent = path.parent().unwrap_or(Path::new("/"));
-    let held = fs::metadata(parent)?;
-    if !held.is_dir()
-        || !(held.uid() == process_uid()? || held.uid() == 0)
-        || held.mode() & 0o022 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the directory of the services socket must belong to the server's user or to root and be writable by its owner alone",
-        ));
-    }
+    services_dir_ok(path, process_uid()?)?;
     clear_stale_socket(path)?;
     let (listener, uid) = bind_staged(path)?;
     let listener = OwnerListener {
@@ -605,6 +619,39 @@ pub fn proxy_addr_ok(addr: &SocketAddr) -> Result<(), String> {
     }
     if in_tailnet(&ip) {
         return Err("a tailnet address is never a proxy listener".into());
+    }
+    Ok(())
+}
+
+/// Whether the directory of the services socket at `path`, and every directory above it, is one no user but `uid` and
+/// root can change. The directory itself, read through any symlink, must belong to `uid` or to root and be writable by
+/// its owner alone: anyone who could write to it could bind a socket of their own at the path while the server is
+/// down. Each directory above it must belong to `uid` or to root too, and be writable by its owner alone or carry the
+/// sticky bit, as `/tmp` does: anyone who could rename a directory on the way could put another in its place.
+fn services_dir_ok(path: &Path, uid: u32) -> io::Result<()> {
+    let refused = |dir: &Path, why: &str| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the services socket's directory, and every directory above it, must belong to the server's user or to root and be writable by its owner alone (a directory above it may be sticky instead): {} {why}",
+                dir.display()
+            ),
+        )
+    };
+    let parent = fs::canonicalize(path.parent().unwrap_or(Path::new("/")))?;
+    for (depth, dir) in parent.ancestors().enumerate() {
+        let held = fs::metadata(dir)?;
+        if !held.is_dir() {
+            return Err(refused(dir, "is not a directory"));
+        }
+        if held.uid() != uid && held.uid() != 0 {
+            return Err(refused(dir, "belongs to another user"));
+        }
+        let open = held.mode() & 0o022 != 0;
+        let sticky = held.mode() & 0o1000 != 0;
+        if open && (depth == 0 || !sticky) {
+            return Err(refused(dir, "can be written to by a group or by others"));
+        }
     }
     Ok(())
 }

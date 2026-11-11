@@ -138,7 +138,9 @@ fn the_plugin_refuses_a_record_that_gives_kernel_access_to_anything_else() {
 }
 
 /// A record that is lost and made again from the instance's own marks says what the instance has: the device stays on
-/// the instance, so the record names the access. An instance of another project is never read for it.
+/// the instance, so the record names the access. Only a device to this node's own services socket is read, and only on
+/// an instance of the node's own project. A device somebody made by hand for another path is not an access Arca gave:
+/// the record does not name it, and it never stops `serve` from starting.
 #[test]
 fn a_record_made_again_from_an_instance_reads_the_kernel_access_its_device_shows() {
     let device = service::kernel_device(&service::KernelLink {
@@ -152,22 +154,33 @@ fn a_record_made_again_from_an_instance_reads_the_kernel_access_its_device_shows
     };
     let mut other = device.clone();
     other["connect"] = json!("tcp:127.0.0.1:7460");
-    let rig = Rig::with(
-        FakeState {
-            server: json!({}),
-            projects: vec![],
-            instances: vec![
-                with_device("cloud", PROJECT, "192.0.2.10", "uuid-cloud", &device),
-                // The same device in another manager's project: not the node's own service.
-                with_device("far", "arca", "192.0.2.11", "uuid-far", &device),
-                // A device of the same name and another shape is not the access Arca gives.
-                with_device("odd", PROJECT, "192.0.2.12", "uuid-odd", &other),
-            ],
-            networks: vec![],
-            pools: vec![],
-        },
-        vec![PROJECT.to_string(), "arca".into()],
+    let elsewhere = service::kernel_device(&service::KernelLink {
+        port: 7461,
+        connect: "/run/other/hand-made.sock".into(),
+    });
+    let state = || FakeState {
+        server: json!({}),
+        projects: vec![],
+        instances: vec![
+            with_device("cloud", PROJECT, "192.0.2.10", "uuid-cloud", &device),
+            // The same device in another manager's project: not the node's own service.
+            with_device("far", "arca", "192.0.2.11", "uuid-far", &device),
+            // A device of the same name and another shape is not the access Arca gives.
+            with_device("odd", PROJECT, "192.0.2.12", "uuid-odd", &other),
+            // A device of the right shape that somebody pointed at another socket by hand.
+            with_device("hand", PROJECT, "192.0.2.13", "uuid-hand", &elsewhere),
+        ],
+        networks: vec![],
+        pools: vec![],
+    };
+    let projects = || vec![PROJECT.to_string(), "arca".into()];
+    let rig = Rig::with_services(
+        state(),
+        projects(),
         Some("192.0.2.0/24"),
+        None,
+        None,
+        Some(KERNEL),
     );
     let listed = rig.call("service_list", json!({})).expect("list");
     let row = |name: &str| {
@@ -183,14 +196,64 @@ fn a_record_made_again_from_an_instance_reads_the_kernel_access_its_device_shows
         row("cloud")["kernelAccess"],
         json!({ "port": 7461, "connect": KERNEL })
     );
-    assert!(row("far").get("kernelAccess").is_none());
-    assert!(row("odd").get("kernelAccess").is_none());
+    for name in ["far", "odd", "hand"] {
+        assert!(row(name).get("kernelAccess").is_none(), "{name}");
+    }
     assert_eq!(
         rig.service_config("cloud").kernel_access,
         Some(service::KernelLink {
             port: 7461,
             connect: KERNEL.into()
         })
+    );
+    assert_eq!(rig.service_config("hand").kernel_access, None);
+    // So the records made here never stand between this node and its next start.
+    assert_eq!(
+        arca::handlers::kernel_access_refusal(&rig.cfg, &rig.entries()),
+        None
+    );
+    // The record follows the device. Pointed somewhere else by hand, or taken off, it leaves the record at the next
+    // call, and a start over a config with no services socket is then not refused.
+    let without_socket = |rig: &Rig| {
+        let mut cfg = (*rig.cfg).clone();
+        cfg.listen.services = None;
+        arca::handlers::kernel_access_refusal(&cfg, &rig.entries())
+    };
+    assert_eq!(
+        without_socket(&rig).as_deref(),
+        Some(
+            "the service cloud has access to this node's kernel through the socket /run/arca/services.sock, and this config sets no listen.services: set listen.services to /run/arca/services.sock, or remove the service before taking it out"
+        )
+    );
+    rig.edit(
+        "PATCH",
+        &format!("/1.0/instances/cloud?project={PROJECT}"),
+        json!({"devices":{
+            "eth0":{"type":"nic","name":"eth0","ipv4.address":"192.0.2.10"},
+            "kernel": elsewhere
+        }}),
+    );
+    rig.call("service_list", json!({})).expect("list");
+    assert_eq!(rig.service_config("cloud").kernel_access, None);
+    assert_eq!(without_socket(&rig), None);
+    // Put back as Arca made it, the record names it again.
+    rig.edit(
+        "PATCH",
+        &format!("/1.0/instances/cloud?project={PROJECT}"),
+        json!({"devices":{
+            "eth0":{"type":"nic","name":"eth0","ipv4.address":"192.0.2.10"},
+            "kernel": device
+        }}),
+    );
+    rig.call("service_list", json!({})).expect("list");
+    assert!(rig.service_config("cloud").kernel_access.is_some());
+    // On a node with no services socket, no device is read back at all.
+    let bare = Rig::with(state(), projects(), Some("192.0.2.0/24"));
+    bare.call("service_list", json!({})).expect("list");
+    assert_eq!(bare.service_config("cloud").kernel_access, None);
+    assert_eq!(
+        arca::handlers::kernel_access_refusal(&bare.cfg, &bare.entries()),
+        None
     );
     // The reading is exact: it gives back only what `kernel_device` makes.
     assert_eq!(service::kernel_link_of(&json!({ "devices": {} })), None);
