@@ -1,10 +1,10 @@
 [package]
 name = "arca-approval"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca's owner approvals: the signed statement, its canonical form, and the checks that spend each one once"
+description = "Automagik Arca's owner approvals: the signed statement, its canonical form, and the checks that spend each one once"
 
 [dependencies]
 arca-kernel.workspace = true

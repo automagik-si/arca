@@ -1,12 +1,12 @@
 {
   "name": "arca-canvas-dsh",
   "version": "0.1.0",
-  "description": "Arca snapshots and a Doctor chat with in-canvas approvals for DSH",
+  "description": "Automagik Arca snapshots and a Doctor chat with in-canvas approvals for DSH",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/weunfold/arca.git",
+    "url": "https://github.com/automagik-si/arca.git",
     "directory": "packages/arca-canvas-dsh"
   },
   "main": "./index.js",

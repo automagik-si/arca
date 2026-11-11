@@ -1,10 +1,10 @@
 [package]
 name = "arca-mcp"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Arca MCP server: the verb table as MCP tools over streamable HTTP, behind hashed bearer tokens and two listeners"
+description = "The Automagik Arca MCP server: the verb table as MCP tools over streamable HTTP, behind hashed bearer tokens and two listeners"
 
 [dependencies]
 arca-api.workspace = true

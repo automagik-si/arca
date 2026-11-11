@@ -1,10 +1,10 @@
 [package]
 name = "arca-api"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca API contracts: the verb-class table, the OpenRPC document and a JSON Schema subset validator"
+description = "Automagik Arca API contracts: the verb-class table, the OpenRPC document and a JSON Schema subset validator"
 
 [dependencies]
 serde.workspace = true

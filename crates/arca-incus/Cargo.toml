@@ -1,10 +1,10 @@
 [package]
 name = "arca-incus"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca's Incus access: a GET-only client over the unix socket, a fake Incus and a recording shim"
+description = "Automagik Arca's Incus access: a GET-only client over the unix socket, a fake Incus and a recording shim"
 
 [dependencies]
 arca-kernel.workspace = true

@@ -1,10 +1,10 @@
 [package]
 name = "arca-reconcile"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca's single reconciler: applies signed desired state through the plugins, reverts removed entries and deletes only under an approved plan"
+description = "Automagik Arca's single reconciler: applies signed desired state through the plugins, reverts removed entries and deletes only under an approved plan"
 
 [dependencies]
 arca-approval.workspace = true

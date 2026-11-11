@@ -1,10 +1,10 @@
 [package]
 name = "arca-metrics"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Arca's host sampler: local procfs and sysfs readings, remote Incus host totals, and Incus pool and instance counts, served in the node_metrics shape"
+description = "Automagik Arca's host sampler: local procfs and sysfs readings, remote Incus host totals, and Incus pool and instance counts, served in the node_metrics shape"
 
 [dependencies]
 arca-incus.workspace = true

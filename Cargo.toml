@@ -3,9 +3,10 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
+version = "0.1.0-alpha.7"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/weunfold/arca"
+repository = "https://github.com/automagik-si/arca"
 
 # Every external version is an exact pin, written once here. A crate takes one with `.workspace = true`.
 # The pins read from this host's cargo cache or from the crates.io index on 2026-10-30.

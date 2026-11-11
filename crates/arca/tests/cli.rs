@@ -228,6 +228,57 @@ fn usage_errors_exit_2_and_say_what_was_wrong() {
 }
 
 #[test]
+fn version_prints_the_product_name_the_version_the_commit_and_the_target_and_exits_0() {
+    let mut lines = Vec::new();
+    for spelling in ["--version", "version", "-V"] {
+        let out = arca().arg(spelling).output().expect("run the binary");
+        assert_eq!(out.status.code(), Some(0), "{spelling} exits 0");
+        assert!(out.stderr.is_empty(), "{spelling} prints nothing on stderr");
+        lines.push(stdout_text(&out));
+    }
+    assert!(
+        lines.iter().all(|line| line == &lines[0]),
+        "every spelling prints the same line: {lines:?}"
+    );
+    let line = lines[0].strip_suffix('\n').expect("one line");
+    assert!(!line.contains('\n'), "one line only: {line:?}");
+
+    // "Automagik Arca <version> (<short commit>, <target triple>)"
+    let prefix = concat!("Automagik Arca ", env!("CARGO_PKG_VERSION"), " (");
+    let inside = line
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{line:?} starts with {prefix:?} and ends with a bracket"));
+    let (commit, target) = inside.split_once(", ").expect("a commit and a target");
+    let hex = (7..=40).contains(&commit.len())
+        && commit
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    assert!(
+        hex || commit == "unknown",
+        "{commit:?} is a short commit, or unknown for a build with no git checkout"
+    );
+    assert!(
+        target.split('-').count() >= 3 && target.starts_with(std::env::consts::ARCH),
+        "{target:?} is this build's target triple"
+    );
+
+    // The usage text lists the command, and the command takes no argument.
+    let help = arca().arg("--help").output().expect("run the binary");
+    assert_eq!(help.status.code(), Some(0));
+    assert!(
+        stdout_text(&help).contains("\n  version (or --version, -V)\n"),
+        "the usage text lists version"
+    );
+    let extra = arca()
+        .args(["--version", "now"])
+        .output()
+        .expect("run the binary");
+    assert_eq!(extra.status.code(), Some(2), "version takes no argument");
+    assert!(extra.stdout.is_empty());
+}
+
+#[test]
 fn sample_for_takes_up_to_60_seconds_and_refuses_61() {
     // A sampling run of 60 seconds would take a minute, so the test stops at the config: a refused config exits 2 before any
     // sample is taken. The length is checked first, so a length the command accepts gets past it and reaches the config

@@ -1,7 +1,8 @@
 # Operating the `arca` binary
 
-The `arca` binary runs one node's one-shot host reads, mints scoped bearer tokens, runs the recording shim, and serves the
-Arca MCP. Every command that needs the node reads one JSON config file, given with `--config`.
+The `arca` binary is Automagik Arca's one program. It runs one node's one-shot host reads, mints scoped bearer tokens, runs
+the recording shim, and serves the Arca MCP. Every command that needs the node reads one JSON config file, given with
+`--config`.
 
 ## Commands
 
@@ -23,6 +24,7 @@ Arca MCP. Every command that needs the node reads one JSON config file, given wi
 | `arca token revoke <id>` with `--config <file>` or `--hash-dir <dir>` | the token's hash file | the id and `revoked: true` |
 | `arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]` | forwards GET, refuses the rest | the shim summary, on SIGTERM; the summary so far on stderr, on SIGUSR1 |
 | `arca adopt plan\|apply\|release\|verify\|status --instance <name> ... --config <file>` | one listed container, and its adoption record | the plan, the steps run, or the check made; see "Adopting a container" |
+| `arca --version`, `arca version` or `arca -V` | nothing | one line: `Automagik Arca <version> (<short commit>, <target triple>)`; the commit reads `unknown` when the binary was built with no git checkout |
 | `arca service import plan --name <service> --config <file>` | one instance `kernel.importServices` lists, and the instance listing, through Incus GET | the import's dry run as JSON: every check, the one write and the pre-image digest; see "Importing a service another manager created" |
 
 `watch` and `metrics` print the same JSON as the MCP verb of the same name, so a command's output can be compared with the

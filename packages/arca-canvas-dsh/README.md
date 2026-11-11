@@ -1,4 +1,4 @@
-# Arca canvas for DSH
+# Automagik Arca canvas for DSH
 
 A host plugin for stock DSH and an embedding DSH host. It polls Arca through a
 Unix socket and serves a cached snapshot at `GET /arca-canvas/snapshot`.
@@ -23,7 +23,7 @@ tag was checked against that exact release on 2026-11-05. Install the package at
 an exact full commit containing this directory:
 
 ```sh
-dsh plugin --profile <profile> add -w "github:weunfold/arca#<commit>&path:/packages/arca-canvas-dsh"
+dsh plugin --profile <profile> add -w "github:automagik-si/arca#<commit>&path:/packages/arca-canvas-dsh"
 ```
 
 Replace `<profile>` and `<commit>` with the desired profile and full commit SHA.

@@ -1,10 +1,10 @@
 [package]
 name = "arca-link"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Arca node link: one endpoint, one-time pairing and byte streams to local sockets"
+description = "The Automagik Arca node link: one endpoint, one-time pairing and byte streams to local sockets"
 
 [dependencies]
 base64.workspace = true
