@@ -1176,8 +1176,8 @@ fn g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change() {
     let waited = waits(&rig);
     // The deadline covers every request the node sends before it waits on the join, so it is seconds and not a tenth
     // of one: on a slow machine a tenth passed before the wait was sent, and the node then sent fewer requests. While
-    // it waits, the fake answers every quarter of a second that the join still runs and the node asks again. How often
-    // is not the node's choice, so this rig's golden log leaves the waits out (see `WITHOUT_WAITS`).
+    // it waits, the fake holds each wait for a quarter of a second, answers that the join still runs, and the node asks
+    // again. How often is not the node's choice, so this rig's golden log leaves the waits out (see `WITHOUT_WAITS`).
     assert!(
         seam.run(
             &target,
@@ -1193,6 +1193,12 @@ fn g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change() {
         commands(&rig).contains(&join.argv()),
         "the join was started"
     );
+    // The fake writes a wait down when it answers it, a quarter of a second after it arrived. A wait the node sent
+    // just before its deadline is therefore not in the log yet when the node has given up.
+    let written = Instant::now() + Duration::from_secs(1);
+    while waits(&rig) == waited && Instant::now() < written {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         waits(&rig) > waited,
         "the join was waited on before its deadline passed"

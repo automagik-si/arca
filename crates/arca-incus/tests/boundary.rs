@@ -119,7 +119,8 @@ fn the_detector_flags_every_way_of_enabling_the_feature() {
     assert!(enables_write(
         "[features]\nincus-write = [\"arca-incus/write\"]\n"
     ));
-    // A dependency for one platform only is not in another platform's resolved graph, so this check has to see it.
+    // Two spellings of a dependency for one platform only. This text check sees these two and not every spelling cargo
+    // accepts; the graph check below reads what cargo itself made of the manifests, for every platform.
     assert!(enables_write(
         "[target.'cfg(windows)'.dependencies]\narca-incus = { workspace = true, features = [\"write\"] }\n"
     ));
@@ -137,6 +138,11 @@ fn host(cargo: &std::ffi::OsStr) -> String {
         .arg("-vV")
         .output()
         .expect("cargo prints its version");
+    assert!(
+        output.status.success(),
+        "cargo -vV failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
@@ -145,17 +151,17 @@ fn host(cargo: &std::ffi::OsStr) -> String {
         .to_string()
 }
 
-/// The workspace's resolved graph, as `cargo metadata` prints it. Each dependency keeps its real package name, and every
-/// package's features are already resolved, so no manifest is parsed here.
+/// The resolved graph of the workspace at `manifest`, as `cargo metadata` prints it. Each dependency keeps its real package
+/// name, and every package's features are already resolved, so no manifest is parsed here.
 ///
-/// It is the graph of the platform the test runs on. `cargo metadata` reads the manifest of every package it lists, and
-/// without the filter it lists the packages of every platform the lock file names. A machine that has only built the
+/// The resolve is the one of the platform the test runs on. `cargo metadata` reads the manifest of every package it lists,
+/// and without the filter it lists the packages of every platform the lock file names. A machine that has only built the
 /// workspace holds the crates of its own platform, so there the unfiltered call has to download the others and, offline,
-/// fails. The filter leaves out one thing: a dependency on `arca-incus` declared for another platform only. The manifest
-/// check above reads those tables too, and `the_detector_flags_every_way_of_enabling_the_feature` holds it to that.
-fn resolved_graph() -> Value {
+/// fails. The filter narrows the resolve and the list of packages. It does not narrow what a package declares: each
+/// package's `dependencies` still carries its entries for every platform, each with its `target`. [`write_enablers`] reads
+/// those, so a dependency declared for another platform only is still seen.
+fn resolved_graph(manifest: &Path) -> Value {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let manifest = crates_dir().join("..").join("Cargo.toml");
     let output = Command::new(&cargo)
         .args([
             "metadata",
@@ -166,7 +172,7 @@ fn resolved_graph() -> Value {
         ])
         .arg(host(&cargo))
         .arg("--manifest-path")
-        .arg(&manifest)
+        .arg(manifest)
         .output()
         .expect("cargo metadata runs");
     assert!(
@@ -215,37 +221,81 @@ fn resolved_features(metadata: &Value, name: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("the resolved graph holds {name}"))
 }
 
-/// The packages whose enabled features give `arca-incus` its `write` feature. A package counts when it depends on
-/// `arca-incus` in the resolve and either lists `write` in its dependency entry, or reaches `arca-incus/write` through its
-/// own feature table. A dependency that is not active is not in the resolve, so it counts for nothing.
+/// The packages that give `arca-incus` its `write` feature. Every package is judged by what it declares, for every
+/// platform, and not by whether this platform's resolve links it to `arca-incus`: a dependency declared for another
+/// platform only is in no resolve this test can ask for offline. A package counts when
+///
+/// - an entry for `arca-incus` among its declared dependencies lists `write`, and that entry is in use; or
+/// - its enabled features reach `<key>/write`, or the weak `<key>?/write` while the dependency is in use.
+///
+/// `<key>` is the name the package gives the dependency: `arca-incus`, or the new name of a renamed one. A dependency is
+/// in use when it is not optional, when the resolve links the package to `arca-incus`, or when an enabled feature turns it
+/// on. An optional dependency that nothing turns on counts for nothing.
 fn write_enablers(metadata: &Value) -> BTreeSet<String> {
     let packages = packages_by_id(metadata);
+    let nodes: BTreeMap<&str, &Value> = array(&metadata["resolve"]["nodes"])
+        .iter()
+        .map(|node| (text(&node["id"]), node))
+        .collect();
     let mut enablers = BTreeSet::new();
-    for node in array(&metadata["resolve"]["nodes"]) {
-        let package = packages.get(text(&node["id"])).expect("a resolved package");
-        let depends = array(&node["deps"])
+    for (id, package) in &packages {
+        let entries: Vec<&Value> = array(&package["dependencies"])
             .iter()
-            .any(|dep| name_of(&packages, text(&dep["pkg"])) == INCUS);
-        if !depends {
+            .filter(|dep| text(&dep["name"]) == INCUS)
+            .collect();
+        if entries.is_empty() {
             continue;
         }
-        let listed = array(&package["dependencies"]).iter().any(|dep| {
-            text(&dep["name"]) == INCUS
-                && strings(&dep["features"])
-                    .iter()
-                    .any(|f| f.as_str() == WRITE)
+        let node = nodes.get(id);
+        let enabled = node.map_or_else(Vec::new, |node| strings(&node["features"]));
+        let linked = node.is_some_and(|node| {
+            array(&node["deps"])
+                .iter()
+                .any(|dep| name_of(&packages, text(&dep["pkg"])) == INCUS)
         });
         let table = package["features"].as_object().expect("a feature table");
-        if listed || reaches_write(table, &strings(&node["features"])) {
+        let keys: BTreeSet<&str> = entries.iter().map(|dep| key_of(dep)).collect();
+        let reached = reach(table, &enabled, &keys);
+        let in_use = |dep: &Value| {
+            dep["optional"].as_bool() != Some(true) || linked || reached.on.contains(key_of(dep))
+        };
+        let listed = entries
+            .iter()
+            .any(|dep| strings(&dep["features"]).iter().any(|f| f == WRITE) && in_use(dep));
+        let weak = entries
+            .iter()
+            .any(|dep| reached.weak.contains(key_of(dep)) && in_use(dep));
+        if listed || reached.write || weak {
             enablers.insert(text(&package["name"]).to_string());
         }
     }
     enablers
 }
 
-/// Whether the enabled features reach `arca-incus/write`, or the weak `arca-incus?/write`, through the package's own feature
-/// table. A local feature is followed. A `dep:` entry only activates a dependency, so it leads nowhere here.
-fn reaches_write(table: &Map<String, Value>, enabled: &[String]) -> bool {
+/// The name a package gives a dependency: its new name when it is renamed, and the package's name otherwise.
+fn key_of(dep: &Value) -> &str {
+    dep["rename"].as_str().unwrap_or_else(|| text(&dep["name"]))
+}
+
+/// What a package's enabled features do to its dependencies on `arca-incus`.
+#[derive(Default)]
+struct Reach<'a> {
+    /// A feature names `<key>/write`: the dependency is turned on, with its writer.
+    write: bool,
+    /// The keys a feature names as `<key>?/write`: the writer, but only where the dependency is in use.
+    weak: BTreeSet<&'a str>,
+    /// The keys a feature turns on, as `dep:<key>` or as `<key>/<feature>`.
+    on: BTreeSet<&'a str>,
+}
+
+/// Follows the enabled features through the package's own feature table. `keys` are the names the package gives its
+/// dependencies on `arca-incus`. A local feature is followed; an entry for any other dependency leads nowhere here.
+fn reach<'a>(
+    table: &Map<String, Value>,
+    enabled: &[String],
+    keys: &BTreeSet<&'a str>,
+) -> Reach<'a> {
+    let mut found = Reach::default();
     let mut pending: Vec<String> = enabled.to_vec();
     let mut seen = BTreeSet::new();
     while let Some(feature) = pending.pop() {
@@ -256,26 +306,35 @@ fn reaches_write(table: &Map<String, Value>, enabled: &[String]) -> bool {
             continue;
         };
         for entry in strings(entries) {
-            match entry.split_once('/') {
-                Some((dep, name)) => {
-                    let dep = dep
-                        .strip_prefix("dep:")
-                        .unwrap_or(dep)
-                        .trim_end_matches('?');
-                    if dep == INCUS && name == WRITE {
-                        return true;
-                    }
+            if let Some(dep) = entry.strip_prefix("dep:") {
+                if let Some(key) = keys.get(dep) {
+                    found.on.insert(*key);
                 }
-                None => pending.push(entry),
+                continue;
+            }
+            let Some((dep, name)) = entry.split_once('/') else {
+                pending.push(entry);
+                continue;
+            };
+            let Some(key) = keys.get(dep.trim_end_matches('?')) else {
+                continue;
+            };
+            if dep.ends_with('?') {
+                if name == WRITE {
+                    found.weak.insert(*key);
+                }
+            } else {
+                found.on.insert(*key);
+                found.write |= name == WRITE;
             }
         }
     }
-    false
+    found
 }
 
 #[test]
 fn the_resolved_graph_gives_the_write_feature_to_arca_providers_only() {
-    let metadata = resolved_graph();
+    let metadata = resolved_graph(&crates_dir().join("..").join("Cargo.toml"));
     let enablers = write_enablers(&metadata);
     let outside: Vec<&String> = enablers
         .iter()
@@ -297,10 +356,11 @@ fn the_resolved_graph_gives_the_write_feature_to_arca_providers_only() {
 
 #[test]
 fn the_resolved_graph_check_flags_renamed_dependencies_and_every_feature_syntax() {
-    // Three enablers, each by a different route: a renamed dependency that lists `write`, a feature chain that reaches
-    // `arca-incus/write`, and a weak `arca-incus?/write`. Four packages must not count: one whose `dep:` entry only
-    // activates the dependency, one whose optional dependency is not active, one whose feature is another crate's write,
-    // and the writer itself.
+    // Five enablers, each by a different route: a renamed dependency that lists `write`, a feature chain that reaches
+    // `arca-incus/write`, a weak `arca-incus?/write`, a dependency declared for another platform only, which no resolve
+    // of this platform links, and a feature that reaches the writer through a renamed dependency's new name. Five
+    // packages must not count: one whose `dep:` entry only activates the dependency, one whose optional dependency is not
+    // active, the same for another platform only, one whose feature is another crate's write, and the writer itself.
     let metadata = json!({
         "packages": [
             {"id": "p-incus", "name": "arca-incus", "features": {"write": []}, "dependencies": []},
@@ -317,7 +377,15 @@ fn the_resolved_graph_check_flags_renamed_dependencies_and_every_feature_syntax(
             {"id": "p-inactive", "name": "inactive", "features": {},
                 "dependencies": [{"name": "arca-incus", "rename": null, "features": ["write"], "optional": true, "kind": null}]},
             {"id": "p-other", "name": "other", "features": {"write": ["arca-kernel/write"]},
-                "dependencies": [{"name": "arca-kernel", "rename": null, "features": ["write"], "optional": false, "kind": null}]}
+                "dependencies": [{"name": "arca-kernel", "rename": null, "features": ["write"], "optional": false, "kind": null}]},
+            {"id": "p-macos", "name": "macos-only", "features": {},
+                "dependencies": [{"name": "arca-incus", "rename": null, "features": ["write"], "optional": false, "kind": null,
+                    "target": "cfg(target_os = \"macos\")"}]},
+            {"id": "p-macos-off", "name": "macos-optional", "features": {},
+                "dependencies": [{"name": "arca-incus", "rename": null, "features": ["write"], "optional": true, "kind": null,
+                    "target": "cfg(target_os = \"macos\")"}]},
+            {"id": "p-alias", "name": "alias", "features": {"w": ["incus/write"]},
+                "dependencies": [{"name": "arca-incus", "rename": "incus", "features": [], "optional": false, "kind": null}]}
         ],
         "resolve": {"nodes": [
             {"id": "p-incus", "deps": [], "features": ["write"]},
@@ -327,12 +395,54 @@ fn the_resolved_graph_check_flags_renamed_dependencies_and_every_feature_syntax(
             {"id": "p-weak", "deps": [{"name": "arca-incus", "pkg": "p-incus"}], "features": ["maybe"]},
             {"id": "p-plain", "deps": [{"name": "arca-incus", "pkg": "p-incus"}], "features": ["incus"]},
             {"id": "p-inactive", "deps": [], "features": []},
-            {"id": "p-other", "deps": [{"name": "arca-kernel", "pkg": "p-kernel"}], "features": ["write"]}
+            {"id": "p-other", "deps": [{"name": "arca-kernel", "pkg": "p-kernel"}], "features": ["write"]},
+            {"id": "p-macos", "deps": [], "features": []},
+            {"id": "p-macos-off", "deps": [], "features": []},
+            {"id": "p-alias", "deps": [{"name": "incus", "pkg": "p-incus"}], "features": ["w"]}
         ]}
     });
-    let expected: BTreeSet<String> = ["chain", "renamed", "weak"]
+    let expected: BTreeSet<String> = ["alias", "chain", "macos-only", "renamed", "weak"]
         .into_iter()
         .map(String::from)
         .collect();
     assert_eq!(write_enablers(&metadata), expected);
+}
+
+#[test]
+fn the_graph_check_names_a_member_that_enables_the_writer_for_another_platform_only() {
+    // A workspace of two crates, written here and read by cargo itself. `arca-api` depends on `arca-incus` for macOS only
+    // and lists `write` over several lines, as cargo allows. On any other platform no resolve links the two, and the
+    // text check does not read this spelling, so only what cargo says the member declares can give it away.
+    let api = "[package]\nname = \"arca-api\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n\
+               [target.'cfg(target_os = \"macos\")'.dependencies]\n\
+               arca-incus = { workspace = true, features = [\n    \"write\",\n] }\n";
+    assert!(
+        !enables_write(api),
+        "the text check does not read this spelling"
+    );
+    let dir = std::env::temp_dir().join(format!("arca-boundary-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    for (file, body) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n\n\
+             [workspace.dependencies]\narca-incus = { path = \"crates/arca-incus\" }\n",
+        ),
+        (
+            "crates/arca-incus/Cargo.toml",
+            "[package]\nname = \"arca-incus\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[features]\nwrite = []\n",
+        ),
+        ("crates/arca-incus/src/lib.rs", ""),
+        ("crates/arca-api/Cargo.toml", api),
+        ("crates/arca-api/src/lib.rs", ""),
+    ] {
+        let path = dir.join(file);
+        fs::create_dir_all(path.parent().expect("a parent directory"))
+            .expect("the directory is made");
+        fs::write(&path, body).expect("the file is written");
+    }
+    let metadata = resolved_graph(&dir.join("Cargo.toml"));
+    fs::remove_dir_all(&dir).expect("the workspace is removed");
+    let enablers: Vec<String> = write_enablers(&metadata).into_iter().collect();
+    assert_eq!(enablers, ["arca-api"]);
 }
