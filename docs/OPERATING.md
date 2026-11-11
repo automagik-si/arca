@@ -68,7 +68,8 @@ refused without the value being echoed back.
 | `identityPhones` | no | Instance names the watch flags with `identity: true`. |
 | `listen.unix` | yes | The MCP socket. Created with mode 0600. |
 | `listen.tailnet` | no | One tailnet address, or `null`. See below. |
-| `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. Set to `127.0.0.1` with the peer `127.0.0.1`, it is the listener a service with kernel access connects to. See below, and "A service that may talk to the kernel". |
+| `listen.proxy` | no | `{ "addr": "<ip>:<port>", "peer": "<ip>" }`, or `null`: one address for a reverse proxy on the same host, served to the single peer address `peer`. See below. |
+| `listen.services` | no | The path of a second unix socket, or `null`: the services socket. It serves the MCP routes alone, never the approval page, to the server's own user and to root. A service with kernel access connects to it. See below, and "A service that may talk to the kernel". |
 | `tokens.hashDir` | yes | The directory of hash files. See below. |
 | `kernel.projects` | no | The project family the kernel may write in. With projects named, the writer serves only those projects. With none, the kernel is watch-only: the reconciler's provider reads only, service writes are refused, no GPU device writer exists, and a removal cannot reach Incus. |
 | `kernel.scratch` | no | When `true`, every kernel project must start with `arcak-scratch-`. |
@@ -100,6 +101,8 @@ The config is refused, with exit 2, when:
   `fd7a:115c:a1e0::/48`, and not on port 80, 443, 7443 or 9443;
 - `listen.proxy.addr` is a wildcard, a tailnet address (IPv4-mapped included), port 0, or port 80, 443, 7443 or 9443;
   `listen.proxy.peer` is missing or a wildcard; or `listen.proxy` carries any other key;
+- `listen.services` is not an absolute file path of at most 100 bytes made of letters, digits, `/`, `.`, `_` and `-`
+  with no `..` part, or it is `listen.unix`'s path;
 - a kernel project is `bench`, `default`, or a name in `kernel.droiddProjects`;
 - `kernel.projects` is not empty and `kernel.droiddProjects` is empty;
 - `kernel.scratch` is `true` and a kernel project does not start with `arcak-scratch-`.
@@ -137,12 +140,21 @@ any other bind error, such as a port in use, stops it at once.
 The connection is plain HTTP on the bridge, and a host that can take the peer's address can reach the listener; the bearer
 token is still required. Serving on a proxy address is a separate step, approved by the owner like the tailnet listener.
 
-The address may be the host's loopback, `{ "addr": "127.0.0.1:<port>", "peer": "127.0.0.1" }`. Nothing outside the host
-reaches such a listener, and every process on the host does: unlike the unix socket, which serves the server's own uid
-alone, a loopback listener cannot tell one local user from another. What a local process may do there is what the token
-it holds allows, and without one every call is 401. This is the one `listen.proxy` a service with kernel access connects
-to (see "A service that may talk to the kernel"). The listener is one address served to one peer: a node whose
-`listen.proxy` serves a reverse proxy at a bridge address has none left for that.
+### Services socket
+
+`listen.services` is the path of a second unix socket, for example `/run/arca/services.sock` beside `listen.unix`. It
+is bound as the first one is (mode 0600, renamed into place) and serves the server's own user and root, and nobody else.
+It serves the MCP routes and nothing else: `POST /mcp` and the read-only GET routes, each behind a bearer token. The
+approval page is never on it, on any node and whatever the config becomes: a request for `/approve` or anything under it
+is 404, and a request that carries an `Origin` is 403. A node may serve its approval page and have this socket too; the
+two sockets are separate, and one path cannot be both.
+
+Incus connects to this socket, as root, for a service with kernel access (see "A service that may talk to the kernel").
+Root is served for that reason alone, and root can already do everything on the host. No other local user reaches the
+socket, and it has no port: nothing on the host can take a port in its place while the server is down. The directory
+that holds it must belong to the server's user or to root and be writable by its owner alone; `serve` refuses to bind
+it anywhere else, since another user could put a socket of its own at the path and be sent a service's token. The
+socket has its own limit of 64 connections, apart from every other listener's. A clean stop removes it.
 
 ## The link
 
@@ -377,7 +389,7 @@ The `automagik-server` template pins the OCI server image, mounts `/data` owned 
 ### A service that may talk to the kernel
 
 A service's NIC ACL rejects the bridge gateway, so a service cannot reach the kernel's MCP over the network, and the
-unix socket serves the server's own uid alone. A container template may declare that its service talks to the kernel:
+unix socket serves the server's own uid alone and may carry the approval page. A container template may declare that its service talks to the kernel:
 
 ```json
 "kernelAccess": { "port": 7461 }
@@ -388,11 +400,11 @@ The service's instance then carries one more device, named `kernel`, and nothing
 unix socket are as they are for every service.
 
 ```json
-"kernel": { "type": "proxy", "bind": "instance", "listen": "tcp:127.0.0.1:7461", "connect": "tcp:127.0.0.1:<listen.proxy port>" }
+"kernel": { "type": "proxy", "bind": "instance", "listen": "tcp:127.0.0.1:7461", "connect": "unix:<listen.services>" }
 ```
 
-Incus listens inside the instance, on its loopback, and connects from the host to the kernel's `listen.proxy` on the
-host's loopback. Inside the instance the kernel is `http://127.0.0.1:7461/mcp`: plain HTTP that never leaves the
+Incus listens inside the instance, on its loopback, and connects from the host to the kernel's services socket
+(`listen.services`). Inside the instance the kernel is `http://127.0.0.1:7461/mcp`: plain HTTP that never leaves the
 instance's loopback, so a client that allows plain HTTP on loopback alone works unchanged. Nothing crosses the bridge.
 
 The device carries bytes and no authority. Every process in the instance reaches the listener, and each one gets what the
@@ -405,39 +417,59 @@ A create of such a template is refused, before anything is written, unless all o
   shown a card for it. No verb installs a template: a tenant names a template that is already in
   `<stateDir>/templates`, and one that declares `kernelAccess` is refused there. Beneath that, a tenant's project blocks
   every proxy device (`restricted.devices.proxy=block`).
-- **The node has the listener.** `listen.proxy` must be `127.0.0.1` served to the peer `127.0.0.1`. When it is not, the
-  refusal says what to set: `"listen": { "proxy": { "addr": "127.0.0.1:<a free port>", "peer": "127.0.0.1" } }` in the
-  node's config, then restart `serve`. Any other `listen.proxy` (a bridge address, another loopback address, IPv6
-  loopback, another peer) is refused the same way.
-- **The node does not serve its approval page on that listener.** A node with `approvalOrigin` serves `/approve` on the
-  proxy listener as well, with no token, and trusts the caller address its one peer forwards. A service there would be
-  that peer: it could read and decline waiting proposals with no token. So a node with `approvalOrigin` gives no kernel
-  access; it is for a node whose approval page is served by another machine.
-- **The create says so.** The call repeats the template's key, `"kernelAccess": { "port": 7461 }`. A proposal made with
-  `action_propose` fills it in from the template, so the owner's approval binds it, and the owner's card carries a
-  `Kernel access` row: "Yes: this service can call this node's kernel from inside, at http://127.0.0.1:7461/mcp, with
-  whatever token it is given. The token's scope and tool list decide what it may do, and a call without a token is
-  refused." A template that gains the key after its card was shown is not created by that approval. A call that states
-  the key for a template without it is an invalid call.
+- **The node has the socket.** `listen.services` must be set. When it is not, the refusal says what to set:
+  `"listen": { "services": "/run/arca/services.sock" }` (a path beside `listen.unix`) in the node's config, then restart
+  `serve`. No other listener stands in for it: the unix socket, the tailnet listener and `listen.proxy` may carry the
+  approval page, whose routes need no token, so no device is ever pointed at one of them. A node that serves its
+  approval page and has `listen.services` gives kernel access like any other.
+- **The owner approved it.** Such a service is created only from a proposal: `action_propose` with `service_create`,
+  then the owner's approval. A direct `service_create` of such a template is refused with `NotApproved`, whatever the
+  token's scope. The proposal carries the template's key, `"kernelAccess": { "port": 7461 }`, filled in from the
+  template, so the approval binds it, and the owner's card carries a `Kernel access` row: "Yes: this service can call
+  this node's kernel from inside, at http://127.0.0.1:7461/mcp, with whatever token it is given. The token's scope and
+  tool list decide what it may do, and a call without a token is refused." A template that gains the key, or changes
+  its port, after its card was shown is not created by that approval. A call that states the key for a template
+  without it is an invalid call.
 
 Only a container template takes the key: a virtual machine has no device that listens inside it.
 
 `service_list` and `service_status` carry `kernelAccess: { "port", "connect" }` for such a service and no such key for
-any other. `connect` is the listener the device was made for. `service_status` also answers `ready`, and `problem` when
-it is false: the instance does not carry the device as Arca made it, or the node's `listen.proxy` is no longer the
-address the device connects to (remove the service and create it again), or the node has since set `approvalOrigin`.
-The device is the instance's own: it stays through a restart of the instance, of `serve` and of the host, and it is
-deleted with the instance by `service_remove`.
+any other. `connect` is the socket the device was made for. `service_status` also answers `ready`, and `problem` when
+it is false: the instance does not carry the device as Arca made it, or the node's `listen.services` is no longer the
+socket the device connects to.
+
+The device keeps the path it was made with. `serve` therefore refuses to start (exit 2, naming the service and the
+path) while any service's record names kernel access through a socket the config does not serve as `listen.services`:
+one that is no longer set, or one at another path. Set it back, or remove the service first. This holds whatever else
+the config has become, so a device is never left connected to a listener that could carry the approval page.
+
+The device is the instance's own. It stays through a restart of the instance and of `serve` (tested against the fake
+Incus), and it is deleted with the instance by `service_remove`. That it is there again after a restart of the host is
+Incus's to keep, in its own database, and is not yet checked on a live node. A record that is lost and made again from
+the instance's marks reads the device back, so `service_list` still says the service has the access.
 
 The effect journal records the create of the instance, and the digest it keeps (`op_digest`) is the digest of the create
 that carries the device; `journal_list` shows the effect, not the body. The service's record in the desired state names
 both ends of the access, and a proposal's journal line keeps the card's row.
 
-Not yet checked on a live Incus: that a proxy device with `bind=instance` in the restricted service project listens on
-the container's loopback and reaches a listener on the host's loopback as the peer `127.0.0.1`. To check it on a node
-without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus config device show <service>
---project arcak-svc` shows the `kernel` device above; `ss -ltn` on the host shows the listener on `127.0.0.1:<port>` and
-no other address; and the service's own log shows its first call to the kernel answered.
+What a process in the instance can and cannot do through the device:
+
+- With no token, nothing: every MCP route answers 401, and no other route exists on the socket.
+- With the service's token, what that token allows. Any process in the instance that can read the token can use it.
+- It can hold connections open. The socket's own limit of 64 is then spent, which stops other services with kernel
+  access from calling the kernel; the unix socket, the tailnet listener and the proxy listener are not affected.
+
+Not yet checked on a live Incus, and the first things to check there:
+
+- that a proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=unix:<path>` is accepted on a
+  container in the restricted service project and listens on the container's loopback;
+- that Incus connects to the socket as root, which is the one peer beside the server's own user the socket serves, and
+  that the confinement of Incus's proxy helper lets it reach a socket under the server's runtime directory.
+
+To check it on a node without writing anything: `service_status` answers `kernelAccess.ready: true`; `incus config
+device show <service> --project arcak-svc` shows the `kernel` device above; `ls -l` shows the socket at mode 0600,
+owned by the server's user; and the service's own log shows its first call to the kernel answered. If the service's
+calls are closed with no answer while `ready` is true, Incus is not connecting as root.
 
 `service_remove` takes `{name, approval}` and returns `{removed: true}` after full success. The owner signs a delete
 approval for target `name` and arguments `{name}` through the owner request flow arriving in Group 7. Removal spends
@@ -532,7 +564,8 @@ its request is read.
   sign; nothing written) or `changed`. No line is echoed. It is a doctor verb that writes, served only by a kernel whose
   `approval.peerKeys` is set; see "Approving on another machine".
 
-`serve` listens on the unix socket, and on the tailnet and proxy addresses when the config names them. If any listener
+`serve` listens on the unix socket, and on the tailnet and proxy addresses and the services socket when the config names
+them. If any listener
 fails, all of them stop and `serve` exits 1. On SIGTERM or SIGINT it stops every listener, removes its socket and exits 0.
 SIGHUP reloads the bearer token store only; it does not reread the node config or the owner passkeys.
 A socket that another server answers on is left alone.

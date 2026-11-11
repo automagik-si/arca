@@ -94,8 +94,8 @@ pub struct KernelAccess {
     pub port: u16,
 }
 
-/// What a service with kernel access records: the port inside its instance, and the address on the host's loopback its
-/// device connects to, which is the node's `listen.proxy` as it was when the service was created.
+/// What a service with kernel access records: the port inside its instance, and the path of the socket on the host its
+/// device connects to, which is the node's `listen.services` as it was when the service was created.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelLink {
@@ -108,23 +108,22 @@ pub const KERNEL_DEVICE: &str = "kernel";
 /// The lowest port a template's `kernelAccess` may name.
 pub const KERNEL_ACCESS_PORT_MIN: u16 = 1024;
 
-/// The host address a kernel access device may connect to: `127.0.0.1` and a fixed port, written as `127.0.0.1:<port>`.
+/// The socket on the host a kernel access device may connect to: a path the services socket may have
+/// ([`arca_mcp::services_path_ok`]). No address of any network is one.
 pub fn kernel_connect_ok(connect: &str) -> bool {
-    connect.parse::<std::net::SocketAddrV4>().is_ok_and(|addr| {
-        *addr.ip() == Ipv4Addr::LOCALHOST && addr.port() != 0 && addr.to_string() == connect
-    })
+    arca_mcp::services_path_ok(Path::new(connect)).is_ok()
 }
 
 /// The device of a service with kernel access. Incus listens inside the instance (`bind=instance`) on its loopback and
-/// connects from the host to the kernel's listener on the host's loopback, so nothing of it is on the bridge and the
-/// instance's NIC ACL is not involved. Whoever connects still needs a bearer token: the device carries bytes and no
-/// authority.
+/// connects from the host to the kernel's services socket, so nothing of it is on the bridge or on any host port, and
+/// the instance's NIC ACL is not involved. That socket serves the MCP routes alone, so whoever connects still needs a
+/// bearer token: the device carries bytes and no authority.
 pub fn kernel_device(link: &KernelLink) -> Value {
     json!({
         "type": "proxy",
         "bind": "instance",
         "listen": format!("tcp:127.0.0.1:{}", link.port),
-        "connect": format!("tcp:{}", link.connect)
+        "connect": format!("unix:{}", link.connect)
     })
 }
 
@@ -147,6 +146,28 @@ pub struct Vm {
     /// The template's settings, as a `cloud-init.vendor-data` that writes them to [`GUEST_SETTINGS_PATH`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor_data: Option<String>,
+}
+
+/// The kernel access an instance's own devices show: its `kernel` device, when it is exactly the device Arca makes for
+/// some port and some services socket path ([`kernel_device`]). `None` for an instance with no such device, or with one
+/// of any other shape. A record made again from an instance's marks reads it, so the record says what the instance has.
+pub fn kernel_link_of(row: &Value) -> Option<KernelLink> {
+    let device = &row["devices"][KERNEL_DEVICE];
+    let link = KernelLink {
+        port: device["listen"]
+            .as_str()?
+            .strip_prefix("tcp:127.0.0.1:")?
+            .parse()
+            .ok()?,
+        connect: device["connect"]
+            .as_str()?
+            .strip_prefix("unix:")?
+            .to_string(),
+    };
+    (link.port >= KERNEL_ACCESS_PORT_MIN
+        && kernel_connect_ok(&link.connect)
+        && *device == kernel_device(&link))
+    .then_some(link)
 }
 
 /// Where a virtual machine's guest finds its template's `settings`, as one JSON object.
@@ -735,7 +756,7 @@ impl Plugin for Service {
                 || !kernel_connect_ok(&link.connect))
         {
             return Err(PluginError::Config(
-                "kernel access is for a container of the node's own service project, on a port of 1024 or above that is not one of its own, to the kernel's listener on 127.0.0.1".into(),
+                "kernel access is for a container of the node's own service project, on a port of 1024 or above that is not one of its own, to the kernel's services socket".into(),
             ));
         }
         if let Some(vm) = &cfg.vm

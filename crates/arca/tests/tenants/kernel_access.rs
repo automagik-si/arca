@@ -1,17 +1,18 @@
 //! A template that declares `kernelAccess`: its service, in the node's own project, gets one device that listens inside
-//! the instance on loopback and connects to the kernel's `listen.proxy` on the host's loopback. A tenant never gets it,
-//! a node without that listener gives none, and an ordinary template gets no such device. Every address is synthetic.
+//! the instance on loopback and connects to the kernel's services socket (`listen.services`) on the host. A tenant never
+//! gets it, a node without that socket gives none, a create runs only from a proposal the owner approved, and an
+//! ordinary template gets no such device. Every path and address is synthetic.
 use super::*;
 use arca_kernel::plugin::{EffectOp, op_digest};
 
-/// The port the kernel's proxy listener has on the rig's node.
-const KERNEL: &str = "127.0.0.1:7460";
+/// The services socket of the rig's node.
+const KERNEL: &str = "/run/arca/services.sock";
 /// The port the template names inside the instance.
 const PORT: u16 = 7461;
 
-/// The `listen.proxy` a node needs before it gives a service kernel access.
-fn loopback() -> Value {
-    json!({ "proxy": { "addr": KERNEL, "peer": "127.0.0.1" } })
+/// The `listen.services` a node needs before it gives a service kernel access.
+fn socket() -> Value {
+    json!({ "services": KERNEL })
 }
 
 fn cloud_template() -> Value {
@@ -47,10 +48,11 @@ fn node(node: Value) -> Rig {
     rig
 }
 
+/// Creates the service `cloud` the one way it is created: proposed, approved by the owner, and run.
 fn create_cloud(rig: &Rig) -> Value {
-    rig.call(
+    rig.approved(
         "service_create",
-        json!({ "name": "cloud", "template": "cloud", "kernelAccess": stated() }),
+        json!({ "name": "cloud", "template": "cloud" }),
     )
     .expect("the create")
 }
@@ -71,7 +73,7 @@ fn device() -> Value {
         "type": "proxy",
         "bind": "instance",
         "listen": format!("tcp:127.0.0.1:{PORT}"),
-        "connect": format!("tcp:{KERNEL}")
+        "connect": format!("unix:{KERNEL}")
     })
 }
 
@@ -135,7 +137,7 @@ fn propose(rig: &Rig, args: Value) -> Result<Value, CallError> {
 
 #[test]
 fn a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_acl_rule_for_it() {
-    let rig = node(loopback());
+    let rig = node(socket());
     let made = create_cloud(&rig);
     assert_eq!(made["state"], "running");
     assert_eq!(
@@ -144,7 +146,7 @@ fn a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_
     );
 
     // The device: Incus listens inside the instance on its loopback and connects from the host to the kernel's
-    // listener on the host's loopback. It is the instance's only proxy device.
+    // services socket. It is the instance's only proxy device, and it names no address of any network.
     let held = instance(&rig, "cloud").expect("the instance");
     assert_eq!(held["devices"]["kernel"], device());
     assert_eq!(proxies(&held), ["kernel"]);
@@ -249,7 +251,7 @@ fn a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_
 
 #[test]
 fn an_ordinary_template_gets_no_such_device_and_cannot_ask_for_one() {
-    let rig = node(loopback());
+    let rig = node(socket());
     let made = rig
         .call(
             "service_create",
@@ -303,7 +305,7 @@ fn an_ordinary_template_gets_no_such_device_and_cannot_ask_for_one() {
 
 #[test]
 fn nothing_in_a_tenant_gets_kernel_access_and_no_verb_installs_a_template() {
-    let rig = node(loopback());
+    let rig = node(socket());
     let before = rig.fake().writes().len();
     let entries = rig.entries().len();
     // A tenant names a template by its name, like any caller. One that declares kernelAccess is refused there,
@@ -365,33 +367,21 @@ fn nothing_in_a_tenant_gets_kernel_access_and_no_verb_installs_a_template() {
 }
 
 #[test]
-fn a_node_gives_kernel_access_only_through_a_loopback_proxy_listener_served_to_loopback() {
-    const SET: &str = "set \"listen\": { \"proxy\": { \"addr\": \"127.0.0.1:<a free port>\", \"peer\": \"127.0.0.1\" } } in the node's config and restart serve";
-    let not_set = format!(
-        "template cloud gives its service access to this node's kernel, and this node has no listener for it (listen.proxy is not set): {SET}"
-    );
-    let other = format!(
-        "template cloud gives its service access to this node's kernel, and this node's listen.proxy is not 127.0.0.1 served to the peer 127.0.0.1: it serves one address to one peer, so while it serves a reverse proxy at another address it gives no service kernel access. To give it, {SET}"
-    );
-    let page = "template cloud gives its service access to this node's kernel, and this node serves its approval page on the same listener (approvalOrigin is set). The page's routes need no token, so the service would reach them as the reverse proxy does. Kernel access is for a node whose approval page is served by another machine".to_string();
+fn a_node_gives_kernel_access_only_through_its_services_socket() {
+    let refused = "template cloud gives its service access to this node's kernel, and this node has no socket for it (listen.services is not set): set \"listen\": { \"services\": \"<a path beside listen.unix, such as /run/arca/services.sock>\" } in the node's config and restart serve. That socket serves the kernel's MCP alone, and a token is needed on every call";
     let proxy = |addr: &str, peer: &str| json!({ "proxy": { "addr": addr, "peer": peer } });
-    for (config, expected) in [
-        // No proxy listener at all.
-        (json!({}), &not_set),
-        // A reverse proxy in a container on the host's bridge: the one address and the one peer are taken.
-        (proxy("192.0.2.1:7460", "192.0.2.20"), &other),
-        // Loopback, served to another loopback peer: Incus connects from 127.0.0.1.
-        (proxy("127.0.0.1:7460", "127.0.0.2"), &other),
-        (proxy("127.0.0.2:7460", "127.0.0.1"), &other),
-        (proxy("[::1]:7460", "::1"), &other),
-        // The right listener on a node that serves its approval page on it too.
-        (
-            json!({
-                "proxy": { "addr": KERNEL, "peer": "127.0.0.1" },
-                "approvalOrigin": "https://arca.example.com"
-            }),
-            &page,
-        ),
+    for config in [
+        // No listener but the unix socket.
+        json!({}),
+        // A reverse proxy in a container on the host's bridge.
+        proxy("192.0.2.1:7460", "192.0.2.20"),
+        // A proxy listener on the host's loopback is still the proxy listener: it may carry the approval page, so
+        // no device is ever pointed at it.
+        proxy("127.0.0.1:7460", "127.0.0.1"),
+        json!({
+            "proxy": { "addr": "127.0.0.1:7460", "peer": "127.0.0.1" },
+            "approvalOrigin": "https://arca.example.com"
+        }),
     ] {
         let rig = node(config.clone());
         let before = rig.fake().writes().len();
@@ -404,7 +394,7 @@ fn a_node_gives_kernel_access_only_through_a_loopback_proxy_listener_served_to_l
         ] {
             let (code, message) = refusal(result);
             assert_eq!(code, "refused", "{config}");
-            assert_eq!(&message, expected, "{config}");
+            assert_eq!(message, refused, "{config}");
         }
         assert_eq!(rig.fake().writes().len(), before, "{config}");
         assert!(instance(&rig, "cloud").is_none(), "{config}");
@@ -424,19 +414,168 @@ fn a_node_gives_kernel_access_only_through_a_loopback_proxy_listener_served_to_l
 }
 
 #[test]
+fn the_device_connects_to_the_services_socket_on_a_node_that_also_serves_its_approval_page() {
+    // The node kernel access is for: it serves its approval page (`approvalOrigin`) through a reverse proxy on
+    // `listen.proxy`, here on the host's loopback, and its own services reach the kernel through `listen.services`,
+    // which never carries the page.
+    let rig = node(json!({
+        "proxy": { "addr": "127.0.0.1:7450", "peer": "127.0.0.1" },
+        "services": KERNEL,
+        "approvalOrigin": "https://arca.example.com"
+    }));
+    let made = create_cloud(&rig);
+    assert_eq!(
+        made["kernelAccess"],
+        json!({ "port": PORT, "connect": KERNEL })
+    );
+    let held = instance(&rig, "cloud").expect("the instance");
+    assert_eq!(held["devices"]["kernel"], device());
+    let services = rig
+        .cfg
+        .listen
+        .services
+        .clone()
+        .expect("the services socket");
+    assert_eq!(
+        held["devices"]["kernel"]["connect"],
+        format!("unix:{}", services.display())
+    );
+    // Nothing of the proxy listener, which carries the page, and nothing of the unix socket is in the device.
+    let connect = held["devices"]["kernel"]["connect"]
+        .as_str()
+        .expect("connect");
+    assert!(
+        !connect.starts_with("tcp:") && !connect.contains("7450"),
+        "{connect}"
+    );
+    assert_ne!(
+        connect,
+        format!("unix:{}", rig.cfg.listen.unix.display()),
+        "{connect}"
+    );
+    assert_eq!(
+        rig.call("service_status", json!({ "name": "cloud" }))
+            .expect("status")["kernelAccess"],
+        json!({ "port": PORT, "connect": KERNEL, "ready": true })
+    );
+    // The config check keeps the two sockets apart: one path cannot be both.
+    let mut same = rig.config();
+    same.listen.services = Some(same.listen.unix.clone());
+    let refused = arca::config::check(&same).expect_err("refused").to_string();
+    assert!(
+        refused.starts_with("listen.services is refused: "),
+        "{refused}"
+    );
+    // And the services socket is a plain absolute file path, and nothing else.
+    for path in [
+        "services.sock",
+        "/run/arca/",
+        "/run/arca/../incus/unix.socket",
+        "/run/arca/services.sock,mode=0666",
+        "/run/arca/services sock",
+    ] {
+        let mut config = rig.config();
+        config.listen.services = Some(path.into());
+        let refused = arca::config::check(&config)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.starts_with("listen.services is refused: "),
+            "{path}: {refused}"
+        );
+    }
+}
+
+/// What `serve` answers when it is started over the rig's desired state with `node` as its config beside the kernel
+/// key. The state directory is copied, since the rig's own kernel holds its lock.
+fn serve_start(rig: &Rig, node: Value) -> Result<(), String> {
+    let copy = rig
+        .dir
+        .join(format!("start-{}", SEQ.fetch_add(1, Ordering::SeqCst)));
+    fs::create_dir(&copy).expect("a copy of the state directory");
+    fs::set_permissions(&copy, fs::Permissions::from_mode(0o700)).expect("0700");
+    for file in fs::read_dir(&rig.dir)
+        .expect("the state directory")
+        .flatten()
+    {
+        if file.file_type().is_ok_and(|kind| kind.is_file()) {
+            fs::copy(file.path(), copy.join(file.file_name())).expect("a state file");
+        }
+    }
+    let cfg = node_config(&copy, &rig.socket, &rig.kernel_config, &node);
+    arca::config::check(&cfg).expect("the config itself is one serve accepts");
+    arca::cmd_serve::check_bridged_start(&cfg, &copy.join("sys")).map_err(|failure| match failure {
+        arca::Failure::Config(why) => why,
+        other => panic!("not a config refusal: {other:?}"),
+    })
+}
+
+#[test]
+fn serve_refuses_to_start_when_a_service_with_kernel_access_would_be_left_on_another_socket() {
+    let rig = node(socket());
+    rig.call(
+        "service_create",
+        json!({ "name": "web", "template": "app" }),
+    )
+    .expect("an ordinary service");
+    // A node with no service that has the access starts with any of these configs.
+    let approval = json!("https://arca.example.com");
+    let configs = [
+        json!({}),
+        json!({ "services": "/run/arca/other.sock" }),
+        json!({ "proxy": { "addr": "127.0.0.1:7460", "peer": "127.0.0.1" }, "approvalOrigin": approval }),
+        socket(),
+    ];
+    for config in &configs {
+        assert_eq!(serve_start(&rig, config.clone()), Ok(()), "{config}");
+    }
+    create_cloud(&rig);
+    // With one, the start is refused unless the config serves the very socket its device connects to: without the
+    // services socket, and with one at another path. Whatever the config has become (an approval page, a proxy
+    // listener on the host's loopback), the device is never left pointing at anything else.
+    let gone = "the service cloud has access to this node's kernel through the socket /run/arca/services.sock, and this config sets no listen.services: set listen.services to /run/arca/services.sock, or remove the service before taking it out";
+    let moved = "the service cloud has access to this node's kernel through the socket /run/arca/services.sock, and this config's listen.services is /run/arca/other.sock: set listen.services back to /run/arca/services.sock, or remove the service before changing it";
+    assert_eq!(serve_start(&rig, configs[0].clone()), Err(gone.to_string()));
+    assert_eq!(
+        serve_start(&rig, configs[1].clone()),
+        Err(moved.to_string())
+    );
+    assert_eq!(serve_start(&rig, configs[2].clone()), Err(gone.to_string()));
+    assert_eq!(serve_start(&rig, socket()), Ok(()));
+    // The same socket beside an approval page and a proxy listener starts: the page is never on the services socket.
+    assert_eq!(
+        serve_start(
+            &rig,
+            json!({
+                "services": KERNEL,
+                "proxy": { "addr": "127.0.0.1:7460", "peer": "127.0.0.1" },
+                "approvalOrigin": approval
+            })
+        ),
+        Ok(())
+    );
+    // Once the service is removed, the socket may go.
+    rig.approved("service_remove", json!({ "name": "cloud" }))
+        .expect("the removal");
+    assert_eq!(serve_start(&rig, json!({})), Ok(()));
+}
+
+#[test]
 fn a_create_states_the_access_and_the_owners_card_says_it_in_words() {
-    let rig = node(loopback());
-    // A direct create that does not state the access, or states another port, is refused before any write.
+    let rig = node(socket());
+    // A direct create is refused before any write, whether or not it states the access: such a service is created
+    // only from a proposal, so the owner always sees the card.
     let before = rig.fake().writes().len();
     for args in [
         json!({ "name": "cloud", "template": "cloud" }),
-        json!({ "name": "cloud", "template": "cloud", "kernelAccess": { "port": 7462 } }),
+        json!({ "name": "cloud", "template": "cloud", "kernelAccess": stated() }),
+        json!({ "name": "cloud", "template": "cloud", "kernelAccess": stated(), "approval": "a-guess" }),
     ] {
         let (code, message) = refusal(rig.call("service_create", args));
-        assert_eq!(code, "refused");
+        assert_eq!(code, "NotApproved");
         assert_eq!(
             message,
-            "template cloud gives its service access to this node's kernel, and a create of it says so: add \"kernelAccess\": { \"port\": 7461 } to the call, exactly as the template has it. A proposal made with action_propose names it by itself, on the owner's card"
+            "template cloud gives its service access to this node's kernel, so its create runs only from a proposal the owner approved: propose it with action_propose, and the owner's card says what the access is"
         );
     }
     assert_eq!(rig.fake().writes().len(), before);
@@ -496,7 +635,7 @@ fn a_create_states_the_access_and_the_owners_card_says_it_in_words() {
 
 #[test]
 fn a_template_that_gains_kernel_access_after_its_card_was_shown_is_not_created_by_that_approval() {
-    let rig = node(loopback());
+    let rig = node(socket());
     let mut late = app_template("late");
     late["ports"] = json!([8080]);
     rig.template("late", late.clone());
@@ -508,11 +647,9 @@ fn a_template_that_gains_kernel_access_after_its_card_was_shown_is_not_created_b
     rig.template("late", late);
     let before = rig.fake().writes().len();
     let (_, message) = refusal(approve(&rig, &proposal));
-    assert!(
-        message.contains(
-            "template late gives its service access to this node's kernel, and a create of it says so"
-        ),
-        "{message}"
+    assert_eq!(
+        message,
+        "template late gives its service access to this node's kernel (\"kernelAccess\": { \"port\": 7461 }), and the proposal the owner approved does not say that: the template changed after it was proposed. Propose the create again, so the owner's card says it"
     );
     assert_eq!(rig.fake().writes().len(), before);
     assert!(instance(&rig, "late").is_none());
@@ -525,7 +662,7 @@ fn a_template_that_gains_kernel_access_after_its_card_was_shown_is_not_created_b
 
 #[test]
 fn the_access_survives_a_restart_and_goes_with_the_service() {
-    let mut rig = node(loopback());
+    let mut rig = node(socket());
     create_cloud(&rig);
     let ready = json!({ "port": PORT, "connect": KERNEL, "ready": true });
     let status = |rig: &Rig| {
@@ -554,30 +691,20 @@ fn the_access_survives_a_restart_and_goes_with_the_service() {
     assert_eq!(status(&rig), ready);
     assert_eq!(rig.fake().writes().len(), writes);
 
-    // The device names the listener as it was at the create. A node whose listener has since moved says so, and so
-    // does one that has since begun to serve its approval page on it.
-    rig.node = json!({ "proxy": { "addr": "127.0.0.1:7470", "peer": "127.0.0.1" } });
-    rig = rig.restart();
-    assert_eq!(
-        status(&rig),
-        json!({
-            "port": PORT, "connect": KERNEL, "ready": false,
-            "problem": "this node's listen.proxy is no longer 127.0.0.1:7460 served to the peer 127.0.0.1, so the device connects to nothing of Arca's; remove the service and create it again"
-        })
-    );
-    rig.node = json!({
-        "proxy": { "addr": KERNEL, "peer": "127.0.0.1" },
-        "approvalOrigin": "https://arca.example.com"
-    });
-    rig = rig.restart();
-    assert_eq!(
-        status(&rig),
-        json!({
-            "port": PORT, "connect": KERNEL, "ready": false,
-            "problem": "this node now serves its approval page on the same listener (approvalOrigin is set), so the service also reaches the page's routes, which need no token"
-        })
-    );
-    rig.node = loopback();
+    // The device names the socket as it was at the create. A kernel opened over a config whose socket has since
+    // moved, or is gone, says so (`serve` itself refuses to start over such a config).
+    for moved in [json!({ "services": "/run/arca/other.sock" }), json!({})] {
+        rig.node = moved;
+        rig = rig.restart();
+        assert_eq!(
+            status(&rig),
+            json!({
+                "port": PORT, "connect": KERNEL, "ready": false,
+                "problem": "this node's listen.services is no longer /run/arca/services.sock, so the device connects to nothing of Arca's; remove the service and create it again"
+            })
+        );
+    }
+    rig.node = socket();
     rig = rig.restart();
     assert_eq!(status(&rig), ready);
 
@@ -607,7 +734,7 @@ fn the_access_survives_a_restart_and_goes_with_the_service() {
 
 #[test]
 fn a_template_names_a_kernel_access_port_of_its_own_and_only_a_container_template_may() {
-    let rig = node(loopback());
+    let rig = node(socket());
     let dir = rig.dir.join("templates");
     let load = |name: &str, change: &dyn Fn(&mut Value)| {
         let mut template = cloud_template();

@@ -1838,7 +1838,8 @@ fn action_approval_failure(error: ActionApprovalError) -> CallError {
     }
 }
 
-/// Runs one already approved action through the same handler its gated verb uses. The verbs that take an inline approval
+/// Runs one already approved action through the same handler its gated verb uses. `service_create` gets the random
+/// grant too: a template with kernel access is created only from an approved proposal. The verbs that take an inline approval
 /// (`service_remove`, `service_publish`, the GPU, storage and snapshot verbs, `instance_stop` and `instance_restart`) get
 /// the random grant in that field, and the
 /// handler consumes it, so the owner's real approval is never stored or replayed.
@@ -1862,7 +1863,8 @@ impl ActionExecutor {
         let mut call = args.clone();
         if matches!(
             action,
-            "service_remove"
+            "service_create"
+                | "service_remove"
                 | "service_publish"
                 | "service_import"
                 | "service_release"
@@ -3175,20 +3177,30 @@ fn enrich_service_create(
     Ok(payload)
 }
 
-/// The kernel access a create of `template` gives: the port inside the instance and this node's listener for it, or
+/// What a `service_create` call brings to a template that declares kernel access: what it stated as `kernelAccess`, and
+/// whether it runs from a proposal the owner approved.
+struct KernelAccessCall<'a> {
+    stated: Option<&'a Value>,
+    approved: bool,
+}
+
+/// The kernel access a create of `template` gives: the port inside the instance and this node's services socket, or
 /// `None` for a template that declares none. A template that declares it is refused, before anything is written, in a
-/// tenant and on a node with no listener a service may reach. `given` is what a create itself stated as `kernelAccess`,
-/// which must be exactly the template's; a proposal passes `None`, since the access is filled in when it is made.
+/// tenant and on a node with no `listen.services`. A create (`call`) of one runs only from a proposal the owner
+/// approved, whose card says what the access is, and states exactly the template's `kernelAccess`; a proposal passes
+/// `None`, since the access is filled in when it is made.
 fn kernel_access_for(
     cfg: &NodeConfig,
     template: &crate::service::Template,
     in_tenant: bool,
-    given: Option<Option<&Value>>,
-) -> Result<Option<(u16, std::net::SocketAddr)>, CallError> {
+    call: Option<KernelAccessCall<'_>>,
+) -> Result<Option<(u16, String)>, CallError> {
     let name = &template.name;
     let Some(access) = &template.kernel_access else {
-        return match given {
-            Some(Some(_)) => Err(kernel_access_mismatch(template)),
+        return match call {
+            Some(KernelAccessCall {
+                stated: Some(_), ..
+            }) => Err(kernel_access_mismatch(template)),
             _ => Ok(None),
         };
     };
@@ -3197,27 +3209,26 @@ fn kernel_access_for(
             "template {name} gives its service access to this node's kernel, and nothing in a tenant has that: only a service of the node's own project is created from it"
         )));
     }
-    const SET: &str = "set \"listen\": { \"proxy\": { \"addr\": \"127.0.0.1:<a free port>\", \"peer\": \"127.0.0.1\" } } in the node's config and restart serve";
-    let connect = cfg.kernel_access().map_err(|why| {
-        service_refused(match why {
-            crate::config::NoKernelAccess::NoListener => format!(
-                "template {name} gives its service access to this node's kernel, and this node has no listener for it (listen.proxy is not set): {SET}"
-            ),
-            crate::config::NoKernelAccess::OtherListener => format!(
-                "template {name} gives its service access to this node's kernel, and this node's listen.proxy is not 127.0.0.1 served to the peer 127.0.0.1: it serves one address to one peer, so while it serves a reverse proxy at another address it gives no service kernel access. To give it, {SET}"
-            ),
-            crate::config::NoKernelAccess::ApprovalPage => format!(
-                "template {name} gives its service access to this node's kernel, and this node serves its approval page on the same listener (approvalOrigin is set). The page's routes need no token, so the service would reach them as the reverse proxy does. Kernel access is for a node whose approval page is served by another machine"
-            ),
-        })
-    })?;
-    if let Some(given) = given
-        && given != Some(&kernel_access_arg(access.port))
-    {
+    let Some(connect) = cfg.kernel_access() else {
         return Err(service_refused(format!(
-            "template {name} gives its service access to this node's kernel, and a create of it says so: add \"kernelAccess\": {{ \"port\": {} }} to the call, exactly as the template has it. A proposal made with action_propose names it by itself, on the owner's card",
-            access.port
+            "template {name} gives its service access to this node's kernel, and this node has no socket for it (listen.services is not set): set \"listen\": {{ \"services\": \"<a path beside listen.unix, such as /run/arca/services.sock>\" }} in the node's config and restart serve. That socket serves the kernel's MCP alone, and a token is needed on every call"
         )));
+    };
+    if let Some(call) = call {
+        if !call.approved {
+            return Err(CallError::Refused {
+                code: "NotApproved".into(),
+                message: format!(
+                    "template {name} gives its service access to this node's kernel, so its create runs only from a proposal the owner approved: propose it with action_propose, and the owner's card says what the access is"
+                ),
+            });
+        }
+        if call.stated != Some(&kernel_access_arg(access.port)) {
+            return Err(service_refused(format!(
+                "template {name} gives its service access to this node's kernel (\"kernelAccess\": {{ \"port\": {} }}), and the proposal the owner approved does not say that: the template changed after it was proposed. Propose the create again, so the owner's card says it",
+                access.port
+            )));
+        }
     }
     Ok(Some((access.port, connect)))
 }
@@ -3244,15 +3255,39 @@ fn kernel_access_problem(
         ));
     }
     match cfg.kernel_access() {
-        Ok(addr) if addr.to_string() == link.connect => None,
-        Err(crate::config::NoKernelAccess::ApprovalPage) => Some(
-            "this node now serves its approval page on the same listener (approvalOrigin is set), so the service also reaches the page's routes, which need no token".to_string(),
-        ),
+        Some(path) if path == link.connect => None,
         _ => Some(format!(
-            "this node's listen.proxy is no longer {} served to the peer 127.0.0.1, so the device connects to nothing of Arca's; remove the service and create it again",
+            "this node's listen.services is no longer {}, so the device connects to nothing of Arca's; remove the service and create it again",
             link.connect
         )),
     }
+}
+
+/// Why `serve` does not start over this desired state: a service's record names kernel access through a socket this
+/// config does not serve. The device of such a service connects to the path its record holds, and only the services
+/// socket is known never to carry the approval page; a start that left the path to anything else is refused.
+pub fn kernel_access_refusal(
+    cfg: &NodeConfig,
+    entries: &[arca_kernel::desired::Entry],
+) -> Option<String> {
+    let served = cfg.kernel_access();
+    entries
+        .iter()
+        .filter(|entry| entry.plugin.0 == "arca.service")
+        .find_map(|entry| {
+            let access = entry.config.get("kernelAccess")?;
+            let recorded = access["connect"].as_str().unwrap_or("an unreadable path");
+            let name = entry.config["name"].as_str().unwrap_or(entry.id.0.as_str());
+            match &served {
+                Some(path) if path == recorded => None,
+                Some(path) => Some(format!(
+                    "the service {name} has access to this node's kernel through the socket {recorded}, and this config's listen.services is {path}: set listen.services back to {recorded}, or remove the service before changing it"
+                )),
+                None => Some(format!(
+                    "the service {name} has access to this node's kernel through the socket {recorded}, and this config sets no listen.services: set listen.services to {recorded}, or remove the service before taking it out"
+                )),
+            }
+        })
 }
 
 /// The refusal for a call whose `kernelAccess` is not its template's.
@@ -4150,7 +4185,11 @@ pub(crate) fn adopted_config(
         creating: false,
         vm: None,
         tenant: None,
-        kernel_access: None,
+        // The device is the instance's own, so a record made again from the instance says it has the access. Only an
+        // instance of the node's own project is read for it.
+        kernel_access: (project == arca_netproject::PROJECT)
+            .then(|| crate::service::kernel_link_of(row))
+            .flatten(),
     })
 }
 
@@ -4593,6 +4632,8 @@ impl ToolHandler for ServiceHandler {
                 "deploy",
                 "start",
                 "kernelAccess",
+                // Only an approved proposal carries it: the one-shot grant of its approval.
+                "approval",
             ],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
@@ -4643,7 +4684,11 @@ impl ToolHandler for ServiceHandler {
         }
         let preapproved = matches!(
             self.verb,
-            "service_remove" | "service_publish" | "service_import" | "service_release"
+            "service_create"
+                | "service_remove"
+                | "service_publish"
+                | "service_import"
+                | "service_release"
         ) && args
             .get("approval")
             .and_then(Value::as_str)
@@ -5087,17 +5132,18 @@ impl ToolHandler for ServiceHandler {
                     &self.cfg.state_dir.join("secrets"),
                 );
                 // A template that gives its service access to the kernel: refused in a tenant, on a node with no
-                // listener for it, and unless the call itself states it. All of it comes before any write.
+                // socket for it, and unless the create runs from an approved proposal that states it. All of it comes
+                // before any write.
                 let kernel_access = kernel_access_for(
                     &self.cfg,
                     &template,
                     tenant.is_some(),
-                    Some(args.get("kernelAccess")),
+                    Some(KernelAccessCall {
+                        stated: args.get("kernelAccess"),
+                        approved: preapproved,
+                    }),
                 )?
-                .map(|(port, connect)| crate::service::KernelLink {
-                    port,
-                    connect: connect.to_string(),
-                });
+                .map(|(port, connect)| crate::service::KernelLink { port, connect });
                 if template.is_vm() {
                     let Some(caps) = self.cfg.kernel.vm_caps() else {
                         return Err(service_refused(no_vm_caps(template_name)));

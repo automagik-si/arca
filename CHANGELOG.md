@@ -11,12 +11,14 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   come from are in `assets/open-intelligence/`.
 - A service may talk to the kernel. A container template declares `kernelAccess: { "port": <n> }`, and its service, in
   the node's own project, finds the kernel's MCP at `http://127.0.0.1:<n>/mcp` inside its instance: one Incus proxy
-  device that listens inside the instance and connects to the node's `listen.proxy` on the host's loopback. Nothing
-  crosses the bridge and no ACL rule changes. The token the service is given still decides everything: without one
-  every call is 401. Such a create is refused in a tenant, on a node whose `listen.proxy` is not `127.0.0.1` served to
-  the peer `127.0.0.1`, and on a node that serves its approval page on that listener; the create states the access,
-  and the owner's card says it in words. `service_list` and `service_status` show it. See "A service that may talk to
-  the kernel" in `docs/OPERATING.md` and Rule 69 in `docs/OWNERSHIP.md`.
+  device that listens inside the instance and connects to the node's new services socket, `listen.services`. That
+  socket serves the MCP routes alone and never the approval page, to the server's own user and to root, so no other
+  local user reaches it and it has no port. Nothing crosses the bridge and no ACL rule changes. The token the service
+  is given still decides everything: without one every call is 401. Such a service is created only from a proposal the
+  owner approved, whose card says the access in words; it is refused in a tenant and on a node that sets no
+  `listen.services`. `serve` refuses to start while a service has the access through a socket the config no longer
+  serves. `service_list` and `service_status` show it. See "A service that may talk to the kernel" in
+  `docs/OPERATING.md` and Rule 69 in `docs/OWNERSHIP.md`.
 
 ## 0.1.0-alpha.7
 

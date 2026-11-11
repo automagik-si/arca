@@ -1,5 +1,5 @@
-//! The three listeners: the unix socket at mode 0600, the tailnet address and its peer filter, and the proxy address and its
-//! exact peer. Only loopback and temporary unix sockets are used. The tailnet ranges are checked as addresses; no test binds
+//! The four listeners: the unix socket at mode 0600, the tailnet address and its peer filter, the proxy address and its
+//! exact peer, and the services socket. Only loopback and temporary unix sockets are used. The tailnet ranges are checked as addresses; no test binds
 //! a tailnet address.
 
 mod common;
@@ -7,7 +7,7 @@ mod common;
 use std::fs::{self, Permissions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::str::FromStr;
@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 
 use arca_api::Scope;
 use arca_mcp::{
-    Server, TokenStore, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy, serve_tailnet,
-    serve_unix, tailnet_addr_ok,
+    Server, TokenStore, peer_allowed, proxy_addr_ok, serve_filtered, serve_proxy, serve_services,
+    serve_tailnet, serve_unix, services_path_ok, tailnet_addr_ok,
 };
 use common::{
-    Scratch, bearer, connect_tcp, connect_unix, mint_into, own_uid, post, post_bytes, rpc,
-    wait_for_socket, write_hash_file,
+    Scratch, bearer, connect_tcp, connect_unix, exchange, mint_into, own_uid, post, post_bytes,
+    rpc, wait_for_socket, write_hash_file,
 };
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -766,21 +766,102 @@ fn a_proxy_peer_other_than_the_configured_one_is_closed_with_no_bytes() {
     }
 }
 
-/// The arrangement a service with kernel access reaches the kernel through: the proxy listener on `127.0.0.1`, served
-/// to the one peer `127.0.0.1`. The listener gives its peer no authority: a call without a token is 401, and a token
-/// with a tool list reaches its tools and nothing else. Another loopback address is not the peer.
+// The services socket: a second unix socket, for the node's own services, that serves the MCP router alone.
+
 #[test]
-fn a_loopback_proxy_listener_served_to_loopback_gives_its_peer_only_what_the_token_gives() {
-    let scratch = Scratch::new("proxy-loopback");
+fn services_path_ok_takes_a_plain_absolute_file_path_and_nothing_else() {
+    for text in [
+        "/run/arca/services.sock",
+        "/run/user/1000/arca/services.sock",
+        "/a",
+    ] {
+        assert_eq!(
+            services_path_ok(Path::new(text)),
+            Ok(()),
+            "accepted: {text}"
+        );
+    }
+    let long = format!("/run/{}", "a".repeat(100));
+    for text in [
+        "",
+        "services.sock",
+        "run/arca/services.sock",
+        "/",
+        "/run/arca/",
+        "/run//services.sock",
+        "/run/../services.sock",
+        "/run/./services.sock",
+        "/run/arca/services sock",
+        "/run/arca/services.sock,mode=0666",
+        "/run/arca/services.sock\n",
+        "/run/arca/serviços.sock",
+        "127.0.0.1:7460",
+        "tcp:127.0.0.1:7460",
+        long.as_str(),
+    ] {
+        assert!(
+            services_path_ok(Path::new(text)).is_err(),
+            "a services socket path must be refused: {text:?}"
+        );
+    }
+}
+
+#[test]
+fn serve_services_refuses_a_path_or_a_directory_another_user_could_take() {
+    let rt = Runtime::new().expect("runtime");
+    // A path that fails the path rules is refused before anything is bound.
+    let err = rt
+        .block_on(serve_services(
+            empty_router("services-path"),
+            Path::new("services.sock"),
+        ))
+        .expect_err("a relative path is never bound");
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    // A directory that a group or others may write to: another user could put a socket of its own at the path while
+    // the server is down, and be sent a service's token.
+    for mode in [0o770, 0o707, 0o777] {
+        let scratch = Scratch::new("services-open");
+        fs::set_permissions(scratch.path(), Permissions::from_mode(mode))
+            .expect("open the directory");
+        let path = scratch.at("services.sock");
+        let err = rt
+            .block_on(serve_services(empty_router("services-open-router"), &path))
+            .expect_err("a directory others may write to is refused");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{mode:o}");
+        assert!(fs::symlink_metadata(&path).is_err(), "nothing was bound");
+        fs::set_permissions(scratch.path(), Permissions::from_mode(0o700)).expect("close it");
+    }
+}
+
+/// The socket a service with kernel access reaches the kernel through, with the MCP router alone. It is mode 0600 in
+/// the server's own directory, so no other user of the host connects to it. It gives its peer no authority: a call
+/// without a token is 401, a token with a tool list reaches its tools and nothing else, and the approval page's paths
+/// are not there.
+#[test]
+fn the_services_socket_gives_its_peer_only_what_the_token_gives_and_serves_no_approval_page() {
+    let scratch = Scratch::new("services");
     let tools = vec!["plan_list".to_string(), "action_propose".to_string()];
     let (listed, text) = arca_mcp::mint_with_tools(Scope::Doctor, Some(&tools));
-    write_hash_file(scratch.path(), "service", &text, 0o400);
-    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let hashes = scratch.at("tokens");
+    fs::create_dir(&hashes).expect("the token directory");
+    fs::set_permissions(&hashes, Permissions::from_mode(0o700)).expect("make it private");
+    write_hash_file(&hashes, "service", &text, 0o400);
+    let tokens = TokenStore::load(&hashes).expect("loads");
     let router = Server::new(arca_api::verbs(), tokens).router();
     let rt = Runtime::new().expect("runtime");
-    let at = start_proxy(&rt, router, "127.0.0.1");
-    assert!(at.ip().is_loopback());
-    assert_eq!(proxy_addr_ok(&at), Ok(()));
+    let path = scratch.at("services.sock");
+    let served = path.clone();
+    rt.spawn(async move { serve_services(router, &served).await });
+    wait_for_path(&path);
+    let meta = fs::symlink_metadata(&path).expect("stat the socket");
+    assert!(meta.file_type().is_socket(), "the path is a socket");
+    assert_eq!(
+        meta.permissions().mode() & 0o777,
+        0o600,
+        "the socket is 0600"
+    );
+    assert_eq!(meta.uid(), own_uid(scratch.path()));
+    assert_eq!(names_in(scratch.path()), ["services.sock", "tokens"]);
     let call = |name: &str| {
         rpc(
             json!(1),
@@ -800,21 +881,62 @@ fn a_loopback_proxy_listener_served_to_loopback_gives_its_peer_only_what_the_tok
         call("plan_list"),
         call("service_remove"),
     ] {
-        let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
-        let reply = post(&mut stream, &[], &body);
+        let reply = post(&mut connect_unix(&path), &[], &body);
         assert_eq!(reply.status, 401, "no bearer is 401");
         assert!(reply.body.is_empty(), "a 401 carries no body");
     }
     // A token that is not one of the node's is no token.
-    let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
     let stranger = format!("arca_{}", "A".repeat(43));
-    let reply = post(&mut stream, &[bearer(&stranger)], &call("plan_list"));
+    let reply = post(
+        &mut connect_unix(&path),
+        &[bearer(&stranger)],
+        &call("plan_list"),
+    );
     assert_eq!(reply.status, 401);
 
-    // The service's token: a doctor token with a tool list. It is offered its tools alone.
-    let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
+    // The approval page's paths are not on this socket, with a token or without one: 404, and no page. A request
+    // that carries an Origin, as the page's own POSTs do, is 403 before its path is looked at.
+    for (method, target) in [
+        ("GET", "/approve"),
+        ("GET", "/approve/plans"),
+        ("GET", "/approve/passkeys"),
+        ("GET", "/approve/canvas"),
+        ("POST", "/approve/decline"),
+        ("POST", "/approve/approve"),
+        ("POST", "/approve/setup-code"),
+    ] {
+        for headers in [vec![], vec![bearer(&listed)]] {
+            let mut request = format!(
+                "{method} {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nContent-Type: application/json\r\nConnection: close\r\n"
+            );
+            for (name, value) in &headers {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+            request.push_str("\r\n{}");
+            let reply = exchange(&mut connect_unix(&path), request.as_bytes());
+            assert_eq!(reply.status, 404, "{method} {target}");
+            assert!(reply.body.is_empty(), "{method} {target} answers no page");
+        }
+        let request = format!(
+            "{method} {target} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://arca.example.com\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let reply = exchange(&mut connect_unix(&path), request.as_bytes());
+        assert_eq!(reply.status, 403, "{method} {target} with an Origin");
+    }
+    // So is a call to /mcp itself that carries an Origin, with a valid token.
     let reply = post(
-        &mut stream,
+        &mut connect_unix(&path),
+        &[
+            bearer(&listed),
+            ("Origin".into(), "https://arca.example.com".into()),
+        ],
+        &call("plan_list"),
+    );
+    assert_eq!(reply.status, 403, "an Origin is 403");
+
+    // The service's token: a doctor token with a tool list. It is offered its tools alone.
+    let reply = post(
+        &mut connect_unix(&path),
         &[bearer(&listed)],
         &rpc(json!(2), "tools/list", json!({})),
     );
@@ -828,15 +950,7 @@ fn a_loopback_proxy_listener_served_to_loopback_gives_its_peer_only_what_the_tok
     assert_eq!(names, vec!["plan_list", "action_propose"]);
     // A verb its scope would admit, outside its list, is refused before any handler runs.
     for outside in ["service_create", "service_remove", "plan_decline"] {
-        let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
-        let reply = post(&mut stream, &[bearer(&listed)], &call(outside));
+        let reply = post(&mut connect_unix(&path), &[bearer(&listed)], &call(outside));
         assert_eq!(reply.status, 403, "{outside} is outside the token's list");
     }
-
-    // The listener serves its one peer: another address of the host's loopback gets no bytes.
-    let mut stream = connect_from(&rt, "127.0.0.2", at).expect("the TCP connect itself succeeds");
-    let _ = stream.write_all(&post_bytes(&[bearer(&listed)], &call("plan_list")));
-    let mut received = Vec::new();
-    let _ = stream.read_to_end(&mut received);
-    assert!(received.is_empty(), "another peer receives no bytes");
 }

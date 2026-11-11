@@ -2168,8 +2168,8 @@ pub fn service_view_schema() -> Value {
                 "description": "Present only on a service whose template declares kernelAccess: the service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given. service_status also answers ready and, when it is false, problem.",
                 "properties": {
                     "connect": {
-                        "description": "The address on the host's loopback its device connects to: the node's listen.proxy as it was when the service was created.",
-                        "maxLength": 21,
+                        "description": "The path of the socket on the host its device connects to: the node's listen.services as it was when the service was created.",
+                        "maxLength": 100,
                         "type": "string"
                     },
                     "port": {
@@ -2184,7 +2184,7 @@ pub fn service_view_schema() -> Value {
                         "type": "string"
                     },
                     "ready": {
-                        "description": "service_status only: whether the instance carries the device as Arca made it and this server's listen.proxy is still the address it connects to.",
+                        "description": "service_status only: whether the instance carries the device as Arca made it and this server's listen.services is still the socket it connects to.",
                         "type": "boolean"
                     }
                 },
@@ -2402,7 +2402,7 @@ fn service_create_params_base() -> Value {
             },
             "kernelAccess": {
                 "additionalProperties": false,
-                "description": "Only for a template that declares kernelAccess, and then required: the template's own kernelAccess, repeated exactly. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A proposal made with action_propose fills this in from the template, so the owner's card says it. Refused in a tenant, and on a node whose listen.proxy is not 127.0.0.1 served to the peer 127.0.0.1.",
+                "description": "Only for a template that declares kernelAccess: the template's own kernelAccess. A proposal made with action_propose fills it in from the template, so the owner's approval binds it and the owner's card says it; a caller has no need to state it. Such a service can call this node's kernel from inside its instance, at http://127.0.0.1:<port>/mcp, with whatever token it is given; the token's scope and tool list decide what it may do. A create of such a template runs only from an approved proposal: called directly it is refused with NotApproved. Refused in a tenant, and on a node that sets no listen.services.",
                 "properties": {
                     "port": { "maximum": 65535, "minimum": 1024, "type": "integer" }
                 },

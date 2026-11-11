@@ -58,7 +58,8 @@ struct Rig {
     key: common::SkKey,
     clock: Arc<AtomicU64>,
     kernel_config: Value,
-    /// What the node's config holds beside the kernel key: `proxy` is its `listen.proxy`, and `approvalOrigin` its own.
+    /// What the node's config holds beside the kernel key: `proxy` and `services` are its `listen.proxy` and
+    /// `listen.services`, and `approvalOrigin` its own.
     node: Value,
     nonce: AtomicU64,
     cfg: Arc<NodeConfig>,
@@ -78,8 +79,10 @@ fn node_config(
         "tokens": {"hashDir": dir.join("tokens")},
         "kernel": kernel
     });
-    if let Some(proxy) = node.get("proxy") {
-        config["listen"]["proxy"] = proxy.clone();
+    for key in ["proxy", "services"] {
+        if let Some(value) = node.get(key) {
+            config["listen"][key] = value.clone();
+        }
     }
     if let Some(origin) = node.get("approvalOrigin") {
         config["approvalOrigin"] = origin.clone();
@@ -107,7 +110,8 @@ impl Rig {
         Self::with_node(kernel_config, json!({}), state)
     }
 
-    /// A node whose config also holds what `node` names: its `listen.proxy` as `proxy`, and its `approvalOrigin`.
+    /// A node whose config also holds what `node` names: its `listen.proxy` and `listen.services`, and its
+    /// `approvalOrigin`.
     fn with_node(kernel_config: Value, node: Value, state: FakeState) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-tenants-{}-{}",
