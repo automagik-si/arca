@@ -478,6 +478,17 @@ function domainCard(doc, project, x, y, width, height) {
   return node;
 }
 
+const VERSION_DIFFERS = 'Other version';
+const VERSION_DIFFERS_WHY = 'The template installed on this machine names another version than the one this service runs.';
+
+// A service whose installed template names another version than the one it runs. The words say only that the
+// two differ: nothing here knows which is newer.
+function versionTag(doc, className) {
+  const tag = el(doc, 'span', className, VERSION_DIFFERS);
+  tag.title = VERSION_DIFFERS_WHY;
+  return tag;
+}
+
 function instanceCard(doc, card, x, y, width, height) {
   const node = cardShell(doc, 'instance', x, y, width, height);
   node.dataset.host = card.host;
@@ -487,6 +498,7 @@ function instanceCard(doc, card, x, y, width, height) {
   node.append(head);
   const tags = el(doc, 'div', 'arca-card-tags');
   tags.append(hostTag(doc, card.host));
+  if (card.service?.versionDiffers) tags.append(versionTag(doc, 'arca-prov arca-version'));
   if (card.url) {
     const link = el(doc, 'a', 'arca-card-link', 'Open');
     link.href = card.url;
@@ -1054,6 +1066,7 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
         const item = el(doc, 'li', 'arca-detail-service');
         item.append(el(doc, 'span', '', service.name), el(doc, 'span', 'arca-detail-service-state', service.state || 'Unknown'));
         if (service.lanPort !== null) item.append(el(doc, 'span', 'arca-detail-service-port mono', `port ${service.lanPort}`));
+        if (service.versionDiffers) item.append(versionTag(doc, 'arca-detail-service-version'));
         rows.append(item);
       }
       services.append(rows);

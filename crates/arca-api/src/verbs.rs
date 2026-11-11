@@ -2223,6 +2223,34 @@ pub fn service_view_schema() -> Value {
                 "description": "Its template (empty for an instance droidd did not create).",
                 "maxLength": 40,
                 "type": "string"
+            },
+            "update": {
+                "additionalProperties": false,
+                "description": "The version the service runs beside the one its template, as installed on this node, names now. Both come from this node's own records and files: no registry is asked. service_list carries it only when the two differ, with state alone; service_status carries it for every service whose own version is known (a container made from an image by digest, or a virtual machine whose template names its version's setting in update.pin). Two digests carry no order: differs says the template names another version, never which one is newer. Today the only way to the template's version is service_remove and service_create.",
+                "properties": {
+                    "pin": {
+                        "description": "service_status only: the version the service was created with, an image by digest.",
+                        "maxLength": 512,
+                        "type": "string"
+                    },
+                    "problem": {
+                        "description": "service_status only, when state is unknown: why the installed template cannot say.",
+                        "maxLength": 512,
+                        "type": "string"
+                    },
+                    "state": {
+                        "description": "same: the installed template names the version the service runs. differs: it names another one. unknown: the template is not installed any more, cannot be used, or is of another kind now.",
+                        "enum": ["same", "differs", "unknown"],
+                        "type": "string"
+                    },
+                    "templatePin": {
+                        "description": "service_status only: the version the installed template names now.",
+                        "maxLength": 512,
+                        "type": "string"
+                    }
+                },
+                "required": ["state"],
+                "type": "object"
             }
         },
         "required": ["name", "template", "state", "ipv4", "ports", "links", "published", "lanPort"],

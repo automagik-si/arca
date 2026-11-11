@@ -1782,6 +1782,7 @@ body,
 
 .arca-detail-owner-vram,
 .arca-detail-service-port,
+.arca-detail-service-version,
 .arca-detail-service-state {
   flex: none;
   font-size: 11px;

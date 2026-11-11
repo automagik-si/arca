@@ -2660,6 +2660,43 @@ of the owner. The service's record keeps the replaced values as `vm.settings`.
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the
 instance when it created it, so the build can be looked up, and two machines compared, afterwards.
 
+**Whether the installed template names another version.** A service keeps the version it was created with, and the
+template installed on the node (`<stateDir>/templates`) may name another one later, for example after `arca templates
+install --replace` from a newer release. `service_status` answers both under `update`:
+
+```json
+"update": {
+  "pin": "ghcr.io/example/app@sha256:1111…",
+  "templatePin": "ghcr.io/example/app@sha256:2222…",
+  "state": "differs"
+}
+```
+
+- `pin` is the version the service was created with, from its own record: a container's image and digest, or, for a
+  virtual machine, the image by digest its settings hold under the key its template names in `update.pin`.
+- `templatePin` is the one the installed template names now.
+- `state` is `same`, `differs`, or `unknown` with the reason in `problem` (the template is not installed any more,
+  cannot be used as it is, or is of another kind now).
+
+`service_list` carries `"update": { "state": "differs" }` on a row whose template names another version, and no such
+key on any other row. Both are read from this node's own records and files: no registry is asked and nothing is
+written. Two digests carry no order, so `differs` never says which version is the newer one. A service made from a
+system image by an alias has no version of this kind and carries no `update` (`baseImage`, above, is what it has),
+and neither does an adopted instance. Today the only way to the template's version is `service_remove` and
+`service_create`: this only tells you that there is one.
+
+A virtual-machine template says where its version is with one key:
+
+```json
+"settings": { "serverImage": "ghcr.io/example/app@sha256:1111…" },
+"update": { "pin": "serverImage" }
+```
+
+`update.pin` names a key of `settings` whose value is an image by digest (`<registry>/<name>@sha256:<64 hex
+digits>`, in lower case) and which `createSettings` does not list: a create never chooses the version. A template
+that breaks this is refused, and so is `update` on a container template, whose version is its `digest`. The shipped
+`automagik-workspace` names `serverImage`.
+
 ### What every virtual machine carries
 
 Whatever its network, a virtual machine Arca creates has two things more than its root disk and its NIC:

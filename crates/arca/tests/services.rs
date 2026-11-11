@@ -426,7 +426,12 @@ fn service_create_list_status_round_trip() {
     let status = rig
         .call("service_status", json!({"name":"nats"}))
         .expect("status");
-    assert_eq!(status, created);
+    // The status is the create's view, with the version the service runs beside the one its template names: the
+    // same here, so the listing above carries no such key.
+    let mut expected = created.clone();
+    let pin = format!("docker.io/library/nats@{DIGEST}");
+    expected["update"] = json!({ "pin": pin, "templatePin": pin, "state": "same" });
+    assert_eq!(status, expected);
     let instance = rig
         .get(&format!("/1.0/instances/nats?project={PROJECT}"))
         .expect("instance");
@@ -577,6 +582,7 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         settings: None,
         create_settings: Vec::new(),
         kernel_access: None,
+        update: None,
     }
 }
 

@@ -1080,6 +1080,17 @@ enter Incus's instance config.
   `ActionKind::prepare` refuses a setting whose row would pass 160 characters (`SETTING_ROW_MAX`), so the owner
   approves exactly what is shown. Settings never hold a
   secret. Tests in `crates/arca/tests/services/create_settings.rs`.
+- `update` is `{ "pin": "<key>" }`, on a virtual-machine template only: the key of `settings` that holds the version
+  its service runs. `validate_vm_template` refuses a key that `settings` does not have, one that `createSettings`
+  lists (a create never chooses the version), and a value that is not an image by digest (`image_by_digest`).
+  `service_status` answers `update`: `pin`, the version the service was created with, read from its own record
+  (`created_pin`: a container's OCI source, or what the record's vendor data holds under that key), `templatePin`, the
+  one the template installed in `<stateDir>/templates` names now (`template_pin`), and `state`, `same` or `differs`, or
+  `unknown` with a `problem` when the installed template cannot say. `service_list` carries `update` only on a row that
+  differs. It is a read of the node's own records and files and writes nothing: no registry or network is asked, no
+  instance, record or journal changes, and it says only that the two differ, never which is newer. An adopted
+  instance and a service from a system image carry no `update`. Tests in
+  `crates/arca/tests/services/update_available.rs`.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
   machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
