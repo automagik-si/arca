@@ -11,7 +11,7 @@ Releases are now cut by themselves: every change that lands on `dev` and ships i
 without anyone writing a version or a tag. The numbers changed with it. A release is `0.N.P`, with no `alpha` word:
 `0.8.0` follows `0.1.0-alpha.7`, a change to what the binary is built from takes the next `N`, and a change that ships
 without changing the binary takes the next `P`. The canvas package carries the same version as the binary. Arca is
-still an alpha for single hosts; the number no longer says so, the README does.
+still an alpha for single hosts; the number no longer says so, `docs/OPERATING.md` does.
 
 Each release now carries `install.sh`, the installer, beside the binary. It installs the release it comes with, and
 `SHA256SUMS` lists it with the binary: check a download with `sha256sum --check --ignore-missing SHA256SUMS`, and
