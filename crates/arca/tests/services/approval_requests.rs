@@ -554,12 +554,14 @@ fn g7_owner_approval_status_gives_the_approval_to_the_requester_only_and_wait_ms
         g.status("phone", Scope::Viewer, &id),
         Err(CallError::Forbidden { .. })
     ));
+    // The longest wait the verb takes.
+    const WAIT_MS: u64 = 30_000;
     let status = Arc::clone(&g.verbs["owner_approval_status"]);
     let waited = id.clone();
     let started = Instant::now();
     let waiter = std::thread::spawn(move || {
         status.call(
-            json!({ "id": waited, "waitMs": 20_000 }),
+            json!({ "id": waited, "waitMs": WAIT_MS }),
             &caller("doctor", Scope::Doctor),
         )
     });
@@ -569,8 +571,11 @@ fn g7_owner_approval_status_gives_the_approval_to_the_requester_only_and_wait_ms
         .join()
         .expect("the waiter")
         .expect("the status answers");
+    // A waiter the decision does not wake answers when its own wait runs out, and with the same state. Only one that
+    // was woken answers before that, so the wait's own length is the bound, and not a shorter guess at how fast this
+    // machine writes the decision down.
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < Duration::from_millis(WAIT_MS),
         "woken by the decision"
     );
     assert_eq!(woke["state"], "approved");

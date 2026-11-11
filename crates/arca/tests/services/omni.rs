@@ -55,7 +55,8 @@ struct OmniState {
     key: String,
     /// The next answer, in place of the usual one: status, body, extra headers.
     next: Option<(u16, Value, Vec<(String, String)>)>,
-    delay: Duration,
+    /// Omni has the request and keeps its answer back until this is false again.
+    held: bool,
     made: u64,
 }
 
@@ -123,8 +124,9 @@ fn handle(stream: TcpStream, state: &Mutex<OmniState>) {
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     let body: Option<Value> = (!body.is_empty()).then(|| serde_json::from_slice(&body).unwrap());
-    let delay = state.lock().unwrap().delay;
-    std::thread::sleep(delay);
+    while state.lock().unwrap().held {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let (status, answer, headers) = answer(state, &method, &url, key.clone(), body.clone());
     state.lock().unwrap().seen.push(Seen {
         method,
@@ -915,7 +917,11 @@ fn g6_body_cap_and_timeout_with_1_mib_and_15_s_defaults() {
         "too_large",
         "^Omni answered more than 512 bytes$",
     );
-    r.omni.state().delay = Duration::from_millis(1500);
+    // Omni keeps its answer back until the test lets it go, so the refusal cannot be an answer that came late: the
+    // node gave up on its own. The clock is asked one thing only, which of its two timeouts that was. A node that
+    // had dropped the 300 ms it was given would wait the default, so the default is the bound, and not a guess at how
+    // fast this machine gets through 300 ms.
+    r.omni.state().held = true;
     let t = Instant::now();
     r.refused(
         "omni_status",
@@ -924,10 +930,10 @@ fn g6_body_cap_and_timeout_with_1_mib_and_15_s_defaults() {
         r"^omni does not answer GET /api/v2/instances at .* \(no answer in time\)",
     );
     assert!(
-        t.elapsed() < Duration::from_millis(1200),
-        "it gave up at its timeout, not at Omni's answer"
+        t.elapsed() < TIMEOUT,
+        "it gave up at the timeout it was given, before the default one"
     );
-    r.omni.state().delay = Duration::ZERO;
+    r.omni.state().held = false;
 }
 
 #[test]
