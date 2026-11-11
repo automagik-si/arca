@@ -1295,6 +1295,45 @@ Source: `open_deploy`, `deploys`, `Deploy::provisional` and `TenantHandler::depl
 `the_front_reaches_only_ordinary_services_and_follows_a_front_that_is_made_again` in
 `crates/arca/tests/tenants/deploys.rs`.
 
+## A service that may talk to the kernel
+
+**Rule 69.** Only a container of the node's own service project may be given a way to the kernel's MCP, and the way
+gives no authority. A template declares it with `kernelAccess: { "port" }`. The service's record then names the port and
+the listener, and its instance is created with one device, `kernel`: a proxy that listens inside the instance
+(`bind=instance`) on `127.0.0.1:<port>` and connects from the host to the node's `listen.proxy` on `127.0.0.1`. No ACL
+rule, no NIC key and nothing of the unix socket changes for it: the service's NIC still rejects the bridge gateway, as
+every service's does, and the device's traffic never reaches the bridge. A create is refused before any write when the
+call names a tenant, when the node's `listen.proxy` is not `127.0.0.1` served to the peer `127.0.0.1`, when the node
+serves its approval page on that listener (`approvalOrigin`), and when the call does not itself state the template's
+`kernelAccess`; a proposal states it from the template, so the owner's approval binds it and the card says it in words.
+The plugin refuses a record that names kernel access in a tenant, in another project, on a virtual machine, on a port
+below 1024 or one of the service's own, or to anything but `127.0.0.1:<port>`, whatever wrote the record. A tenant's
+project blocks proxy devices as well (Rule 62). The listener answers 401 to a call without a token and holds a token to
+its scope and tool list, as every listener does, so a process in the instance may do exactly what the token it holds
+allows. The device is part of the instance: it is created with it, and removed with it (Rule 66).
+
+The trade against the unix socket: the socket serves the server's own uid alone, and a loopback listener serves every
+local process, so any user of the host can connect to it. That is accepted because the listener gives its peer nothing:
+without a bearer token of the node every call is 401, a token's secret is 256 random bits whose digest alone is stored,
+and with a token a local user can do what that token allows and no more, which is what the same user could already do
+with that token on the tailnet or proxy listener.
+Source: `KernelAccess`, `KernelLink`, `kernel_device`, `kernel_connect_ok`, `Service::apply` and `validate_template` in
+`crates/arca/src/service.rs`; `NodeConfig::{kernel_listener, kernel_access}` in `crates/arca/src/config.rs`;
+`kernel_access_for`, `enrich_service_create` and the `service_create` and `service_status` arms of `ServiceHandler` in
+`crates/arca/src/handlers.rs`; `kernel_access_words` in `crates/arca/src/action_proposal.rs`; `mcp`, `serve_proxy` and
+`Filtered` in `crates/arca-mcp/src/http.rs`. Tests in `crates/arca/tests/tenants/kernel_access.rs`
+(`a_service_with_kernel_access_carries_one_device_of_exactly_this_shape_and_no_acl_rule_for_it`,
+`an_ordinary_template_gets_no_such_device_and_cannot_ask_for_one`,
+`nothing_in_a_tenant_gets_kernel_access_and_no_verb_installs_a_template`,
+`a_node_gives_kernel_access_only_through_a_loopback_proxy_listener_served_to_loopback`,
+`a_create_states_the_access_and_the_owners_card_says_it_in_words`,
+`a_template_that_gains_kernel_access_after_its_card_was_shown_is_not_created_by_that_approval`,
+`the_access_survives_a_restart_and_goes_with_the_service`), in `crates/arca/tests/services/kernel_access.rs`
+(`the_plugin_makes_the_kernel_access_device_from_the_record_alone`,
+`the_plugin_refuses_a_record_that_gives_kernel_access_to_anything_else`) and
+`a_loopback_proxy_listener_served_to_loopback_gives_its_peer_only_what_the_token_gives` in
+`crates/arca-mcp/tests/listen.rs`. The device's behaviour on a live Incus is under "Assumptions to confirm".
+
 ## Out of scope
 
 nftables rules, Caddy routes, tunnels and DNS records carry no Incus mark, so this model does not cover them. Their removal is
@@ -1307,6 +1346,11 @@ possible.
 
 These hold in the fake and are the basis of the rules above. None has yet been checked against a live Incus, and each check
 must run before any live write.
+
+- A proxy device with `bind=instance`, `listen=tcp:127.0.0.1:<port>` and `connect=tcp:127.0.0.1:<port>` is accepted on a
+  container in the restricted service project (`restricted.devices.proxy=allow`), listens on the container's own
+  loopback, and connects to a listener on the host's loopback with the source address `127.0.0.1`, so the proxy
+  listener's one-peer filter admits it (Rule 69). The fake stores the device and models none of this.
 
 - A virtual machine from a public cloud image (`images:debian/13/cloud`) that Arca creates runs its
   `cloud-init.user-data` once at its first boot and writes the file its `cloud-init.vendor-data` names, on a host whose

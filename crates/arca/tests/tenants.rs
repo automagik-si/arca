@@ -58,8 +58,33 @@ struct Rig {
     key: common::SkKey,
     clock: Arc<AtomicU64>,
     kernel_config: Value,
+    /// What the node's config holds beside the kernel key: `proxy` is its `listen.proxy`, and `approvalOrigin` its own.
+    node: Value,
     nonce: AtomicU64,
     cfg: Arc<NodeConfig>,
+}
+
+/// The config of a rig's node: the kernel key `kernel`, and what `node` adds ([`Rig::node`]).
+fn node_config(
+    dir: &std::path::Path,
+    incus: &std::path::Path,
+    kernel: &Value,
+    node: &Value,
+) -> NodeConfig {
+    let mut config = json!({
+        "stateDir": dir,
+        "incus": {"socket": incus},
+        "listen": {"unix": dir.join("arca.sock")},
+        "tokens": {"hashDir": dir.join("tokens")},
+        "kernel": kernel
+    });
+    if let Some(proxy) = node.get("proxy") {
+        config["listen"]["proxy"] = proxy.clone();
+    }
+    if let Some(origin) = node.get("approvalOrigin") {
+        config["approvalOrigin"] = origin.clone();
+    }
+    serde_json::from_value(config).expect("config")
 }
 
 impl Rig {
@@ -79,6 +104,11 @@ impl Rig {
     }
 
     fn with_kernel(kernel_config: Value, state: FakeState) -> Self {
+        Self::with_node(kernel_config, json!({}), state)
+    }
+
+    /// A node whose config also holds what `node` names: its `listen.proxy` as `proxy`, and its `approvalOrigin`.
+    fn with_node(kernel_config: Value, node: Value, state: FakeState) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "arca-tenants-{}-{}",
             std::process::id(),
@@ -96,6 +126,7 @@ impl Rig {
             fake.socket().to_path_buf(),
             Some(fake),
             kernel_config,
+            node,
             common::SkKey::from_seed(9),
             Arc::new(AtomicU64::new(NOW)),
         )
@@ -115,6 +146,7 @@ impl Rig {
             socket,
             None,
             kernel_config,
+            json!({}),
             common::SkKey::from_seed(9),
             Arc::new(AtomicU64::new(now)),
         )
@@ -126,17 +158,11 @@ impl Rig {
         incus: PathBuf,
         fake: Option<FakeIncus>,
         kernel_config: Value,
+        node: Value,
         key: common::SkKey,
         clock: Arc<AtomicU64>,
     ) -> Self {
-        let cfg: NodeConfig = serde_json::from_value(json!({
-            "stateDir": dir,
-            "incus": {"socket": incus},
-            "listen": {"unix": dir.join("arca.sock")},
-            "tokens": {"hashDir": dir.join("tokens")},
-            "kernel": kernel_config
-        }))
-        .expect("config");
+        let cfg = node_config(&dir, &incus, &kernel_config, &node);
         arca::config::check(&cfg).expect("the config is one serve accepts");
         let scratch = common::Scratch::new("tenant-owner");
         let verifier = common::verifier_for(&scratch, &[&key], "tenants");
@@ -238,6 +264,7 @@ impl Rig {
             key,
             clock,
             kernel_config,
+            node,
             nonce: AtomicU64::new(0),
             cfg,
         }
@@ -250,13 +277,14 @@ impl Rig {
         let key = common::SkKey::from_seed(9);
         let clock = Arc::clone(&self.clock);
         let kernel_config = self.kernel_config.clone();
+        let node = self.node.clone();
         self.handlers.clear();
         // The state directory's lock is the old kernel's until it is dropped.
         let old = std::mem::replace(&mut self.kernel, Arc::new(Mutex::new(placeholder_kernel())));
         drop(old);
         drop(self);
         let socket = fake.socket().to_path_buf();
-        Self::open(dir, socket, Some(fake), kernel_config, key, clock)
+        Self::open(dir, socket, Some(fake), kernel_config, node, key, clock)
     }
 
     fn fake(&self) -> &FakeIncus {
@@ -333,14 +361,7 @@ impl Rig {
 
     /// The node config the rig serves with.
     fn config(&self) -> NodeConfig {
-        serde_json::from_value(json!({
-            "stateDir": self.dir,
-            "incus": {"socket": self.socket},
-            "listen": {"unix": self.dir.join("arca.sock")},
-            "tokens": {"hashDir": self.dir.join("tokens")},
-            "kernel": self.kernel_config
-        }))
-        .expect("config")
+        node_config(&self.dir, &self.socket, &self.kernel_config, &self.node)
     }
 
     fn template(&self, name: &str, value: Value) {
@@ -441,5 +462,7 @@ mod deploys;
 mod gate;
 #[path = "tenants/isolation.rs"]
 mod isolation;
+#[path = "tenants/kernel_access.rs"]
+mod kernel_access;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;

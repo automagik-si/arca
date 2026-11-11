@@ -20,7 +20,7 @@ use arca_mcp::{
 };
 use common::{
     Scratch, bearer, connect_tcp, connect_unix, mint_into, own_uid, post, post_bytes, rpc,
-    wait_for_socket,
+    wait_for_socket, write_hash_file,
 };
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -764,4 +764,79 @@ fn a_proxy_peer_other_than_the_configured_one_is_closed_with_no_bytes() {
             "a peer other than the configured one receives no bytes: {other}"
         );
     }
+}
+
+/// The arrangement a service with kernel access reaches the kernel through: the proxy listener on `127.0.0.1`, served
+/// to the one peer `127.0.0.1`. The listener gives its peer no authority: a call without a token is 401, and a token
+/// with a tool list reaches its tools and nothing else. Another loopback address is not the peer.
+#[test]
+fn a_loopback_proxy_listener_served_to_loopback_gives_its_peer_only_what_the_token_gives() {
+    let scratch = Scratch::new("proxy-loopback");
+    let tools = vec!["plan_list".to_string(), "action_propose".to_string()];
+    let (listed, text) = arca_mcp::mint_with_tools(Scope::Doctor, Some(&tools));
+    write_hash_file(scratch.path(), "service", &text, 0o400);
+    let tokens = TokenStore::load(scratch.path()).expect("loads");
+    let router = Server::new(arca_api::verbs(), tokens).router();
+    let rt = Runtime::new().expect("runtime");
+    let at = start_proxy(&rt, router, "127.0.0.1");
+    assert!(at.ip().is_loopback());
+    assert_eq!(proxy_addr_ok(&at), Ok(()));
+    let call = |name: &str| {
+        rpc(
+            json!(1),
+            "tools/call",
+            json!({ "name": name, "arguments": {} }),
+        )
+    };
+
+    // No token: 401 on the one POST route, whatever the call. Nothing is answered about the node.
+    for body in [
+        rpc(
+            json!(1),
+            "initialize",
+            json!({ "protocolVersion": "2025-11-25" }),
+        ),
+        rpc(json!(1), "tools/list", json!({})),
+        call("plan_list"),
+        call("service_remove"),
+    ] {
+        let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
+        let reply = post(&mut stream, &[], &body);
+        assert_eq!(reply.status, 401, "no bearer is 401");
+        assert!(reply.body.is_empty(), "a 401 carries no body");
+    }
+    // A token that is not one of the node's is no token.
+    let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
+    let stranger = format!("arca_{}", "A".repeat(43));
+    let reply = post(&mut stream, &[bearer(&stranger)], &call("plan_list"));
+    assert_eq!(reply.status, 401);
+
+    // The service's token: a doctor token with a tool list. It is offered its tools alone.
+    let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
+    let reply = post(
+        &mut stream,
+        &[bearer(&listed)],
+        &rpc(json!(2), "tools/list", json!({})),
+    );
+    assert_eq!(reply.status, 200);
+    let names: Vec<String> = reply.json()["result"]["tools"]
+        .as_array()
+        .expect("a tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("a name").to_string())
+        .collect();
+    assert_eq!(names, vec!["plan_list", "action_propose"]);
+    // A verb its scope would admit, outside its list, is refused before any handler runs.
+    for outside in ["service_create", "service_remove", "plan_decline"] {
+        let mut stream = connect_from(&rt, "127.0.0.1", at).expect("the peer connects");
+        let reply = post(&mut stream, &[bearer(&listed)], &call(outside));
+        assert_eq!(reply.status, 403, "{outside} is outside the token's list");
+    }
+
+    // The listener serves its one peer: another address of the host's loopback gets no bytes.
+    let mut stream = connect_from(&rt, "127.0.0.2", at).expect("the TCP connect itself succeeds");
+    let _ = stream.write_all(&post_bytes(&[bearer(&listed)], &call("plan_list")));
+    let mut received = Vec::new();
+    let _ = stream.read_to_end(&mut received);
+    assert!(received.is_empty(), "another peer receives no bytes");
 }

@@ -200,6 +200,45 @@ pub struct ProxyListen {
     pub peer: IpAddr,
 }
 
+/// Why this node gives no service access to its kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoKernelAccess {
+    /// `listen.proxy` is not set.
+    NoListener,
+    /// `listen.proxy` is set to an address other than `127.0.0.1`, or serves a peer other than `127.0.0.1`.
+    OtherListener,
+    /// The proxy listener also serves the approval page, whose routes need no token.
+    ApprovalPage,
+}
+
+impl NodeConfig {
+    /// The listener a kernel access device connects to: `listen.proxy`, when its address is `127.0.0.1` and its one
+    /// peer is `127.0.0.1`. Incus connects to it from the host itself, so the listener sees that peer. `None` for any
+    /// other `listen.proxy`.
+    pub fn kernel_listener(&self) -> Option<SocketAddr> {
+        let proxy = self.listen.proxy?;
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        (proxy.addr.ip() == loopback && proxy.peer == loopback).then_some(proxy.addr)
+    }
+
+    /// The address a new service with kernel access connects to, or why this node gives none. A node that serves its
+    /// approval page (`approvalOrigin`) serves it on the proxy listener too, without a token, and trusts the address
+    /// its one peer forwards: a service on that listener would be that peer, so such a node gives no kernel access.
+    pub fn kernel_access(&self) -> Result<SocketAddr, NoKernelAccess> {
+        let addr = self
+            .kernel_listener()
+            .ok_or(if self.listen.proxy.is_some() {
+                NoKernelAccess::OtherListener
+            } else {
+                NoKernelAccess::NoListener
+            })?;
+        if self.approval_origin.is_some() {
+            return Err(NoKernelAccess::ApprovalPage);
+        }
+        Ok(addr)
+    }
+}
+
 /// The directory of the hash files the server reads.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
