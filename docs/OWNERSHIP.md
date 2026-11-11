@@ -1028,6 +1028,16 @@ tombstone. The effect is then journalled as applied, with the instance's delete 
 fails with Incus's reason, so the entry is reported failed and a removal deletes the instance through the usual plan.
 Incus's reason is carried the same way when the create did not land at all. In both, every secret file's content is
 replaced in the text before it is returned or journalled, since a create's body carries resolved secrets.
+A create that asked for no start is not this case and needs no rule of its own. `service_create` with `start: false`,
+a container template whose secret is not set yet and a virtual machine whose template declares secrets (Rule 68) all
+record `start: false`; the create's body carries it, the instance is created stopped and the effect applies as any
+create does. A container's secrets and links are then config patches of a stopped instance, and the first start is
+`instance_start`, which is not a plugin effect. The three are not one create, though. An explicit `start: false` also
+records `autostart: false` and its body carries no `boot.autostart`, whatever the template sets: Incus restores an
+instance's last state when the key is unset, so a host restart never boots the service before its first
+`instance_start`. Nothing writes the key later, so no instance is changed after its create for this. A create that the
+template alone stops keeps the template's `autostart` in its record and `boot.autostart` in its body, as before
+(tests in `crates/arca/tests/tenants/create_stopped.rs`).
 Every other failed create is settled as before: failed when the name answers 404, and otherwise left open. Before this
 rule the intent stayed open, which blocks every later effect until a restart.
 Source: `IncusProvider::settle_create` in `crates/arca-providers/src/incus.rs`; `EffectRefusal::Landed` and `Ctx::effect`

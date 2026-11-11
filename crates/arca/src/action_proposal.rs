@@ -264,7 +264,9 @@ impl ActionKind {
         self.details_with_gpu(args, None)
     }
 
-    /// The same rows, with the card's product filled in for an attach or detach when the inventory knows it. The GPU row
+    /// The same rows, with the card's product filled in for an attach or detach when the inventory knows it. For a
+    /// `service_create` the same argument carries why its template is created stopped whatever the call says, when it
+    /// is (`crate::service::template_stopped_reason`), and for a deploy's removal the deploy's parts. The GPU row
     /// always carries the PCI address, so two identical cards are never confused, and the effect row never claims that a
     /// card shared by more than one container has isolated VRAM.
     pub fn details_with_gpu(self, args: &Value, gpu_product: Option<&str>) -> Vec<ActionDetail> {
@@ -282,6 +284,15 @@ impl ActionKind {
                 }
                 if args.get("mac").is_some() {
                     rows.push(row("MAC address", text("mac")));
+                }
+                // The row says what will happen, so the owner approves a stopped service knowingly: a create that
+                // said `start: false`, and one whose template is created stopped whatever the call says (the reason
+                // is read from the template when the proposal is made, and is not in its arguments).
+                match (args.get("start").and_then(Value::as_bool), gpu_product) {
+                    (Some(false), _) => rows.push(row("Start", start_words(false))),
+                    (_, Some(reason)) => rows.push(row("Start", &stopped_words(reason))),
+                    (Some(true), None) => rows.push(row("Start", start_words(true))),
+                    (None, None) => {}
                 }
                 rows
             }
@@ -518,6 +529,13 @@ impl ActionKind {
                 format!("Remove everything the deploy {} created", text("deploy"))
             }
         };
+        // A service created stopped is named as one: nothing of it runs until it is started.
+        let sentence =
+            if self == Self::ServiceCreate && args.get("start") == Some(&Value::Bool(false)) {
+                format!("{sentence} and leave it stopped")
+            } else {
+                sentence
+            };
         match args.get("tenant").and_then(Value::as_str) {
             Some(tenant) if !matches!(self, Self::TenantCreate | Self::TenantRemove) => {
                 format!("{sentence}, in tenant {tenant}")
@@ -526,6 +544,24 @@ impl ActionKind {
         }
     }
 }
+
+/// What a `service_create` proposal's `start` means, in the owner's words.
+pub fn start_words(start: bool) -> &'static str {
+    if start {
+        "Yes: it is started once it is created"
+    } else {
+        "No: it is created stopped, and instance_start starts it later"
+    }
+}
+
+/// The `Start` row of a `service_create` whose template is created stopped whatever the call says: `reason` finishes
+/// "it is created stopped because".
+pub fn stopped_words(reason: &str) -> String {
+    format!("{STOPPED_BECAUSE}{reason}; instance_start starts it later")
+}
+
+/// How every [`stopped_words`] row begins.
+const STOPPED_BECAUSE: &str = "No: it is created stopped because ";
 
 /// One argument the owner is shown, as a label and its exact value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +623,30 @@ fn loaded_words(
                 stored.label == built.label
                     && (stored.label == "Parts" || stored.value == built.value)
             });
+        return (
+            action.summary(args),
+            if fits {
+                stored_details.to_vec()
+            } else {
+                rebuilt
+            },
+        );
+    }
+    // Why a template is created stopped was read from the template when the create was proposed, and is not in its
+    // arguments either: the journal's `Start` row is kept when it is such a row and every other row is the one this
+    // action writes for these arguments.
+    if action == ActionKind::ServiceCreate {
+        let rebuilt = action.details(args);
+        let without_start = |rows: &[ActionDetail]| -> Vec<ActionDetail> {
+            rows.iter()
+                .filter(|row| row.label != "Start")
+                .cloned()
+                .collect()
+        };
+        let stored_start = stored_details.iter().find(|row| row.label == "Start");
+        let fits = args.get("start") != Some(&Value::Bool(false))
+            && stored_start.is_some_and(|row| row.value.starts_with(STOPPED_BECAUSE))
+            && without_start(stored_details) == without_start(&rebuilt);
         return (
             action.summary(args),
             if fits {
@@ -1274,6 +1334,49 @@ mod tests {
         );
         assert!(!path.exists(), "the journal was moved aside");
         assert!(quarantined(&dir.0), "the invalid journal was quarantined");
+    }
+
+    #[test]
+    fn a_creates_stopped_row_is_kept_on_replay_only_when_it_is_such_a_row_for_these_arguments() {
+        let reason = "its template needs the secret TUNNEL_TOKEN, which is not set yet";
+        let action = ActionKind::ServiceCreate;
+        // Proposed with the template's reason: the journal's rows carry it, and a replay keeps them.
+        let args = json!({ "name": "tunnel", "template": "tunnel" });
+        let stored = action.details_with_gpu(&args, Some(reason));
+        assert_eq!(stored.last().map(|row| row.label.as_str()), Some("Start"));
+        assert_eq!(stored.last().unwrap().value, stopped_words(reason));
+        assert_eq!(loaded_words(action, &args, "", &stored).1, stored);
+        // The same with `start: true`: "Yes" is never shown for a template that is created stopped.
+        let named = json!({ "name": "tunnel", "template": "tunnel", "start": true });
+        let stored_named = action.details_with_gpu(&named, Some(reason));
+        assert_eq!(stored_named.last().unwrap().value, stopped_words(reason));
+        assert_eq!(
+            loaded_words(action, &named, "", &stored_named).1,
+            stored_named
+        );
+        // Rows that do not fit the arguments, or a Start row in other words, are rebuilt from the arguments alone.
+        let other = json!({ "name": "other", "template": "tunnel" });
+        assert_eq!(
+            loaded_words(action, &other, "", &stored).1,
+            action.details(&other)
+        );
+        let mut forged = stored.clone();
+        forged.last_mut().unwrap().value = "Yes: anything".to_string();
+        assert_eq!(
+            loaded_words(action, &args, "", &forged).1,
+            action.details(&args)
+        );
+        // The call's own `start: false` is in the arguments, and its row is always rebuilt from them.
+        let asked = json!({ "name": "tunnel", "template": "tunnel", "start": false });
+        let rebuilt = loaded_words(
+            action,
+            &asked,
+            "",
+            &action.details_with_gpu(&asked, Some(reason)),
+        )
+        .1;
+        assert_eq!(rebuilt, action.details(&asked));
+        assert_eq!(rebuilt.last().unwrap().value, start_words(false));
     }
 
     #[test]

@@ -334,7 +334,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "service_create",
-        summary: "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows.",
+        summary: "Create a service from a template, in the service project and under the kernel's mark: a container on the service network, or a virtual machine on the service network or on an existing host bridge the node allows. With start: false it is created stopped, so service_secret_set and service_connect put its secrets and links in place before instance_start starts it for the first time.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -2371,6 +2371,10 @@ fn service_create_params_base() -> Value {
                 "description": "For a virtual-machine template on a host bridge: a fixed MAC for its NIC, six hex octets joined by \":\". Left out, Incus picks one. Refused on the managed service network.",
                 "pattern": "^[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}$",
                 "type": "string"
+            },
+            "start": {
+                "description": "Optional. Absent or true: the service is started once it is created, as without the field. A container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets, are created stopped whatever this says, and the answer's stoppedBecause says why. False: it is created stopped, the answer's state is \"stopped\", and its create carries no boot.autostart, so a host restart does not boot it before its first instance_start and afterwards restores the state it was in. service_secret_set and service_connect then apply to it, and instance_start starts it for the first time: a container with every secret and link in its environment. A virtual machine's secrets are never in its environment: instance_start writes them into the guest as files once it has booted, and inside a tenant they are not written yet (the start is refused with InstanceSecretsNotWritten and the machine stays running without them).",
+                "type": "boolean"
             }
         },
         "required": ["template", "name"],
@@ -2379,7 +2383,13 @@ fn service_create_params_base() -> Value {
 }
 
 fn service_create_result() -> Value {
-    service_view_schema()
+    let mut view = service_view_schema();
+    view["properties"]["stoppedBecause"] = json!({
+        "description": "Present when the service was created stopped: why, in words that name a secret and never show one. Either the call said start: false, or its template is created stopped whatever the call says.",
+        "maxLength": 4096,
+        "type": "string"
+    });
+    view
 }
 
 fn service_list_params() -> Value {

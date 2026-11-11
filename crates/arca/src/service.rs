@@ -1464,6 +1464,57 @@ pub fn environment(
     Ok((env, start))
 }
 
+/// Why a new service of this template is created stopped whatever the call's `start` says, in words that finish
+/// "it is created stopped because ...". `None` when a create starts it. A virtual machine whose template declares
+/// secrets is one: they are written into its guest by `instance_start`. A container is one while its environment names
+/// a secret that is neither stored for the entry `owner` nor made by the template. Nothing is read but whether each
+/// secret's file exists, and nothing is written: a secret is named, never shown.
+pub fn template_stopped_reason(
+    template: &Template,
+    owner: &str,
+    secrets_dir: &Path,
+) -> Option<String> {
+    let named = |keys: &[&str]| match keys {
+        [one] => format!("the secret {one}"),
+        keys => format!("the secrets {}", keys.join(", ")),
+    };
+    if template.is_vm() {
+        if template.secrets.is_empty() {
+            return None;
+        }
+        let keys: Vec<&str> = template.secrets.iter().map(String::as_str).collect();
+        return Some(format!(
+            "its template declares {}, and a virtual machine's secrets are written into it by instance_start",
+            named(&keys)
+        ));
+    }
+    let mut missing = BTreeSet::new();
+    for pattern in template.env.values() {
+        let mut rest = pattern.as_str();
+        while let Some(at) = rest.find("{{secret:") {
+            let after = &rest[at + "{{secret:".len()..];
+            let Some(end) = after.find("}}") else { break };
+            let key = &after[..end];
+            let held = template.secrets.iter().any(|declared| declared == key)
+                && (template.generate.contains_key(key)
+                    || secret_file(secrets_dir, owner, key).is_some_and(|file| file.is_file()));
+            if !held {
+                missing.insert(key);
+            }
+            rest = &after[end + 2..];
+        }
+    }
+    if missing.is_empty() {
+        return None;
+    }
+    let keys: Vec<&str> = missing.into_iter().collect();
+    Some(format!(
+        "its template needs {}, which {} not set yet",
+        named(&keys),
+        if keys.len() == 1 { "is" } else { "are" }
+    ))
+}
+
 /// The reference to the secret `key` of the service whose entry is `owner` ([`entry_id`]).
 pub fn secret_reference(owner: &str, key: &str) -> String {
     format!("{SECRET_PREFIX}{owner}/{}", secret_name(key))

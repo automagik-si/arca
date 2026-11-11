@@ -258,7 +258,7 @@ The secret file holds the secret and one newline. A client reads that file, stri
 A service is one template-derived container in the service project. Its template lives in
 `<stateDir>/templates/<name>.json`; `service_create` allocates `.10`-`.239` on the service bridge, creates the
 service profile and NIC ACL, records the desired entry, and starts the container when every environment secret it
-needs is available. `service_list` and `service_status` derive state from Incus and report instances that Arca did
+needs is available; with `start: false` it never starts it (see "Creating a service stopped" below). `service_list` and `service_status` derive state from Incus and report instances that Arca did
 not create as `unknown` without touching them. A row's `ports` are the container's own ports;
 `lanPort` is the host proxy port when the template sets `lan`, or null. Only `lanPort` is a host
 listener. `service_logs` returns console lines as untrusted text with stored
@@ -274,6 +274,48 @@ dashes and underscores, not starting with a dot, so no path. A template whose sc
 (`automagik`; `automagik-server` is an OCI image) needs that image in the service project's image store first:
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
+
+**Creating a service stopped.** A secret (`service_secret_set`) and a link (`service_connect`) reach a container's
+environment at its next start, not while it runs. A service that is started as it is created therefore boots once
+without them, and a program that sets itself up at its first boot (a database with its password, an application with
+its admin password or its `DATABASE_URL`) keeps what it saw then. So `service_create` takes `start`:
+
+| `start` | What `service_create` does |
+| --- | --- |
+| left out, or `true` | As always: the service is started once it is created. Two kinds of template are created stopped whatever `start` says: a container whose template needs a secret that is not set yet, and a virtual machine whose template declares secrets. The answer then carries `stoppedBecause`, with the reason. Their create is the one it always was, with the template's `boot.autostart`. |
+| `false` | The service is created stopped and nothing starts it. The answer's `state` is `"stopped"`, `stoppedBecause` says "the call said start: false", and `service_status` shows the same state. Its create carries no `boot.autostart` (see below). |
+
+The order for a deploy that needs secrets or links at its first boot:
+
+1. `service_create` with `"start": false`, for each service.
+2. `service_secret_set` and `service_connect`, as often as needed. Both write the stopped service's config, as they do
+   for a running one.
+3. `instance_start` for each service, the providers first. This is the first start, and the environment it gives a
+   container holds every secret and every link variable set in step 2.
+
+**A host restart.** A template may set `autostart`, which a create writes as `boot.autostart`: Incus then starts the
+instance whenever the host restarts, also one that has never run. With an explicit `start: false` the create leaves the
+key out, and the service's record says `autostart: false`, so a create made again from the record is the same. Incus
+(7.5.1) describes the key as "Whether to always start the instance when the daemon starts", and "If unset or set to
+`last-state`, restores the last state". So a service created with `start: false` is never booted by a host restart
+before its first `instance_start`; after that, a host restart restores the state it was in, and a service stopped
+with the owner's approval stays stopped. This holds for an explicit `start: false` only. A create that the template
+alone stops (the two kinds in the table) keeps `boot.autostart` as the template sets it, as before: Incus may boot such
+a service on a host restart before its first `instance_start`, without its secrets. So for a template with `autostart`,
+`start: false` and `start` left out are not the same create.
+
+**A virtual machine.** It takes `start: false` like a container, but its secrets are not environment values: they are
+stored, and `instance_start` writes them into the guest as files once the machine has booted (see "Secrets of a
+virtual machine"). Inside a tenant they are not written yet: `instance_start` starts the machine and is refused with
+`InstanceSecretsNotWritten`, and the machine runs without them until Arca writes guest secrets inside a tenant. A
+virtual machine is never the consumer of a link.
+
+Nothing else changes: the address, the firewall rules, the caps and the approval rules are those of any create, and
+the effect journal holds the instance's create as it holds any create (an intent, then the applied effect with the
+instance's delete as its inverse). The service's record holds `start: false`. On the approval page, the card of a
+`service_create` has a `Start` row whenever the service will be created stopped: for `start: false` ("No: it is
+created stopped, and instance_start starts it later", and the summary ends "and leave it stopped"), and for a
+template that is created stopped whatever the call says ("No: it is created stopped because ...", with the reason).
 
 The `automagik` image is built from a checkout with `bash templates/automagik.build.sh PROJECT PROFILE
 local:BASE_FINGERPRINT`, which publishes it in `PROJECT` under the alias the template names. `PROFILE` must carry a
@@ -941,7 +983,8 @@ database, GPU, storage, snapshot or instance verbs: `service_create`, `service_r
 `instance_restart` (see [Starting, stopping and restarting instances](#starting-stopping-and-restarting-instances)). `action_propose` takes `{action, args}`; `args` is checked against that verb's own parameter schema, with
 the inline `approval` field removed because the proposal replaces it. An unknown action is an invalid call and leaves no
 record. A proposal cannot choose a container image: `postgres_create` uses `kernel.postgresImage`, and an explicit image that
-differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains.
+differs from it is refused. `service_create` names a template from the kernel's catalog, whose name the schema constrains;
+its card has a `Start` row whenever the service will be created stopped, with the reason, so the owner approves a stopped service knowingly.
 A GPU proposal names an existing Incus instance and the card's PCI address. The kernel resolves the instance's project,
 type and `volatile.uuid` when the proposal is made and puts them in the arguments, so the owner's digest binds them. Only a
 kernel-mode node writes, and only an instance in `kernel.projects` whose own config classifies as a kernel object: a
@@ -2755,6 +2798,13 @@ beside the `service`, and the instance verbs take either `instance` or, in a ten
   create (counted from `tenant-deploys.jsonl`, so a restart does not reset it). Until then that token may call
   `deploy_rollback`. A provisional service is not reached by the front and is flagged in `tenant_usage`. Afterwards it
   is an ordinary service, and its removal needs the owner's approval;
+- `service_create` takes `start: false` as in the node's own project (see "Creating a service stopped"): the service is
+  created stopped, `service_secret_set` and `service_connect` apply to it, and `instance_start` with `tenant` starts it
+  for the first time, with no approval from a token whose tool allowlist names the verb. A deploy's rules do not look
+  at whether a service runs: a provisional service that is still stopped is confirmed by `deploy_confirm` and removed
+  by `deploy_rollback` like a running one. A virtual machine's secrets are files in its guest, written after it boots,
+  and inside a tenant they are not written yet: `instance_start` starts the machine and is refused with
+  `InstanceSecretsNotWritten`;
 
 - a service's address comes from the tenant's block, and its caps are checked before Incus is asked, so a refusal names
   the cap (`limits.instances`, `limits.containers`, `limits.virtual-machines`, `limits.cpu`, `limits.memory`,
@@ -2780,6 +2830,17 @@ machine and the caps, and removes everything it made:
 ARCA_TENANT_PROBE_SOCKET=/var/lib/incus/unix.socket ARCA_TENANT_PROBE_CIDR=<the node's serviceCidr> \
 ARCA_TENANT_PROBE_DROIDD=<the node's droiddProjects, comma-separated> ARCA_TENANT_PROBE_FRONT=<a service, optional> \
   cargo test -p arca --test tenants -- --ignored --nocapture scratch_probe
+```
+
+A second, smaller ignored probe covers "Creating a service stopped" on a real Incus, with the same variables: one
+scratch tenant, two containers created with `start: false` in a deploy, their secrets and their link set while they are
+stopped, and `instance_start` for each. It then reads, inside each container, the environment its first process was
+started with, and removes everything it made:
+
+```sh
+ARCA_TENANT_PROBE_SOCKET=/var/lib/incus/unix.socket ARCA_TENANT_PROBE_CIDR=<the node's serviceCidr> \
+ARCA_TENANT_PROBE_DROIDD=<the node's droiddProjects, comma-separated> \
+  cargo test -p arca --test tenants -- --ignored --nocapture created_stopped_probe
 ```
 
 ## When an approved action fails

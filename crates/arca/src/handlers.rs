@@ -1403,6 +1403,11 @@ impl ToolHandler for ActionPropose {
             )?
             .card
             .map(|card| card.product),
+            // The card of a create says when its template is created stopped whatever the call says, and why.
+            ActionKind::ServiceCreate => self
+                .node
+                .as_deref()
+                .and_then(|node| service_create_stopped_reason(node, &payload)),
             // The card of a deploy's removal lists the deploy's parts as they stand now.
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
@@ -3156,6 +3161,27 @@ fn enrich_service_create(
     Ok(payload)
 }
 
+/// Why the template a proposed `service_create` names is created stopped whatever the call's `start` says, for the
+/// owner's card. `None` when a create starts it, or when the template does not load (the create itself refuses that).
+fn service_create_stopped_reason(cfg: &NodeConfig, payload: &Value) -> Option<String> {
+    let template = crate::service::load_template(
+        &cfg.state_dir.join("templates"),
+        payload["template"].as_str()?,
+    )
+    .ok()?;
+    let owner = crate::service::entry_id(payload["tenant"].as_str(), payload["name"].as_str()?);
+    crate::service::template_stopped_reason(&template, &owner, &cfg.state_dir.join("secrets"))
+}
+
+/// The words of a create's answer for a service created stopped: the call's own `start: false`, or the template's
+/// reason, which names a secret and never shows one.
+fn stopped_because(start: bool, template: Option<String>) -> String {
+    if !start {
+        return "the call said start: false".to_string();
+    }
+    template.unwrap_or_else(|| "its template's environment cannot be filled in yet".to_string())
+}
+
 /// Why a fixed MAC is refused on the managed service network.
 const MANAGED_MAC: &str = "mac: a virtual machine on the managed service network has its address reserved by Arca, so it takes no fixed MAC; mac is for a host bridge";
 
@@ -4446,7 +4472,7 @@ fn service_name(args: &Value) -> Result<String, CallError> {
 impl ToolHandler for ServiceHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         let allowed: &[&str] = match self.verb {
-            "service_create" => &["name", "template", "bridge", "mac", "deploy"],
+            "service_create" => &["name", "template", "bridge", "mac", "deploy", "start"],
             "service_status" => &["name"],
             "service_logs" => &["name", "lines"],
             "service_remove" | "service_import" | "service_release" => &["name", "approval"],
@@ -4898,6 +4924,13 @@ impl ToolHandler for ServiceHandler {
                     .ok_or_else(|| {
                         CallError::Invalid("template: expected a template name".into())
                     })?;
+                // `start: false` creates the service stopped: its secrets and links are set before its first start.
+                let start = match args.get("start") {
+                    None => true,
+                    Some(value) => value.as_bool().ok_or_else(|| {
+                        CallError::Invalid("start: expected true or false".into())
+                    })?,
+                };
                 let id = crate::service::entry_id(tenant_id, &name);
                 if entries
                     .iter()
@@ -4917,6 +4950,12 @@ impl ToolHandler for ServiceHandler {
                 let templates_dir = self.cfg.state_dir.join("templates");
                 let template = crate::service::load_template(&templates_dir, template_name)
                     .map_err(service_template_error)?;
+                // Read before the create makes any secret: why this template is created stopped whatever `start` says.
+                let forced = crate::service::template_stopped_reason(
+                    &template,
+                    &id,
+                    &self.cfg.state_dir.join("secrets"),
+                );
                 if template.is_vm() {
                     let Some(caps) = self.cfg.kernel.vm_caps() else {
                         return Err(service_refused(no_vm_caps(template_name)));
@@ -5059,12 +5098,20 @@ impl ToolHandler for ServiceHandler {
                     let deploy =
                         tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)?;
                     self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);
+                    // Created stopped when the call asked for that. A machine whose template declares secrets is
+                    // created stopped whatever the call says, and the two rules give one `start: false`.
+                    config.start = config.start && start;
+                    // An explicit `start: false`, and nothing else, also leaves `boot.autostart` out, recorded as
+                    // `autostart: false` so a create made again from the record is the same: Incus restores the last
+                    // state when the key is unset, so a host restart never boots it before its first instance_start. A
+                    // create the template alone stops keeps the template's autostart, in its record and in its body.
+                    config.autostart = config.autostart && start;
                     changes.push(crate::desired_store::EntryChange::Put(service_entry(
                         &id,
                         "arca.service",
                         serde_json::to_value(&config).map_err(|_| internal())?,
                     )));
-                    return self.settle_create(
+                    let mut made = self.settle_create(
                         &read,
                         &name,
                         template_name,
@@ -5072,7 +5119,11 @@ impl ToolHandler for ServiceHandler {
                         &config,
                         None,
                         now,
-                    );
+                    )?;
+                    if !config.start {
+                        made["stoppedBecause"] = json!(stopped_because(start, forced));
+                    }
+                    return Ok(made);
                 }
                 if bridged.is_some() && !managed {
                     return Err(service_refused(bridged_only(template_name)));
@@ -5124,12 +5175,20 @@ impl ToolHandler for ServiceHandler {
                     tenants::open_deploy(&self.cfg, tenant.as_ref(), &args, caller, &id, now)
                         .inspect_err(|_| cleanup_service_secrets(&service_secrets, &seeded))?;
                 self.place_in_tenant(&mut config, tenant.as_ref(), &all_entries, deploy);
+                // Created stopped when the call asked for that. A service whose template needs a secret that is not
+                // set yet is created stopped either way.
+                config.start = config.start && start;
+                // An explicit `start: false`, and nothing else, also leaves `boot.autostart` out, recorded as
+                // `autostart: false` so a create made again from the record is the same: Incus restores the last state
+                // when the key is unset, so a host restart never boots it before its first instance_start. A create
+                // the template alone stops keeps the template's autostart, in its record and in its body.
+                config.autostart = config.autostart && start;
                 changes.push(crate::desired_store::EntryChange::Put(service_entry(
                     &id,
                     "arca.service",
                     serde_json::to_value(&config).map_err(|_| internal())?,
                 )));
-                let made = self.settle_create(
+                let mut made = self.settle_create(
                     &read,
                     &name,
                     template_name,
@@ -5138,6 +5197,9 @@ impl ToolHandler for ServiceHandler {
                     Some((service_secrets.as_path(), &seeded)),
                     now,
                 )?;
+                if !config.start {
+                    made["stoppedBecause"] = json!(stopped_because(start, forced));
+                }
                 // The node's front was made, or made again at another address: every tenant service's ACL follows now.
                 let front = self
                     .cfg
