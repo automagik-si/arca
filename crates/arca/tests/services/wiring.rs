@@ -1174,6 +1174,10 @@ fn g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change() {
     held.held = true;
     rig.fake.script_exec(held);
     let waited = waits(&rig);
+    // The deadline covers every request the node sends before it waits on the join, so it is seconds and not a tenth
+    // of one: on a slow machine a tenth passed before the wait was sent, and the node then sent fewer requests. While
+    // it waits, the fake answers every quarter of a second that the join still runs and the node asks again. How often
+    // is not the node's choice, so this rig's golden log leaves the waits out (see `WITHOUT_WAITS`).
     assert!(
         seam.run(
             &target,
@@ -1181,23 +1185,18 @@ fn g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change() {
             "service_publish",
             &join,
             &[],
-            Some(Instant::now() + Duration::from_millis(100))
+            Some(Instant::now() + Duration::from_secs(3))
         )
         .is_err()
     );
-    // The fake writes a request down when it answers it, and it answers a wait on a held operation after a quarter of
-    // a second: later than the join's deadline, when the node has stopped listening. Left alone, that line lands
-    // wherever the rest of this test has got to, or after its end, and the golden log would hold one machine's timing.
-    // The node sends the same requests either way, so the test goes on only once the line is there. The deadline stays
-    // under that quarter of a second: a longer one has the node ask again, once for each quarter it waits.
-    let landed = Instant::now() + Duration::from_secs(30);
-    while waits(&rig) == waited {
-        assert!(
-            Instant::now() < landed,
-            "the join was started and waited on before its deadline passed"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    assert!(
+        commands(&rig).contains(&join.argv()),
+        "the join was started"
+    );
+    assert!(
+        waits(&rig) > waited,
+        "the join was waited on before its deadline passed"
+    );
     assert!(matches!(
         run(&seam, &target, &C::TailscaleVersion),
         Err(ExecError::Refused("hung"))
