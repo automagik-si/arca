@@ -1,4 +1,5 @@
 import { approvalUrl } from './approval.js';
+import { OPEN_INTELLIGENCE_TAG } from './open-intelligence.js';
 import {
   buildDashboard, formatCelsius, formatGb, formatMhz, formatWatts, humanize, parseProjectHash,
   proposalId, projectHash, relativeAge, WATCH_ONLY_SERVICES,
@@ -200,6 +201,11 @@ function svgEl(doc, tag, attrs = {}, children = []) {
   for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, String(value));
   node.append(...children);
   return node;
+}
+
+// A drawing kept as [tag, attributes, children], a child being another drawing or a string of text.
+function svgTree(doc, [tag, attrs, children]) {
+  return svgEl(doc, tag, attrs, children.map((child) => (typeof child === 'string' ? child : svgTree(doc, child))));
 }
 
 function icon(doc, name) {
@@ -835,7 +841,10 @@ export function createCanvas(root, { base = '/arca-canvas' } = {}) {
   composer.append(composerBox, composerNote);
 
   panel.append(panelHead, chatScroll, stepsScroll, composer);
-  main.append(left, panel);
+  // The Open Intelligence tag of the we unfold movement: a picture at the foot of the canvas, never a link.
+  const foot = el(doc, 'footer', 'arca-foot');
+  foot.append(svgTree(doc, OPEN_INTELLIGENCE_TAG));
+  main.append(left, panel, foot);
 
   const detailBackdrop = el(doc, 'div', 'arca-detail-backdrop');
   detailBackdrop.hidden = true;

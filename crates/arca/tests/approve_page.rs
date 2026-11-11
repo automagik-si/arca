@@ -3403,6 +3403,95 @@ fn the_request_card_keeps_its_enroll_sentence_and_its_large_code_element() {
 }
 
 #[test]
+fn every_inline_page_carries_the_open_intelligence_tag_once_as_a_picture_and_never_a_link() {
+    // The footer cut exactly as `assets/open-intelligence/render.mjs` draws it from the we unfold Badge component.
+    let tag =
+        include_str!("../../../assets/open-intelligence/open-intelligence-tag.svg").trim_end();
+    assert!(
+        tag.starts_with(
+            r#"<svg viewBox="0 0 340 64" width="170" height="32" role="img" aria-label="Open Intelligence badge">"#
+        ),
+        "the footer cut is 170 px wide and names itself"
+    );
+    assert!(
+        tag.ends_with(">OPEN INTELLIGENCE</text></svg>"),
+        "the words are OPEN INTELLIGENCE"
+    );
+    assert!(
+        tag.contains(r##"fill="#0e1017" stroke="#ebe6da""##) && !tag.contains("var("),
+        "the tag carries plain colours as attributes: no browser has to read var() in an attribute"
+    );
+    assert_eq!(
+        tag.matches("stroke=\"").count(),
+        tag.matches("stroke=\"#ebe6da\"").count(),
+        "the tag is the one-colour cut: the pill's outline and every stroke of the mark share one colour"
+    );
+    assert!(
+        tag.matches("<path ").count() > 100,
+        "the mark is in the tag"
+    );
+    for (label, html) in [
+        ("approval", include_str!("../src/approve_page.html")),
+        ("sign-in", include_str!("../src/canvas_signin.html")),
+        ("error", include_str!("../src/canvas_error.html")),
+    ] {
+        assert_eq!(
+            html.matches(tag).count(),
+            1,
+            "{label}: the vendored tag, byte for byte"
+        );
+        assert_eq!(html.matches("OPEN INTELLIGENCE").count(), 1, "{label}");
+        let at = html.find(tag).expect("the tag");
+        let before = &html[..at];
+        assert!(
+            before.ends_with("<footer>")
+                || before.ends_with(r#"<footer class="open-intelligence">"#),
+            "{label}: the tag opens the footer"
+        );
+        let mut rest = html[at + tag.len()..].to_string();
+        assert!(
+            rest.starts_with("</footer>"),
+            "{label}: the footer holds the tag and nothing else"
+        );
+        if let (Some(start), Some(end)) = (rest.find("<script>"), rest.find("</script>")) {
+            rest.replace_range(start..end + "</script>".len(), "");
+        }
+        for closing in ["</footer>", "</main>", "</body>", "</html>"] {
+            rest = rest.replace(closing, "");
+        }
+        assert!(
+            rest.trim().is_empty(),
+            "{label}: the footer is the last thing the page shows"
+        );
+        assert!(
+            !html.contains("<a ") && !html.contains("<a>"),
+            "{label}: the page has no link, so the tag is not one"
+        );
+        assert!(!html.contains("style=\""), "{label}: no style attribute");
+        // The colours come from the page's own stylesheet, which the CSP hash covers: the pill takes the page's ground
+        // and ink, the words its ink, in light and dark.
+        let style = &html[html.find("<style>").expect("a style block")
+            ..html.find("</style>").expect("a closed style block")];
+        let scope = if label == "approval" {
+            ".open-intelligence"
+        } else {
+            "footer"
+        };
+        assert!(
+            style.contains(&format!(
+                "{scope} rect {{ fill: var(--arca-bg); stroke: var(--arca-ink); }}"
+            )) && style.contains(&format!("{scope} path {{ stroke: var(--arca-ink); }}"))
+                && style.contains(&format!("{scope} text {{ fill: var(--arca-ink); }}")),
+            "{label}: the stylesheet colours the pill, the mark and the words from the page's tokens"
+        );
+        assert!(
+            style.contains("--arca-bg:") && style.contains("--arca-ink:"),
+            "{label}: the page defines the two tokens the tag takes"
+        );
+    }
+}
+
+#[test]
 fn credential_placeholder_is_only_in_the_body_attribute() {
     for (label, html) in [
         ("approval", include_str!("../src/approve_page.html")),

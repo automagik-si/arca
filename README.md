@@ -1,5 +1,7 @@
 # Automagik Arca
 
+<a href="https://weunfold.ai/"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/open-intelligence/open-intelligence-badge-ivory.svg"><img src="assets/open-intelligence/open-intelligence-badge-ink.svg" alt="Open Intelligence" width="170" height="32"></picture></a>
+
 Automagik Arca is a Rust kernel for a node's own infrastructure. The kernel reads what it owns, plans each change, and
 applies a change only after the node's owner has approved it and the change is written to a journal. Each node signs its
 own desired state with its own key. It talks to Incus over the local unix socket. The program is one binary, `arca`.
