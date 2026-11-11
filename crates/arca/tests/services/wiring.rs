@@ -173,6 +173,16 @@ fn seam(rig: &Rig, name: &str) -> (ServiceExec, ExecTarget) {
 fn run(seam: &ServiceExec, target: &ExecTarget, cmd: &C) -> Result<Vec<u8>, ExecError> {
     seam.run(target, "viewer", "service_logs", cmd, &[], None)
 }
+/// How many waits on an operation the fake has written down.
+fn waits(rig: &Rig) -> usize {
+    rig.fake
+        .requests()
+        .iter()
+        .filter(|r| {
+            r.method == "GET" && r.path.starts_with("/1.0/operations/") && r.path.contains("/wait?")
+        })
+        .count()
+}
 
 #[test]
 fn g5_connect_and_disconnect_open_only_the_provider_port_and_render_env() {
@@ -1163,6 +1173,7 @@ fn g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change() {
     let mut held = ExecScript::new(join.argv(), 0, "");
     held.held = true;
     rig.fake.script_exec(held);
+    let waited = waits(&rig);
     assert!(
         seam.run(
             &target,
@@ -1174,6 +1185,19 @@ fn g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change() {
         )
         .is_err()
     );
+    // The fake writes a request down when it answers it, and it answers a wait on a held operation after a quarter of
+    // a second: later than the join's deadline, when the node has stopped listening. Left alone, that line lands
+    // wherever the rest of this test has got to, or after its end, and the golden log would hold one machine's timing.
+    // The node sends the same requests either way, so the test goes on only once the line is there. The deadline stays
+    // under that quarter of a second: a longer one has the node ask again, once for each quarter it waits.
+    let landed = Instant::now() + Duration::from_secs(30);
+    while waits(&rig) == waited {
+        assert!(
+            Instant::now() < landed,
+            "the join was started and waited on before its deadline passed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(matches!(
         run(&seam, &target, &C::TailscaleVersion),
         Err(ExecError::Refused("hung"))

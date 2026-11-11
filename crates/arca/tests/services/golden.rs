@@ -7,6 +7,16 @@
 //! A rig whose log depends on timing (a poll, a held operation, two calls at once) is not in the file and is not compared.
 //! `ARCA_GOLDEN_OUT=<file>` appends each rig's line to that file instead of comparing; the golden file is the lines that
 //! were equal over several such runs.
+//!
+//! Equal runs on one fast machine do not show that a log is free of timing. The fake writes a request down when it
+//! answers it, not when it arrives, and it holds a wait on a running operation for up to a quarter of a second. So a
+//! wait on a held operation is in the log late, and once more for each quarter of a second the operation stays held: a
+//! machine slow enough has another log. A rig with such a wait belongs in the file only when its test fixes where that
+//! line lands, as `g5_hung_mark_allows_key_cleanup_and_stop_and_clears_on_uuid_change` does.
+//!
+//! A digest names a log and does not show it. `ARCA_GOLDEN_DUMP=<directory>` writes the text each digest is made from,
+//! one file for each rig and digest, so two runs that differ leave two files to compare. A rig that fails the comparison
+//! prints the same text.
 use super::*;
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -27,7 +37,8 @@ thread_local! {
     static RIGS: Cell<usize> = const { Cell::new(0) };
 }
 
-fn digest(fake: &FakeIncus) -> String {
+/// The text a rig's digest is made from: each request in the order the fake recorded it, then each write.
+fn log_text(fake: &FakeIncus) -> String {
     let mut text = String::new();
     for request in fake.requests() {
         text.push_str(&format!(
@@ -44,7 +55,15 @@ fn digest(fake: &FakeIncus) -> String {
             write.config_keys.join(",")
         ));
     }
-    Digest::of(text.as_bytes()).to_hex()
+    text
+}
+
+/// Writes one rig's log text into the dump directory, named by its rig and by its digest.
+fn dump(directory: &std::ffi::OsStr, key: &str, found: &str, text: &str) {
+    let directory = std::path::Path::new(directory);
+    fs::create_dir_all(directory).expect("the golden dump directory exists");
+    let name = format!("{}.{}.txt", key.replace("::", "."), &found[..12]);
+    fs::write(directory.join(name), text).expect("the golden dump is written");
 }
 
 /// Records one rig's request log as its test ends. Called from the rig's `Drop`, and silent while the test is failing.
@@ -63,7 +82,11 @@ pub(super) fn record(fake: &FakeIncus) {
         index
     });
     let key = format!("{test}#{index}");
-    let found = digest(fake);
+    let text = log_text(fake);
+    let found = Digest::of(text.as_bytes()).to_hex();
+    if let Some(directory) = std::env::var_os("ARCA_GOLDEN_DUMP") {
+        dump(&directory, &key, &found, &text);
+    }
     if let Some(out) = std::env::var_os("ARCA_GOLDEN_OUT") {
         use std::io::Write;
         let mut file = fs::OpenOptions::new()
@@ -77,7 +100,7 @@ pub(super) fn record(fake: &FakeIncus) {
     if let Some(expected) = EXPECTED.get(key.as_str()) {
         assert_eq!(
             found, *expected,
-            "{key}: a node without kernel.tenants sends other Incus requests than the golden log holds"
+            "{key}: a node without kernel.tenants sends other Incus requests than the golden log holds. It sent:\n{text}"
         );
     }
 }

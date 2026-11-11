@@ -44,7 +44,7 @@ function listeners() {
 function fakeDsh({
   sessionId = 'session-doctor-1', script = async () => {}, noRestrict = false, noDefinitions = false,
   noGuard = false, hangCreateOnce = false, endOnCancel = true, onCancel = null,
-  failResume = false, hangFirstDispose = false,
+  failResume = false, hangFirstDispose = false, onAgentSetUp = null,
 } = {}) {
   const events = listeners();
   const globals = new Map();
@@ -221,6 +221,7 @@ function fakeDsh({
         agent.session = { id: options.sessionId };
         if (createGate && created.length === 1) await createGate;
         await options.setup?.(agentCtx);
+        onAgentSetUp?.();
         const first = created.length === 1;
         return {
           agent,
@@ -260,7 +261,7 @@ function fakeDsh({
 
 // A minimal DSH whose first create/resume hangs until released, so a newer attempt can publish a live
 // handle before that stale attempt settles.
-function raceDsh({ conflictResume = false } = {}) {
+function raceDsh({ conflictResume = false, releaseOnConflict = false } = {}) {
   let resolveGate;
   let rejectGate;
   const gate = new Promise((resolve, reject) => { resolveGate = resolve; rejectGate = reject; });
@@ -344,6 +345,8 @@ function raceDsh({ conflictResume = false } = {}) {
         resumeAttempts += 1;
         resumeIds.push(options.resumeSessionId);
         if (conflictResume && firstResumePending) {
+          // The collision itself lets the first resume go, so the second attempt never waits on the test.
+          if (releaseOnConflict) resolveGate();
           const error = new Error(`session "${options.resumeSessionId}" is already owned by an active write handle`);
           error.name = 'SessionAlreadyOwnedError';
           throw error;
@@ -374,7 +377,27 @@ function raceDsh({ conflictResume = false } = {}) {
 
 async function harness(t, options = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'arca-chat-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  let chat;
+  let server;
+  // One hook, and the directory goes last. The hooks of a test stop at the first one that throws, and removing the
+  // directory can throw while the chat still writes its state there. A server left listening after that keeps the
+  // test process alive for good, so a failed test would never end.
+  t.after(async () => {
+    try {
+      await chat?.close();
+    } finally {
+      try {
+        if (server) {
+          await new Promise((resolve) => {
+            server.closeAllConnections?.();
+            server.close(resolve);
+          });
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
   const statePath = join(dir, 'chat.json');
   const fake = options.fake ?? fakeDsh(options);
   const store = options.store ?? new ChatStore(statePath, {
@@ -382,7 +405,7 @@ async function harness(t, options = {}) {
     ...(options.readFile ? { readFile: options.readFile } : {}),
   });
   const clientCalls = [];
-  const chat = createDoctorChat({
+  chat = createDoctorChat({
     hosts: [{ name: 'alpha' }, { name: 'beta' }],
     approvalUrl: 'https://example.com/approve',
     resolveDsh: () => (options.noDsh ? null : fake.dsh),
@@ -408,19 +431,27 @@ async function harness(t, options = {}) {
     uuid: options.uuid ?? (() => 'session-doctor-1'),
     now: options.now,
   });
-  t.after(() => chat.close());
-  const server = createServer((req, res) => {
+  // What a test may wait for in place of a pause: every request the chat has finished with, and every response
+  // whose client went away before its end.
+  const handled = [];
+  let dropped = 0;
+  server = createServer((req, res) => {
     const path = new URL(req.url, 'http://local').pathname;
-    if (path === '/chat') void chat.handle(req, res);
-    else if (path === '/chat/history') void chat.history(res);
+    if (path === '/chat') {
+      res.on('close', () => {
+        if (!res.writableEnded) dropped += 1;
+      });
+      const done = chat.handle(req, res);
+      handled.push(done.then(() => {}, () => {}));
+    } else if (path === '/chat/history') void chat.history(res);
     else res.writeHead(404).end();
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  t.after(() => new Promise((resolve) => {
-    server.closeAllConnections?.();
-    server.close(resolve);
-  }));
-  return { chat, fake, statePath, dir, port: server.address().port, clientCalls };
+  return {
+    chat, fake, statePath, dir, port: server.address().port, clientCalls,
+    dropped: () => dropped,
+    settled: () => Promise.all(handled),
+  };
 }
 
 function parseEvents(raw) {
@@ -455,6 +486,61 @@ async function until(predicate, timeout = 3000) {
     if (Date.now() > end) throw new Error('timed out');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+}
+
+// Harness options for a turn whose model run must time out. One deadline covers a turn's setup and its run, so a
+// real deadline short enough to wait for can be over before setup ends: the run then never starts, nothing is
+// cancelled and the request ends in 'error'. That is a slow machine and not the chat. So the deadline here is long
+// and the chat reads the test's clock, which stands still until the first agent is set up and then jumps to the
+// deadline. Setup always fits, the run always starts, and its timer has one millisecond left. Later turns of the same
+// test get the whole deadline.
+function runTimesOut() {
+  const turnMs = 60_000;
+  let at = Date.parse('2026-11-08T12:00:00Z');
+  let jumped = false;
+  return {
+    turnMs,
+    setupMs: turnMs,
+    now: () => at,
+    onAgentSetUp() {
+      if (jumped) return;
+      jumped = true;
+      at += turnMs;
+    },
+  };
+}
+
+// A chat store that keeps its document in memory, for a test that pins a short real bound on setup. Such a test needs
+// the bound to pass for a setup that hangs and to hold for the next one, which does not. With the real store every
+// setup waits for the disk, and a slow disk outlasts a 20 ms bound. Nothing the chat awaits from this store leaves
+// the microtask queue, and a timer only fires between tasks: from a request's arrival to the end of a setup that
+// does not hang no timer can fire, on any machine.
+function memoryStore(initial = {}) {
+  let state = {
+    version: 1, sessionId: null, day: dayOf(Date.now()), dailyTokens: 0, budgetExhausted: false, messages: [],
+    ...initial,
+  };
+  let queue = Promise.resolve();
+  return {
+    get state() {
+      return state;
+    },
+    async read() {
+      return state;
+    },
+    patch(update) {
+      const run = queue.then(async () => {
+        state = await update(state);
+        return state;
+      });
+      queue = run.then(() => undefined, () => undefined);
+      return run;
+    },
+    async flush() {
+      await queue;
+    },
+    exhaust() {},
+  };
 }
 
 test('SSE framing keeps one JSON object per data line and cannot forge an event', () => {
@@ -1389,8 +1475,9 @@ test('the dispatch guard denies run_code and a tool registered after setup', asy
 test('a cancelled run must end before the next; its late events are dropped', async (t) => {
   let first = true;
   const { fake, port, statePath } = await harness(t, {
-    turnMs: 25,
-    cancelMs: 500,
+    ...runTimesOut(),
+    // This test ends the cancelled run itself. The fallback that would end it for the chat must not get there first.
+    cancelMs: 60_000,
     endOnCancel: false,
     script: async (api) => {
       if (first) {
@@ -1405,8 +1492,9 @@ test('a cancelled run must end before the next; its late events are dropped', as
     },
   });
   const firstPost = post(port, { message: 'first' });
-  await until(() => fake.followed.length === 1);
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  await until(() => fake.cancels.length === 1);
+  assert.deepEqual(fake.cancels, ['timeout']);
+  assert.equal(fake.followed.length, 1, 'the run started before its deadline passed');
   const busy = await post(port, { message: 'while cancelling' });
   assert.equal(busy.status, 429, 'the next turn waits for the cancelled run to end');
   fake.api.lateEnd(1);
@@ -1426,7 +1514,7 @@ test('a cancelled run must end before the next; its late events are dropped', as
 
 test('a hanging agent setup is bounded and busy is cleared for the next request', async (t) => {
   const { fake, port } = await harness(t, {
-    hangCreateOnce: true, setupMs: 20,
+    hangCreateOnce: true, setupMs: 20, store: memoryStore(),
     script: async (api) => { api.text('ok'); api.end(); },
   });
   const first = await post(port, { message: 'hang' });
@@ -1440,8 +1528,9 @@ test('a hanging agent setup is bounded and busy is cleared for the next request'
 });
 
 test('a client disconnect during setup makes no model call', async (t) => {
-  const { fake, port } = await harness(t, {
-    hangCreateOnce: true, setupMs: 500,
+  // No bound may pass here: the setup hangs until the test lets it go.
+  const { fake, port, dropped, settled } = await harness(t, {
+    hangCreateOnce: true, setupMs: 60_000, turnMs: 60_000,
     script: async (api) => { api.text('ok'); api.end(); },
   });
   const controller = new AbortController();
@@ -1452,10 +1541,12 @@ test('a client disconnect during setup makes no model call', async (t) => {
     signal: controller.signal,
   }).catch(() => null);
   await until(() => fake.created.length === 1);
-  await new Promise((resolve) => setTimeout(resolve, 20));
   controller.abort();
+  // The setup ends only after the chat has seen the client go, and the chat is asked again only after it has
+  // finished with that request. Both are waited for, so the order is the test's and not the machine's.
+  await until(() => dropped() === 1);
   fake.releaseCreate();
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await settled();
   assert.equal(fake.followed.length, 0, 'no followup after the client went away');
   await pending;
   const second = await post(port, { message: 'after disconnect' });
@@ -1626,7 +1717,7 @@ test('the start event names the Doctor session and carries the stored id when kn
 
 test('partial usage reported by an interrupted assistant message is counted', async (t) => {
   const { port, statePath } = await harness(t, {
-    turnMs: 30,
+    ...runTimesOut(),
     script: async (api) => {
       api.text('partial answer');
       api.usage({ inputTokens: 10, outputTokens: 20 });
@@ -1642,18 +1733,23 @@ test('partial usage reported by an interrupted assistant message is counted', as
 });
 
 test('a hanging setup shares the turn deadline and cannot extend the request', async (t) => {
-  const { port } = await harness(t, { hangCreateOnce: true, setupMs: 5000, turnMs: 50 });
+  const setupMs = 5000;
+  const { port } = await harness(t, { hangCreateOnce: true, setupMs, turnMs: 50 });
   const started = Date.now();
   const result = await post(port, { message: 'deadline' });
   const elapsed = Date.now() - started;
   assert.equal(result.events.at(-1).data.reason, 'error');
-  assert.ok(elapsed < 1000, `setup must not outlive the turn deadline (${elapsed}ms)`);
+  // Only the turn deadline can have ended a setup that hangs before its own bound.
+  assert.ok(elapsed < setupMs, `setup must not outlive the turn deadline (${elapsed}ms)`);
 });
 
 test('an agent error with no turn/end releases the turn and the next request', async (t) => {
   let calls = 0;
-  const { port } = await harness(t, {
-    turnMs: 40,
+  // The deadline is long on purpose: only the error may release this turn, and a slow setup must not spend it.
+  const turnMs = 60_000;
+  const { fake, port } = await harness(t, {
+    turnMs,
+    setupMs: turnMs,
     cancelMs: 20,
     endOnCancel: false,
     script: async (api) => {
@@ -1670,7 +1766,8 @@ test('an agent error with no turn/end releases the turn and the next request', a
   const first = await post(port, { message: 'error' });
   const elapsed = Date.now() - started;
   assert.equal(first.events.at(-1).data.reason, 'error');
-  assert.ok(elapsed < 500, `the error released the turn in ${elapsed}ms`);
+  assert.deepEqual(fake.cancels, ['error']);
+  assert.ok(elapsed < turnMs, `the error released the turn in ${elapsed}ms, before its deadline`);
   const second = await post(port, { message: 'after error' });
   assert.equal(second.status, 200);
   assert.equal(second.events.at(-1).data.reason, 'complete');
@@ -1681,6 +1778,7 @@ test('a stale create cannot replace or dispose the live agent', async (t) => {
   let sequence = 0;
   const { chat, port } = await harness(t, {
     fake: race,
+    store: memoryStore(),
     setupMs: 25,
     turnMs: 500,
     cancelMs: 20,
@@ -1708,31 +1806,29 @@ test('a stale create cannot replace or dispose the live agent', async (t) => {
 });
 
 test('a stale resume overlapping a newer setup reuses the live session id', async (t) => {
-  const race = raceDsh({ conflictResume: true });
+  const race = raceDsh({ conflictResume: true, releaseOnConflict: true });
   let sequence = 0;
-  const { chat, port, statePath } = await harness(t, {
+  const store = memoryStore({ sessionId: 'saved-doctor' });
+  const { chat, port } = await harness(t, {
     fake: race,
+    store,
     setupMs: 200,
     turnMs: 1000,
     cancelMs: 20,
     uuid: () => `candidate-${++sequence}`,
   });
-  await writeFile(statePath, JSON.stringify({
-    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 0, messages: [],
-  }));
   const first = await post(port, { message: 'stale resume' });
   assert.equal(first.events.at(-1).data.reason, 'error');
   // The first resume is still holding the session write handle. The second attempt races it and must wait,
-  // not treat the write conflict as a missing session and create a new id.
-  const secondPromise = post(port, { message: 'live resume' });
-  await until(() => race.resumeIds.length === 2);
-  race.resolveGate();
-  const second = await secondPromise;
+  // not treat the write conflict as a missing session and create a new id. The first resume lets go when the
+  // second collides with it.
+  const second = await post(port, { message: 'live resume' });
   assert.equal(second.events.at(-1).data.reason, 'complete');
+  assert.equal(race.resumeIds.length, 3, 'the hanging resume, the one that collided with it, and its retry');
   assert.equal(race.createdIds.length, 0, 'the newer setup never forks a new DSH session');
   assert.deepEqual([...new Set(race.resumeIds)], ['saved-doctor'], 'both setups stay on the stored session id');
   assert.equal(chat.sessionId, 'saved-doctor');
-  assert.equal(JSON.parse(await readFile(statePath, 'utf8')).sessionId, 'saved-doctor');
+  assert.equal(store.state.sessionId, 'saved-doctor');
   await chat.close();
 });
 
@@ -1741,12 +1837,11 @@ test('a write conflict with no live holder recovers with a fresh session', async
   let first = true;
   let sequence = 0;
   const { chat, fake, port } = await harness(t, {
+    ...runTimesOut(),
     failResume: true,
     hangFirstDispose: true,
     endOnCancel: false,
-    turnMs: 25,
     cancelMs: 20,
-    setupMs: 500,
     log: (line) => logged.push(line),
     uuid: () => `candidate-${++sequence}`,
     script: async (api) => {
@@ -1777,16 +1872,14 @@ test('a write conflict with no live holder recovers with a fresh session', async
 test('a stale resume rejection cannot corrupt the live agent', async (t) => {
   const race = raceDsh();
   let sequence = 0;
-  const { chat, port, statePath } = await harness(t, {
+  const { chat, port } = await harness(t, {
     fake: race,
+    store: memoryStore({ sessionId: 'saved-doctor' }),
     setupMs: 25,
     turnMs: 500,
     cancelMs: 20,
     uuid: () => `candidate-${++sequence}`,
   });
-  await writeFile(statePath, JSON.stringify({
-    version: 1, sessionId: 'saved-doctor', day: dayOf(Date.now()), dailyTokens: 0, messages: [],
-  }));
   const first = await post(port, { message: 'stale resume' });
   assert.equal(first.events.at(-1).data.reason, 'error');
   const second = await post(port, { message: 'live resume' });
