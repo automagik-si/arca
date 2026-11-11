@@ -22,9 +22,12 @@
 #     automagik-tunnel   cloudflared, as a remotely-managed tunnel. It calls out to Cloudflare; nothing calls in. The
 #                        route in Cloudflare names http://127.0.0.1:3082. Its metrics listener is put on loopback,
 #                        where a container would otherwise open it to every address.
-#   The server is never told its public name. The gate speaks to it as loopback, so it needs none, and without one it
-#   refuses (HTTP 403) every request that comes under a public name: a route in Cloudflare that names the server's
-#   port instead of the gate's shows that refusal at once, and never the workspace without its gate.
+#   The server is never told its public name. The gate speaks to it as loopback, so it needs none. A route in
+#   Cloudflare that names the server's port instead of the gate's then reaches a server that does not trust the
+#   public name: its interface's requests and live connections are refused (HTTP 403), its page asks for the
+#   server's own sign-in (HTTP 401), and only its static files load. Nothing of the workspace can be used that way.
+#   That holds only while the route sends the visitor's own Host: a Host override to a loopback name on the route
+#   would make the server accept the request, past the gate. No route of a workspace sets one.
 #   Plain `docker run` gives this shape; Docker Compose is not installed.
 #
 # What it reads:
@@ -297,13 +300,15 @@ proven() {
 # is only acted on when Docker has said that it stopped or that it is not there.
 state_of() {
   local out
-  if out=$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$1" 2>&1); then
+  # Docker's words on its standard error are read only when it failed: a warning beside a good answer is not one.
+  if out=$(docker inspect --type container -f '{{.State.Running}} {{.State.ExitCode}}' "$1" 2>"$WS_RUN/docker.err"); then
     case $out in
       'true '*) echo running ;;
       'false '[0-9]*) echo "exited ${out#false }" ;;
       *) echo unknown ;;
     esac
   else
+    out=$(cat "$WS_RUN/docker.err" 2>/dev/null)
     case ${out,,} in
       *'no such object'* | *'no such container'*) echo absent ;;
       *) echo unknown ;;

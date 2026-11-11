@@ -2579,9 +2579,12 @@ token passes through that assistant's conversation.
    application of step 2 in place. Select "Add route", then "Published application". Enter the subdomain
    (`workspace`), choose your domain (`example.com`) in "Domain", and in "Service URL" enter `http://127.0.0.1:3082`:
    the gate's port, not the server's 3081. That address is the loopback the connector shares with the gate. Select
-   "Add route". A route that names 3081 by mistake does not open the workspace without its gate: the server is
-   never told its public name, so it answers every request under one with a refusal (HTTP 403), and the address
-   shows that at once. Correct the port in the route.
+   "Add route". Leave the route's "HTTP Host Header" setting empty, here and always: a Host override to a
+   loopback name would make the server accept requests it otherwise refuses, and a route to its port would then
+   pass the gate by. A route that names 3081 by mistake, without such an override, does not give anyone the
+   workspace: the server is never told its public name, so it refuses the requests and live connections its
+   interface makes (HTTP 403), its page asks for the server's own sign-in (HTTP 401), and only its static files
+   load. A page that never comes to life is that mistake: correct the port in the route.
 8. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
    `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tunnel is running and has registered with Cloudflare; public address https://workspace.example.com, sign-in by Cloudflare Access (team example.cloudflareaccess.com, 1 e-mail address(es))`.
    The Cloudflare "Tunnels" page lists the tunnel as `Healthy`. `https://workspace.example.com` shows Cloudflare's
@@ -3073,8 +3076,9 @@ Not proven by these tests, because they need a real virtual machine, the images 
 - that nothing in the machine listens beyond loopback (the image's own services were not listed on a live machine);
 - that the connector says `Registered tunnel connection`, the line the keeper looks for, and that a route to
   `http://127.0.0.1:3082` carries the workspace's pages, WebSockets and long-lived streams through Cloudflare;
-- that a route to the server's port 3081 is refused with 403: that is the server's own rule for a `Host` it was not
-  told to trust, read in its code and not exercised here;
+- what a route to the server's port 3081 gets (403 for the interface's requests and connections, 401 for the page,
+  the static files loading): that is the server's own behaviour for a `Host` it was not told to trust, as its
+  makers report it for the pinned build; it was not exercised here;
 - the sign-in through Cloudflare Access, end to end;
 - the Cloudflare screens named in the steps, which follow the tunnel section above and Cloudflare's documentation
   and were not walked through in this work.

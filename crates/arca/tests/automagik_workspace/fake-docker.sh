@@ -53,7 +53,10 @@ case $command in
     echo "0123456789ab"
     ;;
   inspect)
+    [ "${1-}" = --type ] && shift 2
     format=$2 name=$3
+    # A warning beside a good answer, as a Docker client prints one on its standard error.
+    [ ! -e "$root/warn-inspect" ] || echo "WARNING: Error loading config file: permission denied" >&2
     if [ -e "$root/fail-inspect" ]; then
       echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
       exit 1
