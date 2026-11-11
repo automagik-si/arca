@@ -127,4 +127,10 @@ fn closed_arguments_and_file_paths_refuse_injection_and_out_of_range_values() {
         ServiceFile::Secret(SecretName::new("TOKEN").unwrap()).path(),
         "/run/secrets/TOKEN"
     );
+    // A virtual machine's secrets: one fixed directory in the guest, and a file in it named by the secret.
+    assert_eq!(ServiceFile::GuestSecretsDir.path(), "/etc/arca-secrets");
+    assert_eq!(
+        ServiceFile::GuestSecret(SecretName::new("API_TOKEN").unwrap()).path(),
+        "/etc/arca-secrets/API_TOKEN"
+    );
 }

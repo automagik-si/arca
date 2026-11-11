@@ -24,6 +24,7 @@ pub mod cmd_watch;
 pub mod config;
 pub mod desired_store;
 pub mod gpu;
+pub mod guest_secrets;
 pub mod handlers;
 pub mod kernel;
 pub mod lifecycle;

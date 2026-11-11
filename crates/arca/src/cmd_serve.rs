@@ -403,6 +403,9 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .map_err(Failure::Config)?;
         let retained_kernel = Arc::clone(&kernel);
+        // A start or a restart of a virtual-machine service writes its stored secrets into its guest.
+        let guest_secrets =
+            crate::guest_secrets::GuestSecrets::new(Arc::new(cfg.clone()), Arc::clone(&kernel));
         Some(Arc::new(
             crate::lifecycle::InstanceLifecycle::new(
                 cfg.incus.socket.clone(),
@@ -415,7 +418,10 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
                 },
                 &cfg.state_dir,
             )
-            .with_tenants(tenant_projects.clone()),
+            .with_tenants(tenant_projects.clone())
+            .with_after_start(Arc::new(move |project, instance| {
+                guest_secrets.deliver(project, instance)
+            })),
         ))
     } else {
         None

@@ -582,7 +582,7 @@ fn the_verbs_that_need_the_service_network_refuse_a_bridged_vm_in_plain_words() 
             "service_secret_set",
             json!({"name":"ws1","key":"TOKEN","value":"a-long-enough-value"})
         )),
-        "service ws1 is a virtual machine on a host bridge that Arca does not manage: it has no template secrets or environment for Arca to set"
+        "template does not declare that secret: this virtual machine's template declares none"
     );
     assert_eq!(rig.fake.writes().len(), before, "no refusal wrote anything");
     assert_eq!(rig.network_requests(), Vec::<String>::new());
@@ -801,11 +801,17 @@ fn a_vm_template_needs_both_limits_and_a_root_size_and_nothing_of_the_service_ne
             with("provides", json!({"env":{"URL":"x"}})),
             "provides needs a port",
         ),
-        (with("lan", json!({"port": 22})), "has no env, secrets"),
-        (with("publishable", json!(true)), "has no env, secrets"),
-        (with("env", json!({"A":"b"})), "has no env, secrets"),
-        (with("secrets", json!(["TOKEN"])), "has no env, secrets"),
-        (with("data", json!({"path":"/data"})), "has no env, secrets"),
+        (with("lan", json!({"port": 22})), "has no env, generate"),
+        (with("publishable", json!(true)), "has no env, generate"),
+        (with("env", json!({"A":"b"})), "has no env, generate"),
+        (
+            with("generate", json!({"TOKEN":"k_"})),
+            "has no env, generate",
+        ),
+        (
+            with("data", json!({"path":"/data"})),
+            "has no env, generate",
+        ),
         (
             with("image", json!("docker.io/library/debian")),
             "invalid system image",

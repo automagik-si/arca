@@ -219,11 +219,19 @@ impl ExecCommand {
     }
 }
 
-/// A destination is constructed only by the fixed key variant or the secrets-path validator.
+/// Where a virtual machine's secrets are written inside its guest: a directory of root's, mode 0700, on the guest's own
+/// disk, with one file of root's, mode 0600, per secret. Incus writes both through the guest agent.
+pub const GUEST_SECRETS_DIR: &str = "/etc/arca-secrets";
+
+/// A destination is constructed only by a fixed variant or the secrets-path validator.
 #[derive(Clone, Debug)]
 pub enum ServiceFile {
     TailnetKey,
     Secret(SecretName),
+    /// [`GUEST_SECRETS_DIR`] itself, made as a directory.
+    GuestSecretsDir,
+    /// One secret's file in [`GUEST_SECRETS_DIR`].
+    GuestSecret(SecretName),
 }
 #[derive(Clone, Debug)]
 pub struct SecretName(String);
@@ -245,6 +253,15 @@ impl ServiceFile {
         match self {
             Self::TailnetKey => "/run/arca-ts/authkey".into(),
             Self::Secret(key) => format!("/run/secrets/{}", key.0),
+            Self::GuestSecretsDir => GUEST_SECRETS_DIR.into(),
+            Self::GuestSecret(key) => format!("{GUEST_SECRETS_DIR}/{}", key.0),
+        }
+    }
+    /// The Incus file type and mode the destination is written with: a private directory, or a private file.
+    fn kind(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::GuestSecretsDir => ("directory", "0700"),
+            _ => ("file", "0600"),
         }
     }
 }
@@ -355,7 +372,8 @@ impl UnixIncusWriter {
         }
         Ok(framed.body)
     }
-    /// The payload is sent only as the files request body, with root ownership and mode 0600.
+    /// The payload is sent only as the files request body, with root ownership and mode 0600. A directory destination
+    /// takes no payload and is made with mode 0700; Incus leaves one that exists as it is.
     pub fn write_service_file(
         &self,
         owned: &Owned,
@@ -363,7 +381,11 @@ impl UnixIncusWriter {
         bytes: &[u8],
     ) -> Result<(), IncusError> {
         let path = target(owned)?;
-        if bytes.len() > OUTPUT_CAP || owned.entry() != self.entry() {
+        let (kind, mode) = file.kind();
+        if bytes.len() > OUTPUT_CAP
+            || owned.entry() != self.entry()
+            || (kind == "directory" && !bytes.is_empty())
+        {
             return Err(refused());
         }
         let fresh = self.read_owned(owned.target())?;
@@ -375,7 +397,7 @@ impl UnixIncusWriter {
             file.path()
         );
         check_path(&path)?;
-        let mut request = format!("POST {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\nX-Incus-type: file\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\nX-Incus-mode: 0600\r\nX-Incus-write: overwrite\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
+        let mut request = format!("POST {path} HTTP/1.1\r\nHost: incus\r\nConnection: close\r\nX-Incus-type: {kind}\r\nX-Incus-uid: 0\r\nX-Incus-gid: 0\r\nX-Incus-mode: {mode}\r\nX-Incus-write: overwrite\r\nContent-Length: {}\r\n\r\n", bytes.len()).into_bytes();
         request.extend_from_slice(bytes);
         let framed = exchange_capped(
             &self.socket,

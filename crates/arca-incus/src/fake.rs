@@ -2925,6 +2925,8 @@ struct ServiceFake {
     calls: Vec<ServiceRequest>,
     recordings: BTreeMap<String, Vec<u8>>,
     files: BTreeMap<String, Vec<u8>>,
+    /// How many file writes to a virtual machine still fail, as they do until its guest agent runs.
+    agent_unready: u32,
 }
 
 /// Request evidence for tests only; bodies may contain test secrets, so this has no Debug implementation.
@@ -2970,6 +2972,11 @@ impl FakeIncus {
     }
     pub fn service_files(&self) -> BTreeMap<String, Vec<u8>> {
         lock(&self.shared.service).files.clone()
+    }
+    /// Makes the next `times` file writes to a virtual machine fail, as Incus fails them while the guest agent has
+    /// not started yet.
+    pub fn set_guest_agent_unready(&self, times: u32) {
+        lock(&self.shared.service).agent_unready = times;
     }
 }
 
@@ -3025,6 +3032,17 @@ fn service_response(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)
     if rest == ["files"] {
         let path = crate::read::percent_decode(query_param(query, "path").unwrap_or(""));
         let key = format!("{project}/{name}:{path}");
+        // A virtual machine takes a file through its guest agent only: not while it is stopped, and not before the
+        // agent runs.
+        if request.method == "POST" && store.objects[index].body["type"] == "virtual-machine" {
+            if store.objects[index].body["status"] != "Running" {
+                return Some(encoded(500, "Instance is not running"));
+            }
+            if service.agent_unready > 0 {
+                service.agent_unready -= 1;
+                return Some(encoded(500, "Failed to connect to the agent"));
+            }
+        }
         return Some(match request.method.as_str() {
             "POST" => {
                 service.files.insert(key, request.body.clone());

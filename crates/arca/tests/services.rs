@@ -559,6 +559,8 @@ fn source_template(kind: &str, image: &str, digest: Option<&str>) -> service::Te
         data: None,
         lan: None,
         root_size: None,
+        first_boot: None,
+        settings: None,
     }
 }
 

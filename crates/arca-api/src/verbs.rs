@@ -460,7 +460,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "service_secret_set",
-        summary: "Set one of a service's secrets (its template lists them). Write-only: no tool, log or audit row shows it again. The service's environment, and its consumers', is updated for their next start.",
+        summary: "Set one of a service's secrets (its template lists them). Write-only: no tool, log or audit row shows it again. The service's environment, and its consumers', is updated for their next start. A virtual machine's secret is never in its environment or its Incus config: it is stored, and instance_start writes it into the guest as a file of root's in /etc/arca-secrets; it may have line breaks.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -698,7 +698,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "instance_start",
-        summary: "Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused.",
+        summary: "Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused. For a virtual-machine service with stored secrets (service_secret_set) it also writes them into the guest, whether it started the machine or found it running, and the answer names them.",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

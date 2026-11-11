@@ -545,7 +545,7 @@ refused with `InstanceNotArca` and a sentence that says why; no write is sent to
 
 | Verb | Who runs it | On a running instance | On a stopped instance |
 |------|-------------|-----------------------|-----------------------|
-| `instance_start` | a `doctor` token, directly; no approval | nothing changes, `changed: false`, "is already running" | starts it |
+| `instance_start` | a `doctor` token, directly; no approval | nothing changes, `changed: false`, "is already running"; a virtual machine's stored secrets are written into its guest again | starts it, and writes a virtual machine's stored secrets into its guest |
 | `instance_stop` | only an approved action proposal | shuts it down | nothing changes, `changed: false`, "is already stopped" |
 | `instance_restart` | only an approved action proposal | shuts it down and starts it again | starts it, and says so |
 
@@ -577,7 +577,11 @@ them. Each call that passes its gate is written to `instance-actions.jsonl` in t
 
 `outcome` is `started`, `already_running`, `stopped`, `already_stopped`, `restarted`, `started_from_stopped`, `refused` or
 `failed`, and `code` is the refusal's code for the last two: `failed` only when a state change was sent and did not finish.
-`proposal` is the approved proposal a stop or a restart ran from; a start carries no grant, so it is `null` there. The `begin` line is durable before anything is sent to Incus:
+`proposal` is the approved proposal a stop or a restart ran from; a start carries no grant, so it is `null` there. A
+start or a restart that wrote a virtual machine's secrets into its guest adds a third line,
+`{"kind":"guest_secrets","id":"ia-<ms>-<n>","outcome":"written","secrets":["<name>", ...]}`, or `"outcome":"failed"`
+with `"secrets":null`: it names the secrets and never holds a value or a reason (see "Secrets of a virtual machine").
+The `begin` line is durable before anything is sent to Incus:
 when it cannot be written (the file is a link, or is not mode 0600) the call is refused with `InstanceJournalUnavailable`
 and nothing changes. A file past 8 MiB is set aside as `instance-actions.jsonl.1`, replacing the one set aside before.
 
@@ -2201,8 +2205,9 @@ A template is a virtual machine when its `kind` is `virtual-machine`:
 `limits` must set both `cpu` and `memory`, and `rootSize` is required; all three follow the size rules above. A
 virtual-machine template may also set `description` and `autostart`, and `ports` with `provides` when a container is
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
-host bridge. It may not set `env`, `secrets`, `generate`, `entrypoint`, `publishable`, `dashPort`, `droiddPort`, `data`
-or `lan`: each of those depends on a container's environment, image or devices.
+host bridge. It may also set `firstBoot`, `settings` and `secrets`, which "First boot, settings and secrets of a
+virtual machine" below describes. It may not set `env`, `generate`, `entrypoint`, `publishable`, `dashPort`,
+`droiddPort`, `data` or `lan`: each of those depends on a container's environment, image or devices.
 
 `service_create` takes two more arguments for a virtual-machine template:
 
@@ -2243,8 +2248,65 @@ What a bridged node refuses, and why:
 | `service_create` that would pass a cap of `kernel.bridged.limits` | The cap, what is in use, what was asked and what is allowed. |
 | `service_connect`, `service_disconnect` | Links need the service network and its per-service firewall rules. |
 | `service_publish`, `service_unpublish` | The virtual machine cannot be published from Arca; reach it on its bridge's own network. |
-| `service_secret_set` | A virtual machine has no template secrets or environment. |
+| `service_secret_set` for a secret the template does not declare | The template does not declare that secret. A declared one is stored (see "First boot, settings and secrets of a virtual machine"). |
 | `postgres_create` and the probe consumer | They need `kernel.serviceCidr`. |
+
+### First boot, settings and secrets of a virtual machine
+
+A virtual-machine template may say what the machine does at its first boot, give it settings, and declare secrets:
+
+```json
+{
+  "name": "example-vm",
+  "kind": "virtual-machine",
+  "image": "images:debian/13/cloud",
+  "limits": { "cpu": "2", "memory": "4GiB" },
+  "rootSize": "20GiB",
+  "firstBoot": { "file": "example-vm.sh" },
+  "settings": { "greeting": "hello" },
+  "secrets": ["API_TOKEN"]
+}
+```
+
+| Field | What it is | How it reaches the machine |
+|-------|------------|----------------------------|
+| `firstBoot` | `{ "file": "<name>" }`: a plain file beside the template, at most 256KiB, that begins `#!` (a script) or `#cloud-config`. | As the instance's `cloud-init.user-data`. cloud-init runs a script once, as root, at the machine's first boot. The image must carry cloud-init: on the public images server that is the `cloud` variant, for example `images:debian/13/cloud`. |
+| `settings` | One JSON object, at most 16KiB. It never holds a secret. | As the instance's `cloud-init.vendor-data`: cloud-init writes the object to `/etc/arca/settings.json` (readable by every user of the machine) before the script runs. |
+| `secrets` | Up to 16 names of letters, digits and `_`. | Never through Incus's config. See below. |
+
+The script and the settings are read when the machine is created and are fixed from then on, like everything else in a
+virtual machine's Incus config. A template that is edited later applies to machines created after the edit.
+`service_create` refuses a template whose script file is missing, naming the file it looked for.
+
+**Secrets of a virtual machine.** A container's secret is an environment value in its Incus config. A virtual
+machine's is never there. The steps:
+
+1. `service_create` creates a machine whose template declares secrets **stopped**, so it never boots without them.
+2. `service_secret_set` with `{"name", "key", "value"}` stores the value in Arca's private `secrets/` directory, as for
+   a container, and answers `{"ok": true}`. The value is 8 to 4096 characters; for a virtual machine it may have line
+   breaks (a private key in PEM form is several lines), and no other control character. Nothing is sent to the machine
+   yet.
+3. `instance_start` with `{"project": "arcak-svc", "instance": "<name>"}` starts the machine, waits for its guest agent
+   (up to 120 seconds: a new machine boots first) and writes each stored secret into the guest as the file
+   `/etc/arca-secrets/<KEY>`. The directory is root's with mode 0700 and each file is root's with mode 0600. The answer
+   names the secrets it wrote.
+
+A new value: run `service_secret_set` again, then `instance_start` again. A start of a machine that is already running
+restarts nothing and writes the files again, so a secret is replaced without an approval and without interrupting the
+machine; the programs in the guest read the file when they next need it. `instance_restart` writes them too.
+
+When the guest agent does not answer in time (the image has none, or the machine is still booting), the verb is refused
+with `InstanceSecretsNotWritten`: the machine is running, its secrets are not in it, and running `instance_start`
+again writes them.
+
+Where a virtual machine's secret is, and is not:
+
+- It is in Arca's `secrets/` directory, and on the machine's own disk in `/etc/arca-secrets`. The second copy is why a
+  machine that Incus starts by itself after the host restarts, or that restarts from inside, still works with nobody
+  asked. Root inside the machine can read it, and a snapshot or a copy of the machine's disk carries it.
+- It is not in the instance's config in Incus (so `incus config show` does not show it), in Arca's desired state, in
+  the effect journal, in `instance-actions.jsonl` (which names the secrets written), in `exec-audit.jsonl`, or in any
+  answer or refusal. `service_logs` replaces a stored value with `[secret]` when it fits on one line.
 
 ### What every virtual machine carries
 
@@ -2255,7 +2317,7 @@ Whatever its network, a virtual machine Arca creates has two things more than it
 | the device `agent`: `{ "type": "disk", "source": "agent:config" }` | Incus 7.6 offers the guest its config share over 9p only. A QEMU built without virtio-9p (some distributions ship one) gives the guest no share, so the guest agent never starts, `service_status` never shows an address and nothing can be run in the guest. The drive carries the same share. A restricted project always admits it. |
 | the NIC's `name`, `enp5s0`, with the instance key `agent.nic_config` set to `true` | The public images configure the interface `enp5s0` and no other. The name the guest's kernel picks follows the PCI slot QEMU gives the NIC, which differs between hosts (a QEMU without 9p has one device fewer, and the NIC came up as `enp4s0`), so the guest never asked for an address. With `agent.nic_config` the agent renames the NIC to the device's `name` when it starts. |
 
-Nothing is changed on a virtual machine after its create, so one made by an earlier Arca has neither. Add both by hand
+Nothing is changed on a virtual machine's Incus config after its create, so one made by an earlier Arca has neither. Add both by hand
 if it needs them: `incus config device add <name> agent disk source=agent:config --project arcak-svc`, and for the NIC
 `incus config device set <name> eth0 name=enp5s0 --project arcak-svc` with
 `incus config set <name> agent.nic_config=true --project arcak-svc`, then restart it. The rename has been read in
@@ -2295,7 +2357,7 @@ What the other verbs do with a virtual machine on the managed network:
 | `service_connect` from a container to it | Allowed when its template declares `ports`: the link opens the first port in its ACL for that container, and gives the container the template's `provides` values. |
 | `service_connect` from it | Refused. A link hands its consumer the connection values as container environment, which a virtual machine's programs never read. |
 | `service_publish`, `service_unpublish` | Refused. A dash is published by a tailnet node inside an Arca-built container image, and no virtual-machine image carries one. |
-| `service_secret_set` | Refused. A virtual-machine template has no secrets or environment. |
+| `service_secret_set` | Allowed for a secret its template declares: the value is stored, and the next `instance_start` writes it into the guest. Never an environment value. |
 | `mac` on `service_create` | Refused. The address is reserved by Arca's plan; a fixed MAC is for a host bridge. |
 
 **The caps.** One set of caps covers every virtual machine Arca holds, on either network: `kernel.bridged.limits`
