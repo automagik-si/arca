@@ -1,5 +1,5 @@
 //! Tenants: the scope a verb's `tenant` argument gives it, the address blocks, the caps, and the tenant verbs. A tenant is
-//! the entry `tenant-<id>`; everything in it is an entry whose record names the tenant's project. Rules 61 to 66 of the
+//! the entry `tenant-<id>`; everything in it is an entry whose record names the tenant's project. Rules 61 to 68 of the
 //! ownership document.
 use super::*;
 use arca_kernel::desired::Entry;
@@ -735,63 +735,100 @@ fn fresh_id(taken: &[String]) -> Result<String, CallError> {
     Err(internal())
 }
 
+fn show_gib(bytes: u128) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+fn show_count(count: u128) -> String {
+    count.to_string()
+}
+
 /// Why the caps of a new tenant do not fit the node, or `None`: inside `capacity` with every other tenant's, and its
 /// virtual machines inside the node's own virtual-machine cap with theirs and the node's own machines.
 fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> Option<String> {
     let tenants_cfg = cfg.kernel.tenants.as_ref()?;
-    let held = tenants(entries);
-    if held.len() as u64 >= u64::from(tenants_cfg.max_tenants) {
+    let held = tenants(entries).len();
+    if held as u64 >= u64::from(tenants_cfg.max_tenants) {
         return Some(format!(
-            "this node holds {} tenants, and kernel.tenants.maxTenants is {}",
-            held.len(),
+            "this node holds {held} tenants, and kernel.tenants.maxTenants is {}",
             tenants_cfg.max_tenants
         ));
     }
-    let capacity = &tenants_cfg.capacity;
+    capacity_refusal(cfg, entries, caps, None)
+}
+
+/// Why `caps` do not fit the node beside every other tenant's, or `None`. With `resized` they replace that tenant's caps,
+/// and only a cap that grows is checked: a tenant that asks for less is never refused for the room the others take.
+fn capacity_refusal(
+    cfg: &NodeConfig,
+    entries: &[Entry],
+    caps: &TenantCaps,
+    resized: Option<&TenantScope>,
+) -> Option<String> {
+    let capacity = &cfg.kernel.tenants.as_ref()?.capacity;
+    let others: Vec<TenantCaps> = tenants(entries)
+        .into_iter()
+        .filter(|(_, config)| resized.is_none_or(|scope| config.id != scope.id))
+        .map(|(_, config)| config.caps)
+        .collect();
+    let with = if resized.is_some() {
+        "with this resize"
+    } else {
+        "with this tenant"
+    };
+    let grows = |pick: &dyn Fn(&TenantCaps) -> u128| {
+        resized.is_none_or(|scope| pick(caps) > pick(&scope.config.caps))
+    };
     let sum = |pick: &dyn Fn(&TenantCaps) -> u128| -> u128 {
-        held.iter()
-            .map(|(_, config)| pick(&config.caps))
+        others
+            .iter()
+            .map(pick)
             .fold(pick(caps), u128::saturating_add)
     };
-    let gib = |bytes: u128| format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64);
-    let plain = |n: u128| n.to_string();
-    type Check<'a> = (&'a str, u128, u128, &'a dyn Fn(u128) -> String);
+    type Check<'a> = (
+        &'a str,
+        &'a dyn Fn(&TenantCaps) -> u128,
+        u128,
+        fn(u128) -> String,
+    );
     let checks: [Check<'_>; 4] = [
         (
             "instances",
-            sum(&|caps| u128::from(caps.instances)),
+            &|caps: &TenantCaps| u128::from(caps.instances),
             u128::from(capacity.instances),
-            &plain,
+            show_count,
         ),
         (
             "cpu",
-            sum(&|caps| u128::from(caps.cpu)),
+            &|caps: &TenantCaps| u128::from(caps.cpu),
             u128::from(capacity.cpu),
-            &plain,
+            show_count,
         ),
         (
             "memory",
-            sum(&|caps| bytes(&caps.memory)),
+            &|caps: &TenantCaps| bytes(&caps.memory),
             crate::service::size_bytes(&capacity.memory).unwrap_or(0),
-            &gib,
+            show_gib,
         ),
         (
             "disk",
-            sum(&|caps| bytes(&caps.disk)),
+            &|caps: &TenantCaps| bytes(&caps.disk),
             crate::service::size_bytes(&capacity.disk).unwrap_or(0),
-            &gib,
+            show_gib,
         ),
     ];
-    for (key, wanted, cap, show) in checks {
-        if wanted > cap {
+    for (key, pick, cap, show) in checks {
+        let wanted = sum(pick);
+        if grows(pick) && wanted > cap {
             return Some(format!(
-                "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.{key}): {} with this tenant, {} allowed",
+                "the tenants' caps together would exceed this node's capacity (kernel.tenants.capacity.{key}): {} {with}, {} allowed",
                 show(wanted),
                 show(cap)
             ));
         }
     }
-    if caps.virtual_machines != 0 {
+    let machines = |caps: &TenantCaps| u128::from(caps.virtual_machines);
+    if caps.virtual_machines != 0 && grows(&machines) {
         let Some(node) = cfg.kernel.vm_caps() else {
             return Some(
                 "the caps allow virtual machines (virtualMachines), and this node sets no virtual-machine caps (kernel.vmLimits, or kernel.bridged with its limits)"
@@ -802,15 +839,157 @@ fn admission_refusal(cfg: &NodeConfig, entries: &[Entry], caps: &TenantCaps) -> 
             .iter()
             .filter(|(_, record)| record.vm.is_some() && record.tenant.is_none())
             .count() as u128;
-        let wanted = reserved_vms(entries) + u128::from(caps.virtual_machines) + own;
+        let wanted = sum(&machines) + own;
         if wanted > u128::from(node.virtual_machines) {
             return Some(format!(
-                "the tenants' virtual machines (virtualMachines) together with the node's own would exceed the node's virtual-machine cap: {wanted} with this tenant, {} allowed",
+                "the tenants' virtual machines (virtualMachines) together with the node's own would exceed the node's virtual-machine cap: {wanted} {with}, {} allowed",
                 node.virtual_machines
             ));
         }
     }
     None
+}
+
+/// Why the tenant's records already use more than `caps` allow, or `None`. The use is counted as a create counts it
+/// ([`used`]), and the refusal names the cap.
+fn below_use_refusal(scope: &TenantScope, entries: &[Entry], caps: &TenantCaps) -> Option<String> {
+    let held = used(scope, entries);
+    type Check<'a> = (&'a str, &'a str, u128, u128, fn(u128) -> String);
+    let checks: [Check<'_>; 6] = [
+        (
+            "instances",
+            "limits.instances",
+            held.containers + held.virtual_machines,
+            u128::from(caps.instances),
+            show_count,
+        ),
+        (
+            "containers",
+            "limits.containers",
+            held.containers,
+            u128::from(caps.containers),
+            show_count,
+        ),
+        (
+            "virtual machines",
+            "limits.virtual-machines",
+            held.virtual_machines,
+            u128::from(caps.virtual_machines),
+            show_count,
+        ),
+        (
+            "CPUs",
+            "limits.cpu",
+            held.cpu,
+            u128::from(caps.cpu),
+            show_count,
+        ),
+        (
+            "memory",
+            "limits.memory",
+            held.memory,
+            crate::service::size_bytes(&caps.memory).unwrap_or(0),
+            show_gib,
+        ),
+        (
+            "disk",
+            "limits.disk",
+            held.disk,
+            crate::service::size_bytes(&caps.disk).unwrap_or(0),
+            show_gib,
+        ),
+    ];
+    for (what, key, held, asked, show) in checks {
+        if asked < held {
+            return Some(format!(
+                "resize tenant {}: its cap on {what} ({key}) cannot go below what the tenant uses now: {} in use, {} asked",
+                scope.id,
+                if held == u128::MAX {
+                    "an unreadable amount".to_string()
+                } else {
+                    show(held)
+                },
+                show(asked)
+            ));
+        }
+    }
+    None
+}
+
+/// A `tenant_resize`'s tenant and the caps it would hold, each checked against the tenant and the node. A cap the call
+/// leaves out keeps the value the tenant's record holds now.
+fn resize_args(
+    cfg: &NodeConfig,
+    entries: &[Entry],
+    args: &Value,
+) -> Result<(TenantScope, TenantCaps), CallError> {
+    if cfg.kernel.tenants.is_none() {
+        return Err(no_tenants());
+    }
+    let scope = scope_of(cfg, id_arg(args)?, entries)?;
+    let expected = || {
+        CallError::Invalid(
+            "caps: expected the caps to change, of instances, containers, virtualMachines, cpu, memory and disk"
+                .into(),
+        )
+    };
+    let asked = args
+        .get("caps")
+        .and_then(Value::as_object)
+        .ok_or_else(expected)?;
+    let mut merged = caps_json(&scope.config.caps);
+    for (key, value) in asked {
+        if merged.get(key).is_none() {
+            return Err(expected());
+        }
+        merged[key.as_str()] = value.clone();
+    }
+    let caps: TenantCaps = serde_json::from_value(merged).map_err(|_| expected())?;
+    if !block::caps_ok(&caps, crate::service::size_ok) {
+        return Err(CallError::Invalid(
+            "caps: instances of 1 to 16, containers and virtualMachines of at most that, cpu of at least 1, and memory and disk as sizes such as 8GiB".into(),
+        ));
+    }
+    if caps == scope.config.caps {
+        return Err(service_refused(format!(
+            "resize tenant {}: the caps asked are the caps it has; nothing would change",
+            scope.id
+        )));
+    }
+    if let Some(why) = below_use_refusal(&scope, entries, &caps) {
+        return Err(service_refused(why));
+    }
+    // The block the tenant was created with is the one it keeps: it holds what it held then, and the subnet's top
+    // block still lacks the broadcast address.
+    let room = scope.block.addresses().len();
+    if caps.instances as usize > room {
+        return Err(service_refused(format!(
+            "resize tenant {}: its address block {} holds {room} instances, and {} were asked (limits.instances). More would need a bigger block at other addresses, and a tenant is never re-addressed: create a new tenant with the larger cap",
+            scope.id, scope.config.block, caps.instances
+        )));
+    }
+    if let Some(why) = capacity_refusal(cfg, entries, &caps, Some(&scope)) {
+        return Err(service_refused(format!(
+            "resize tenant {}: {why}",
+            scope.id
+        )));
+    }
+    Ok((scope, caps))
+}
+
+/// The checks a proposed `tenant_resize` passes before the owner is asked. The arguments are left exactly as proposed.
+pub(super) fn check_resize(
+    cfg: &NodeConfig,
+    entries: &[Entry],
+    payload: &Value,
+) -> Result<(), CallError> {
+    resize_args(cfg, entries, payload).map(|_| ())
+}
+
+/// The caps a tenant holds as its resize is proposed, as JSON: the owner's card shows each one beside what is asked.
+pub(super) fn held_caps(cfg: &NodeConfig, entries: &[Entry], payload: &Value) -> Option<String> {
+    let scope = scope_of(cfg, id_arg(payload).ok()?, entries).ok()?;
+    Some(caps_json(&scope.config.caps).to_string())
 }
 
 /// The checks a proposed `tenant_create` passes before the owner is asked. The arguments are left exactly as proposed.
@@ -945,7 +1124,7 @@ fn create_args(
     Ok((id, caps))
 }
 
-/// `tenant_create`, `tenant_remove`, `tenant_list`, `tenant_status` and `tenant_usage`.
+/// `tenant_create`, `tenant_resize`, `tenant_remove`, `tenant_list`, `tenant_status` and `tenant_usage`.
 pub(super) struct TenantHandler {
     pub verb: &'static str,
     pub kernel: Arc<Mutex<Kernel>>,
@@ -965,6 +1144,7 @@ pub fn tenant_handlers(
         "tenant_list",
         "tenant_status",
         "tenant_usage",
+        "tenant_resize",
         "tenant_remove",
         "deploy_confirm",
         "deploy_rollback",
@@ -1055,6 +1235,7 @@ impl ToolHandler for TenantHandler {
     fn call(&self, args: Value, caller: &Caller) -> Result<Value, CallError> {
         let allowed: &[&str] = match self.verb {
             "tenant_create" => &["id", "caps", "approval"],
+            "tenant_resize" => &["id", "caps", "approval"],
             "tenant_remove" => &["id", "approval"],
             "tenant_status" | "tenant_usage" => &["id"],
             "deploy_confirm" | "deploy_rollback" => &["tenant", "deploy"],
@@ -1072,7 +1253,10 @@ impl ToolHandler for TenantHandler {
         if self.cfg.kernel.tenants.is_none() {
             return Err(no_tenants());
         }
-        let writing = matches!(self.verb, "tenant_create" | "tenant_remove");
+        let writing = matches!(
+            self.verb,
+            "tenant_create" | "tenant_resize" | "tenant_remove"
+        );
         if writing {
             if caller.scope < Scope::Doctor {
                 return Err(CallError::Forbidden {
@@ -1087,9 +1271,9 @@ impl ToolHandler for TenantHandler {
                         .map(|mut kernel| kernel.consume_action_grant(self.verb, &args, grant))
                         .unwrap_or(false)
                 });
-            // A removal runs only with the one-shot grant of a proposal the owner approved. A create inside the node's
-            // standing policy needs no approval, from a token whose tool allowlist names it; caps above the node's
-            // defaults are the owner's to approve.
+            // A removal and a resize run only with the one-shot grant of a proposal the owner approved, whatever the
+            // caps. A create inside the node's standing policy needs no approval, from a token whose tool allowlist
+            // names it; caps above the node's defaults are the owner's to approve.
             let standing = self.verb == "tenant_create"
                 && self.cfg.kernel.tenants.as_ref().is_some_and(|policy| {
                     args.get("caps").is_none_or(|caps| {
@@ -1202,6 +1386,7 @@ impl ToolHandler for TenantHandler {
                 self.deploy(&args, caller, &entries, now)
             }
             "tenant_create" => self.create(&args, &entries, &read, now),
+            "tenant_resize" => self.resize(&args, &entries, &read, now),
             "tenant_remove" => self.remove(&args, &entries, &read, now),
             _ => Err(service_not_found("unknown tenant verb")),
         }
@@ -1486,6 +1671,68 @@ impl TenantHandler {
         let entries = lock(&self.kernel)?.entries().to_vec();
         let scope = scope_of(&self.cfg, &id, &entries)?;
         Ok(status_json(&scope, &entries, Some(0)))
+    }
+
+    /// Changes a tenant's caps. The step is one change of the tenant's record, which its entry applies as one journaled
+    /// write of the project's `limits.*` keys under the ETag of its read (Rule 68): the record is durable before Incus
+    /// is asked, and the write's intent before the write. No instance is touched. A write Incus refuses puts the
+    /// record back, so the record and the project hold the same caps when the call answers.
+    fn resize(
+        &self,
+        args: &Value,
+        entries: &[Entry],
+        read: &UnixIncus,
+        now: u64,
+    ) -> Result<Value, CallError> {
+        let (scope, caps) = resize_args(&self.cfg, entries, args)?;
+        let entry_id = tenant_entry(&scope.id);
+        let record = |caps: &TenantCaps| -> Result<crate::desired_store::EntryChange, CallError> {
+            let config = TenantConfig {
+                caps: caps.clone(),
+                ..scope.config.clone()
+            };
+            Ok(crate::desired_store::EntryChange::Put(service_entry(
+                &entry_id,
+                "arca.tenant",
+                serde_json::to_value(&config).map_err(|_| internal())?,
+            )))
+        };
+        let outcomes = lock(&self.kernel)?
+            .propose(vec![record(&caps)?], now)
+            .map_err(|_| internal())?;
+        if service_wiring::failed_for(&outcomes, &[entry_id.as_str()]) {
+            let why = service_wiring::failure_reason(&outcomes, &[entry_id.as_str()])
+                .unwrap_or_else(|| "the kernel recorded no reason".to_string());
+            // What the project holds now decides which caps the record keeps.
+            return Err(service_refused(
+                match read.get(&format!("/1.0/projects/{}", scope.project)) {
+                    Ok(project)
+                        if caps.limits().iter().all(|(key, value)| {
+                            project["config"][*key].as_str() == Some(value.as_str())
+                        }) =>
+                    {
+                        format!(
+                            "resize tenant {}: {why}. Its project holds the new caps, and so does its record",
+                            scope.id
+                        )
+                    }
+                    Ok(_) => {
+                        let _ = lock(&self.kernel)?.propose(vec![record(&scope.config.caps)?], now);
+                        format!("resize tenant {}: {why}; its caps are unchanged", scope.id)
+                    }
+                    // A project that cannot be read says nothing about the write: the record keeps the caps the owner
+                    // approved, and the entry, which did not apply, is applied again.
+                    Err(_) => format!(
+                        "resize tenant {}: {why}. Incus could not be read back: the tenant's record holds the new caps, and its project is brought to them when the kernel next reconciles",
+                        scope.id
+                    ),
+                },
+            ));
+        }
+        let entries = lock(&self.kernel)?.entries().to_vec();
+        let scope = scope_of(&self.cfg, &scope.id, &entries)?;
+        let instances = tenant_rows(read, &scope)?.len();
+        Ok(status_json(&scope, &entries, Some(instances)))
     }
 
     /// Removes a tenant in the one order Incus accepts: each instance is deleted and read back absent before its NIC

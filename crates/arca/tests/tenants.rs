@@ -12,7 +12,14 @@ use arca::{
 };
 use arca_api::Scope;
 use arca_incus::{FakeIncus, FakeState, IncusRead, ProjectFamily, UnixIncus};
+use arca_kernel::canon::Digest;
+use arca_kernel::desired::EntryId;
 use arca_kernel::identity::NodeKey;
+use arca_kernel::journal::{AclPatch, Inverse};
+use arca_kernel::ownership::{IncusKind, ObjectRef};
+use arca_kernel::plugin::{
+    EffectOp, EffectRefusal, Observe, Planned, Provider, ReadBack, Retirement,
+};
 use arca_mcp::{CallError, Caller, ToolHandler};
 use arca_netproject::PROJECT;
 use arca_providers::incus::{Family, IncusProvider, TenantProjects};
@@ -49,6 +56,86 @@ fn policy() -> Value {
     })
 }
 
+/// Where the kernel's process is killed, at the next write of a project's config: after the write's intent is in the
+/// journal and before its request, or after Incus answered the request and before its outcome is in the journal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kill {
+    BeforeWrite,
+    AfterWrite,
+}
+
+/// The Incus provider, with a kill armed by a test. A kill unwinds out of the kernel from inside the write, so nothing
+/// that follows the write in a live process runs: no outcome is journalled and no handler tidies up. The test then
+/// starts a new kernel over the same state directory, as a restarted process does.
+struct KilledProvider {
+    inner: IncusProvider,
+    kill: Arc<Mutex<Option<Kill>>>,
+}
+
+impl Provider for KilledProvider {
+    fn observe(
+        &self,
+        entry: &EntryId,
+        projects: &[String],
+        query: &Observe,
+    ) -> Result<Value, EffectRefusal> {
+        self.inner.observe(entry, projects, query)
+    }
+    fn plan(&self, entry: &EntryId, op: &EffectOp) -> Result<Planned, EffectRefusal> {
+        self.inner.plan(entry, op)
+    }
+    fn effect(
+        &mut self,
+        entry: &EntryId,
+        op: &EffectOp,
+        planned: &Planned,
+    ) -> Result<(ObjectRef, Inverse), EffectRefusal> {
+        let project_write = matches!(
+            op,
+            EffectOp::IncusPatchConfig { object, .. } if object.kind == IncusKind::Project
+        );
+        let kill = project_write
+            .then(|| self.kill.lock().expect("the kill switch").take())
+            .flatten();
+        match kill {
+            None => self.inner.effect(entry, op, planned),
+            Some(Kill::BeforeWrite) => {
+                std::panic::resume_unwind(Box::new("killed before the write"))
+            }
+            Some(Kill::AfterWrite) => {
+                self.inner
+                    .effect(entry, op, planned)
+                    .expect("the write lands before the kill");
+                std::panic::resume_unwind(Box::new("killed after the write"))
+            }
+        }
+    }
+    fn read_back(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        pre_image: Option<&std::collections::BTreeMap<String, Option<String>>>,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back(entry, target, pre_image)
+    }
+    fn read_back_acl(
+        &self,
+        entry: &EntryId,
+        target: &ObjectRef,
+        patch: &AclPatch,
+    ) -> Result<ReadBack, EffectRefusal> {
+        self.inner.read_back_acl(entry, target, patch)
+    }
+    fn retire(
+        &mut self,
+        entry: &EntryId,
+        object: &ObjectRef,
+        plan: &Digest,
+    ) -> Result<Retirement, EffectRefusal> {
+        self.inner.retire(entry, object, plan)
+    }
+}
+
 struct Rig {
     dir: PathBuf,
     socket: PathBuf,
@@ -59,6 +146,8 @@ struct Rig {
     clock: Arc<AtomicU64>,
     kernel_config: Value,
     nonce: AtomicU64,
+    /// The kill a test arms for the next write of a project's config.
+    kill: Arc<Mutex<Option<Kill>>>,
 }
 
 impl Rig {
@@ -160,6 +249,8 @@ impl Rig {
         let socket = incus.clone();
         let secrets = dir.join("secrets");
         let provider_tenants = tenants.clone();
+        let kill: Arc<Mutex<Option<Kill>>> = Arc::default();
+        let provider_kill = Arc::clone(&kill);
         let kernel = Arc::new(Mutex::new(
             Kernel::open_with_tenants(
                 &dir,
@@ -169,11 +260,12 @@ impl Rig {
                 "node1".into(),
                 Some(PG_IMAGE),
                 move |retained| {
-                    Ok(Box::new(
-                        IncusProvider::new(socket, family, secrets, retained)
+                    Ok(Box::new(KilledProvider {
+                        inner: IncusProvider::new(socket, family, secrets, retained)
                             .expect("provider")
                             .with_tenants(provider_tenants),
-                    ))
+                        kill: provider_kill,
+                    }))
                 },
                 tenants.clone(),
                 clock.load(Ordering::SeqCst),
@@ -228,6 +320,7 @@ impl Rig {
             clock,
             kernel_config,
             nonce: AtomicU64::new(0),
+            kill,
         }
     }
 
@@ -429,3 +522,5 @@ mod gate;
 mod isolation;
 #[path = "tenants/real_incus.rs"]
 mod real_incus;
+#[path = "tenants/resize.rs"]
+mod resize;

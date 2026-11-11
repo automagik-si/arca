@@ -10,6 +10,10 @@ fn a_node_without_the_key_has_no_tenants_whatever_the_verb() {
         ("tenant_list", json!({})),
         ("tenant_status", json!({ "id": A })),
         ("tenant_usage", json!({ "id": A })),
+        (
+            "tenant_resize",
+            json!({ "id": A, "caps": { "cpu": 4 }, "approval": "x" }),
+        ),
         ("tenant_remove", json!({ "id": A, "approval": "x" })),
         (
             "service_create",

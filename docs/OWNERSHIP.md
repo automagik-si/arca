@@ -1078,8 +1078,9 @@ and `prepared_create` in `crates/arca-providers/src/incus.rs`. Test
 `crates/arca/tests/tenants/admission.rs`.
 
 **Rule 63.** A tenant's caps are its project's own `limits.instances`, `limits.containers`, `limits.virtual-machines`,
-`limits.cpu`, `limits.memory` and `limits.disk`. They are set at the project's create and, when the entry's caps change,
-by one journaled write of the project's whole config under the read's ETag (Rule 43). Incus enforces them. The kernel checks
+`limits.cpu`, `limits.memory` and `limits.disk`. They are set at the project's create and, when the entry's caps change
+(`tenant_resize`, Rule 68), by one journaled write of the project's whole config under the read's ETag (Rule 43). Incus
+enforces them. The kernel checks
 them first, from its own records, so a refusal names the cap: a container counts its template's limits or the tenant
 profile's (2 CPUs, 2GiB), a 16GiB root disk and its data volume's size; a virtual machine counts its limits and its root
 disk. `kernel.tenants.capacity` bounds the sum of every tenant's caps, and
@@ -1198,6 +1199,44 @@ Source: `open_deploy`, `deploys`, `Deploy::provisional` and `TenantHandler::depl
 `one_owner_approval_removes_everything_a_confirmed_deploy_created_and_nothing_else` and
 `the_front_reaches_only_ordinary_services_and_follows_a_front_that_is_made_again` in
 `crates/arca/tests/tenants/deploys.rs`.
+
+**Rule 68.** A tenant's caps change only by `tenant_resize`, and only with the owner's approval. The verb runs from an
+action proposal and nothing else: there is no standing policy for it, so a resize inside `kernel.tenants.defaultCaps`
+is approved like any other, and a direct call is refused in the words of every approval-only verb. The proposal's
+digest covers `{id, caps}` exactly as proposed, so an approval for one tenant, or for one set of caps, runs no other. A
+cap the call leaves out keeps the value the tenant's record holds when the resize runs. The card shows the tenant and
+all six caps as the record holds them when the resize is proposed: a changed one as `old -> new`, the others marked
+unchanged; after a restart the journal's rows are kept only while every new value on them is the one the arguments
+ask. The checks run when the resize is proposed and again when it runs, and each refusal names its cap:
+
+- no cap goes below what the tenant uses, counted from its records as a create counts it (Rule 63);
+- a cap that grows keeps the sum of every tenant's caps inside `kernel.tenants.capacity`, and the tenants' virtual
+  machines with the node's own inside the node's count (Rule 58). A cap that does not grow is not checked against the
+  others, so a tenant that asks for less is never refused for their room;
+- `instances` stays within the addresses of the tenant's own block (Rule 64): a /29 holds 8 and a /28 holds 16, and the
+  subnet's top block one fewer. The block is never changed and a tenant is never given new addresses; more instances
+  than its block holds are refused, with the advice to create a new tenant.
+
+The resize is one step. The handler holds the kernel's write gate and replaces the tenant's entry with the new caps.
+The desired state is durable before Incus is asked; the entry's apply then makes one write of the project's
+`limits.*` keys, with its intent in the journal before the request and its outcome after (Rule 63). No instance is
+written, so none is restarted. A process killed in between leaves Incus with the old caps or the new, whole, and the
+next start brings the two together at the caps the record holds: an intent with no outcome is settled from what the
+project shows, and the entry is applied again. A write Incus refuses puts the old record back before the call answers,
+so the record and the project agree. `capacity`, the block and Rule 62's restrictions are untouched by a resize.
+Source: `resize_args`, `below_use_refusal`, `capacity_refusal`, `check_resize` and `TenantHandler::resize` in
+`crates/arca/src/tenants.rs`; `Tenant::apply` in `crates/arca-netproject/src/tenant.rs`; `resize_rows` and
+`resize_rows_fit` in `crates/arca/src/action_proposal.rs`. Tests in `crates/arca/tests/tenants/resize.rs`:
+`a_resize_grows_and_shrinks_a_tenant_in_place_and_restarts_nothing`,
+`a_resize_below_what_the_tenant_uses_is_refused_and_names_the_cap`,
+`a_resize_past_the_nodes_capacity_is_refused_and_names_the_capacity`,
+`a_resize_past_the_tenants_address_block_is_refused_and_never_moves_the_tenant`,
+`a_resize_runs_only_from_the_owners_approval_whatever_the_caps`, `an_approval_is_bound_to_its_tenant_and_its_caps`,
+`the_card_shows_the_tenant_and_every_cap_as_old_to_new`, `resizing_one_tenant_changes_nothing_of_another`,
+`a_kill_in_the_middle_of_a_resize_leaves_one_set_of_caps_and_the_next_start_reconciles_them` and
+`a_write_incus_refuses_leaves_the_old_caps_in_the_record_and_in_incus`; and
+`a_resize_card_survives_a_restart_only_while_its_new_values_are_the_ones_the_arguments_ask` in
+`crates/arca/src/action_proposal.rs`.
 
 ## Out of scope
 

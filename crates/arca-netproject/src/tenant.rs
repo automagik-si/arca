@@ -1,7 +1,8 @@
 //! Tenants: one restricted project per tenant, on the node's managed service bridge. A tenant is the entry `tenant-<id>`
 //! (plugin `arca.tenant`). It owns its project and that project's service profile, and nothing else: it makes no bridge and
 //! no network, and its instances sit on the bridge the node's services already use. Each tenant holds a /28 of the service
-//! /24, and its instances take their addresses from it (Rules 61 to 65 of the ownership document).
+//! /24, and its instances take their addresses from it (Rules 61 to 65 of the ownership document). Its caps follow its
+//! entry: `tenant_resize` changes them in place (Rule 68).
 use crate::{BRIDGE, PROFILE, check_cidr, create, observed, project_ref};
 use arca_kernel::{
     desired::PluginId,

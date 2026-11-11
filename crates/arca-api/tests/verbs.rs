@@ -83,6 +83,7 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "tenant_list",
             "tenant_status",
             "tenant_usage",
+            "tenant_resize",
             "tenant_remove",
             "deploy_confirm",
             "deploy_rollback",
@@ -134,6 +135,7 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("tenant_list", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_status", VerbClass::L, Scope::Viewer, false, false),
         ("tenant_usage", VerbClass::L, Scope::Viewer, false, false),
+        ("tenant_resize", VerbClass::L, Scope::Doctor, true, false),
         ("tenant_remove", VerbClass::L, Scope::Doctor, true, true),
         ("deploy_confirm", VerbClass::L, Scope::Doctor, true, false),
         ("deploy_rollback", VerbClass::L, Scope::Doctor, true, true),
@@ -253,6 +255,7 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "instance_stop",
         "instance_restart",
         "tenant_create",
+        "tenant_resize",
         "tenant_remove",
         "deploy_remove",
     ];

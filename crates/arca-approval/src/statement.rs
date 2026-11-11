@@ -43,6 +43,8 @@ pub enum ArcaAction {
     /// ([`valid_enroll_code`]); the approval changes nothing in the kernel and is spent with `enroll_confirm`.
     Enroll,
     TenantCreate,
+    /// A change of one tenant's caps. It is never inside a standing policy: every resize is the owner's to approve.
+    TenantResize,
     TenantRemove,
     DeployRemove,
 }
@@ -77,6 +79,7 @@ impl ArcaAction {
             Self::InstanceRestart => "instance_restart",
             Self::Enroll => "enroll",
             Self::TenantCreate => "tenant_create",
+            Self::TenantResize => "tenant_resize",
             Self::TenantRemove => "tenant_remove",
             Self::DeployRemove => "deploy_remove",
         }
@@ -111,6 +114,7 @@ impl ArcaAction {
             "instance_restart" => Some(Self::InstanceRestart),
             "enroll" => Some(Self::Enroll),
             "tenant_create" => Some(Self::TenantCreate),
+            "tenant_resize" => Some(Self::TenantResize),
             "tenant_remove" => Some(Self::TenantRemove),
             "deploy_remove" => Some(Self::DeployRemove),
             _ => None,

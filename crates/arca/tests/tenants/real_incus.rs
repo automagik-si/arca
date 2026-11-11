@@ -487,6 +487,50 @@ fn scratch_probe_two_tenants_on_the_nodes_own_bridge() {
             "caps ok: kernel: {message}; Incus: {}",
             out.lines().last().unwrap_or("").trim()
         );
+        // A resize: A grows in place, with its two containers and its machine running. Incus reports the new
+        // limits, B's are as they were, and no instance was restarted: each has the process it had.
+        let pid = |name: &str| -> i64 {
+            rig.get(&format!("/1.0/instances/{name}/state?project={pa}"))
+                .unwrap_or_else(|| panic!("the state of {name}"))["pid"]
+                .as_i64()
+                .unwrap_or(0)
+        };
+        let running = [web, api, "box-aaaaaaaa"];
+        let before: Vec<i64> = running.iter().map(|name| pid(name)).collect();
+        assert!(
+            before.iter().all(|pid| *pid > 0),
+            "an instance of A is not running before the resize: {before:?}"
+        );
+        let grown = rig
+            .approved(
+                "tenant_resize",
+                json!({ "id": A, "caps": { "instances": 4, "containers": 4, "cpu": 8,
+                    "memory": "8GiB", "disk": "55GiB" } }),
+            )
+            .expect("the grow of A");
+        assert_eq!(grown["caps"]["instances"], 4);
+        let reported = |project: &str, key: &str| -> String {
+            let (ok, out) = incus(&["project", "get", project, key]);
+            assert!(ok, "incus could not read {key} of {project}: {out}");
+            out.trim().to_string()
+        };
+        for (key, grown, kept) in [
+            ("limits.instances", "4", "3"),
+            ("limits.containers", "4", "3"),
+            ("limits.virtual-machines", "1", "1"),
+            ("limits.cpu", "8", "6"),
+            ("limits.memory", "8GiB", "6GiB"),
+            ("limits.disk", "55GiB", "45GiB"),
+        ] {
+            assert_eq!(reported(pa, key), grown, "Incus reports {key} of A");
+            assert_eq!(reported(pb, key), kept, "Incus reports {key} of B");
+        }
+        let after: Vec<i64> = running.iter().map(|name| pid(name)).collect();
+        assert_eq!(after, before, "the resize restarted an instance of A");
+        println!(
+            "resize ok: A grew to {}; Incus reports its new limits and B's old ones; A's instances kept their processes {after:?}",
+            grown["caps"]
+        );
     }));
     // Whatever happened, everything the probe made is removed, and what is left is listed.
     let mut removed = true;

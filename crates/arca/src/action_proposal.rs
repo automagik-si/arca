@@ -66,13 +66,86 @@ pub enum ActionKind {
     InstanceStop,
     InstanceRestart,
     TenantCreate,
+    TenantResize,
     TenantRemove,
     DeployRemove,
 }
 
+/// The caps of a tenant as a card names them, each with its field in the verb's `caps`.
+const CAP_ROWS: [(&str, &str); 6] = [
+    ("Instances", "instances"),
+    ("Containers", "containers"),
+    ("Virtual machines", "virtualMachines"),
+    ("CPUs", "cpu"),
+    ("Memory", "memory"),
+    ("Disk", "disk"),
+];
+
+/// One cap's value as a card writes it: a count as its digits, a size as its text.
+fn cap_text(value: &Value) -> Option<String> {
+    value
+        .as_u64()
+        .map(|count| count.to_string())
+        .or_else(|| value.as_str().map(str::to_string))
+}
+
+/// The rows of a `tenant_resize` card. With `held`, the caps the tenant holds as the proposal is made, every cap has a row:
+/// a changed one as `old -> new`, the others marked unchanged. Without it only the caps the proposal names are known, each
+/// with the value asked.
+fn resize_rows(args: &Value, held: Option<&Value>) -> Vec<ActionDetail> {
+    let mut rows = vec![ActionDetail {
+        label: "Tenant".to_string(),
+        value: args["id"].as_str().unwrap_or_default().to_string(),
+    }];
+    for (label, key) in CAP_ROWS {
+        let asked = args["caps"].get(key).and_then(cap_text);
+        let old = held.and_then(|held| held.get(key)).and_then(cap_text);
+        let value = match (old, asked) {
+            (Some(old), Some(new)) if old != new => format!("{old} -> {new}"),
+            (Some(old), _) => format!("{old} (unchanged)"),
+            (None, Some(new)) => new,
+            (None, None) => continue,
+        };
+        rows.push(ActionDetail {
+            label: label.to_string(),
+            value,
+        });
+    }
+    rows
+}
+
+/// Whether `stored` are the rows a `tenant_resize` card shows for `args`: the tenant, then all six caps, each either
+/// marked unchanged or ending in the value the arguments ask. The old values are not in the arguments, so they are the
+/// journal's own; every new value is checked against what the approval binds.
+fn resize_rows_fit(args: &Value, stored: &[ActionDetail]) -> bool {
+    stored.len() == CAP_ROWS.len() + 1
+        && stored[0].label == "Tenant"
+        && Some(stored[0].value.as_str()) == args["id"].as_str()
+        && CAP_ROWS
+            .iter()
+            .zip(&stored[1..])
+            .all(|((label, key), row)| {
+                let unchanged = row
+                    .value
+                    .strip_suffix(" (unchanged)")
+                    .filter(|old| !old.is_empty() && !old.contains(" -> "));
+                row.label == *label
+                    && match args["caps"].get(*key).and_then(cap_text) {
+                        Some(new) => {
+                            unchanged == Some(new.as_str())
+                                || row
+                                    .value
+                                    .strip_suffix(&format!(" -> {new}"))
+                                    .is_some_and(|old| !old.is_empty() && old != new)
+                        }
+                        None => unchanged.is_some(),
+                    }
+            })
+}
+
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 20] = [
+    pub const ALL: [ActionKind; 21] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceImport,
@@ -91,6 +164,7 @@ impl ActionKind {
         Self::InstanceStop,
         Self::InstanceRestart,
         Self::TenantCreate,
+        Self::TenantResize,
         Self::TenantRemove,
         Self::DeployRemove,
     ];
@@ -116,6 +190,7 @@ impl ActionKind {
             Self::InstanceStop => "instance_stop",
             Self::InstanceRestart => "instance_restart",
             Self::TenantCreate => "tenant_create",
+            Self::TenantResize => "tenant_resize",
             Self::TenantRemove => "tenant_remove",
             Self::DeployRemove => "deploy_remove",
         }
@@ -267,6 +342,9 @@ impl ActionKind {
     /// The same rows, with the card's product filled in for an attach or detach when the inventory knows it. The GPU row
     /// always carries the PCI address, so two identical cards are never confused, and the effect row never claims that a
     /// card shared by more than one container has isolated VRAM.
+    ///
+    /// `gpu_product` is whatever the card shows that the arguments do not hold, read when the proposal is made: a card's
+    /// product, the parts of a deploy's removal, and for a `tenant_resize` the caps the tenant holds now, as JSON.
     pub fn details_with_gpu(self, args: &Value, gpu_product: Option<&str>) -> Vec<ActionDetail> {
         let text = |key: &str| args[key].as_str().unwrap_or_default();
         let row = |label: &str, value: &str| ActionDetail {
@@ -386,6 +464,13 @@ impl ActionKind {
                 }
                 rows
             }
+            // Each cap as old -> new, from the caps the tenant holds as the proposal is made.
+            Self::TenantResize => resize_rows(
+                args,
+                gpu_product
+                    .and_then(|held| serde_json::from_str::<Value>(held).ok())
+                    .as_ref(),
+            ),
             Self::TenantRemove => vec![
                 row("Tenant", text("id")),
                 row(
@@ -405,8 +490,10 @@ impl ActionKind {
         };
         // An action inside a tenant says so.
         let mut rows = rows;
-        if !matches!(self, Self::TenantCreate | Self::TenantRemove)
-            && let Some(tenant) = args.get("tenant").and_then(Value::as_str)
+        if !matches!(
+            self,
+            Self::TenantCreate | Self::TenantResize | Self::TenantRemove
+        ) && let Some(tenant) = args.get("tenant").and_then(Value::as_str)
         {
             rows.push(row("Tenant", tenant));
         }
@@ -513,13 +600,19 @@ impl ActionKind {
                 "Create a tenant with caps above this node's defaults".to_string()
             }
             Self::TenantCreate => "Create a tenant".to_string(),
+            Self::TenantResize => format!("Change the caps of the tenant {}", text("id")),
             Self::TenantRemove => format!("Remove the tenant {} and everything in it", text("id")),
             Self::DeployRemove => {
                 format!("Remove everything the deploy {} created", text("deploy"))
             }
         };
         match args.get("tenant").and_then(Value::as_str) {
-            Some(tenant) if !matches!(self, Self::TenantCreate | Self::TenantRemove) => {
+            Some(tenant)
+                if !matches!(
+                    self,
+                    Self::TenantCreate | Self::TenantResize | Self::TenantRemove
+                ) =>
+            {
                 format!("{sentence}, in tenant {tenant}")
             }
             _ => sentence,
@@ -593,6 +686,18 @@ fn loaded_words(
                 stored_details.to_vec()
             } else {
                 rebuilt
+            },
+        );
+    }
+    // The caps a resize replaces were read from the tenant's record when it was proposed: the journal's rows are kept
+    // when every new value on them is the one these arguments ask.
+    if action == ActionKind::TenantResize {
+        return (
+            action.summary(args),
+            if resize_rows_fit(args, stored_details) {
+                stored_details.to_vec()
+            } else {
+                action.details(args)
             },
         );
     }
@@ -1254,6 +1359,63 @@ mod tests {
         assert_eq!(store.waiting()[0].details, proposed.details);
         assert_eq!(store.waiting()[0].summary, proposed.summary);
         assert!(store.waiting()[0].details[3].value.contains("shared"));
+    }
+
+    #[test]
+    fn a_resize_card_survives_a_restart_only_while_its_new_values_are_the_ones_the_arguments_ask() {
+        let held = json!({ "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8,
+            "memory": "16GiB", "disk": "100GiB" })
+        .to_string();
+        let args = json!({ "id": "abcdefgh", "caps": { "cpu": 16, "disk": "100GiB" } });
+        let dir = Temp::new("resize-card");
+        let mut store = ActionProposalStore::open(&dir.0, 1_000, None);
+        let proposed = store
+            .propose(ActionKind::TenantResize, args.clone(), 1_000, Some(&held))
+            .expect("a resize proposal");
+        let shown = |details: &[ActionDetail]| -> Vec<String> {
+            details
+                .iter()
+                .map(|row| format!("{}: {}", row.label, row.value))
+                .collect()
+        };
+        assert_eq!(
+            shown(&proposed.details),
+            [
+                "Tenant: abcdefgh",
+                "Instances: 4 (unchanged)",
+                "Containers: 4 (unchanged)",
+                "Virtual machines: 1 (unchanged)",
+                "CPUs: 8 -> 16",
+                "Memory: 16GiB (unchanged)",
+                "Disk: 100GiB (unchanged)",
+            ]
+        );
+        drop(store);
+        // The old values are not in the arguments: a restart keeps the journal's rows.
+        let store = ActionProposalStore::open(&dir.0, 2_000, None);
+        assert_eq!(store.waiting()[0].details, proposed.details);
+        drop(store);
+
+        // Rows that show another new value, another tenant, or a change the arguments do not ask are not kept: the
+        // card is built again from the arguments, which are what the approval binds.
+        let path = dir.0.join(ACTION_PROPOSALS_FILE);
+        let good = fs::read_to_string(&path).expect("the journal");
+        for (from, to) in [
+            ("8 -> 16", "8 -> 64"),
+            ("\"value\":\"abcdefgh\"", "\"value\":\"zzzzzzzz\""),
+            ("16GiB (unchanged)", "16GiB -> 64GiB"),
+            ("4 (unchanged)", "(unchanged)"),
+            ("8 -> 16", "16 -> 16"),
+        ] {
+            assert!(good.contains(from), "{from}");
+            write_journal(&dir.0, &good.replacen(from, to, 1));
+            let store = ActionProposalStore::open(&dir.0, 2_000, None);
+            assert_eq!(
+                shown(&store.waiting()[0].details),
+                ["Tenant: abcdefgh", "CPUs: 16", "Disk: 100GiB"],
+                "{to}"
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! The one write gate: every handler that picks an address or a block, and the front pass, waits for it.
+//! The one write gate: every handler that picks an address or a block or changes a tenant's caps, and the front pass,
+//! waits for it.
 use super::*;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -52,6 +53,13 @@ fn every_create_and_the_front_pass_wait_for_the_kernels_write_gate() {
             Box::new(|rig| rig.create_tenant(json!({ "id": "cccccccc" })).is_ok()),
         ),
         start(
+            "tenant_resize",
+            Box::new(|rig| {
+                rig.approved("tenant_resize", json!({ "id": B, "caps": { "cpu": 4 } }))
+                    .is_ok()
+            }),
+        ),
+        start(
             "sync_front",
             Box::new(|rig| {
                 arca::handlers::sync_front(&rig.kernel, &rig.config(), rig.now()).is_ok()
@@ -71,7 +79,7 @@ fn every_create_and_the_front_pass_wait_for_the_kernels_write_gate() {
             .all(|entry| entry.id.0 != "tenant-cccccccc")
     );
     drop(held);
-    let mut seen: Vec<&str> = (0..4)
+    let mut seen: Vec<&str> = (0..5)
         .map(|_| {
             finished
                 .recv_timeout(Duration::from_secs(30))
@@ -85,7 +93,8 @@ fn every_create_and_the_front_pass_wait_for_the_kernels_write_gate() {
             "postgres_create",
             "service_create",
             "sync_front",
-            "tenant_create"
+            "tenant_create",
+            "tenant_resize"
         ]
     );
     for thread in threads {

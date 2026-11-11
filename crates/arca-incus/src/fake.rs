@@ -202,6 +202,7 @@ struct Shared {
     writes: Mutex<Vec<WriteRecord>>,
     reject_config: Mutex<Vec<String>>,
     reject_patch: Mutex<Vec<String>>,
+    reject_put: Mutex<Vec<String>>,
     reject_delete: Mutex<Vec<String>>,
     fail_create_start: AtomicBool,
     host_interfaces: Mutex<Vec<HostInterface>>,
@@ -387,6 +388,7 @@ impl Shared {
             writes: Mutex::new(Vec::new()),
             reject_config: Mutex::new(Vec::new()),
             reject_patch: Mutex::new(Vec::new()),
+            reject_put: Mutex::new(Vec::new()),
             reject_delete: Mutex::new(Vec::new()),
             fail_create_start: AtomicBool::new(false),
             host_interfaces: Mutex::new(Vec::new()),
@@ -499,6 +501,12 @@ impl FakeIncus {
 
     pub fn set_reject_patch(&self, path_prefix: &str) {
         lock(&self.shared.reject_patch).push(path_prefix.to_string());
+    }
+
+    /// Makes PUT requests matching this path prefix fail with 400 before changing any object: a project's config write
+    /// is a PUT.
+    pub fn set_reject_put(&self, path_prefix: &str) {
+        lock(&self.shared.reject_put).push(path_prefix.to_string());
     }
 
     /// Starts an operation that names `target` and runs until the test releases or fails it. It changes no object. It shows in
@@ -1713,6 +1721,16 @@ fn put(
     request: &Request,
     address: &Address,
 ) -> (u16, String, Value) {
+    if lock(&shared.reject_put)
+        .iter()
+        .any(|prefix| request.path().starts_with(prefix))
+    {
+        return (
+            400,
+            String::new(),
+            error_envelope(400, "put rejected by test"),
+        );
+    }
     let (index, body) = match written(store, request, address) {
         Ok(found) => found,
         Err(answer) => return answer,

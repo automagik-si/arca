@@ -287,6 +287,8 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::TenantCreate => json!({ "id": "abcdefgh", "caps": {
                 "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8,
                 "memory": "16GiB", "disk": "100GiB" } }),
+            ActionKind::TenantResize => json!({ "id": "abcdefgh", "caps": {
+                "instances": 4, "cpu": 16, "memory": "32GiB" } }),
             ActionKind::TenantRemove => json!({ "id": "abcdefgh" }),
             ActionKind::DeployRemove => json!({ "tenant": "abcdefgh", "deploy": "d1" }),
             ActionKind::ServicePublish => json!({ "name": "nats", "reach": "tailnet" }),
@@ -433,6 +435,72 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     ("Memory", "16GiB"),
                     ("Disk", "100GiB"),
                 ]
+            );
+            continue;
+        }
+        if action == ActionKind::TenantResize {
+            // The arguments alone name the tenant and each cap asked. No cap of the schema is left without a label.
+            let shown = |details: &[arca::action_proposal::ActionDetail]| -> Vec<(String, String)> {
+                details
+                    .iter()
+                    .map(|row| (row.label.clone(), row.value.clone()))
+                    .collect()
+            };
+            let rows = |rows: &[(&str, &str)]| -> Vec<(String, String)> {
+                rows.iter()
+                    .map(|(label, value)| (label.to_string(), value.to_string()))
+                    .collect()
+            };
+            assert_eq!(
+                shown(&details),
+                rows(&[
+                    ("Tenant", "abcdefgh"),
+                    ("Instances", "4"),
+                    ("CPUs", "16"),
+                    ("Memory", "32GiB"),
+                ])
+            );
+            // With the caps the tenant holds as the proposal is made, the card shows every cap: a changed one as
+            // old -> new, the others marked unchanged.
+            let held = json!({ "instances": 4, "containers": 4, "virtualMachines": 1, "cpu": 8,
+                "memory": "16GiB", "disk": "100GiB" })
+            .to_string();
+            assert_eq!(
+                shown(&action.details_with_gpu(&prepared, Some(&held))),
+                rows(&[
+                    ("Tenant", "abcdefgh"),
+                    ("Instances", "4 (unchanged)"),
+                    ("Containers", "4 (unchanged)"),
+                    ("Virtual machines", "1 (unchanged)"),
+                    ("CPUs", "8 -> 16"),
+                    ("Memory", "16GiB -> 32GiB"),
+                    ("Disk", "100GiB (unchanged)"),
+                ])
+            );
+            // Every cap the schema takes has its row when it is asked, and the schema takes nothing else.
+            let every = json!({ "id": "abcdefgh", "caps": { "instances": 2, "containers": 2,
+                "virtualMachines": 0, "cpu": 4, "memory": "8GiB", "disk": "50GiB" } });
+            let asked = action.details_with_gpu(&every, Some(&held));
+            assert!(
+                asked[1..].iter().all(|row| row.value.contains(" -> ")),
+                "{asked:?}"
+            );
+            let schema = action.params_schema();
+            let mut fields: Vec<&str> = schema["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            fields.sort_unstable();
+            assert_eq!(fields, ["caps", "id"]);
+            assert_eq!(
+                schema["properties"]["caps"]["properties"]
+                    .as_object()
+                    .expect("the caps")
+                    .len(),
+                asked.len() - 1,
+                "a cap of the schema has no row"
             );
             continue;
         }

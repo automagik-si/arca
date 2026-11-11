@@ -79,7 +79,7 @@ impl Verb {
     }
 }
 
-static VERBS: [Verb; 55] = [
+static VERBS: [Verb; 56] = [
     Verb {
         name: "arca_status",
         summary: "Node status: the API version, the node id, the mode, the uptime, whether Incus answers and the last applied sequence number.",
@@ -795,6 +795,20 @@ static VERBS: [Verb; 55] = [
         result: tenant_usage_result,
     },
     Verb {
+        name: "tenant_resize",
+        summary: "Change a tenant's caps, up or down, only from a proposal the owner approved, whatever the caps: a cap left out keeps its value. Refused for a cap below what the tenant uses now, for caps that would pass the node's capacity with every other tenant's, and for more instances than the tenant's address block holds (a tenant is never given new addresses). The tenant's running instances are not restarted.",
+        class: VerbClass::L,
+        min_scope: Scope::Doctor,
+        writes: true,
+        destructive: false,
+        untrusted: false,
+        output_key: None,
+        summary_text: summary_tenant,
+        cut: no_cut,
+        params: tenant_resize_params,
+        result: tenant_status_result,
+    },
+    Verb {
         name: "tenant_remove",
         summary: "Remove a tenant and everything in it, only from a proposal the owner approved: each instance is deleted and confirmed gone before its firewall rules, then its secrets, and last the tenant's profile and project.",
         class: VerbClass::L,
@@ -975,6 +989,33 @@ fn tenant_create_params() -> Value {
 
 fn tenant_id_params() -> Value {
     params(vec![("id", true, tenant_id_schema())])
+}
+
+/// The caps a resize names: each one is optional, and one left out keeps its value.
+fn tenant_caps_change_schema() -> Value {
+    let mut schema = object_of(
+        vec![
+            ("instances", false, at_least(1)),
+            ("containers", false, at_least(0)),
+            ("virtualMachines", false, at_least(0)),
+            ("cpu", false, at_least(1)),
+            ("memory", false, string_max(32)),
+            ("disk", false, string_max(32)),
+        ],
+        true,
+    );
+    schema["description"] = json!(
+        "The caps to change, shaped as in tenant_create. A cap left out keeps its current value; at least one must change."
+    );
+    schema
+}
+
+fn tenant_resize_params() -> Value {
+    params(vec![
+        ("id", true, tenant_id_schema()),
+        ("caps", true, tenant_caps_change_schema()),
+        ("approval", true, approval_schema()),
+    ])
 }
 
 fn tenant_remove_params() -> Value {
@@ -1698,8 +1739,8 @@ fn plan_list_result() -> Value {
     )])
 }
 
-/// The twenty verbs an action proposal may name. The list is closed here and checked by the handler again.
-const ACTION_NAMES: [&str; 20] = [
+/// The twenty-one verbs an action proposal may name. The list is closed here and checked by the handler again.
+const ACTION_NAMES: [&str; 21] = [
     "service_create",
     "service_remove",
     "service_import",
@@ -1718,6 +1759,7 @@ const ACTION_NAMES: [&str; 20] = [
     "instance_stop",
     "instance_restart",
     "tenant_create",
+    "tenant_resize",
     "tenant_remove",
     "deploy_remove",
 ];

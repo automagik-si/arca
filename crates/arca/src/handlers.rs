@@ -1358,6 +1358,13 @@ impl ToolHandler for ActionPropose {
             let entries = lock(&self.kernel)?.entries().to_vec();
             tenants::check_deploy_remove(node, &entries, &payload, now)?;
             payload
+        } else if action == ActionKind::TenantResize {
+            // A resize the node would refuse is refused now, in the words the verb itself uses. Its arguments are
+            // recorded exactly as proposed: the approval binds this tenant and these caps.
+            let node = self.node.as_ref().ok_or_else(tenants::no_tenants)?;
+            let entries = lock(&self.kernel)?.entries().to_vec();
+            tenants::check_resize(node, &entries, &payload)?;
+            payload
         } else {
             payload
         };
@@ -1407,6 +1414,13 @@ impl ToolHandler for ActionPropose {
             ActionKind::DeployRemove => {
                 let entries = lock(&self.kernel)?.entries().to_vec();
                 Some(tenants::deploy_parts(&entries, &payload))
+            }
+            // The card of a resize shows each cap as the tenant holds it now, beside what is asked.
+            ActionKind::TenantResize => {
+                let entries = lock(&self.kernel)?.entries().to_vec();
+                self.node
+                    .as_ref()
+                    .and_then(|node| tenants::held_caps(node, &entries, &payload))
             }
             _ => None,
         };
@@ -1869,6 +1883,7 @@ impl ActionExecutor {
                 | "instance_stop"
                 | "instance_restart"
                 | "tenant_create"
+                | "tenant_resize"
                 | "tenant_remove"
                 | "deploy_remove"
         ) {
