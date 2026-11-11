@@ -47,8 +47,13 @@ pub type Retained = Arc<dyn Fn() -> Result<RetainedEntries, String> + Send + Syn
 
 /// What follows a start or a restart that left the instance running, given its project and name: the secrets of a
 /// virtual-machine service are written into its guest (`crate::guest_secrets`). `Ok(None)` when the instance has
-/// none, the names written otherwise, or in plain words what was not done. No answer holds a value.
-pub type AfterStart = Arc<dyn Fn(&str, &str) -> Result<Option<Vec<String>>, String> + Send + Sync>;
+/// none, the names written otherwise, or in plain words what was not done and whether asking again can help. No answer
+/// holds a value.
+pub type AfterStart = Arc<
+    dyn Fn(&str, &str) -> Result<Option<Vec<String>>, crate::guest_secrets::NotWritten>
+        + Send
+        + Sync,
+>;
 
 /// The state writer of a kernel-mode node, the ownership check in front of it, and the journal behind it.
 pub struct InstanceLifecycle {
@@ -287,12 +292,19 @@ impl InstanceLifecycle {
                         crate::guest_secrets::written_words(&names)
                     );
                 }
-                Err(why) => {
+                Err(not_written) => {
+                    // What to do next is said once, and only what is true: asking again helps when the guest was
+                    // not ready, and changes nothing when something has to be put right first.
+                    let next = if not_written.retry {
+                        "Run instance_start for it again to write them; that never restarts it"
+                    } else {
+                        "Running instance_start again changes nothing until that is put right"
+                    };
                     return Err(refused(
                         "InstanceSecretsNotWritten",
                         format!(
-                            "{}. It is running, but its secrets were not written into the guest: {why}. Run instance_start for it again to write them; that never restarts it",
-                            done.message
+                            "{}. It is running, but its secrets were not written into the guest: {}. {next}",
+                            done.message, not_written.why
                         ),
                     ));
                 }

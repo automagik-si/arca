@@ -137,31 +137,7 @@ impl ServiceExec {
         target: &ExecTarget,
         budget: Duration,
     ) -> Result<UnixIncusWriter, ExecError> {
-        let family = ProjectFamily::new(
-            self.cfg.kernel.projects.iter().map(String::as_str),
-            self.cfg.kernel.droidd_projects.iter().map(String::as_str),
-        )
-        .map_err(|_| ExecError::Refused("target"))?;
-        // A tenant's service is read in its own tenant's project, and in no other tenant's.
-        let family = match &target.service.tenant {
-            Some(tenant)
-                if arca_kernel::ownership::tenant_of_project(&target.service.project)
-                    == Some(tenant.id.as_str()) =>
-            {
-                family
-                    .with_tenants([target.service.project.as_str()])
-                    .map_err(|_| ExecError::Refused("target"))?
-            }
-            Some(_) => return Err(ExecError::Refused("target")),
-            None => family,
-        };
-        Ok(UnixIncusWriter::new(
-            self.cfg.incus.socket.clone(),
-            target.entry.clone(),
-            target.retained.clone(),
-            family,
-        )
-        .with_total_budget(budget))
+        writer_for(&self.cfg, target, budget)
     }
     pub fn check(&self, target: &ExecTarget, writer: &UnixIncusWriter) -> Result<Owned, ExecError> {
         let cfg = &target.service;
@@ -397,6 +373,40 @@ impl ServiceExec {
             }
         }
     }
+}
+
+/// The writer bound to `target`'s entry: over the node's configured family, and for a service in a tenant over that
+/// tenant's project too and no other tenant's. A record whose project is not its own tenant's is refused.
+pub fn writer_for(
+    cfg: &NodeConfig,
+    target: &ExecTarget,
+    budget: Duration,
+) -> Result<UnixIncusWriter, ExecError> {
+    let family = ProjectFamily::new(
+        cfg.kernel.projects.iter().map(String::as_str),
+        cfg.kernel.droidd_projects.iter().map(String::as_str),
+    )
+    .map_err(|_| ExecError::Refused("target"))?;
+    // A tenant's service is read in its own tenant's project, and in no other tenant's.
+    let family = match &target.service.tenant {
+        Some(tenant)
+            if arca_kernel::ownership::tenant_of_project(&target.service.project)
+                == Some(tenant.id.as_str()) =>
+        {
+            family
+                .with_tenants([target.service.project.as_str()])
+                .map_err(|_| ExecError::Refused("target"))?
+        }
+        Some(_) => return Err(ExecError::Refused("target")),
+        None => family,
+    };
+    Ok(UnixIncusWriter::new(
+        cfg.incus.socket.clone(),
+        target.entry.clone(),
+        target.retained.clone(),
+        family,
+    )
+    .with_total_budget(budget))
 }
 
 pub fn failure_text(text: &str, secrets: &[String]) -> String {
