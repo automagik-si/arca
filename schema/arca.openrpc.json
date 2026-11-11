@@ -3436,6 +3436,11 @@
         "schema": {
           "additionalProperties": false,
           "properties": {
+            "baseImage": {
+              "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
+              "maxLength": 64,
+              "type": "string"
+            },
             "ipv4": {
               "description": "Its fixed address on the service bridge.",
               "maxLength": 15,
@@ -3731,6 +3736,11 @@
             "service": {
               "additionalProperties": false,
               "properties": {
+                "baseImage": {
+                  "description": "The fingerprint (SHA-256) of the image its instance was created from, as Incus recorded it. Absent when Incus recorded none.",
+                  "maxLength": 64,
+                  "type": "string"
+                },
                 "ipv4": {
                   "description": "Its fixed address on the service bridge.",
                   "maxLength": 15,
@@ -4106,7 +4116,7 @@
           "type": "object"
         }
       },
-      "summary": "Set one of a service's secrets (its template lists them). Write-only: no tool, log or audit row shows it again. The service's environment, and its consumers', is updated for their next start.",
+      "summary": "Set one of a service's secrets (its template lists them). Write-only: no tool, log or audit row shows it again. The service's environment, and its consumers', is updated for their next start. A virtual machine's secret is never in its environment or its Incus config: it is stored, and instance_start writes it into the guest as a file of root's in /etc/arca-secrets; it may have line breaks.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
@@ -6168,7 +6178,7 @@
           "type": "object"
         }
       },
-      "summary": "Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused.",
+      "summary": "Start a stopped Incus instance that Arca owns or has adopted, named by its project and its name. An instance that already runs is left running, and the answer says so. An instance that is not Arca's is refused. For a virtual-machine service with stored secrets (service_secret_set) it also writes them into the guest, whether it started the machine or found it running, and the answer names them.",
       "x-arca-additional-properties": true,
       "x-arca-class": "L",
       "x-arca-read-only-hint": false,
