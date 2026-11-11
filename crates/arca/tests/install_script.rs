@@ -445,7 +445,7 @@ impl Drop for Machine {
     }
 }
 
-/// The config of the README's quickstart, for this machine.
+/// The config of the quickstart (`docs/QUICKSTART.md`), for this machine.
 fn quickstart_config(machine: &Machine) -> Value {
     json!({
         "stateDir": machine.home(".local/state/arca-node"),
@@ -1561,23 +1561,24 @@ fn a_machine_it_cannot_run_on_is_refused_with_every_reason_at_once() {
 }
 
 #[test]
-fn the_script_is_what_the_readme_and_the_hard_rules_say() {
+fn the_script_is_what_the_quickstart_and_the_hard_rules_say() {
     let text = script_text();
 
     // The release it installs is the one the quickstart downloads by hand.
-    let readme = fs::read_to_string(repo().join("README.md")).expect("the README");
-    let by_hand = readme
+    let quickstart =
+        fs::read_to_string(repo().join("docs/QUICKSTART.md")).expect("docs/QUICKSTART.md");
+    let by_hand = quickstart
         .lines()
         .find_map(|line| line.strip_prefix("v="))
         .expect("the quickstart names its release");
     assert_eq!(
         current(),
         by_hand,
-        "scripts/install.sh and the README's quickstart name one release"
+        "scripts/install.sh and docs/QUICKSTART.md name one release"
     );
     assert!(
-        readme.contains("scripts/install.sh"),
-        "the README shows the installer"
+        quickstart.contains("scripts/install.sh"),
+        "docs/QUICKSTART.md shows the installer"
     );
 
     // It never becomes another user, and never uses the address that skips pre-releases.
@@ -1615,7 +1616,7 @@ fn the_script_is_what_the_readme_and_the_hard_rules_say() {
         assert!(line.contains(":?}"), "not guarded: {line}");
     }
 
-    // shellcheck, where the machine has it, for both shells the README names.
+    // shellcheck, where the machine has it, for both shells the quickstart names.
     match find("shellcheck") {
         Some(shellcheck) => {
             for shell in ["sh", "bash"] {
