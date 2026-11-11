@@ -1,7 +1,7 @@
 #!/bin/bash
 # The automagik-workspace service (templates/automagik-workspace.json): one virtual machine that runs one Automagik
-# workspace, the gate in front of it and the Cloudflare Tunnel connector that publishes it. This one file is both
-# halves of it.
+# workspace, the gate in front of it and the one part that lets people reach it: a Cloudflare Tunnel connector
+# (settings.reach "cloudflare") or a tailnet node (settings.reach "tailnet"). This one file is both halves of it.
 #
 # - Run with no argument it is the machine's first-boot script: cloud-init runs it once, as root. It installs Docker and
 #   the few tools the keeper uses from the distribution's own packages, checks the settings, makes the two data
@@ -28,24 +28,37 @@
 #   server's own sign-in (HTTP 401), and only its static files load. Nothing of the workspace can be used that way.
 #   That holds only while the route sends the visitor's own Host: a Host override to a loopback name on the route
 #   would make the server accept the request, past the gate. No route of a workspace sets one.
+#     automagik-tailnet  with reach "tailnet", in the tunnel's place: a Tailscale node, in userspace networking, that
+#                        serves HTTPS on port 443 of the machine's own tailnet name and hands every request to
+#                        http://127.0.0.1:3082, the gate. It serves nothing else: no other port, and never Funnel,
+#                        so the workspace is reachable from its tailnet alone. Its state is the machine's
+#                        /var/lib/automagik-workspace/tailnet, which keeps the node's identity across restarts.
 #   Plain `docker run` gives this shape; Docker Compose is not installed.
+#
+#   With reach "tailnet" the gate signs its owner in itself, with passkeys. Its first owner claims it once, with a
+#   code the gate writes into its own data (/data/claim-code in the gate's container). The keeper never reads that
+#   code and never prints it; it looks only at whether the file is there. read_claim_code below is the one place
+#   that reads it, and nothing in this script calls it.
 #
 # What it reads:
 # - /etc/arca/settings.json: the service's settings, written by cloud-init at the first boot and fixed from then on.
 #   publicUrl is the workspace's exact public origin (https://<host>, no path); the shipped example address means
 #   "not set". accessTeamDomain, accessAudience and accessEmails are the owner's Cloudflare Access application for
 #   that address (none of them a secret): all three are set, or none. serverImage is the server's image by digest.
-# - /etc/arca-secrets/TUNNEL_TOKEN: the tunnel's token, written by Arca at each start (service_secret_set, then
-#   instance_start). The server and the gate start without it; the tunnel waits for it, and a new token replaces the
-#   tunnel only.
+#   reach is "cloudflare" (also when it is left out) or "tailnet"; with "tailnet" publicUrl is the node's own
+#   https://<machine>.<tailnet>.ts.net and the Access settings are refused.
+# - /etc/arca-secrets/TUNNEL_TOKEN (reach "cloudflare") or /etc/arca-secrets/TAILSCALE_AUTHKEY (reach "tailnet"):
+#   the one secret of the reach, written by Arca at each start (service_secret_set, then instance_start). The server
+#   and the gate start without it; the tunnel or the node waits for it, and a new one replaces that part only.
 #
 # What it writes: one line on the machine's console (service_logs) whenever the state of a part changes, and the same
 # status line at intervals. The server and the gate are healthy when the image's own check says so: HTTP 401 on the
 # loopback port, the answer to a visitor who has not signed in.
 #
-# The token is never printed or put on a command line. The keeper never holds it in a variable: it is copied, without
-# line breaks, to a file on /run (memory) that only the tunnel's user reads, and cloudflared reads that file
-# (`--token-file`), so it is not in Docker's record of the container either. The keeper never reads the server's or
+# The secret is never printed or put on a command line. The keeper never holds it in a variable: it is copied, without
+# line breaks, to a file on /run (memory) that only its part's user reads. cloudflared reads that file
+# (`--token-file`) and the tailnet node is told the file's path (`TS_AUTHKEY=file:<path>`), so the secret is not in
+# Docker's record of the container either. The keeper keeps only its digest, to see when it changes. The keeper never reads the server's or
 # the gate's data, and it never copies their output to the console: the server's sign-in link is in both.
 #
 # Every path, pause and external program below can be replaced through the environment, which is how the test in
@@ -56,6 +69,7 @@ set -u
 : "${WS_SECRETS:=/etc/arca-secrets}"
 : "${WS_DATA:=/var/lib/automagik-workspace/data}"
 : "${WS_GATE_DATA:=/var/lib/automagik-workspace/gate}"
+: "${WS_TAILNET_STATE:=/var/lib/automagik-workspace/tailnet}"
 : "${WS_RUN:=/run/automagik-workspace}"
 : "${WS_CONSOLE:=/dev/console}"
 : "${WS_INSTALLED:=/usr/local/sbin/arca-automagik-workspace}"
@@ -63,6 +77,8 @@ set -u
 : "${WS_DOCKER_ETC:=/etc/docker}"
 : "${WS_DATA_OWNER:=1000:1000}"      # the server image's own user, which the gate runs as too
 : "${WS_TUNNEL_OWNER:=65532:65532}"  # the user the tunnel is run as; it alone reads the token's copy
+: "${WS_TAILNET_OWNER:=0:0}"         # the tailnet image's own user; it alone reads the auth key's copy
+: "${WS_CLAIM_MINUTES:=15}"          # how long the gate's claim code is good for, as the gate fixes it
 : "${WS_TICK:=10}"            # seconds between two looks at the parts
 : "${WS_STATUS_EVERY:=300}"   # seconds between two status lines when nothing changes
 : "${WS_REFUSE_EVERY:=300}"   # seconds between two tellings of why the workspace does not start
@@ -74,10 +90,12 @@ EXAMPLE_URL='https://workspace.example.com'
 SERVER=automagik-server
 GATE=automagik-gate
 TUNNEL=automagik-tunnel
+TAILNET=automagik-tailnet
 
 # What this script takes from the Automagik server image, each in this one place, as the Automagik repository has
-# them at commit 8fb2e6f (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs): the build the
-# shipped template pins. A later build that changes one of them changes one line here.
+# them at commit 5fe0be6 (server/compose.gate.yml, server/gate-entrypoint.mjs, server/gate-access.mjs,
+# server/gate-claim.mjs): the build the shipped template pins. A later build that changes one of them changes one
+# line here.
 SERVER_PORT=3081                                  # the server's own port, fixed in the image
 GATE_PORT=3082                                    # the gate's port, the one upstream's compose file fixes
 IMAGE_NODE=/nodejs/bin/node                       # the image's node
@@ -89,15 +107,25 @@ GATE_PORT_ENV=AUTOMAGIK_GATE_PORT                 # the gate: its loopback port
 ACCESS_TEAM_ENV=AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN # the gate: the Cloudflare Access team's host name
 ACCESS_AUDIENCE_ENV=AUTOMAGIK_GATE_ACCESS_AUD     # the gate: the Access application's audience tag
 ACCESS_EMAILS_ENV=AUTOMAGIK_GATE_ACCESS_EMAILS    # the gate: the e-mail addresses that may sign in, comma-separated
+GATE_CLAIM_ENV=AUTOMAGIK_GATE_CLAIM               # the gate without Access: "remote" takes the first claim on its main
+                                                  # port, behind the code; "local" (its default) only on port 3083
+CLAIM_CODE_FILE=/data/claim-code                  # the gate's claim code, in the gate's own data; gone once claimed
 
 # The connector's image, by digest: the one templates/cloudflare-tunnel.json pins (cloudflared 2026.10.7). It is not a
 # setting: a workspace does not choose its connector.
 TUNNEL_IMAGE=docker.io/cloudflare/cloudflared@sha256:4955524aeaa379e154023d5a027c250f7b35041a2e7e950cf13f144bc9b9c5ba
 
+# The tailnet node's image, by digest: Tailscale's own image from its official registry, release v1.104.4. Like the
+# connector's it is not a setting. What this script takes from that image is in this one place: the names its start
+# program reads, where it keeps its state, and its control socket, which `tailscale status` is pointed at.
+TAILNET_IMAGE=docker.io/tailscale/tailscale@sha256:ed6480b33c6eb67c9cbd203ed42b9fb57e361986725b6856def71b7a3d9e276c
+TAILNET_STATE_DIR=/var/lib/tailscale
+TAILNET_SOCKET=/tmp/tailscaled.sock
+
 # Every program this script starts that bash does not have built in. The first boot refuses to go on while one of
 # them is missing, and names it.
 WS_PROGRAMS='docker jq systemctl apt-get hostname sha256sum install tr cut date sleep cat chmod chown mv rm grep
-tail mkdir'
+tail mkdir stat'
 
 # The Debian packages the first boot installs. Recommended packages are not installed, so every package that is needed
 # is named here. docker.io is the daemon alone: on Debian 13 the `docker` command is a package of its own, docker-cli,
@@ -194,7 +222,10 @@ UNIT
 # The server's /data and the gate's /data: two directories on the machine's own disk, the server user's. Only the
 # directories themselves are touched; what the server and the gate keep in them is never read or changed.
 data_directories() {
-  install -d -m 0750 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$WS_DATA" "$WS_GATE_DATA"
+  install -d -m 0750 -o "${WS_DATA_OWNER%%:*}" -g "${WS_DATA_OWNER##*:}" "$WS_DATA" "$WS_GATE_DATA" || return 1
+  # The tailnet node's state: its identity on the tailnet. Made only for the reach that has a node.
+  [ "${REACH:-cloudflare}" != tailnet ] ||
+    install -d -m 0700 -o "${WS_TAILNET_OWNER%%:*}" -g "${WS_TAILNET_OWNER##*:}" "$WS_TAILNET_STATE"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -207,8 +238,8 @@ refuse() {
   return 1
 }
 
-# Reads the settings into PUBLIC_URL, SERVER_IMAGE and the ACCESS_ values. When they cannot be used it fails, with
-# the reason, in words, in REFUSAL.
+# Reads the settings into REACH, PUBLIC_URL, SERVER_IMAGE and the ACCESS_ values. When they cannot be used it fails,
+# with the reason, in words, in REFUSAL.
 load_settings() {
   local url port address='[A-Za-z0-9._%+-]+@[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?'
   REFUSAL=''
@@ -217,6 +248,7 @@ load_settings() {
     return
   fi
   url=$(jq -r '.publicUrl | if type == "string" then . else "" end' "$WS_SETTINGS")
+  REACH=$(jq -r '.reach | if . == null then "cloudflare" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   SERVER_IMAGE=$(jq -r '.serverImage | if type == "string" then . else "" end' "$WS_SETTINGS")
   # A missing key is an empty one, and so is an empty list. A value of the wrong kind becomes "!", which no rule
   # below takes. Each entry of the list is one whole address: an entry that holds a comma, a space or a line break
@@ -225,6 +257,11 @@ load_settings() {
   ACCESS_AUDIENCE=$(jq -r '.accessAudience | if . == null then "" elif type == "string" then . else "!" end' "$WS_SETTINGS")
   ACCESS_EMAILS=$(jq -r --arg address "\\A$address\\z" '.accessEmails | if . == null or . == [] then "" elif type == "array" and length <= 16 and all(.[]; type == "string" and test($address)) then join(",") else "!" end' "$WS_SETTINGS" 2>/dev/null) || ACCESS_EMAILS='!'
   ACCESS_COUNT=0
+  if [ "$REACH" != cloudflare ] && [ "$REACH" != tailnet ]; then
+    REACH=cloudflare
+    refuse "settings.reach is how the workspace is reached: \"cloudflare\" (a Cloudflare Tunnel; also when it is left out) or \"tailnet\" (a node on your tailnet)"
+    return
+  fi
   if ! pinned "$SERVER_IMAGE"; then
     refuse "settings.serverImage is an image by digest: <registry>/<name>@sha256:<64 hex digits>"
     return
@@ -239,6 +276,19 @@ load_settings() {
   else
     refuse "settings.publicUrl is the workspace's exact public origin: https://<host name>, in lower case, with no path or closing slash, and a port only when it is not 443 (1 to 65535, written without a leading 0)"
     return
+  fi
+  if [ "$REACH" = tailnet ]; then
+    # The node serves its own tailnet name on port 443 and no other, and the gate's passkeys belong to that name.
+    if [ -n "$ACCESS_TEAM$ACCESS_AUDIENCE$ACCESS_EMAILS" ]; then
+      refuse "the Cloudflare Access settings do not go with settings.reach \"tailnet\": on a tailnet the gate signs its owner in itself, with passkeys. Leave all three empty"
+      return
+    fi
+    if ! [[ $PUBLIC_URL =~ ^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)\.[a-z0-9]([a-z0-9-]*[a-z0-9])?\.ts\.net$ ]]; then
+      refuse "with settings.reach \"tailnet\", settings.publicUrl is the machine's own tailnet address: https://<machine>.<tailnet>.ts.net, in lower case, with no port and no path"
+      return
+    fi
+    TAILNET_NAME=${BASH_REMATCH[1]}
+    return 0
   fi
   [ -n "$ACCESS_TEAM$ACCESS_AUDIENCE$ACCESS_EMAILS" ] || return 0
   if [ -z "$ACCESS_TEAM" ] || [ -z "$ACCESS_AUDIENCE" ] || [ -z "$ACCESS_EMAILS" ]; then
@@ -335,11 +385,11 @@ keep_server() {
   case $state in
     running | unknown) return 0 ;;
   esac
-  docker rm -f "$GATE" "$TUNNEL" >/dev/null 2>&1
-  rm -f "$WS_RUN/tunnel-token.sha256"
+  docker rm -f "$GATE" "$TUNNEL" "$TAILNET" >/dev/null 2>&1
+  rm -f "$WS_RUN/tunnel-token.sha256" "$WS_RUN/tailnet-key.sha256"
   REGISTERED=''
   if [ "$state" != absent ]; then
-    say "the server stopped (exit code ${state#exited }); it is started again after a pause, and the gate and the tunnel with it"
+    say "the server stopped (exit code ${state#exited }); it is started again after a pause, and the gate and the $(reach_part) with it"
     docker rm -f "$SERVER" >/dev/null 2>&1
     failed server
     return 0
@@ -378,6 +428,9 @@ keep_gate() {
     -e "$GATE_ENABLED_ENV=1" -e "$GATE_ORIGIN_ENV=$PUBLIC_URL" -e "$GATE_PORT_ENV=$GATE_PORT")
   [ "$ACCESS_COUNT" -eq 0 ] || args+=(-e "$ACCESS_TEAM_ENV=$ACCESS_TEAM" -e "$ACCESS_AUDIENCE_ENV=$ACCESS_AUDIENCE"
     -e "$ACCESS_EMAILS_ENV=$ACCESS_EMAILS")
+  # On a tailnet the first owner claims the gate on its main port, behind the gate's code: the node forwards that
+  # port and no other, so the gate's claim-only port (3083) is never opened, forwarded or published.
+  [ "$REACH" != tailnet ] || args+=(-e "$GATE_CLAIM_ENV=remote")
   args+=(-v "$WS_GATE_DATA:/data" -v "$WS_DATA:/dsh:ro")
   say "starting the gate"
   if out=$(docker "${args[@]}" "$SERVER_IMAGE" "$GATE_ENTRY" 2>&1 >/dev/null); then
@@ -389,18 +442,28 @@ keep_gate() {
   fi
 }
 
-# The token's digest, from the secret file without its line breaks. The token itself never leaves the pipe.
-token_digest() {
-  tr -d '[:space:]' <"$WS_SECRETS/TUNNEL_TOKEN" 2>/dev/null | sha256sum | cut -d' ' -f1
+# A secret's digest, from its file without its line breaks. The secret itself never leaves the pipe.
+secret_digest() {
+  tr -d '[:space:]' <"$WS_SECRETS/$1" 2>/dev/null | sha256sum | cut -d' ' -f1
 }
 
-# The digest of nothing: what token_digest gives for a file that holds no token.
+token_digest() {
+  secret_digest TUNNEL_TOKEN
+}
+
+# The part that lets people reach the workspace, as the status line names it.
+reach_part() {
+  if [ "${REACH:-cloudflare}" = tailnet ]; then echo "tailnet node"; else echo tunnel; fi
+}
+
+# The digest of nothing: what secret_digest gives for a file that holds no secret.
 EMPTY_DIGEST=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 TUNNEL_TRIED=''
 REGISTERED=''
 
 keep_tunnel() {
   local dir=$WS_RUN/tunnel digest state out
+  [ "$REACH" = cloudflare ] || return 0
   running "$SERVER" || return 0
   [ -e "$WS_SECRETS/TUNNEL_TOKEN" ] || return 0
   digest=$(token_digest)
@@ -446,6 +509,78 @@ keep_tunnel() {
     failed tunnel
     say "the tunnel did not start: $(last_line "$out")"
   fi
+}
+
+TAILNET_TRIED=''
+
+# The tailnet node, in the tunnel's place when settings.reach is "tailnet". It joins the server's namespace, so the
+# gate is on its loopback. Its serve file, written here, is all it serves: HTTPS on port 443 of its own tailnet name,
+# every path handed to the gate's port. There is no other port in it and no Funnel, and the gate's claim-only port
+# is never named. Tailscale's proxy keeps the visitor's Host header, which the gate needs, and carries WebSockets.
+keep_tailnet() {
+  local dir=$WS_RUN/tailnet digest state out
+  [ "$REACH" = tailnet ] || return 0
+  running "$SERVER" || return 0
+  [ -e "$WS_SECRETS/TAILSCALE_AUTHKEY" ] || return 0
+  digest=$(secret_digest TAILSCALE_AUTHKEY)
+  [ "$digest" != "$EMPTY_DIGEST" ] || return 0
+  state=$(state_of "$TAILNET")
+  case $state in
+    unknown) return 0 ;;
+    running)
+      [ "$digest" != "$(cat "$WS_RUN/tailnet-key.sha256" 2>/dev/null)" ] || return 0
+      say "TAILSCALE_AUTHKEY changed: the tailnet node is started again with the new one"
+      docker rm -f "$TAILNET" >/dev/null 2>&1
+      ;;
+    exited*)
+      say "the tailnet node stopped (exit code ${state#exited }); it is started again after a pause"
+      docker rm -f "$TAILNET" >/dev/null 2>&1
+      failed tailnet
+      ;;
+  esac
+  # A key that was not tried yet does not wait for the pause its predecessor earned.
+  [ "$digest" = "$TAILNET_TRIED" ] || proven tailnet
+  due tailnet || return 0
+  TAILNET_TRIED=$digest
+  rm -f "$WS_RUN/tailnet-key.sha256"
+  # The key's copy and the serve file: memory only, and the node's user alone enters the directory.
+  if ! install -d -m 0700 -o "${WS_TAILNET_OWNER%%:*}" -g "${WS_TAILNET_OWNER##*:}" "$dir" ||
+    ! (umask 077 && tr -d '[:space:]' <"$WS_SECRETS/TAILSCALE_AUTHKEY" >"$dir/authkey.new") ||
+    ! chown "$WS_TAILNET_OWNER" "$dir/authkey.new" || ! chmod 0400 "$dir/authkey.new" ||
+    ! mv -f "$dir/authkey.new" "$dir/authkey" ||
+    ! (umask 077 && printf '%s\n' "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"\${TS_CERT_DOMAIN}:443\":{\"Handlers\":{\"/\":{\"Proxy\":\"http://127.0.0.1:$GATE_PORT\"}}}}}" >"$dir/serve.json") ||
+    ! chown "$WS_TAILNET_OWNER" "$dir/serve.json"; then
+    rm -f "$dir/authkey.new"
+    failed tailnet
+    say "the tailnet node did not start: the key's copy could not be written under $WS_RUN"
+    return 0
+  fi
+  say "starting the tailnet node (Docker downloads its image first when it is not on this machine yet)"
+  # The key is named by its file; with TS_AUTH_ONCE a node that is already logged in does not use it again.
+  if out=$(docker run -d --name "$TAILNET" --network "container:$SERVER" --restart no --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    -e TS_AUTHKEY=file:/run/arca-tailnet/authkey -e TS_AUTH_ONCE=true -e TS_USERSPACE=true \
+    -e "TS_STATE_DIR=$TAILNET_STATE_DIR" -e "TS_SOCKET=$TAILNET_SOCKET" -e "TS_HOSTNAME=$TAILNET_NAME" \
+    -e TS_SERVE_CONFIG=/run/arca-tailnet/serve.json -e TS_ACCEPT_DNS=false \
+    -v "$WS_TAILNET_STATE:$TAILNET_STATE_DIR" -v "$dir:/run/arca-tailnet:ro" "$TAILNET_IMAGE" 2>&1 >/dev/null); then
+    printf '%s\n' "$digest" >"$WS_RUN/tailnet-key.sha256"
+    say "the tailnet node is started from $TAILNET_IMAGE"
+  else
+    docker rm -f "$TAILNET" >/dev/null 2>&1
+    failed tailnet
+    say "the tailnet node did not start: $(last_line "$out")"
+  fi
+}
+
+# The gate's claim code, read from the gate's own container: exactly this one file and nothing else. NOTHING IN THIS
+# SCRIPT CALLS IT, and no command of this script reaches it. It is the one place for whoever is to show the code to
+# the workspace's owner, once, after the owner has proved who they are; the code must never reach a console, a log
+# or an assistant. A code is good for fifteen minutes; inside the gate's container,
+# `/nodejs/bin/node /opt/automagik/gate-control.mjs renew-claim` makes a new one.
+# shellcheck disable=SC2329
+read_claim_code() {
+  docker exec "$GATE" "$IMAGE_NODE" -e \
+    "process.stdout.write(require('fs').readFileSync('$CLAIM_CODE_FILE','utf8'))"
 }
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -501,7 +636,66 @@ look_at_gate() {
   GATE_STATE=$WORDS
 }
 
+# What the tailnet node says of itself, without its key: whether it is logged in, and under which name. A node that
+# is not logged in after a start says so; its usual cause is a key the tailnet does not take.
+look_at_tailnet() {
+  local status backend name
+  if [ ! -e "$WS_SECRETS/TAILSCALE_AUTHKEY" ]; then
+    TUNNEL_STATE="the tailnet node waits for TAILSCALE_AUTHKEY (service_secret_set, then instance_start)"
+    return
+  elif [ "$(secret_digest TAILSCALE_AUTHKEY)" = "$EMPTY_DIGEST" ]; then
+    TUNNEL_STATE="the tailnet node waits: TAILSCALE_AUTHKEY is empty (service_secret_set, then instance_start)"
+    return
+  fi
+  case $(state_of "$TAILNET") in
+    running) ;;
+    unknown)
+      TUNNEL_STATE="Docker did not answer about the tailnet node"
+      return
+      ;;
+    *)
+      TUNNEL_STATE="the tailnet node is not running"
+      return
+      ;;
+  esac
+  status=$(docker exec "$TAILNET" tailscale --socket "$TAILNET_SOCKET" status --json 2>/dev/null)
+  backend=$(printf '%s' "$status" | jq -r '.BackendState // empty' 2>/dev/null | tr -cd 'A-Za-z')
+  name=$(printf '%s' "$status" | jq -r '.Self.DNSName // empty' 2>/dev/null | tr -cd 'a-z0-9.-')
+  name=${name%.}
+  case $backend in
+    Running)
+      if [ "https://$name" = "$PUBLIC_URL" ]; then
+        proven tailnet
+        TUNNEL_STATE="the tailnet node is logged in and serves https://$name"
+      else
+        TUNNEL_STATE="the tailnet node is logged in as ${name:-a name it does not tell}, which is NOT the name in settings.publicUrl: the gate refuses every request under another name. Free the name on the tailnet, or create the workspace again with the name the node has"
+      fi
+      ;;
+    NeedsLogin) TUNNEL_STATE="the tailnet node is NOT logged in: the tailnet did not take its key (used already, expired or revoked). Set TAILSCALE_AUTHKEY again (service_secret_set, then instance_start)" ;;
+    NeedsMachineAuth) TUNNEL_STATE="the tailnet node is NOT logged in yet: it waits for approval in the tailnet's admin console. A pre-approved key needs none" ;;
+    *) TUNNEL_STATE="the tailnet node is running and is not logged in yet" ;;
+  esac
+}
+
+# Whether the gate has its owner, from the one thing the gate shows of it: its claim code's file is there until the
+# first claim and gone after it. Only the file's name and age are looked at, from the machine's side of the gate's
+# data; the code in it is never read.
+claim_state() {
+  local file=$WS_GATE_DATA/${CLAIM_CODE_FILE##*/} made
+  if ! made=$(stat -c %Y "$file" 2>/dev/null); then
+    echo "claimed"
+  elif [ $(($(now) - made)) -ge $((WS_CLAIM_MINUTES * 60)) ]; then
+    echo "waiting for its first claim, with a claim code that is past its $WS_CLAIM_MINUTES minutes: a new one has to be made"
+  else
+    echo "waiting for its first claim"
+  fi
+}
+
 look_at_tunnel() {
+  if [ "$REACH" = tailnet ]; then
+    look_at_tailnet
+    return
+  fi
   if [ ! -e "$WS_SECRETS/TUNNEL_TOKEN" ]; then
     TUNNEL_STATE="the tunnel waits for TUNNEL_TOKEN (service_secret_set, then instance_start)"
   elif [ "$(token_digest)" = "$EMPTY_DIGEST" ]; then
@@ -525,12 +719,18 @@ look_at_tunnel() {
 }
 
 public_state() {
-  if [ -z "$PUBLIC_URL" ]; then
-    echo "no public address"
+  if [ "$REACH" = tailnet ]; then
+    if [ "$GATE_STATE" = "${GATE_STATE#the gate is healthy}" ]; then
+      echo "reach tailnet: $PUBLIC_URL, sign-in by passkey"
+    else
+      echo "reach tailnet: $PUBLIC_URL, sign-in by passkey, $(claim_state)"
+    fi
+  elif [ -z "$PUBLIC_URL" ]; then
+    echo "reach cloudflare: no public address"
   elif [ "$ACCESS_COUNT" -gt 0 ]; then
-    echo "public address $PUBLIC_URL, sign-in by Cloudflare Access (team $ACCESS_TEAM, $ACCESS_COUNT e-mail address(es))"
+    echo "reach cloudflare: public address $PUBLIC_URL, sign-in by Cloudflare Access (team $ACCESS_TEAM, $ACCESS_COUNT e-mail address(es))"
   else
-    echo "public address $PUBLIC_URL, with no Cloudflare Access settings, so the gate has no sign-in to offer"
+    echo "reach cloudflare: public address $PUBLIC_URL, with no Cloudflare Access settings, so nobody can sign in through the tunnel"
   fi
 }
 
@@ -561,15 +761,16 @@ run_workspace() {
     [ -z "$STOP" ] || exit 0
   done
   until mkdir -p "$WS_RUN" && chmod 0700 "$WS_RUN" && data_directories; do
-    say "workspace $WS_NAME does not start: $WS_RUN, $WS_DATA or $WS_GATE_DATA could not be made"
+    say "workspace $WS_NAME does not start: $WS_RUN or one of its data directories under ${WS_DATA%/*} could not be made"
     nap "$WS_REFUSE_EVERY"
     [ -z "$STOP" ] || exit 0
   done
-  say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the tunnel, in one network namespace; $(public_state)"
+  say "workspace $WS_NAME: the server, the gate on loopback port $GATE_PORT and the $(reach_part), in one network namespace; $(public_state)"
   while [ -z "$STOP" ]; do
     keep_server
     keep_gate
     keep_tunnel
+    keep_tailnet
     look_at_server
     look_at_gate
     look_at_tunnel

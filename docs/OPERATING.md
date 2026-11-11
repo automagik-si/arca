@@ -2530,7 +2530,7 @@ three containers, in the shape of Automagik's own `server/compose.gate.yml`:
 |-----------|------------|------------------|
 | `automagik-server` | The Automagik server image. Its state is in `/data`. | Its own loopback, port 3081. It has a network namespace of its own and no published port. |
 | `automagik-gate` | The same image by the same digest, started with the gate's entrypoint. The only door to the server: it signs the owner in, and it holds the server's own sign-in credential, which never leaves the machine. | The same loopback, port 3082: it joins the server's network namespace. |
-| `automagik-tunnel` | Cloudflare's connector (`cloudflared`). It calls out to Cloudflare; nothing calls in. | Nothing but its metrics, put on that loopback too. It joins the same namespace and hands visitors to the gate's port. |
+| `automagik-tunnel` (or `automagik-tailnet`, see "On a tailnet instead") | Cloudflare's connector (`cloudflared`). It calls out to Cloudflare; nothing calls in. | Nothing but its metrics, put on that loopback too. It joins the same namespace and hands visitors to the gate's port. |
 
 The three share one loopback that belongs to none of the machine's own addresses. Nothing listens on the machine's
 address, on the service network or on the host: the template has no port, no link and no host listener. The virtual
@@ -2592,21 +2592,86 @@ token passes through that assistant's conversation.
 
 | Setting | Meaning |
 |---------|---------|
-| `publicUrl` | The workspace's exact public origin, as a browser writes it: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
+| `publicUrl` | With `reach` `tailnet`, the machine's own `https://<machine>.<tailnet>.ts.net`. Otherwise the workspace's exact public origin, as a browser writes it: `https://` and a host name in lower case; no path and no closing slash; a port only when it is not 443 (1 to 65535, without a leading 0). The gate gets it as `AUTOMAGIK_GATE_ORIGIN` and stops on any other spelling, so the script refuses those first. The server is not given it. The shipped `https://workspace.example.com` means "not set": the server then starts alone, no gate is started, and every status line says so. |
 | `accessTeamDomain`, `accessAudience`, `accessEmails` | Your Cloudflare Access application for that address: the team's host name alone (`<team>.cloudflareaccess.com`, no `https://`, and no other domain), the application's audience tag, and the list of e-mail addresses that may sign in (1 to 16, one address in each entry). None is a secret. Set all three or none; they need `publicUrl`. They ship empty. The gate gets them as `AUTOMAGIK_GATE_ACCESS_TEAM_DOMAIN`, `AUTOMAGIK_GATE_ACCESS_AUD` and `AUTOMAGIK_GATE_ACCESS_EMAILS` (the addresses joined by commas). |
 | `serverImage` | The Automagik server's public image, pinned by digest. The server and the gate both run from this one value: to move to another build, replace it. A workspace needs a build that has the gate and its Cloudflare Access sign-in (see below). |
 
-Two things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image is
-fixed in the script at the digest the `cloudflare-tunnel` template pins.
+| `reach` | How people reach the workspace: `cloudflare` (the steps above; also when the setting is left out) or `tailnet` (see "On a tailnet instead" below). |
+
+Three things are not settings. The gate's port is 3082, as Automagik's compose file fixes it. The connector's image
+is fixed in the script at the digest the `cloudflare-tunnel` template pins, and the tailnet node's at a digest of
+Tailscale's own image (`docker.io/tailscale/tailscale`, release 1.104.4).
+
+### On a tailnet instead
+
+With `settings.reach` set to `tailnet` the workspace is reachable from your own tailnet and from nowhere else: no
+Cloudflare Tunnel, no Cloudflare Access. The third container is then `automagik-tailnet`, a Tailscale node in the
+server's network namespace (userspace networking: no device, no capability). It serves HTTPS on port 443 of the
+machine's own tailnet name, `https://<machine>.<tailnet>.ts.net`, and hands every request to the gate on
+`http://127.0.0.1:3082`, with the visitor's `Host` header as it came. That is all it serves: no other port, never
+Funnel, and never the gate's claim-only port 3083. The gate signs its owner in itself, with passkeys.
+
+You need a tailnet with MagicDNS and HTTPS certificates turned on (Tailscale's admin console, "DNS"), since the gate
+takes nothing but an exact `https://` address. A certificate's name is published in the public certificate logs, so
+choose a machine name you do not mind the world reading.
+
+1. **Tailscale admin console, "Settings" > "Keys".** Generate an auth key: for one use, not ephemeral, pre-approved
+   if your tailnet asks for device approval, and with a tag, so that the node's own key does not expire. Copy it;
+   treat it like a password. Decide the machine's name (for example `workspace1`) and note your tailnet's name:
+   together they are the address, `https://workspace1.<tailnet>.ts.net`.
+2. **The template for your workspace**, as in step 3 above: in the copy set `settings.reach` to `tailnet` and
+   `settings.publicUrl` to that address, with no port and no closing slash. Leave the three Access settings empty;
+   with `tailnet` they are refused.
+3. **Arca: `service_create`** with `{"name": "workspace1", "template": "example-workspace"}`. It stays `stopped`.
+4. **Arca: `service_secret_set`** with `{"name": "workspace1", "key": "TAILSCALE_AUTHKEY", "value": "<the key>"}`.
+   The key is exactly `TAILSCALE_AUTHKEY`; `TUNNEL_TOKEN` is not used by this reach.
+5. **Arca: `instance_start`** with `{"project": "arcak-svc", "instance": "workspace1"}`.
+6. **Check.** `service_logs` with `{"name": "workspace1"}` shows the keeper's status line:
+   `arca-automagik-workspace: status: the server is healthy (HTTP 401 on its loopback port 3081); the gate is healthy (HTTP 401 on its loopback port 3082); the tailnet node is logged in and serves https://workspace1.<tailnet>.ts.net; reach tailnet: https://workspace1.<tailnet>.ts.net, sign-in by passkey, waiting for its first claim`.
+7. **The first claim.** A new gate has no owner. It writes a claim code into its own data, good once and for
+   fifteen minutes, and the first person who opens `https://workspace1.<tailnet>.ts.net/_gate/claim` from the
+   tailnet with that code registers a passkey and becomes the owner. Arca does not hand that code to you yet: the
+   step that shows it once, after your passkey on Arca's approval page, is not built. Until it is, the code can
+   only be read on the machine itself, with the command Automagik's server documentation gives for the gate's
+   container. That is a step for the person who looks after the node, at a terminal, and never one for an
+   assistant: the keeper does not read the code, does not print it, and no Arca verb returns it. After the claim
+   the status line says `claimed`.
+
+What to know about this reach:
+
+- **What the status line can say of the node.** `logged in and serves https://<name>` when all is well.
+  `NOT logged in` when the tailnet did not take the key (used already, expired or revoked), or when the node waits
+  for approval in the admin console. `logged in as <another name>, which is NOT the name in settings.publicUrl`
+  when the name was already taken on the tailnet and Tailscale gave the node another: the gate refuses every
+  request under a name that is not its own, so free the name or create the workspace again.
+- **Claimed or not** is read from one thing: the claim code's file is in the gate's data until the first claim and
+  gone after it. The keeper looks at whether the file is there and how old it is, from the machine's side of the
+  gate's data, and never at what is in it. A code past its fifteen minutes is said too; a new one is made by
+  Automagik's `gate-control.mjs renew-claim` inside the gate's container, or by a restart of an unclaimed gate.
+- **The first claim is protected by the code alone.** Everyone who can reach the node's port 443 on your tailnet
+  can open the claim page; only the code lets them claim. Limit who reaches the node with your tailnet's access
+  rules for its tag, and claim soon after the start.
+- **The auth key** is handled like the tunnel's token: Arca's private `secrets/` directory, the machine's
+  `/etc/arca-secrets/TAILSCALE_AUTHKEY` (root's, mode 0600), and a copy in the machine's memory
+  (`/run/automagik-workspace/tailnet/authkey`, mode 0400) that the node is pointed at by path. It is in no
+  environment value, on no command line and in no output; the keeper keeps only its digest. The node uses the key
+  once: afterwards its identity is in its state.
+- **The node's state** is the machine's `/var/lib/automagik-workspace/tailnet`. It is the node's identity on your
+  tailnet and survives restarts of the container and of the machine. `service_remove` deletes it with the machine;
+  remove the node in Tailscale's admin console as well. A snapshot carries the identity: do not run a restored
+  copy beside the original.
+- **A new key** (`service_secret_set`, then `instance_start`) starts the node again; a node that is already
+  logged in keeps its identity and does not need the new key.
 
 What to know:
 
-- **The pinned server image.** `settings.serverImage` is build `3.128.0-8fb2e6f0` of the Automagik server, from
-  the Automagik repository's commit `8fb2e6f`: the first with the gate and its Cloudflare Access sign-in. An older
-  build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
+- **The pinned server image.** `settings.serverImage` is the build of the Automagik server from the Automagik
+  repository's commit `5fe0be6`. It has the gate, its Cloudflare Access sign-in, and the gate's own sign-in with
+  passkeys, which the tailnet reach uses; both reaches run it. Nothing of the Access sign-in changed between the
+  build pinned before (`8fb2e6f`) and this one. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
   tries again after a pause, and the public address leads nowhere. Everything this script takes from the image
-  (three paths, the two ports and the six variable names) is in one block at the top of `automagik-workspace.sh`,
-  as that commit has them; check the block when you move the pin to a later build.
+  (three paths, the two ports, the claim code's place and the seven variable names) is in one block at the top of
+  `automagik-workspace.sh`, as that commit has them; check the block when you move the pin to a later build.
 - **The first sign-in.** The server signs a browser in with a link that it writes once into its own data. Arca
   never reads that link, the keeper never reads the server's or the gate's data, and the keeper never copies their
   output to the console, so the link is in no `service_logs` answer and reaches no assistant. The way in is
@@ -2614,7 +2679,8 @@ What to know:
   is signed by your team, is for this application, has not expired and names one of the listed addresses), keeps
   the server's link to itself and signs that visitor in. No link leaves the machine. The sign-in happens when a
   page is opened; the workspace's live connections then ride on the gate's own session. Without the three Access
-  settings the gate is still the only door, and it has no sign-in to offer: nobody gets in.
+  settings the gate is still the only door, and nobody can sign in through the tunnel: the gate then waits for a
+  first claim on a port of its own (3083), which the connector is never pointed at.
 - **Access is the lock on the address.** Keep the Access policy to the addresses in `accessEmails`, and add the
   route only after it. The gate refuses a visitor Cloudflare did not sign in; the policy keeps strangers from
   reaching the gate at all. To check a proof the gate fetches your team's public keys from
@@ -3059,6 +3125,27 @@ stopping, the gate and the connector following a replaced server, the health wor
 no answer, a start that Docker refuses, the settings that are refused (by the keeper and, on the console, by the
 first boot), the first boot's packages, unit and console lines, its three failures, and that the token is in no
 output, no file outside the machine's memory and no command line.
+
+For the tailnet reach it covers the node's exact command line (the server's namespace, userspace networking, the
+key as a file's path, the state directory), its serve file (port 443 to the gate, nothing else, no Funnel), a gate
+started with the remote claim and none of the Access settings, that port 3083 is named nowhere, the key's file
+modes, a new key replacing the node only, a node that is not logged in, one that waits for approval, one under
+another name, the claim state said from the code file's presence and age, and that neither the key nor the claim
+code is in any output or command line. One test holds the script to its one reader of the claim code, which
+nothing calls.
+
+Not proven for the tailnet reach, because it needs a real tailnet:
+
+- that Tailscale's image starts as the script starts it (userspace networking with no capability, the key read
+  from `TS_AUTHKEY=file:<path>`, `TS_AUTH_ONCE`, the state directory) and logs in with a tagged key;
+- that its serve file is applied: HTTPS on 443 with a certificate for the tailnet name, every request handed to
+  `127.0.0.1:3082` with the visitor's `Host` header unchanged, WebSockets carried, and no other port answering;
+- that `tailscale status --json` on the socket the script names gives `BackendState` and `Self.DNSName` as the
+  keeper reads them;
+- that the node keeps its identity across a restart of the container and of the machine;
+- the gate's claim and passkey sign-in under a `ts.net` name, end to end, and that the claim code's file is there
+  and gone as the keeper expects;
+- the Tailscale screens named in the steps, which follow Tailscale's documentation and were not walked through.
 
 Not proven by these tests, because they need a real virtual machine, the images and a Cloudflare account:
 

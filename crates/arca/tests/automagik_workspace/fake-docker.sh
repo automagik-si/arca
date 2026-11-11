@@ -4,7 +4,9 @@
 # container is running while its directory holds the file `running`; the test stops one by removing that file and
 # writing `exit`. A container that joins another's network namespace starts only while that one runs, as with Docker.
 # A container given a directory at /run/arca-tunnel records the digest of the token file it finds there, as proof
-# that the token reached it as a file. While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it
+# that the token reached it as a file; one given a directory at /run/arca-tailnet does the same for the auth key it
+# finds there. `docker exec <name> tailscale ... status --json` prints $FAKE_DOCKER_DIR/tailnet-status.json (a node
+# that is still starting when there is no such file). While $FAKE_DOCKER_DIR/fail-inspect is there, `docker inspect` fails as it
 # does when the daemon cannot be reached. `docker exec` plays the image's health check: it prints the code in
 # $FAKE_DOCKER_DIR/health-<name> (401 when there is no such file) and succeeds on 401. Nothing here is Docker.
 set -u
@@ -16,7 +18,7 @@ command=${1-}
 
 case $command in
   run)
-    name='' token_dir='' joins=''
+    name='' token_dir='' token_file='' joins=''
     while [ $# -gt 0 ]; do
       case $1 in
         --name) name=$2; shift 2 ;;
@@ -25,7 +27,10 @@ case $command in
           shift 2
           ;;
         -v)
-          case $2 in *:/run/arca-tunnel:ro) token_dir=${2%:/run/arca-tunnel:ro} ;; esac
+          case $2 in
+            *:/run/arca-tunnel:ro) token_dir=${2%:/run/arca-tunnel:ro} token_file=token ;;
+            *:/run/arca-tailnet:ro) token_dir=${2%:/run/arca-tailnet:ro} token_file=authkey ;;
+          esac
           shift 2
           ;;
         -e | --restart | --user | --cap-drop | --security-opt | --entrypoint) shift 2 ;;
@@ -48,7 +53,7 @@ case $command in
     mkdir -p "$root/containers/$name"
     printf '%s\n' "${1-}" >"$root/containers/$name/image"
     : >"$root/containers/$name/log"
-    [ -z "$token_dir" ] || sha256sum <"$token_dir/token" | cut -d' ' -f1 >"$root/containers/$name/token.sha256"
+    [ -z "$token_dir" ] || sha256sum <"$token_dir/$token_file" | cut -d' ' -f1 >"$root/containers/$name/token.sha256"
     : >"$root/containers/$name/running"
     echo "0123456789ab"
     ;;
@@ -82,6 +87,10 @@ case $command in
     ;;
   exec)
     [ -e "$root/containers/$1/running" ] || exit 1
+    if [ "${2-}" = tailscale ]; then
+      cat "$root/tailnet-status.json" 2>/dev/null || echo '{"BackendState":"Starting","Self":{"DNSName":""}}'
+      exit 0
+    fi
     code=$(cat "$root/health-$1" 2>/dev/null || echo 401)
     echo "$code"
     [ "$code" = 401 ]

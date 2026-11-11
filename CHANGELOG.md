@@ -4,6 +4,15 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+- The `automagik-workspace` template can be reached on a tailnet instead of through a Cloudflare Tunnel:
+  `settings.reach` is `cloudflare` (as before, and when it is left out) or `tailnet`. With `tailnet` the machine
+  runs a Tailscale node (Tailscale's own image, by digest) in the server's network namespace, which serves HTTPS on
+  port 443 of the machine's tailnet name and hands every request to the gate; it serves nothing else and never
+  Funnel. Its one secret is `TAILSCALE_AUTHKEY`, handled like the tunnel's token, and the node's identity is kept
+  on the machine's disk. The gate then signs its owner in itself, with passkeys, after a first claim; the keeper
+  says whether the node is logged in, under which name, and whether the gate is claimed, and never reads the claim
+  code. Arca does not yet hand that code to the owner. Both reaches now pin the Automagik server build that has
+  the passkey sign-in (`5fe0be6`). See "On a tailnet instead" in `docs/OPERATING.md`.
 - A new shipped template, `automagik-workspace`: one Automagik workspace in its own virtual machine (2 CPUs, 4GiB,
   20GiB), published through a Cloudflare Tunnel whose connector runs inside the same machine. A keeper runs the
   Automagik server, its gate (the same image, the only door to the server) and the connector in one network
@@ -12,7 +21,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   public address and the owner's Cloudflare Access application (team domain, audience tag, allowed e-mail
   addresses), all three or none. The first boot says on the console what it installs and what failed, and the keeper
   says whether each part is healthy (HTTP 401) and whether the tunnel has registered. The pinned server image is the
-  first build with the gate and its Cloudflare Access sign-in (`3.128.0-8fb2e6f0`). No workspace was brought up on
+  first build with the gate and its Cloudflare Access sign-in. No workspace was brought up on
   a real machine in this work: see "An Automagik workspace in its own virtual machine" in `docs/OPERATING.md` for
   the steps and for what stays unproven.
 - Automagik Arca carries the Open Intelligence tag of the [we unfold](https://weunfold.ai/) movement, in its
