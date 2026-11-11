@@ -7,6 +7,10 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+- The README and `docs/QUICKSTART.md` now fetch the installer from the newest release
+  (`https://github.com/automagik-si/arca/releases/latest/download/install.sh`) and no longer from the `dev` branch:
+  what runs is the released `install.sh`, which that release's `SHA256SUMS` lists.
+
 ## 0.8.0 (2026-11-11)
 
 Releases are now cut by themselves: every change that lands on `dev` and ships is released, numbered and published

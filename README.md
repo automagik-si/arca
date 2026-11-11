@@ -31,7 +31,7 @@
 On a Linux machine with Incus ([what this does and does not do](docs/QUICKSTART.md#install-with-one-command)):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh | sh
+curl -fsSL https://github.com/automagik-si/arca/releases/latest/download/install.sh | sh
 ```
 
 ## How it works
