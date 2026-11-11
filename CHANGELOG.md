@@ -4,6 +4,17 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 
 ## Unreleased
 
+- The `automagik-workspace` template can be reached on a tailnet instead of through a Cloudflare Tunnel:
+  `settings.reach` is `cloudflare` (as before, and when it is left out) or `tailnet`. With `tailnet` the machine
+  runs a Tailscale node (Tailscale's own image, by digest) in a network namespace of its own, which serves HTTPS on
+  port 443 of the machine's tailnet name, never Funnel, and reaches the gate through a relay on a private network
+  that leads to the gate's port alone. The node never shares the server's namespace, where it would hand every
+  loopback port of the workspace to the tailnet. Its one secret is `TAILSCALE_AUTHKEY`, handled like the tunnel's token, and the node's identity is kept
+  on the machine's disk. The gate then signs its owner in itself, with passkeys, after a first claim; the keeper
+  says whether the node is logged in, under which name, and whether the gate is claimed, and never reads the claim
+  code. Arca does not yet hand that code to the owner. Both reaches now pin the Automagik server build that has
+  the passkey sign-in (`5fe0be6`). With the Cloudflare reach the connector is no longer started beside a gate that
+  has no Access settings, where nobody could sign in through it. See "On a tailnet instead" in `docs/OPERATING.md`.
 - An installer, `scripts/install.sh`: one command that leaves what the README's quickstart leaves, a read-only node
   for the user who runs it. It checks the machine first (Linux, x86_64, glibc 2.34 or newer, `curl`, `sha256sum`, a
   runtime directory that is the user's alone, an Incus socket this user may open) and, when something is missing, says
@@ -46,7 +57,7 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
   public address and the owner's Cloudflare Access application (team domain, audience tag, allowed e-mail
   addresses), all three or none. The first boot says on the console what it installs and what failed, and the keeper
   says whether each part is healthy (HTTP 401) and whether the tunnel has registered. The pinned server image is the
-  first build with the gate and its Cloudflare Access sign-in (`3.128.0-8fb2e6f0`). No workspace was brought up on
+  first build with the gate and its Cloudflare Access sign-in. No workspace was brought up on
   a real machine in this work: see "An Automagik workspace in its own virtual machine" in `docs/OPERATING.md` for
   the steps and for what stays unproven.
 - Automagik Arca carries the Open Intelligence tag of the [we unfold](https://weunfold.ai/) movement, in its
