@@ -23,6 +23,48 @@ Automagik Arca runs your services on machines you own. Set up the way the quicks
 
 [Start in five minutes](#quickstart-a-read-only-node-in-five-minutes) · [The full guide](docs/OPERATING.md) · [What changed](CHANGELOG.md)
 
+## Install with one command
+
+[`scripts/install.sh`](scripts/install.sh) does the quickstart below for you, for the user who runs it. It needs what
+the quickstart needs (x86_64 Linux with glibc 2.34 or newer, a running Incus that this user can reach) and `curl` and
+`sha256sum`.
+
+**Download it, read it, run it.**
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh
+less install.sh
+sh install.sh
+```
+
+**Or in one line.** The script runs as soon as it has arrived, so use this only when you trust the address:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh | sh
+```
+
+To hand it to a coding agent, paste this: *Download
+`https://raw.githubusercontent.com/automagik-si/arca/dev/scripts/install.sh`, read it, run it with `sh`, and tell me
+what it printed.*
+
+- **It checks first.** Linux, x86_64, glibc, `curl`, `sha256sum`, and an Incus socket this user may open. When one is
+  missing it says which and how to fix it, and stops before it has changed anything. It never runs `sudo`, and it writes
+  only in your home directory.
+- **It installs one named release**, the one the quickstart names, checked against that release's `SHA256SUMS`, at
+  `~/.local/bin/arca`. `sh install.sh --version <version>` names another.
+- **It writes the quickstart's config and mints one `viewer` token**, only where there is no config. A config that
+  exists is not changed, and the script says so.
+- **It runs the node as a service**, `arca.service`, a systemd user unit. Where `systemctl --user` does not answer, it
+  prints the one command that starts the node and starts nothing.
+- **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
+  token), and the two ways to connect an assistant from step 4 below.
+- **A second run** replaces the program in place and restarts the service. `sh install.sh --uninstall` removes the
+  program and the service, and keeps the config, the tokens and the state.
+
+**Not yet:** the script is read from the `dev` branch, so no release's checksum covers it yet. It is tested against
+stand-ins for the download, the program and systemd, and it was run for real on one machine that already had Incus and
+Arca; it has not been run on a machine that never had either. There is no installer for a Mac.
+
 ## Quickstart: a read-only node in five minutes
 
 You need an x86_64 Linux host with glibc 2.34 or newer (Enterprise Linux 9, Ubuntu 22.04, Debian 12, or newer), a running

@@ -1466,6 +1466,11 @@ Both units restart on failure after 10 seconds, at most 5 times in 10 minutes (`
 use systemd specifiers only (`%h` for the home directory, `%t` for the user's runtime directory), so they carry no
 host-specific value.
 
+`scripts/install.sh` (README, "Install with one command") installs a unit of its own instead, `arca.service`: the
+node alone, reading the Incus socket its config names, with no shim and no memory limit, and with the same restart
+rule. It is for a first read-only node. The installer refuses a user who has either of the two units above, and its
+`--uninstall` leaves the program in place for them.
+
 What the host needs:
 
 - The service's user can read the Incus socket, for example through the group that owns it.
