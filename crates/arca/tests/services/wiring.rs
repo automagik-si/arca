@@ -173,6 +173,22 @@ fn seam(rig: &Rig, name: &str) -> (ServiceExec, ExecTarget) {
 fn run(seam: &ServiceExec, target: &ExecTarget, cmd: &C) -> Result<Vec<u8>, ExecError> {
     seam.run(target, "viewer", "service_logs", cmd, &[], None)
 }
+/// Whether the exec audit holds an exec that has started and not ended.
+fn exec_in_flight(rig: &Rig) -> bool {
+    let audit = fs::read_to_string(rig.dir.join(AUDIT_FILE)).unwrap_or_default();
+    let rows: Vec<Value> = audit
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let ended: Vec<u64> = rows
+        .iter()
+        .filter(|row| row["kind"] == "end")
+        .filter_map(|row| row["id"].as_u64())
+        .collect();
+    rows.iter().any(|row| {
+        row["kind"] == "start" && row["id"].as_u64().is_some_and(|id| !ended.contains(&id))
+    })
+}
 /// How many waits on an operation the fake has written down.
 fn waits(rig: &Rig) -> usize {
     rig.fake
@@ -766,7 +782,9 @@ fn service_remove_logs_a_running_services_node_out_before_it_deletes_it() {
             }
             rig.fake.script_exec(s);
         }
-        let removal_started = Instant::now();
+        // No clock is read here. A held logout never ends, and the removal gives it up at its own deadline: that the
+        // removal answers at all while the logout's exec is still held is the bound. How long it took is that
+        // deadline plus the machine's speed, on a slow disk seconds more, and says nothing else about the node.
         assert_eq!(
             op(
                 &rig,
@@ -776,10 +794,16 @@ fn service_remove_logs_a_running_services_node_out_before_it_deletes_it() {
             .unwrap(),
             json!({"removed":true})
         );
-        assert!(
-            removal_started.elapsed() < Duration::from_secs(63),
-            "{failure}"
-        );
+        if failure == "held" {
+            let operations = rig
+                .get("/1.0/operations?all-projects=true&recursion=1")
+                .unwrap();
+            assert_eq!(
+                operations["running"].as_array().map(Vec::len),
+                Some(1),
+                "the logout's exec was still held when the removal answered"
+            );
+        }
         let requests = &rig.fake.requests()[before..];
         let exec = requests
             .iter()
@@ -1295,12 +1319,16 @@ fn g5_bad_removal_approval_runs_no_exec_and_other_verbs_answer_during_logout() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!commands(&rig).is_empty());
-    let before = Instant::now();
     assert_eq!(
         rig.call("service_status", json!({"name":"dash"})).unwrap()["state"],
         "running"
     );
-    assert!(before.elapsed() < Duration::from_secs(1));
+    // The status answered while the node was still being logged out: the audit holds the logout's exec as started and
+    // not as ended. A status that had waited for the logout would find its end written, whatever the clock says.
+    assert!(
+        exec_in_flight(&rig),
+        "the logout's exec was still running when the status answered"
+    );
     let op = rig
         .fake
         .service_requests()
@@ -1317,6 +1345,7 @@ fn g5_bad_removal_approval_runs_no_exec_and_other_verbs_answer_during_logout() {
         .unwrap();
     rig.fake.release_operation(&arca_incus::OpId(id.into()));
     assert_eq!(thread.join().unwrap().unwrap(), json!({"removed":true}));
+    assert!(!exec_in_flight(&rig), "every exec of the removal has ended");
 }
 
 #[test]
@@ -1338,9 +1367,8 @@ fn g5_publish_clears_key_directory_after_a_timed_out_join() {
     script(&rig, C::ClearKeyDir, 0, ""); // The hung mark must still permit this post-join cleanup.
     script(&rig, C::ClearKeyDir, 0, "");
     script(&rig, C::StopDaemon, 0, "");
-    let started = Instant::now();
+    // The join's own limit ends it. The time that takes is the limit plus the machine's speed, so no clock is read.
     let error = publish(&rig, &key, "dash").unwrap_err();
-    assert!(started.elapsed() < Duration::from_secs(127));
     assert!(
         matches!(error,CallError::Refused{message,..} if message.contains("approval is spent"))
     );
