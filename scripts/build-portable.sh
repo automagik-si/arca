@@ -17,6 +17,10 @@
 # Prints the zig that built the binary, the binary's path, its SHA-256 and the highest GLIBC
 # symbol version it needs. Exits non-zero when that version is above the ceiling, when no
 # such version can be read, or when any step fails.
+#
+# The binary carries no path of the build machine: cargo's registry sources and this checkout
+# are compiled under fixed names (/cargo/registry/src and /arca), and the script fails when the
+# home directory, cargo's home or the checkout's path is still found in the binary.
 set -euo pipefail
 
 # The glibc the binary may need at most. 2.34 is Enterprise Linux 9.
@@ -95,6 +99,21 @@ zig_version="$("$CARGO_ZIGBUILD_ZIG_COMMAND" version)"
 [ "$zig_version" = "$ZIG_VERSION" ] ||
     fail "$CARGO_ZIGBUILD_ZIG_COMMAND is zig $zig_version, not the pinned $ZIG_VERSION"
 
+# rustc writes the path of each source file it compiled into the binary's panic messages. The two
+# places those files come from, cargo's registry sources and this checkout, are given fixed names,
+# so the binary does not name the build machine's home directory. Flags the caller already set are
+# kept; they go in CARGO_ENCODED_RUSTFLAGS, whose separator lets a path hold a space.
+cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+sep=$'\x1f'
+if [ -z "${CARGO_ENCODED_RUSTFLAGS-}" ] && [ -n "${RUSTFLAGS-}" ]; then
+    read -r -a inherited <<<"$RUSTFLAGS"
+    CARGO_ENCODED_RUSTFLAGS="$(IFS="$sep" && printf '%s' "${inherited[*]}")"
+fi
+CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+$CARGO_ENCODED_RUSTFLAGS$sep}--remap-path-prefix=$cargo_home/registry/src=/cargo/registry/src"
+CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS$sep--remap-path-prefix=$repo=/arca"
+export CARGO_ENCODED_RUSTFLAGS
+unset RUSTFLAGS
+
 cd "$repo"
 "$zigbuild_dir/cargo-zigbuild" zigbuild --release --locked -p arca --bin arca --target "$RUST_TARGET.$GLIBC_CEILING"
 
@@ -103,6 +122,13 @@ target_dir="$(cargo metadata --format-version 1 --no-deps --locked |
 [ -n "$target_dir" ] || fail "could not read the target directory from cargo metadata"
 binary="$target_dir/$RUST_TARGET/release/arca"
 [ -x "$binary" ] || fail "the build did not produce $binary"
+
+# No path of the build machine may be left in the binary.
+for private in "$HOME" "$cargo_home" "$repo"; do
+    [ -n "$private" ] || continue
+    ! grep -a -q -F -- "${private%/}/" "$binary" ||
+        fail "the binary still names a path under $private"
+done
 
 # The highest GLIBC_x.y version among the dynamic symbols is the oldest glibc that can load
 # the binary. objdump runs as its own command so that its failure stops the script; a binary
