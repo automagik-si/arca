@@ -541,6 +541,139 @@ fn the_installer_s_version_line_is_one_field_like_the_others() {
     );
 }
 
+/// The check that no path of the build machine is left in the binary, run through the build script's own
+/// `--check-paths` on stand-in files, in a scratch repository on a machine whose home directory is `/home/runner`, as
+/// on GitHub's runners. A template of that repository names `/home/runner/_work`, a path inside a container.
+#[test]
+fn the_build_refuses_a_path_of_the_build_machine_and_not_the_repository_s_own_text() {
+    let scratch = Scratch::new("paths");
+    scratch.write(
+        "scripts/build-portable.sh",
+        &fs::read_to_string(Path::new(REPO).join("scripts/build-portable.sh")).expect("the script"),
+    );
+    let template = "docker run -v \"$dir/work:/home/runner/_work\" \\\n  cp -a \"$POOL-externals:/home/runner/.\" \"$RUNNER_HOME/\"\n";
+    scratch.write("templates/pool.sh", template);
+    scratch.git(&["add", "-A"]);
+    scratch.git(&["commit", "-q", "-m", "feat(templates): a pool"]);
+    let repo = scratch.0.to_str().expect("a path").to_string();
+    let check = |name: &str, content: &[u8], cargo_home: Option<&str>| {
+        let file = scratch.0.join(name);
+        fs::write(&file, content).expect("write");
+        let mut command = Command::new("bash");
+        command
+            .arg(scratch.0.join("scripts/build-portable.sh"))
+            .arg("--check-paths")
+            .arg(&file)
+            .env("HOME", "/home/runner")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("CARGO_HOME");
+        if let Some(home) = cargo_home {
+            command.env("CARGO_HOME", home);
+        }
+        let out = command.output().expect("run scripts/build-portable.sh");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+    // A program as the compiler leaves it: the template's text among other bytes, and sources under their fixed names.
+    let mut program = b"\x7fELF\0\0/cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.8/src/lib.rs/arca/crates/arca/src/lib.rs\0".to_vec();
+    program.extend_from_slice(template.as_bytes());
+    program.extend_from_slice(
+        b"\0/rustc/sysroot/lib/rustlib/src/rust/library/core/src/option.rs\0\xff\xfe",
+    );
+
+    // The repository's own text is not a path of the build machine, though it starts with the home directory.
+    let (code, said) = check("clean", &program, None);
+    assert_eq!(code, Some(0), "{said}");
+
+    // Each of these is one: a registry source, a git checkout, the toolchain's sources, the checkout itself, a file the
+    // build made, and a path that only starts like the template's. Every one is refused, and named.
+    let leaks = [
+        "/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ring-0.17.8/src/lib.rs".to_string(),
+        "/home/runner/.cargo/git/checkouts/dep-0a7fdb298878dfd0/1234abc/src/lib.rs".to_string(),
+        "/home/runner/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/option.rs".to_string(),
+        "/home/runner/.cache/arca-portable-tools/zig-0.17.1/lib/libc/glibc/x.c".to_string(),
+        "/home/runner/_work/arca/arca/target/release/build/x-1/out/gen.rs".to_string(),
+        format!("{repo}/crates/arca/src/lib.rs"),
+    ];
+    for leak in &leaks {
+        let mut with = program.clone();
+        with.extend_from_slice(leak.as_bytes());
+        with.push(0);
+        let (code, said) = check("leaky", &with, None);
+        assert_eq!(code, Some(1), "{leak} is refused: {said}");
+        assert!(
+            said.contains("names 1 path(s) of the build machine"),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("\n  {leak}\n")),
+            "{leak} is named: {said}"
+        );
+        assert!(
+            !said.contains("/home/runner/_work\n") && !said.contains("/home/runner/.\n"),
+            "the template's text is not named: {said}"
+        );
+        assert!(
+            said.ends_with("build-portable: the binary still names a path of the build machine\n")
+        );
+    }
+    // All at once: counted, and listed.
+    let mut all = program.clone();
+    for leak in &leaks {
+        all.extend_from_slice(leak.as_bytes());
+        all.push(b'\n');
+    }
+    let (code, said) = check("leaky", &all, None);
+    assert_eq!(code, Some(1));
+    assert!(
+        said.contains("names 6 path(s) of the build machine"),
+        "{said}"
+    );
+
+    // Cargo's home somewhere else is refused there too.
+    let mut elsewhere = program.clone();
+    elsewhere.extend_from_slice(b"\0/opt/cargo/registry/src/x-1.0.0/src/lib.rs\0");
+    let (code, said) = check("elsewhere", &elsewhere, Some("/opt/cargo"));
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains("\n  /opt/cargo/registry/src/x-1.0.0/src/lib.rs\n"),
+        "{said}"
+    );
+    let (code, said) = check("elsewhere", &elsewhere, None);
+    assert_eq!(code, Some(0), "not a directory of this build: {said}");
+
+    // The text is the product's only while a file the binary is built from holds it. Once the template is gone the
+    // same bytes are refused, and the same words in a test, a document or a script excuse nothing.
+    scratch.git(&["rm", "-q", "templates/pool.sh"]);
+    for elsewhere in ["crates/a/tests/pool.rs", "docs/POOL.md", "scripts/pool.sh"] {
+        scratch.write(elsewhere, template);
+    }
+    scratch.git(&["add", "-A"]);
+    scratch.git(&["commit", "-q", "-m", "feat(templates): no pool"]);
+    let (code, said) = check("clean", &program, None);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains("names 2 path(s) of the build machine"),
+        "{said}"
+    );
+    assert!(
+        said.contains("\n  /home/runner/.\n") && said.contains("\n  /home/runner/_work\n"),
+        "{said}"
+    );
+    // In a source file of a crate it is the product's text again.
+    scratch.write(
+        "crates/a/src/pool.rs",
+        &format!("const POOL: &str = r#\"{template}\"#;\n"),
+    );
+    scratch.git(&["add", "-A"]);
+    scratch.git(&["commit", "-q", "-m", "feat(a): a pool"]);
+    let (code, said) = check("clean", &program, None);
+    assert_eq!(code, Some(0), "{said}");
+}
+
 /// scripts/release.sh, run whole in a scratch repository whose build is a stand-in that reports a program saying the
 /// right version line. The script's own steps are the real ones.
 #[test]
