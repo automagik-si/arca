@@ -2512,18 +2512,28 @@ the template's settings with those values in place of the defaults, at `/etc/arc
 refused, before anything is created, and in words that name the setting:
 
 - a name the template does not list (here `pin`), or any `settings` for a template that lists none;
-- a value of another type than the template's default: text for a number, `2.5` for a whole number, a list for an
-  object;
-- a control character anywhere in a value, and a value nested more than eight deep;
-- for a setting whose default is an `https://` address, anything but a plain `https://<host>/<path>`: no user or
-  password (`@`), no query (`?`), no fragment (`#`), nothing percent-encoded. Such a setting decides where the machine
-  sends a credential, so it is never taken loosely;
+- a value of another shape than the template's default, at every level: text for a number, `2.5` for a whole number,
+  a list for an object; in a list, an element unlike the default's first one; in an object, a key the default does
+  not have. The refusal names the place, such as `settings.classes[2].memory`;
+- a number that would not read back the same when the create is approved: `2.0` for a whole number, or a whole
+  number of 2^53 or more; and a negative number where the default is not negative;
+- a control character anywhere in a value, a character that reorders or hides text (a right-to-left override, a
+  zero-width space), and a value nested more than eight deep;
+- for a setting whose default is an `https://` address, anything but a plain `https://<host>/<path>` on the
+  default's own host: no user or password (`@`), no query (`?`), no fragment (`#`), nothing percent-encoded, and no
+  other host or port. A create changes the path only. Such a setting decides where the machine sends a credential,
+  so a template for another host is a template of its own;
+- for a setting whose default is a size such as `4GiB`, anything but a size above zero of at most six digits, and
+  under a key named `memory` more than the machine's own memory (the template's `limits.memory`);
 - settings that pass 16KiB once merged.
 
 Settings are fixed at create, like the rest of a virtual machine's first boot: to change one, create the service
 again. They never hold a secret, and Arca shows them: `service_status` answers `settings`, the object the machine
 was created with, and when a create is proposed the owner's card has one row for each setting it replaces, with its
-value, so an address is seen before it is approved. The service's record keeps the replaced values as `vm.settings`.
+value in words, so an address is seen before it is approved. A list has one row for each element (`Setting classes
+1`, `Setting classes 2`), each with its fields, so a long list is shown whole. The card cuts nothing: a proposal whose
+setting would need a row of more than 160 characters is refused when it is made, naming the row, and nothing is asked
+of the owner. The service's record keeps the replaced values as `vm.settings`.
 
 **Which image a machine was made from.** A template may name its image by an alias (`images:debian/13/cloud`), which
 does not say which build that was. `service_status` adds `baseImage`, the fingerprint (SHA-256) Incus recorded on the
@@ -2890,9 +2900,9 @@ since it is where the pool's credential will be used.
 
 | Setting | At create | Meaning |
 |---------|-----------|---------|
-| `url` | yes | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). A plain `https` address: Arca refuses one with a user name, a query or a fragment, and so does the pool. |
+| `url` | yes | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). A plain `https` address on the template's own host, `github.com`: a create changes the path only, and Arca refuses another host, a port, a user name, a query or a fragment, as the pool does. |
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
-| `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. |
+| `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
 | `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. |
 | `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |

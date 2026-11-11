@@ -160,7 +160,11 @@ size_bytes() {
   local value=$1 number unit
   number=${value%%[!0-9]*}
   unit=${value#"$number"}
-  [ -n "$number" ] || return 1
+  # One to six digits, and not zero: six digits of the largest unit still fit the shell's arithmetic, a longer number
+  # would wrap around to a negative size, and a slot of no memory is no slot.
+  case $number in '' | ???????*) return 1 ;; esac
+  number=$((10#$number))
+  [ "$number" -gt 0 ] || return 1
   case $unit in
     B) echo "$number" ;;
     kB) echo $((number * 1000)) ;;
@@ -276,6 +280,11 @@ load_settings() {
     return 1
     ;;
   esac
+  if [ ${#GROUP} -gt 15 ] || [ -z "$MAX_SLOTS" ] || [ ${#MAX_SLOTS} -gt 4 ]; then
+    say "settings: runnerGroupId and maxSlots are whole numbers"
+    return 1
+  fi
+  MAX_SLOTS=$((10#$MAX_SLOTS))
   if [ -z "$reserve" ] || [ -z "$docker_cache" ] || [ -z "$dependency_cache" ]; then
     say "settings: reserveMemory, dockerCache and dependencyCache are sizes such as 4GiB"
     return 1
@@ -288,14 +297,18 @@ load_settings() {
   local name labels labels_json cpu memory slots bytes n
   while IFS=$'\t' read -r name labels labels_json cpu memory slots; do
     bytes=$(size_bytes "$memory") || bytes=''
+    # Each number is checked for its length before it is compared: a number too long for the shell's arithmetic is
+    # an error there, not a size.
     if [ -z "$name" ] || [ -n "${name//[a-z0-9]/}" ] || [ ${#name} -gt 16 ] ||
       [ -z "$labels" ] || [ -n "${labels//[A-Za-z0-9._,-]/}" ] ||
-      [ -z "$cpu" ] || [ -n "${cpu//[0-9]/}" ] || [ "$cpu" -lt 1 ] ||
-      [ -z "$slots" ] || [ -n "${slots//[0-9]/}" ] || [ "$slots" -lt 1 ] || [ "$slots" -gt 256 ] ||
+      [ -z "$cpu" ] || [ -n "${cpu//[0-9]/}" ] || [ ${#cpu} -gt 4 ] || [ "$((10#$cpu))" -lt 1 ] ||
+      [ -z "$slots" ] || [ -n "${slots//[0-9]/}" ] || [ ${#slots} -gt 3 ] || [ "$((10#$slots))" -lt 1 ] || [ "$((10#$slots))" -gt 256 ] ||
       [ -z "$bytes" ]; then
       say "settings: class ${name:-(unnamed)} needs a name of a-z and 0-9, labels of letters, digits, dots, dashes and underscores, a cpu count, a memory size such as 4GiB and a slots count of 1 to 256"
       return 1
     fi
+    cpu=$((10#$cpu))
+    slots=$((10#$slots))
     CLASS_NAMES+=("$name")
     for ((n = 0; n < slots; n++)); do
       SLOT_CLASS+=("$name")
@@ -499,11 +512,21 @@ set_state() {
 # Text from a job, made safe for one line of a console and one field of a tab-separated file.
 plain() { printf '%s' "$1" | tr -c 'A-Za-z0-9 ._:/()#@+,=-' '?' | cut -c1-120; }
 
-# When the job a runner's output names began, as seconds: the runner prints the time before "Running job:". Now, when
-# the time cannot be read.
+# The name of the job a runner's output names: what follows "Running job: " on the runner's own line, which begins
+# with the time. A line of another shape is read as before.
+job_name() {
+  local name
+  name=$(printf '%s\n' "$1" | sed -n 's/^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z: Running job: //p' | head -n1)
+  [ -n "$name" ] || name=$(printf '%s\n' "$1" | sed -n 's/.*Running job: //p' | head -n1)
+  plain "$name"
+}
+
+# When that job began, as seconds: the runner begins the line with the time. Only the time at the very start of the
+# line is read, so a job whose name holds a time and the words "Running job:" cannot set it. Now, when the time
+# cannot be read.
 job_began() {
   local stamp at
-  stamp=$(printf '%s\n' "$1" | sed -n 's/.*\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\)Z: Running job: .*/\1/p' | head -n1)
+  stamp=$(printf '%s\n' "$1" | sed -n 's/^\([0-9]\{4\}-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\)Z: Running job: .*/\1/p' | head -n1)
   at=$(date -u -d "$stamp UTC" +%s 2>/dev/null) || at=''
   case $at in '' | *[!0-9]*) now ;; *) echo "$at" ;; esac
 }
@@ -666,7 +689,7 @@ slot_cycle() {
     [ -n "$busy_since" ] || lines=$(docker logs "$runner" 2>&1)
     case $lines in *'Running job: '*)
       busy_since=$(job_began "$lines")
-      job=$(plain "$(printf '%s\n' "$lines" | sed -n 's/.*Running job: //p' | head -n1)")
+      job=$(job_name "$lines")
       set_state "$slot" busy "$name ${job:+job \"$job\"}"
       ;;
     esac
@@ -702,7 +725,7 @@ slot_cycle() {
   lines=$(docker logs "$runner" 2>&1)
   if [ -z "$busy_since" ] && [[ $lines == *'Running job: '* ]]; then
     busy_since=$(job_began "$lines")
-    job=$(plain "$(printf '%s\n' "$lines" | sed -n 's/.*Running job: //p' | head -n1)")
+    job=$(job_name "$lines")
   fi
   result=$(printf '%s\n' "$lines" | sed -n 's/.*completed with result: \([A-Za-z]*\).*/\1/p' | tail -n1)
   lines=''
@@ -725,7 +748,11 @@ slot_cycle() {
     slot_reap "$slot"
     slot_abandon "$slot" "$runner_id"
     case $updating in
-      1) slot_failed "$slot" "its runner stopped (exit $code) while it was updating itself, before it took a job" ;;
+      1)
+        slot_failed "$slot" "its runner stopped (exit $code) while it was updating itself, before it took a job"
+        # The update replaces the runner's own files: if it fails with them layered, the next runners start plain.
+        [ -z "$layered" ] || plain_home "A runner stopped while it was updating itself with its files layered"
+        ;;
       finished) slot_failed "$slot" "its runner stopped (exit $code) after it had updated itself, before it took a job" ;;
       *)
         slot_failed "$slot" "its runner stopped (exit $code) before it took a job"

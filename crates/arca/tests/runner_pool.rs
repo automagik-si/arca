@@ -1862,6 +1862,33 @@ fn settings_that_cannot_be_used_are_said_in_words_and_nothing_is_registered() {
             with("runnerImage", Value::Null),
             "settings: runnerImage and dockerImage are required",
         ),
+        // A size no arithmetic can hold, and a size of nothing. (A class larger than the memory there is for slots is
+        // a warning, not a refusal: the other classes still run.)
+        (
+            with(
+                "classes",
+                json!([{ "name": "small", "labels": ["arca"], "cpu": 2, "memory": "8589934592GiB", "slots": 1 }]),
+            ),
+            "settings: class small needs a name",
+        ),
+        (
+            with(
+                "classes",
+                json!([{ "name": "small", "labels": ["arca"], "cpu": 2, "memory": "0GiB", "slots": 1 }]),
+            ),
+            "settings: class small needs a name",
+        ),
+        (
+            with(
+                "classes",
+                json!([{ "name": "small", "labels": ["arca"], "cpu": 2, "memory": "4GiB", "slots": "99999999999999999999" }]),
+            ),
+            "settings: class small needs a name",
+        ),
+        (
+            with("maxSlots", json!("99999999999999999999")),
+            "settings: runnerGroupId and maxSlots are whole numbers",
+        ),
         (
             with("classes", json!([])),
             "settings: classes needs at least one class",
@@ -2270,6 +2297,19 @@ fn a_runner_github_tells_to_update_updates_inside_its_container_and_then_takes_i
         pool.output().contains("slot 0 (small) failed: its runner stopped (exit 1) while it was updating itself, before it took a job")
     });
     assert_eq!(pool.jobs().len(), 0);
+    // The update replaces the runner's own files, and this runner had them layered: the next runners start with
+    // their image's own files, said once, as after a mount that failed.
+    wait_for(&pool, "the pool back to plain files", || {
+        pool.output().contains("A runner stopped while it was updating itself with its files layered. Runners start with their image's own files from now on")
+    });
+    wait_for(&pool, "a runner without the layer", || {
+        pool.read("docker/calls.log")
+            .lines()
+            .filter(|line| line.starts_with("run ") && line.contains(RUNNER_IMAGE))
+            .next_back()
+            .is_some_and(|run| !run.contains(":/home/runner "))
+    });
+    assert_eq!(pool.output().matches("with its files layered").count(), 1);
     pool.stop();
     let _ = fs::remove_dir_all(scratch);
 }
@@ -2474,6 +2514,16 @@ fn a_running_job_is_shown_as_busy_and_is_timed_from_when_it_began() {
     // Timed from the runner's own "Running job" line: about two seconds, not the five since the runner started.
     let seconds: u64 = pool.jobs()[0][6].parse().expect("seconds");
     assert!((1..=3).contains(&seconds), "{seconds}");
+    // A job whose name holds a time and the runner's own words cannot set when it began: only the time the line
+    // starts with is read. The name is kept as the runner printed it.
+    let sneaky = "sneaky 2001-01-01 00:00:00Z: Running job: other";
+    wait_for(&pool, "a fresh runner", || github.live().len() == 1);
+    github.queue(&["arca"], sneaky, 1.0);
+    wait_for(&pool, "the second job", || pool.jobs().len() == 2);
+    let second = &pool.jobs()[1];
+    assert_eq!(second[4], sneaky);
+    let seconds: u64 = second[6].parse().expect("seconds");
+    assert!(seconds <= 3, "{seconds}");
     assert_eq!(pool.stop(), Some(0));
     // The pool never asks Docker for a runner's processes: it reads the runner's own lines.
     assert!(

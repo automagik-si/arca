@@ -1061,16 +1061,24 @@ enter Incus's instance config.
   unchanged. Neither may hold a secret, and nothing is changed on a virtual machine after its create (Rule 59), so a changed
   script or setting applies to a machine created after the change.
 - `createSettings` lists the top-level keys of `settings` that one `service_create` may replace with its own `settings`
-  argument. The value in the template is the default and gives the type. `create_settings` refuses, before any write and
-  again when a create is proposed: a key that is not listed; a value of another JSON type than the default (a whole
-  number stays whole); a control character in any string or key, or more than eight levels; and, where the default is an
-  `https://` address, anything but `https://<host>[:<port>][/<path>]` with a plain host and path (`https_address_ok`: no
-  `@`, `?`, `#`, `%`, space or backslash), since such a setting decides where the guest sends a credential; and a merged
+  argument. The value in the template is the default and gives the shape. `create_settings` refuses, before any write and
+  again when a create is proposed, and names the place down to a list's element (`setting_refusal`): a key that is not
+  listed; at any level a value of another JSON type than the default, an element of a list unlike the default's first,
+  or a key the default's object does not have; a number that does not read back the same from the canonical JSON an
+  approval's digest is made over (`2.0`, a whole number of 2^53 or more), which before this check spent the owner's
+  approval on an internal error, and a negative number where the default is not negative; a control character or a
+  character that reorders or hides text (the bidirectional controls, zero-width characters) in any string or key, or
+  more than eight levels; where the default is an `https://` address, anything but `https://<host>[/<path>]` with a
+  plain path (`https_address_ok`: no `@`, `?`, `#`, `%`, space or backslash) on the default's own host and port, since
+  such a setting decides where the guest sends a credential; where the default is a size, anything but a size above
+  zero of at most six digits, and under a key named `memory` more than the template's `limits.memory`; and a merged
   object over the settings size. The machine's `cloud-init.vendor-data` is built from the merged object; the record
   keeps the replaced values as `vm.settings`, and a record of a create that gave none has no such key and is the record
   of before. `service_status` answers `settings`, read back from the record's vendor data (`Vm::guest_settings`), so it
   is what the machine got whatever the template says later; the owner's card has one row for each replaced key with its
-  value (`ActionKind::details`), control characters removed and a long value cut with an ellipsis. Settings never hold a
+  value in words, and for a list one row for each element (`setting_rows`). The card cuts nothing a proposal carries:
+  `ActionKind::prepare` refuses a setting whose row would pass 160 characters (`SETTING_ROW_MAX`), so the owner
+  approves exactly what is shown. Settings never hold a
   secret. Tests in `crates/arca/tests/services/create_settings.rs`.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual

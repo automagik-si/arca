@@ -20,7 +20,7 @@ fn pool_template() -> Value {
             "group": 1,
             "ratio": 1.5,
             "open": false,
-            "classes": [{ "name": "small", "labels": ["a"], "slots": 1 }],
+            "classes": [{ "name": "small", "labels": ["a"], "cpu": 2, "memory": "2GiB", "slots": 1 }],
             "limits": { "slots": 2 },
             "pin": "registry.example/runner@sha256:1111",
             "note": "plain text"
@@ -173,25 +173,92 @@ fn a_setting_the_template_does_not_list_a_wrong_type_or_a_loose_address_is_refus
             json!({ "url": null }),
             "settings.url: expected a string, the type of the template's default".into(),
         ),
-        // No control character, in a string or in a key, however deep.
+        // No control character, in a string or in a key, however deep; and no character that reorders or hides the
+        // text on the owner's card (a right-to-left override, a zero-width space).
         (
             json!({ "note": "two\nlines" }),
-            "settings.note: a value holds no control character and nests at most eight deep".into(),
+            "settings.note: a value holds no control character and no character that reorders or hides text".into(),
         ),
         (
             json!({ "classes": [{ "name": "a\u{1b}[31m" }] }),
-            "settings.classes: a value holds no control character and nests at most eight deep"
-                .into(),
+            "settings.classes[1].name: a value holds no control character and no character that reorders or hides text".into(),
         ),
         (
             json!({ "limits": { "a\tb": 1 } }),
-            "settings.limits: a value holds no control character and nests at most eight deep"
-                .into(),
+            "settings.limits: a key holds no control character and no character that reorders or hides text".into(),
         ),
         (
+            json!({ "note": "pay \u{202e}eno ot\u{202c} nobody" }),
+            "settings.note: a value holds no control character and no character that reorders or hides text".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small" }, { "name": "sm\u{200b}all" }] }),
+            "settings.classes[2].name: a value holds no control character and no character that reorders or hides text".into(),
+        ),
+        // Every element of a list is like the default's first: the same types, and no key it does not have.
+        (
             json!({ "classes": [[[[[[[[[1]]]]]]]]] }),
-            "settings.classes: a value holds no control character and nests at most eight deep"
-                .into(),
+            "settings.classes[1]: expected an object, the type of the template's default".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "slots": "3" }] }),
+            "settings.classes[1].slots: expected a whole number, the type of the template's default".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "labels": "a" }] }),
+            "settings.classes[1].labels: expected a list, the type of the template's default".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "colour": "red" }] }),
+            "settings.classes[1].colour: the template's default has no such key (it has cpu, labels, memory, name, slots)".into(),
+        ),
+        // A number must read back the same when the create is approved: 2.0 would come back as 2, and a whole
+        // number of 2^53 or more as another number. Either would spend the owner's approval on an error.
+        (
+            json!({ "classes": [{ "name": "small", "cpu": 2.0 }] }),
+            "settings.classes[1].cpu: expected a whole number, the type of the template's default".into(),
+        ),
+        (
+            json!({ "ratio": 2.0 }),
+            "settings.ratio: a number is a whole number below 2^53 written without a fraction, or a number with a fraction: anything else does not read back the same when the create is approved".into(),
+        ),
+        (
+            json!({ "group": 9007199254740992u64 }),
+            "settings.group: a number is a whole number below 2^53 written without a fraction, or a number with a fraction: anything else does not read back the same when the create is approved".into(),
+        ),
+        (
+            json!({ "group": -1 }),
+            "settings.group: expected a whole number of 0 or more".into(),
+        ),
+        // A size is a size, above zero, that no arithmetic can overflow; a memory is at most the machine's.
+        (
+            json!({ "classes": [{ "name": "small", "memory": "8589934592GiB" }] }),
+            "settings.classes[1].memory: expected a size such as 2GiB, above zero and at most the machine's memory (4GiB)".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "memory": "0GiB" }] }),
+            "settings.classes[1].memory: expected a size such as 2GiB, above zero and at most the machine's memory (4GiB)".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "memory": "8GiB" }] }),
+            "settings.classes[1].memory: expected a size such as 2GiB, above zero and at most the machine's memory (4GiB)".into(),
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "memory": "lots" }] }),
+            "settings.classes[1].memory: expected a size such as 2GiB, above zero and at most the machine's memory (4GiB)".into(),
+        ),
+        // An address keeps the template's host: a create changes the path only.
+        (
+            json!({ "url": "https://elsewhere.example/example-org" }),
+            "settings.url: its host is git.example, as in the template's default: a create changes the path only, since the machine sends its credential to that host".into(),
+        ),
+        (
+            json!({ "url": "https://git.example:8443/example-org" }),
+            "settings.url: its host is git.example, as in the template's default: a create changes the path only, since the machine sends its credential to that host".into(),
+        ),
+        (
+            json!({ "url": "https://192.0.2.7/example-org" }),
+            "settings.url: its host is git.example, as in the template's default: a create changes the path only, since the machine sends its credential to that host".into(),
         ),
     ] {
         assert_eq!(
@@ -251,9 +318,9 @@ fn a_setting_the_template_does_not_list_a_wrong_type_or_a_loose_address_is_refus
     assert_eq!(rig.fake.writes().len(), before, "no refusal wrote anything");
     assert!(rig.entry_ids().iter().all(|id| id != "service-p1"));
 
-    // What is taken: a port, a deeper path, and the address with nothing after the host.
+    // What is taken: another path on the template's host (whatever the case of the host), and the host alone.
     for (name, url) in [
-        ("p1", "https://git.example:8443/example-org/example-repo"),
+        ("p1", "https://GIT.example/example-org/example-repo"),
         ("p2", "https://git.example"),
     ] {
         create_with(&rig, name, json!({ "url": url })).expect("a plain https address");
@@ -290,7 +357,9 @@ fn a_template_lists_only_keys_of_its_own_settings_and_only_a_virtual_machine_lis
     // Without settings there is nothing to list.
     let mut template = vm_template();
     template["createSettings"] = json!(["url"]);
-    assert!(load(template).is_err());
+    assert!(load(template).expect_err("refused").message.contains(
+        "createSettings lists at most 32 distinct keys of settings, each with its default there"
+    ));
     let mut container = nats_template();
     container["createSettings"] = json!(["url"]);
     assert!(
@@ -315,14 +384,15 @@ fn the_owners_card_shows_each_replaced_setting_and_a_proposal_with_a_refused_one
     let key = common::SkKey::from_seed(9);
     let rig = Rig::with(mixed_kernel(&["br0"], roomy()), Some(&key), vec![]);
     rig.template("pool", pool_template());
-    let long = "x".repeat(400);
     let args = json!({
         "name": "p1", "template": "pool",
         "settings": {
             "url": "https://git.example/another-org",
             "group": 7,
-            "classes": [{ "name": "large", "labels": ["a", "b"], "slots": 3 }],
-            "note": long
+            "classes": [
+                { "name": "small", "labels": ["a", "b"], "cpu": 2, "memory": "1GiB", "slots": 3 },
+                { "name": "large", "labels": ["a", "c"], "cpu": 2, "memory": "4GiB", "slots": 1 }
+            ]
         }
     });
     let prepared = ActionKind::ServiceCreate
@@ -333,21 +403,86 @@ fn the_owners_card_shows_each_replaced_setting_and_a_proposal_with_a_refused_one
         .into_iter()
         .map(|row| (row.label, row.value))
         .collect();
-    // One row per replaced setting, with its value; a long value is cut and says so.
+    // One row per replaced setting, with its value in words. A list has one row for each element, so every class is
+    // on the card whole: its memory and its slots are what the owner approves.
+    let own = |label: &str, value: &str| (label.to_string(), value.to_string());
     assert_eq!(
         details,
         [
-            ("Name".to_string(), "p1".to_string()),
-            ("Template".to_string(), "pool".to_string()),
-            (
-                "Setting classes".to_string(),
-                r#"[{"labels":["a","b"],"name":"large","slots":3}]"#.to_string()
+            own("Name", "p1"),
+            own("Template", "pool"),
+            own(
+                "Setting classes 1",
+                "cpu: 2; labels: a, b; memory: 1GiB; name: small; slots: 3"
             ),
-            ("Setting group".to_string(), "7".to_string()),
-            ("Setting note".to_string(), format!("{}…", "x".repeat(160))),
+            own(
+                "Setting classes 2",
+                "cpu: 2; labels: a, c; memory: 4GiB; name: large; slots: 1"
+            ),
+            own("Setting group", "7"),
+            own("Setting url", "https://git.example/another-org"),
+        ]
+    );
+    // The card cuts nothing a proposal carries: a setting whose row would pass 160 characters is refused when the
+    // proposal is made, with the row and its length, so the owner never approves what the card does not show.
+    let long = "x".repeat(161);
+    let too_long = |settings: Value| {
+        ActionKind::ServiceCreate
+            .prepare(
+                &json!({ "name": "p1", "template": "pool", "settings": settings }),
+                None,
+            )
+            .expect_err("refused")
+    };
+    assert_eq!(
+        too_long(json!({ "note": long })),
+        "args/settings: the owner's card shows a setting in rows of at most 160 characters, and \"Setting note\" needs 161: shorten it, or give a list more and shorter elements"
+    );
+    let wide = too_long(json!({ "classes": [
+        { "name": "small" },
+        { "name": "large", "labels": (0..40).map(|n| format!("label-{n}")).collect::<Vec<_>>() }
+    ] }));
+    assert!(
+        wide.starts_with("args/settings: the owner's card shows a setting in rows of at most 160 characters, and \"Setting classes 2\" needs "),
+        "{wide}"
+    );
+    assert!(
+        ActionKind::ServiceCreate
+            .prepare(
+                &json!({ "name": "p1", "template": "pool", "settings": { "note": "x".repeat(160) } }),
+                None
+            )
+            .is_ok()
+    );
+    // The shipped runner pool's own classes, the value an owner is most likely to be shown, fit: one row a class,
+    // each whole.
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let pool =
+        service::load_template(&shipped, "github-runner-pool").expect("the shipped template");
+    let classes = pool.settings.as_ref().expect("settings")["classes"].clone();
+    assert!(classes.to_string().len() > 160, "one row would have cut it");
+    let shown = ActionKind::ServiceCreate.details(
+        &ActionKind::ServiceCreate
+            .prepare(
+                &json!({ "name": "ci", "template": "github-runner-pool", "settings": { "classes": classes } }),
+                None,
+            )
+            .expect("the shipped classes can be proposed"),
+    );
+    let rows: Vec<(&str, &str)> = shown[2..]
+        .iter()
+        .map(|row| (row.label.as_str(), row.value.as_str()))
+        .collect();
+    assert_eq!(
+        rows,
+        [
             (
-                "Setting url".to_string(),
-                "https://git.example/another-org".to_string()
+                "Setting classes 1",
+                "cpu: 2; labels: self-hosted, linux, x64, arca; memory: 4GiB; name: standard; slots: 2"
+            ),
+            (
+                "Setting classes 2",
+                "cpu: 6; labels: self-hosted, linux, x64, arca-large; memory: 9GiB; name: large; slots: 2"
             ),
         ]
     );
@@ -379,19 +514,46 @@ fn the_owners_card_shows_each_replaced_setting_and_a_proposal_with_a_refused_one
             &doctor_caller(),
         )
     };
-    // A setting the create would refuse is refused when the proposal is made: the owner is never shown it.
-    for settings in [
-        json!({ "pin": "registry.example/other@sha256:2222" }),
-        json!({ "url": "https://git.example@elsewhere.example/example-org" }),
-        json!({ "group": "7" }),
+    // A setting the create would refuse is refused when the proposal is made, for the same reason in the same
+    // words: the owner is never shown it, and no approval is spent on it.
+    for (settings, why) in [
+        (
+            json!({ "pin": "registry.example/other@sha256:2222" }),
+            "settings.pin: template pool does not let a create set it",
+        ),
+        (
+            json!({ "url": "https://git.example@elsewhere.example/example-org" }),
+            "settings.url: expected an https address like the template's default",
+        ),
+        (
+            json!({ "url": "https://elsewhere.example/example-org" }),
+            "settings.url: its host is git.example, as in the template's default",
+        ),
+        (
+            json!({ "group": "7" }),
+            "settings.group: expected a whole number, the type of the template's default",
+        ),
+        (
+            json!({ "group": -1 }),
+            "settings.group: expected a whole number of 0 or more",
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "cpu": 2.0 }] }),
+            "settings.classes[1].cpu: expected a whole number, the type of the template's default",
+        ),
+        (
+            json!({ "classes": [{ "name": "small", "memory": "8589934592GiB" }] }),
+            "settings.classes[1].memory: expected a size such as 2GiB, above zero and at most the machine's memory (4GiB)",
+        ),
+        (
+            json!({ "note": "pay \u{202e}eno ot" }),
+            "settings.note: a value holds no control character and no character that reorders or hides text",
+        ),
     ] {
-        assert!(
-            matches!(
-                propose(json!({ "name": "p1", "template": "pool", "settings": settings })),
-                Err(CallError::Refused { .. })
-            ),
-            "{settings}"
-        );
+        let said = refusal(propose(
+            json!({ "name": "p1", "template": "pool", "settings": settings }),
+        ));
+        assert!(said.starts_with(why), "{settings}: {said}");
     }
     assert!(rig.entry_ids().is_empty());
     // A good one is proposed with its rows, approved by the owner, and run by the same handler.
@@ -437,11 +599,10 @@ fn the_owners_card_shows_each_replaced_setting_and_a_proposal_with_a_refused_one
     executor
         .run(&approved.action, &approved.args, &approved.grant)
         .expect("the approved create runs");
-    // The machine got exactly the values the owner was shown, the long one whole.
+    // The machine got exactly the values the owner was shown.
     let got = guest_settings(&rig, "p1");
     assert_eq!(got["url"], "https://git.example/another-org");
     assert_eq!(got["group"], 7);
-    assert_eq!(got["note"], json!(long));
     assert_eq!(got["pin"], pool_template()["settings"]["pin"]);
 }
 
