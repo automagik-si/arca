@@ -3,7 +3,8 @@
 #
 # SAFETY. This repository is public, and a job on our pool runs whatever the commit says and can reach the pool's
 # GitHub credential. So the pool's labels are used only by events that people with write access to this repository
-# cause. The one condition that decides it is in the `runners` job below; every other job takes its runner from there.
+# cause, and never by a pull request a bot opened or pushed to. The one condition that decides it is in the `runners`
+# job below; every other job takes its runner from there.
 # No job names a pool label itself, and there is no `pull_request_target` trigger and none may be added.
 #
 # That condition routes; it does not guard. For a pull request GitHub reads the workflow files of the pull request
@@ -22,10 +23,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same branch or pull request replaces the run that is still going.
+# A newer push to a pull request replaces that pull request's run that is still going. Nothing else is replaced:
+# every commit that reaches `dev` is checked to the end, and so is every entry of the merge queue.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -51,16 +53,19 @@ jobs:
           #   - a push to `dev`;
           #   - the merge queue;
           #   - a person with write access starting the workflow by hand;
-          #   - a pull request whose branch is in this repository, which only people with write access can push.
-          # Anything else gets GitHub's hosted runners: a pull request from a fork, and any event added to `on:`
-          # later that is not named here.
+          #   - a pull request whose branch is in this repository, opened by a person and pushed to by a person.
+          # Anything else gets GitHub's hosted runners: a pull request from a fork; a pull request that a bot or an
+          # app opened or pushed to (Dependabot, Renovate: they can push branches here too, and what they bring is
+          # other people's code); and any event added to `on:` later that is not named here.
           TRUSTED: >-
             ${{
             (github.event_name == 'push' && github.ref == 'refs/heads/dev') ||
             github.event_name == 'merge_group' ||
             github.event_name == 'workflow_dispatch' ||
             (github.event_name == 'pull_request' &&
-            github.event.pull_request.head.repo.full_name == github.repository)
+            github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.type != 'Bot' &&
+            !endsWith(github.actor, '[bot]'))
             }}
         run: |
           if [ "$TRUSTED" = true ]; then
@@ -81,7 +86,7 @@ jobs:
     runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
     timeout-minutes: 15
     env:
-      # The `standard` class: 2 CPUs, 4GiB. scripts/ci-setup.sh uses the number on the pool only.
+      # The CPUs of our pool's `standard` class (2 CPUs, 4GiB). scripts/ci-setup.sh uses the number on the pool only.
       CI_SLOT_CPUS: 2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,8 +103,8 @@ jobs:
     runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
     timeout-minutes: 60
     env:
-      # The `large` class: 8 CPUs, 8GiB.
-      CI_SLOT_CPUS: 8
+      # The CPUs of our pool's `large` class (6 CPUs, 10GiB).
+      CI_SLOT_CPUS: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,7 +120,7 @@ jobs:
     runs-on: ${{ fromJSON(needs.runners.outputs.large) }}
     timeout-minutes: 90
     env:
-      CI_SLOT_CPUS: 8
+      CI_SLOT_CPUS: 6
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -130,6 +135,8 @@ jobs:
     needs: runners
     runs-on: ${{ fromJSON(needs.runners.outputs.standard) }}
     timeout-minutes: 30
+    env:
+      CI_SLOT_CPUS: 2
     defaults:
       run:
         shell: bash
@@ -152,5 +159,8 @@ jobs:
       # with apt, because a pool job starts from a fresh image.
       - name: Chromium
         run: npx playwright install --with-deps chromium
+      # Node starts one test file for each CPU it sees, and most of these files start a Chromium. On the pool that
+      # would be one for each CPU of the whole virtual machine inside a 4GiB slot, so there the script gives the
+      # slot's own number. On a hosted runner the variable is not set and Node decides.
       - name: node --test
-        run: node --test
+        run: node --test ${CANVAS_TEST_CONCURRENCY:+--test-concurrency="$CANVAS_TEST_CONCURRENCY"}

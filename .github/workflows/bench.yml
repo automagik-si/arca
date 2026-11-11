@@ -46,8 +46,8 @@ jobs:
             cpus: ''
           - name: the pool (${{ inputs.pool_label }})
             runs-on: '["self-hosted", "linux", "x64", "${{ inputs.pool_label }}"]'
-            # The class's CPU ceiling in templates/github-runner-pool.json: `standard` 2, `large` 8.
-            cpus: ${{ inputs.pool_label == 'arca-large' && '8' || '2' }}
+            # The CPUs of the class on our pool, as in ci.yml: `large` 6, `standard` 2.
+            cpus: ${{ inputs.pool_label == 'arca-large' && '6' || '2' }}
     runs-on: ${{ fromJSON(matrix.runs-on) }}
     timeout-minutes: 120
     env:

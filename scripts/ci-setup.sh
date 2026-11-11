@@ -5,7 +5,8 @@
 #   scripts/ci-setup.sh fmt      the Rust toolchain
 #   scripts/ci-setup.sh build    the toolchain and a C compiler (the build scripts of ring and SQLite need one)
 #   scripts/ci-setup.sh test     the same, and the programs the tests start
-#   scripts/ci-setup.sh canvas   where npm and Playwright keep their downloads, for packages/arca-canvas-dsh
+#   scripts/ci-setup.sh canvas   where npm and Playwright keep their downloads, and how many test files run at once,
+#                                for packages/arca-canvas-dsh
 #
 # It exists because a job on the runner pool starts in a small image: Ubuntu 24.04 with git, curl, jq, tar and sudo,
 # and no compiler, no rustup and no Node. A GitHub-hosted runner has most of this already, and the same script then
@@ -22,14 +23,14 @@
 # Environment:
 #   POOL_CACHE_DIR   set by the pool; see above
 #   CI_CACHE         `off` builds from nothing even where POOL_CACHE_DIR is set
-#   CI_SLOT_CPUS     the CPU ceiling of the pool class the job asked for (`cpu` in the pool's template)
+#   CI_SLOT_CPUS     the CPU ceiling of the pool class the job asked for (the class's `cpu` in the pool's settings)
 #
-# CPUs. A pool slot has a CPU ceiling but shows every CPU of the pool's virtual machine, so cargo and the test harness
-# would start one process or thread for each of those inside the slot's memory limit. The script therefore tells both
-# how many CPUs the job has. It takes the number from the runner when the runner says it: the CPU limit of the job's
-# own control group. Today's pool puts the limit on the slot's group, above the job's, where the job cannot read it,
-# and gives the job no variable with it either; so on the pool (POOL_CACHE_DIR is set) CI_SLOT_CPUS is used instead.
-# On any other runner cargo and the tests are told nothing and use the CPUs they see.
+# CPUs. A pool slot has a CPU ceiling but shows every CPU of the pool's virtual machine, so cargo, the test harness and
+# Node's test runner would start one process or thread for each of those inside the slot's memory limit. The script
+# therefore tells them how many CPUs the job has. It takes the number from the runner when the runner says it: the
+# CPU limit of the job's own control group. Today's pool puts the limit on the slot's group, above the job's, where
+# the job cannot read it, and gives the job no variable with it either; so on the pool (POOL_CACHE_DIR is set)
+# CI_SLOT_CPUS is used instead. On any other runner they are told nothing and use the CPUs they see.
 set -euo pipefail
 
 # To move the pin, change the version and the SHA-256 together. The SHA-256 is the one the Rust project publishes
@@ -164,9 +165,13 @@ case $mode in
   build | test)
     need cc gcc libc6-dev
     if [ "$mode" = test ]; then
-      # What the tests start: ssh-keygen, openssl, setfattr and getfattr, kill, tar and mkfifo.
+      # What the tests start: ssh-keygen, openssl, setfattr and getfattr, kill, tar and mkfifo, and for the runner
+      # pool's own tests (crates/arca/tests/runner_pool.rs) curl, jq and flock.
       need ssh-keygen openssh-client
       need openssl openssl
+      need curl curl
+      need jq jq
+      need flock util-linux
       need setfattr attr
       need kill procps
       need tar tar
@@ -176,10 +181,13 @@ case $mode in
     setup_rust
     ;;
   canvas)
+    cpus=$(job_cpus)
     {
       echo "npm_config_cache=$cache/npm"
       echo "PLAYWRIGHT_BROWSERS_PATH=$cache/ms-playwright"
+      if [ -n "$cpus" ]; then echo "CANVAS_TEST_CONCURRENCY=$cpus"; fi
     } >>"$GITHUB_ENV"
+    say "node runs ${cpus:-as many test files at once as it sees CPUs ($(nproc))}${cpus:+ test files at once}"
     ;;
 esac
 

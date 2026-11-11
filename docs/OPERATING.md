@@ -2954,7 +2954,7 @@ from a fork.
 | `fmt` | `cargo fmt --all --check` | `standard` |
 | `clippy` | `cargo clippy --workspace -- -D warnings` | `large` |
 | `test` | `cargo test --workspace` | `large` |
-| `canvas` | in `packages/arca-canvas-dsh`: `npm ci`, `npx playwright install --with-deps chromium`, `node --test` | `standard` |
+| `canvas` | in `packages/arca-canvas-dsh`: `npm ci`, `npx playwright install --with-deps chromium`, `node --test` (on the pool with `--test-concurrency`, see below) | `standard` |
 
 A fifth, `runners`, comes first and only decides where those four run (below).
 
@@ -2962,8 +2962,9 @@ The Rust toolchain is the one `rust-toolchain.toml` names (1.97.1, with clippy a
 1.29.3, which `scripts/ci-setup.sh` fetches and checks by SHA-256. Node is 24.11.0, the version the canvas package's
 README develops with. The two actions, `actions/checkout` (v7.0.1) and `actions/setup-node` (v7.1.0), are named by
 commit, with the version in a comment beside it; to move one, change both together. The workflow's token can read the
-repository's contents and nothing else, a job that passes its time limit is stopped, and a newer push to the same
-branch or pull request replaces a run that is still going.
+repository's contents and nothing else, and a job that passes its time limit is stopped. A newer push to a pull
+request replaces that pull request's run that is still going. Nothing else is replaced: every commit that reaches
+`dev` is checked to the end, and so is every entry of the merge queue.
 
 **Which events may use the pool.** The repository is public, a job on the pool runs whatever the commit says, and a
 job can reach the pool's GitHub credential ("Who can reach what"). So the pool's labels are used only by events that
@@ -2972,10 +2973,16 @@ people with write access to this repository cause:
 - a push to `dev`;
 - the merge queue;
 - a person with write access starting the workflow by hand ("Actions", the workflow, "Run workflow");
-- a pull request whose branch is in this repository.
+- a pull request whose branch is in this repository, opened by a person and last pushed to by a person.
 
-A pull request from a fork runs the same four jobs on GitHub's hosted runners (`ubuntu-latest`), and so does any
-event that is later added to the workflow without being added to that list. The rule is one condition, in the
+People are not the only ones who can push a branch here: a bot or an app with write access to the contents can too
+(Dependabot and Renovate do), and what they bring is other people's code, such as a new release of a dependency with
+its build script. So a pull request that a bot opened (its author's type is `Bot`), or that a bot pushed to (the
+actor's name ends in `[bot]`), does not use the pool, whatever repository its branch is in. Once a person with write
+access has merged it, it reaches the pool like every other commit on `dev`.
+
+A pull request from a fork or from a bot runs the same four jobs on GitHub's hosted runners (`ubuntu-latest`), and so
+does any event that is later added to the workflow without being added to that list. The rule is one condition, in the
 `runners` job of `ci.yml`; the other jobs take their runner from its answer and name no label themselves. There is
 no `pull_request_target` trigger, and none may be added.
 
@@ -2998,13 +3005,16 @@ outside the workflow files stop that, and all three have to be in place:
 What is left if all of that fails is what the pool gives every job: one job per runner, in a virtual machine that is
 the wall between the job and the machine Arca runs on.
 
-**On the pool.** `fmt` and `canvas` ask for `[self-hosted, linux, x64, arca]`, the `standard` class (2 CPUs, 4GiB);
-`clippy` and `test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class (8 CPUs, 8GiB). The shipped
-template has one `large` slot, so with it `clippy` and `test` take turns; a pool for this repository wants two.
+**On the pool.** `fmt` and `canvas` ask for `[self-hosted, linux, x64, arca]`, the `standard` class; `clippy` and
+`test` ask for `[self-hosted, linux, x64, arca-large]`, the `large` class. The pool that serves this repository has
+two slots of each, `standard` with 2 CPUs and 4GiB and `large` with 6 CPUs and 10GiB, so all four jobs run at the
+same time. Those are not the shipped template's sizes (one `large` slot of 8 CPUs and 8GiB). The workflow carries the
+two CPU numbers (`CI_SLOT_CPUS`); change them there when the pool's classes change.
 
 A pool job starts in a small image with no compiler, so `scripts/ci-setup.sh` installs what is missing first: the
 toolchain, `gcc`, and the programs the tests start. A job sees every CPU of the pool's virtual machine and not its
-slot's ceiling, so the script tells cargo and the tests how many CPUs the job has. It reads the number from the job's
+slot's ceiling, so the script tells cargo, the tests and Node's test runner (`--test-concurrency`, or six Chromiums
+would start in a 4GiB slot) how many CPUs the job has. It reads the number from the job's
 own control group when the runner puts a limit there. Today's pool does not (the limit is on the slot's group, which
 the job cannot read) and gives the job no variable with it, so on the pool the script uses the class's number from
 the workflow (`CI_SLOT_CPUS`). On a hosted runner it tells them nothing.
