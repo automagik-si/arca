@@ -1,6 +1,10 @@
 //! The HTTP surface: the `POST /mcp` route, the read-only GET routes, the unix socket listener, the tailnet listener with
 //! its peer filter, the proxy listener with its exact-peer filter, and the services socket.
 //!
+//! `POST /mcp` answers `200` with a JSON-RPC result or error, `202` to a notification, and to a request that declares
+//! protocol version `2026-07-28`: `400` when its headers and its body disagree or lack what that version requires, and
+//! `404` for a method the server does not have. A `GET` on `/mcp` is `405`, and no session id is ever issued or read.
+//!
 //! A request carrying any `Origin` header is refused `403` before its body is read, whatever its method or path: a browser
 //! page is never a client. The unix socket is bound inside a fresh private directory, chmodded 0600 and renamed into place,
 //! so no other user ever reaches it at a wider mode, and it serves only peers of this process's own uid. The tailnet
@@ -40,6 +44,7 @@ use crate::auth::{Caller, TokenStore};
 use crate::fresh::{fresh_dir, process_uid};
 use crate::jsonrpc;
 use crate::tools::{CallError, ToolHandler};
+use crate::version::{Mirrored, Mirrors};
 
 /// The most body bytes one request may carry.
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -181,8 +186,13 @@ async fn mcp(State(server): State<Arc<Server>>, headers: HeaderMap, body: Bytes)
     let Some(caller) = bearer(&headers).and_then(|token| server.tokens.lookup(token)) else {
         return unauthorized();
     };
-    match jsonrpc::dispatch(&server, &caller, &body).await {
-        Ok(Some(reply)) => Json(reply).into_response(),
+    let mirrors = Mirrors {
+        version: mirrored(&headers, "mcp-protocol-version"),
+        method: mirrored(&headers, "mcp-method"),
+        name: mirrored(&headers, "mcp-name"),
+    };
+    match jsonrpc::dispatch(&server, &caller, &mirrors, &body).await {
+        Ok(Some(answer)) => (answer.status, Json(answer.body)).into_response(),
         Ok(None) => StatusCode::ACCEPTED.into_response(),
         Err(CallError::Forbidden { .. }) => StatusCode::FORBIDDEN.into_response(),
         Err(CallError::Unauthenticated) => unauthorized(),
@@ -228,6 +238,16 @@ fn unauthorized() -> Response {
         [(header::WWW_AUTHENTICATE, "Bearer")],
     )
         .into_response()
+}
+
+/// The header `name` of a request, which mirrors a field of its body. A header sent twice has no one value.
+fn mirrored<'a>(headers: &'a HeaderMap, name: &str) -> Mirrored<'a> {
+    let mut values = headers.get_all(name).iter();
+    match (values.next(), values.next()) {
+        (None, _) => Mirrored::Absent,
+        (Some(only), None) => only.to_str().map_or(Mirrored::Unreadable, Mirrored::Value),
+        (Some(_), Some(_)) => Mirrored::Unreadable,
+    }
 }
 
 /// The token of a single `Authorization: Bearer` header. The scheme is matched without regard to case; a second

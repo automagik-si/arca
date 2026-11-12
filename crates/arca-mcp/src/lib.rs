@@ -1,5 +1,10 @@
 //! The Arca MCP server: the verb table served as MCP tools over streamable HTTP, JSON responses only.
 //!
+//! It speaks two protocol versions on the one `POST /mcp` route. A request that declares `2026-07-28` is answered as
+//! that version asks: no handshake, the version and the method mirrored in headers, `server/discover`. Any other request
+//! is answered as `2025-11-25` always was, `initialize` included, so a client written for it needs no change. The
+//! [`version`] module decides which, from the request alone.
+//!
 //! Every request is refused `403` when it carries an `Origin` header. Otherwise it must carry a bearer token of a stored
 //! scope, or it is refused `401`. The server keeps only SHA-256 digests of the tokens, read from `<id>.hash` files.
 //! It listens on a unix socket (mode 0600) and, optionally, on one tailnet address, on one proxy address that serves a
@@ -10,6 +15,7 @@ mod fresh;
 pub mod http;
 pub mod jsonrpc;
 pub mod tools;
+pub mod version;
 
 pub use auth::{Caller, TokenStore, TokenStoreError, mint, mint_with_tools};
 pub use http::{
@@ -17,6 +23,4 @@ pub use http::{
     serve_services, serve_tailnet, serve_unix, services_path_ok, tailnet_addr_ok,
 };
 pub use tools::{CallError, ToolHandler};
-
-/// The MCP protocol version the server speaks.
-pub const PROTOCOL_VERSION: &str = "2025-11-25";
+pub use version::{PROTOCOL_VERSION, STATELESS_PROTOCOL_VERSION, SUPPORTED_VERSIONS};

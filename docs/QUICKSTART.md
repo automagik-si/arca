@@ -127,10 +127,12 @@ arca call arca_status --config ~/.config/arca/node.json --token-file ~/.config/a
 The answer is one JSON object with `"mode":"watch-only"`, `"incusReachable":true` and the release's `"version"`.
 `arca call watch_report ...` lists every project and instance with its owner.
 
-**4. Connect an assistant over MCP.** The node is an MCP server over streamable HTTP: `POST /mcp`, JSON answers, protocol
-version `2025-11-25`, and a bearer token on every request. With the `viewer` token from step 3, this read-only node lists
-18 tools, among them `arca_status`, `node_metrics`, `watch_report`, `alerts_list` and `service_list`. Two ways to reach it
-work today:
+**4. Connect an assistant over MCP.** The node is an MCP server over streamable HTTP: `POST /mcp`, JSON answers, and a
+bearer token on every request. It speaks protocol version `2026-07-28` (no handshake: each request names its version)
+and still `2025-11-25` (`initialize` first), so a client of either connects with no setting; `server/discover` names
+both. ["The MCP server"](OPERATING.md#the-mcp-server) in the operating guide has the details. With the `viewer` token
+from step 3, this read-only node lists 18 tools, among them `arca_status`, `node_metrics`, `watch_report`, `alerts_list`
+and `service_list`. Two ways to reach it work today:
 
 - **An assistant with a shell on the node** runs `arca call <verb>` as in step 3. `arca call` is an MCP client over the
   unix socket, and the socket answers only the user who runs `serve`.

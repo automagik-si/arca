@@ -1,4 +1,9 @@
-//! JSON-RPC 2.0 framing for the MCP methods the server answers: `initialize`, `ping`, `tools/list` and `tools/call`.
+//! JSON-RPC 2.0 framing for the MCP methods the server answers: `server/discover`, `tools/list` and `tools/call`, and for
+//! a legacy request also `initialize` and `ping`.
+//!
+//! [`crate::version::era`] says how each request is answered. A legacy request gets the answer it always got, inside a
+//! `200`. A modern one (`2026-07-28`) gets `resultType` and the server's name in every result, `ttlMs` and `cacheScope`
+//! in the tool list, `404` for a method the server does not have, and `400` when it lacks what its version requires.
 //!
 //! A request without an `id` is a notification and gets no body, but only a `notifications/` method may be one. Any other
 //! method without an id is refused as an invalid request, so a write never runs with no answer to its caller. An `id` is
@@ -6,12 +11,13 @@
 
 use arca_api::verbs::{NOT_CONFIRMED, take_confirm};
 use arca_api::{API_VERSION, Verb, conforms, may_call};
+use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::PROTOCOL_VERSION;
 use crate::auth::Caller;
 use crate::http::Server;
 use crate::tools::CallError;
+use crate::version::{self, Era, Mirrors, PROTOCOL_VERSION, SERVER_INFO_META, SUPPORTED_VERSIONS};
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
@@ -19,71 +25,122 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const REFUSED: i64 = -32000;
 
-/// Answers one request body. `Ok(None)` is a notification, which gets no body. `Err` is a refusal that is not a JSON-RPC
-/// error: the HTTP layer answers it with a status.
+/// How long a client may keep a tool list or a discovery answer, in milliseconds. Neither changes while the server runs.
+const CACHE_TTL_MS: u64 = 300_000;
+
+/// One JSON-RPC reply and the HTTP status it travels in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub status: StatusCode,
+    pub body: Value,
+}
+
+impl Answer {
+    fn ok(body: Value) -> Answer {
+        Answer {
+            status: StatusCode::OK,
+            body,
+        }
+    }
+}
+
+/// Answers one request body sent with the headers `mirrors`. `Ok(None)` is a notification, which gets no body. `Err` is
+/// a refusal that is not a JSON-RPC error: the HTTP layer answers it with a status.
 pub async fn dispatch(
     server: &Server,
     caller: &Caller,
+    mirrors: &Mirrors<'_>,
     body: &[u8],
-) -> Result<Option<Value>, CallError> {
+) -> Result<Option<Answer>, CallError> {
     let value: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(_) => {
-            return Ok(Some(error_reply(
+            return Ok(Some(Answer::ok(error_reply(
                 Value::Null,
                 PARSE_ERROR,
                 "parse error",
                 None,
-            )));
+            ))));
         }
     };
     let Some(request) = value.as_object() else {
-        return Ok(Some(error_reply(
+        return Ok(Some(Answer::ok(error_reply(
             Value::Null,
             INVALID_REQUEST,
             "invalid request",
             None,
-        )));
+        ))));
     };
     let id = request.get("id").cloned();
     let id_ok = id.as_ref().is_none_or(|v| v.is_string() || v.is_number());
     let method = request.get("method").and_then(Value::as_str);
     let version_ok = request.get("jsonrpc") == Some(&json!("2.0"));
     let (true, true, Some(method)) = (version_ok, id_ok, method) else {
-        return Ok(Some(error_reply(
+        return Ok(Some(Answer::ok(error_reply(
             valid_id_or_null(&id),
             INVALID_REQUEST,
             "invalid request",
             None,
-        )));
+        ))));
     };
     let Some(id) = id else {
         if method.starts_with("notifications/") {
             return Ok(None);
         }
-        return Ok(Some(error_reply(
+        return Ok(Some(Answer::ok(error_reply(
             Value::Null,
             INVALID_REQUEST,
             "a request needs an id",
             None,
-        )));
+        ))));
     };
     let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-    match method {
-        "initialize" => Ok(Some(result_reply(id, initialize_result()))),
-        "ping" => Ok(Some(result_reply(id, json!({})))),
-        "tools/list" => Ok(Some(result_reply(
+    let era = match version::era(mirrors, method, &params) {
+        Ok(era) => era,
+        Err(refusal) => {
+            return Ok(Some(Answer {
+                status: StatusCode::BAD_REQUEST,
+                body: error_reply(id, refusal.code, &refusal.message, refusal.data),
+            }));
+        }
+    };
+    let body = match (era, method) {
+        // Discovery is answered to anyone who asks, in the one shape it has: it is how a caller learns the versions.
+        (_, "server/discover") => result_reply(id, discover_result()),
+        (Era::Legacy, "initialize") => result_reply(id, initialize_result()),
+        (Era::Legacy, "ping") => result_reply(id, json!({})),
+        (Era::Legacy, "tools/list") => {
+            result_reply(id, json!({ "tools": tools_for(server, caller) }))
+        }
+        (Era::Modern, "tools/list") => result_reply(
             id,
-            json!({ "tools": tools_for(server, caller) }),
-        ))),
-        "tools/call" => call_tool(server, caller, id, &params).await,
-        _ => Ok(Some(error_reply(
-            id,
-            METHOD_NOT_FOUND,
-            "method not found",
-            None,
-        ))),
-    }
+            modern_result(json!({
+                "tools": tools_for(server, caller),
+                "ttlMs": CACHE_TTL_MS,
+                // The list is the caller's own: it depends on the token's scope and on its tool list.
+                "cacheScope": "private"
+            })),
+        ),
+        (_, "tools/call") => {
+            let Some(mut reply) = call_tool(server, caller, id, &params, era).await? else {
+                return Ok(None);
+            };
+            if era == Era::Modern
+                && let Some(result) = reply.get_mut("result")
+            {
+                *result = modern_result(result.take());
+            }
+            reply
+        }
+        (Era::Legacy, _) => error_reply(id, METHOD_NOT_FOUND, "method not found", None),
+        (Era::Modern, _) => {
+            return Ok(Some(Answer {
+                status: StatusCode::NOT_FOUND,
+                body: error_reply(id, METHOD_NOT_FOUND, "method not found", None),
+            }));
+        }
+    };
+    Ok(Some(Answer::ok(body)))
 }
 
 fn valid_id_or_null(id: &Option<Value>) -> Value {
@@ -96,9 +153,35 @@ fn valid_id_or_null(id: &Option<Value>) -> Value {
 fn initialize_result() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": "arca", "version": API_VERSION }
+        "capabilities": capabilities(),
+        "serverInfo": server_info()
     })
+}
+
+/// The answer to `server/discover`: the versions, the capabilities and the server's name. It is the same for every
+/// caller, so any cache may keep it.
+fn discover_result() -> Value {
+    modern_result(json!({
+        "supportedVersions": SUPPORTED_VERSIONS,
+        "capabilities": capabilities(),
+        "ttlMs": CACHE_TTL_MS,
+        "cacheScope": "public"
+    }))
+}
+
+fn capabilities() -> Value {
+    json!({ "tools": { "listChanged": false } })
+}
+
+fn server_info() -> Value {
+    json!({ "name": "arca", "version": API_VERSION })
+}
+
+/// `result` with what every `2026-07-28` result carries: `resultType`, and the server's name beside any `_meta` it has.
+fn modern_result(mut result: Value) -> Value {
+    result["resultType"] = json!("complete");
+    result["_meta"][SERVER_INFO_META] = server_info();
+    result
 }
 
 /// The tools the caller may call, in table order. A write verb is absent for a viewer, and `token_list` for anything
@@ -125,7 +208,13 @@ async fn call_tool(
     caller: &Caller,
     id: Value,
     params: &Value,
+    era: Era,
 ) -> Result<Option<Value>, CallError> {
+    // A tool the server does not have: `2026-07-28` keeps "method not found" for a method, so there it is a bad parameter.
+    let unknown_tool = match era {
+        Era::Legacy => METHOD_NOT_FOUND,
+        Era::Modern => INVALID_PARAMS,
+    };
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return Ok(Some(error_reply(
             id,
@@ -135,7 +224,7 @@ async fn call_tool(
         )));
     };
     let Some(verb) = server.verbs.iter().find(|v| v.name == name) else {
-        return Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None)));
+        return Ok(Some(error_reply(id, unknown_tool, "not_found", None)));
     };
     if !may_call(caller.scope, verb) || !caller.allows_tool(verb.name) {
         return Err(CallError::Forbidden {
@@ -160,7 +249,7 @@ async fn call_tool(
         )));
     }
     let Some(handler) = server.handlers.get(name).cloned() else {
-        return Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None)));
+        return Ok(Some(error_reply(id, unknown_tool, "not_found", None)));
     };
     let owned_caller = caller.clone();
     let outcome = tokio::task::spawn_blocking(move || handler.call(arguments, &owned_caller)).await;
@@ -196,7 +285,7 @@ async fn call_tool(
                 tool_result(verb, value, cut.as_deref()),
             )))
         }
-        Err(CallError::NotFound) => Ok(Some(error_reply(id, METHOD_NOT_FOUND, "not_found", None))),
+        Err(CallError::NotFound) => Ok(Some(error_reply(id, unknown_tool, "not_found", None))),
         Err(CallError::Invalid(why)) => Ok(Some(error_reply(id, INVALID_PARAMS, &why, None))),
         Err(
             refused @ (CallError::Refused { .. }
