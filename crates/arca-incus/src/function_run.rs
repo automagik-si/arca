@@ -7,9 +7,11 @@
 //! ([`FUNCTION_KEY`]) in its own config, or that is not a container, before anything is written. A service's instance
 //! never carries the mark, so no service is ever started, stopped or force-stopped from here.
 //!
-//! What a run writes to Incus: the instance's `state` (a start, and a stop when the run passes its time limit) and its
-//! console log (cleared before the start, so what is read after the run is that run's output and nothing older). It
-//! never creates, deletes, renames or reconfigures an instance.
+//! What a run writes to Incus: the instance's root disk (rebuilt from its image before the start, so no run finds what
+//! an earlier one wrote), its `state` (a start, and a stop when the run passes its time limit) and its console log
+//! (cleared before the start, so what is read after the run is that run's output and nothing older). It never
+//! creates, deletes or renames an instance, and never changes its config or its devices: a rebuild keeps both, and
+//! the instance's uuid.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,6 +28,25 @@ pub const FUNCTION_KEY: &str = "user.arca.function";
 pub const OUTPUT_MAX: usize = 1024 * 1024;
 /// The longest one start or stop operation is waited on.
 const DEADLINE: Duration = Duration::from_secs(60);
+
+/// Where the image a run's root was rebuilt from came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshRoot {
+    /// The copy the project's own image store holds: no registry was asked.
+    Store,
+    /// The registry: the store's copy was gone, and Incus fetched the image again.
+    Registry,
+}
+
+impl FreshRoot {
+    /// The word a run's line carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::Registry => "registry",
+        }
+    }
+}
 
 /// Whether `state` is a function's instance: a container whose own config carries the mark.
 pub fn is_function(state: &InstanceState) -> bool {
@@ -83,6 +104,63 @@ impl FunctionRun {
             return Err(refused("the instance is not stopped"));
         }
         self.put_state(&fresh, &json!({ "action": "start" }))
+    }
+
+    /// Gives the instance its image's own root again: Incus rebuilds the root disk from the image and keeps the config,
+    /// the devices and the uuid.
+    ///
+    /// `fingerprint` is the image the function was created from, as its record holds it: the copy the project's own
+    /// store keeps, for which no registry is asked. The instance's own word for its image (`volatile.base_image`) is
+    /// never used: whoever may write the instance could point it at another image of the store. When the store no
+    /// longer holds that copy, or the record names none, the rebuild names `source` instead, the image by digest on
+    /// its registry, and Incus fetches it again; `source` must be exactly that. A copy that is there and cannot be
+    /// rebuilt from is an error, and the registry is not asked: only a missing copy is. `cancelled` is asked before
+    /// the registry is: a function that is being removed fetches nothing. The instance must be stopped.
+    pub fn fresh_root(
+        &self,
+        seen: &InstanceState,
+        fingerprint: Option<&str>,
+        source: &Value,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<FreshRoot, IncusError> {
+        let fresh = self.fresh(seen)?;
+        if !fresh.is_stopped() {
+            return Err(refused("the instance is not stopped"));
+        }
+        if let Some(held) = fingerprint {
+            if !self::fingerprint(held) {
+                return Err(refused(
+                    "the function's record names an image that is no fingerprint",
+                ));
+            }
+            if self.changer.image_present(&fresh.project, held)? {
+                self.changer.rebuild(
+                    &fresh.project,
+                    &fresh.name,
+                    &json!({ "source": { "type": "image", "fingerprint": held } }),
+                )?;
+                return Ok(FreshRoot::Store);
+            }
+        }
+        if cancelled() {
+            return Err(refused(
+                "the function is being removed, so its image was not fetched",
+            ));
+        }
+        if !registry_source(source) {
+            return Err(refused(
+                "the function's record names no image by digest on a registry to rebuild its root from",
+            ));
+        }
+        match self
+            .changer
+            .rebuild(&fresh.project, &fresh.name, &json!({ "source": source }))
+        {
+            Ok(()) => Ok(FreshRoot::Registry),
+            Err(remote) => Err(refused(&format!(
+                "the node's own copy of the image is gone, and the registry did not give it again: {remote}"
+            ))),
+        }
     }
 
     /// Stops the instance: a graceful stop that Incus gives `grace` to finish, then a forced one. With no grace the stop
@@ -174,6 +252,34 @@ impl FunctionRun {
     fn put_state(&self, fresh: &InstanceState, body: &Value) -> Result<(), IncusError> {
         self.changer.put_state(&fresh.project, &fresh.name, body)
     }
+}
+
+/// Whether `text` is an image fingerprint as Incus writes one: 64 hex digits in lower case.
+fn fingerprint(text: &str) -> bool {
+    text.len() == 64
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Whether `source` is an OCI image pulled by digest from a registry, and nothing more: the only source a rebuild that
+/// asks a registry may name.
+fn registry_source(source: &Value) -> bool {
+    let Some(fields) = source.as_object() else {
+        return false;
+    };
+    fields.len() == 5
+        && source["type"] == "image"
+        && source["mode"] == "pull"
+        && source["protocol"] == "oci"
+        && source["server"]
+            .as_str()
+            .is_some_and(|server| server.starts_with("https://"))
+        && source["alias"].as_str().is_some_and(|alias| {
+            alias
+                .rsplit_once("@sha256:")
+                .is_some_and(|(name, digest)| !name.is_empty() && fingerprint(digest))
+        })
 }
 
 fn console_url(state: &InstanceState, query: &str) -> Result<String, IncusError> {

@@ -215,6 +215,10 @@ struct Shared {
     exit_plans: Mutex<BTreeMap<(String, String), (u32, String)>>,
     /// The exits armed by a start that has not ended yet.
     exits: Mutex<BTreeMap<(String, String), (u32, String)>>,
+    /// The rebuilds each instance took, in order: `store` for the store's copy, `registry` for a registry's.
+    rebuilds: Mutex<BTreeMap<(String, String), Vec<String>>>,
+    /// The instances whose rebuild from the store's copy is refused, and whether one from a registry is refused too.
+    rebuild_refusals: Mutex<BTreeMap<(String, String), bool>>,
     counter: AtomicU64,
     /// The `/1.0/resources` document the fake serves, when a test sets one.
     resources: Mutex<Option<Value>>,
@@ -304,6 +308,7 @@ enum Route {
     PoolResources(String),
     NetworkLeases(String),
     InstanceState(Address),
+    InstanceRebuild(Address),
     Console(Address),
     InstanceSnapshots(Address),
     InstanceBackups(Address),
@@ -326,6 +331,7 @@ impl Route {
             }
             Route::Object(_) => &["GET", "PATCH", "DELETE"],
             Route::InstanceState(_) => &["GET", "PUT"],
+            Route::InstanceRebuild(_) => &["POST"],
             Route::Console(_) => &["GET"],
             Route::InstanceSnapshots(_) => &["GET", "POST"],
             Route::InstanceBackups(_) => &["GET", "POST"],
@@ -402,6 +408,8 @@ impl Shared {
             console: Mutex::new(BTreeMap::new()),
             exit_plans: Mutex::new(BTreeMap::new()),
             exits: Mutex::new(BTreeMap::new()),
+            rebuilds: Mutex::new(BTreeMap::new()),
+            rebuild_refusals: Mutex::new(BTreeMap::new()),
             counter: AtomicU64::new(1),
             resources: Mutex::new(None),
         }
@@ -458,6 +466,32 @@ impl FakeIncus {
     /// Takes back [`FakeIncus::exit_after_start`]: the instance runs until it is stopped.
     pub fn run_until_stopped(&self, project: &str, name: &str) {
         lock(&self.shared.exit_plans).remove(&(project.to_string(), name.to_string()));
+    }
+
+    /// The rebuilds the instance `name` in `project` took, in order: `store:<fingerprint>` for one from the store's
+    /// own copy of an image, `registry` for one that named a registry.
+    pub fn rebuilds(&self, project: &str, name: &str) -> Vec<String> {
+        lock(&self.shared.rebuilds)
+            .get(&(project.to_string(), name.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The store no longer holds the image of the instance `name` in `project`: a rebuild from its fingerprint is
+    /// refused, and one that names a registry fetches it again.
+    pub fn lose_image(&self, project: &str, name: &str) {
+        lock(&self.shared.rebuild_refusals).insert((project.to_string(), name.to_string()), false);
+    }
+
+    /// Every rebuild of the instance `name` in `project` is refused: the store's copy is gone and the registry does
+    /// not answer.
+    pub fn refuse_rebuild(&self, project: &str, name: &str) {
+        lock(&self.shared.rebuild_refusals).insert((project.to_string(), name.to_string()), true);
+    }
+
+    /// Takes back [`FakeIncus::lose_image`] and [`FakeIncus::refuse_rebuild`].
+    pub fn allow_rebuild(&self, project: &str, name: &str) {
+        lock(&self.shared.rebuild_refusals).remove(&(project.to_string(), name.to_string()));
     }
 
     /// Sets the raw console log a project's instance serves from `/console`.
@@ -1104,6 +1138,7 @@ fn parse(target: &str) -> Option<Route> {
         ["instances"] => Route::Collection(address("instance", "", "")),
         ["instances", name] => Route::Object(address("instance", "", name)),
         ["instances", name, "state"] => Route::InstanceState(address("instance", "", name)),
+        ["instances", name, "rebuild"] => Route::InstanceRebuild(address("instance", "", name)),
         ["instances", name, "console"] => Route::Console(address("instance", "", name)),
         ["instances", name, "snapshots"] => Route::InstanceSnapshots(address("snapshot", name, "")),
         ["instances", name, "snapshots", snapshot] => {
@@ -1321,6 +1356,7 @@ fn dispatch(shared: &Shared, request: &Request, route: Route) -> (u16, String, V
         )),
         ("GET", Route::InstanceState(address)) => instance_state(store, &address),
         ("PUT", Route::InstanceState(address)) => change_state(shared, store, request, &address),
+        ("POST", Route::InstanceRebuild(address)) => rebuild(shared, store, request, &address),
         ("GET", Route::InstanceSnapshots(address) | Route::InstanceBackups(address)) => {
             sync(Value::Array(
                 store
@@ -1415,6 +1451,19 @@ impl Store {
         alias: &str,
         cached: bool,
     ) -> String {
+        self.put_image_from(project, fingerprint, alias, cached, None)
+    }
+
+    /// [`Store::put_image`], with the server a fetched image came from: Incus keeps it, and the alias it was asked
+    /// for, in the image's own record.
+    fn put_image_from(
+        &mut self,
+        project: &str,
+        fingerprint: String,
+        alias: &str,
+        cached: bool,
+        server: Option<&str>,
+    ) -> String {
         let home = self
             .image_store(project)
             .unwrap_or_else(|| project.to_string());
@@ -1435,6 +1484,8 @@ impl Store {
                 body: json!({
                     "fingerprint": fingerprint, "project": home, "cached": cached,
                     "aliases": aliases, "type": "container",
+                    "auto_update": cached,
+                    "update_source": server.map(|server| json!({ "server": server, "alias": alias, "protocol": "oci" })),
                 }),
             });
         }
@@ -1614,7 +1665,16 @@ fn create(
         // The image is pulled from the server into the store the project reads, and kept there as a cached image.
         let alias = source.get("alias").and_then(Value::as_str).unwrap_or("");
         let fingerprint = Digest::of(format!("{server}|{alias}").as_bytes()).to_hex();
-        store.put_image(&project, fingerprint, alias, true);
+        let (server, alias) = (server.to_string(), alias.to_string());
+        store.put_image_from(&project, fingerprint.clone(), &alias, true, Some(&server));
+        // A new function's instance says which image it was made from, as Incus writes it for every instance. The
+        // fake writes it for a function's alone: a service's view shows the key, and the suites that compare whole
+        // views were written without it.
+        if let Some(config) = body.get_mut("config").and_then(Value::as_object_mut)
+            && config.contains_key("user.arca.function")
+        {
+            config.insert("volatile.base_image".to_string(), json!(fingerprint));
+        }
     }
     let parent = address.parent.clone();
     if matches!(kind, "volume" | "bucket") && !store.pools.iter().any(|(pool, _)| *pool == parent) {
@@ -2719,6 +2779,59 @@ fn instance_state(store: &Store, address: &Address) -> Answer {
     sync(
         json!({ "status": status, "status_code": if running { 103 } else { 102 }, "network": network }),
     )
+}
+
+/// Rebuilds a stopped instance's root from an image, as an operation, and records which image the request named: the
+/// store's copy by fingerprint (`store`) or a registry's by alias (`registry`). A running instance is refused, and
+/// so is what a test set with [`FakeIncus::lose_image`] or [`FakeIncus::refuse_rebuild`]. The fake keeps no root.
+fn rebuild(shared: &Shared, store: &mut Store, request: &Request, address: &Address) -> Answer {
+    let bad = |message: &str| (400, String::new(), error_envelope(400, message));
+    let Some(index) = store.find(address) else {
+        return (404, String::new(), error_envelope(404, "not found"));
+    };
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
+        return bad("the body is not a JSON object");
+    };
+    if text_of(&store.objects[index].body, "status") != "Stopped" {
+        return bad("Instance must be stopped to be rebuilt");
+    }
+    let key = (address.project.clone(), address.name.clone());
+    let local = sent
+        .get("source")
+        .and_then(|source| source.get("fingerprint"))
+        .is_some();
+    let refusal = lock(&shared.rebuild_refusals).get(&key).copied();
+    match (local, refusal) {
+        (true, Some(_)) => {
+            return answered(
+                shared,
+                store,
+                "instance",
+                "PUT",
+                Err((400, "Image not provided for instance rebuild".to_string())),
+            );
+        }
+        (false, Some(true)) => {
+            return answered(
+                shared,
+                store,
+                "instance",
+                "PUT",
+                Err((400, "Failed getting remote image info".to_string())),
+            );
+        }
+        _ => {}
+    }
+    let named = sent
+        .get("source")
+        .and_then(|source| source.get("fingerprint"))
+        .and_then(Value::as_str)
+        .map_or_else(
+            || "registry".to_string(),
+            |fingerprint| format!("store:{fingerprint}"),
+        );
+    lock(&shared.rebuilds).entry(key).or_default().push(named);
+    answered(shared, store, "instance", "PUT", Ok(()))
 }
 
 /// Starts, stops or restarts an instance from a PUT of its state, as an operation. A stop or a restart of a hung instance fails

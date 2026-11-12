@@ -6219,8 +6219,8 @@ impl ToolHandler for ServiceHandler {
                 if config.adopted {
                     return Err(service_wiring::adopted(&name));
                 }
-                // A service a function links to stays until the function is gone: said before any approval is
-                // spent.
+                // A service a function links to stays until the function is gone: said here, on the entries this call
+                // read, before the write gate is waited for. The kernel checks again under its own lock.
                 // A removal that runs from an approved card has used that approval up by now, and says so.
                 if tenant.is_none()
                     && let Some(refusal) =

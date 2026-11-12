@@ -10,7 +10,10 @@ use arca_kernel::desired::Entry;
 use arca_netproject::destination::Destination;
 
 /// How long a removal waits for a run that is going to be stopped.
-const RETIRE_WAIT: Duration = Duration::from_secs(60);
+/// It covers the longest thing a run does that a removal cannot cut short: one rebuild of its root, which Incus is
+/// given a minute for, twice over. A removal therefore never gives up, its approval spent, on a run that was only
+/// fetching its image.
+const RETIRE_WAIT: Duration = Duration::from_secs(150);
 
 /// Functions and services share one name space, because Incus refuses two instances of one name on a bridge. A verb
 /// of one kind that names a record of the other is refused here, in words, before it does anything.
@@ -240,6 +243,7 @@ fn function_view(config: &ServiceConfig, runner: &crate::function_run::FunctionR
         "kind": "container",
         "image": function.image,
         "digest": function.digest,
+        "fingerprint": function.fingerprint,
         "command": function.command,
         "env": function.env,
         "secrets": function.secrets.iter().map(|secret| json!({
@@ -547,6 +551,31 @@ impl ServiceHandler {
             serde_json::to_value(&config).map_err(|_| internal())?,
         )));
         self.settle_create(read, &name, function::TEMPLATE, changes, &config, None, now)?;
+        // The image Incus fetched for it is written into its record: the one copy each run's root is rebuilt from.
+        // It is the record of the node's store whose registry and digest are the approved ones.
+        if let Ok(images) = read.get(&format!(
+            "/1.0/images?project={}&recursion=1",
+            config.project
+        )) && let Ok(made) = read.get(&format!(
+            "/1.0/instances/{}?project={}",
+            config.instance, config.project
+        )) && let Some(fingerprint) = function::fetched_fingerprint(
+            &images,
+            &config.source,
+            made["config"]["volatile.base_image"].as_str(),
+        ) {
+            let Some((_, mut held)) = service_entries(lock(&self.kernel)?.entries())
+                .into_iter()
+                .find(|(entry, _)| entry.id.0 == id)
+            else {
+                return Err(internal());
+            };
+            if let Some(function) = held.function.as_mut() {
+                function.fingerprint = Some(fingerprint);
+            }
+            held.environment_patch = Some(BTreeSet::new());
+            self.put(&[held], now)?;
+        }
         // The function exists, stopped. Each linked service now lets it in: one rule on that service's NIC, bound to
         // this instance's uuid and address, exactly as a link between two services is.
         let created = lock(&self.kernel)?.entries().to_vec();

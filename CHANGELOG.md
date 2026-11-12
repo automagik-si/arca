@@ -11,6 +11,13 @@ A template whose image is `local:<alias>` and that already carried a `digest` wa
 ignored. It is enforced now: a create from such a template is refused unless the image under the alias has that
 fingerprint, and a digest that is not `sha256:` and 64 lowercase hex digits is refused when the template is read. Check
 a local template's `digest` against `incus image list` before you upgrade, or take the digest out.
+Every run of a function now starts from its image's own root. Before a run starts, its container's root is rebuilt
+from the function's image: from the copy the node already holds, the one the function's record took when it was
+created, or from the registry by the approved digest when that copy is gone. So no run finds what an earlier one
+wrote, which replaces the limit 0.13.0 named. A root that cannot be rebuilt is a run that does not start, and its
+line says why. A run's line gains `root`, `rootImage` and `rootMs`.
+
+## 0.13.0 (2026-11-12)
 
 ## 0.13.0 (2026-11-12)
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU

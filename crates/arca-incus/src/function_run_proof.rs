@@ -58,8 +58,21 @@ fn send(
     checked_envelope(exchange(socket, CALL, &request)?)
 }
 
-/// Sends a write and waits for its operation, at most [`CALL`] in one wait.
+/// A write, tried again for a few seconds while Incus answers that the instance is busy with an operation of its own.
 fn write(socket: &Path, method: &str, path: &str, body: Option<&Value>) -> Result<(), String> {
+    let mut last = Ok(());
+    for _ in 0..20 {
+        last = write_once(socket, method, path, body);
+        match &last {
+            Err(why) if why.contains("busy") => std::thread::sleep(Duration::from_millis(500)),
+            _ => break,
+        }
+    }
+    last
+}
+
+/// Sends a write and waits for its operation, at most [`CALL`] in one wait.
+fn write_once(socket: &Path, method: &str, path: &str, body: Option<&Value>) -> Result<(), String> {
     let envelope = send(socket, method, path, body).map_err(|error| error.to_string())?;
     let Some(operation) = envelope["operation"]
         .as_str()
@@ -467,6 +480,295 @@ fn a_real_incus_runs_a_function_shaped_container() {
             "PROOF stop with one second of grace: forced: {forced}, took {} ms",
             stop.elapsed().as_millis()
         );
+    }));
+    let _ = run
+        .read(&project, NAME)
+        .and_then(|seen| run.stop(&seen, Duration::ZERO));
+    match delete(socket, &instance) {
+        Ok(()) => println!("PROOF the container was deleted"),
+        Err(why) => println!("PROOF the container was NOT deleted: {why}"),
+    }
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The second proof: how a run can be given the image's own root again. A snapshot restore, and whether it also puts
+/// back the instance's config; Incus's rebuild of the root from the image, how long it takes, what it keeps, and what
+/// it does when the image is no longer in the project's store. Same switch, same scratch project, same clean-up.
+#[test]
+#[ignore = "touches a real Incus; run by hand with ARCA_REAL_INCUS_PROOF=1"]
+fn a_real_incus_gives_a_container_its_images_root_again() {
+    if env("ARCA_REAL_INCUS_PROOF").as_deref() != Some("1") {
+        eprintln!("ARCA_REAL_INCUS_PROOF is not 1; nothing was done");
+        return;
+    }
+    let socket = env("ARCA_PROOF_SOCKET").unwrap_or_else(|| "/var/lib/incus/unix.socket".into());
+    let socket = Path::new(&socket);
+    let project = env("ARCA_PROOF_PROJECT").expect("ARCA_PROOF_PROJECT");
+    let pool = env("ARCA_PROOF_POOL").expect("ARCA_PROOF_POOL");
+    assert!(
+        project.starts_with("arcak-scratch-"),
+        "the project must be a scratch project"
+    );
+    let instance = format!("/1.0/instances/{NAME}?project={project}");
+    let source = json!({ "type": "image", "mode": "pull", "protocol": "oci",
+                         "server": "https://docker.io", "alias": IMAGE });
+    if send(socket, "GET", &instance, None).is_ok() {
+        delete(socket, &instance).expect("the container of an earlier run is deleted");
+    }
+    // The program says whether an earlier run left its file, and leaves one.
+    let script = "ls /probe >/dev/null 2>&1 && echo FOUND || echo CLEAN; touch /probe; echo {\\\"ok\\\":true}";
+    write(
+        socket,
+        "POST",
+        &format!("/1.0/instances?project={project}"),
+        Some(&json!({
+            "name": NAME,
+            "type": "container",
+            "source": source,
+            "config": {
+                FUNCTION_KEY: "true",
+                "limits.cpu": "1",
+                "limits.memory": "128MiB",
+                "oci.entrypoint": format!("/bin/sh -c '{script}'"),
+            },
+            "devices": { "root": { "type": "disk", "path": "/", "pool": pool } },
+            "start": false,
+        })),
+    )
+    .expect("the container is created");
+    let family =
+        ProjectFamily::new([project.as_str()], std::iter::empty::<&str>()).expect("family");
+    let run = FunctionRun::new(socket.to_path_buf(), family);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // One run, patiently: what the program printed.
+        let once = || -> String {
+            std::thread::sleep(Duration::from_secs(2));
+            let seen = run.read(&project, NAME).expect("a function's");
+            run.clear_output(&seen).expect("the log is cleared");
+            run.start(&seen).expect("it starts");
+            let from = Instant::now();
+            while run.status(&seen).expect("status") != "Stopped" {
+                assert!(from.elapsed() < Duration::from_secs(30), "it never exited");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            run.output_after_exit(&seen, Duration::from_secs(5))
+                .expect("the output")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let config = |key: &str| -> Value {
+            send(socket, "GET", &instance, None).expect("the instance")["metadata"]["config"][key]
+                .clone()
+        };
+        println!("PROOF first run on a new root: {}", once());
+        println!("PROOF second run, nothing done between: {}", once());
+
+        // 1. A snapshot restore: the files, and the config?
+        write(
+            socket,
+            "POST",
+            &format!("/1.0/instances/{NAME}/snapshots?project={project}"),
+            Some(&json!({ "name": "clean", "stateful": false })),
+        )
+        .expect("the snapshot is taken");
+        write(
+            socket,
+            "PATCH",
+            &instance,
+            Some(&json!({ "config": { "user.note": "set-after-the-snapshot" } })),
+        )
+        .expect("a key is set after the snapshot");
+        println!(
+            "PROOF config key before the restore: {}",
+            config("user.note")
+        );
+        write(
+            socket,
+            "PUT",
+            &instance,
+            Some(&json!({ "restore": "clean" })),
+        )
+        .expect("it is restored");
+        println!(
+            "PROOF config key after the restore: {} (null: a restore puts the config back too)",
+            config("user.note")
+        );
+        write(
+            socket,
+            "DELETE",
+            &format!("/1.0/instances/{NAME}/snapshots/clean?project={project}"),
+            None,
+        )
+        .expect("the snapshot is deleted");
+
+        // 2. A rebuild from the image: what it takes, what it keeps.
+        write(
+            socket,
+            "PATCH",
+            &instance,
+            Some(&json!({ "config": { "user.note": "kept-by-a-rebuild" } })),
+        )
+        .expect("a key is set");
+        println!("PROOF run before the rebuild: {}", once());
+        println!(
+            "PROOF before a rebuild: volatile.uuid = {}, volatile.uuid.generation = {}",
+            config("volatile.uuid"),
+            config("volatile.uuid.generation")
+        );
+        let rebuilds = format!("/1.0/instances/{NAME}/rebuild?project={project}");
+        let mut times = Vec::new();
+        for index in 0..10 {
+            let from = Instant::now();
+            match write(
+                socket,
+                "POST",
+                &rebuilds,
+                Some(&json!({ "source": source })),
+            ) {
+                Ok(()) => times.push(from.elapsed()),
+                Err(why) => {
+                    println!("PROOF rebuild {index} REFUSED: {why}");
+                    break;
+                }
+            }
+            if index == 0 {
+                println!("PROOF run after the first rebuild: {}", once());
+                println!(
+                    "PROOF after a rebuild: user.note = {}, function mark = {}, entry point kept = {}",
+                    config("user.note"),
+                    config(FUNCTION_KEY),
+                    config("oci.entrypoint")
+                        .as_str()
+                        .is_some_and(|text| text.contains("/probe"))
+                );
+            }
+        }
+        println!(
+            "PROOF rebuild from the image in the store: {}",
+            median_and_worst(&times)
+        );
+        println!("PROOF run after the last rebuild: {}", once());
+
+        // 2b. The same rebuild from the copy the project's store already holds, named by its fingerprint: no registry
+        // is asked.
+        let images = send(
+            socket,
+            "GET",
+            &format!("/1.0/images?project={project}&recursion=1"),
+            None,
+        )
+        .expect("the images");
+        let fingerprint = images["metadata"][0]["fingerprint"]
+            .as_str()
+            .expect("the store holds the image")
+            .to_string();
+        println!(
+            "PROOF the store's copy: {} images, cached: {}, last used: {}",
+            images["metadata"].as_array().map_or(0, Vec::len),
+            images["metadata"][0]["cached"],
+            images["metadata"][0]["last_used_at"]
+        );
+        let local = json!({ "source": { "type": "image", "fingerprint": fingerprint } });
+        let mut times = Vec::new();
+        for index in 0..10 {
+            // Back to back, Incus answers that the instance must be stopped: it is still ending the last rebuild.
+            std::thread::sleep(Duration::from_millis(500));
+            let from = Instant::now();
+            match write(socket, "POST", &rebuilds, Some(&local)) {
+                Ok(()) => times.push(from.elapsed()),
+                Err(why) => {
+                    println!("PROOF local rebuild {index} REFUSED: {why}");
+                    break;
+                }
+            }
+        }
+        println!(
+            "PROOF rebuild from the store's own copy, by fingerprint: {}",
+            median_and_worst(&times)
+        );
+        println!("PROOF run after a local rebuild: {}", once());
+        println!(
+            "PROOF after the rebuilds: volatile.uuid = {}, volatile.uuid.generation = {}",
+            config("volatile.uuid"),
+            config("volatile.uuid.generation")
+        );
+        println!(
+            "PROOF the image the instance says it was made from (volatile.base_image) is the store's copy: {}",
+            config("volatile.base_image") == json!(fingerprint)
+        );
+        let after = send(
+            socket,
+            "GET",
+            &format!("/1.0/images/{fingerprint}?project={project}"),
+            None,
+        )
+        .expect("the image");
+        println!(
+            "PROOF the store's copy after the local rebuilds: last used: {}",
+            after["metadata"]["last_used_at"]
+        );
+
+        // 3. The image gone from the project's store: does a rebuild pull it again, or refuse?
+        let images = send(
+            socket,
+            "GET",
+            &format!("/1.0/images?project={project}&recursion=1"),
+            None,
+        )
+        .expect("the images");
+        for image in images["metadata"].as_array().into_iter().flatten() {
+            if let Some(fingerprint) = image["fingerprint"].as_str() {
+                write(
+                    socket,
+                    "DELETE",
+                    &format!("/1.0/images/{fingerprint}?project={project}"),
+                    None,
+                )
+                .expect("the image is deleted");
+            }
+        }
+        let from = Instant::now();
+        match write(
+            socket,
+            "POST",
+            &rebuilds,
+            Some(&json!({ "source": source })),
+        ) {
+            Ok(()) => println!(
+                "PROOF rebuild with the image gone from the store: done in {} ms (Incus pulled it again)",
+                from.elapsed().as_millis()
+            ),
+            Err(why) => {
+                println!("PROOF rebuild with the image gone from the store: REFUSED: {why}")
+            }
+        }
+        println!("PROOF run after that rebuild: {}", once());
+        // And by fingerprint, with the copy gone again: this one cannot pull.
+        let images = send(
+            socket,
+            "GET",
+            &format!("/1.0/images?project={project}&recursion=1"),
+            None,
+        )
+        .expect("the images");
+        for image in images["metadata"].as_array().into_iter().flatten() {
+            if let Some(found) = image["fingerprint"].as_str() {
+                write(
+                    socket,
+                    "DELETE",
+                    &format!("/1.0/images/{found}?project={project}"),
+                    None,
+                )
+                .expect("the image is deleted");
+            }
+        }
+        match write(socket, "POST", &rebuilds, Some(&local)) {
+            Ok(()) => println!("PROOF local rebuild with the copy gone: done"),
+            Err(why) => println!("PROOF local rebuild with the copy gone: REFUSED: {why}"),
+        }
     }));
     let _ = run
         .read(&project, NAME)

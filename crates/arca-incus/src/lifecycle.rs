@@ -223,6 +223,42 @@ impl StateChanger {
         self.wait_for(&envelope)
     }
 
+    /// Asks Incus to rebuild one instance's root disk from an image and waits for the operation. The instance keeps its
+    /// config, its devices and its uuid. It is the crate's own, for [`crate::function_run`] alone, which sends it to a
+    /// function's stopped instance and to nothing else.
+    pub(crate) fn rebuild(
+        &self,
+        project: &str,
+        name: &str,
+        body: &Value,
+    ) -> Result<(), IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(name) {
+            return Err(refused("the project or instance name is not plain"));
+        }
+        let url = format!("/1.0/instances/{name}/rebuild?project={project}");
+        let envelope = checked_envelope(self.send("POST", &url, Some(body))?)?;
+        self.wait_for(&envelope)
+    }
+
+    /// Whether the store the project reads holds an image with this fingerprint. For [`crate::function_run`] alone.
+    pub(crate) fn image_present(
+        &self,
+        project: &str,
+        fingerprint: &str,
+    ) -> Result<bool, IncusError> {
+        self.allow(project)?;
+        if !plain_name(project) || !plain_name(fingerprint) {
+            return Err(refused("the project or the fingerprint is not plain"));
+        }
+        let url = format!("/1.0/images/{fingerprint}?project={project}");
+        match checked_envelope(self.send("GET", &url, None)?) {
+            Ok(_) => Ok(true),
+            Err(IncusError::Status { code: 404, .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Refuses a project outside the family before any request is sent, a read included.
     fn allow(&self, project: &str) -> Result<(), IncusError> {
         self.allows(project)

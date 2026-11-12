@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use arca_incus::function_run::{FUNCTION_KEY, FunctionRun};
+use arca_incus::function_run::{FUNCTION_KEY, FreshRoot, FunctionRun};
 use arca_incus::{FakeIncus, FakeState, IncusError, ProjectFamily, StateAction, StateChanger};
 use serde_json::{Value, json};
 
@@ -49,7 +49,7 @@ impl Rig {
                     "relay",
                     "Stopped",
                     "container",
-                    json!({ FUNCTION_KEY: "true" }),
+                    json!({ FUNCTION_KEY: "true", "volatile.base_image": "c".repeat(64) }),
                 ),
                 instance(
                     "busy",
@@ -87,6 +87,15 @@ impl Rig {
             .read(PROJECT, name)
             .expect("the instance reads")
             .status
+    }
+
+    /// How many rebuilds the fake was asked for, refused ones included.
+    fn rebuild_requests(&self) -> usize {
+        self.fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "POST" && request.path.contains("/rebuild"))
+            .count()
     }
 
     /// The state changes the fake received, as `(method, path)`.
@@ -196,6 +205,126 @@ fn a_service_is_never_read_started_or_force_stopped_from_here() {
         .expect_err("the graceful stop fails");
     assert_eq!(rig.status("web"), "Running");
     assert_eq!(rig.state_writes().len(), 1);
+}
+
+#[test]
+fn a_root_is_rebuilt_from_the_recorded_copy_and_from_the_registry_only_when_that_is_gone() {
+    let rig = Rig::new();
+    let source = json!({
+        "type": "image", "mode": "pull", "protocol": "oci",
+        "server": "https://registry.example",
+        "alias": format!("acme/relay@sha256:{}", "a".repeat(64)),
+    });
+    let never = || false;
+    let held = rig.fake.add_image(PROJECT, "the-functions-image");
+    let other = rig.fake.add_image(PROJECT, "another-image");
+    let seen = rig.run.read(PROJECT, "relay").expect("a function");
+    // The store holds the recorded copy: the root is rebuilt from it, and from no other image, whatever the
+    // instance itself says it was made from (its volatile.base_image is another fingerprint here).
+    assert_ne!(seen.own_config["volatile.base_image"], held);
+    assert_eq!(
+        rig.run
+            .fresh_root(&seen, Some(&held), &source, &never)
+            .expect("rebuilt"),
+        FreshRoot::Store
+    );
+    assert_eq!(
+        rig.fake.rebuilds(PROJECT, "relay"),
+        [format!("store:{held}")]
+    );
+    // The recorded copy is gone from the store, or the record names none: the registry is asked.
+    let gone = "d".repeat(64);
+    for recorded in [Some(gone.as_str()), None] {
+        assert_eq!(
+            rig.run
+                .fresh_root(&seen, recorded, &source, &never)
+                .expect("rebuilt"),
+            FreshRoot::Registry
+        );
+    }
+    assert_eq!(rig.fake.rebuilds(PROJECT, "relay").len(), 3);
+    // A copy that is there and cannot be rebuilt from is an error: the registry is not asked for it.
+    rig.fake.lose_image(PROJECT, "relay");
+    let sent = rig.rebuild_requests();
+    let refused = rig
+        .run
+        .fresh_root(&seen, Some(&other), &source, &never)
+        .expect_err("the rebuild from the copy fails");
+    assert!(
+        !matches!(&refused, IncusError::Refused(why) if why.contains("registry")),
+        "{refused:?}"
+    );
+    assert_eq!(
+        rig.rebuild_requests(),
+        sent + 1,
+        "one try from the store, none from the registry"
+    );
+    rig.fake.allow_rebuild(PROJECT, "relay");
+    // With the copy gone, only an image by digest on a registry is asked for: a tag, a bare name, another protocol,
+    // a server without TLS, another mode and a source with a field more are each refused before any request.
+    let sent = rig.rebuild_requests();
+    for change in [
+        json!({ "alias": "acme/relay:latest" }),
+        json!({ "alias": "acme/relay" }),
+        json!({ "protocol": "simplestreams" }),
+        json!({ "server": "http://registry.example" }),
+        json!({ "mode": "local" }),
+        json!({ "secret": "x" }),
+    ] {
+        let mut odd = source.clone();
+        for (key, value) in change.as_object().expect("an object") {
+            odd[key] = value.clone();
+        }
+        let refused = rig
+            .run
+            .fresh_root(&seen, Some(&gone), &odd, &never)
+            .expect_err("not a pinned image");
+        assert!(
+            matches!(&refused, IncusError::Refused(why) if why.contains("no image by digest")),
+            "{change}: {refused:?}"
+        );
+    }
+    // A record whose image is no fingerprint is refused, and a function that is being removed fetches nothing.
+    assert!(matches!(
+        rig.run.fresh_root(&seen, Some("../x"), &source, &never),
+        Err(IncusError::Refused(_))
+    ));
+    let removing = || true;
+    let cancelled = rig
+        .run
+        .fresh_root(&seen, Some(&gone), &source, &removing)
+        .expect_err("cancelled");
+    assert!(
+        matches!(&cancelled, IncusError::Refused(why) if why.contains("being removed")),
+        "{cancelled:?}"
+    );
+    assert_eq!(rig.rebuild_requests(), sent, "no rebuild was asked for");
+    // The copy gone and the registry silent: the error says so.
+    rig.fake.refuse_rebuild(PROJECT, "relay");
+    let both = rig
+        .run
+        .fresh_root(&seen, Some(&gone), &source, &never)
+        .expect_err("no image anywhere");
+    assert!(
+        matches!(&both, IncusError::Refused(why) if why.contains("the registry did not give it again")),
+        "{both:?}"
+    );
+    // A running function is not rebuilt, and neither is anything that is not a function.
+    let busy = rig.run.read(PROJECT, "busy").expect("a function");
+    let sent = rig.rebuild_requests();
+    assert!(matches!(
+        rig.run.fresh_root(&busy, Some(&held), &source, &never),
+        Err(IncusError::Refused(_))
+    ));
+    let family = ProjectFamily::new([PROJECT], std::iter::empty::<&str>()).expect("family");
+    let service = StateChanger::new(rig.fake.socket().to_path_buf(), family)
+        .read(PROJECT, "web")
+        .expect("the service reads");
+    assert!(matches!(
+        rig.run.fresh_root(&service, Some(&held), &source, &never),
+        Err(IncusError::Refused(_))
+    ));
+    assert_eq!(rig.rebuild_requests(), sent, "nothing was sent for either");
 }
 
 #[test]
