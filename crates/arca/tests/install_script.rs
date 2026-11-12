@@ -1353,6 +1353,101 @@ fn a_flag_changes_nothing_in_a_config_the_script_did_not_write_and_a_closed_door
 }
 
 #[test]
+fn enable_changes_runs_the_programs_own_step_for_the_service_it_started_and_says_plainly_when_it_was_not_done()
+ {
+    let version = door_since();
+    let init_calls = |machine: &Machine| -> Vec<String> {
+        machine
+            .log("arca")
+            .into_iter()
+            .filter(|line| line.starts_with("init"))
+            .collect()
+    };
+
+    // Without the flag the step is never taken: the node only looks.
+    let machine = Machine::new();
+    machine.release(&version);
+    let config = machine.home(".config/arca/node.json");
+    machine.run(&["--version", &version]).ok();
+    assert_eq!(init_calls(&machine), Vec::<String>::new());
+
+    // With it: after the node runs as this script's service, the program's own step is run once, with the yes the
+    // flag is and the config by name, and its words are the report's. The script reads no standard input for it.
+    let run = machine.piped("sh", &["--version", &version, "--enable-changes"]);
+    run.ok()
+        .says("--enable-changes: `arca init` ran, and these are its words.")
+        .says("    Arca may now make changes on this machine.")
+        .says("    No passkey is trusted yet, so nothing can be approved until you enrol the first one.")
+        .says(&format!("      arca setup-code --config {}", config.display()))
+        .says(&format!("      arca init --watch-only --config {}", config.display()))
+        .says("node      mode kernel")
+        .says("This node may now make changes, each only after you approve it: --enable-changes asked for it.")
+        .never_says("its config, which this script did not write, says so")
+        .never_says(TOKEN);
+    assert_eq!(
+        init_calls(&machine),
+        vec![format!(
+            "init --enable-changes --yes --config {}",
+            config.display()
+        )]
+    );
+    let log = machine.log("arca");
+    let step = log
+        .iter()
+        .position(|line| line.starts_with("init"))
+        .expect("the step");
+    assert!(
+        log[..step]
+            .iter()
+            .any(|line| line.starts_with("call arca_status")),
+        "the node was asked before the step: {log:?}"
+    );
+    assert!(
+        !machine.dir.join("fake/stdin-read.log").exists(),
+        "something the script started could read its standard input"
+    );
+
+    // The step refuses: the script says it was not done, gives its words and the command, and does not end with 0.
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.switch("init-refuses", true);
+    let run = machine.run(&["--version", &version, "--enable-changes"]);
+    run.refused()
+        .says("--enable-changes was NOT done: `arca init` stopped, and the node still only looks. Its words:")
+        .says("    arca: init changed nothing: this config has no approval page and no loopback door for one")
+        .says("To take the step yourself once that is settled:")
+        .says("init --enable-changes --yes --config")
+        .says("node      mode watch-only")
+        .never_says("may now make changes");
+
+    // A program from before the step: it is not run at all, and the script says why.
+    let machine = Machine::new();
+    machine.release(&version);
+    machine.switch("program-without-init", true);
+    let run = machine.run(&["--version", &version, "--enable-changes"]);
+    run.refused()
+        .says("--enable-changes was NOT done, and the node still only looks.")
+        .says("This program has no `arca init`: it is from a release before that step.");
+    assert_eq!(init_calls(&machine), Vec::<String>::new());
+
+    // A config of the owner's own with no service of this script's: no node was started, so there is none to
+    // change. The step is not run.
+    let machine = Machine::new();
+    machine.release(&version);
+    fs::create_dir_all(machine.home(".config/arca")).expect("the config directory");
+    fs::write(
+        machine.home(".config/arca/node.json"),
+        "{ \"stateDir\": \"/somewhere/else\" }\n",
+    )
+    .expect("a config");
+    let run = machine.run(&["--version", &version, "--enable-changes"]);
+    assert_ne!(run.code, Some(0), "{}", run.all());
+    run.says("--enable-changes was NOT done, and the node still only looks.")
+        .says("This script runs `arca init` only for the node it runs as a service, and it started none here.");
+    assert_eq!(init_calls(&machine), Vec::<String>::new());
+}
+
+#[test]
 fn a_service_from_an_earlier_run_is_restarted_only_where_the_node_can_be_asked() {
     let restarts = |machine: &Machine| {
         machine

@@ -5,6 +5,8 @@
 #   sh install.sh --version <version>  the same, for another release
 #   sh install.sh --no-door            the same, and the node opens no TCP port: no HTTP MCP door, now or on a later run
 #   sh install.sh --door               the same, and the door is opened again after an earlier --no-door
+#   sh install.sh --enable-changes     the same, and then the node may make changes, each only after the owner
+#                                      approves it with a passkey: it runs `arca init --enable-changes --yes`
 #   sh install.sh --uninstall          remove the program and the service this script installed
 #   sh install.sh --help
 #
@@ -116,6 +118,9 @@ ${DOOR_PORTS%% *}, or the next free one), with a token. It opens no address anot
 
   sh install.sh --no-door            open no TCP port at all; a later run without a flag keeps it that way
   sh install.sh --door               open the door again
+  sh install.sh --enable-changes     after installing, let the node make changes, each only after you approve it with
+                                     your passkey (it runs: arca init --enable-changes --yes). Without it the node
+                                     only looks
 
 It ends with 0 when the node runs and answered, with 1 when it refused or failed, and with $NOT_STARTED when the program
 is installed and it started no node.
@@ -831,6 +836,35 @@ ask_status() {
     done
 }
 
+# --enable-changes: the one step from a node that only looks to one that may change things, taken by the program
+# itself. This script reads no standard input, so the flag is the owner's yes, and init takes its own defaults. It is
+# run only for the node this script runs as a service, which init then restarts and asks; its words are the report's.
+enable_changes() {
+    init_said=
+    init_done=
+    [ "$enable_flag" = 1 ] || return 0
+    init_command="$bin init --enable-changes --yes --config $config"
+    if [ "$service" != unit ]; then
+        init_done=skipped
+        init_said="This script runs \`arca init\` only for the node it runs as a service, and it started none here."
+        return 0
+    fi
+    # The program says whether it has the step: one from before it would only print its usage.
+    case $("$bin" --help 2>/dev/null </dev/null) in
+        *'init --enable-changes'*) ;;
+        *)
+            init_done=absent
+            init_said="This program has no \`arca init\`: it is from a release before that step."
+            return 0
+            ;;
+    esac
+    if init_said=$("$bin" init --enable-changes --yes --config "$config" 2>&1 </dev/null); then
+        init_done=yes
+    else
+        init_done=no
+    fi
+}
+
 report() {
     status_command="$bin call arca_status --config $config --token-file $token_file"
     start_command="$bin serve --config $config"
@@ -897,7 +931,11 @@ report() {
             say "  node      mode $mode, version $node_version, INCUS DOES NOT ANSWER THE NODE"
         fi
         if [ "$mode" != watch-only ]; then
-            say "            This node is not read-only: its config, which this script did not write, says so."
+            if [ "$init_done" = yes ]; then
+                say "            This node may now make changes, each only after you approve it: --enable-changes asked for it."
+            else
+                say "            This node is not read-only: its config, which this script did not write, says so."
+            fi
         fi
     elif exists "$token_file"; then
         say "  node      it has not answered \`arca_status\`"
@@ -917,6 +955,31 @@ report() {
             ;;
     esac
 
+    if [ -n "$init_done" ]; then
+        say
+        case $init_done in
+            yes)
+                say "--enable-changes: \`arca init\` ran, and these are its words."
+                ;;
+            no)
+                say "--enable-changes was NOT done: \`arca init\` stopped, and the node still only looks. Its words:"
+                result=1
+                ;;
+            *)
+                say "--enable-changes was NOT done, and the node still only looks."
+                result=1
+                ;;
+        esac
+        say
+        printf '%s\n' "$init_said" | while IFS= read -r init_line; do
+            say "    $init_line"
+        done
+        if [ "$init_done" != yes ]; then
+            say
+            say "  To take the step yourself once that is settled:"
+            say "    $init_command"
+        fi
+    fi
     say
     case $service in
         unit)
@@ -1109,6 +1172,7 @@ main() {
     version_named=0
     action=install
     door_flag=
+    enable_flag=0
     while [ "$#" -gt 0 ]; do
         case $1 in
             --version)
@@ -1122,6 +1186,7 @@ main() {
                 version_named=1
                 ;;
             --uninstall) action=uninstall ;;
+            --enable-changes) enable_flag=1 ;;
             --no-door)
                 [ "$door_flag" != door ] || fail "--door and --no-door are not both given."
                 door_flag=no-door
@@ -1202,6 +1267,7 @@ main() {
     install_program
     write_config
     start_service
+    enable_changes
     report
 }
 
