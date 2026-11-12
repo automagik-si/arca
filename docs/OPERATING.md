@@ -63,8 +63,8 @@ only reads says nothing, and a config named with `--config` is not said back. On
 `--hash-dir` alone read no config at all, not even the variable's.
 
 **The variable alone never picks the node for a command that hands out, removes or rewrites something.** `token mint`,
-`token revoke`, `call --peer`, `link remove`, `probe consumer remove`, `adopt apply`, `adopt release` and both modes of
-`init` would succeed on whatever node `ARCA_CONFIG` was left set for, and the installer mints the same token id on every
+`token revoke`, `token reload`, `call --peer`, `link pair`, `link join`, `link remove`, `probe consumer remove`, `adopt
+apply`, `adopt release` and both modes of `init` would succeed on whatever node `ARCA_CONFIG` was left set for, and the installer mints the same token id on every
 node. So with the
 variable set and no `--config`, they go on only when the variable names the same file as the default. When it names
 another file they refuse with exit 2, do nothing, and say the flag to run them with:

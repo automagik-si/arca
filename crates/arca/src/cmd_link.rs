@@ -64,8 +64,9 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         "remove" => crate::Does::Removes,
         _ => crate::Does::Acts,
     };
-    // Removing a peer cuts it off from one node, so the variable alone never picks that node.
-    let (_, config) = if does == crate::Does::Removes {
+    // Removing a peer cuts it off from one node, and pairing or joining hands a peer out on one node: the variable alone
+    // never picks that node. Running the link and listing its peers follow the variable as every command does.
+    let (_, config) = if matches!(command.as_str(), "remove" | "pair" | "join") {
         crate::load_node_config_to(&flags, does)?
     } else {
         crate::load_config_to(&flags, does)?

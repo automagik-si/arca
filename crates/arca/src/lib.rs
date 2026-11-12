@@ -93,9 +93,9 @@ defaults, the files the installer writes:
   Every command finds its config this way. One that writes to a node or acts on it, without --config, first says on
   stderr which config it uses; one that removes or cuts something off also names the node's state directory.
   A call with --peer sends its token to another node, so its --token-file is always named: it has no default.
-  token mint, token revoke, call --peer, link remove, probe consumer remove, adopt apply, adopt release and init hand
-  out, remove or rewrite something on one node, so the variable alone never picks it: when ARCA_CONFIG names another
-  file than the default, they refuse and say the --config to run them with.";
+  token mint, token revoke, token reload, call --peer, link pair, link join, link remove, probe consumer remove,
+  adopt apply, adopt release and init hand out, remove or rewrite something on one node, so the variable alone never
+  picks it: when ARCA_CONFIG names another file than the default, they refuse and say the --config to run them with.";
 
 /// The variable that names the config when `--config` is not given.
 pub const CONFIG_VARIABLE: &str = "ARCA_CONFIG";
@@ -418,8 +418,9 @@ fn variable_names_the_default(variable: &Path, default: Option<&Path>) -> bool {
 }
 
 /// The config of a command that hands out, sends or removes a credential, a peer or an instance, or rewrites what a node
-/// is: `token mint`, `token revoke`, `call --peer`, `link remove`, `probe consumer remove`, `adopt apply`, `adopt
-/// release` and both modes of `init`. It is found as every
+/// is: `token mint`, `token revoke`, `token reload` (the step that makes a revoke take effect), `call --peer`, `link
+/// pair` and `link join` (which hand out a peer), `link remove`, `probe consumer remove`, `adopt apply`, `adopt release`
+/// and both modes of `init`. It is found as every
 /// command finds it, with one exception: THE VARIABLE ALONE NEVER PICKS THE NODE. A variable left set for another node
 /// would send such a command there, it would succeed, and the line on stderr is not something a script or an assistant
 /// stops for. So with the variable set and no flag, the command goes on only when the variable names the same file as

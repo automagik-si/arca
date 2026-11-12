@@ -127,7 +127,8 @@ const RELOAD_WAIT: Duration = Duration::from_secs(30);
 /// node that could not read its token directory, and a signal whose effect cannot be told are each said in words, with a
 /// failure's exit code. It finds its config as every command does, and says which one when the flag did not name it.
 pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let (config, cfg) = crate::load_config_to(flags, Does::Acts)?;
+    // A reload is the step that makes a revoke, or a mint, take effect on one node: the variable alone never picks it.
+    let (config, cfg) = crate::load_node_config_to(flags, Does::Acts)?;
     let config_path = config.path.as_path();
     let config_text = config_path.display();
     // The process is checked through /proc. Without it nothing can be checked, so nothing is signalled.

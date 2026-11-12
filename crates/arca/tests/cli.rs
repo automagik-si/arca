@@ -1710,9 +1710,9 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  Every command finds its config this way. One that writes to a node or acts on it, without --config, first says on",
         "  stderr which config it uses; one that removes or cuts something off also names the node's state directory.",
         "  A call with --peer sends its token to another node, so its --token-file is always named: it has no default.",
-        "  token mint, token revoke, call --peer, link remove, probe consumer remove, adopt apply, adopt release and init hand",
-        "  out, remove or rewrite something on one node, so the variable alone never picks it: when ARCA_CONFIG names another",
-        "  file than the default, they refuse and say the --config to run them with.",
+        "  token mint, token revoke, token reload, call --peer, link pair, link join, link remove, probe consumer remove,",
+        "  adopt apply, adopt release and init hand out, remove or rewrite something on one node, so the variable alone never",
+        "  picks it: when ARCA_CONFIG names another file than the default, they refuse and say the --config to run them with.",
         "  init --watch-only [--config <file>] (back to a node that only looks)",
         "  call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]",
         "  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]",
@@ -2690,6 +2690,9 @@ fn the_variable_alone_never_picks_the_node_for_a_command_that_hands_out_or_remov
             "token", "mint", "--scope", "viewer", "--id", "minted-1", "--out", &out_arg,
         ],
         vec!["token", "revoke", "assistant-1"],
+        // The reload is the step that makes a revoke take effect; pairing hands out a peer.
+        vec!["token", "reload"],
+        vec!["link", "pair"],
         vec![
             "call",
             "--peer",
