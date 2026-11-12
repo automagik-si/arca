@@ -197,6 +197,28 @@ fn a_template_whose_rules_cannot_be_read_or_whose_defaults_fail_them_is_refused_
             json!({ "need": "classes", "atLeast": 1, "why": "x" }),
             "need names classes, whose value is not a whole number".to_string(),
         ),
+        // A name a refusal would tell back is short and plain: one that is not is refused and never shown.
+        (
+            json!({ "need": "x".repeat(65), "atLeast": 1, "why": "x" }),
+            "a setting is named in 1 to 64 plain characters".to_string(),
+        ),
+        (
+            json!({ "need": "maxSlots", "atLeast": { "count": "y".repeat(65) }, "why": "x" }),
+            "a setting is named in 1 to 64 plain characters".to_string(),
+        ),
+        (
+            json!({ "need": "max\u{202e}stolS", "atLeast": 1, "why": "x" }),
+            "a setting is named in 1 to 64 plain characters".to_string(),
+        ),
+        (
+            json!({ "need": "", "atLeast": 1, "why": "x" }),
+            "a setting is named in 1 to 64 plain characters".to_string(),
+        ),
+        // At 64 characters the name is read, and told back when the template has no such setting.
+        (
+            json!({ "need": "z".repeat(64), "atLeast": 1, "why": "x" }),
+            format!("need names {}, which is not a setting of the template", "z".repeat(64)),
+        ),
         // An amount of no form the kernel reads.
         (json!({ "need": { "sum": "classes" }, "atLeast": 1, "why": "x" }), forms.to_string()),
         (json!({ "need": "maxSlots", "atLeast": -1, "why": "x" }), forms.to_string()),
@@ -268,7 +290,7 @@ fn a_template_whose_rules_cannot_be_read_or_whose_defaults_fail_them_is_refused_
     );
 }
 
-/// The two GitLab pool templates as they ship state six rules, each one the pool's own script refuses on the
+/// The two GitLab pool templates as they ship state eight rules, each one the pool's own script refuses on the
 /// machine's console (`settings: ...` in `templates/gitlab-runner-pool.sh`). Their defaults pass, each rule refuses
 /// the first value outside it and takes the last value inside it.
 #[test]
@@ -286,7 +308,7 @@ fn the_shipped_gitlab_pool_templates_state_what_their_script_refuses() {
     for name in ["gitlab-runner-pool", "gitlab-runner-pool-large"] {
         let template = service::load_template(&shipped, name)
             .unwrap_or_else(|error| panic!("{name} loads with its rules: {}", error.message));
-        assert_eq!(template.setting_rules.len(), 6, "{name}");
+        assert_eq!(template.setting_rules.len(), 8, "{name}");
         let refused = |settings: Value| {
             service::create_settings(&template, Some(&settings))
                 .expect_err("refused")
@@ -300,6 +322,15 @@ fn the_shipped_gitlab_pool_templates_state_what_their_script_refuses() {
             (
                 json!({ "jobCpu": 0 }),
                 "settings: settings.jobCpu is 0, below 1: ",
+            ),
+            // The script reads these two counts in at most three digits.
+            (
+                json!({ "concurrent": 1000 }),
+                "settings: settings.concurrent is 1000, above 999: ",
+            ),
+            (
+                json!({ "jobCpu": 1000 }),
+                "settings: settings.jobCpu is 1000, above 999: ",
             ),
             (
                 json!({ "memoryOvercommitPercent": 99 }),
@@ -324,6 +355,7 @@ fn the_shipped_gitlab_pool_templates_state_what_their_script_refuses() {
         }
         for settings in [
             json!({ "concurrent": 1, "jobCpu": 1 }),
+            json!({ "concurrent": 999, "jobCpu": 999 }),
             json!({ "memoryOvercommitPercent": 100 }),
             json!({ "memoryOvercommitPercent": 200 }),
             json!({ "runners": runners(1) }),
@@ -333,4 +365,46 @@ fn the_shipped_gitlab_pool_templates_state_what_their_script_refuses() {
                 .unwrap_or_else(|error| panic!("{name} {settings}: {}", error.message));
         }
     }
+}
+
+/// The rules are asked of a create only. A service made before its template stated a rule, with a value the rule
+/// would now refuse, still answers its verbs once the template states it: nothing reads a service's stored settings
+/// against the rules.
+#[test]
+fn a_service_made_before_a_rule_was_stated_still_answers_once_the_template_states_it() {
+    let rig = ruled_rig();
+    let mut before = ruled_template();
+    before
+        .as_object_mut()
+        .expect("a template")
+        .remove("settingRules");
+    rig.template("ruled", before);
+    rig.call(
+        "service_create",
+        json!({ "name": "old", "template": "ruled", "settings": { "percent": 250 } }),
+    )
+    .expect("created while the template stated no rule");
+    rig.template("ruled", ruled_template());
+    // The same create is refused now.
+    assert_eq!(
+        refusal(rig.call(
+            "service_create",
+            json!({ "name": "new", "template": "ruled", "settings": { "percent": 250 } }),
+        )),
+        "settings: settings.percent is 250, above 200: 200 is the most"
+    );
+    // The service that exists is read as before.
+    let status = rig
+        .call("service_status", json!({ "name": "old" }))
+        .expect("status");
+    assert_eq!(status["name"], "old");
+    let listed = rig.call("service_list", json!({})).expect("the list");
+    assert!(
+        listed["services"]
+            .as_array()
+            .expect("services")
+            .iter()
+            .any(|service| service["name"] == "old"),
+        "{listed}"
+    );
 }

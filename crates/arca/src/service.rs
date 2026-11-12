@@ -1295,6 +1295,9 @@ fn check_rule(rule: &SettingRule, settings: Option<&Value>) -> RuleCheck {
     })
 }
 
+/// The longest name of a setting that a rule may give, and that a refusal shows of a name a create gave.
+const SETTING_NAME_MAX: usize = 64;
+
 /// Why a template's `settingRules` are not ones it may state, or `None`: each is readable against the template's own
 /// settings, gives a plain reason, and holds for the template's own defaults.
 fn setting_rules_refusal(template: &Template) -> Option<String> {
@@ -1310,6 +1313,20 @@ fn setting_rules_refusal(template: &Template) -> Option<String> {
             if why.is_empty() || rule.why.chars().count() > 200 || !plain_text(&rule.why) {
                 return Some(format!(
                     "settingRules[{n}]: why is its reason in plain words, 1 to 200 characters"
+                ));
+            }
+            // A name a rule gives is told back in a refusal, of the template and of a create: it is held to the
+            // length and the characters a create's own setting names are shown with, and one that is not is never
+            // told back.
+            let named = |side: &Value| match Amount::of(side) {
+                Some(Amount::Setting(name) | Amount::Count(name)) => {
+                    name.is_empty() || name.chars().count() > SETTING_NAME_MAX || !plain_text(name)
+                }
+                _ => false,
+            };
+            if named(&rule.need) || named(&rule.at_least) {
+                return Some(format!(
+                    "settingRules[{n}]: a setting is named in 1 to {SETTING_NAME_MAX} plain characters"
                 ));
             }
             match check_rule(rule, template.settings.as_ref()) {
@@ -1937,7 +1954,7 @@ pub fn create_settings(
             let shown: String = key
                 .chars()
                 .filter(|c| plain_text(&c.to_string()))
-                .take(64)
+                .take(SETTING_NAME_MAX)
                 .collect();
             return refused(format!(
                 "settings.{shown}: template {name} does not let a create set it; it lets a create set {}",

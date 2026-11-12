@@ -10,9 +10,9 @@ Write under this comment only what a reader needs beyond those lines; the releas
 A virtual-machine template can say what must hold between its settings (`settingRules`: one amount at least
 another), and a create whose settings would not pass is refused when it is proposed, before any card. The two GitLab
 runner pool templates now state what their script already refused on the machine's console: `concurrent` and
-`jobCpu` of 1 or more, `memoryOvercommitPercent` from 100 to 200, and 1 to 12 `runners`. Both files changed, so an
+`jobCpu` from 1 to 999, `memoryOvercommitPercent` from 100 to 200, and 1 to 12 `runners`. Both files changed, so an
 installed copy that was not edited is brought up to date by the upgrade, and a card for one of them that waits across
-the upgrade is refused and proposed again.
+the upgrade is refused when approved, and must be proposed again.
 
 A create is refused when the instance it would get has the name of another service's instance on the node: the
 node's own service `x-<tenant id>` and that tenant's service `x`. Before, the second one was recorded and Incus

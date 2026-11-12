@@ -460,3 +460,88 @@ fn an_instance_name_a_service_of_another_side_has_is_refused_in_either_order() {
     propose(&rig, json!({ "name": "x", "template": "app", "tenant": B }))
         .expect("the other tenant's x is free");
 }
+
+/// A function's instance has the function's own name, so a function named like a tenant's instance is refused when
+/// it is proposed, by the check its create makes too (`name_free`).
+#[test]
+fn a_function_named_like_a_tenants_instance_is_refused_when_it_is_proposed() {
+    let rig = two_tenants(policy());
+    rig.call(
+        "service_create",
+        json!({ "name": "x", "template": "app", "tenant": A }),
+    )
+    .expect("the tenant's service x");
+    let function = |name: &str| {
+        json!({
+            "action": "function_create",
+            "args": {
+                "name": name,
+                "image": "registry.example/acme/relay",
+                "digest": DIGEST,
+                "command": ["/relay", "--once"],
+                "triggers": [{ "timer": { "everySeconds": 30 } }]
+            }
+        })
+    };
+    let name = format!("x-{A}");
+    let (code, message) = refusal(untouched(&rig, || {
+        rig.call("action_propose", function(&name))
+    }));
+    assert_eq!(code, "refused");
+    assert_eq!(
+        message,
+        format!(
+            "the name {name} is taken on this node: the instance this function would get has the name of another service's instance. Choose another name"
+        )
+    );
+    // A name no instance has is proposed, with the same arguments otherwise.
+    rig.call("action_propose", function(&format!("x-{B}")))
+        .expect("the other tenant holds no x, so that instance name is free");
+}
+
+/// On a node whose database is made from its template, a database is a service of the node's own, and its
+/// instance has its name. One named like a tenant's instance is refused through either door, and no card is shown
+/// for it; a tenant's service whose instance would have a database's name is refused too.
+#[test]
+fn a_template_database_named_like_a_tenants_instance_is_refused_in_either_order() {
+    let mut kernel = json!({
+        "projects": [PROJECT],
+        "droiddProjects": ["other"],
+        "serviceCidr": CIDR,
+        "vmLimits": { "virtualMachines": 4, "cpu": 16, "memory": "64GiB", "disk": "1TiB" }
+    });
+    kernel["tenants"] = policy();
+    let rig = Rig::with_kernel(kernel, empty_state());
+    arca::cmd_templates::install_into(&rig.dir.join("templates"), false)
+        .unwrap_or_else(|_| panic!("the shipped templates install"));
+    rig.template("app", app_template("app"));
+    rig.create_tenant(json!({ "id": A })).expect("the tenant");
+    rig.call(
+        "service_create",
+        json!({ "name": "x", "template": "app", "tenant": A }),
+    )
+    .expect("the tenant's service x");
+    let name = format!("x-{A}");
+    let words = format!(
+        "the name {name} is taken on this node: the instance this database would get has the name of another service's instance. Choose another name"
+    );
+    let create = refusal(rig.call("postgres_create", json!({ "name": name })));
+    assert_eq!(create, ("refused".to_string(), words));
+    let proposed = untouched(&rig, || {
+        rig.call(
+            "action_propose",
+            json!({ "action": "postgres_create", "args": { "name": name } }),
+        )
+    });
+    assert_eq!(refusal(proposed), create);
+
+    // The other order: the node's database first, then the tenant's service whose instance would have its name.
+    let database = format!("y-{A}");
+    rig.call("postgres_create", json!({ "name": database }))
+        .expect("the node's database");
+    refused_as_the_create(
+        &rig,
+        json!({ "name": "y", "template": "app", "tenant": A }),
+        "the name y is taken on this node: the instance this service would get has the name of another service's instance. Choose another name",
+    );
+}
