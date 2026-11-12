@@ -3954,13 +3954,74 @@ fn local_image_present(
     )))
 }
 
+/// Whether the node's config asks for no service project at all: no service subnet, no host bridges, and the service
+/// project not among the kernel's projects. Such a node was never set up to run a service, so a list of its services is
+/// the empty list. A config that names any of the three and not the rest is a fault, and every call still refuses it.
+pub(crate) fn no_service_project_asked(cfg: &NodeConfig) -> bool {
+    let kernel = &cfg.kernel;
+    kernel.service_cidr.is_none()
+        && kernel.bridged.is_none()
+        && !kernel
+            .projects
+            .iter()
+            .any(|project| project == arca_netproject::PROJECT)
+}
+
+/// Whether the node's desired state holds a record of anything in the service project: a service, a database, a consumer,
+/// or the project and network themselves. A node whose config no longer asks for the project may still hold them.
+fn holds_service_records(entries: &[arca_kernel::desired::Entry]) -> bool {
+    entries.iter().any(|entry| {
+        matches!(
+            entry.plugin.0.as_str(),
+            "arca.service" | "arca.netproject" | "arca.postgres" | "arca.consumer"
+        )
+    })
+}
+
+/// The config keys that let a node run services. A kernel project also needs `kernel.droiddProjects`, which the config
+/// check asks for by name.
+fn service_keys() -> String {
+    format!(
+        "its config must set kernel.serviceCidr to an IPv4 /24 and list {} in kernel.projects (with kernel.droiddProjects), and the node be restarted",
+        arca_netproject::PROJECT
+    )
+}
+
+/// The refusal of a call that needs the service subnet on a node whose config names none: what the node is, and the
+/// config keys that would let it run services.
+fn no_service_subnet(cfg: &NodeConfig) -> CallError {
+    let fix = service_keys();
+    service_refused(if !no_service_project_asked(cfg) {
+        format!(
+            "no service project: the node's config does not set kernel.serviceCidr. To run services, {fix}"
+        )
+    } else if cfg.kernel.projects.is_empty() {
+        format!(
+            "no service project: this node only looks, and its config sets up no services. To let it run them, {fix}"
+        )
+    } else {
+        format!(
+            "no service project: this node's config sets up no services. To let it run them, {fix}"
+        )
+    })
+}
+
+/// The refusal of every service call on a node whose config asks for no service project while its desired state still
+/// holds what it ran: the list is not empty, and the node cannot serve it, so it says so.
+fn service_records_without_config() -> CallError {
+    service_refused(format!(
+        "no service project: this node's config sets up no services, but the node still holds records of services it ran. To reach them again, {}",
+        service_keys()
+    ))
+}
+
 /// The service project's CIDR and gateway, or a refusal before any Incus read.
 fn service_project(cfg: &NodeConfig) -> Result<(String, String), CallError> {
     let cidr = cfg
         .kernel
         .service_cidr
         .as_deref()
-        .ok_or_else(|| service_refused("no service project: kernel.serviceCidr is required"))?;
+        .ok_or_else(|| no_service_subnet(cfg))?;
     let gateway = crate::service::gateway(cidr)
         .map_err(|_| service_refused("no service project: the service CIDR is invalid"))?;
     if !cfg
@@ -4844,6 +4905,17 @@ impl ToolHandler for ServiceHandler {
                 "deploy: only a call inside a tenant names a deploy".into(),
             ));
         }
+        // A node whose config asks for no service project, and whose desired state holds nothing of one, has no service:
+        // the list is empty, and Incus is not asked. A node that still holds records of what it ran has not, so no call
+        // answers for it as if it had none. Every other verb, and every half-made service config, still refuses below.
+        if tenant.is_none() && no_service_project_asked(&self.cfg) {
+            if holds_service_records(lock(&self.kernel)?.entries()) {
+                return Err(service_records_without_config());
+            }
+            if self.verb == "service_list" {
+                return Ok(json!({ "services": [] }));
+            }
+        }
         let (cidr, gateway) = match bridged {
             _ if tenant.is_some() => tenants::network(&self.cfg)?,
             Some(_) if !managed => {
@@ -5548,5 +5620,80 @@ impl ToolHandler for ServiceHandler {
             }
             _ => Err(service_not_found("unknown service verb")),
         }
+    }
+}
+
+#[cfg(test)]
+mod service_project_tests {
+    use super::*;
+
+    fn config(kernel: Value) -> NodeConfig {
+        serde_json::from_value(json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": kernel
+        }))
+        .expect("the fixture config parses")
+    }
+
+    fn refused(cfg: &NodeConfig) -> String {
+        match service_project(cfg) {
+            Err(CallError::Refused { message, .. }) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_config_that_names_nothing_of_the_service_project_asks_for_none() {
+        let project = arca_netproject::PROJECT;
+        assert!(no_service_project_asked(&config(
+            json!({ "droiddProjects": [] })
+        )));
+        assert!(no_service_project_asked(&config(
+            json!({ "projects": ["elsewhere"], "droiddProjects": ["droid"] })
+        )));
+        // Naming the service project as droidd's, or a scratch run, asks for no service either.
+        assert!(no_service_project_asked(&config(
+            json!({ "droiddProjects": [project] })
+        )));
+        assert!(no_service_project_asked(&config(
+            json!({ "scratch": true, "droiddProjects": [] })
+        )));
+        // Any one of the three keys is a config that asked for services, whole or not.
+        assert!(!no_service_project_asked(&config(
+            json!({ "serviceCidr": "192.0.2.0/24", "droiddProjects": [] })
+        )));
+        assert!(!no_service_project_asked(&config(
+            json!({ "projects": [project], "droiddProjects": ["droid"] })
+        )));
+    }
+
+    #[test]
+    fn a_missing_subnet_is_refused_in_the_words_of_what_the_node_is() {
+        let keys = "its config must set kernel.serviceCidr to an IPv4 /24 and list arcak-svc in kernel.projects (with kernel.droiddProjects), and the node be restarted";
+        assert_eq!(
+            refused(&config(json!({ "droiddProjects": [] }))),
+            format!(
+                "no service project: this node only looks, and its config sets up no services. To let it run them, {keys}"
+            )
+        );
+        assert_eq!(
+            refused(&config(
+                json!({ "projects": ["elsewhere"], "droiddProjects": ["droid"] })
+            )),
+            format!(
+                "no service project: this node's config sets up no services. To let it run them, {keys}"
+            )
+        );
+        assert_eq!(
+            refused(&config(
+                json!({ "projects": ["arcak-svc"], "droiddProjects": ["droid"] })
+            )),
+            format!(
+                "no service project: the node's config does not set kernel.serviceCidr. To run services, {keys}"
+            )
+        );
     }
 }
