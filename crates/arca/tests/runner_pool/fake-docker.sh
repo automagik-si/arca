@@ -128,6 +128,8 @@ case $command in
     echo "id-$name"
     ;;
   rm)
+    # Removing a container takes time on a real machine: a test can say how long.
+    [ -z "${FAKE_RM_SECONDS:-}" ] || sleep "$FAKE_RM_SECONDS"
     for argument in "$@"; do
       case $argument in -*) continue ;; esac
       rm -rf "$root/containers/$argument" "$root/containers/${argument#id-}"

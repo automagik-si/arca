@@ -191,11 +191,14 @@ size_bytes() {
 mib() { echo $(($1 / 1048576)); }
 
 SLOT_CLASS=()
+SLOT_CLASS_N=()
 SLOT_LABELS=()
 SLOT_LABELS_JSON=()
 SLOT_CPU=()
 SLOT_MEM=()
 CLASS_NAMES=()
+# The first slot of each class: every slot of a class has the same size.
+CLASS_FIRST=()
 
 # Reads the settings into the slot table. Every slot has a class: its labels and its size. A setting that cannot be
 # used is said in words and the controller does not start.
@@ -318,9 +321,11 @@ load_settings() {
     fi
     cpu=$((10#$cpu))
     slots=$((10#$slots))
+    CLASS_FIRST+=("${#SLOT_CLASS[@]}")
     CLASS_NAMES+=("$name")
     for ((n = 0; n < slots; n++)); do
       SLOT_CLASS+=("$name")
+      SLOT_CLASS_N+=($((${#CLASS_NAMES[@]} - 1)))
       SLOT_LABELS+=("$labels")
       SLOT_LABELS_JSON+=("$labels_json")
       SLOT_CPU+=("$cpu")
@@ -330,6 +335,14 @@ load_settings() {
   SLOTS=${#SLOT_CLASS[@]}
   if [ "$SLOTS" -lt 1 ]; then
     say "settings: classes needs at least one class with at least one slot"
+    return 1
+  fi
+  CLASSES=${#CLASS_NAMES[@]}
+  # Every class is kept one place under the cap (see "A place for every class" in the controller), so a cap below the
+  # number of classes is refused: with fewer places than classes one class would have none, and its jobs would wait
+  # for ever beside a pool that looks well. A pool of one class is not asked: its cap is one at least, as before.
+  if [ "$CLASSES" -gt 1 ] && [ "$MAX_SLOTS" -lt "$CLASSES" ]; then
+    say "settings: maxSlots is $MAX_SLOTS and classes names $CLASSES classes. Every class is kept one place under the cap, so maxSlots is never below the number of classes: with $MAX_SLOTS places, $((CLASSES - MAX_SLOTS)) of the $CLASSES classes would have no runner and their jobs would wait for ever. Set maxSlots to $CLASSES or more, or name fewer classes"
     return 1
   fi
   [ "$MAX_SLOTS" -ge 1 ] || MAX_SLOTS=1
@@ -589,6 +602,7 @@ slot_cycle() {
   local slot=$1
   local class=${SLOT_CLASS[$slot]} dir runner daemon slice token name body jit runner_id tries state code
   local started busy_since='' job='' result='' peak cpu seconds finished cgroup updating='' layered='' home=() lines
+  local retired=''
   ABORT=''
   # The controller's own flag is not the slot's: a slot begun as the controller is told to stop would find it set, and
   # none of its pauses would be taken until the controller's signal reached it.
@@ -718,8 +732,19 @@ slot_cycle() {
       updating=finished
       [ -n "$busy_since" ] || set_state "$slot" idle "$name"
     fi
+    # The controller asks a runner that waits for a job to give its place to a class that has none.
+    if [ -e "$POOL_RUN/retire/$slot" ] && slot_retire "$slot" "$runner_id" "$runner" "$busy_since"; then
+      retired=1
+      break
+    fi
     nap "$POOL_POLL"
   done
+
+  if [ -n "$retired" ]; then
+    # GitHub has taken the runner off, or no longer had it: it ran no job and is cleaned up as one that ended.
+    slot_reap "$slot"
+    return 0
+  fi
 
   if [ -n "$ABORT" ]; then
     # The controller is stopping. A runner that has no job is taken off GitHub; one with a job is lost with it.
@@ -776,6 +801,56 @@ slot_cycle() {
     esac
   fi
   return 0
+}
+
+# Gives up the place of a runner that waits for a job, when the controller asks for it (give_a_place). That a runner
+# is idle is read at one moment and its container is removed at another, and GitHub can hand it a job in between. So
+# GitHub is asked first to take the registration off: it refuses that for a runner that has a job (422), and after its
+# yes the runner gets none. Only then is the place given up. What came of it is written for the controller:
+# - `retired`: GitHub took the runner off. Returns 0, and the slot ends.
+# - `gone`: GitHub no longer had the runner (404) and it ran no job. Returns 0, and the slot ends the same way.
+# - `job`: the runner has a job, or has had its one job: the slot has seen it take one, or GitHub says so. It is kept
+#   and is not asked again.
+# - `error` and words: GitHub could not be asked, or answered something else. The runner is kept and may be asked again.
+slot_retire() {
+  local slot=$1 runner_id=$2 runner=$3 busy=$4 class=${SLOT_CLASS[$1]} for_class answer
+  for_class=$(cat "$POOL_RUN/retire/$slot" 2>/dev/null)
+  if [ -n "$busy" ]; then
+    answer=job
+  elif ! github_token; then
+    answer="error GitHub sign-in failed: $TOKEN_ERROR"
+  elif api DELETE "$SCOPE/actions/runners/$runner_id" "$TOKEN"; then
+    answer=retired
+    say "slot $slot ($class): its idle runner is retired and its place goes to class $for_class, which had no runner while every place under the cap of $MAX_SLOTS was held"
+  else
+    case $API_CODE in
+      422)
+        answer=job
+        say "slot $slot ($class): its runner is kept: it was asked to give its place to class $for_class, and GitHub says it has a job ($API_ERROR)"
+        ;;
+      404)
+        # GitHub removes a runner that has ended its one job, too: that one is left to end and be recorded.
+        if [[ $(docker logs "$runner" 2>&1) == *'Running job: '* ]]; then
+          answer=job
+        else
+          answer=gone
+          say "slot $slot ($class): GitHub no longer has its runner, which took no job: it is cleaned up and its place goes to class $for_class"
+        fi
+        ;;
+      *)
+        # A token GitHub no longer takes is not kept.
+        [ "$API_CODE" != 401 ] || rm -f "$POOL_RUN/token"
+        answer="error $API_ERROR"
+        ;;
+    esac
+  fi
+  TOKEN=''
+  rm -f "$API_OUT"
+  printf '%s\n' "$answer" >"$POOL_RUN/retire/$slot.answer.new" &&
+    mv "$POOL_RUN/retire/$slot.answer.new" "$POOL_RUN/retire/$slot.answer"
+  rm -f "$POOL_RUN/retire/$slot"
+  case $answer in retired | gone) return 0 ;; esac
+  return 1
 }
 
 # Takes a runner that will never run off GitHub, so no dead registration is left. The token is asked for here and not
@@ -1051,9 +1126,149 @@ print_status() {
     say "pool $POOL_NAME id $POOL_ID for $URL, $GROUP_NOTE"
     [ -z "$NEVER_NOTE" ] || say "$NEVER_NOTE"
     [ -z "$FIT_NOTE" ] || say "$FIT_NOTE"
+    [ -z "$CAP_NOTE" ] || say "$CAP_NOTE"
+    [ -z "$CLASS_NOTE" ] || say "$CLASS_NOTE"
     say "totals busy=$busy idle=$idle starting=$starting queued=$queued jobs_done=$(count_of jobs) failures=$(count_of failures) runner_updates=$(count_of updates) memory_reserved=$(mib "$reserved")MiB of $(mib "$BUDGET")MiB slots_cap=$MAX_SLOTS"
   } | tee "$POOL_LOGS/status.txt.new"
   mv "$POOL_LOGS/status.txt.new" "$POOL_LOGS/status.txt"
+}
+
+# A place for every class. The cap (maxSlots) counts registered runners, and a runner that is registered and waits for
+# a job keeps its place until a job ends somewhere. Without more, a class whose slot could not start when the places
+# were handed out (its memory was not free then) would wait behind the idle runners of the other classes, with its jobs.
+# So, under the cap, every class is kept one place, in three parts:
+# - the cap is never below the number of classes (load_settings refuses it);
+# - a free place goes to the class that has the fewest runners (round_begin and next_slot);
+# - when a class has no runner and every place is held, one runner that waits for a job gives its place up
+#   (give_a_place, and slot_retire in the slot).
+# What this is not: a cap on running jobs. A just-in-time runner cannot be told to wait, so every registered runner may
+# take a job at any moment, and a runner that has one is never retired: a class whose place is held by runners at work
+# waits until one ends. Nor is a place memory: a slot still starts only when its whole size fits.
+# These functions read and change the controller's own variables (run_pool's): bash lets a function it calls do so.
+
+# The pass that hands out places looks at every slot without a runner once. round_begin lists them for each class in
+# the order of the round, which starts at $first; next_slot then gives the one to look at next, in $slot: of the slots
+# not yet looked at, one of the class with the fewest runners; among several such classes, and among the slots of one
+# class, the first in the round. It returns 1 when every slot has been looked at. With one class this is the round
+# alone, as it was before classes were counted. The slots are walked once for a pass, however many they are.
+round_begin() {
+  local m s c
+  for ((c = 0; c < CLASSES; c++)); do round[c]=''; done
+  for ((m = 0; m < SLOTS; m++)); do
+    s=$(((first + m) % SLOTS))
+    [ -z "${PIDS[$s]:-}" ] || continue
+    # The slot, and where it stands in the round.
+    round[SLOT_CLASS_N[s]]+="$s:$m "
+  done
+}
+
+next_slot() {
+  local c head from='' least='' place=''
+  for ((c = 0; c < CLASSES; c++)); do
+    [ -n "${round[$c]}" ] || continue
+    head=${round[$c]%% *}
+    if [ -z "$from" ] || [ "${class_live[$c]}" -lt "$least" ] ||
+      { [ "${class_live[$c]}" = "$least" ] && [ "${head#*:}" -lt "$place" ]; }; then
+      from=$c
+      least=${class_live[$c]}
+      place=${head#*:}
+    fi
+  done
+  [ -n "$from" ] || return 1
+  head=${round[$from]%% *}
+  slot=${head%:*}
+  round[from]=${round[$from]#* }
+}
+
+# When a class has no runner and every place under the cap is held: asks one idle runner to give its place up, and
+# says in $CLASS_NOTE, for the status block, which class waits and for what. One runner at a time. It is a runner of
+# the class that holds the most places among the classes that hold two or more and have an idle runner: never a
+# class's only runner, or the two classes would trade the place at every pass. Nothing is asked while the place is not
+# the one thing the class lacks: while no runner can be registered at all, or when the class's slot would still not
+# have its memory with the idle runner gone. A runner would then be retired at every pass, for nothing.
+give_a_place() {
+  local c s phase rest answer names='' waiting=() want='' give='' most=1 need error='' last=''
+  if [ -n "$RETIRING" ]; then
+    if [ -z "${PIDS[$RETIRING]:-}" ]; then
+      # It has ended: retired, or by itself.
+      RETIRING=''
+      RETIRE_ERROR=''
+    elif answer=$(cat "$POOL_RUN/retire/$RETIRING.answer" 2>/dev/null) && [ -n "$answer" ]; then
+      case $answer in
+        job)
+          rm -f "$POOL_RUN/retire/$RETIRING.answer"
+          KEPT[RETIRING]=1
+          RETIRING=''
+          RETIRE_ERROR=''
+          ;;
+        'error '*)
+          rm -f "$POOL_RUN/retire/$RETIRING.answer"
+          error=${answer#error }
+          RETIRING=''
+          ;;
+        # Retired, or gone from GitHub: the slot is cleaning up, and its place is free when it has ended.
+        *) RETIRE_ERROR='' ;;
+      esac
+    fi
+  fi
+  CLASS_NOTE=''
+  if [ "$CLASSES" -gt 1 ] && [ "$live" -ge "$MAX_SLOTS" ]; then
+    for ((c = 0; c < CLASSES; c++)); do
+      [ "${class_live[$c]}" = 0 ] || continue
+      waiting+=("$c")
+      names="${names:+$names, }${CLASS_NAMES[$c]}"
+    done
+  fi
+  if [ ${#waiting[@]} = 0 ]; then
+    RETIRE_ERROR=''
+    return 0
+  fi
+  names="class $names: no runner, and every place under the cap of $MAX_SLOTS is held"
+  if [ -n "$error" ] && [ "$error" != "$RETIRE_ERROR" ]; then
+    # Said once, and kept for the status block: the next pass asks again.
+    RETIRE_ERROR=$error
+    say "$names. An idle runner was asked to give its place up and is kept, because GitHub did not take it off: $error. It is asked again"
+  fi
+  [ -z "$RETIRE_ERROR" ] || last=". The last time one was asked, GitHub did not take the runner off: $RETIRE_ERROR"
+  if [ -n "$RETIRING" ]; then
+    CLASS_NOTE="$names. Slot $RETIRING (${SLOT_CLASS[$RETIRING]}) gives up its idle runner's place for it$last"
+    return 0
+  fi
+  if [ -z "$(credential_kind)" ] || [ -n "$GROUP_HOLD" ] || [ "$until_at" -gt "$at" ]; then
+    CLASS_NOTE="$names. No idle runner is retired for it while no new runner can be registered (the slots' own lines say why)"
+    return 0
+  fi
+  for ((c = 0; c < CLASSES; c++)); do
+    [ "${class_live[$c]}" -gt "$most" ] || continue
+    for ((s = 0; s < SLOTS; s++)); do
+      [ "${SLOT_CLASS_N[$s]}" = "$c" ] && [ -n "${PIDS[$s]:-}" ] && [ -z "${KEPT[$s]:-}" ] || continue
+      { IFS=$'\t' read -r phase rest <"$POOL_RUN/slots/$s"; } 2>/dev/null || phase=''
+      [ "$phase" = idle ] || continue
+      give=$s
+      most=${class_live[$c]}
+      break
+    done
+  done
+  if [ -z "$give" ]; then
+    CLASS_NOTE="WARNING: $names, and no class that holds two or more has a runner that waits for a job. A runner that has a job, or that is starting, is never retired: the class waits until a job ends"
+    return 0
+  fi
+  # The class the place is asked for: the first of those without a runner whose slot would have its memory.
+  for c in "${waiting[@]}"; do
+    need=${SLOT_MEM[${CLASS_FIRST[$c]}]}
+    if [ $((reserved - SLOT_MEM[give] + need)) -le "$BUDGET" ] && [ "${available:-0}" -ge "$need" ]; then
+      want=$c
+      break
+    fi
+  done
+  if [ -z "$want" ]; then
+    c=${waiting[0]}
+    CLASS_NOTE="WARNING: $names. No idle runner is retired for class ${CLASS_NAMES[$c]}: its slot of $(mib "${SLOT_MEM[${CLASS_FIRST[$c]}]}") MiB would still not have its memory. A place is not memory"
+    return 0
+  fi
+  printf '%s\n' "${CLASS_NAMES[$want]}" >"$POOL_RUN/retire/$give.new" && mv "$POOL_RUN/retire/$give.new" "$POOL_RUN/retire/$give"
+  RETIRING=$give
+  CLASS_NOTE="$names. Slot $give (${SLOT_CLASS[$give]}) gives up its idle runner's place for it$last"
 }
 
 run_pool() {
@@ -1065,9 +1280,9 @@ run_pool() {
     while [ -z "$STOP" ]; do nap 300; done
     return 1
   }
-  mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp" "$POOL_RUN/jit"
+  mkdir -p "$POOL_STATE/slots" "$POOL_LOGS" "$POOL_RUN/slots" "$POOL_RUN/tmp" "$POOL_RUN/jit" "$POOL_RUN/retire"
   chmod 700 "$POOL_RUN" "$POOL_RUN/tmp" "$POOL_RUN/jit"
-  rm -f "${POOL_RUN:?}"/slots/* "${POOL_RUN:?}"/jit/* "${POOL_RUN:?}/jobs" "${POOL_RUN:?}/failures" "${POOL_RUN:?}/updates" "${POOL_RUN:?}/backoff" "${POOL_RUN:?}/backoff-until" "${POOL_RUN:?}/plain-home" "${POOL_RUN:?}"/tmp/*
+  rm -f "${POOL_RUN:?}"/slots/* "${POOL_RUN:?}"/jit/* "${POOL_RUN:?}/jobs" "${POOL_RUN:?}/failures" "${POOL_RUN:?}/updates" "${POOL_RUN:?}/backoff" "${POOL_RUN:?}/backoff-until" "${POOL_RUN:?}/plain-home" "${POOL_RUN:?}"/tmp/* "${POOL_RUN:?}"/retire/*
   load_pool_id
   JOBS_HEADER=$(printf 'finished\tslot\tclass\tlabels\tjob\tresult\tseconds\tpeak_memory_bytes\tcpu_seconds\trunner')
   [ -s "$POOL_LOGS/jobs.tsv" ] || printf '%s\n' "$JOBS_HEADER" >"$POOL_LOGS/jobs.tsv"
@@ -1099,6 +1314,13 @@ run_pool() {
   if [ "$SLOTS" -le "$MAX_SLOTS" ] && [ "$wanted" -gt "$BUDGET" ]; then
     FIT_NOTE="WARNING: the $SLOTS slots ask for $(mib "$wanted") MiB together and the machine has $(mib "$BUDGET") MiB for slots (the $(mib "${total:-0}") MiB it reports, less reserveMemory $(mib "$RESERVE") MiB): $(mib $((wanted - BUDGET))) MiB too much, so they never all run at once. A machine reports less memory than the size it was given. Make the slots or reserveMemory smaller, or the machine larger, in the template, and create the pool again"
     say "$FIT_NOTE"
+  fi
+  # What the cap is and is not, where it can hold a class back: said at the start and in every status block.
+  CAP_NOTE=''
+  CLASS_NOTE=''
+  if [ "$CLASSES" -gt 1 ] && [ "$SLOTS" -gt "$MAX_SLOTS" ]; then
+    CAP_NOTE="every class is kept one place under the cap of $MAX_SLOTS: a free place goes to the class with the fewest runners, and when a class has none and every place is held, one runner that waits for a job is retired for it, of the class that holds the most. The cap counts registered runners, not running jobs: a registered runner cannot be told to wait and one that has a job is never retired, so a class can wait until a job ends; and a place is not memory"
+    say "$CAP_NOTE"
   fi
   write_slices
 
@@ -1164,19 +1386,27 @@ run_pool() {
 
   PIDS=()
   WAIT=()
-  local slot live reserved pending available next=0 first n last_status=0 until_at at
+  # The slot whose idle runner is asked to give its place up, when one is; the slots whose runner GitHub kept because
+  # it has a job; and what GitHub last answered when it did not take a runner off.
+  RETIRING=''
+  KEPT=()
+  RETIRE_ERROR=''
+  local slot live reserved pending available next=0 first n last_status=0 until_at at class_live=() round=()
   while [ -z "$STOP" ]; do
     live=0
     reserved=0
+    for ((n = 0; n < CLASSES; n++)); do class_live[n]=0; done
     for ((slot = 0; slot < SLOTS; slot++)); do
       if [ -n "${PIDS[$slot]:-}" ]; then
         if kill -0 "${PIDS[$slot]}" 2>/dev/null; then
           live=$((live + 1))
           reserved=$((reserved + SLOT_MEM[slot]))
+          class_live[SLOT_CLASS_N[slot]]=$((class_live[SLOT_CLASS_N[slot]] + 1))
         else
           wait "${PIDS[$slot]}" 2>/dev/null
           PIDS[slot]=''
-          rm -f "$POOL_RUN/slots/$slot"
+          KEPT[slot]=''
+          rm -f "$POOL_RUN/slots/$slot" "$POOL_RUN/retire/$slot" "$POOL_RUN/retire/$slot.answer"
         fi
       fi
     done
@@ -1185,17 +1415,18 @@ run_pool() {
     case $until_at in '' | *[!0-9]*) until_at=0 ;; esac
     available=$(meminfo_bytes MemAvailable)
     pending=0
+    give_a_place
     # Admission. A slot starts only while there is a place under the cap and memory for its whole size: memory that
-    # no other slot has reserved, and memory the machine has free now. CPU is not reserved. The search starts after
-    # the slot admitted last, so every class gets its turn. Where it starts is read once for the pass and every slot
-    # is looked at once: a pass that moved its start while it walked left slots out, and gave a place a job had freed
-    # back to the slot that had just ended, past one that waited.
+    # no other slot has reserved, and memory the machine has free now. CPU is not reserved. Every slot without a
+    # runner is looked at once in a pass. A place goes to the class with the fewest runners first, so every class has
+    # one before any has two. Among equals the slots go round-robin: the round starts after the slot admitted last
+    # and is read once for the pass. (A pass that moved its start while it walked left slots out.) Round-robin is not
+    # "the one that waited longest first": a slot that has just ended can come before one that waited a pass longer.
     first=$next
-    for ((n = 0; n < SLOTS; n++)); do
+    round_begin
+    while next_slot; do
       # No slot is begun once the controller is told to stop.
       [ -z "$STOP" ] || break
-      slot=$(((first + n) % SLOTS))
-      [ -z "${PIDS[$slot]:-}" ] || continue
       if [ -z "$(credential_kind)" ]; then
         WAIT[slot]='waiting for a credential'
       elif [ -n "$GROUP_HOLD" ]; then
@@ -1215,6 +1446,7 @@ run_pool() {
         live=$((live + 1))
         reserved=$((reserved + SLOT_MEM[slot]))
         pending=$((pending + SLOT_MEM[slot]))
+        class_live[SLOT_CLASS_N[slot]]=$((class_live[SLOT_CLASS_N[slot]] + 1))
         next=$(((slot + 1) % SLOTS))
       fi
     done

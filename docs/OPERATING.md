@@ -3840,7 +3840,7 @@ since it is where the pool's credential will be used.
 | `url` | yes | The organisation the runners belong to, or one repository (`https://github.com/example-org/example-repo`; read step 2 first). A plain `https` address on the template's own host, `github.com`: a create changes the path only, and Arca refuses another host, a port, a user name, a query or a fragment, as the pool does. |
 | `runnerGroupId` | yes | The number of the runner group the runners join (step 1). Not used for a repository. |
 | `classes` | yes | The label sets, each with its slot size: `name` (a-z, 0-9), `labels` (what a job's `runs-on` asks for), `cpu`, `memory` and `slots` (how many runners of this class the pool keeps). Given at create, it replaces the whole list. Each class is checked like the template's first: whole numbers for `cpu` and `slots`, and a `memory` above zero and at most the machine's. The card shows one row a class. |
-| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. |
+| `maxSlots` | yes | The cap: never more than this many slots at once, whatever the classes add up to. Never below the number of classes: a pool created with less does not start ("A place for every class" below). |
 | `allowDefaultRunnerGroup` | no | `true` lets the pool start on the organisation's default runner group. Leave it out. |
 | `reserveMemory` | no | Memory kept back for the virtual machine itself. The slots share what is left. |
 | `dockerCache`, `dependencyCache` | no | The disk the Docker layer caches and the dependency caches may use, over all slots. |
@@ -3872,6 +3872,32 @@ controller now says this at its start and in every status block, as a `WARNING` 
 much. (It does not say this when `maxSlots` is below the number of slots: then they are not meant to run all at
 once.) A slot that is larger by itself than the memory for slots never starts, whatever `maxSlots` is, and the jobs
 that ask for its labels wait for ever: the controller says that too, as a `WARNING` that names the class.
+
+**A place for every class.** `maxSlots` caps registered runners, and a runner that is registered and waits for a job
+keeps its place until a job ends. So that no class is left without a runner behind the idle runners of the others,
+the pool keeps every class one place under the cap:
+
+- `maxSlots` is never below the number of classes. A pool created with less does not start, and its console says
+  both numbers and what to set: `settings: maxSlots is 2 and classes names 3 classes. ... Set maxSlots to 3 or more,
+  or name fewer classes`.
+- A free place goes to the class that has the fewest runners, so every class has one runner before any has two.
+  Among classes that have equally many, and among the slots of one class, the places go round-robin.
+- When a class has no runner and every place is held, the pool retires one runner that waits for a job and the class
+  gets its place. The runner is one of the class that holds the most places, among the classes that hold two or more.
+  The pool first asks GitHub to take the runner off, and removes it only on GitHub's yes: GitHub refuses that for a
+  runner that has a job, so a job that reached the runner in that moment is kept and runs to its end.
+
+What this is not:
+
+- It is not a cap on running jobs, and it promises no job a start time. A just-in-time runner cannot be told to wait:
+  every registered runner may take a job at any moment. A runner that has a job is never retired, and neither is a
+  class's only runner. So when every runner that could give its place up is at work, the class waits until a job
+  ends.
+- A place is not memory. A slot still starts only when its whole memory fits (above), and the pool retires nothing
+  for a class whose slot would still lack its memory.
+- It is one place a class, not a share. Beyond that one place, the busiest classes can hold all the others.
+
+A pool with one class has nothing to hand out between classes and works as it did.
 
 **4. Arca: `service_secret_set`**, for the App twice:
 `{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
@@ -3945,7 +3971,17 @@ repository, one that admits public repositories, and the default group each show
 public repository for a pool that serves one. The pool reads this again every ten minutes, so a change made on GitHub
 after the pool started shows up. If the group has become one the pool refuses (it was made the default group, or
 deleted), the line begins `REFUSED`, the runners that already wait or work are left, and no new slot starts
-(`queued (held: ...)`) until it is put right on GitHub; the pool then goes on by itself. The last ten
+(`queued (held: ...)`) until it is put right on GitHub; the pool then goes on by itself.
+
+A pool with more than one class and more slots than `maxSlots` says in every block what the cap is and is not (`every
+class is kept one place under the cap of 4: ...`). While a class has no runner and every place is held, one more line
+names the class (`class large: no runner, and every place under the cap of 4 is held. ...`) and says what the pool
+does about it: which slot gives up its idle runner's place, or, as a `WARNING`, why none does: no class that holds
+two or more places has a runner that waits for a job, or the class's slot would still lack its memory. Each retired
+runner is one line of its own (`slot 0 (standard): its idle runner is retired and its place goes to class large,
+...`), and so is a runner that GitHub kept because it had a job. If GitHub answers the request to take a runner off
+with an error, or not at all, nothing is retired: the pool says GitHub's answer once, keeps it in the class's line,
+and asks again every few seconds. A runner GitHub no longer has is cleaned up, and its place is free. The last ten
 finished jobs are repeated in every block (`recent job`), so `service_logs` still reaches them after many blocks. All
 job lines are kept in the virtual machine, in `/var/log/arca-runner-pool/jobs.tsv`, one job per line with its finish
 time, slot, class, labels, name, result, seconds, peak memory in bytes, CPU seconds and runner name. Past 4MiB (some
