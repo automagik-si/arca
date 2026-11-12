@@ -1,0 +1,14 @@
+{
+  "name": "fredoka-rebuild",
+  "private": true,
+  "type": "module",
+  "description": "Rebuilds docs/brand/fonts/fredoka-latin.woff2 from its pinned source. CI runs it; nothing ships from here.",
+  "dependencies": {
+    "subset-font": "2.9.0"
+  },
+  "overrides": {
+    "harfbuzzjs": "1.6.4",
+    "fontverter": "2.0.0",
+    "wawoff2": "2.0.1"
+  }
+}
