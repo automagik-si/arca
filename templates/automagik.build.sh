@@ -25,29 +25,40 @@ base=${3:?expected local base image fingerprint}
 [[ $project =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ && $profile =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] || exit 2
 [[ $base =~ ^local:[0-9a-f]{64}$ ]] || { echo 'base must be local:<64 hex fingerprint>' >&2; exit 2; }
 # Read public template values without interpreting them as shell code.
-mapfile -t pins < <(python3 - "$root/automagik.json" <<'PY'
-import json, re, sys
+# The image is named after both things it is built from: the Automagik commit and the harness, the first 12 hex
+# digits of each (the commit's, and the SHA-256 of automagik-dsh/package-lock.json, which pins DSH and everything it
+# installs). A changed harness is a new name, so it is built beside the old image and never mistaken for it. Incus
+# allows an alias of 64 characters at most, so the full commit is a property of the image, not part of its name.
+mapfile -t pins < <(python3 - "$root/automagik.json" "$root/automagik-dsh/package-lock.json" <<'PY'
+import hashlib, json, re, sys
 with open(sys.argv[1]) as source:
     t = json.load(source)
+with open(sys.argv[2], 'rb') as lock:
+    harness = hashlib.sha256(lock.read()).hexdigest()
 assert re.fullmatch('[0-9a-f]{40}', t['commit'])
-assert t['image'] == 'local:arca-automagik-' + t['commit']
+image = 'local:arca-automagik-' + t['commit'][:12] + '-dsh-' + harness[:12]
+if t['image'] != image:
+    sys.exit('automagik.json names the image ' + str(t['image']) + ', and its commit with this harness '
+             '(automagik-dsh/package-lock.json) is ' + image + ': set "image" to that')
 assert isinstance(t['dashPort'], int) and 1 <= t['dashPort'] <= 65535
 print(t['commit'])
-print(t['image'][6:])
+print(image[6:])
 print(t['dashPort'])
+print(harness)
 PY
 )
-[[ ${#pins[@]} == 3 ]] || exit 2
+[[ ${#pins[@]} == 4 ]] || exit 2
 commit=${pins[0]}
 alias=${pins[1]}
 port=${pins[2]}
+harness=${pins[3]}
 builder=build-automagik
 # Refuse an existing builder or alias. Cleanup touches only a builder this run made.
 if incus info "$builder" --project "$project" >/dev/null 2>&1; then
   echo 'builder already exists' >&2; exit 1
 fi
 if incus image info "$alias" --project "$project" >/dev/null 2>&1; then
-  echo 'image alias already exists' >&2; exit 1
+  echo "image $alias already exists: this commit with this harness is built already" >&2; exit 1
 fi
 made=false
 cleanup() {
@@ -179,4 +190,5 @@ truncate -s 0 /etc/machine-id
 INSTALL
 incus stop "$builder" --project "$project"
 incus publish "$builder" --project "$project" --alias "$alias" \
-  "description=Automagik at $commit" "arca.commit=$commit" "arca.base=${base#local:}"
+  "description=Automagik at $commit, harness $harness" "arca.commit=$commit" "arca.harness=$harness" \
+  "arca.base=${base#local:}"

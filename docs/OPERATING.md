@@ -774,6 +774,21 @@ incus delete base-prep --project PROJECT
 The pull also leaves a cached copy of `images:debian/13` in the project; delete it if it is not wanted. The build
 removes its own builder instance and leaves the base and the built image.
 
+The image's name carries both things it is built from: `arca-automagik-<commit>-dsh-<harness>`, the first 12 hex digits
+of the template's `commit` and of the SHA-256 of `templates/automagik-dsh/package-lock.json`, which pins DSH and
+everything it installs (Incus takes an alias of 64 characters at most, so the full commit is the image's `arca.commit`
+property, beside `arca.harness`). The template names that image, and the script refuses a template that names another
+before it touches Incus, with the name to set. So a new DSH is a new name: it is built beside the image of the harness
+before, and the script refuses only a build of the same commit with the same harness, which is there already. Nothing is
+deleted by hand.
+
+A node that built its image before the name carried the harness (up to Arca 0.13.0, `arca-automagik-` and the whole
+commit) keeps it. The upgrade replaces the `automagik` template, as it replaces any shipped template nobody edited. A
+service made before keeps running: it is its own instance, made when it was created, and the upgrade does not touch it.
+A new `service_create` from the template is refused, before anything is written, with `template automagik: its image
+arca-automagik-...-dsh-... is not on this node`, until that image is built with the script above. The old image is left
+as it is.
+
 When a create fails in the kernel, the refusal carries the recorded reason and says what remains: `nothing was left
 behind` only when the cleanup that follows completed and nothing waits for an approval. A template with `data`
 leaves its data volume in a delete plan for the owner's approval, and the refusal names it. When the cleanup did not

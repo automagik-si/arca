@@ -2,7 +2,7 @@
   "name": "automagik",
   "description": "Automagik: DeepSeek Harness web on 127.0.0.1:3080 with Bot, welcome and Omni channels plugins. Build with templates/automagik.build.sh PROJECT PROFILE local:BASE_FINGERPRINT (prepared amd64 Debian base; see script prerequisites). Plugins use pinned commits; npm uses the vendored lockfile. Tailscale is installed, disabled. A link to omni-api gives OMNI_API_URL.",
   "kind": "system",
-  "image": "local:arca-automagik-bc0e4cf5465cae4fbeb454fbb089249bfeb3e189",
+  "image": "local:arca-automagik-bc0e4cf5465c-dsh-05465a119673",
   "commit": "bc0e4cf5465cae4fbeb454fbb089249bfeb3e189",
   "ports": [],
   "env": {},

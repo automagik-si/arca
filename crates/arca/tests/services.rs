@@ -2871,6 +2871,142 @@ fn template_images_are_pinned_by_digest_and_the_automagik_build_by_commit() {
     );
 }
 
+/// The image a harness gives: the template's commit and the SHA-256 of the harness's lockfile, 12 hex digits of each.
+fn automagik_image_for(commit: &str, lockfile: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let harness: String = Sha256::digest(lockfile)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        "local:arca-automagik-{}-dsh-{}",
+        &commit[..12],
+        &harness[..12]
+    )
+}
+
+/// The `automagik` image is named after the Automagik commit and the harness it is built with, so two builds of one
+/// commit with different DSH versions never share a name. The name is an Incus alias: 64 characters at most.
+#[test]
+fn the_automagik_image_is_named_after_its_commit_and_its_harness() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let automagik = service::load_template(&dir, "automagik").unwrap();
+    let lockfile = std::fs::read(dir.join("automagik-dsh/package-lock.json")).unwrap();
+    let commit = automagik.commit.as_deref().unwrap();
+    assert_eq!(automagik.image, automagik_image_for(commit, &lockfile));
+    assert!(automagik.image.len() - "local:".len() <= 64);
+}
+
+/// The build script names the image from the harness it pushes, and refuses a template whose image is not that name,
+/// before it touches Incus: a changed lockfile is a new name, which is then built beside the old image instead of
+/// being refused as one that exists. A fake `incus` records each call, holds the old image, and stops the build at
+/// the builder's create.
+#[test]
+fn the_automagik_build_names_its_image_after_the_harness_it_installs() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let dir = std::env::temp_dir().join(format!("arca-automagik-build-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("templates/automagik-dsh")).unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    for name in [
+        "automagik.build.sh",
+        "automagik.json",
+        "automagik-dsh/package.json",
+        "automagik-dsh/package-lock.json",
+    ] {
+        std::fs::copy(src.join(name), dir.join("templates").join(name)).unwrap();
+    }
+    let incus = dir.join("bin/incus");
+    std::fs::write(
+        &incus,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$INCUS_LOG\"\ncase \"$1 $2\" in\n  'image info') [ \"$3\" = \"$HELD\" ] && exit 0; exit 1 ;;\n  info\\ *) exit 1 ;;\n  init\\ *) exit 3 ;;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&incus, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = dir.join("incus.log");
+    let template = dir.join("templates/automagik.json");
+    let shipped = service::load_template(&dir.join("templates"), "automagik").unwrap();
+    let old = shipped.image.strip_prefix("local:").unwrap().to_string();
+    // Runs the build with the fake `incus` holding an image under `held` (none when it is empty).
+    let build = |held: &str| {
+        let _ = std::fs::remove_file(&log);
+        let out = std::process::Command::new("bash")
+            .arg(dir.join("templates/automagik.build.sh"))
+            .args(["project", "profile", &format!("local:{}", "0".repeat(64))])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    dir.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("INCUS_LOG", &log)
+            .env("HELD", held)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+            std::fs::read_to_string(&log).unwrap_or_default(),
+        )
+    };
+
+    // As shipped, with no image of that name: the build looks for the template's name and goes on to the builder.
+    let (code, stderr, calls) = build("");
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        calls.contains(&format!("image info {old} --project project\n")),
+        "{calls}"
+    );
+    assert!(calls.contains("init local:"), "{calls}");
+
+    // The same commit with the same harness, built once already: the name exists and the build is refused, as before.
+    let (code, stderr, calls) = build(&old);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "image {old} already exists: this commit with this harness is built already"
+        )),
+        "{stderr}"
+    );
+    assert!(!calls.contains("init "), "{calls}");
+
+    // The harness changes: the template's name is not this harness's, and the build says which it is, before Incus.
+    let lockfile = dir.join("templates/automagik-dsh/package-lock.json");
+    let mut changed = std::fs::read(&lockfile).unwrap();
+    changed.extend_from_slice(b"\n");
+    std::fs::write(&lockfile, &changed).unwrap();
+    let new = automagik_image_for(shipped.commit.as_deref().unwrap(), &changed);
+    assert_ne!(new, shipped.image);
+    let (code, stderr, calls) = build(&old);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "automagik.json names the image {}, and its commit with this harness (automagik-dsh/package-lock.json) is {new}: set \"image\" to that",
+            shipped.image
+        )),
+        "{stderr}"
+    );
+    assert!(calls.is_empty(), "{calls}");
+
+    // With the template naming it, the new image is built beside the old one, which stays.
+    let text = std::fs::read_to_string(&template).unwrap();
+    std::fs::write(&template, text.replace(&shipped.image, &new)).unwrap();
+    let (code, stderr, calls) = build(&old);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        calls.contains(&format!(
+            "image info {} --project project\n",
+            new.strip_prefix("local:").unwrap()
+        )),
+        "{calls}"
+    );
+    assert!(calls.contains("init local:"), "{calls}");
+    assert!(!calls.contains("delete"), "{calls}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn template_entrypoints_nats_jetstream_and_autopg_postgres() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
@@ -3608,6 +3744,97 @@ fn service_create_refuses_a_local_image_the_service_project_does_not_hold_and_na
     rig.fake.add_image(PROJECT, "dash-image");
     rig.call("service_create", json!({"name":"dash","template":"dash"}))
         .expect("the image in place, the service is created");
+}
+
+/// A node that installed the `automagik` template before its image's name carried the harness, and built that image.
+/// The upgrade replaces the template (nobody edited it), and the image's new name is not on the node: the service made
+/// before keeps running from its own instance, and a new one is refused with the name to build until it is built. The
+/// old image is left where it is, and nothing is deleted by hand.
+#[test]
+fn a_node_with_the_automagik_image_of_before_keeps_its_service_and_builds_the_new_name_for_the_next()
+ {
+    use sha2::{Digest as _, Sha256};
+    let rig = Rig::new();
+    let templates = rig.dir.join("templates");
+    assert!(arca::cmd_templates::install_into(&templates, false).is_ok());
+    let shipped = service::load_template(&templates, "automagik").unwrap();
+    let commit = shipped.commit.clone().unwrap();
+    let before = format!("arca-automagik-{commit}");
+    // The template as 0.1.0-alpha.7 to 0.13.0 shipped it: only the image's name differs.
+    let text = fs::read_to_string(templates.join("automagik.json")).unwrap();
+    let old_text = text.replace(&shipped.image, &format!("local:{before}"));
+    let hash: String = Sha256::digest(old_text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert!(
+        arca::cmd_templates::EARLIER.contains(&("automagik.json", hash.as_str())),
+        "{hash}"
+    );
+    fs::write(templates.join("automagik.json"), &old_text).unwrap();
+    rig.template("nats", nats_template());
+    rig.call("service_create", json!({"name":"nats","template":"nats"}))
+        .expect("nats");
+    let old_image = rig.fake.add_image(PROJECT, &before);
+    let old = rig
+        .call(
+            "service_create",
+            json!({"name":"automagik1","template":"automagik"}),
+        )
+        .expect("the service made from the image of before");
+    let read = |rig: &Rig| {
+        rig.get(&format!("/1.0/instances/automagik1?project={PROJECT}"))
+            .expect("the instance of the service from before")
+    };
+    let instance_before = read(&rig);
+
+    // The upgrade: no flag, and the report names the template.
+    let report = arca::cmd_templates::install_into(&templates, false).expect("install");
+    assert_eq!(report["replaced"], json!(["automagik.json"]), "{report}");
+
+    // The service from before is the same instance, and keeps running.
+    assert_eq!(read(&rig), instance_before);
+    let listed = rig.call("service_list", json!({})).expect("list");
+    let row = listed["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "automagik1")
+        .cloned()
+        .expect("the service from before");
+    assert_eq!(row["state"], old["state"], "{row}");
+
+    // A new one waits for the image under its new name, and says which.
+    let new = shipped.image.strip_prefix("local:").unwrap();
+    let Err(CallError::Refused { message, .. }) = rig.call(
+        "service_create",
+        json!({"name":"automagik2","template":"automagik"}),
+    ) else {
+        panic!("the image under its new name is not on the node yet");
+    };
+    assert!(
+        message.starts_with(&format!(
+            "template automagik: its image {new} is not on this node: no image in the service project {PROJECT} has that alias"
+        )),
+        "{message}"
+    );
+    // Built beside the old image, it serves the next service, and the old image stays.
+    let new_image = rig.fake.add_image(PROJECT, new);
+    rig.call(
+        "service_create",
+        json!({"name":"automagik2","template":"automagik"}),
+    )
+    .expect("the new image in place");
+    let images: Vec<String> = rig
+        .fake
+        .images()
+        .into_iter()
+        .map(|(_, fingerprint)| fingerprint)
+        .collect();
+    assert!(
+        images.contains(&old_image) && images.contains(&new_image),
+        "{images:?}"
+    );
 }
 
 #[test]
