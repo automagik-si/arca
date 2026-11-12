@@ -1014,7 +1014,7 @@ fn initialize_answers_the_protocol_version_and_the_tools_capability() {
     let result = &reply.json()["result"];
     assert_eq!(result["protocolVersion"], "2025-11-25");
     assert!(result["capabilities"]["tools"].is_object());
-    assert_eq!(result["serverInfo"]["version"], "0.1.0");
+    assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

@@ -20,9 +20,19 @@ On the approval page, while no passkey is trusted, a waiting card's button says 
 "Approve", and a tap on it takes the owner to the passkey setup, which is at the top of the page. Before, it asked for a
 passkey there was none of and failed. Once a passkey is trusted the cards are drawn again with their Approve buttons.
 
+The MCP server names the release it is. `serverInfo.version` said `0.1.0`, the version of the verbs' contract, on
+`initialize` and beside every `2026-07-28` result; it is now the release, the version `arca --version` prints. A
+`server/discover` answer now carries `serverInfo` too, where before the server was named only inside its `_meta`.
+
 Passkeys can now be RSA keys (RS256) as well as P-256 keys (ES256). Some Windows Hello and TPM authenticators make only
 RSA keys, and setting up such a passkey failed at its last step. The page now offers both, enrols either, and checks
 either's signature on every approval and sign-in. A passkeys line names its key's `alg`, `ES256` or `RS256`.
+
+`arca status` works on a node that was upgraded rather than installed fresh. Such a node keeps its viewer token beside
+its config under another name (`viewer.secret`), and `arca status` with no `--token-file` asked only for the
+installer's `assistant-1.secret`, so the first command after an upgrade told the owner to mint a token. When that file
+is not there, `arca status` now uses a viewer token of this node from the same directory; a token of a wider scope is
+never taken in its place. A `--token-file` or `ARCA_TOKEN_FILE` that names a file is still read alone.
 
 ## 0.16.0 (2026-11-12)
 

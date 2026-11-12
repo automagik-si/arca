@@ -1319,6 +1319,7 @@ fn first_passkey_and_first_approved_change(tag: &str, by_init: bool, rs256_only:
     } else {
         assert_eq!(kept[0].alg(), arca_approval::PasskeyAlg::Es256);
     }
+
     // The page draws the cards again once the passkey is trusted, and the button then approves.
     let deadline = Instant::now() + WAIT;
     loop {
