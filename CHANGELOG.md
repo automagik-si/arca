@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.15.0 (2026-11-12)
+
 The `automagik` image is now named after the harness too: `arca-automagik-<commit>-dsh-<harness>`, 12 hex digits of the
 Automagik commit and of the SHA-256 of the DSH lockfile. Before, it was named after the commit alone, so a build with a
 newer DSH was refused as an image that exists, and the old one had to be deleted by hand. The template changed, so an
@@ -29,6 +31,14 @@ lines after a BEGIN line with no END are still shown when each carries a prefix 
 and so is a key longer than a journal window when neither its BEGIN nor its END line is inside the window; a stray END
 line hides the text from its start, so a function's result that names such a line is hidden too; a stray BEGIN line
 hides everything up to the next END line. `docs/OPERATING.md` lists them all.
+
+- Merge PR 108: the 0.14.0 notes say what 0.14.0 shipped, and the key-hiding notes say when a window inside a key is hidden and what is still shown
+- Merge dev at v0.14.0 into set F
+- Merge PR 99: a key is hidden by its shape without hiding what follows it, in one pass over any log, and the journal is read at the lines asked
+- Merge PR 104: the Automagik image is named after its commit and its DSH harness, so a new DSH builds a new image beside the old one and none is deleted by hand
+- Merge PR 105: the guide's table says one step lets a node change things, and what that step leaves to the config
+- Merge set E fix into set F
+- Merge PR 65 commit 2: the Automagik image is built with DSH 0.2.2-rc.2
 
 ## 0.14.0 (2026-11-12)
 
