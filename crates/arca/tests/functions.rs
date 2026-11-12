@@ -722,9 +722,52 @@ fn a_secret_is_set_by_name_and_a_run_waits_for_it() {
         "function_secret_set",
         json!({ "name": "relay", "key": "NATS_URL", "value": "two\nlines-of-it" }),
     ));
-    assert!(
-        message.contains("8 to 4096 characters without control characters"),
-        "{message}"
+    assert_eq!(
+        message,
+        "a function's secret is one line of 8 to 4096 characters without control characters: this one has a line break"
+    );
+    // A value read whole from a file ends with a line break. A function's secret is an environment value, so it is
+    // refused, in words that say the line break is the one thing to change; a carriage return before it changes nothing.
+    for end in ["\n", "\r\n"] {
+        let (code, message) = refusal(rig.call(
+            "function_secret_set",
+            json!({ "name": "relay", "key": "NATS_URL", "value": format!("nats://192.0.2.10:4222{end}") }),
+        ));
+        assert_eq!(code, "Invalid");
+        assert_eq!(
+            message,
+            "a function's secret is one line of 8 to 4096 characters without control characters: this one ends with a line break, and nothing else is wrong with it. Send it without the line break at its end (each run reads it as an environment value, and the line break would be part of it; only a virtual machine's secret, which is a file, may end with one)"
+        );
+    }
+    for (value, why) in [
+        (
+            "1234567".to_string(),
+            "this one is not 8 to 4096 characters",
+        ),
+        ("v".repeat(4097), "this one is not 8 to 4096 characters"),
+        ("\n".repeat(8), "this one has a line break"),
+        (
+            format!("nats://192.0.2.10{}", '\0'),
+            "this one has a NUL character",
+        ),
+    ] {
+        let (_, message) = refusal(rig.call(
+            "function_secret_set",
+            json!({ "name": "relay", "key": "NATS_URL", "value": value }),
+        ));
+        assert_eq!(
+            message,
+            format!(
+                "a function's secret is one line of 8 to 4096 characters without control characters: {why}"
+            )
+        );
+    }
+    // None of them was stored: the function still waits for both.
+    assert_eq!(rig.state_writes(), writes);
+    let line = rig.run("relay");
+    assert_eq!(
+        line["why"],
+        "the secrets DATABASE_URL, NATS_URL are not set: function_secret_set sets each"
     );
 
     // A database address with a word in it, put together here: no secret-shaped text stands in this file.

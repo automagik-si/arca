@@ -43,6 +43,35 @@ fn change(config: &ServiceConfig) -> Result<crate::desired_store::EntryChange, C
         serde_json::to_value(config).map_err(|_| internal())?,
     )))
 }
+/// The code of the refusal for a change the kernel could not save.
+pub const STATE_NOT_SAVED: &str = "state_not_saved";
+
+/// The refusal for a change the kernel could not save as the node's next state: in words, never "internal". The
+/// caller is told the kind of fault; the kernel's own reason, which may name a file of the node, goes to the node's
+/// log on one line. Neither holds an argument of the call.
+pub(super) fn state_not_saved(verb: &str, error: &arca_kernel::KernelError) -> CallError {
+    use arca_kernel::KernelError;
+    eprintln!(
+        "arca: {verb} could not save the node's state: {}",
+        error.to_string().replace(['\n', '\r'], " ")
+    );
+    let kind = match error {
+        KernelError::Io { .. } => "a file of its state could not be written",
+        KernelError::Locked { .. } => "its state is held by another process",
+        KernelError::Refused(_) => "its own next state document was refused",
+        KernelError::Journal(_) | KernelError::Unresolved { .. } => {
+            "its effect journal could not be written or holds an open intent"
+        }
+        _ => "its kernel could not record the change",
+    };
+    CallError::Refused {
+        code: STATE_NOT_SAVED.into(),
+        message: format!(
+            "this node could not save the change: {kind}. The service's record is as it was before the call; the node's log has the reason, and the same request may be made again once it is fixed"
+        ),
+    }
+}
+
 pub(super) fn failed_for(outcomes: &[Outcome], entries: &[&str]) -> bool {
     outcomes.iter().any(|outcome| match outcome {
         Outcome::Failed { entry, .. } => entries.iter().any(|id| entry.0 == *id),
@@ -169,7 +198,7 @@ impl ServiceHandler {
         let changes = configs.iter().map(change).collect::<Result<Vec<_>, _>>()?;
         let outcomes = lock(&self.kernel)?
             .propose(changes, now)
-            .map_err(|_| internal())?;
+            .map_err(|error| state_not_saved(self.verb, &error))?;
         let ids = configs
             .iter()
             .map(ServiceConfig::entry_id)
@@ -368,31 +397,20 @@ impl ServiceHandler {
                     },
                 ));
             }
-            // A virtual machine's secret is a file in its guest, never an environment value, so it may have line
-            // breaks: a private key in PEM form is several lines.
-            // A key file saved on another system ends each line with a carriage return and a line feed: the
-            // pair is stored as one line feed.
-            let lines = cfg.vm.is_some();
-            let given = args["value"].as_str().map(|given| {
-                if lines {
-                    given.replace("\r\n", "\n")
-                } else {
-                    given.to_owned()
-                }
-            });
-            let value = given
-                .as_deref()
-                .filter(|s| {
-                    (8..=4096).contains(&s.chars().count())
-                        && !s.chars().any(|c| c.is_control() && !(lines && c == '\n'))
-                })
-                .ok_or_else(|| {
-                    CallError::Invalid(if lines {
-                        "a secret is 8 to 4096 characters; a virtual machine's may have line breaks, and no other control character".into()
-                    } else {
-                        "a secret is 8 to 4096 characters without control characters".into()
-                    })
-                })?;
+            // What the value may hold depends on where it goes: a file in a virtual machine's guest, or an
+            // environment value of a container or of a function's run ([`service::secret_value`]).
+            let of = if cfg.vm.is_some() {
+                service::SecretOf::Machine
+            } else if cfg.function.is_some() {
+                service::SecretOf::Function
+            } else {
+                service::SecretOf::Container
+            };
+            let given = args["value"]
+                .as_str()
+                .ok_or_else(|| CallError::Invalid("value: expected the secret, as text".into()))?;
+            let value = service::secret_value(given, of).map_err(CallError::Invalid)?;
+            let value = value.as_str();
             self.live_owned(&entry, &cfg)?;
             let owner = cfg.entry_id();
             let reference = self.store_value(&owner, value)?;

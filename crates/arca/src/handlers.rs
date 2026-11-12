@@ -4965,6 +4965,109 @@ fn service_refused(message: impl Into<String>) -> CallError {
     }
 }
 
+/// The code of a refusal for a read of Incus that got no answer: Incus did not answer by the deadline, could not be
+/// reached, or answered with a server error. Nothing is wrong with the request, and the same request may be made again.
+pub const INCUS_UNAVAILABLE: &str = "incus_unavailable";
+/// The code of a refusal for a read of Incus whose answer could not be used: a status that is no server error, an
+/// answer over the size this node reads, or one that is not the JSON it expects. Asking again is likely to answer the
+/// same.
+pub const INCUS_ANSWER: &str = "incus_answer";
+
+/// What follows a read of Incus that got no answer.
+const ASK_AGAIN: &str =
+    "The same request may be made again (an approved action is proposed again).";
+/// What follows a read of Incus whose answer could not be used.
+const ASKED_THE_SAME: &str =
+    "The same request is likely to be answered the same until Incus answers that read.";
+
+/// The refusal for a read of Incus, inside a service call, that failed: in words, never "internal". `what` is what was
+/// read and `subject` what it was read for (the service the call names, or the list); `changed` says what the call had
+/// done by then, such as "Nothing was changed.". The words hold the kind of failure and Incus's status, and never
+/// Incus's own text, which may quote a value.
+fn incus_read_refused(
+    error: &arca_incus::IncusError,
+    what: &str,
+    subject: &str,
+    changed: &str,
+) -> CallError {
+    use arca_incus::IncusError;
+    let (code, cause) = match error {
+        IncusError::Timeout => (
+            INCUS_UNAVAILABLE,
+            format!(
+                "Incus did not answer within {} seconds",
+                arca_incus::read::TIMEOUT.as_secs()
+            ),
+        ),
+        IncusError::Io(_) => (
+            INCUS_UNAVAILABLE,
+            "Incus could not be reached on its socket".to_string(),
+        ),
+        IncusError::Status { code, .. } if *code >= 500 => (
+            INCUS_UNAVAILABLE,
+            format!("Incus answered with its own error (status {code})"),
+        ),
+        IncusError::Status { code, .. } => {
+            (INCUS_ANSWER, format!("Incus answered with status {code}"))
+        }
+        IncusError::TooLarge => (
+            INCUS_ANSWER,
+            format!(
+                "Incus's answer was over the {} MiB this node reads",
+                arca_incus::read::MAX_BODY >> 20
+            ),
+        ),
+        _ => (
+            INCUS_ANSWER,
+            "Incus's answer was not the JSON this node expects".to_string(),
+        ),
+    };
+    let after = if code == INCUS_UNAVAILABLE {
+        ASK_AGAIN
+    } else {
+        ASKED_THE_SAME
+    };
+    let mut message = format!("{cause} when this node read {what} for {subject}.");
+    for sentence in [changed, after] {
+        if !sentence.is_empty() {
+            message.push(' ');
+            message.push_str(sentence);
+        }
+    }
+    CallError::Refused {
+        code: code.into(),
+        message,
+    }
+}
+
+/// What a service call reads Incus for, as a refusal names it: the service or the function the call names, or the list.
+fn read_subject(verb: &str, args: &Value) -> String {
+    let kind = if verb.starts_with("function_") {
+        "function"
+    } else {
+        "service"
+    };
+    ["name", "from"]
+        .into_iter()
+        .find_map(|key| args.get(key).and_then(Value::as_str))
+        .filter(|name| crate::service::service_name_ok(name))
+        .map(|name| format!("{kind} {name}"))
+        .unwrap_or_else(|| format!("the list of {kind}s"))
+}
+
+/// What a service call had changed when its first reads of Incus are made: nothing, which a call that only reads does
+/// not need said.
+fn nothing_changed(verb: &str) -> &'static str {
+    if matches!(
+        verb,
+        "service_list" | "service_status" | "service_logs" | "function_list" | "function_runs"
+    ) {
+        ""
+    } else {
+        "Nothing was changed."
+    }
+}
+
 fn service_not_found(message: impl Into<String>) -> CallError {
     CallError::Refused {
         code: "not_found".into(),
@@ -5246,18 +5349,30 @@ fn vm_refusal(name: &str, what: &str) -> CallError {
     service_refused(format!("service {name} is a virtual machine: {what}"))
 }
 
-fn service_listing(read: &UnixIncus, project: Option<&str>) -> Result<Vec<Value>, CallError> {
+/// The instances of `project`, or of every project, each with its state. `subject` and `changed` are for the refusal
+/// when Incus does not answer ([`incus_read_refused`]).
+fn service_listing(
+    read: &UnixIncus,
+    project: Option<&str>,
+    subject: &str,
+    changed: &str,
+) -> Result<Vec<Value>, CallError> {
     let path = project
         .map(|project| format!("/1.0/instances?project={project}&recursion=2"))
         .unwrap_or_else(|| "/1.0/instances?all-projects=true&recursion=2".into());
     match read.get(&path) {
         Ok(rows) => Ok(rows.as_array().cloned().unwrap_or_default()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
-        Err(_) => Err(internal()),
+        Err(error) => Err(incus_read_refused(
+            &error,
+            "the instances and their state",
+            subject,
+            changed,
+        )),
     }
 }
 
-fn service_leases(read: &UnixIncus) -> Result<Vec<String>, CallError> {
+fn service_leases(read: &UnixIncus, subject: &str) -> Result<Vec<String>, CallError> {
     let path = format!(
         "/1.0/networks/{}/leases?project={}",
         arca_netproject::BRIDGE,
@@ -5271,7 +5386,12 @@ fn service_leases(read: &UnixIncus) -> Result<Vec<String>, CallError> {
             .filter_map(|lease| lease["address"].as_str().map(str::to_string))
             .collect()),
         Err(arca_incus::IncusError::Status { code: 404, .. }) => Ok(Vec::new()),
-        Err(_) => Err(internal()),
+        Err(error) => Err(incus_read_refused(
+            &error,
+            "the addresses the service network has leased",
+            subject,
+            "Nothing was created.",
+        )),
     }
 }
 
@@ -5821,9 +5941,10 @@ impl ServiceHandler {
         rows: &[Value],
         entries: &[arca_kernel::desired::Entry],
         tenant: Option<&tenants::TenantScope>,
+        subject: &str,
     ) -> Result<String, CallError> {
         let candidates = crate::service::candidates(cidr).map_err(service_template_error)?;
-        let leases = service_leases(read)?;
+        let leases = service_leases(read, subject)?;
         let used = service_used(rows, &leases, entries);
         if let Some(scope) = tenant {
             return tenants::free_address(scope, &used);
@@ -5925,7 +6046,14 @@ impl ServiceHandler {
                     )));
                 }
                 Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
-                Err(_) => return Err(internal()),
+                Err(error) => {
+                    return Err(incus_read_refused(
+                        &error,
+                        "the instance of a create that did not complete",
+                        &format!("service {name}"),
+                        "Whether its instance exists is not known: service_status shows what is there, and service_remove removes it.",
+                    ));
+                }
             }
             let removal = {
                 let mut kernel = lock(&self.kernel)?;
@@ -5962,7 +6090,14 @@ impl ServiceHandler {
         )) {
             Ok(state) => Some(state),
             Err(arca_incus::IncusError::Status { code: 404, .. }) => None,
-            Err(_) => return Err(internal()),
+            Err(error) => {
+                return Err(incus_read_refused(
+                    &error,
+                    "the state of the new instance",
+                    &format!("service {name}"),
+                    "The service was created: service_status shows it.",
+                ));
+            }
         };
         let live = live.map(|state| {
             let mut row = state;
@@ -6186,7 +6321,8 @@ impl ToolHandler for ServiceHandler {
             _ => service_project(&self.cfg)?,
         };
         let read = UnixIncus::new(self.cfg.incus.socket.clone());
-        let rows = service_listing(&read, None)?;
+        let subject = read_subject(self.verb, &args);
+        let rows = service_listing(&read, None, &subject, nothing_changed(self.verb))?;
         let mut entries = {
             let kernel = lock(&self.kernel)?;
             kernel.entries().to_vec()
@@ -6563,7 +6699,12 @@ impl ToolHandler for ServiceHandler {
                 }
                 let done = crate::service_import::import(&self.cfg, &name, &entries, now)?;
                 // The mark is on the instance now. Its record is made from it, exactly as a restart reads it.
-                let rows = service_listing(&read, None)?;
+                let rows = service_listing(
+                    &read,
+                    None,
+                    &subject,
+                    "The instance carries Arca's mark already, and its record is made by the next service call that Incus answers.",
+                )?;
                 adopt_services(
                     &self.kernel,
                     &self.cfg,
@@ -6816,7 +6957,14 @@ impl ToolHandler for ServiceHandler {
                             )));
                         }
                         Err(arca_incus::IncusError::Status { code: 404, .. }) => {}
-                        Err(_) => return Err(internal()),
+                        Err(error) => {
+                            return Err(incus_read_refused(
+                                &error,
+                                "the service project",
+                                &subject,
+                                "Nothing was created.",
+                            ));
+                        }
                     }
                     let needs = ProjectNeeds {
                         managed: matches!(network, VmNetwork::Managed),
@@ -6838,6 +6986,7 @@ impl ToolHandler for ServiceHandler {
                                 &all_rows,
                                 &all_entries,
                                 tenant.as_ref(),
+                                &subject,
                             )?;
                             VmPlace::Managed {
                                 ipv4,
@@ -6920,8 +7069,14 @@ impl ToolHandler for ServiceHandler {
                         return Err(refusal);
                     }
                 }
-                let ipv4 =
-                    self.free_address(&read, &cidr, &all_rows, &all_entries, tenant.as_ref())?;
+                let ipv4 = self.free_address(
+                    &read,
+                    &cidr,
+                    &all_rows,
+                    &all_entries,
+                    tenant.as_ref(),
+                    &subject,
+                )?;
                 let pool = service_pool(&self.cfg).map_err(|_| {
                     service_refused("the default profile does not name a storage pool")
                 })?;

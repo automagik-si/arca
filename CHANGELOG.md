@@ -32,6 +32,15 @@ card was shown, the approval was accepted and used up, and only then did the cre
 caps on virtual machines (`kernel.vmLimits`, `kernel.bridged.limits`) and a tenant's caps. The approved create still
 checks them, because the node can fill up while a card waits. One refusal for room can still follow an approval: no
 free address in the service subnet.
+A service call that failed because Incus was slow or did not answer said only `internal: the tool failed`, and the
+node's log had no line for it. Such a call is now refused in words that say Incus did not answer, for which service,
+and that the same request may be made again, under the code `incus_unavailable` (`incus_answer` when Incus answered
+something this node cannot use, `state_not_saved` when the kernel could not save the change). When an answer is still
+`internal`, the node's log gets one line with the verb and the reason. A virtual machine's secret may be 4096
+characters and one line break at its end (a key file read whole), a value of only line breaks is refused, and a
+container's or a function's secret that ends with a line break is refused in words that name the line break. A text
+that is too short or too long for its field is refused in words that name the limit. See "When Incus does not answer,
+and when the answer is internal" in docs/OPERATING.md.
 
 A template whose image is `local:<alias>` and that already carried a `digest` was accepted before, and the digest was
 ignored. It is enforced now: a create from such a template is refused unless the image under the alias has that

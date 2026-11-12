@@ -1086,7 +1086,12 @@ fn id_arg(args: &Value) -> Result<&str, CallError> {
 
 /// The tenant's instances as Incus lists them, with their state and expanded config.
 fn tenant_rows(read: &UnixIncus, scope: &TenantScope) -> Result<Vec<Value>, CallError> {
-    service_listing(read, Some(&scope.project))
+    service_listing(
+        read,
+        Some(&scope.project),
+        &format!("tenant {}", scope.id),
+        "",
+    )
 }
 
 fn status_json(scope: &TenantScope, entries: &[Entry], instances: Option<usize>) -> Value {
@@ -1523,11 +1528,19 @@ impl TenantHandler {
                     "the Incus project {project} already exists and Arca did not create it for this tenant; it is left alone"
                 )));
             }
-            Err(_) => return Err(internal()),
+            Err(error) => {
+                return Err(super::incus_read_refused(
+                    &error,
+                    "the Incus project a new tenant would take",
+                    &format!("tenant {id}"),
+                    "Nothing was created.",
+                ));
+            }
         }
         // The block: the highest one of the tenant's size that overlaps no tenant's and holds no address in use.
-        let rows = service_listing(read, None)?;
-        let leases = service_leases(read)?;
+        let subject = format!("tenant {id}");
+        let rows = service_listing(read, None, &subject, "Nothing was created.")?;
+        let leases = service_leases(read, &subject)?;
         let in_use = service_used(&rows, &leases, entries);
         let held = held_blocks(&self.cfg, entries);
         let prefix = block::block_prefix(&caps);

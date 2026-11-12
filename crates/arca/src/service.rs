@@ -2528,6 +2528,97 @@ mod tests {
     }
 }
 
+/// What a secret is a value of: where it goes decides what it may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretOf {
+    /// A virtual machine's: a file in its guest, so it may have line breaks and end with one.
+    Machine,
+    /// A container's: an environment value, so it is one line.
+    Container,
+    /// A function's: an environment value of each run, so it is one line.
+    Function,
+}
+
+/// The longest secret, in characters. A virtual machine's does not count one line break at its end.
+pub const SECRET_MAX: usize = 4096;
+/// The shortest secret, in characters. In a virtual machine's, line breaks do not count toward it.
+pub const SECRET_MIN: usize = 8;
+
+/// The control character that stands in the way, by what it is. The words never hold the character or where it is.
+fn control_named(text: &str) -> &'static str {
+    match text.chars().find(|c| c.is_control() && *c != '\n') {
+        Some('\0') => "a NUL character",
+        Some('\t') => "a tab",
+        Some('\r') => "a carriage return that no line feed follows",
+        Some(_) => "a control character that is no line break",
+        None => "a line break",
+    }
+}
+
+/// The value a secret verb stores for the value a caller gave, or why it stores none, in words that name the rule and
+/// its limit and never the value, a part of it or its length.
+///
+/// A virtual machine's secret is a file, as a key file is: it is stored byte for byte as given, with the line break
+/// at its end when it has one, except that each carriage return and line feed pair is stored as one line feed. It is
+/// 8 to 4096 characters, not counting one line break at its end, and at least 8 of them are not line breaks.
+///
+/// A container's and a function's secret is an environment value: one line of 8 to 4096 characters. A line break at
+/// its end would become part of the value the program reads, so it is refused, in words that say it is the only fault.
+pub fn secret_value(given: &str, of: SecretOf) -> Result<String, String> {
+    if of == SecretOf::Machine {
+        let value = given.replace("\r\n", "\n");
+        let limits = format!(
+            "a virtual machine's secret is {SECRET_MIN} to {SECRET_MAX} characters, not counting one line break at its end; it may have line breaks, and no other control character"
+        );
+        if value.chars().any(|c| c.is_control() && c != '\n') {
+            return Err(format!("{limits}: this one has {}", control_named(&value)));
+        }
+        let counted = value.strip_suffix('\n').unwrap_or(&value).chars().count();
+        if counted > SECRET_MAX {
+            return Err(format!("{limits}: this one is longer"));
+        }
+        if value.chars().filter(|c| *c != '\n').count() < SECRET_MIN {
+            return Err(format!(
+                "{limits}: this one has fewer than {SECRET_MIN} characters that are not line breaks"
+            ));
+        }
+        return Ok(value);
+    }
+    let (whose, why) = match of {
+        SecretOf::Function => ("a function's", "each run reads it as an environment value"),
+        _ => (
+            "a container's",
+            "the program reads it as an environment value",
+        ),
+    };
+    let limits = format!(
+        "{whose} secret is one line of {SECRET_MIN} to {SECRET_MAX} characters without control characters"
+    );
+    let length_ok = |text: &str| (SECRET_MIN..=SECRET_MAX).contains(&text.chars().count());
+    if !given.chars().any(char::is_control) {
+        return if length_ok(given) {
+            Ok(given.to_string())
+        } else {
+            Err(format!(
+                "{limits}: this one is not {SECRET_MIN} to {SECRET_MAX} characters"
+            ))
+        };
+    }
+    // A value read whole from a file ends with a line break: said as the one thing to change, when it is.
+    let cut = given
+        .strip_suffix("\r\n")
+        .or_else(|| given.strip_suffix('\n'));
+    if let Some(cut) = cut
+        && !cut.chars().any(char::is_control)
+        && length_ok(cut)
+    {
+        return Err(format!(
+            "{limits}: this one ends with a line break, and nothing else is wrong with it. Send it without the line break at its end ({why}, and the line break would be part of it; only a virtual machine's secret, which is a file, may end with one)"
+        ));
+    }
+    Err(format!("{limits}: this one has {}", control_named(given)))
+}
+
 pub fn write_secret(path: &Path, value: &str) -> Result<(), TemplateError> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;

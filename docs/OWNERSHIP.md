@@ -1096,8 +1096,10 @@ enter Incus's instance config.
   `crates/arca/tests/services/update_available.rs`.
 - `secrets` names the template's secrets. `service_secret_set` stores a value in the secret store, the private files under
   `<stateDir>/secrets` that a container's secrets use, and puts a reference in the record's `secretRefs`. A virtual
-  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value; a
-  carriage return before a line feed is dropped, and a carriage return alone is refused. A virtual machine whose template
+  machine's value may have line breaks (a private key in PEM form), since it is a file and not an environment value, and
+  it is stored as given, with the line break at its end when it has one (the limit of 4096 characters does not count
+  that one); a carriage return before a line feed is dropped, and a carriage return alone is refused. A container's and
+  a function's value is one line, and a line break at its end is refused (`service::secret_value`). A virtual machine whose template
   declares secrets is created stopped. That fails closed and is not a guarantee that it never boots without them: a
   machine with `boot.autostart` that Incus starts by itself before the first `instance_start` boots with no secret file,
   and what runs in it must wait for the file.

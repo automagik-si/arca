@@ -157,8 +157,8 @@
           "type": "string"
         },
         "value": {
-          "description": "The secret, 8 to 4096 characters.",
-          "maxLength": 4096,
+          "description": "The secret. A container's is one line of 8 to 4096 characters without control characters: it is an environment value, so a line break at its end is refused. A virtual machine's is a file in its guest and is stored as given, with the line break at its end when it has one (a key file read whole): 8 to 4096 characters not counting that one line break, with line breaks and no other control character, each carriage return and line feed pair stored as one line feed.",
+          "maxLength": 4097,
           "minLength": 8,
           "type": "string"
         },

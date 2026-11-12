@@ -260,7 +260,13 @@ async fn call_tool(
     let outcome = tokio::task::spawn_blocking(move || handler.call(arguments, &owned_caller)).await;
     let result = match outcome {
         Ok(result) => result,
-        Err(_) => {
+        Err(stopped) => {
+            let why = if stopped.is_panic() {
+                "its handler panicked"
+            } else {
+                "its handler was stopped before it answered"
+            };
+            (server.log)(&internal_line(name, why));
             return Ok(Some(result_reply(
                 id,
                 tool_failure("internal", "the tool failed"),
@@ -279,7 +285,11 @@ async fn call_tool(
                 ),
                 None => (None, value),
             };
-            if conforms(&(verb.result)(), &value).is_err() {
+            if let Err(why) = conforms(&(verb.result)(), &value) {
+                (server.log)(&internal_line(
+                    name,
+                    &format!("its answer does not fit the verb's result schema ({why})"),
+                ));
                 return Ok(Some(result_reply(
                     id,
                     tool_failure("internal", "the tool failed"),
@@ -305,12 +315,27 @@ async fn call_tool(
                 refused.refusal_data(),
             )))
         }
-        Err(CallError::Internal(_)) => Ok(Some(result_reply(
-            id,
-            tool_failure("internal", "the tool failed"),
-        ))),
+        Err(CallError::Internal(why)) => {
+            (server.log)(&internal_line(name, &why));
+            Ok(Some(result_reply(
+                id,
+                tool_failure("internal", "the tool failed"),
+            )))
+        }
         Err(other) => Err(other),
     }
+}
+
+/// The line the node's log gets when a tool call is answered "internal: the tool failed": the verb and why, on one
+/// line. The caller is not told the reason; whoever runs the node reads it here. `why` is a reason the server wrote
+/// (a handler's own internal text, or what the door found wrong with the answer), and never an argument of the call.
+pub(crate) fn internal_line(verb: &str, why: &str) -> String {
+    let why: String = why
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(300)
+        .collect();
+    format!("arca: {verb} was answered \"internal: the tool failed\": {why}")
 }
 
 const UNTRUSTED_META: &str = "droidd/untrusted";
