@@ -1,4 +1,4 @@
-//! `templates install [--config <file>] [--replace]`: puts the shipped service templates in `<stateDir>/templates`, each
+//! `templates install --config <file> [--replace]`: puts the shipped service templates in `<stateDir>/templates`, each
 //! template's JSON together with the script its entrypoint or its first boot reads. The files are the repository's `templates/` as this build
 //! holds them, so no checkout is needed and a template never arrives without its script.
 //!
@@ -41,7 +41,10 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 ];
 
 pub fn install(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = crate::load_config(flags)?;
+    let cfg = crate::load_named_config(
+        flags,
+        "templates install writes into a node's state directory",
+    )?;
     install_into(&cfg.state_dir.join("templates"), flags.switch("replace")).map(Some)
 }
 

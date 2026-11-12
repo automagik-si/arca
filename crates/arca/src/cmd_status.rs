@@ -7,7 +7,7 @@
 
 use serde_json::{Value, json};
 
-use crate::cmd_call::{read_token, run_call};
+use crate::cmd_call::{Addressed, read_token, run_call};
 use crate::config::NodeConfig;
 use crate::{Failure, Flags};
 
@@ -15,9 +15,11 @@ use crate::{Failure, Flags};
 const VERB: &str = "arca_status";
 
 pub fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = crate::load_config(flags)?;
-    let token = read_token(&crate::token_path(flags)?)?;
-    let answer = run_call(&cfg.listen.unix, None, &token, VERB, json!({}))?.unwrap_or(Value::Null);
+    let (config, cfg) = crate::load_chosen_config(flags)?;
+    let node = Addressed::new(&config, &cfg, false);
+    let token = read_token(&crate::token_path(flags)?, &node)?;
+    let answer =
+        run_call(&cfg.listen.unix, None, &token, VERB, json!({}), &node)?.unwrap_or(Value::Null);
     if flags.switch("json") {
         return Ok(Some(answer));
     }
@@ -61,17 +63,21 @@ pub fn words(status: &Value, cfg: &NodeConfig) -> String {
             text("metricsSource"),
             text("metricsSourceReason")
         ),
+        // The node answered on this socket, so this door is open. The other listeners are only what the config file
+        // names: nothing here asked them, and a listener may still be starting, or the file may have changed since.
         format!(
             "MCP door: open, on the unix socket {}",
             cfg.listen.unix.display()
         ),
     ];
     if let Some(addr) = cfg.listen.tailnet {
-        lines.push(format!("MCP door: also on the tailnet address {addr}"));
+        lines.push(format!(
+            "Config also names: the tailnet address {addr} (from the config file, not checked)"
+        ));
     }
     if let Some(proxy) = &cfg.listen.proxy {
         lines.push(format!(
-            "MCP door: also on {}, for the reverse proxy at {}",
+            "Config also names: {}, for the reverse proxy at {} (from the config file, not checked)",
             proxy.addr, proxy.peer
         ));
     }
@@ -184,11 +190,11 @@ mod tests {
         }));
         let text = words(&answer("kernel", true), &cfg);
         assert!(
-            text.contains("MCP door: also on the tailnet address 100.64.0.1:8443"),
+            text.contains("Config also names: the tailnet address 100.64.0.1:8443 (from the config file, not checked)"),
             "{text}"
         );
         assert!(
-            text.contains("MCP door: also on 127.0.0.1:8080, for the reverse proxy at 127.0.0.1"),
+            text.contains("Config also names: 127.0.0.1:8080, for the reverse proxy at 127.0.0.1 (from the config file, not checked)"),
             "{text}"
         );
         assert!(text.ends_with("arca call watch_report"), "{text}");

@@ -250,7 +250,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_create",
-        summary: "Create a Postgres database on the node's service network, in the node's own project: one instance from a digest-pinned image (name@sha256:<64 hex>), with a password Arca generates and keeps; no tool shows it. Returns its name, its entry and the status pending; postgres_list shows when it runs. Nothing reaches it until postgres_link links a consumer. Inside a tenant a database is the postgres service template instead (service_create, then service_connect).",
+        summary: "Create a Postgres database on the node's service network, in the node's service project (arcak-svc): one instance from a digest-pinned image (name@sha256:<64 hex>), with a password Arca generates and keeps; no tool shows it. Returns its name, its entry and the status pending; postgres_list shows when it runs. Nothing reaches it until postgres_link links a consumer. Inside a tenant a database is a service from the postgres-autopg template instead (service_create, then service_connect).",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,
@@ -264,7 +264,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_list",
-        summary: "The Postgres databases in the node's own project, each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
+        summary: "The Postgres databases in the node's service project (arcak-svc), each with its name, its entry, its status (pending until it has an address), its address, its port and the consumers linked to it. A node with no database answers an empty list. Never a password or a connection URL. A tenant's databases are services: service_list shows them.",
         class: VerbClass::L,
         min_scope: Scope::Viewer,
         writes: false,
@@ -306,7 +306,7 @@ static VERBS: [Verb; 55] = [
     },
     Verb {
         name: "postgres_delete",
-        summary: "Delete a Postgres database and its data. Every consumer's link to it goes, and so do its password and the connection URLs Arca kept. Returns removed: true when it is gone, or the delete plan that waits for the owner's approval (plan_list shows it, approval_submit carries the approval).",
+        summary: "Delete a Postgres database and its data. The call itself, at once, removes every consumer's link to the database, its password and the connection URLs Arca kept, even when the delete of the database then waits for the owner. Returns removed: true and no plan when the database is gone, or removed: false and the delete plan that waits for the owner's approval (plan_list shows it, approval_submit carries the approval).",
         class: VerbClass::L,
         min_scope: Scope::Doctor,
         writes: true,

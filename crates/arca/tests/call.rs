@@ -25,8 +25,15 @@ const WAIT: Duration = Duration::from_secs(15);
 /// kernel project starts with `arcak-scratch-`.
 const CALL_PROJECT: &str = "arcak-scratch-call";
 
+/// The binary, with no home directory and no variable to take a config or a token from: a call that names neither must
+/// never read the files of the user who runs the tests.
 fn arca() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_arca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arca"));
+    command
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE");
+    command
 }
 
 /// A served node, killed when the test ends.
@@ -373,10 +380,13 @@ fn a_doctor_calling_token_list_is_refused_403_and_the_call_exits_4() {
     let node = start_node("doctor-operator");
     let out = call(&node, &node.doctor, "token_list", &["--args", "{}"]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
-    // The refusal names the scope the verb needs and how a token of it is made.
+    // The refusal names the scope the verb needs, how a token of it is made for this node, and how the node takes it.
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "arca: the token's scope may not make this call: token_list needs a token of the operator scope, and a token minted with --tools must list it. An owner mints one with: arca token mint --scope operator --id <id> --out <file>\n"
+        format!(
+            "arca: the token's scope may not make this call: token_list needs a token of the operator scope, and a token minted with --tools must list it. An owner mints one with: {}\n",
+            mint_advice(&node, "operator")
+        )
     );
 }
 
@@ -420,7 +430,11 @@ fn a_token_the_server_does_not_hold_is_refused_401_and_the_call_exits_4() {
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "arca: the node does not accept this token: it was revoked, or it was minted for another node. To make a new one, mint one with: arca token mint --scope viewer --id <id> --out <file>\n"
+        format!(
+            "arca: the node does not accept this token: it was minted after the node last read its tokens, it was revoked, or it is another node's. If it was just minted, have the node read it: {}. For a new one: {}\n",
+            reload_command(&node),
+            mint_advice(&node, "viewer")
+        )
     );
 }
 
@@ -685,6 +699,89 @@ fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
     assert_eq!(code(&out), 2);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file>\n"
+        format!(
+            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {}/.config/arca/node.json. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}\n",
+            home.display(),
+            reload_command(&node)
+        )
+    );
+}
+
+/// The command a refusal gives to make `node` read its tokens again.
+fn reload_command(node: &Node) -> String {
+    format!(
+        "kill -HUP $(cat {}/serve.pid)",
+        node.scratch.path("state").display()
+    )
+}
+
+/// What a refusal says about minting a token of `scope` for `node`.
+fn mint_advice(node: &Node, scope: &str) -> String {
+    format!(
+        "arca token mint --scope {scope} --id <id> --out <file> --config {}. A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: {}",
+        node.config.display(),
+        reload_command(node)
+    )
+}
+
+#[test]
+fn a_token_minted_while_the_node_runs_is_refused_until_the_reload_the_refusal_names() {
+    let node = start_node("mint-reload");
+    // The mint the 403 and 401 texts give, with this node's config: it writes the hash and sends no signal.
+    let fresh = node.scratch.path("fresh.secret");
+    let minted = arca()
+        .args([
+            "token", "mint", "--scope", "viewer", "--id", "fresh-1", "--out",
+        ])
+        .arg(&fresh)
+        .arg("--config")
+        .arg(&node.config)
+        .output()
+        .expect("run token mint");
+    assert_eq!(
+        code(&minted),
+        0,
+        "{}",
+        String::from_utf8_lossy(&minted.stderr)
+    );
+    let before = call(&node, &fresh, "arca_status", &[]);
+    assert_eq!(
+        code(&before),
+        4,
+        "the running node has not read the new token"
+    );
+    let refusal = String::from_utf8_lossy(&before.stderr).into_owned();
+    assert!(
+        refusal.contains("it was minted after the node last read its tokens"),
+        "the refusal lists the true cause: {refusal}"
+    );
+    let reload = reload_command(&node);
+    assert!(
+        refusal.contains(&reload),
+        "the refusal names the reload: {refusal}"
+    );
+
+    // The reload, run as the refusal words it.
+    let ran = Command::new("sh")
+        .arg("-c")
+        .arg(&reload)
+        .output()
+        .expect("run the reload");
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut after = call(&node, &fresh, "arca_status", &[]);
+    while code(&after) != 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(100));
+        after = call(&node, &fresh, "arca_status", &[]);
+    }
+    assert_eq!(
+        code(&after),
+        0,
+        "{}",
+        String::from_utf8_lossy(&after.stderr)
     );
 }

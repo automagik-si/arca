@@ -1,6 +1,7 @@
 //! The `arca` binary: one node's one-shot watch and metrics reads, scoped token minting, the recording shim, and the Arca MCP
-//! server. Every command that needs the node reads one config file: the one `--config` names, else the one the
-//! `ARCA_CONFIG` variable names, else the file the installer writes. `serve` and `adopt` take it from `--config` alone.
+//! server. Every command that needs the node reads one config file. A command that only reads a node takes the one
+//! `--config` names, else the one the `ARCA_CONFIG` variable names, else the file the installer writes. A command that
+//! writes to a node, starts one or calls a peer takes it from `--config` alone.
 //!
 //! Exit codes: 0 for success; 1 for a runtime failure (a socket, a read or a write that failed); 2 for a usage or config
 //! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error, whose
@@ -55,20 +56,21 @@ const USAGE: &str = "usage: arca <command>
   status [--json] [--config <file>] [--token-file <file>]
   watch --once --json [--config <file>]
   metrics --json [--sample-for <seconds, 0 to 60>] [--config <file>]
-  link serve [--config <file>] (forwards arca/mcp/1 to listen.unix by default)
-  link pair [--config <file>] [--minutes <n>]
-  link join [--] <link> [--config <file>]
+  link serve --config <file> (forwards arca/mcp/1 to listen.unix by default)
+  link pair --config <file> [--minutes <n>]
+  link join [--] <link> --config <file>
   link peers [--config <file>]
-  link remove [--] <name> [--config <file>]
-  probe consumer add --name <n> --image <fingerprint> [--config <file>]
-  probe consumer remove --name <n> [--config <file>]
+  link remove [--] <name> --config <file>
+  probe consumer add --name <n> --image <fingerprint> --config <file>
+  probe consumer remove --name <n> --config <file>
   serve --config <file>
-  call [--peer <name>] <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
+  call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
+  call --peer <name> <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   call (alone: lists the verbs)
-  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]
-  token revoke <id> [--config <file> | --hash-dir <dir>]
-  store check [--config <file>]
-  templates install [--config <file>] [--replace]
+  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)
+  token revoke <id> (--config <file> | --hash-dir <dir>)
+  store check --config <file>
+  templates install --config <file> [--replace]
   service import plan --name <service> [--config <file>]
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
@@ -81,7 +83,7 @@ defaults, the files the installer writes:
   --config      ~/.config/arca/node.json
   --token-file  ~/.config/arca/assistant-1.secret
   The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.
-  serve and adopt start or change a node, so they take --config alone: no variable and no default.";
+  Only a command that reads a node takes them; one that writes to a node, starts one or calls a peer takes the flag alone.";
 
 /// The variable that names the config when `--config` is not given.
 pub const CONFIG_VARIABLE: &str = "ARCA_CONFIG";
@@ -175,9 +177,11 @@ pub fn usage_failure() -> Failure {
 
 /// The usage lines of one command, and of one of its actions when `action` names one that has lines of its own.
 fn usage_of(command: &str, action: Option<&str>) -> Vec<&'static str> {
+    // The command lines end at the first empty line; the notes under them are not usage.
     let lines = |prefix: String| -> Vec<&'static str> {
         USAGE
             .lines()
+            .take_while(|line| !line.is_empty())
             .filter(|line| *line == prefix.trim_end() || line.starts_with(&prefix))
             .collect()
     };
@@ -306,9 +310,9 @@ pub(crate) fn token_path(flags: &Flags) -> Result<Chosen, Failure> {
     chosen(flags, "token-file", TOKEN_VARIABLE, INSTALL_TOKEN)
 }
 
-/// Reads and checks the config a command reads. A default that is not there is not a read failure: nothing was installed
-/// for this user, and the refusal says so.
-pub(crate) fn load_config(flags: &Flags) -> Result<NodeConfig, Failure> {
+/// Reads and checks the config of a command that only reads a node, and says where it came from. A default that is not
+/// there is not a read failure: nothing was installed for this user, and the refusal says so.
+pub(crate) fn load_chosen_config(flags: &Flags) -> Result<(Chosen, NodeConfig), Failure> {
     let chosen = config_path(flags)?;
     if chosen.origin == Origin::Default && std::fs::symlink_metadata(&chosen.path).is_err() {
         return Err(Failure::Config(format!(
@@ -316,11 +320,17 @@ pub(crate) fn load_config(flags: &Flags) -> Result<NodeConfig, Failure> {
             chosen.path.display()
         )));
     }
-    Ok(config::load(&chosen.path)?)
+    let config = config::load(&chosen.path)?;
+    Ok((chosen, config))
 }
 
-/// Reads and checks the config of a command that starts or changes a node. Such a command takes it from `--config` alone,
-/// never from a variable or a default; `why` says so in the refusal.
+/// The config of a command that only reads a node: `--config`, else `ARCA_CONFIG`, else the installer's.
+pub(crate) fn load_config(flags: &Flags) -> Result<NodeConfig, Failure> {
+    load_chosen_config(flags).map(|(_, config)| config)
+}
+
+/// Reads and checks the config of a command that writes to a node, starts one or calls a peer. Such a command takes it
+/// from `--config` alone, never from a variable or a default; `why` says so in the refusal.
 pub(crate) fn load_named_config(flags: &Flags, why: &str) -> Result<NodeConfig, Failure> {
     let path = flags.value("config").ok_or_else(|| {
         Failure::Usage(format!(
@@ -592,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             refused.message(),
-            "--minutes needs a value\nusage:\n  arca link pair [--config <file>] [--minutes <n>]"
+            "--minutes needs a value\nusage:\n  arca link pair --config <file> [--minutes <n>]"
         );
         // A refusal that is not about a flag stays one line, and so does one of another kind.
         let plain = with_usage(

@@ -768,14 +768,13 @@ fn token_mint_needs_a_hash_dir_or_a_config() {
         .arg(&out_file)
         .output()
         .expect("run the binary");
-    // With neither, the mint reads the config every other command reads; here there is none.
-    assert_eq!(out.status.code(), Some(2), "neither is refused");
+    assert_eq!(out.status.code(), Some(2), "neither is a usage error");
     assert!(out.stdout.is_empty(), "nothing on stdout");
     assert!(
         stderr_text(&out).starts_with(
-            "arca: there is no config at /nonexistent/arca-test-home/.config/arca/node.json"
+            "arca: --config or --hash-dir is required: a token is a credential of one node"
         ),
-        "the message says which config was looked for: {}",
+        "the message says what is missing: {}",
         stderr_text(&out)
     );
     assert!(!out_file.exists(), "no secret file");
@@ -1188,80 +1187,107 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
 }
 
-/// Mints a viewer token `id` with the arguments `with` adds, and returns the run.
-fn mint_with(scratch: &Scratch, id: &str, with: &dyn Fn(&mut Command)) -> Output {
-    let mut command = arca();
-    command
-        .args(["token", "mint", "--scope", "viewer", "--id", id, "--out"])
-        .arg(scratch.at(&format!("{id}.secret")));
-    with(&mut command);
-    command.output().expect("run the binary")
-}
-
 #[test]
-fn the_config_is_the_flag_then_the_variable_then_the_file_the_installer_writes() {
+fn a_reading_command_takes_the_flag_then_the_variable_then_the_file_the_installer_writes() {
     let scratch = Scratch::new("config-order");
-    let by_default = token_dir(&scratch, "tokens-default");
-    let by_variable = token_dir(&scratch, "tokens-variable");
-    let by_flag = token_dir(&scratch, "tokens-flag");
-    let naming = |dir: &Path| {
+    // Three configs, each refused for a field of its own, so the refusal says which file was read.
+    let broken = |field: &str| {
         let mut value = config(&scratch, &scratch.at("incus.sock"));
-        value["tokens"]["hashDir"] = json!(dir.display().to_string());
+        value[field] = json!(1);
         value
     };
-    let home = installed_home(&scratch, Some(&naming(&by_default)));
-    let variable_config = write_config(&scratch, "variable.json", &naming(&by_variable));
-    let flag_config = write_config(&scratch, "flag.json", &naming(&by_flag));
-
-    // No flag and no variable: the installer's file under the home directory.
-    let out = mint_with(&scratch, "default-1", &|command| {
-        command.env("HOME", &home);
-    });
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-    assert!(
-        by_default.join("default-1.hash").exists(),
-        "the default config was read"
-    );
-
-    // The variable wins over the default.
-    let out = mint_with(&scratch, "variable-1", &|command| {
+    let home = installed_home(&scratch, Some(&broken("fromTheDefault")));
+    let variable_config = write_config(&scratch, "variable.json", &broken("fromTheVariable"));
+    let flag_config = write_config(&scratch, "flag.json", &broken("fromTheFlag"));
+    let read = |with: &dyn Fn(&mut Command)| {
+        let mut command = arca();
         command
-            .env("HOME", &home)
-            .env("ARCA_CONFIG", &variable_config);
-    });
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+            .args(["watch", "--once", "--json"])
+            .env("HOME", &home);
+        with(&mut command);
+        let out = command.output().expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+        stderr_text(&out)
+    };
+    let refused = |path: &Path, field: &str| {
+        format!(
+            "arca: in the config file {}: unknown field {field}; ",
+            path.display()
+        )
+    };
+    let by_default = read(&|_| {});
     assert!(
-        by_variable.join("variable-1.hash").exists(),
-        "the variable's config was read"
+        by_default.starts_with(&refused(
+            &home.join(".config/arca/node.json"),
+            "fromTheDefault"
+        )),
+        "{by_default}"
     );
-    assert!(!by_default.join("variable-1.hash").exists());
-
-    // The flag wins over both.
-    let out = mint_with(&scratch, "flag-1", &|command| {
+    let by_variable = read(&|command| {
+        command.env("ARCA_CONFIG", &variable_config);
+    });
+    assert!(
+        by_variable.starts_with(&refused(&variable_config, "fromTheVariable")),
+        "{by_variable}"
+    );
+    let by_flag = read(&|command| {
         command
-            .env("HOME", &home)
             .env("ARCA_CONFIG", &variable_config)
             .arg("--config")
             .arg(&flag_config);
     });
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert!(
-        by_flag.join("flag-1.hash").exists(),
-        "the flag's config was read"
+        by_flag.starts_with(&refused(&flag_config, "fromTheFlag")),
+        "{by_flag}"
     );
-    assert!(!by_variable.join("flag-1.hash").exists());
+}
 
-    // A hash directory alone reads no config at all, as the installer's own mint line relies on.
-    let alone = token_dir(&scratch, "tokens-alone");
-    let out = mint_with(&scratch, "alone-1", &|command| {
-        command
-            .env("HOME", &home)
-            .env("ARCA_CONFIG", scratch.at("no-such-config.json"))
-            .arg("--hash-dir")
-            .arg(&alone);
+#[test]
+fn the_token_file_is_the_flag_then_the_variable_then_the_file_the_installer_writes() {
+    let scratch = Scratch::new("token-order");
+    let home = installed_home(&scratch, Some(&config(&scratch, &scratch.at("incus.sock"))));
+    // The default holds a token; the variable names no file; the flag names a file that is too open. Each is refused, or
+    // gets as far as the socket, in its own words.
+    token_file(&home.join(".config/arca/assistant-1.secret"));
+    let loose = scratch.at("loose.secret");
+    token_file(&loose);
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o640)).expect("chmod 0640");
+    let status = |with: &dyn Fn(&mut Command)| {
+        let mut command = arca();
+        command.arg("status").env("HOME", &home);
+        with(&mut command);
+        let out = command.output().expect("run the binary");
+        (out.status.code(), stderr_text(&out))
+    };
+    let (code, text) = status(&|_| {});
+    assert_eq!(
+        code,
+        Some(1),
+        "the default token was read, and the node is not running: {text}"
+    );
+    assert!(
+        text.starts_with("arca: the node's socket does not answer"),
+        "{text}"
+    );
+    let (code, text) = status(&|command| {
+        command.env("ARCA_TOKEN_FILE", scratch.at("no-such.secret"));
     });
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-    assert!(alone.join("alone-1.hash").exists());
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.starts_with("arca: the token file does not exist: "),
+        "{text}"
+    );
+    let (code, text) = status(&|command| {
+        command
+            .env("ARCA_TOKEN_FILE", scratch.at("no-such.secret"))
+            .arg("--token-file")
+            .arg(&loose);
+    });
+    assert_eq!(code, Some(2), "{text}");
+    assert!(
+        text.starts_with("arca: the token file can be read by its group or by others"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -1298,22 +1324,68 @@ fn a_default_config_that_is_not_there_says_where_it_was_looked_for_and_what_to_d
 }
 
 #[test]
-fn serve_and_adopt_read_no_default_config_and_no_variable() {
+fn a_command_that_writes_starts_a_node_or_calls_a_peer_reads_no_default_and_no_variable() {
     let scratch = Scratch::new("config-named");
     let value = config(&scratch, &scratch.at("incus.sock"));
     let home = installed_home(&scratch, Some(&value));
+    token_file(&home.join(".config/arca/assistant-1.secret"));
     let named = write_config(&scratch, "named.json", &value);
-    for (args, why) in [
-        (vec!["serve"], "serve starts a node"),
+    let out_file = scratch.at("never-written.secret");
+    let out_arg = out_file.display().to_string();
+    let required =
+        |why: &str| format!("arca: --config is required: {why}, so it reads no default config\n");
+    let cases: Vec<(Vec<&str>, String)> = vec![
+        (vec!["serve"], required("serve starts a node")),
         (
             vec!["adopt", "status", "--instance", "svc1", "--json"],
-            "adopt changes a node",
+            required("adopt changes a node"),
         ),
-    ] {
+        (
+            vec!["link", "pair"],
+            required("link pair acts on a node's link"),
+        ),
+        (
+            vec!["link", "serve"],
+            required("link serve acts on a node's link"),
+        ),
+        (
+            vec!["link", "remove", "peer-1"],
+            required("link remove acts on a node's link"),
+        ),
+        (
+            vec!["templates", "install"],
+            required("templates install writes into a node's state directory"),
+        ),
+        (
+            vec!["store", "check"],
+            required("store check writes into a node's state directory"),
+        ),
+        (
+            vec!["probe", "consumer", "remove", "--name", "web"],
+            required("probe consumer changes a node's desired state"),
+        ),
+        (
+            vec!["call", "--peer", "host", "arca_status"],
+            required("a call with --peer sends a token to another node"),
+        ),
+        (
+            vec!["token", "mint", "--scope", "viewer", "--id", "x-1", "--out", &out_arg],
+            "arca: --config or --hash-dir is required: a token is a credential of one node, so the command reads no default config\n".to_string(),
+        ),
+        (
+            vec!["token", "revoke", "x-1"],
+            "arca: --config or --hash-dir is required: a token is a credential of one node, so the command reads no default config\n".to_string(),
+        ),
+    ];
+    for (args, first_line) in cases {
         let out = arca()
             .args(&args)
             .env("HOME", &home)
             .env("ARCA_CONFIG", &named)
+            .env(
+                "ARCA_TOKEN_FILE",
+                home.join(".config/arca/assistant-1.secret"),
+            )
             .output()
             .expect("run the binary");
         assert_eq!(
@@ -1323,15 +1395,75 @@ fn serve_and_adopt_read_no_default_config_and_no_variable() {
             stderr_text(&out)
         );
         assert!(
-            stderr_text(&out).starts_with(&format!(
-                "arca: --config is required: {why}, so it reads no default config\nusage:\n  arca {} ",
-                args[0]
-            )),
+            stderr_text(&out).starts_with(&first_line),
             "{args:?}: {}",
             stderr_text(&out)
         );
-        assert!(out.stdout.is_empty());
+        assert!(out.stdout.is_empty(), "{args:?}");
     }
+    assert!(!out_file.exists(), "no token was minted");
+    // The usage under a refusal is the command's own lines, and nothing of the notes below them.
+    let out = arca()
+        .arg("serve")
+        .env("HOME", &home)
+        .output()
+        .expect("run the binary");
+    assert_eq!(
+        stderr_text(&out),
+        "arca: --config is required: serve starts a node, so it reads no default config\nusage:\n  arca serve --config <file>\n"
+    );
+}
+
+#[test]
+fn a_peer_call_takes_its_token_from_the_flag_alone_and_never_sends_this_nodes_own() {
+    let scratch = Scratch::new("peer-token");
+    let value = config(&scratch, &scratch.at("incus.sock"));
+    let home = installed_home(&scratch, Some(&value));
+    // Both of this node's own token sources hold a token: neither may be read for a call that leaves the node.
+    let own = home.join(".config/arca/assistant-1.secret");
+    token_file(&own);
+    let named = write_config(&scratch, "named.json", &value);
+    for prefix in [true, false] {
+        let mut command = arca();
+        command.arg("call");
+        if prefix {
+            command.args(["--peer", "host", "arca_status"]);
+        } else {
+            command.args(["arca_status", "--peer", "host"]);
+        }
+        let out = command
+            .arg("--config")
+            .arg(&named)
+            .env("HOME", &home)
+            .env("ARCA_TOKEN_FILE", &own)
+            .output()
+            .expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+        assert!(
+            stderr_text(&out).starts_with(
+                "arca: --token-file is required with --peer: the token is sent to the peer, so it is one the peer minted and the caller names, never this node's own token from the default file or from ARCA_TOKEN_FILE\n"
+            ),
+            "{}",
+            stderr_text(&out)
+        );
+    }
+    // With the flag, the call goes on to the link, which is not running here: the token was taken from the flag.
+    let out = arca()
+        .args(["call", "--peer", "host", "arca_status", "--config"])
+        .arg(&named)
+        .arg("--token-file")
+        .arg(&own)
+        .env("HOME", &home)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_text(&out));
+    assert_eq!(
+        stderr_text(&out),
+        format!(
+            "arca: the link is not running: start it with: arca link serve --config {}, and keep it running\n",
+            named.display()
+        )
+    );
 }
 
 #[test]
@@ -1344,6 +1476,9 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  --config      ~/.config/arca/node.json",
         "  --token-file  ~/.config/arca/assistant-1.secret",
         "  The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.",
+        "  Only a command that reads a node takes them; one that writes to a node, starts one or calls a peer takes the flag alone.",
+        "  call --peer <name> <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]",
+        "  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)",
         "  serve --config <file>",
     ] {
         assert!(
@@ -1409,10 +1544,13 @@ fn token_file(path: &Path) {
 }
 
 #[test]
-fn status_of_a_node_that_is_not_running_says_so_and_how_to_start_it() {
+fn status_of_a_node_that_is_not_running_says_so_and_how_to_start_that_node() {
     let scratch = Scratch::new("status-down");
-    let home = installed_home(&scratch, Some(&config(&scratch, &scratch.at("incus.sock"))));
+    let value = config(&scratch, &scratch.at("incus.sock"));
+    let home = installed_home(&scratch, Some(&value));
     token_file(&home.join(".config/arca/assistant-1.secret"));
+    let down = "arca: the node's socket does not answer: the node is not running, or listen.unix in its config names another socket. Start the node with: ";
+    // The installer's node: its service, or serve with its config.
     let out = arca()
         .arg("status")
         .env("HOME", &home)
@@ -1422,15 +1560,41 @@ fn status_of_a_node_that_is_not_running_says_so_and_how_to_start_it() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         stderr_text(&out),
-        "arca: the node's socket does not answer: the node is not running, or listen.unix in the config names another socket. Start the node with: systemctl --user start arca.service\n"
+        format!(
+            "{down}systemctl --user start arca.service (the installer's service), or: arca serve --config {}/.config/arca/node.json\n",
+            home.display()
+        )
     );
+    // Another node, named by the flag or by the variable: the advice names that node, never the installer's service.
+    let other = write_config(&scratch, "other.json", &value);
+    for by_variable in [false, true] {
+        let mut command = arca();
+        command.arg("status").env("HOME", &home);
+        if by_variable {
+            command.env("ARCA_CONFIG", &other);
+        } else {
+            command.arg("--config").arg(&other);
+        }
+        let out = command.output().expect("run the binary");
+        assert_eq!(out.status.code(), Some(1), "{}", stderr_text(&out));
+        assert_eq!(
+            stderr_text(&out),
+            format!("{down}arca serve --config {}\n", other.display())
+        );
+    }
 }
 
 #[test]
-fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one() {
+fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one_the_node_will_read() {
     let scratch = Scratch::new("token-absent");
     let home = installed_home(&scratch, Some(&config(&scratch, &scratch.at("incus.sock"))));
-    // The installer's own path is named: nobody typed it.
+    let installed = format!("{}/.config/arca", home.display());
+    // What every mint advice ends with: the node reads tokens at its start or on SIGHUP, and the command that sends it.
+    let reload = format!(
+        "A node reads its tokens only when it starts or on SIGHUP, so a node that is running needs this after the mint: kill -HUP $(cat {}/serve.pid)",
+        scratch.at("state").display()
+    );
+    // The installer's own path is named, since nobody typed it, and the mint writes to it, so no flag is needed after.
     let out = arca()
         .arg("status")
         .env("HOME", &home)
@@ -1440,8 +1604,7 @@ fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one() {
     assert_eq!(
         stderr_text(&out),
         format!(
-            "arca: the token file {}/.config/arca/assistant-1.secret, where the installer writes it, does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> (then pass --token-file <file>)\n",
-            home.display()
+            "arca: the token file {installed}/assistant-1.secret, where the installer writes it, does not exist: mint one with: arca token mint --scope viewer --id <id> --out {installed}/assistant-1.secret --config {installed}/node.json. {reload}\n"
         )
     );
     // A path the caller gave, in the flag or in the variable, is never repeated.
@@ -1458,7 +1621,9 @@ fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one() {
         assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
         assert_eq!(
             stderr_text(&out),
-            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file>\n"
+            format!(
+                "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> --config {installed}/node.json. {reload}\n"
+            )
         );
     }
     // A file that is there and too open is a different refusal, with its own fix.

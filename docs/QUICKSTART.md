@@ -115,11 +115,15 @@ arca status
 
 It takes no flag: `--config` and `--token-file` default to the two files above (`~/.config/arca/node.json` and
 `~/.config/arca/assistant-1.secret`). A flag wins over the `ARCA_CONFIG` or `ARCA_TOKEN_FILE` variable, and the variable
-over the default; `serve` and `adopt` always take `--config`. The answer is the node in words: its version,
-`Mode: watch-only`, whether Incus answers, where the MCP door is, and the next step. `arca status --json` prints the
-`arca_status` tool's own answer, the same as `arca call arca_status`: one JSON object with `"mode":"watch-only"`,
+over the default. Only a command that reads a node takes the defaults; one that writes to a node, starts one or calls a
+peer (`serve`, `token mint`, `adopt` and the like) takes `--config` as a flag. The answer is the node in words: its
+version, `Mode: watch-only`, whether Incus answers, where the MCP door is, and the next step. `arca status --json` prints
+the `arca_status` tool's own answer, the same as `arca call arca_status`: one JSON object with `"mode":"watch-only"`,
 `"incusReachable":true` and the release's `"version"`. `arca call watch_report` lists every project and instance with
 its owner, and `arca call` alone lists every verb.
+
+A token minted while the node runs is refused until the node reads it: `serve` reads its tokens when it starts and on
+SIGHUP, so run `kill -HUP $(cat <stateDir>/serve.pid)` after a later `arca token mint`, or restart the node.
 
 **4. Connect an assistant over MCP.** The node is an MCP server over streamable HTTP: `POST /mcp`, JSON answers, protocol
 version `2025-11-25`, and a bearer token on every request. With the `viewer` token from step 3, this read-only node lists

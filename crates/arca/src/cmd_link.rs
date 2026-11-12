@@ -58,7 +58,12 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         &["config"][..]
     };
     let flags = parse_flags(args, allowed, &[])?;
-    let config = crate::load_config(&flags)?;
+    // Listing the peers only reads; every other action changes or runs a node's link.
+    let config = if command == "peers" {
+        crate::load_config(&flags)?
+    } else {
+        crate::load_named_config(&flags, &format!("link {command} acts on a node's link"))?
+    };
     let mut link_config = config.link.clone().unwrap_or_default();
     if command == "serve" {
         link_config

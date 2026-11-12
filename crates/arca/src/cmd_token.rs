@@ -76,10 +76,10 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     fs::remove_file(&hash_path)
         .map_err(|e| Failure::Runtime(format!("cannot remove the hash file: {e}")))?;
     let mut reload_signalled = false;
-    if let Some(path) = config_of(flags)? {
-        let cfg = config::load(&path)?;
+    if let Some(path) = flags.value("config") {
+        let cfg = config::load(Path::new(path))?;
         let pid_path = cfg.state_dir.join(SERVE_PID_FILE);
-        let config_path = path.as_path();
+        let config_path = Path::new(path);
         let from_file = fs::read_to_string(&pid_path)
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
@@ -196,24 +196,15 @@ fn parse_tools(text: &str, scope: Scope) -> Result<Vec<String>, Failure> {
     Ok(tools)
 }
 
-/// The config a token command reads: the one `--config` names; else, when no `--hash-dir` is given either, the one every
-/// other command reads (`ARCA_CONFIG`, then the installer's). A `--hash-dir` alone reads no config, as before.
-fn config_of(flags: &Flags) -> Result<Option<PathBuf>, Failure> {
-    if flags.value("config").is_none() && flags.value("hash-dir").is_some() {
-        return Ok(None);
-    }
-    Ok(Some(crate::config_path(flags)?.path))
-}
-
-/// The directory the hash file goes into: `--hash-dir`, or `tokens.hashDir` of the config. A config is loaded and checked as
-/// every other command checks it. When both flags are given they must name the same directory, and when neither is given the
-/// config is the one every other command reads.
+/// The directory the hash file goes into: `--hash-dir`, or `tokens.hashDir` of `--config`. A config is loaded and checked as
+/// every other command checks it. When both are given they must name the same directory, and when neither is given the
+/// command is refused: a credential is never written to, or removed from, a node nobody named.
 fn hash_dir_of(flags: &Flags) -> Result<PathBuf, Failure> {
     let given = flags.value("hash-dir").map(PathBuf::from);
-    let configured = match config_of(flags)? {
-        Some(_) => Some(crate::load_config(flags)?.tokens.hash_dir),
-        None => None,
-    };
+    let configured = flags
+        .value("config")
+        .map(|path| config::load(Path::new(path)).map(|cfg| cfg.tokens.hash_dir))
+        .transpose()?;
     match (given, configured) {
         (Some(given), Some(configured)) if same_dir(&given, &configured) => Ok(given),
         (Some(_), Some(_)) => Err(Failure::Usage(
@@ -221,7 +212,7 @@ fn hash_dir_of(flags: &Flags) -> Result<PathBuf, Failure> {
         )),
         (Some(dir), None) | (None, Some(dir)) => Ok(dir),
         (None, None) => Err(Failure::Usage(
-            "--hash-dir or --config is required: the token's hash goes into one directory".to_string(),
+            "--config or --hash-dir is required: a token is a credential of one node, so the command reads no default config".to_string(),
         )),
     }
 }

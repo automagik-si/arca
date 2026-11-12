@@ -96,8 +96,15 @@ fn private_dir(path: &Path) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
 }
 
+/// The binary, with no home directory and no variable to take a config or a token from: a call that names neither must
+/// never read the files of the user who runs the tests.
 fn arca() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_arca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arca"));
+    command
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE");
+    command
 }
 
 fn run(command: &mut Command, what: &str) {

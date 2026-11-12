@@ -1405,7 +1405,10 @@ fn the_postgres_descriptions_say_what_each_verb_returns() {
         ),
         ("postgres_link", vec!["DATABASE_URL", "never the URL"]),
         ("postgres_unlink", vec!["variables removed", "data stay"]),
-        ("postgres_delete", vec!["its data", "delete plan"]),
+        (
+            "postgres_delete",
+            vec!["at once", "removed: false", "delete plan"],
+        ),
     ] {
         for word in words {
             assert!(

@@ -34,7 +34,7 @@ pub fn probe(args: &[String]) -> Result<Option<Value>, Failure> {
     if !arca_netproject::name_ok(name, "consumer", 63) {
         return Err(Failure::Config("invalid consumer name".into()));
     }
-    let cfg = crate::load_config(&flags)?;
+    let cfg = crate::load_named_config(&flags, "probe consumer changes a node's desired state")?;
     let key = NodeKey::load_or_create(&cfg.state_dir.join("node.key"))
         .map_err(|_| Failure::Runtime("node key unavailable".into()))?;
     let mut store =
