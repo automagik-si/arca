@@ -1017,7 +1017,9 @@ impl Drop for Pool {
 }
 
 fn wait_for(pool: &Pool, what: &str, mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // The bound only keeps a test from waiting for ever: what is waited for is the same, however long the machine
+    // takes. Thirty seconds was once too short on a loaded pool.
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !ready() {
         assert!(
             Instant::now() < deadline,
