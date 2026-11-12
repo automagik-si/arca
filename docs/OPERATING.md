@@ -765,7 +765,7 @@ that loses the plugin. They come through the welcome once Automagik's fixed rele
 until then, and being published on the tailnet with `service_publish`, which an OCI service cannot be. Build
 `automagik` when you need either.
 
-A node that installed `automagik-server` or `automagik-workspace` up to Arca 0.15.0 (the server template pinned
+A node that installed `automagik-server` or `automagik-workspace` up to Arca 0.16.0 (the server template pinned
 Automagik 3.95.0, the workspace a build of Automagik's commit `5fe0be6`) gets both brought up to 3.136.4 by the
 upgrade, as any shipped template nobody edited. A service made before keeps running the image it was created with: it
 is its own instance, and the upgrade does not touch it. Its `service_status` shows the newer release under `update`
@@ -3963,7 +3963,7 @@ What to know:
   repository's commit `7aaa512`), the same image the `automagik-server` template pins. It has the gate, its
   Cloudflare Access sign-in, and the gate's own sign-in with passkeys, which the tailnet reach uses; both reaches run
   it. The gate's files (`compose.gate.yml`, `gate-entrypoint.mjs`, `gate-access.mjs`, `gate-claim.mjs`) are the same
-  as at commit `5fe0be6`, the build pinned up to Arca 0.15.0. The image's health check was rewritten since; it still
+  as at commit `5fe0be6`, the build pinned up to Arca 0.16.0. The image's health check was rewritten since; it still
   prints the code of the port it asks (the gate's in the gate's container, the server's in the server's), which is
   all the keeper reads. Nothing of the Access sign-in changed between the build pinned before that (`8fb2e6f`) and
   `5fe0be6`. An older build has no gate: its gate container stops at once, the keeper says `the gate stopped (exit code ...)` and
