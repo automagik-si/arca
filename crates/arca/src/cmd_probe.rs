@@ -1,26 +1,40 @@
 //! Offline consumer proposals. The desired-state lock excludes a running server.
 use crate::{
-    Failure, config,
+    Failure,
     desired_store::{DesiredStore, EntryChange},
     handlers::{ensure_netproject, now_ms, service_entry},
-    parse_flags, usage_failure,
+    parse_flags, unknown_word,
 };
 use arca_kernel::{desired::EntryId, identity::NodeKey};
 use serde_json::{Value, json};
-use std::path::Path;
 pub fn probe(args: &[String]) -> Result<Option<Value>, Failure> {
-    let [kind, action, rest @ ..] = args else {
-        return Err(usage_failure());
+    let args = match args.split_first() {
+        Some((kind, args)) if kind == "consumer" => args,
+        other => {
+            return Err(unknown_word(
+                "a probe kind",
+                other.map(|(kind, _)| kind.as_str()),
+                &["consumer"],
+            ));
+        }
     };
-    if kind != "consumer" || !["add", "remove"].contains(&action.as_str()) {
-        return Err(usage_failure());
-    }
+    let actions = ["add", "remove"];
+    let (action, rest) = match args.split_first() {
+        Some((action, rest)) if actions.contains(&action.as_str()) => (action, rest),
+        other => {
+            return Err(unknown_word(
+                "a probe consumer action",
+                other.map(|(action, _)| action.as_str()),
+                &actions,
+            ));
+        }
+    };
     let flags = parse_flags(rest, &["name", "image", "config"], &[])?;
     let name = flags.required("name")?;
     if !arca_netproject::name_ok(name, "consumer", 63) {
         return Err(Failure::Config("invalid consumer name".into()));
     }
-    let cfg = config::load(Path::new(flags.required("config")?))?;
+    let cfg = crate::load_config(&flags)?;
     let key = NodeKey::load_or_create(&cfg.state_dir.join("node.key"))
         .map_err(|_| Failure::Runtime("node key unavailable".into()))?;
     let mut store =

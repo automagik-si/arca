@@ -360,8 +360,14 @@ pub enum ConfigError {
         path: String,
         why: String,
     },
-    /// The file does not parse, or a key is unknown or missing. The text is serde's naming of the key, with values removed.
+    /// The file does not parse, or a key is unknown or missing. The text names the key by its place in the file
+    /// (`kernel.serviceCidr`), with values removed.
     Parse(String),
+    /// The file at `path` reads, and `why` is what is refused in it: the refusal names the file to fix.
+    File {
+        path: String,
+        why: Box<ConfigError>,
+    },
     /// The tailnet address fails the tailnet rules.
     TailnetAddr(String),
     /// The proxy address fails the proxy rules, or its peer is not one address.
@@ -404,6 +410,10 @@ impl fmt::Display for ConfigError {
         match self {
             Self::Io { path, why } => write!(f, "cannot read the config file {path}: {why}"),
             Self::Parse(why) => write!(f, "the config file is refused: {why}"),
+            Self::File { path, why } => match why.as_ref() {
+                Self::Parse(why) => write!(f, "in the config file {path}: {why}"),
+                why => write!(f, "in the config file {path}: {why}"),
+            },
             Self::TailnetAddr(why) => write!(f, "listen.tailnet is refused: {why}"),
             Self::ProxyAddr(why) => write!(f, "listen.proxy is refused: {why}"),
             Self::ServicesSocket(why) => write!(f, "listen.services is refused: {why}"),
@@ -461,9 +471,28 @@ pub fn load(path: &Path) -> Result<NodeConfig, ConfigError> {
         path: path.display().to_string(),
         why: io_reason(&e),
     })?;
+    let in_file = |why: ConfigError| ConfigError::File {
+        path: path.display().to_string(),
+        why: Box::new(why),
+    };
+    let config = parse(&text).map_err(|why| in_file(ConfigError::Parse(why)))?;
+    check(&config).map_err(in_file)?;
+    Ok(config)
+}
+
+/// The config in `text`, or why it does not parse, in [`parse_reason`]'s words.
+fn parse(text: &str) -> Result<NodeConfig, String> {
+    let mut json = serde_json::Deserializer::from_str(text);
     let config: NodeConfig =
-        serde_json::from_str(&text).map_err(|e| ConfigError::Parse(parse_reason(&e)))?;
-    check(&config)?;
+        serde_path_to_error::deserialize(&mut json).map_err(|e| parse_reason(&e))?;
+    // Anything after the one JSON value is refused, as `serde_json::from_str` refuses it.
+    json.end().map_err(|e| {
+        format!(
+            "the file is not valid JSON (line {}, column {})",
+            e.line(),
+            e.column()
+        )
+    })?;
     Ok(config)
 }
 
@@ -906,21 +935,21 @@ fn io_reason(error: &io::Error) -> String {
     }
 }
 
-/// serde's account of a parse failure, with the rejected value removed. Only the two key errors name anything, and they
-/// name keys; every other data error is a fixed phrase.
-fn parse_reason(error: &serde_json::Error) -> String {
-    let position = format!("line {}, column {}", error.line(), error.column());
-    let message = match error.classify() {
+/// A parse failure in the reader's words: which field, by its place in the file (`kernel.tenants.maxTenants`), and what is
+/// wrong with it. A rejected value is never repeated: an unknown or missing key is named, a wrong type names what was
+/// expected, and every other data error is a fixed phrase.
+fn parse_reason(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
+    let inner = error.inner();
+    let position = format!("line {}, column {}", inner.line(), inner.column());
+    let at = error.path().to_string();
+    let at = if at == "." { "" } else { at.as_str() };
+    let message = match inner.classify() {
         Category::Data => {
-            let text = error.to_string();
+            let text = inner.to_string();
             let head = text
                 .rsplit_once(" at line ")
                 .map_or(text.as_str(), |(head, _)| head);
-            if head.starts_with("unknown field") || head.starts_with("missing field") {
-                head.to_string()
-            } else {
-                "a value has the wrong type or form".to_string()
-            }
+            data_reason(head, at)
         }
         Category::Syntax | Category::Eof => "the file is not valid JSON".to_string(),
         Category::Io => "the file could not be read".to_string(),
@@ -928,9 +957,192 @@ fn parse_reason(error: &serde_json::Error) -> String {
     format!("{message} ({position})")
 }
 
+/// serde's data error `head`, for the value at `at` (empty at the top of the file).
+fn data_reason(head: &str, at: &str) -> String {
+    // The names serde puts in backticks: the key it refused or missed first, then the keys it knows.
+    let names: Vec<&str> = head.split('`').skip(1).step_by(2).collect();
+    if head.starts_with("unknown field") {
+        let Some((name, known)) = names.split_first() else {
+            return "unknown field".to_string();
+        };
+        // The path ends at the refused key when the reader got as far as naming it.
+        let parent = if at == *name {
+            ""
+        } else {
+            at.strip_suffix(&format!(".{name}")).unwrap_or(at)
+        };
+        let hint = match crate::closest(name, known.iter().copied()) {
+            Some(near) => format!("; did you mean {}?", dotted(parent, near)),
+            None if known.is_empty() => String::new(),
+            None => format!("; the fields here are {}", known.join(", ")),
+        };
+        return format!("unknown field {}{hint}", dotted(parent, name));
+    }
+    if head.starts_with("missing field") {
+        return match names.first() {
+            Some(name) => format!("the field {} is missing", dotted(at, name)),
+            None => "a field is missing".to_string(),
+        };
+    }
+    let subject = if at.is_empty() { "a value" } else { at };
+    // Only serde's own forms end in what was expected; the text before it may hold the value, so it is dropped.
+    let serde_form = [
+        "invalid type: ",
+        "invalid value: ",
+        "invalid length ",
+        "unknown variant ",
+    ]
+    .iter()
+    .any(|form| head.starts_with(form));
+    match head.rsplit_once(", expected ") {
+        Some((_, expected)) if serde_form => {
+            format!("{subject} has the wrong type or form: expected {expected}")
+        }
+        _ => format!("{subject} has the wrong type or form"),
+    }
+}
+
+/// `name` under `parent`, as the keys from the top of the file.
+fn dotted(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}.{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file in a fresh directory under the system's temporary directory, removed when dropped.
+    struct ConfigFile(PathBuf);
+
+    impl ConfigFile {
+        fn new(tag: &str, value: &serde_json::Value) -> ConfigFile {
+            let dir =
+                std::env::temp_dir().join(format!("arca-config-{tag}-{}", std::process::id()));
+            fs::create_dir_all(&dir).expect("the scratch directory");
+            let path = dir.join("node.json");
+            let text = serde_json::to_string_pretty(value).expect("the config serializes");
+            fs::write(&path, text).expect("the config file");
+            ConfigFile(path)
+        }
+
+        /// What `load` refuses this file with.
+        fn refusal(&self) -> String {
+            load(&self.0)
+                .expect_err("the config is refused")
+                .to_string()
+        }
+    }
+
+    impl Drop for ConfigFile {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn plain() -> serde_json::Value {
+        serde_json::json!({
+            "stateDir": "/nonexistent/state",
+            "incus": { "socket": "/nonexistent/incus.sock" },
+            "listen": { "unix": "/nonexistent/arca.sock" },
+            "tokens": { "hashDir": "/nonexistent/tokens" },
+            "kernel": { "droiddProjects": ["droid"] }
+        })
+    }
+
+    #[test]
+    fn an_unknown_field_is_named_by_its_place_with_the_file_and_the_closest_known_field() {
+        let mut value = plain();
+        value["kernel"]["serviceCdir"] = serde_json::json!("192.0.2.0/24");
+        let file = ConfigFile::new("unknown", &value);
+        let refusal = file.refusal();
+        assert!(
+            refusal.starts_with(&format!(
+                "in the config file {}: unknown field kernel.serviceCdir; did you mean kernel.serviceCidr? (line ",
+                file.0.display()
+            )),
+            "{refusal}"
+        );
+        assert!(
+            !refusal.contains("192.0.2.0"),
+            "the value is never repeated: {refusal}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_at_the_top_with_no_close_name_lists_the_fields_there() {
+        let mut value = plain();
+        value["zzzzzzzzzzzz"] = serde_json::json!(1);
+        let refusal = ConfigFile::new("unknown-top", &value).refusal();
+        assert!(
+            refusal.contains(": unknown field zzzzzzzzzzzz; the fields here are "),
+            "{refusal}"
+        );
+        assert!(refusal.contains("stateDir"), "{refusal}");
+    }
+
+    #[test]
+    fn a_missing_field_is_named_by_its_place_with_the_file() {
+        let mut value = plain();
+        value["listen"] = serde_json::json!({});
+        let file = ConfigFile::new("missing", &value);
+        let refusal = file.refusal();
+        assert!(
+            refusal.starts_with(&format!(
+                "in the config file {}: the field listen.unix is missing (line ",
+                file.0.display()
+            )),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_type_is_named_with_what_was_expected_and_never_its_value() {
+        let mut value = plain();
+        value["kernel"]["projects"] = serde_json::json!("a-secret-looking-value");
+        let file = ConfigFile::new("wrong-type", &value);
+        let refusal = file.refusal();
+        assert!(
+            refusal.starts_with(&format!(
+                "in the config file {}: kernel.projects has the wrong type or form: expected a sequence (line ",
+                file.0.display()
+            )),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("a-secret-looking-value"), "{refusal}");
+    }
+
+    #[test]
+    fn a_rule_a_parsed_config_breaks_names_the_file_too() {
+        let mut value = plain();
+        value["kernel"]["postgresImage"] = serde_json::json!("postgres:16");
+        let file = ConfigFile::new("rule", &value);
+        assert_eq!(
+            file.refusal(),
+            format!(
+                "in the config file {}: kernel.postgresImage must be a digest-pinned image reference (name@sha256:<64 hex>)",
+                file.0.display()
+            )
+        );
+    }
+
+    #[test]
+    fn text_after_the_config_is_refused_as_invalid_json() {
+        let file = ConfigFile::new("trailing", &plain());
+        let mut text = fs::read_to_string(&file.0).expect("the config file");
+        text.push_str("\n{}");
+        fs::write(&file.0, text).expect("the config file");
+        assert!(
+            file.refusal().contains("the file is not valid JSON (line "),
+            "{}",
+            file.refusal()
+        );
+    }
 
     fn config_with(approval_host: Option<&str>) -> NodeConfig {
         let mut value = serde_json::json!({

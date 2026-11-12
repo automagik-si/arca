@@ -27,7 +27,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
-use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,9 +41,9 @@ use arca_kernel::ownership::{IncusKind, OwnerClass, classify};
 use serde_json::{Value, json};
 
 use crate::adoptions::{AdoptionPlan, AdoptionRecord, Facts, Phase, release_steps, resume_steps};
-use crate::config::{self, NodeConfig};
+use crate::config::NodeConfig;
 use crate::desired_store::lock_state_dir;
-use crate::{Failure, Flags, parse_flags, usage_failure};
+use crate::{Failure, Flags, parse_flags, unknown_word};
 
 /// The kernel's config namespace: a key in it is a kernel mark or a tombstone.
 const KERNEL_NAMESPACE: &str = "user.arcakernel.";
@@ -71,8 +70,9 @@ pub fn adopt(argv: &[String]) -> Result<Option<Value>, Failure> {
 
 /// Runs one `adopt` action, asking `halt` at each kill point of each step it runs.
 pub fn adopt_halting(argv: &[String], halt: Halt<'_>) -> Result<Option<Value>, Failure> {
+    let actions = ["plan", "apply", "release", "verify", "status"];
     let Some((action, rest)) = argv.split_first() else {
-        return Err(usage_failure());
+        return Err(unknown_word("an adopt action", None, &actions));
     };
     match action.as_str() {
         "plan" => plan(&parse_flags(
@@ -98,7 +98,7 @@ pub fn adopt_halting(argv: &[String], halt: Halt<'_>) -> Result<Option<Value>, F
             &[],
         )?),
         "status" => status(&parse_flags(rest, &["instance", "config"], &["json"])?),
-        _ => Err(usage_failure()),
+        other => Err(unknown_word("an adopt action", Some(other), &actions)),
     }
 }
 
@@ -119,7 +119,7 @@ fn read_failure(error: IncusError) -> Failure {
 
 /// The config and the allowlisted target the flags name.
 fn setup(flags: &Flags) -> Result<(NodeConfig, AdoptTarget), Failure> {
-    let cfg = config::load(Path::new(flags.required("config")?))?;
+    let cfg = crate::load_named_config(flags, "adopt changes a node")?;
     let instance = flags.required("instance")?;
     let target = cfg
         .kernel

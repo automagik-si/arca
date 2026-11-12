@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::adoptions::{AdoptionRecord, ImportEvent, Phase};
 use crate::config::{ImportService, NodeConfig};
-use crate::{Failure, Flags, parse_flags, usage_failure};
+use crate::{Failure, Flags, parse_flags};
 
 /// The namespace of every key the kernel writes on an object.
 const KERNEL_NAMESPACE: &str = "user.arcakernel.";
@@ -645,15 +645,19 @@ pub fn release(cfg: &NodeConfig, name: &str, project: &str) -> Result<Released, 
     }
 }
 
-/// `arca service import plan --name <n> --config <file>`: prints the plan as JSON and writes nothing. It reads Incus with
+/// `arca service import plan --name <n> [--config <file>]`: prints the plan as JSON and writes nothing. It reads Incus with
 /// GET alone and never opens the state directory, so it runs beside a serving kernel.
 pub fn command(argv: &[String]) -> Result<Option<Value>, Failure> {
     let rest = match argv {
         [import, plan, rest @ ..] if import == "import" && plan == "plan" => rest,
-        _ => return Err(usage_failure()),
+        _ => {
+            return Err(Failure::Usage(
+                "service takes one action: arca service import plan --name <service>".to_string(),
+            ));
+        }
     };
     let flags: Flags = parse_flags(rest, &["name", "config"], &["json"])?;
-    let cfg = crate::config::load(std::path::Path::new(flags.required("config")?))?;
+    let cfg = crate::load_config(&flags)?;
     let name = flags.required("name")?;
     if !crate::service::service_name_ok(name) {
         return Err(Failure::Usage("--name is a service name".to_string()));

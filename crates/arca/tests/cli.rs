@@ -49,8 +49,26 @@ impl Drop for Scratch {
     }
 }
 
+/// The binary, with no home directory and no variable to take a config or a token from: a test that names neither must
+/// never read the files of the user who runs the tests.
 fn arca() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_arca"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arca"));
+    command
+        .env("HOME", "/nonexistent/arca-test-home")
+        .env_remove("ARCA_CONFIG")
+        .env_remove("ARCA_TOKEN_FILE");
+    command
+}
+
+/// A home directory under `scratch` as the installer leaves it: `.config/arca`, with `node.json` when `config` is given.
+fn installed_home(scratch: &Scratch, config: Option<&Value>) -> PathBuf {
+    let home = scratch.at("home");
+    let dir = home.join(".config/arca");
+    fs::create_dir_all(&dir).expect("the installer's directory");
+    if let Some(config) = config {
+        fs::write(dir.join("node.json"), config.to_string()).expect("the installer's config");
+    }
+    home
 }
 
 fn stdout_text(out: &Output) -> String {
@@ -750,11 +768,15 @@ fn token_mint_needs_a_hash_dir_or_a_config() {
         .arg(&out_file)
         .output()
         .expect("run the binary");
-    assert_eq!(out.status.code(), Some(2), "neither is a usage error");
+    // With neither, the mint reads the config every other command reads; here there is none.
+    assert_eq!(out.status.code(), Some(2), "neither is refused");
     assert!(out.stdout.is_empty(), "nothing on stdout");
     assert!(
-        !stderr_text(&out).is_empty(),
-        "the message says what is missing"
+        stderr_text(&out).starts_with(
+            "arca: there is no config at /nonexistent/arca-test-home/.config/arca/node.json"
+        ),
+        "the message says which config was looked for: {}",
+        stderr_text(&out)
     );
     assert!(!out_file.exists(), "no secret file");
 }
@@ -1164,4 +1186,337 @@ fn serve_answers_on_the_proxy_listener_and_stops_every_listener_on_sigterm() {
     );
     let summary = rig.shim.stop().expect("stop the shim");
     assert_eq!(summary.refused, 0, "serve sent Incus only GETs");
+}
+
+/// Mints a viewer token `id` with the arguments `with` adds, and returns the run.
+fn mint_with(scratch: &Scratch, id: &str, with: &dyn Fn(&mut Command)) -> Output {
+    let mut command = arca();
+    command
+        .args(["token", "mint", "--scope", "viewer", "--id", id, "--out"])
+        .arg(scratch.at(&format!("{id}.secret")));
+    with(&mut command);
+    command.output().expect("run the binary")
+}
+
+#[test]
+fn the_config_is_the_flag_then_the_variable_then_the_file_the_installer_writes() {
+    let scratch = Scratch::new("config-order");
+    let by_default = token_dir(&scratch, "tokens-default");
+    let by_variable = token_dir(&scratch, "tokens-variable");
+    let by_flag = token_dir(&scratch, "tokens-flag");
+    let naming = |dir: &Path| {
+        let mut value = config(&scratch, &scratch.at("incus.sock"));
+        value["tokens"]["hashDir"] = json!(dir.display().to_string());
+        value
+    };
+    let home = installed_home(&scratch, Some(&naming(&by_default)));
+    let variable_config = write_config(&scratch, "variable.json", &naming(&by_variable));
+    let flag_config = write_config(&scratch, "flag.json", &naming(&by_flag));
+
+    // No flag and no variable: the installer's file under the home directory.
+    let out = mint_with(&scratch, "default-1", &|command| {
+        command.env("HOME", &home);
+    });
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(
+        by_default.join("default-1.hash").exists(),
+        "the default config was read"
+    );
+
+    // The variable wins over the default.
+    let out = mint_with(&scratch, "variable-1", &|command| {
+        command
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &variable_config);
+    });
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(
+        by_variable.join("variable-1.hash").exists(),
+        "the variable's config was read"
+    );
+    assert!(!by_default.join("variable-1.hash").exists());
+
+    // The flag wins over both.
+    let out = mint_with(&scratch, "flag-1", &|command| {
+        command
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &variable_config)
+            .arg("--config")
+            .arg(&flag_config);
+    });
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(
+        by_flag.join("flag-1.hash").exists(),
+        "the flag's config was read"
+    );
+    assert!(!by_variable.join("flag-1.hash").exists());
+
+    // A hash directory alone reads no config at all, as the installer's own mint line relies on.
+    let alone = token_dir(&scratch, "tokens-alone");
+    let out = mint_with(&scratch, "alone-1", &|command| {
+        command
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", scratch.at("no-such-config.json"))
+            .arg("--hash-dir")
+            .arg(&alone);
+    });
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(alone.join("alone-1.hash").exists());
+}
+
+#[test]
+fn a_default_config_that_is_not_there_says_where_it_was_looked_for_and_what_to_do() {
+    let scratch = Scratch::new("config-absent");
+    let home = installed_home(&scratch, None);
+    let out = arca()
+        .args(["watch", "--once", "--json"])
+        .env("HOME", &home)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert_eq!(
+        stderr_text(&out).trim_end(),
+        format!(
+            "arca: there is no config at {}/.config/arca/node.json, where the installer writes it: install Arca for this user, or name another config with --config <file> or ARCA_CONFIG",
+            home.display()
+        )
+    );
+    // With no home directory there is no default to name.
+    let out = arca()
+        .args(["watch", "--once", "--json"])
+        .env_remove("HOME")
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr_text(&out).starts_with(
+            "arca: --config is required here: neither ARCA_CONFIG nor HOME is set, so there is no default to read"
+        ),
+        "{}",
+        stderr_text(&out)
+    );
+}
+
+#[test]
+fn serve_and_adopt_read_no_default_config_and_no_variable() {
+    let scratch = Scratch::new("config-named");
+    let value = config(&scratch, &scratch.at("incus.sock"));
+    let home = installed_home(&scratch, Some(&value));
+    let named = write_config(&scratch, "named.json", &value);
+    for (args, why) in [
+        (vec!["serve"], "serve starts a node"),
+        (
+            vec!["adopt", "status", "--instance", "svc1", "--json"],
+            "adopt changes a node",
+        ),
+    ] {
+        let out = arca()
+            .args(&args)
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &named)
+            .output()
+            .expect("run the binary");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr_text(&out)
+        );
+        assert!(
+            stderr_text(&out).starts_with(&format!(
+                "arca: --config is required: {why}, so it reads no default config\nusage:\n  arca {} ",
+                args[0]
+            )),
+            "{args:?}: {}",
+            stderr_text(&out)
+        );
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
+fn help_says_the_defaults_and_the_order_they_are_taken_in() {
+    let out = arca().arg("--help").output().expect("run the binary");
+    assert_eq!(out.status.code(), Some(0));
+    let help = stdout_text(&out);
+    for line in [
+        "  status [--json] [--config <file>] [--token-file <file>]",
+        "  --config      ~/.config/arca/node.json",
+        "  --token-file  ~/.config/arca/assistant-1.secret",
+        "  The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.",
+        "  serve --config <file>",
+    ] {
+        assert!(
+            help.lines().any(|have| have == line),
+            "the help has the line {line:?}:\n{help}"
+        );
+    }
+}
+
+#[test]
+fn a_mistyped_command_action_or_flag_is_answered_with_the_closest_known_one() {
+    let cases: [(&[&str], &str); 6] = [
+        (
+            &["stauts"],
+            "arca: that is not an arca command; did you mean status? Run arca --help for all of them\n",
+        ),
+        (
+            &["frobnicate"],
+            "arca: that is not an arca command: run arca --help for all of them\n",
+        ),
+        (
+            &["link", "piar"],
+            "arca: that is not a link action; did you mean pair? It is one of serve, pair, join, peers, remove\n",
+        ),
+        (
+            &["token", "rotate"],
+            "arca: that is not a token action: it is one of mint, revoke\n",
+        ),
+        (
+            &["adopt"],
+            "arca: an adopt action is missing: it is one of plan, apply, release, verify, status\n",
+        ),
+        (
+            &["watch", "--once", "--jsno"],
+            "arca: unknown flag --jsno; did you mean --json?\nusage:\n  arca watch --once --json [--config <file>]\n",
+        ),
+    ];
+    for (args, want) in cases {
+        let out = arca().args(args).output().expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{args:?} is a usage error");
+        assert!(out.stdout.is_empty(), "{args:?} prints nothing on stdout");
+        assert_eq!(stderr_text(&out), want, "{args:?}");
+    }
+}
+
+#[test]
+fn a_flag_that_is_missing_shows_the_usage_of_its_command() {
+    let out = arca()
+        .args(["shim", "--upstream", "a", "--listen", "b"])
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr_text(&out),
+        "arca: --log is required\nusage:\n  arca shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]\n"
+    );
+}
+
+/// A file that holds a well-formed token no node knows, at mode 0600.
+fn token_file(path: &Path) {
+    fs::write(path, format!("arca_{}\n", "A".repeat(43))).expect("the token file");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+}
+
+#[test]
+fn status_of_a_node_that_is_not_running_says_so_and_how_to_start_it() {
+    let scratch = Scratch::new("status-down");
+    let home = installed_home(&scratch, Some(&config(&scratch, &scratch.at("incus.sock"))));
+    token_file(&home.join(".config/arca/assistant-1.secret"));
+    let out = arca()
+        .arg("status")
+        .env("HOME", &home)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_text(&out));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        stderr_text(&out),
+        "arca: the node's socket does not answer: the node is not running, or listen.unix in the config names another socket. Start the node with: systemctl --user start arca.service\n"
+    );
+}
+
+#[test]
+fn a_token_file_that_is_not_there_says_so_and_how_to_mint_one() {
+    let scratch = Scratch::new("token-absent");
+    let home = installed_home(&scratch, Some(&config(&scratch, &scratch.at("incus.sock"))));
+    // The installer's own path is named: nobody typed it.
+    let out = arca()
+        .arg("status")
+        .env("HOME", &home)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert_eq!(
+        stderr_text(&out),
+        format!(
+            "arca: the token file {}/.config/arca/assistant-1.secret, where the installer writes it, does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file> (then pass --token-file <file>)\n",
+            home.display()
+        )
+    );
+    // A path the caller gave, in the flag or in the variable, is never repeated.
+    let typed = scratch.at("typed-by-the-caller.secret");
+    for by_variable in [false, true] {
+        let mut command = arca();
+        command.args(["call", "arca_status"]).env("HOME", &home);
+        if by_variable {
+            command.env("ARCA_TOKEN_FILE", &typed);
+        } else {
+            command.arg("--token-file").arg(&typed);
+        }
+        let out = command.output().expect("run the binary");
+        assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+        assert_eq!(
+            stderr_text(&out),
+            "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file>\n"
+        );
+    }
+    // A file that is there and too open is a different refusal, with its own fix.
+    token_file(&typed);
+    fs::set_permissions(&typed, fs::Permissions::from_mode(0o640)).expect("chmod 0640");
+    let out = arca()
+        .args(["call", "arca_status", "--token-file"])
+        .arg(&typed)
+        .env("HOME", &home)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr_text(&out),
+        "arca: the token file can be read by its group or by others: run chmod 600 on it, so only its owner reads it\n"
+    );
+}
+
+#[test]
+fn a_mistyped_verb_is_answered_with_the_closest_one_and_call_alone_lists_them() {
+    let out = arca()
+        .args(["call", "watch_reprot"])
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        stderr_text(&out),
+        "arca: the verb is not one the node answers; did you mean watch_report? Run arca call alone to list the verbs\n"
+    );
+    let out = arca().arg("call").output().expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    let listed = stderr_text(&out);
+    assert!(
+        listed
+            .starts_with("arca: call needs a verb: arca call <verb>. The verbs are: arca_status, "),
+        "{listed}"
+    );
+    assert!(listed.contains(", watch_report"), "{listed}");
+}
+
+#[test]
+fn a_config_with_a_mistyped_field_names_the_field_and_the_file() {
+    let scratch = Scratch::new("config-field");
+    let mut value = config(&scratch, &scratch.at("incus.sock"));
+    value["kernel"]["serviceCdir"] = json!("192.0.2.0/24");
+    let path = write_config(&scratch, "typo.json", &value);
+    let out = arca()
+        .args(["watch", "--once", "--json", "--config"])
+        .arg(&path)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    let refusal = stderr_text(&out);
+    assert!(
+        refusal.starts_with(&format!(
+            "arca: in the config file {}: unknown field kernel.serviceCdir; did you mean kernel.serviceCidr? (line ",
+            path.display()
+        )),
+        "{refusal}"
+    );
 }

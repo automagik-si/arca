@@ -288,12 +288,27 @@ fn check_object(
             }
         }
     }
-    // An unknown key is never echoed, here or in a path: a client may have put a secret in the key.
+    // An unknown key is never echoed, here or in a path: a client may have put a secret in the key. The refusal names
+    // the place and the fields the schema does take, which are the schema's own words.
     match map.get("additionalProperties") {
         Some(Value::Bool(false)) => {
             for name in fields.keys() {
                 if !props.is_some_and(|p| p.contains_key(name)) {
-                    return Err(format!("{}: a field the schema does not name", here(at)));
+                    let named: Vec<&str> = props
+                        .map(|p| p.keys().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    return Err(if named.is_empty() {
+                        format!(
+                            "{}: a field the schema does not name; it takes no field",
+                            here(at)
+                        )
+                    } else {
+                        format!(
+                            "{}: a field the schema does not name; the fields it takes are {}",
+                            here(at),
+                            named.join(", ")
+                        )
+                    });
                 }
             }
         }
@@ -444,6 +459,25 @@ mod tests {
         assert!(
             !err.contains("extra-key-7"),
             "the unknown key is not echoed: {err}"
+        );
+        // The refusal names the place and the fields the schema does take.
+        assert_eq!(
+            err,
+            "the value: a field the schema does not name; the fields it takes are a"
+        );
+        let nested = json!({
+            "type": "object",
+            "properties": { "args": schema.clone() },
+            "additionalProperties": false
+        });
+        assert_eq!(
+            conforms(&nested, &json!({ "args": { "extra-key-7": 2 } })).expect_err("extra refused"),
+            "/args: a field the schema does not name; the fields it takes are a"
+        );
+        let empty = json!({ "type": "object", "additionalProperties": false });
+        assert_eq!(
+            conforms(&empty, &json!({ "extra-key-7": 2 })).expect_err("extra refused"),
+            "the value: a field the schema does not name; it takes no field"
         );
     }
 

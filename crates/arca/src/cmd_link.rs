@@ -1,8 +1,7 @@
 //! Node link commands. Pairing links never appear in errors.
-use crate::{Failure, config, parse_flags, usage_failure};
+use crate::{Failure, parse_flags, unknown_word};
 use arca_link::{Link, Network, PairLink, State};
 use serde_json::{Value, json};
-use std::path::Path;
 use tokio::signal::unix::{SignalKind, signal};
 
 fn failure(error: arca_link::Error) -> Failure {
@@ -14,12 +13,17 @@ fn failure(error: arca_link::Error) -> Failure {
 }
 
 pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
-    let Some((command, mut args)) = args.split_first() else {
-        return Err(usage_failure());
+    let actions = ["serve", "pair", "join", "peers", "remove"];
+    let (command, mut args) = match args.split_first() {
+        Some((command, args)) if actions.contains(&command.as_str()) => (command, args),
+        other => {
+            return Err(unknown_word(
+                "a link action",
+                other.map(|(command, _)| command.as_str()),
+                &actions,
+            ));
+        }
     };
-    if !["serve", "pair", "join", "peers", "remove"].contains(&command.as_str()) {
-        return Err(usage_failure());
-    }
     let positional = if command == "join" || command == "remove" {
         let end_of_options = args.first().is_some_and(|arg| arg == "--");
         if end_of_options {
@@ -29,7 +33,13 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
             .split_first()
             .filter(|(v, _)| end_of_options || !v.starts_with("--"))
         else {
-            return Err(usage_failure());
+            return Err(Failure::Usage(if command == "join" {
+                "link join needs the link the other node's `arca link pair` printed: arca link join <link>"
+                    .to_string()
+            } else {
+                "link remove needs the name of the peer to remove; arca link peers lists them: arca link remove <name>"
+                    .to_string()
+            }));
         };
         args = rest;
         Some(value.as_str())
@@ -48,7 +58,7 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         &["config"][..]
     };
     let flags = parse_flags(args, allowed, &[])?;
-    let config = config::load(Path::new(flags.required("config")?))?;
+    let config = crate::load_config(&flags)?;
     let mut link_config = config.link.clone().unwrap_or_default();
     if command == "serve" {
         link_config

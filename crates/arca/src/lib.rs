@@ -1,5 +1,6 @@
 //! The `arca` binary: one node's one-shot watch and metrics reads, scoped token minting, the recording shim, and the Arca MCP
-//! server. Every command that needs the node reads one config file, given with `--config`.
+//! server. Every command that needs the node reads one config file: the one `--config` names, else the one the
+//! `ARCA_CONFIG` variable names, else the file the installer writes. `serve` and `adopt` take it from `--config` alone.
 //!
 //! Exit codes: 0 for success; 1 for a runtime failure (a socket, a read or a write that failed); 2 for a usage or config
 //! failure (a bad command line, a refused config, or a token directory that is unsafe or missing); 3 for a tool error, whose
@@ -17,6 +18,7 @@ pub mod cmd_call;
 pub mod cmd_link;
 pub mod cmd_probe;
 pub mod cmd_serve;
+pub mod cmd_status;
 pub mod cmd_store;
 pub mod cmd_templates;
 pub mod cmd_token;
@@ -39,39 +41,61 @@ pub mod storage;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use arca_incus::{RecordingShim, ShimHandle};
 use arca_mcp::CallError;
 use serde_json::Value;
 use tokio::signal::unix::{SignalKind, signal};
 
-use crate::config::ConfigError;
+use crate::config::{ConfigError, NodeConfig};
 
 const USAGE: &str = "usage: arca <command>
   version (or --version, -V)
-  watch --once --json --config <file>
-  metrics --json [--sample-for <seconds, 0 to 60>] --config <file>
-  link serve --config <file> (forwards arca/mcp/1 to listen.unix by default)
-  link pair --config <file> [--minutes <n>]
-  link join [--] <link> --config <file>
-  link peers --config <file>
-  link remove [--] <name> --config <file>
-  probe consumer add --name <n> --image <fingerprint> --config <file>
-  probe consumer remove --name <n> --config <file>
+  status [--json] [--config <file>] [--token-file <file>]
+  watch --once --json [--config <file>]
+  metrics --json [--sample-for <seconds, 0 to 60>] [--config <file>]
+  link serve [--config <file>] (forwards arca/mcp/1 to listen.unix by default)
+  link pair [--config <file>] [--minutes <n>]
+  link join [--] <link> [--config <file>]
+  link peers [--config <file>]
+  link remove [--] <name> [--config <file>]
+  probe consumer add --name <n> --image <fingerprint> [--config <file>]
+  probe consumer remove --name <n> [--config <file>]
   serve --config <file>
-  call [--peer <name>] <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
-  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] (--config <file> | --hash-dir <dir>)
-  token revoke <id> (--config <file> | --hash-dir <dir>)
-  store check --config <file>
-  templates install --config <file> [--replace]
-  service import plan --name <service> --config <file>
+  call [--peer <name>] <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
+  call (alone: lists the verbs)
+  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]
+  token revoke <id> [--config <file> | --hash-dir <dir>]
+  store check [--config <file>]
+  templates install [--config <file>] [--replace]
+  service import plan --name <service> [--config <file>]
   shim --upstream <socket> --listen <socket> --log <file> [--log-max-bytes <n>]
   adopt plan --instance <name> --expect-ip <ipv4> --json --config <file>
   adopt apply --instance <name> --plan-digest <hex> [--expect-ip <ipv4>] [--dry-run] --config <file>
   adopt release --instance <name> [--dry-run] --config <file>
   adopt verify --instance <name> [--port <n> [--http-path <path>] | --url <http url>] [--wait <seconds>] --config <file>
-  adopt status --instance <name> --json --config <file>";
+  adopt status --instance <name> --json --config <file>
+
+defaults, the files the installer writes:
+  --config      ~/.config/arca/node.json
+  --token-file  ~/.config/arca/assistant-1.secret
+  The order is: the flag, then the variable (ARCA_CONFIG, ARCA_TOKEN_FILE), then the default.
+  serve and adopt start or change a node, so they take --config alone: no variable and no default.";
+
+/// The variable that names the config when `--config` is not given.
+pub const CONFIG_VARIABLE: &str = "ARCA_CONFIG";
+/// The variable that names the token file when `--token-file` is not given.
+pub const TOKEN_VARIABLE: &str = "ARCA_TOKEN_FILE";
+/// The directory the installer writes the config and the first token into, under the home directory. The installer uses
+/// `$HOME/.config` and never reads `XDG_CONFIG_HOME`, so neither does this: the default must be the file it wrote.
+const INSTALL_DIR: &str = ".config/arca";
+/// The config the installer writes, in [`INSTALL_DIR`].
+const INSTALL_CONFIG: &str = "node.json";
+/// The token the installer mints, in [`INSTALL_DIR`].
+const INSTALL_TOKEN: &str = "assistant-1.secret";
+/// The service the installer starts the node as.
+pub(crate) const INSTALL_UNIT: &str = "arca.service";
 
 /// Why a command ended without a result. The message never carries a token, a secret or a key.
 #[derive(Debug)]
@@ -149,6 +173,163 @@ pub fn usage_failure() -> Failure {
     Failure::Usage(USAGE.to_string())
 }
 
+/// The usage lines of one command, and of one of its actions when `action` names one that has lines of its own.
+fn usage_of(command: &str, action: Option<&str>) -> Vec<&'static str> {
+    let lines = |prefix: String| -> Vec<&'static str> {
+        USAGE
+            .lines()
+            .filter(|line| *line == prefix.trim_end() || line.starts_with(&prefix))
+            .collect()
+    };
+    let narrowed = action
+        .map(|action| lines(format!("  {command} {action} ")))
+        .unwrap_or_default();
+    if narrowed.is_empty() {
+        lines(format!("  {command} "))
+    } else {
+        narrowed
+    }
+}
+
+/// A refusal about a flag (a missing one, an unknown one, a value that is missing or refused) with the command's own usage
+/// lines under it, so the reader sees what the command takes without asking for the whole help.
+fn with_usage(failure: Failure, command: &str, action: Option<&str>) -> Failure {
+    let Failure::Usage(text) = failure else {
+        return failure;
+    };
+    let about_a_flag = text.starts_with("--")
+        || text.starts_with("unknown flag")
+        || text.starts_with("unexpected argument");
+    let lines = usage_of(command, action);
+    if !about_a_flag || lines.is_empty() || text.contains('\n') {
+        return Failure::Usage(text);
+    }
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|line| format!("  arca {}", line.trim_start()))
+        .collect();
+    Failure::Usage(format!("{text}\nusage:\n{}", lines.join("\n")))
+}
+
+/// The number of single-character edits (insert, remove, replace) that turn `a` into `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.chars().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let replaced = previous + usize::from(x != *y);
+            previous = row[j + 1];
+            row[j + 1] = replaced.min(previous + 1).min(row[j] + 1);
+        }
+    }
+    row[b.len()]
+}
+
+/// The known word closest to `word`, when one is close enough to be what was meant: at most two edits away, or a third of
+/// the word's length when that is more. Two words equally close give the first in `known`'s order.
+pub fn closest<'a>(word: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let limit = (word.chars().count() / 3).max(2);
+    known
+        .into_iter()
+        .map(|candidate| (edit_distance(word, candidate), candidate))
+        .filter(|(distance, candidate)| *distance <= limit && *distance < candidate.chars().count())
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
+}
+
+/// The refusal of a word that is not one of `known`: what kind of word it is, the closest known one when there is one,
+/// and all of them. The word itself is never echoed.
+pub(crate) fn unknown_word(kind: &str, given: Option<&str>, known: &[&str]) -> Failure {
+    let all = known.join(", ");
+    Failure::Usage(match given {
+        None => format!("{kind} is missing: it is one of {all}"),
+        Some(word) => match closest(word, known.iter().copied()) {
+            Some(near) => format!("that is not {kind}; did you mean {near}? It is one of {all}"),
+            None => format!("that is not {kind}: it is one of {all}"),
+        },
+    })
+}
+
+/// Where a path the command reads came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The flag named it.
+    Flag,
+    /// The variable named it.
+    Variable,
+    /// Nothing named it: it is the file the installer writes.
+    Default,
+}
+
+/// A path a command reads, and where it came from.
+pub(crate) struct Chosen {
+    pub path: PathBuf,
+    pub origin: Origin,
+}
+
+/// The path `--flag` names, else the one `variable` names, else `file` in the installer's directory under the home
+/// directory. An empty variable is no variable.
+fn chosen(flags: &Flags, flag: &str, variable: &str, file: &str) -> Result<Chosen, Failure> {
+    if let Some(path) = flags.value(flag) {
+        return Ok(Chosen {
+            path: PathBuf::from(path),
+            origin: Origin::Flag,
+        });
+    }
+    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    if let Some(path) = set(variable) {
+        return Ok(Chosen {
+            path: PathBuf::from(path),
+            origin: Origin::Variable,
+        });
+    }
+    let home = set("HOME").ok_or_else(|| {
+        Failure::Usage(format!(
+            "--{flag} is required here: neither {variable} nor HOME is set, so there is no default to read"
+        ))
+    })?;
+    Ok(Chosen {
+        path: Path::new(&home).join(INSTALL_DIR).join(file),
+        origin: Origin::Default,
+    })
+}
+
+/// The config a command reads: `--config`, else `ARCA_CONFIG`, else the installer's.
+pub(crate) fn config_path(flags: &Flags) -> Result<Chosen, Failure> {
+    chosen(flags, "config", CONFIG_VARIABLE, INSTALL_CONFIG)
+}
+
+/// The token file a command reads: `--token-file`, else `ARCA_TOKEN_FILE`, else the installer's.
+pub(crate) fn token_path(flags: &Flags) -> Result<Chosen, Failure> {
+    chosen(flags, "token-file", TOKEN_VARIABLE, INSTALL_TOKEN)
+}
+
+/// Reads and checks the config a command reads. A default that is not there is not a read failure: nothing was installed
+/// for this user, and the refusal says so.
+pub(crate) fn load_config(flags: &Flags) -> Result<NodeConfig, Failure> {
+    let chosen = config_path(flags)?;
+    if chosen.origin == Origin::Default && std::fs::symlink_metadata(&chosen.path).is_err() {
+        return Err(Failure::Config(format!(
+            "there is no config at {}, where the installer writes it: install Arca for this user, or name another config with --config <file> or {CONFIG_VARIABLE}",
+            chosen.path.display()
+        )));
+    }
+    Ok(config::load(&chosen.path)?)
+}
+
+/// Reads and checks the config of a command that starts or changes a node. Such a command takes it from `--config` alone,
+/// never from a variable or a default; `why` says so in the refusal.
+pub(crate) fn load_named_config(flags: &Flags, why: &str) -> Result<NodeConfig, Failure> {
+    let path = flags.value("config").ok_or_else(|| {
+        Failure::Usage(format!(
+            "--config is required: {why}, so it reads no default config"
+        ))
+    })?;
+    Ok(config::load(Path::new(path))?)
+}
+
 /// The flags of one command: the named values and the bare switches, each given at most once.
 pub struct Flags {
     values: BTreeMap<String, String>,
@@ -208,18 +389,48 @@ pub(crate) fn parse_flags(
                 return Err(Failure::Usage(format!("--{name} is given twice")));
             }
         } else {
-            return Err(Failure::Usage(format!("unknown flag --{name}")));
+            let known = takes_value.iter().chain(switches).copied();
+            return Err(Failure::Usage(match closest(name, known) {
+                Some(near) => format!("unknown flag --{name}; did you mean --{near}?"),
+                None => format!("unknown flag --{name}"),
+            }));
         }
     }
     Ok(flags)
 }
 
-/// Runs one command. A command with a result returns it, and `Ok(None)` prints nothing.
+/// The commands, in the order the usage lists them.
+const COMMANDS: &[&str] = &[
+    "version",
+    "status",
+    "watch",
+    "metrics",
+    "link",
+    "probe",
+    "serve",
+    "call",
+    "token",
+    "store",
+    "templates",
+    "service",
+    "shim",
+    "adopt",
+    "help",
+];
+
+/// Runs one command. A command with a result returns it, and `Ok(None)` prints nothing. A refusal about a flag carries the
+/// command's usage lines.
 pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
     let Some((command, rest)) = argv.split_first() else {
         return Err(usage_failure());
     };
-    match command.as_str() {
+    let action = rest.first().map(String::as_str);
+    run_command(command, rest).map_err(|failure| with_usage(failure, command, action))
+}
+
+fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure> {
+    match command {
+        "status" => cmd_status::status(&parse_flags(rest, &["config", "token-file"], &["json"])?),
         "watch" => cmd_watch::watch(&parse_flags(rest, &["config"], &["once", "json"])?),
         "metrics" => cmd_watch::metrics(&parse_flags(rest, &["config", "sample-for"], &["json"])?),
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),
@@ -232,13 +443,21 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
             Some((action, rest)) if action == "check" => {
                 cmd_store::check(&parse_flags(rest, &["config"], &[])?)
             }
-            _ => Err(usage_failure()),
+            other => Err(unknown_word(
+                "a store action",
+                other.map(|(action, _)| action.as_str()),
+                &["check"],
+            )),
         },
         "templates" => match rest.split_first() {
             Some((action, rest)) if action == "install" => {
                 cmd_templates::install(&parse_flags(rest, &["config"], &["replace"])?)
             }
-            _ => Err(usage_failure()),
+            other => Err(unknown_word(
+                "a templates action",
+                other.map(|(action, _)| action.as_str()),
+                &["install"],
+            )),
         },
         "token" => match rest.split_first() {
             Some((action, rest)) if action == "mint" => cmd_token::mint_token(&parse_flags(
@@ -247,10 +466,19 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
                 &[],
             )?),
             Some((action, rest)) if action == "revoke" => {
-                let (id, rest) = rest.split_first().ok_or_else(usage_failure)?;
+                let (id, rest) = rest.split_first().ok_or_else(|| {
+                    Failure::Usage(
+                        "token revoke needs the id of the token to revoke: arca token revoke <id>"
+                            .to_string(),
+                    )
+                })?;
                 cmd_token::revoke_token(id, &parse_flags(rest, &["hash-dir", "config"], &[])?)
             }
-            _ => Err(usage_failure()),
+            other => Err(unknown_word(
+                "a token action",
+                other.map(|(action, _)| action.as_str()),
+                &["mint", "revoke"],
+            )),
         },
         "shim" => run_shim(&parse_flags(
             rest,
@@ -265,7 +493,17 @@ pub fn run(argv: &[String]) -> Result<Option<Value>, Failure> {
             println!("{}", version_line());
             Ok(None)
         }
-        _ => Err(usage_failure()),
+        "version" | "--version" | "-V" => Err(Failure::Usage(
+            "version takes no argument: run arca version".to_string(),
+        )),
+        _ => Err(Failure::Usage(
+            match closest(command, COMMANDS.iter().copied()) {
+                Some(near) => format!(
+                    "that is not an arca command; did you mean {near}? Run arca --help for all of them"
+                ),
+                None => "that is not an arca command: run arca --help for all of them".to_string(),
+            },
+        )),
     }
 }
 
@@ -326,5 +564,55 @@ fn print_live_summary(handle: &ShimHandle) {
     }
     if handle.log_failed() {
         eprintln!("arca: the shim could not write its log");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_closest_known_word_is_offered_only_when_it_is_near() {
+        let verbs = ["watch_report", "arca_status", "plan_list"];
+        assert_eq!(closest("watch_reprot", verbs), Some("watch_report"));
+        assert_eq!(closest("stauts", COMMANDS.iter().copied()), Some("status"));
+        assert_eq!(closest("jsno", ["once", "json"]), Some("json"));
+        assert_eq!(closest("confg", ["config", "token-file"]), Some("config"));
+        // A word that is near nothing gets no guess.
+        assert_eq!(closest("frobnicate", COMMANDS.iter().copied()), None);
+        assert_eq!(closest("x", COMMANDS.iter().copied()), None);
+    }
+
+    #[test]
+    fn a_refusal_about_a_flag_carries_the_usage_of_its_command_and_action() {
+        let refused = with_usage(
+            Failure::Usage("--minutes needs a value".to_string()),
+            "link",
+            Some("pair"),
+        );
+        assert_eq!(
+            refused.message(),
+            "--minutes needs a value\nusage:\n  arca link pair [--config <file>] [--minutes <n>]"
+        );
+        // A refusal that is not about a flag stays one line, and so does one of another kind.
+        let plain = with_usage(
+            Failure::Usage("the arguments are not a JSON object".to_string()),
+            "call",
+            None,
+        );
+        assert_eq!(plain.message(), "the arguments are not a JSON object");
+        let config = with_usage(Failure::Config("--x".to_string()), "call", None);
+        assert_eq!(config.message(), "--x");
+    }
+
+    #[test]
+    fn every_command_the_usage_lists_is_one_a_typo_can_be_matched_to() {
+        for line in USAGE.lines().skip(1).take_while(|line| !line.is_empty()) {
+            let command = line.split_whitespace().next().expect("a command");
+            assert!(
+                COMMANDS.contains(&command),
+                "{command} is in the list of commands"
+            );
+        }
     }
 }

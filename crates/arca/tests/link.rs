@@ -159,11 +159,9 @@ fn link_remove_accepts_end_of_options_before_name() {
         .output()
         .unwrap();
     assert_eq!(unmarked.status.code(), Some(2));
-    assert!(
-        String::from_utf8(unmarked.stderr)
-            .unwrap()
-            .starts_with("arca: usage: arca")
-    );
+    assert!(String::from_utf8(unmarked.stderr).unwrap().starts_with(
+        "arca: link remove needs the name of the peer to remove; arca link peers lists them"
+    ));
     assert_eq!(state.peers().unwrap(), vec![peer]);
     let output = remove();
     assert!(output.status.success(), "{:?}", output);

@@ -373,6 +373,11 @@ fn a_doctor_calling_token_list_is_refused_403_and_the_call_exits_4() {
     let node = start_node("doctor-operator");
     let out = call(&node, &node.doctor, "token_list", &["--args", "{}"]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+    // The refusal names the scope the verb needs and how a token of it is made.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "arca: the token's scope may not make this call: token_list needs a token of the operator scope, and a token minted with --tools must list it. An owner mints one with: arca token mint --scope operator --id <id> --out <file>\n"
+    );
 }
 
 #[test]
@@ -413,6 +418,10 @@ fn a_token_the_server_does_not_hold_is_refused_401_and_the_call_exits_4() {
     write_mode(&stranger, &format!("arca_{}\n", "A".repeat(43)), 0o400);
     let out = call(&node, &stranger, "arca_status", &[]);
     assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "arca: the node does not accept this token: it was revoked, or it was minted for another node. To make a new one, mint one with: arca token mint --scope viewer --id <id> --out <file>\n"
+    );
 }
 
 #[test]
@@ -594,5 +603,88 @@ fn an_args_file_refused_for_its_mode_names_no_path_in_its_message() {
     assert!(
         !stderr.contains(&args.display().to_string()),
         "the message does not name the file: {stderr}"
+    );
+}
+
+/// A home directory as the installer leaves it for `node`: its config as `node.json` and its viewer token as
+/// `assistant-1.secret`, in `.config/arca`.
+fn installed_home(node: &Node) -> PathBuf {
+    let home = node.scratch.path("home");
+    let dir = home.join(".config/arca");
+    fs::create_dir_all(&dir).expect("the installer's directory");
+    fs::copy(&node.config, dir.join("node.json")).expect("the installer's config");
+    let secret = fs::read_to_string(&node.viewer).expect("the minted secret");
+    write_mode(&dir.join("assistant-1.secret"), &secret, 0o600);
+    home
+}
+
+#[test]
+fn status_with_no_flag_reads_the_installers_files_and_says_the_node_in_words() {
+    let node = start_node("status-words");
+    let home = installed_home(&node);
+    let run = |args: &[&str]| {
+        arca()
+            .args(args)
+            .env("HOME", &home)
+            .env_remove("ARCA_CONFIG")
+            .env_remove("ARCA_TOKEN_FILE")
+            .output()
+            .expect("run arca")
+    };
+    let out = run(&["status"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let words = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = words.lines().collect();
+    assert!(lines[0].starts_with("Automagik Arca "), "{words}");
+    assert!(lines[1].starts_with("Mode: "), "{words}");
+    assert!(lines[2].starts_with("Up for: "), "{words}");
+    assert!(lines[3].starts_with("Incus: "), "{words}");
+    assert!(
+        words.contains(&format!(
+            "MCP door: open, on the unix socket {}",
+            node.socket.display()
+        )),
+        "{words}"
+    );
+    assert!(
+        lines.last().is_some_and(|line| line.starts_with("Next: ")),
+        "{words}"
+    );
+
+    // --json is the tool's own answer: the same document `arca call arca_status` prints, with no flag either.
+    let raw = stdout_json(&run(&["status", "--json"]));
+    let called = stdout_json(&run(&["call", "arca_status"]));
+    let keys = |value: &Value| -> Vec<String> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    assert_eq!(keys(&raw), keys(&called));
+    for key in ["version", "node", "mode", "incusReachable", "appliedSeq"] {
+        assert_eq!(raw[key], called[key], "{key}");
+    }
+    assert_eq!(
+        words.lines().nth(1),
+        Some(
+            format!(
+                "Mode: {}",
+                match raw["mode"].as_str() {
+                    Some("watch-only") => "watch-only (it looks, and changes nothing)".to_string(),
+                    other => format!("{} (it may make changes)", other.unwrap_or("unknown")),
+                }
+            )
+            .as_str()
+        )
+    );
+
+    // An explicit flag still wins over the installer's file: a token file that is not there is refused, not replaced.
+    let out = run(&["status", "--token-file", "/nonexistent/arca-test.secret"]);
+    assert_eq!(code(&out), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "arca: the token file does not exist: mint one with: arca token mint --scope viewer --id <id> --out <file>\n"
     );
 }
