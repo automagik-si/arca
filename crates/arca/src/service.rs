@@ -1188,6 +1188,15 @@ impl Template {
     pub fn is_vm(&self) -> bool {
         self.kind == VM_KIND
     }
+
+    /// The alias of a template's local image, and the fingerprint the template pins it to, when its image is a local
+    /// one (`local:<alias>`) that carries a `digest`. A local image is one somebody put in the service project by
+    /// hand; without a pin the alias is trusted for whatever stands under it.
+    pub fn local_image_pin(&self) -> Option<(&str, &str)> {
+        let alias = self.image.strip_prefix("local:")?;
+        let fingerprint = self.digest.as_deref()?.strip_prefix("sha256:")?;
+        (self.kind != "oci").then_some((alias, fingerprint))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1262,6 +1271,23 @@ fn validate_template(template: &Template, dir: &Path) -> Result<(), TemplateErro
     if template.update.is_some() {
         return Err(TemplateError::refused(format!(
             "template {name}: only a virtual-machine template has an update; a container's version is its digest"
+        )));
+    }
+    // A local image may carry a digest, which pins the alias to one image: it has the shape every digest has.
+    if template.kind != "oci"
+        && template.image.starts_with("local:")
+        && template.digest.as_deref().is_some_and(|digest| {
+            // Lowercase only: it is compared with the fingerprint as Incus writes it.
+            !digest.strip_prefix("sha256:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        })
+    {
+        return Err(TemplateError::refused(format!(
+            "template {name}: the digest of a local image is sha256: and 64 lowercase hex digits, as Incus writes a fingerprint"
         )));
     }
     if template.kind == "oci" && template.digest.is_none() {
@@ -2060,7 +2086,15 @@ pub fn source(template: &Template) -> Result<Value, TemplateError> {
         .filter(|(_kind, alias)| !alias.is_empty())
         .ok_or_else(|| TemplateError::refused("invalid system image"))?;
     match kind {
-        "local" => Ok(json!({ "type": "image", "alias": alias })),
+        // A pinned local image is named to Incus by its fingerprint as well. When a source carries a fingerprint Incus
+        // uses it and never looks the alias up, so the fingerprint decides which image the instance is made from and
+        // the alias is only a name kept in the record.
+        "local" => Ok(match template.local_image_pin() {
+            Some((alias, fingerprint)) => {
+                json!({ "type": "image", "alias": alias, "fingerprint": fingerprint })
+            }
+            None => json!({ "type": "image", "alias": alias }),
+        }),
         "images" => {
             let mut source = json!({
                 "type": "image",

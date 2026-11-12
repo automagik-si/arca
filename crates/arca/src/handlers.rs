@@ -4750,36 +4750,77 @@ fn service_template_error(error: crate::service::TemplateError) -> CallError {
 /// anything is created: such an image is built or copied in by hand, and Incus's own answer to the create names no reason.
 /// Only a listing that answers and lacks the alias refuses. A listing that cannot be read (the project is not made yet, or
 /// the read fails) decides nothing, and the create goes on.
+///
+/// A template that pins its local image (a `digest` beside `local:<alias>`) is held to it, a virtual machine's too. The
+/// fingerprint decides which image an instance is made from, and the alias is only the name it is looked for under: the
+/// image under the alias must be the pinned one. Here an unreadable listing refuses: a pin that cannot be checked is
+/// not met.
 fn local_image_present(
     read: &UnixIncus,
     template: &crate::service::Template,
     project: &str,
 ) -> Result<(), CallError> {
-    let Some(alias) = (template.kind == "system")
-        .then(|| template.image.strip_prefix("local:"))
-        .flatten()
-    else {
-        return Ok(());
+    let pin = template.local_image_pin();
+    let alias = match pin {
+        Some((alias, _)) => alias,
+        None => {
+            let Some(alias) = (template.kind == "system")
+                .then(|| template.image.strip_prefix("local:"))
+                .flatten()
+            else {
+                return Ok(());
+            };
+            alias
+        }
     };
-    let Ok(images) = read.get(&format!("/1.0/images?project={project}&recursion=1")) else {
-        return Ok(());
+    let listing = read
+        .get(&format!("/1.0/images?project={project}&recursion=1"))
+        .ok()
+        .and_then(|images| images.as_array().cloned());
+    let Some(images) = listing else {
+        let Some((_, fingerprint)) = pin else {
+            return Ok(());
+        };
+        // The service project is made with the node's first service. Before that it has no images to hold the pinned
+        // one, and the refusal says so and what comes first.
+        let no_project = matches!(
+            read.get(&format!("/1.0/projects/{project}")),
+            Err(arca_incus::IncusError::Status { code: 404, .. })
+        );
+        return Err(service_refused(if no_project {
+            format!(
+                "template {}: its image {alias} is pinned to sha256:{fingerprint}, and the service project {project} does not exist yet: it is made with this node's first service, so no image can be in it. Create another service first, put the pinned image in the project under the alias {alias}, then create this one",
+                template.name
+            )
+        } else {
+            format!(
+                "template {}: its image {alias} is pinned to sha256:{fingerprint}, and the images of the service project {project} cannot be read to check it. Nothing was created",
+                template.name
+            )
+        }));
     };
-    let Some(images) = images.as_array() else {
-        return Ok(());
-    };
-    let held = images.iter().any(|image| {
+    let held = images.iter().find(|image| {
         image["aliases"]
             .as_array()
             .is_some_and(|aliases| aliases.iter().any(|a| a["name"].as_str() == Some(alias)))
     });
-    if held {
-        return Ok(());
+    let Some(held) = held else {
+        return Err(service_refused(format!(
+            "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
+             A local image is built or copied into that project before the service is created; the template's description says how",
+            template.name, project
+        )));
+    };
+    if let Some((_, fingerprint)) = pin {
+        let found = held["fingerprint"].as_str().unwrap_or("unknown");
+        if found != fingerprint {
+            return Err(service_refused(format!(
+                "template {}: its image {alias} is pinned to sha256:{fingerprint}, and the image under that alias in the service project {project} is sha256:{found}. Nothing was created. Put the pinned image under the alias, or change the template's digest",
+                template.name
+            )));
+        }
     }
-    Err(service_refused(format!(
-        "template {}: its image {alias} is not on this node: no image in the service project {} has that alias. \
-         A local image is built or copied into that project before the service is created; the template's description says how",
-        template.name, project
-    )))
+    Ok(())
 }
 
 /// Whether the node's config asks for no service project at all: no service subnet, no host bridges, and the service
@@ -6398,6 +6439,11 @@ impl ToolHandler for ServiceHandler {
                     }
                 }
                 if template.is_vm() {
+                    // A virtual machine's local image is checked only when the template pins it: an unpinned one is
+                    // left to Incus, as before.
+                    if template.local_image_pin().is_some() {
+                        local_image_present(&read, &template, project)?;
+                    }
                     let Some(caps) = self.cfg.kernel.vm_caps() else {
                         return Err(service_refused(no_vm_caps(template_name)));
                     };

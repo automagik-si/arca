@@ -7,8 +7,12 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
-## 0.13.0 (2026-11-12)
+A template whose image is `local:<alias>` and that already carried a `digest` was accepted before, and the digest was
+ignored. It is enforced now: a create from such a template is refused unless the image under the alias has that
+fingerprint, and a digest that is not `sha256:` and 64 lowercase hex digits is refused when the template is read. Check
+a local template's `digest` against `incus image list` before you upgrade, or take the digest out.
 
+## 0.13.0 (2026-11-12)
 On a node that only looks, the refusals of an instance start, stop or restart, of a storage change and of a GPU
 assignment no longer hold the word `watch-only`, which they did in 0.12.0: they carry the same sentence as every other
 refusal and every answer of such a node, `this node only looks: nothing here can be changed until the node is running

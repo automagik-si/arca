@@ -657,6 +657,21 @@ dashes and underscores, not starting with a dot, so no path. A template whose sc
 `service_create` refuses with the alias when the project's image listing answers and no image there carries it,
 before anything is created. A listing that cannot be read decides nothing, and the create goes on.
 
+A local image may be pinned: a `digest` (`sha256:` and 64 lowercase hex digits, the image's Incus fingerprint) beside
+`local:<alias>`, in a container template or a virtual machine's. Without it the alias is trusted for whatever image
+stands under it. With it the fingerprint decides, and the alias is only the name the image is looked for under:
+
+- `service_create` refuses, before anything is created, when the image under the alias has another fingerprint. The
+  refusal gives both: `its image <alias> is pinned to sha256:<a>, and the image under that alias in the service project
+  arcak-svc is sha256:<b>`. An approved create is held to it like any other, and a create in a tenant is checked
+  against the tenant's own project.
+- It also refuses when the alias is missing, and when the project's images cannot be read: a pin that cannot be checked
+  is not met. On a node with no service yet the service project does not exist, so no image can be in it; the refusal
+  says so and to create another service first.
+- The instance is made from the pinned image: Incus is given the fingerprint, and with a fingerprint Incus never looks
+  the alias up.
+- A digest in upper case, or one that is not 64 hex digits, is refused when the template is read.
+
 **Creating a service stopped.** A secret (`service_secret_set`) and a link (`service_connect`) reach a container's
 environment at its next start, not while it runs. A service that is started as it is created therefore boots once
 without them, and a program that sets itself up at its first boot (a database with its password, an application with
@@ -3120,7 +3135,9 @@ A template is a virtual machine when its `kind` is `virtual-machine`:
 }
 ```
 
-`image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`.
+`image` is `images:<alias>` (the public images server, with an optional `digest` fingerprint) or `local:<alias>`
+(an image in the service project's own store, with an optional `digest` that pins it; see "A local image may be
+pinned" above).
 `limits` must set both `cpu` and `memory`, and `rootSize` is required; all three follow the size rules above. A
 virtual-machine template may also set `description` and `autostart`, and `ports` with `provides` when a container is
 to link to it: a link opens the port in the managed service network's ACL, so a template with `ports` is refused on a
