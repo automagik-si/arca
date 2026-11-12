@@ -29,6 +29,8 @@ pub mod cmd_token;
 pub mod cmd_watch;
 pub mod config;
 pub mod desired_store;
+pub mod function;
+pub mod function_run;
 pub mod gpu;
 pub mod guest_secrets;
 pub mod handlers;

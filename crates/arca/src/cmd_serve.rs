@@ -491,6 +491,38 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
         )
         .map_err(|e| Failure::Runtime(e.to_string()))?;
     }
+    // A kernel-mode node with the managed service network runs functions. Before the timer starts, a function
+    // instance a stopped kernel left running is stopped: nobody watches that run any more. The meter reads memory and
+    // CPU from this machine's cgroup tree only while the node's Incus is this machine's.
+    let functions = if kernel_mode && cfg.kernel.service_cidr.is_some() {
+        let source = Arc::clone(&metrics_source);
+        let runner = Arc::new(
+            crate::function_run::FunctionRunner::new(
+                Arc::clone(&kernel),
+                Arc::new(cfg.clone()),
+                clock.clone(),
+            )
+            .map_err(Failure::Runtime)?
+            .with_cgroup(Arc::new(move || {
+                source
+                    .lock()
+                    .ok()
+                    .filter(|choice| choice.is_local())
+                    .map(|_| PathBuf::from("/sys/fs/cgroup"))
+            })),
+        );
+        for name in runner.sweep() {
+            eprintln!(
+                "arca: a run of function {name} was still going from a kernel that stopped: it was stopped, and the run log says so"
+            );
+        }
+        Arc::clone(&runner)
+            .spawn_timer()
+            .map_err(|e| Failure::Runtime(e.to_string()))?;
+        Some(runner)
+    } else {
+        None
+    };
     let action_slot = ActionSlot::default();
     let action_handlers: Vec<(&'static str, Arc<dyn arca_mcp::ToolHandler>)> =
         plan_handlers_served(
@@ -509,10 +541,11 @@ pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
             clock.clone(),
             Arc::new(cfg.clone()),
         ))
-        .chain(crate::handlers::service_handlers(
+        .chain(crate::handlers::service_handlers_with(
             kernel.clone(),
             clock.clone(),
             Arc::new(cfg.clone()),
+            functions,
         ))
         .chain(crate::handlers::tenant_handlers(
             kernel.clone(),

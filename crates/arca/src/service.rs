@@ -27,6 +27,8 @@ pub const PORTS_KEY: &str = "user.arca.ports";
 pub const PUBLISHED_KEY: &str = "user.arca.published";
 pub const LINKS_KEY: &str = "user.arca.links";
 pub const ENVKEYS_KEY: &str = "user.arca.envkeys";
+/// The key that marks a function's instance. The writer of a run refuses an instance without it.
+pub const FUNCTION_KEY: &str = arca_incus::function_run::FUNCTION_KEY;
 /// The template kind, and the Incus instance type, of a virtual-machine service.
 pub const VM_KIND: &str = "virtual-machine";
 /// Incus caps a disk device path at 255 bytes; "/" is the rootfs disk's path, not a data path.
@@ -301,6 +303,10 @@ pub struct ServiceConfig {
     /// key, and no service in a tenant ever does. Its NIC rules are built from this list and from nothing else.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub destinations: Vec<Destination>,
+    /// Present on a function: a container the kernel starts for one run and stops itself (`crate::function`). No
+    /// service's record carries the key, and nothing in a tenant ever does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<crate::function::Function>,
 }
 
 /// What only a service in a tenant records: the tenant, its address block, and the address of the node's front service
@@ -666,6 +672,15 @@ pub fn egress(cfg: &ServiceConfig, hosts: &Value) -> Vec<Value> {
         Some(Ok(block)) => Some(block),
         _ => None,
     };
+    // A function reaches only what its definition names: its linked services and its destinations, and no more.
+    if let Some(function) = &cfg.function {
+        return arca_netproject::tenant::function_egress_rules(
+            gateway,
+            hosts,
+            &cfg.destinations,
+            &function.reach,
+        );
+    }
     arca_netproject::tenant::egress_rules(gateway, hosts, block, &cfg.destinations)
 }
 
@@ -726,6 +741,11 @@ fn instance_body(cfg: &ServiceConfig, links: &[String]) -> Value {
     }
     if cfg.autostart {
         config.insert("boot.autostart".into(), json!("true"));
+    }
+    if cfg.function.is_some() {
+        // The mark the writer of a run looks for, and a memory limit that swap does not stretch.
+        config.insert(FUNCTION_KEY.into(), json!("true"));
+        config.insert("limits.memory.swap".into(), json!("false"));
     }
     let mut devices = Map::new();
     if let Some(data) = &cfg.data {
@@ -831,6 +851,13 @@ impl Plugin for Service {
         if !cfg.destinations.is_empty() && !destinations_ok(cfg) {
             return Err(PluginError::Config(
                 "a private destination is for a service of the node's own project on the managed service network: one private or tailnet address outside the service subnet and one tcp port each, at most 4".into(),
+            ));
+        }
+        // A function is a container of the node's own project that only the kernel starts: a record that says
+        // otherwise is never applied, whatever else it holds.
+        if !crate::function::record_ok(cfg) {
+            return Err(PluginError::Config(
+                "a function is a container of the node's own service project, created stopped, with no port, and with one opened address for each of its links".into(),
             ));
         }
         if let Some(vm) = &cfg.vm
@@ -1770,7 +1797,7 @@ fn number_reads_back(number: &serde_json::Number) -> bool {
 /// bidirectional marks, embeddings, overrides and isolates, the zero-width characters, the line and paragraph
 /// separators, the byte-order mark and the invisible operators. An owner reads these values on a card before
 /// approving, so what is shown must be what is there.
-fn plain_text(text: &str) -> bool {
+pub(crate) fn plain_text(text: &str) -> bool {
     !text.chars().any(|c| {
         c.is_control()
             || matches!(
@@ -1896,7 +1923,7 @@ fn env_name_ok(name: &str) -> bool {
 
 /// Whether `text` is an image by digest, as a guest's keeper takes one: `<registry>/<name>@sha256:<64 hex digits>`, in
 /// lower case.
-fn image_by_digest(text: &str) -> bool {
+pub(crate) fn image_by_digest(text: &str) -> bool {
     let Some((name, digest)) = text.split_once("@sha256:") else {
         return false;
     };
@@ -2368,7 +2395,7 @@ fn script_unreadable(template: &str, file: &str, error: &std::io::Error) -> Temp
     ))
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if !value.is_empty()
         && value.bytes().all(|b| {
             b.is_ascii_alphanumeric()

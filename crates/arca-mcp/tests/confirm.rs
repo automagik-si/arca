@@ -117,6 +117,12 @@ fn cases() -> Vec<(&'static str, Value, Value, &'static str)> {
             json!({ "removed": true, "deploy": "d1", "parts": ["web"] }),
             "confirm is false: nothing was removed and no approval was spent",
         ),
+        (
+            "function_remove",
+            json!({ "name": "relay", "approval": "0123456789abcdef" }),
+            json!({ "removed": true }),
+            "confirm is false: nothing was removed and no approval was spent",
+        ),
     ]
 }
 

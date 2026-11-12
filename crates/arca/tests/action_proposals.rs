@@ -320,6 +320,19 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
             ActionKind::InstanceStart | ActionKind::InstanceStop | ActionKind::InstanceRestart => {
                 json!({ "project": "arcak-svc", "instance": "web" })
             }
+            ActionKind::FunctionCreate => json!({
+                "name": "relay", "kind": "container", "concurrency": 1,
+                "image": "registry.example/acme/relay",
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "command": ["/relay", "--once"],
+                "env": { "BATCH": "500" },
+                "secrets": ["DATABASE_URL"],
+                "links": [{ "to": "nats", "port": 4222 }],
+                "destinations": [{ "address": "10.20.30.40", "port": 443 }],
+                "triggers": [{ "timer": { "everySeconds": 30 } }],
+                "limits": { "seconds": 60, "memory": "128MiB", "cpu": 1 },
+            }),
+            ActionKind::FunctionRemove => json!({ "name": "relay" }),
         }
     }
 
@@ -417,6 +430,49 @@ fn every_argument_of_every_allowed_verb_is_in_details() {
                     .all(|field| field == "name"),
                 "{action:?} has a field the card does not show"
             );
+            continue;
+        }
+        if action == ActionKind::FunctionCreate {
+            // Every argument of a definition has its row, in the owner's words.
+            let row = |label: &str| {
+                details
+                    .iter()
+                    .find(|row| row.label == label)
+                    .unwrap_or_else(|| panic!("the function card lacks {label}"))
+                    .value
+                    .as_str()
+            };
+            for field in action.params_schema()["properties"]
+                .as_object()
+                .expect("properties")
+                .keys()
+            {
+                let (label, holds) = match field.as_str() {
+                    "name" => ("Function", "relay"),
+                    "kind" => ("Kind", "container"),
+                    "image" => ("Program", "registry.example/acme/relay@sha256:"),
+                    "digest" => ("Program", "@sha256:aaaaaaaa"),
+                    "command" => ("Command", "/relay"),
+                    "env" => ("Setting BATCH", "500"),
+                    "secrets" => ("Secrets", "DATABASE_URL: each run is given these by name"),
+                    "links" => ("Services on this node", "nats on tcp port 4222"),
+                    "destinations" => ("Private network", "10.20.30.40 on tcp port 443"),
+                    "triggers" => ("Runs", "every 30 seconds"),
+                    "concurrency" => ("Runs", "one run at a time"),
+                    "limits" => ("Limits", "at most 60 seconds, 128MiB of memory and 1 CPU"),
+                    other => panic!("function_create field {other} has no owner label"),
+                };
+                assert!(row(label).contains(holds), "{label}: {}", row(label));
+            }
+            assert_eq!(row("Command argument 1"), "--once");
+            assert!(row("Internet").starts_with("No:"));
+            continue;
+        }
+        if action == ActionKind::FunctionRemove {
+            let labels: Vec<&str> = details.iter().map(|row| row.label.as_str()).collect();
+            assert_eq!(labels, ["Function", "Effect"]);
+            assert_eq!(details[0].value, "relay");
+            assert!(details[1].value.contains("run log are kept"));
             continue;
         }
         if action == ActionKind::TenantCreate {

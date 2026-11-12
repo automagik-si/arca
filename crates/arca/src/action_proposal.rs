@@ -68,6 +68,8 @@ pub enum ActionKind {
     TenantCreate,
     TenantRemove,
     DeployRemove,
+    FunctionCreate,
+    FunctionRemove,
 }
 
 /// `text` as one line of a card: control characters become spaces, and past `max` characters it ends in an ellipsis.
@@ -124,7 +126,7 @@ fn setting_words(value: &Value) -> String {
 
 impl ActionKind {
     /// Every allowed action, in the order the table documents them.
-    pub const ALL: [ActionKind; 20] = [
+    pub const ALL: [ActionKind; 22] = [
         Self::ServiceCreate,
         Self::ServiceRemove,
         Self::ServiceImport,
@@ -145,6 +147,8 @@ impl ActionKind {
         Self::TenantCreate,
         Self::TenantRemove,
         Self::DeployRemove,
+        Self::FunctionCreate,
+        Self::FunctionRemove,
     ];
 
     /// The verb name this action runs.
@@ -170,6 +174,8 @@ impl ActionKind {
             Self::TenantCreate => "tenant_create",
             Self::TenantRemove => "tenant_remove",
             Self::DeployRemove => "deploy_remove",
+            Self::FunctionCreate => "function_create",
+            Self::FunctionRemove => "function_remove",
         }
     }
 
@@ -324,6 +330,11 @@ impl ActionKind {
             }
             Self::StorageAdd | Self::SnapshotCreate | Self::SnapshotDelete => {
                 args = crate::storage::prepare(self, args)?;
+            }
+            // Every rule of a definition is checked here, and what the caller left out is written in, so the card
+            // shows each limit and the approval binds it.
+            Self::FunctionCreate => {
+                args = crate::function::prepare(&args)?;
             }
             _ => {}
         }
@@ -498,6 +509,17 @@ impl ActionKind {
                     "Deletes every service of this tenant, with its data, and then the tenant's project.",
                 ),
             ],
+            Self::FunctionCreate => crate::function::create_rows(args)
+                .iter()
+                .map(|(label, value)| row(label, &shown(value, 4096)))
+                .collect(),
+            Self::FunctionRemove => vec![
+                row("Function", text("name")),
+                row(
+                    "Effect",
+                    "Stops the run that is going, if one is, and deletes the function with its secrets. Its lines in the run log are kept.",
+                ),
+            ],
             Self::DeployRemove => vec![
                 row("Deploy", text("deploy")),
                 // What the deploy holds as the proposal is made: the owner sees each part he approves the removal of.
@@ -622,6 +644,8 @@ impl ActionKind {
             Self::DeployRemove => {
                 format!("Remove everything the deploy {} created", text("deploy"))
             }
+            Self::FunctionCreate => crate::function::create_summary(args),
+            Self::FunctionRemove => format!("Remove the function {}", text("name")),
         };
         // A service that can call the kernel is named as one.
         let sentence = if self == Self::ServiceCreate && args.get("kernelAccess").is_some() {

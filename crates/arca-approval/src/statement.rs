@@ -45,6 +45,8 @@ pub enum ArcaAction {
     TenantCreate,
     TenantRemove,
     DeployRemove,
+    FunctionCreate,
+    FunctionRemove,
 }
 
 impl ArcaAction {
@@ -79,6 +81,8 @@ impl ArcaAction {
             Self::TenantCreate => "tenant_create",
             Self::TenantRemove => "tenant_remove",
             Self::DeployRemove => "deploy_remove",
+            Self::FunctionCreate => "function_create",
+            Self::FunctionRemove => "function_remove",
         }
     }
 
@@ -113,6 +117,8 @@ impl ArcaAction {
             "tenant_create" => Some(Self::TenantCreate),
             "tenant_remove" => Some(Self::TenantRemove),
             "deploy_remove" => Some(Self::DeployRemove),
+            "function_create" => Some(Self::FunctionCreate),
+            "function_remove" => Some(Self::FunctionRemove),
             _ => None,
         }
     }

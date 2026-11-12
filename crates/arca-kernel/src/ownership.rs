@@ -143,6 +143,8 @@ pub fn classify_object(
                 "user.arca.links",
                 "user.arca.published",
                 "user.arca.envkeys",
+                // A function's instance: the mark the writer of a run looks for before it starts or stops one.
+                "user.arca.function",
             ]
         }
         IncusKind::Acl

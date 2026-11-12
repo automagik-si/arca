@@ -87,6 +87,12 @@ fn the_table_holds_the_initial_plan_alerts_postgres_and_ontology_verbs_in_order(
             "deploy_confirm",
             "deploy_rollback",
             "deploy_remove",
+            "function_create",
+            "function_remove",
+            "function_secret_set",
+            "function_list",
+            "function_run",
+            "function_runs",
         ]
     );
     assert_eq!(API_VERSION, "0.1.0");
@@ -138,6 +144,18 @@ fn each_verb_has_its_table_row_for_class_scope_and_writes() {
         ("deploy_confirm", VerbClass::L, Scope::Doctor, true, false),
         ("deploy_rollback", VerbClass::L, Scope::Doctor, true, true),
         ("deploy_remove", VerbClass::L, Scope::Doctor, true, true),
+        ("function_create", VerbClass::L, Scope::Doctor, true, false),
+        ("function_remove", VerbClass::L, Scope::Doctor, true, true),
+        (
+            "function_secret_set",
+            VerbClass::L,
+            Scope::Doctor,
+            true,
+            false,
+        ),
+        ("function_list", VerbClass::L, Scope::Viewer, false, false),
+        ("function_run", VerbClass::L, Scope::Doctor, true, false),
+        ("function_runs", VerbClass::L, Scope::Viewer, false, false),
     ];
     for (name, class, scope, writes, destructive) in rows {
         let v = verb(name).expect("the verb is in the table");
@@ -255,6 +273,8 @@ fn plan_verb_schemas_equal_their_table_rows() {
         "tenant_create",
         "tenant_remove",
         "deploy_remove",
+        "function_create",
+        "function_remove",
     ];
     let action_proposal = open(
         json!({
@@ -1314,6 +1334,7 @@ fn every_destructive_verb_takes_an_optional_boolean_confirm_and_no_other_verb_do
             "tenant_remove",
             "deploy_rollback",
             "deploy_remove",
+            "function_remove",
         ]
     );
     for v in verbs() {

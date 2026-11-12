@@ -1689,7 +1689,9 @@
                           "instance_restart",
                           "tenant_create",
                           "tenant_remove",
-                          "deploy_remove"
+                          "deploy_remove",
+                          "function_create",
+                          "function_remove"
                         ],
                         "type": "string"
                       },
@@ -1803,7 +1805,9 @@
               "instance_restart",
               "tenant_create",
               "tenant_remove",
-              "deploy_remove"
+              "deploy_remove",
+              "function_create",
+              "function_remove"
             ],
             "type": "string"
           }
@@ -1841,7 +1845,9 @@
                 "instance_restart",
                 "tenant_create",
                 "tenant_remove",
-                "deploy_remove"
+                "deploy_remove",
+                "function_create",
+                "function_remove"
               ],
               "type": "string"
             },
@@ -2190,7 +2196,9 @@
                 "instance_restart",
                 "tenant_create",
                 "tenant_remove",
-                "deploy_remove"
+                "deploy_remove",
+                "function_create",
+                "function_remove"
               ],
               "type": "string"
             },
@@ -7686,6 +7694,917 @@
       "x-arca-read-only-hint": false,
       "x-arca-scope": "doctor",
       "x-arca-writes": true
+    },
+    {
+      "name": "function_create",
+      "params": [
+        {
+          "name": "digest",
+          "required": true,
+          "schema": {
+            "description": "The image's digest: sha256: and 64 hex digits. A function is an image by digest, never a tag, so a new version is a new function_create that the owner approves.",
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "image",
+          "required": true,
+          "schema": {
+            "description": "The image, as <registry>/<repository> in lower case, such as registry.example/acme/relay. Arca pulls it without a credential.",
+            "maxLength": 255,
+            "pattern": "^[a-z0-9][a-z0-9._:-]*/[a-z0-9._/:-]+$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "triggers",
+          "required": true,
+          "schema": {
+            "description": "When the function runs: exactly one trigger, a timer. A run starts every everySeconds, unless one is still going.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "timer": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "everySeconds": {
+                      "maximum": 86400,
+                      "minimum": 10,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "everySeconds"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "timer"
+              ],
+              "type": "object"
+            },
+            "maxItems": 1,
+            "type": "array"
+          }
+        },
+        {
+          "name": "approval",
+          "required": false,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "command",
+          "required": false,
+          "schema": {
+            "description": "The program and its arguments: the first is the program's absolute path inside the image. No shell runs it. Left out, the image's own entry point runs.",
+            "items": {
+              "maxLength": 160,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          }
+        },
+        {
+          "name": "concurrency",
+          "required": false,
+          "schema": {
+            "description": "How many runs of the function may go at once. This build runs one: the only value is 1, which is also the default.",
+            "enum": [
+              1
+            ],
+            "type": "integer"
+          }
+        },
+        {
+          "name": "destinations",
+          "required": false,
+          "schema": {
+            "description": "Only for a function this node's config names in kernel.serviceDestinations: exactly the addresses and tcp ports the config names for it. A proposal fills it in from the config, so the owner's card shows each address and the approval binds it; a caller cannot state one of its own.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "address": {
+                  "maxLength": 15,
+                  "pattern": "^[0-9]{1,3}(?:\\.[0-9]{1,3}){3}$",
+                  "type": "string"
+                },
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "address",
+                "port"
+              ],
+              "type": "object"
+            },
+            "maxItems": 4,
+            "type": "array"
+          }
+        },
+        {
+          "name": "env",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "maxLength": 160,
+              "type": "string"
+            },
+            "description": "Plain environment values, by name, at most 32. The owner's card shows each whole. Never a secret: a secret is named in secrets.",
+            "propertyNames": {
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "description": "How a run is isolated. This build runs a function in a container: the only value is \"container\", which is also the default.",
+            "enum": [
+              "container"
+            ],
+            "type": "string"
+          }
+        },
+        {
+          "name": "limits",
+          "required": false,
+          "schema": {
+            "additionalProperties": false,
+            "description": "What one run may use. seconds: the longest it may take (default 60); Arca stops a run that passes it, with a stop the program has 5 seconds to obey and then a kill. memory: the most it may use, as a size such as 128MiB (default 128MiB, at least 8MiB); a run that passes it is killed. cpu: the CPUs it may use (default 1).",
+            "properties": {
+              "cpu": {
+                "maximum": 64,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "memory": {
+                "maxLength": 32,
+                "pattern": "^[1-9][0-9]*(?:MiB|GiB)$",
+                "type": "string"
+              },
+              "seconds": {
+                "maximum": 900,
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "links",
+          "required": false,
+          "schema": {
+            "description": "The services of this node the function may reach, each on one tcp port the service declares. A link opens the way and nothing else: no connection value is put in the function's environment.",
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "port": {
+                  "maximum": 65535,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "to": {
+                  "description": "A service of this node.",
+                  "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "to",
+                "port"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "type": "array"
+          }
+        },
+        {
+          "name": "secrets",
+          "required": false,
+          "schema": {
+            "description": "The names of the function's secrets, at most 16. Each run is given these as environment values, and no other. function_secret_set sets each value.",
+            "items": {
+              "description": "The name of an environment variable.",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "command": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "concurrency": {
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "created": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "destinations": {
+              "type": "array"
+            },
+            "digest": {
+              "type": "string"
+            },
+            "env": {
+              "type": "object"
+            },
+            "image": {
+              "type": "string"
+            },
+            "ipv4": {
+              "type": "string"
+            },
+            "kind": {
+              "enum": [
+                "container"
+              ],
+              "type": "string"
+            },
+            "lastRun": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "limits": {
+              "type": "object"
+            },
+            "links": {
+              "items": {
+                "properties": {
+                  "port": {
+                    "maximum": 65535,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "to": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "to",
+                  "port"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+              "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+              "type": "string"
+            },
+            "running": {
+              "type": "boolean"
+            },
+            "secrets": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "set": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "name",
+                  "set"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "triggers": {
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "image",
+            "digest",
+            "command",
+            "env",
+            "secrets",
+            "links",
+            "triggers",
+            "limits",
+            "concurrency",
+            "ipv4",
+            "created",
+            "running",
+            "lastRun"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Create a function: an OCI image by digest that holds one program, run on a timer, each run one start of its own container with a time, a memory and a CPU limit. Only from a proposal the owner approved (action_propose), whose card shows the image and digest, the command, the timer, the limits, the names of its secrets and everything it may reach: the services of this node its links name, each on one tcp port, the private addresses this node's config names for it, and nothing else, no public address among them. It is created stopped; function_secret_set sets its secrets, and the timer runs it from then on.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "function_remove",
+      "params": [
+        {
+          "name": "approval",
+          "required": true,
+          "schema": {
+            "description": "The one-shot grant of the approved action proposal. The owner approves the proposal; this verb is not called with an approval of its own.",
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "description": "Optional. Absent or true: the call runs as without it. False: the call is refused, nothing changes and no approval is spent. It is never part of what an approval binds.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "removed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "removed"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Remove a function, only from a proposal the owner approved: the run that is going, if one is, is stopped, then its instance, its firewall rules and its secrets are deleted and each linked service closes to it. Its lines in the run log are kept.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "function_secret_set",
+      "params": [
+        {
+          "name": "key",
+          "required": true,
+          "schema": {
+            "description": "The secret's name, one of those the function's definition lists.",
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "value",
+          "required": true,
+          "schema": {
+            "description": "The secret: one line of 8 to 4096 characters, without control characters.",
+            "maxLength": 4096,
+            "minLength": 8,
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true,
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "ok"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Set one of a function's secrets (its definition lists their names). Write-only: no tool, log or run line shows it again. Arca reads no vault: whoever holds the value sets it here, by name, and each run is given the secrets its function names and no other, as environment values. A function with a secret not yet set does not run, and its run line names the secret. A value is one line of 8 to 4096 characters.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "function_list",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "functions": {
+              "items": {
+                "properties": {
+                  "command": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "concurrency": {
+                    "maximum": 1,
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "created": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "destinations": {
+                    "type": "array"
+                  },
+                  "digest": {
+                    "type": "string"
+                  },
+                  "env": {
+                    "type": "object"
+                  },
+                  "image": {
+                    "type": "string"
+                  },
+                  "ipv4": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container"
+                    ],
+                    "type": "string"
+                  },
+                  "lastRun": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "limits": {
+                    "type": "object"
+                  },
+                  "links": {
+                    "items": {
+                      "properties": {
+                        "port": {
+                          "maximum": 65535,
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "to": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "to",
+                        "port"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "name": {
+                    "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+                    "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+                    "type": "string"
+                  },
+                  "running": {
+                    "type": "boolean"
+                  },
+                  "secrets": {
+                    "items": {
+                      "properties": {
+                        "name": {
+                          "type": "string"
+                        },
+                        "set": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "set"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "triggers": {
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "image",
+                  "digest",
+                  "command",
+                  "env",
+                  "secrets",
+                  "links",
+                  "triggers",
+                  "limits",
+                  "concurrency",
+                  "ipv4",
+                  "created",
+                  "running",
+                  "lastRun"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "functions"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The functions of this node, each with its image and digest, its command, its timer, its limits, the names of its secrets and whether each is set, what it may reach, whether a run is going and its newest run.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
+    },
+    {
+      "name": "function_run",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "function": {
+              "type": "string"
+            },
+            "run": {
+              "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
+              "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
+              "type": "string"
+            },
+            "started": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "function",
+            "run",
+            "started"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "Run a function now, once, outside its timer. It answers at once with the run's id; function_runs shows the run when it ends. One run of a function goes at a time: while one is going the call is refused with FunctionBusy. A run is not a change, so it needs no approval; it writes one line to the run log and nothing else.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": false,
+      "x-arca-scope": "doctor",
+      "x-arca-writes": true
+    },
+    {
+      "name": "function_runs",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The function's name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter). Functions and services share one name space.",
+            "pattern": "^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$",
+            "type": "string"
+          }
+        },
+        {
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "description": "How many of the newest runs to answer, 1 to 100. The default is 20.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "run",
+          "required": false,
+          "schema": {
+            "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
+            "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "properties": {
+            "function": {
+              "type": "string"
+            },
+            "output": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "run": {
+              "properties": {
+                "cpuMs": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "digest": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "durationMs": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "function": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "container"
+                  ],
+                  "type": "string"
+                },
+                "memoryLimitBytes": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "memoryPeakBytes": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "outcome": {
+                  "enum": [
+                    "ok",
+                    "failed",
+                    "timeout",
+                    "memory",
+                    "died",
+                    "interrupted",
+                    "notStarted"
+                  ],
+                  "type": "string"
+                },
+                "result": {
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
+                "run": {
+                  "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
+                  "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
+                  "type": "string"
+                },
+                "startMs": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "startedAt": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "trigger": {
+                  "enum": [
+                    "timer",
+                    "manual",
+                    "kernel"
+                  ],
+                  "type": "string"
+                },
+                "why": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "run",
+                "function",
+                "kind",
+                "trigger",
+                "startedAt",
+                "outcome"
+              ],
+              "type": "object"
+            },
+            "running": {
+              "type": "boolean"
+            },
+            "runs": {
+              "items": {
+                "properties": {
+                  "cpuMs": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "digest": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "durationMs": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "function": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "container"
+                    ],
+                    "type": "string"
+                  },
+                  "memoryLimitBytes": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "memoryPeakBytes": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "outcome": {
+                    "enum": [
+                      "ok",
+                      "failed",
+                      "timeout",
+                      "memory",
+                      "died",
+                      "interrupted",
+                      "notStarted"
+                    ],
+                    "type": "string"
+                  },
+                  "result": {
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
+                  "run": {
+                    "description": "A run's id: fr-, the time it began in milliseconds, and a number.",
+                    "pattern": "^fr-[0-9]{1,16}-[0-9]{1,12}$",
+                    "type": "string"
+                  },
+                  "startMs": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "startedAt": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "trigger": {
+                    "enum": [
+                      "timer",
+                      "manual",
+                      "kernel"
+                    ],
+                    "type": "string"
+                  },
+                  "why": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "run",
+                  "function",
+                  "kind",
+                  "trigger",
+                  "startedAt",
+                  "outcome"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "function"
+          ],
+          "type": "object"
+        }
+      },
+      "summary": "The newest runs of one function, newest first: one line a run, with what triggered it, when it started, how long the start and the run took, the CPU time and the memory peak when they were read, the memory it was allowed, its outcome (ok, failed, timeout, memory, died, interrupted, notStarted) and its result, the program's last output line. With run, that one run and the end of its output, when it is still kept.",
+      "x-arca-additional-properties": true,
+      "x-arca-class": "L",
+      "x-arca-read-only-hint": true,
+      "x-arca-scope": "viewer",
+      "x-arca-writes": false
     }
   ],
   "openrpc": "1.3.2",
