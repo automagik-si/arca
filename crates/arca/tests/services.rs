@@ -1,5 +1,7 @@
 //! Service verbs against a fake Incus: create, list and status are hermetic; no live host is touched.
 mod common;
+mod templates_before;
+use templates_before::postgres_file_of_0_12_0;
 #[path = "../../arca-approval/tests/common/webauthn.rs"]
 mod webauthn;
 
@@ -3303,35 +3305,6 @@ fn an_entrypoint_script_is_a_plain_file_name_in_the_template_directory() {
             "{file:?} is refused"
         );
     }
-}
-
-/// A shipped Postgres file exactly as release 0.12.0 shipped it, made from this release's file by undoing what
-/// changed since. The caller checks its hash against `cmd_templates::EARLIER`, which proves it is that file byte for
-/// byte.
-fn postgres_file_of_0_12_0(name: &str) -> String {
-    let now = arca::cmd_templates::SHIPPED
-        .iter()
-        .find(|(shipped, _)| *shipped == name)
-        .map(|(_, text)| *text)
-        .expect("a shipped file");
-    let before = match name {
-        "postgres-autopg.json" => now
-            .replace(", which Arca makes at create and never shows", "")
-            .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", ""),
-        "postgres-autopg.sh" => now.replace(
-            "is not set: this service was created from a template that did not make it (arca templates install, then create it again; or service_secret_set)",
-            "is not set (service_secret_set)",
-        ),
-        other => panic!("{other} did not change since 0.12.0"),
-    };
-    let digest = arca_kernel::canon::Digest::of(before.as_bytes()).to_hex();
-    assert!(
-        arca::cmd_templates::EARLIER
-            .iter()
-            .any(|(earlier, hash)| *earlier == name && *hash == digest),
-        "{name} as rebuilt here is not the file 0.12.0 shipped ({digest})"
-    );
-    before
 }
 
 /// A node that installed its templates with an earlier release is not left on a template a later release fixed. A

@@ -659,8 +659,12 @@ program holds their SHA-256 hashes):
 - a template and the script it reads move together: where one of the two is edited, the other is kept as it is too,
   though it is an earlier release's, so a new template is never paired with a script it was not shipped with.
 
-The installer does not run this step. After an upgrade, run `arca templates install --config <file>` once, or
-`arca init --enable-changes` again; neither needs `--replace` for a template nobody edited.
+The installer runs this step on an upgrade (`sh install.sh` on a machine that has Arca), for the node it runs as
+a service and only where templates are already installed: a node that only looks has none and gets none. Its
+report names what it brought up to this release, and what it kept because it was edited, with the one command that
+replaces those (`arca templates install --replace --config <file>`). For a node started any other way, run `arca
+templates install --config <file>` once after the upgrade, or `arca init --enable-changes` again; neither needs
+`--replace` for a template nobody edited.
 
 What a replaced template changes is the next create. Nothing changes for a service that already exists: a
 `postgres-autopg` service keeps the password that is stored, and none is made over it. One that was created

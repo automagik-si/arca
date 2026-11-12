@@ -2,6 +2,8 @@
 //! process over a fake Incus. Every file is in the test's own scratch directory; nothing here asks the machine's Incus,
 //! its systemd or its desktop.
 
+mod templates_before;
+
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arca_incus::{FakeIncus, FakeState, IncusRead as _};
 use serde_json::{Value, json};
+use templates_before::postgres_file_of_0_12_0;
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -1347,35 +1350,6 @@ fn init_restarts_the_installers_own_service_for_this_config_and_no_other() {
         );
     }
     assert_eq!(calls().lines().count(), 3, "one restart per run");
-}
-
-/// A shipped Postgres file exactly as release 0.12.0 shipped it, made from this release's file by undoing what
-/// changed since. The caller checks its hash against `cmd_templates::EARLIER`, which proves it is that file byte for
-/// byte.
-fn postgres_file_of_0_12_0(name: &str) -> String {
-    let now = arca::cmd_templates::SHIPPED
-        .iter()
-        .find(|(shipped, _)| *shipped == name)
-        .map(|(_, text)| *text)
-        .expect("a shipped file");
-    let before = match name {
-        "postgres-autopg.json" => now
-            .replace(", which Arca makes at create and never shows", "")
-            .replace("  \"generate\": { \"POSTGRES_PASSWORD\": \"\" },\n", ""),
-        "postgres-autopg.sh" => now.replace(
-            "is not set: this service was created from a template that did not make it (arca templates install, then create it again; or service_secret_set)",
-            "is not set (service_secret_set)",
-        ),
-        other => panic!("{other} did not change since 0.12.0"),
-    };
-    let digest = arca_kernel::canon::Digest::of(before.as_bytes()).to_hex();
-    assert!(
-        arca::cmd_templates::EARLIER
-            .iter()
-            .any(|(earlier, hash)| *earlier == name && *hash == digest),
-        "{name} as rebuilt here is not the file 0.12.0 shipped ({digest})"
-    );
-    before
 }
 
 /// A node whose templates were installed by 0.12.0: `arca init` brings the unedited ones up to this release and says

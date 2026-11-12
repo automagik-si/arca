@@ -63,7 +63,9 @@ to run their services.
 - **It ends with the node's own answer** to `arca_status`: the mode (`watch-only`), where the token's file is (never the
   token), and the two ways to connect an assistant from step 4 below, with the one line that adds the node to Claude
   Code and one line that says where the cautions are (`arca status --security`). Exit code 0 means the node runs, answered, and reaches Incus.
-- **A second run** replaces the program in place and restarts the service. `sh install.sh --uninstall` removes the
+- **A second run** replaces the program in place and restarts the service. Where the node already has service
+  templates (it ran `arca init`), the run also brings them up to the release: a template that is an earlier
+  release's own file is replaced and named, and one you edited is kept and named, with the command that replaces it. `sh install.sh --uninstall` removes the
   service and the program, while the program is still the file it installed, and keeps the config, the tokens and the
   state.
 
@@ -251,9 +253,10 @@ What comes after is yours:
 
 **A database:** ask your assistant for the `postgres-autopg` service. It is one of the shipped templates, it fetches
 its own pinned image, it makes its own password, and it waits for your approval like any change: once you approve,
-it starts. A node whose templates were installed by 0.12.0 or older has a template that does not make the password;
-`arca templates install --config ~/.config/arca/node.json` replaces it, and every other shipped template nobody
-edited, with this release's. (`postgres_create`, proposed with a name, makes that same service.)
+it starts. A node whose templates were installed by 0.12.0 or older has a template that does not make the password.
+Upgrading with the installer replaces it, and every other shipped template nobody edited, with this release's, and
+says so; `arca templates install --config ~/.config/arca/node.json` does the same by hand. (`postgres_create`,
+proposed with a name, makes that same service.)
 
 That page is for a machine where every account is trusted, and it cannot be opened from a phone; read
 ["The page on this machine alone"](OPERATING.md#the-page-on-this-machine-alone-with-no-domain-and-no-certificate)

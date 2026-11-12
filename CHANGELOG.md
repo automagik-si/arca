@@ -29,6 +29,12 @@ upgrade (or `arca init --enable-changes` again). A shipped template that nobody 
 release's, and the answer names it under `replaced`; a template you edited is kept, as before. 0.13.0 said to use
 `--replace` for this, which also overwrites your edits: it is no longer needed. A service that already exists is not
 changed.
+**If your node has templates from 0.13.0 or older:** upgrading with the installer now brings them up to the release.
+A shipped template that nobody edited is replaced with this release's and named in the report; one you edited is
+kept and named, with the command that replaces it. For a node the installer does not run as a service, run `arca
+templates install --config <file>` once after the upgrade (or `arca init --enable-changes` again). 0.13.0 said to
+use `--replace` for this, which also overwrites your edits: it is no longer needed. A service that already exists is
+not changed.
 
 ## 0.13.0 (2026-11-12)
 
@@ -57,10 +63,6 @@ result, one JSON object with `"ok"`. Six new verbs: `function_create`, `function
 `function_list`, `function_run`, `function_runs`. Known limit: a run can write its container's root file system, and
 the next run finds what it wrote (Incus refuses to start an OCI container with a read-only root). `docs/OPERATING.md`,
 "Functions", has the whole of it.
-database's password itself, so a database you approve on the page starts by itself. Run `arca templates install
---config <file>` once after the upgrade (or `arca init --enable-changes` again): a shipped template that nobody
-edited is replaced with this release's, and the answer names it under `replaced`. A template you edited is kept, as
-before. A `postgres-autopg` service that already exists is not changed, and keeps its password.
 
 `postgres_create` now works on a node set up from a clean install. On a node whose config sets no
 `kernel.postgresImage`, it makes a service from the node's `postgres-autopg` template, with the image fetched by

@@ -38,6 +38,12 @@
 # It starts a node only for a config it wrote, or through a service it wrote earlier, and only where it can ask the
 # node afterwards what it is. For any other config it installs the program, starts nothing and says so.
 #
+# Templates. A node gets its service templates from `arca init`, not from this script. Where the node this script
+# runs as a service already has them, an upgrade runs `arca templates install` for it: a template that is an
+# earlier release's own file, byte for byte, becomes this release's, and the report names it. A template the owner
+# edited is kept, and the report names it too, with the one command that replaces it. A node with no templates gets
+# none here.
+#
 # How it ends:
 #   0   the node runs and answered `arca_status`, and Incus answers the node
 #   1   refused or failed; the words say what, and a refusal has changed nothing
@@ -186,6 +192,29 @@ json_text() {
     esac
     json_rest=${1#*"\"$2\":\""}
     printf '%s\n' "${json_rest%%\"*}"
+}
+
+# The names in the list `"$2":[...]` of the one-line JSON $1, as words with commas: `a, b`. Fails when $1 has no such
+# list; prints nothing for an empty one. The names are file names, which hold no comma and no quote.
+json_list() {
+    case $1 in
+        *"\"$2\":["*) ;;
+        *) return 1 ;;
+    esac
+    json_rest=${1#*"\"$2\":["}
+    json_rest=${json_rest%%]*}
+    json_names=
+    while [ -n "$json_rest" ]; do
+        json_item=${json_rest%%,*}
+        json_item=${json_item#\"}
+        json_item=${json_item%\"}
+        json_names=${json_names:+$json_names, }$json_item
+        case $json_rest in
+            *,*) json_rest=${json_rest#*,} ;;
+            *) json_rest= ;;
+        esac
+    done
+    printf '%s\n' "$json_names"
 }
 
 # The version in the line `arca --version` prints: "Automagik Arca <version> (<commit>, <target>)".
@@ -866,6 +895,33 @@ enable_changes() {
     fi
 }
 
+# The templates of the node this script runs as a service, on an upgrade. `arca init` installs a node's templates; a
+# later release may change one, and a node must not keep a template that release fixed. The program does the work
+# and decides: a file that is an earlier release's own, byte for byte, becomes this release's, and a file the owner
+# edited is kept. This script only runs it and says what it answered.
+#
+# It runs only where templates are already installed, in the state directory this script names in the config it
+# writes, and only while the config still names that directory: a node that only looks has none, and gets none here.
+upgrade_templates() {
+    templates_replaced=
+    templates_kept=
+    templates_failed=
+    [ "$service" = unit ] || return 0
+    exists "$state_dir/templates" || return 0
+    case ${config_has-} in
+        *"\"$state_dir\""*) ;;
+        *) return 0 ;;
+    esac
+    templates_command="$bin templates install --config $config"
+    if ! templates_said=$("$bin" templates install --config "$config" 2>/dev/null </dev/null); then
+        templates_failed=1
+        return 0
+    fi
+    # A program from before it named what it replaced answers without that list: there is then nothing to say.
+    templates_replaced=$(json_list "$templates_said" replaced) || templates_replaced=
+    templates_kept=$(json_list "$templates_said" kept) || templates_kept=
+}
+
 report() {
     status_command="$bin call arca_status --config $config --token-file $token_file"
     start_command="$bin serve --config $config"
@@ -903,6 +959,19 @@ report() {
     fi
     if [ "$config_ours" = 1 ]; then
         say "  state     $state_dir"
+    fi
+    if [ -n "${templates_replaced-}" ]; then
+        say "  templates brought up to this release: $templates_replaced"
+        say "            (each was an earlier release's own file, not edited; a service that already runs is not changed)"
+    fi
+    if [ -n "${templates_kept-}" ]; then
+        say "  templates kept as you edited them: $templates_kept"
+        say "            To replace them with this release's, losing those edits:"
+        say "              $templates_command --replace"
+    fi
+    if [ -n "${templates_failed-}" ]; then
+        say "  templates NOT checked: \`arca templates install\` failed. Run it to see why:"
+        say "              $templates_command"
     fi
     say "  service   $service_note"
     # The node says whether it holds the door's port. A port another program took first does not stop the node: it
@@ -1264,6 +1333,7 @@ main() {
     install_program
     write_config
     start_service
+    upgrade_templates
     enable_changes
     report
 }

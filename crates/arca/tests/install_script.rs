@@ -19,6 +19,8 @@
 //! The tests need `sh`, `bash` and the usual core utilities on the machine that runs them, and a user who is not
 //! root, since the script refuses root. The token is made here.
 
+mod templates_before;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -29,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use templates_before::postgres_file_of_0_12_0;
 
 /// A token of the real shape, which is no node's.
 const TOKEN: &str = "arca_c3ludGhldGljLXRva2VuLWZvci10ZXN0cy1vbmx5LTAwMDA";
@@ -400,7 +403,9 @@ impl Machine {
             )
             .env("FAKE_DIR", self.dir.join("fake"))
             .env("FAKE_PATH", std::env::var_os("PATH").expect("PATH"))
-            .env("FAKE_ARCA_SECRET", TOKEN);
+            .env("FAKE_ARCA_SECRET", TOKEN)
+            // `templates install` is the real program's own: what is replaced and what is kept is its decision.
+            .env("FAKE_REAL_ARCA", env!("CARGO_BIN_EXE_arca"));
         if self.session {
             command.env("XDG_RUNTIME_DIR", self.dir.join("run"));
         }
@@ -843,6 +848,100 @@ fn a_second_run_upgrades_the_program_in_place_and_restarts_the_service() {
         .run(&["--no-such-flag"])
         .refused()
         .says("unknown argument");
+}
+
+/// A node that ran `arca init` on 0.12.0 and is then upgraded by `sh install.sh` alone ends with this release's
+/// Postgres template. The installer runs the program's own `templates install` for the node it runs as a service,
+/// where templates are already installed: a file that is an earlier release's own becomes this release's and is
+/// named; a file the owner edited is kept and named, with the one command that replaces it. A node with no templates
+/// gets none.
+#[test]
+fn an_upgrade_brings_the_templates_of_an_earlier_release_up_to_date_and_names_what_it_kept() {
+    let machine = Machine::new();
+    // A first install: the node only looks, has no templates, and none are installed or checked.
+    machine.run(&[]).ok().never_says("templates");
+    assert_eq!(machine.arca_calls("templates"), 0);
+    assert!(!machine.home(".local/state/arca-node/templates").exists());
+
+    // The node as `arca init` of 0.12.0 left it: the config with init's keys, which is no longer this script's own
+    // text, and the templates of that release. The owner has edited one of them.
+    let mut config = config_on_disk(&machine);
+    config["kernel"] = json!({
+        "projects": ["arcak-svc"], "droiddProjects": ["default"], "serviceCidr": "192.0.2.0/24"
+    });
+    let written = serde_json::to_string_pretty(&config).expect("JSON");
+    fs::write(machine.home(".config/arca/node.json"), &written).expect("the config");
+    let templates = machine.home(".local/state/arca-node/templates");
+    fs::create_dir(&templates).expect("the templates directory");
+    fs::set_permissions(&templates, fs::Permissions::from_mode(0o700)).expect("0700");
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        fs::write(templates.join(name), postgres_file_of_0_12_0(name)).expect("the file of 0.12.0");
+    }
+    fs::write(templates.join("nats.json"), "{}").expect("the owner's edit");
+    let shipped = |name: &str| {
+        arca::cmd_templates::SHIPPED
+            .iter()
+            .find(|(shipped, _)| *shipped == name)
+            .map(|(_, text)| text.to_string())
+            .expect("a shipped file")
+    };
+    let installed =
+        |name: &str| fs::read_to_string(templates.join(name)).expect("an installed file");
+    let bin = machine.home(".local/bin/arca").display().to_string();
+    let config_path = machine.home(".config/arca/node.json").display().to_string();
+
+    // The upgrade, by the installer alone.
+    let upgrade = machine.run(&[]);
+    upgrade
+        .ok()
+        .says("  templates brought up to this release: postgres-autopg.json, postgres-autopg.sh")
+        .says("(each was an earlier release's own file, not edited; a service that already runs is not changed)")
+        .says("  templates kept as you edited them: nats.json")
+        .says("To replace them with this release's, losing those edits:")
+        .says(&format!("{bin} templates install --config {config_path} --replace"));
+    assert_eq!(
+        machine
+            .log("arca")
+            .iter()
+            .filter(|line| line.starts_with("templates"))
+            .collect::<Vec<_>>(),
+        [&format!("templates install --config {config_path}")],
+        "one call, with no --replace"
+    );
+    for name in ["postgres-autopg.json", "postgres-autopg.sh"] {
+        assert_eq!(installed(name), shipped(name), "{name} is this release's");
+    }
+    assert!(installed("postgres-autopg.json").contains("\"generate\""));
+    assert_eq!(installed("nats.json"), "{}", "the owner's edit is kept");
+    // Every other shipped template was missing and is there now: the program's own step puts a template and its
+    // script in place together.
+    assert!(templates.join("omni-api.json").exists());
+    // The config is not this script's own text, and it is as it was.
+    assert_eq!(
+        fs::read_to_string(machine.home(".config/arca/node.json")).expect("the config"),
+        written
+    );
+
+    // Once more: nothing is left to bring up, and the edit is still named with its command.
+    let again = machine.run(&[]);
+    again
+        .ok()
+        .never_says("templates brought up")
+        .says("  templates kept as you edited them: nats.json");
+
+    // A program from before it named what it replaced answers without that list: the report says nothing of it.
+    fs::remove_file(templates.join("nats.json")).expect("remove the edit");
+    machine.switch("program-without-replaced", true);
+    machine.run(&[]).ok().never_says("templates");
+    machine.switch("program-without-replaced", false);
+
+    // A program whose step fails: said, with the command to run, and the install itself is not a failure.
+    machine.switch("templates-install-fails", true);
+    machine
+        .run(&[])
+        .ok()
+        .says("  templates NOT checked: `arca templates install` failed. Run it to see why:")
+        .says(&format!("{bin} templates install --config {config_path}"));
 }
 
 #[test]
