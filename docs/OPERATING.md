@@ -67,6 +67,8 @@ signal: a node reads its tokens when it starts and on SIGHUP, so a running node 
 | `arca templates install --config <file> [--replace]` | nothing from Incus: it writes the shipped service templates, each with its entrypoint or first-boot script, into `<stateDir>/templates` | `{ "dir", "installed", "unchanged", "kept" }` as JSON; a file that differs is kept unless `--replace` is given |
 | `arca probe consumer add --name <n> --image <fingerprint> --config <file>` / `remove --name <n> --config <file>` | locks desired state; add reads the default profile root pool with GET, then proposes a consumer entry | entry id and sequence |
 | `arca serve --config <file>` | runs until SIGTERM or SIGINT; SIGHUP reloads the token store only | nothing |
+| `arca init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>]` | the config, the machine's routes and addresses, and Incus through GET | the plan, two questions, and what Arca may now touch, in words; it writes the config's missing keys after a yes. See "Turning on changes" |
+| `arca init --watch-only --config <file>` | the config | what it wrote and what stays, in words; it empties `kernel.projects` and nothing else |
 | `arca setup-code --config <file>` | asks the running node, on its unix socket, for the setup code of the first passkey; for a machine with no screen | `{ "code", "expiresInSeconds", "page" }` as JSON on stdout, and one sentence on stderr; see "The page on this machine alone" |
 | `arca link serve --config <file>` | runs the node's link until SIGTERM or SIGINT | nothing on a clean run |
 | `arca link pair --config <file> [--minutes <n>]` | the running link's status | `{ "link", "expires" }` as JSON on stdout; a terminal QR on stderr |
@@ -279,6 +281,102 @@ so must every directory above it, except that a directory above it may be sticky
 to bind the socket anywhere else, naming the directory: a user who could write there, or rename a directory on the way,
 could put a socket of their own at the path and be sent a service's token. The socket has its own limit of 64
 connections, apart from every other listener's. A clean stop removes it.
+
+## Turning on changes
+
+A node the installer leaves only looks. One step lets it change things, and one step takes it back. Neither needs a
+second machine, a domain or a certificate.
+
+```sh
+arca init --enable-changes --config ~/.config/arca/node.json
+```
+
+or, at install time, `sh install.sh --enable-changes`, which installs and then runs the same step with `--yes`.
+
+**What does not change.** Every change still waits for the owner. An assistant proposes; nothing runs until the
+owner approves it with a passkey on the approval page. The step gives no token more reach: the installer's token can
+look and propose, as before. Until the first passkey is enrolled, nothing can be approved at all.
+
+**What it asks**, each with a default:
+
+1. `Let Arca make changes on this machine, each only after you approve it? [y/N]`. The default is no. `--yes`
+   answers it on the command line.
+2. `Service network <a.b.c.0/24> is free. Use it? [Y/n]`. The default is yes. `--service-cidr <a.b.c.0/24>` names
+   another, which is checked the same way.
+
+**What it writes.** Only keys that are missing; a key that is set is never changed.
+
+| Key | Written when | Value |
+|-----|--------------|-------|
+| `kernel.projects` | it is empty | `["arcak-svc"]`, the one Incus project Arca's services live in |
+| `kernel.droiddProjects` | it is empty | `["default"]`. Arca never writes in `default`; the entry only names it as not Arca's, which the config requires of a node that names a project of its own |
+| `kernel.serviceCidr` | it is absent | the /24 for the bridge `arcak-svcbr`, which Arca makes for its services |
+| `approvalOrigin` | no approval page is named | `http://localhost:<port>`, on the loopback door the config already opens |
+
+An approval page the config already names, `https://` or `http://localhost`, is kept as it is, and the step says
+which page approves. The config as it was is kept beside it as `<config>.before-init`, and both files are the
+user's alone. The new config is checked as `serve` checks it before it is written, so the step never leaves a config
+the node refuses.
+
+Then it installs the shipped templates into the state directory (`arca templates install`), and restarts the node
+only when the node is the installer's own service for this config (`arca.service`, written by `scripts/install.sh`).
+A node started any other way is the owner's to restart, and the step says so. It ends with what Arca may now touch,
+the page, how to get the first passkey, and the command that goes back.
+
+**How the service network is chosen.** It is read from the machine, never guessed. The step takes the first of
+`10.47.0.0/24` to `10.47.255.0/24` that meets none of these, and names each source in what it prints:
+
+- a route in the kernel's routing table (`/proc/net/route`);
+- an address of the machine itself (`/proc/net/fib_trie`);
+- a network Incus manages, and an address on any interface Incus lists;
+- a range `kernel.reservedCidrs` names;
+- the tailnet range `100.64.0.0/10`, which is never used whatever the tables say.
+
+When one of the sources cannot be read, the step asks whether to go on with what it could read (default no), and
+under `--yes` it stops. A network named with `--service-cidr` must be an IPv4 /24 and pass the same checks.
+
+**What it refuses, changing nothing:**
+
+- a config with no approval page and no loopback door for one. The step opens no door: a missing or `null`
+  `listen.loopback` may be the owner's no. Open it (`sh install.sh --door`) or set an `https://` `approvalOrigin`
+  first;
+- a loopback door that is not on `127.0.0.1` or `[::1]`, which the name `localhost` does not reach;
+- a machine where an instance carries another manager's marks. It names what it saw; list that manager's projects
+  in `kernel.droiddProjects` by hand, and the step fills that key only on a machine that has none;
+- a config set up by hand for something else: `kernel.scratch`, `kernel.bridged`, `kernel.adopt`, or
+  `kernel.projects` that names projects without `arcak-svc`;
+- a service network that is not free, or no free one among its own;
+- an Incus that does not answer on `incus.socket`;
+- root. It runs as the node's user and never runs `sudo`. The one program it starts is `systemctl --user`, to
+  restart the installer's unit.
+
+It takes `--config` as a flag and reads no default, like every command that writes.
+
+**Going back.**
+
+```sh
+arca init --watch-only --config ~/.config/arca/node.json
+```
+
+empties `kernel.projects` and changes nothing else, then restarts the installer's service as above. The node then
+only looks: it starts, stops, creates and removes nothing, and a proposal that waits can no longer run. Nothing is
+removed: the Incus project `arcak-svc`, its bridge, the services in it and the owner's passkeys stay as they are.
+Running `--enable-changes` again adds the project back and keeps the network and the page.
+
+**What this step does not do:**
+
+- It does not enrol a passkey. The owner does, on the page, with a setup code from the node's own screen or from
+  `arca setup-code`; see "The page on this machine alone".
+- The page it names is the page of one machine, for a machine where every account is trusted. Approving from a
+  phone or from another machine needs an `https://` origin, set by hand.
+- It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused; a database is created from the
+  `postgres-autopg` service template instead. It sets no `kernel.vmLimits`, so no virtual machine is created.
+  GPUs, tenants, adoption and import are not turned on.
+- It does not check that Incus can fetch a template's image; a create that cannot answers in Incus's own words.
+- It grants no access to Incus. The node's user must already be able to open the Incus socket, which is the
+  machine's administrator's to grant, as is keeping the service running without a login session.
+- On a node set back to watch-only, `service_list` answers "no service project", though the services are still
+  there; `watch_report` lists them.
 
 ## The link
 

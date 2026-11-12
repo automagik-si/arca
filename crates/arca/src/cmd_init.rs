@@ -496,25 +496,9 @@ impl Node<'_> {
             ),
             "nothing inside the tailnet range 100.64.0.0/10".to_string(),
         ];
-        if !unread.is_empty() {
-            let what = unread.join(" and ");
-            if self.flags.switch("yes") {
-                return Err(Failure::Runtime(format!(
-                    "init changed nothing: it could not read {what}, so it cannot tell which network is free, and it does not guess. Name one you know to be free with --service-cidr <a.b.c.0/24>"
-                )));
-            }
-            if !ask(
-                &format!(
-                    "Could not read {what}, so a network that looks free may be in use. Go on with what could be read? [y/N] "
-                ),
-                false,
-            ) {
-                return Err(Failure::Refused(
-                    "init changed nothing: name a network you know to be free with --service-cidr <a.b.c.0/24>"
-                        .to_string(),
-                ));
-            }
-        }
+        unread_sources(&unread, self.flags.switch("yes"), &|question| {
+            ask(question, false)
+        })?;
         match self.flags.value("service-cidr") {
             Some(named) => {
                 let Some(network) = Cidr::parse(named).filter(|cidr| cidr.prefix == 24 && cidr.is_network()) else {
@@ -561,11 +545,16 @@ impl Node<'_> {
             return Restart::NotOurs;
         };
         let unit = Path::new(&home).join(".config/systemd/user").join(UNIT);
+        // The unit names its config by its whole path; this command may have been given a shorter one.
+        let config = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
         let ours = fs::read_to_string(&unit).is_ok_and(|text| {
             text.starts_with(UNIT_MARK)
                 && text.lines().any(|line| {
-                    line.starts_with("ExecStart=")
-                        && line.ends_with(&format!(" serve --config {}", self.path.display()))
+                    line.strip_prefix("ExecStart=")
+                        .and_then(|command| command.split_once(" serve --config "))
+                        .is_some_and(|(_, named)| {
+                            Path::new(named) == config || Path::new(named) == self.path
+                        })
                 })
         });
         if !ours {
@@ -687,6 +676,30 @@ impl Network {
             Self::Kept(cidr) | Self::Picked { cidr, .. } | Self::Named { cidr, .. } => cidr,
         }
     }
+}
+
+/// What init does when it could not read every source that says which networks are in use. It never guesses: with
+/// `yes` (no person to ask) it stops, and otherwise it asks, with no as the default, and stops on anything but a yes.
+/// With every source read it goes on.
+fn unread_sources(unread: &[String], yes: bool, ask: &dyn Fn(&str) -> bool) -> Result<(), Failure> {
+    if unread.is_empty() {
+        return Ok(());
+    }
+    let what = unread.join(" and ");
+    if yes {
+        return Err(Failure::Runtime(format!(
+            "init changed nothing: it could not read {what}, so it cannot tell which network is free, and it does not guess. Name one you know to be free with --service-cidr <a.b.c.0/24>"
+        )));
+    }
+    if ask(&format!(
+        "Could not read {what}, so a network that looks free may be in use. Go on with what could be read? [y/N] "
+    )) {
+        return Ok(());
+    }
+    Err(Failure::Refused(
+        "init changed nothing: name a network you know to be free with --service-cidr <a.b.c.0/24>"
+            .to_string(),
+    ))
 }
 
 /// The instances on the machine that carry another manager's marks, as `project/name`, from one read of the watch.
@@ -994,6 +1007,50 @@ mod tests {
             candidates().find(|c| used.conflict(c).is_none()),
             Some(cidr("10.47.2.0/24"))
         );
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_read_is_asked_about_or_stops_init_and_is_never_guessed_around() {
+        let unread = vec![
+            "the routing table /proc/net/route".to_string(),
+            "Incus's networks".to_string(),
+        ];
+        let never = |_: &str| -> bool { panic!("nothing is asked") };
+        // Everything was read: nothing to ask, whoever runs it.
+        assert!(unread_sources(&[], true, &never).is_ok());
+        assert!(unread_sources(&[], false, &never).is_ok());
+        // Nobody to ask: it stops, names what it could not read, and says how to go on.
+        let stopped = unread_sources(&unread, true, &never).expect_err("it stops");
+        assert_eq!(stopped.code(), 1);
+        assert!(
+            stopped.message().contains(
+                "it could not read the routing table /proc/net/route and Incus's networks"
+            ),
+            "{}",
+            stopped.message()
+        );
+        assert!(stopped.message().contains("it does not guess"));
+        assert!(stopped.message().contains("--service-cidr"));
+        // A person: asked once, by name of what is missing, and only a yes goes on.
+        let asked = std::cell::RefCell::new(Vec::new());
+        let answer = |yes: bool| {
+            let asked = &asked;
+            move |question: &str| {
+                asked.borrow_mut().push(question.to_string());
+                yes
+            }
+        };
+        assert!(unread_sources(&unread, false, &answer(true)).is_ok());
+        let refused = unread_sources(&unread, false, &answer(false)).expect_err("a no stops it");
+        assert_eq!(refused.code(), 2);
+        let asked = asked.borrow();
+        assert_eq!(asked.len(), 2);
+        assert!(
+            asked[0].starts_with(
+                "Could not read the routing table /proc/net/route and Incus's networks"
+            )
+        );
+        assert!(asked[0].ends_with("[y/N] "));
     }
 
     #[test]

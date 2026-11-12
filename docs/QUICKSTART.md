@@ -212,35 +212,36 @@ and `service_list`. Three ways to reach it work today:
 Streamable HTTP is the node's one MCP transport. A client connects to the node's socket or to an address the node
 serves; the node is not started as a client's local command.
 
-**Not yet:** there is no `arca init`, so the config and its directories are written by hand as above; and Linux x86_64
-is the only published binary.
+**Not yet:** Linux x86_64 is the only published binary.
 
 ## Next: a node that changes things
 
-The node this page leaves only looks: `arca_status` answers `"mode":"watch-only"`, and a watch-only node writes nothing.
-It serves no approval page. Neither the installer nor the steps above turn these on. Today that is done by hand in the
-node's config, and a one-step way is being built.
+The node this page leaves only looks: `arca_status` answers `"mode":"watch-only"`, and a watch-only node writes
+nothing. One step lets it change things, with every change still waiting for you:
 
-This is a list of what to set and where the operating guide says how. The guide is a reference, not a walk-through, and
-the work needs a person comfortable with a terminal.
+```sh
+arca init --enable-changes --config ~/.config/arca/node.json
+```
 
-1. **Name the projects Arca may write in.** `kernel.projects` in `~/.config/arca/node.json`. With projects named, the
-   node's mode is `kernel`; with none it stays `watch-only`. ["The config file"](OPERATING.md#the-config-file) says
-   what this key and the keys beside it (`kernel.droiddProjects`, `kernel.serviceCidr`) may hold, and which configs
-   `serve` refuses.
-2. **Install the shipped templates.** `arca templates install --config ~/.config/arca/node.json` writes them into the
-   node's state directory. A service is created from one of them.
-3. **Set up the approval page and your passkey.** `approvalOrigin` in the config, an HTTPS address in front of the
-   node, and a first passkey enrolled with a one-time code. ["The approval page"](OPERATING.md#the-approval-page) says
-   what the page serves; the numbered steps begin at "To use it:" further down that section. Until a passkey is
-   trusted, every approval fails closed.
-   On one machine the page needs no domain and no HTTPS address: with `"approvalOrigin": "http://localhost:7471"`
-   beside the loopback door it is `http://localhost:7471/approve`, and `arca setup-code --config
-   ~/.config/arca/node.json` prints the first passkey's setup code on a machine with no screen. That way is for a
-   machine where every account is trusted; read
-   ["The page on this machine alone"](OPERATING.md#the-page-on-this-machine-alone-with-no-domain-and-no-certificate)
-   first.
-4. **Restart the node** so it reads the config again: `systemctl --user restart arca.service` where the installer
-   started it, or stop and start `arca serve`.
+It asks before it writes: whether Arca may make changes on this machine, each only after you approve it, and whether
+the service network it found free may be used. Then it names the Incus project Arca's services live in, that
+network, and the approval page on this machine's own door, `http://localhost:7471/approve`, installs the shipped
+templates and restarts the installer's service. `sh install.sh --enable-changes` does the same at install time,
+with the flag as your yes.
+
+What comes after is yours:
+
+1. **Enrol your passkey.** Open `http://localhost:7471/approve` in a browser on the machine and press **Get a setup
+   code**. On a machine with no screen, `arca setup-code --config ~/.config/arca/node.json` prints the code in a
+   terminal. Until a passkey is trusted, nothing can be approved.
+2. **Ask your assistant for something**, such as a NATS service. It proposes; nothing runs.
+3. **Approve it on the page** with your passkey. Arca runs it and writes it in its journal.
+
+That page is for a machine where every account is trusted, and it cannot be opened from a phone; read
+["The page on this machine alone"](OPERATING.md#the-page-on-this-machine-alone-with-no-domain-and-no-certificate)
+before you rely on it. ["Turning on changes"](OPERATING.md#turning-on-changes) says everything the step writes,
+what it refuses, and what it does not do.
+
+To go back to a node that only looks: `arca init --watch-only --config ~/.config/arca/node.json`. Nothing is removed.
 
 To run the node as a service by hand, read ["Running as a user service"](OPERATING.md#running-as-a-user-service).

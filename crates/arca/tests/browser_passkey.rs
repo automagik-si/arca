@@ -984,8 +984,23 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
 #[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
 fn g9_a_real_browser_at_http_localhost_saves_the_first_passkey_with_the_terminals_code_and_approves_a_change()
  {
+    first_passkey_and_first_approved_change("browser-local", false);
+}
+
+/// The whole way from the installer's node to the first approved change: the config is the installer's, which only
+/// looks, and `arca init --enable-changes` is what lets it change things and names its approval page. Then the same
+/// walk as above: the terminal's code, the first passkey, one proposal approved.
+#[test]
+#[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
+fn g10_from_the_installers_node_arca_init_then_the_first_passkey_and_the_first_approved_change() {
+    first_passkey_and_first_approved_change("browser-init", true);
+}
+
+/// The walk both tests above make. With `by_init`, the node's config starts as the installer writes it and `arca init
+/// --enable-changes --yes` makes it one that may change things; without, the config is written whole by the test.
+fn first_passkey_and_first_approved_change(tag: &str, by_init: bool) {
     let chrome_binary = std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.to_string());
-    let scratch = Scratch::new("browser-local");
+    let scratch = Scratch::new(tag);
     let state = scratch.at("state");
     private_dir(&state);
     let hash_dir = scratch.at("tokens");
@@ -1058,23 +1073,61 @@ fn g9_a_real_browser_at_http_localhost_saves_the_first_passkey_with_the_terminal
     let origin = format!("http://localhost:{port}");
     let socket = scratch.at("arca.sock");
     let config = scratch.at("node.json");
-    fs::write(
-        &config,
-        json!({
-            "stateDir": state.display().to_string(),
-            "incus": { "socket": fake.socket().display().to_string(), "pools": [] },
-            "listen": { "unix": socket.display().to_string(), "loopback": format!("127.0.0.1:{port}") },
-            "tokens": { "hashDir": hash_dir.display().to_string() },
-            "approvalOrigin": origin,
-            "approvalHost": "node1",
-            "kernel": {
-                "projects": [arca_netproject::PROJECT], "scratch": false, "droiddProjects": ["droid"],
-                "reservedCidrs": [], "serviceCidr": "192.0.2.0/24"
-            }
-        })
-        .to_string(),
-    )
-    .expect("the config");
+    if by_init {
+        // The installer's config, which names no kernel project, no service network and no approval page.
+        fs::write(
+            &config,
+            json!({
+                "stateDir": state.display().to_string(),
+                "incus": { "socket": fake.socket().display().to_string() },
+                "listen": { "unix": socket.display().to_string(), "loopback": format!("127.0.0.1:{port}") },
+                "tokens": { "hashDir": hash_dir.display().to_string() },
+                "kernel": { "droiddProjects": [] }
+            })
+            .to_string(),
+        )
+        .expect("the installer's config");
+        let out = arca()
+            .args(["init", "--enable-changes", "--yes", "--config"])
+            .arg(&config)
+            .output()
+            .expect("run arca init");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let said = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            said.contains(&format!("passkey on the page: {origin}/approve")),
+            "{said}"
+        );
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&config).expect("the config")).expect("JSON");
+        assert_eq!(written["approvalOrigin"], json!(origin));
+        assert_eq!(
+            written["kernel"]["projects"],
+            json!([arca_netproject::PROJECT])
+        );
+    } else {
+        fs::write(
+            &config,
+            json!({
+                "stateDir": state.display().to_string(),
+                "incus": { "socket": fake.socket().display().to_string(), "pools": [] },
+                "listen": { "unix": socket.display().to_string(), "loopback": format!("127.0.0.1:{port}") },
+                "tokens": { "hashDir": hash_dir.display().to_string() },
+                "approvalOrigin": origin,
+                "approvalHost": "node1",
+                "kernel": {
+                    "projects": [arca_netproject::PROJECT], "scratch": false, "droiddProjects": ["droid"],
+                    "reservedCidrs": [], "serviceCidr": "192.0.2.0/24"
+                }
+            })
+            .to_string(),
+        )
+        .expect("the config");
+    }
     let mut serve = Serve::start(&config, &bin, scratch.at("serve.log"));
     serve.wait_for(&socket);
 
