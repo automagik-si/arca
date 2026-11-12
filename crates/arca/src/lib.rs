@@ -16,6 +16,7 @@ pub mod approve_page;
 pub mod canvas;
 pub mod cmd_adopt;
 pub mod cmd_call;
+pub mod cmd_init;
 pub mod cmd_link;
 pub mod cmd_probe;
 pub mod cmd_serve;
@@ -65,6 +66,8 @@ const USAGE: &str = "usage: arca <command>
   probe consumer add --name <n> --image <fingerprint> --config <file>
   probe consumer remove --name <n> --config <file>
   serve --config <file>
+  init --enable-changes --config <file> [--yes] [--service-cidr <a.b.c.0/24>] (let this node make changes, each after the owner approves it)
+  init --watch-only --config <file> (back to a node that only looks)
   setup-code --config <file> (the code for the first passkey, on this terminal, for a machine with no screen)
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
   call --peer <name> <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
@@ -420,6 +423,7 @@ const COMMANDS: &[&str] = &[
     "link",
     "probe",
     "serve",
+    "init",
     "setup-code",
     "call",
     "token",
@@ -448,6 +452,11 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
         "metrics" => cmd_watch::metrics(&parse_flags(rest, &["config", "sample-for"], &["json"])?),
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),
         "setup-code" => cmd_setup_code::setup_code(&parse_flags(rest, &["config"], &[])?),
+        "init" => cmd_init::init(&parse_flags(
+            rest,
+            &["config", "service-cidr", "token-file"],
+            &["enable-changes", "watch-only", "yes"],
+        )?),
         "call" => cmd_call::call(rest),
         "link" => cmd_link::link(rest),
         "probe" => cmd_probe::probe(rest),
