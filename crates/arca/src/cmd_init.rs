@@ -47,11 +47,6 @@ const UNIT: &str = "arca.service";
 /// The kernel's IPv4 routing table and its table of the machine's own addresses.
 const ROUTES: &str = "/proc/net/route";
 const FIB_TRIE: &str = "/proc/net/fib_trie";
-/// `O_NOFOLLOW` on Linux: an open of a name that is a link fails.
-#[cfg(target_os = "linux")]
-const O_NOFOLLOW: i32 = 0o400000;
-#[cfg(not(target_os = "linux"))]
-const O_NOFOLLOW: i32 = 0;
 /// How long a restarted node has to answer with its new mode.
 const RESTART_WAIT: Duration = Duration::from_secs(30);
 
@@ -264,11 +259,23 @@ impl Node<'_> {
             "What an assistant proposes waits for you: nothing of it runs until you approve it with your passkey on the",
         );
         say("approval page.");
-        for line in direct.words(&self.path) {
+        for line in direct.words(&self.path, self.cfg.kernel.tenants.is_some()) {
             say(&line);
         }
         say("");
 
+        // --yes answers the two questions for the node the installer leaves, whose one token only looks and proposes. It
+        // does not answer for a token that would change things with no card and no passkey: that takes a person.
+        if !nothing_to_write && self.flags.switch("yes") && !direct.none() {
+            return Err(Failure::Refused(format!(
+                "init changed nothing: --yes does not answer for {}, which would then change things without your approval. Run it again without --yes and answer yourself, or take such tokens away first (arca token revoke <id> --config {})",
+                match direct {
+                    DirectTokens::Read(_) => "the tokens named above",
+                    DirectTokens::Unread(_) => "tokens it could not read",
+                },
+                self.path.display()
+            )));
+        }
         if !nothing_to_write {
             if !self.flags.switch("yes") {
                 if !ask(direct.question(), false) {
@@ -333,7 +340,7 @@ impl Node<'_> {
             "  What an assistant proposes waits for you: nothing of it runs until you approve it with your",
         );
         say(&format!("  passkey on the page: {origin}/approve"));
-        for line in direct.words(&self.path) {
+        for line in direct.words(&self.path, self.cfg.kernel.tenants.is_some()) {
             say(&format!("  {line}"));
         }
         if self.passkey_is_trusted() {
@@ -473,7 +480,7 @@ impl Node<'_> {
             let mut file = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .custom_flags(O_NOFOLLOW)
+                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
                 .mode(0o600)
                 .open(path)?;
             file.write_all(text.as_bytes())?;
@@ -499,17 +506,32 @@ impl Node<'_> {
         let mut staged = self.path.as_os_str().to_owned();
         staged.push(format!(".init-{}", std::process::id()));
         let staged = PathBuf::from(staged);
-        private(&staged, &text)
-            .and_then(|()| fs::rename(&staged, &self.path))
-            .and_then(|()| {
-                // The rename is in the directory: without this a power cut could bring the old config back.
-                let parent = self.path.parent().filter(|dir| !dir.as_os_str().is_empty());
-                fs::File::open(parent.unwrap_or(Path::new(".")))?.sync_all()
-            })
-            .map_err(|error| {
-                let _ = fs::remove_file(&staged);
-                failed("the config cannot be written", error)
-            })
+        match private(&staged, &text) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(Failure::Runtime(format!(
+                    "init changed nothing: {} is in the way, left by a run that was cut short. Remove it and run init again",
+                    staged.display()
+                )));
+            }
+            Err(error) => return Err(failed("the config cannot be written", error)),
+        }
+        fs::rename(&staged, &self.path).map_err(|error| {
+            let _ = fs::remove_file(&staged);
+            failed("the config cannot be written", error)
+        })?;
+        // The rename is in the directory: without this sync a power cut could bring the old config back. The config
+        // is changed either way, so a sync that fails is said as that, and init goes on.
+        let parent = self.path.parent().filter(|dir| !dir.as_os_str().is_empty());
+        if let Err(error) =
+            fs::File::open(parent.unwrap_or(Path::new("."))).and_then(|dir| dir.sync_all())
+        {
+            eprintln!(
+                "arca: the config was changed. Making that durable failed ({}), so a power cut in the next seconds could bring the config back as it was: check it after one",
+                error.kind()
+            );
+        }
+        Ok(())
     }
 
     /// The tokens of this node that may change things without the approval page once it may change things at all.
@@ -746,7 +768,7 @@ enum DirectTokens {
 
 impl DirectTokens {
     /// What init says of them before it asks and after it wrote: who may change things with no card and no passkey.
-    fn words(&self, config: &Path) -> Vec<String> {
+    fn words(&self, config: &Path, tenants: bool) -> Vec<String> {
         match self {
             Self::Read(tokens) if tokens.is_empty() => vec![
                 "No token of this node may do more than look and propose, so every change waits for your passkey."
@@ -764,9 +786,18 @@ impl DirectTokens {
                         .to_string(),
                 );
                 lines.push(
-                    "service's secret, unpublish one, start an instance, link and unlink a database, and use the Omni verbs."
+                    "service's secret, unpublish one, start an instance, link and unlink a database, create a database"
                         .to_string(),
                 );
+                lines.push(
+                    "from an image the token names, remove a database's record, password and links, and use the Omni verbs."
+                        .to_string(),
+                );
+                if tenants {
+                    lines.push(
+                        "This node holds tenants: such a token may also create and remove a tenant.".to_string(),
+                    );
+                }
                 lines.push(format!(
                     "To take one away first: arca token revoke <id> --config {}",
                     config.display()
@@ -783,14 +814,22 @@ impl DirectTokens {
         }
     }
 
+    /// Whether every token was read and none of them does more than look and propose.
+    fn none(&self) -> bool {
+        matches!(self, Self::Read(tokens) if tokens.is_empty())
+    }
+
     /// The question, which says the same.
     fn question(&self) -> &'static str {
         match self {
             Self::Read(tokens) if tokens.is_empty() => {
                 "Let Arca make changes on this machine, each only after you approve it? [y/N] "
             }
-            _ => {
+            Self::Read(_) => {
                 "Let Arca make changes on this machine: what is proposed after your approval, and directly for the tokens named above? [y/N] "
+            }
+            Self::Unread(_) => {
+                "Let Arca make changes on this machine: what is proposed after your approval, and directly for any doctor or operator token it has? [y/N] "
             }
         }
     }

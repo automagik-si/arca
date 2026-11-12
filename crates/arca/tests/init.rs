@@ -691,7 +691,9 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
         .says("with no card and no passkey:")
         .says("    doctor-1 (doctor)")
         .says("Whoever holds one may create a service from a template, connect and disconnect services, set a")
-        .says("service's secret, unpublish one, start an instance, link and unlink a database, and use the Omni verbs.")
+        .says("service's secret, unpublish one, start an instance, link and unlink a database, create a database")
+        .says("from an image the token names, remove a database's record, password and links, and use the Omni verbs.")
+        .never_says("This node holds tenants")
         .says(&format!(
             "To take one away first: arca token revoke <id> --config {}",
             node.config.display()
@@ -706,6 +708,16 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
         "the tokens are in what it printed before it asked:\n{all}"
     );
     assert_eq!(node.text(), before);
+
+    // --yes is not an answer for such a token: it stops, names the token again and changes nothing. This is what the
+    // installer's --enable-changes relays where the owner has minted one.
+    let said = node.init(&["--enable-changes", "--yes"], "");
+    assert_eq!(said.code, Some(2), "{}", said.all());
+    said.says("    doctor-1 (doctor)")
+        .says("init changed nothing: --yes does not answer for the tokens named above")
+        .says("Run it again without --yes and answer yourself, or take such tokens away first");
+    assert_eq!(node.text(), before);
+    assert!(!node.backup().exists());
 
     // After a yes the closing words say it again: the passkey gates what is proposed, not what such a token does.
     let said = node.init(&["--enable-changes"], "y\n\n");
@@ -722,6 +734,32 @@ fn init_names_every_token_that_may_change_things_without_the_page_before_it_asks
         .says("No token of this node may do more than look and propose, so every change waits for your passkey.")
         .says("Let Arca make changes on this machine, each only after you approve it? [y/N]")
         .never_says("NOT every change");
+}
+
+#[test]
+fn a_token_directory_that_cannot_be_read_is_said_as_that_and_is_no_yes() {
+    // The node's token directory is open to other users: the store refuses to read it, so init cannot say which
+    // tokens there are. It says exactly that, asks without pointing at a list it did not print, and --yes stops.
+    let node = Installed::new("tokens-unread");
+    mint(&node.scratch, &node.hash_dir, "doctor");
+    fs::set_permissions(&node.hash_dir, fs::Permissions::from_mode(0o777)).expect("chmod 0777");
+    let before = node.text();
+    let said = node.init(&["--enable-changes"], "");
+    assert_eq!(said.code, Some(2), "{}", said.all());
+    said.says(&format!(
+        "The tokens in {} could not be read, so init cannot say whether one of them may change things",
+        node.hash_dir.display()
+    ))
+    .says("directly, with no card and no passkey: a doctor or an operator token may.")
+    .says("and directly for any doctor or operator token it has? [y/N]")
+    .never_says("named above")
+    .never_says("every change waits for your passkey")
+    .never_says("doctor-1");
+    let said = node.init(&["--enable-changes", "--yes"], "");
+    assert_eq!(said.code, Some(2), "{}", said.all());
+    said.says("init changed nothing: --yes does not answer for tokens it could not read");
+    assert_eq!(node.text(), before);
+    fs::set_permissions(&node.hash_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
 }
 
 #[test]

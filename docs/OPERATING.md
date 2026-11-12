@@ -300,10 +300,15 @@ node as the installer leaves it every change waits for the passkey.
 
 A `doctor` or `operator` token does not wait. On a node that may change things, whoever holds one may, with no card
 and no passkey, create a service from a template (the shipped ones among them), connect and disconnect services, set
-a service's secret, unpublish one, start an instance, link and unlink a database, and use the Omni verbs. Such a
+a service's secret, unpublish one, start an instance, link and unlink a database, create a database from an image
+the token names, remove a database's record, password and links, and use the Omni verbs; on a node that holds
+tenants, also create and remove a tenant. Such a
 token gains that reach the moment the node may change things, so the step reads the token directory first and
 **names every `doctor` and `operator` token before it asks**. With none it says so, and then "every change waits
-for your passkey" is true as written. `arca token revoke <id> --config <file>` takes one away.
+for your passkey" is true as written. `arca token revoke <id> --config <file>` takes one away. `--yes` does not
+answer for such a token: where one exists, or the token directory cannot be read, the step under `--yes` stops,
+names them and changes nothing, and so does `sh install.sh --enable-changes`. Run it without `--yes` to answer
+yourself.
 
 **What it asks**, each with a default:
 
@@ -385,7 +390,9 @@ Running `--enable-changes` again adds the project back and keeps the network and
 - The page it names is the page of one machine, for a machine where every account is trusted. Approving from a
   phone or from another machine needs an `https://` origin, set by hand.
 - It sets no `kernel.postgresImage`, so a proposed `postgres_create` stays refused; a database is created from the
-  `postgres-autopg` service template instead. It sets no `kernel.vmLimits`, so no virtual machine is created.
+  `postgres-autopg` service template instead. That is about what is proposed: a `doctor` or `operator` token's own
+  `postgres_create` names its image itself and needs only the service network, and its `postgres_delete` removes a
+  database's record, password and links without a card. It sets no `kernel.vmLimits`, so no virtual machine is created.
   Tenants, adoption and import are not turned on. A node that may change things also runs its snapshot writer
   (snapshot pools and the project `arcak-snapshots`) and its GPU device writer: each acts only from a card the owner
   approves.
