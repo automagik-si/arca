@@ -8,7 +8,13 @@
 //! is unchanged, and this router is merged into its result in `cmd_serve`.
 //!
 //! `approvalOrigin` is the page origin and the WebAuthn rp id. It is not the host an approval statement names: the statement
-//! host stays `approval_host(&cfg)`.
+//! host stays `approval_host(&cfg)`. The origin is `https://` and a host name, or `http://localhost:<port>`, the page of a
+//! node on its own machine's loopback listener, whose rp id is `localhost`.
+//!
+//! The setup code reaches the owner on the machine's own screen, or on a terminal of the node's own user: the unix
+//! socket, and no other listener, carries `POST /local/setup-code` (see [`Page::local_router`]), which `arca setup-code`
+//! calls. It answers only a caller who has just made a file in the node's state directory, which nobody but the node's
+//! user can, and a peer on a forwarded socket cannot.
 //!
 //! With an owner approval request store (`Page::with_approval_requests`), the page lists the requests agents made with
 //! `owner_approval_request` in their own section, as data, and approves one with one tap: `POST /approve/requests/begin`
@@ -129,9 +135,26 @@ struct PageState {
     linked: Arc<Vec<LinkedHost>>,
     peer_sync: Option<PeerSyncer>,
     requests: Option<Arc<ApprovalRequests>>,
+    gate: Option<PageGate>,
 }
 
-/// The transient setup-code state. No code is ever persisted, logged or returned in a response.
+/// Why the page is closed right now, in words for the owner, or `None` while it is open. `serve` gives the page of this
+/// machine alone a gate that is closed while the node does not hold both loopback addresses of the page's port.
+pub type PageGate = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The refusal code of a page that is closed by its gate.
+pub const PAGE_CLOSED: &str = "page_closed";
+
+/// The path the unix socket alone carries for a setup code on the terminal.
+pub const LOCAL_SETUP_CODE_PATH: &str = "/local/setup-code";
+/// The prefix of the file a terminal's request makes in the state directory to show it can write there. The rest of the
+/// name is the request's own random hexadecimal.
+pub const LOCAL_PROOF_PREFIX: &str = "setup-code-request-";
+/// The length of that random part: 16 bytes in lowercase hexadecimal.
+pub const LOCAL_PROOF_LEN: usize = 32;
+
+/// The transient setup-code state. No code is ever persisted or logged. One is returned in a response only by the unix
+/// socket's [`LOCAL_SETUP_CODE_PATH`], to a caller who can write the node's state directory.
 #[derive(Default)]
 struct SetupState {
     live: Option<LiveCode>,
@@ -210,7 +233,7 @@ impl SetupState {
 ///
 /// # Panics
 ///
-/// Panics when `origin` is not the validated `https://` origin. `cmd_serve` only calls this after the config check.
+/// Panics when `origin` is not a validated approval origin. `cmd_serve` only calls this after the config check.
 pub fn router(
     origin: String,
     kernel: Arc<Mutex<Kernel>>,
@@ -224,7 +247,7 @@ pub fn router(
 ///
 /// # Panics
 ///
-/// Panics when `origin` is not the validated `https://` origin.
+/// Panics when `origin` is not a validated approval origin.
 pub fn router_with(
     origin: String,
     kernel: Arc<Mutex<Kernel>>,
@@ -245,7 +268,7 @@ impl Page {
     ///
     /// # Panics
     ///
-    /// Panics when `origin` is not the validated `https://` origin.
+    /// Panics when `origin` is not a validated approval origin.
     pub fn new(
         origin: String,
         kernel: Arc<Mutex<Kernel>>,
@@ -253,12 +276,16 @@ impl Page {
         state_dir: PathBuf,
         display: Arc<dyn SetupCodeDisplay>,
     ) -> Self {
-        let rp_id = origin
-            .strip_prefix("https://")
-            .and_then(|authority| authority.split(':').next())
-            .filter(|host| !host.is_empty())
-            .expect("approvalOrigin is validated before the page router is built")
-            .to_string();
+        let rp_id = if arca_approval::localhost_origin_port(&origin).is_some() {
+            arca_approval::LOCALHOST_RP.to_string()
+        } else {
+            origin
+                .strip_prefix("https://")
+                .and_then(|authority| authority.split(':').next())
+                .filter(|host| !host.is_empty())
+                .expect("approvalOrigin is validated before the page router is built")
+                .to_string()
+        };
         let base_passkeys = kernel
             .lock()
             .map(|kernel| kernel.owner_passkey_lines())
@@ -288,12 +315,20 @@ impl Page {
                 linked: Arc::new(Vec::new()),
                 peer_sync: None,
                 requests: None,
+                gate: None,
             },
         }
     }
 
     /// Supplies the handlers an approved action runs through. `cmd_serve` passes the same handler set the MCP door holds;
     /// tests may pass a fake. Without them an action proposal can still be listed and declined, but not approved.
+    /// Closes the page while `gate` says why: every page route, and the terminal's setup code, answer 503 with the
+    /// gate's words and do nothing else. Without a gate the page is always open.
+    pub fn with_gate(mut self, gate: PageGate) -> Self {
+        self.state.gate = Some(gate);
+        self
+    }
+
     pub fn with_actions(mut self, actions: ActionExecutor) -> Self {
         self.state.actions = actions;
         self
@@ -352,6 +387,17 @@ impl Page {
         &self.state.canvas
     }
 
+    /// The router of the unix socket alone: `POST /local/setup-code`, the setup code for a terminal of the node's own
+    /// user. It shares this binding's setup state, so the code it answers with is the one the page then takes. No TCP
+    /// listener and no services socket may carry it: it has no bearer check and no `Origin` rule of the page's, only
+    /// its own proof (see [`local_setup_code`]).
+    pub fn local_router(&self) -> Router {
+        Router::new()
+            .route(LOCAL_SETUP_CODE_PATH, post(local_setup_code))
+            .layer(DefaultBodyLimit::max(1024))
+            .with_state(Arc::new(self.state.clone()))
+    }
+
     /// Builds a router sharing this binding's setup state. Only the proxy listener trusts forwarded caller addresses.
     pub fn router(&self, trust_forwarded_for: bool) -> Router {
         let state = Arc::new(PageState {
@@ -396,6 +442,10 @@ impl Page {
             .layer(DefaultBodyLimit::max(PAGE_BODY_BYTES))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
+                gate_rule,
+            ))
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
                 origin_rule,
             ))
             .layer(middleware::from_fn(security_headers))
@@ -420,6 +470,27 @@ impl PageState {
             .unwrap_or("proxy-unknown")
             .to_string()
     }
+}
+
+/// The page's gate, after the Origin rule and before any handler or body: while the gate gives a reason, every page route
+/// answers 503 with it, the page itself included. A closed page serves no card, takes no approval and gives no setup
+/// code: the node takes nothing from the owner while it is closed, and no setup code exists to be typed elsewhere.
+/// It does not undo a signature: a passkey approval the owner gave at another program's copy of the page is still a
+/// valid approval of the card that program chose, until its statement expires. That program can spend it once the
+/// page is open again, or through the MCP approval verbs, which this gate does not cover.
+async fn gate_rule(State(state): State<Arc<PageState>>, request: Request, next: Next) -> Response {
+    if let Some(why) = state.gate.as_ref().and_then(|gate| gate()) {
+        return page_closed(why);
+    }
+    next.run(request).await
+}
+
+fn page_closed(why: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "refusal": PAGE_CLOSED, "message": why })),
+    )
+        .into_response()
 }
 
 /// The page's Origin rule, before any body is read: a POST needs the exact configured Origin; a GET needs none or the exact
@@ -1409,6 +1480,126 @@ async fn setup_code(State(state): State<Arc<PageState>>, headers: HeaderMap) -> 
         expires: now.saturating_add(CODE_TTL_MS),
     });
     Json(json!({ "issued": true })).into_response()
+}
+
+/// The setup code for a terminal: the code that is live now, or a new one, in the answer itself. It is for a machine with
+/// no screen to show a code on, and it is the unix socket's route alone.
+///
+/// The caller proves it can write the node's state directory: before it asks, it makes an empty file there named
+/// [`LOCAL_PROOF_PREFIX`] and 32 hexadecimal digits of its own choosing, and sends those digits. The handler finds that
+/// file (a regular file of this process's own user), removes it, and only then answers. The state directory is mode
+/// 0700, so the caller is the node's user on this machine. A peer that reaches the socket some other way, such as
+/// through a forward from another machine, can make no such file and gets 403; so does a request that carries an
+/// `Origin`. Whoever can write the state directory could already write the passkeys file in it, so the route gives
+/// that user nothing new.
+///
+/// No passkey may be trusted yet, as for the page's own request. A new code counts against the same hourly bound and
+/// the same lock; the 60-second spacing between requests, which keeps a page from filling a screen with notifications,
+/// does not apply to a terminal.
+async fn local_setup_code(
+    State(state): State<Arc<PageState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if headers.contains_key(header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let proof = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("proof")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let Some(proof) = proof.filter(|proof| {
+        proof.len() == LOCAL_PROOF_LEN
+            && proof
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !take_local_proof(&state.state_dir, &proof) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "message": "The caller did not show that it can write this node's state directory" })),
+        )
+            .into_response();
+    }
+    // A code for a page that is closed would be typed into whatever answers at the page's address.
+    if let Some(why) = state.gate.as_ref().and_then(|gate| gate()) {
+        return page_closed(why);
+    }
+    let now = (state.clock)();
+    let mut setup = match state.setup.lock() {
+        Ok(setup) => setup,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let trusted = match state.kernel.lock() {
+        Ok(kernel) => kernel.owner_passkey_count() > 0,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if trusted {
+        return already_trusted();
+    }
+    setup.prune(now);
+    if let Some(minutes) = setup.locked_minutes(now) {
+        return locked(minutes);
+    }
+    let answer = |code: &str, expires: u64| {
+        Json(json!({
+            "code": code,
+            "expiresInSeconds": expires.saturating_sub(now).div_ceil(1000),
+        }))
+        .into_response()
+    };
+    if let Some(live) = setup.live_if_fresh(now) {
+        return answer(&live.code, live.expires);
+    }
+    if setup.requests.len() >= MAX_CODE_REQUESTS {
+        setup.lock(now);
+        return locked(setup.locked_minutes(now).unwrap_or(1));
+    }
+    setup.requests.push(now);
+    let Ok(code) = fresh_code() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let expires = now.saturating_add(CODE_TTL_MS);
+    let reply = answer(&code, expires);
+    setup.live = Some(LiveCode { code, expires });
+    reply
+}
+
+/// How old a terminal request's proof file may be. The command makes it and asks at once.
+const LOCAL_PROOF_FRESH: Duration = Duration::from_secs(60);
+
+/// Takes the proof file of one terminal request: `true` when the state directory, which is still a directory of this
+/// process's own user at mode 0700, held a regular file of that user under the request's name, made within the last
+/// [`LOCAL_PROOF_FRESH`], and the file was removed. A link, a directory, another user's file, a file that is not there,
+/// an old file, a file that cannot be removed, and a state directory that was opened up since `serve` checked it at
+/// start are all no proof.
+fn take_local_proof(state_dir: &Path, proof: &str) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(uid) = arca_approval::effective_uid() else {
+        return false;
+    };
+    let private = fs::symlink_metadata(state_dir).is_ok_and(|dir| {
+        dir.is_dir() && dir.uid() == uid && dir.permissions().mode() & 0o777 == 0o700
+    });
+    if !private {
+        return false;
+    }
+    let path = state_dir.join(format!("{LOCAL_PROOF_PREFIX}{proof}"));
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    let fresh = meta
+        .modified()
+        .ok()
+        .and_then(|made| made.elapsed().ok())
+        .is_some_and(|age| age <= LOCAL_PROOF_FRESH);
+    meta.is_file() && meta.uid() == uid && fresh && fs::remove_file(&path).is_ok()
 }
 
 /// Checks a setup code before the page creates a credential, using the same wrong-try budgets as registration. A correct

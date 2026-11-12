@@ -134,6 +134,24 @@
                 "open": {
                   "type": "boolean"
                 },
+                "page": {
+                  "properties": {
+                    "open": {
+                      "type": "boolean"
+                    },
+                    "reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "open",
+                    "reason"
+                  ],
+                  "type": "object"
+                },
                 "reason": {
                   "type": [
                     "string",

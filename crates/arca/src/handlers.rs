@@ -457,51 +457,220 @@ pub struct StatusHandler {
 /// The loopback listener's state: its address, and why it is closed while it is. `serve` shares one value between the
 /// listener, which reports each bind it tries, and `arca_status`, which says what the last try found. A closed door
 /// never stops the node: its other listeners serve, and the address is tried again.
+///
+/// The door of a node whose approval page is `http://localhost:<port>` has a twin: the same port on the other
+/// loopback address. `localhost` names both `127.0.0.1` and `::1`, and a browser tries `::1` first, so a program that
+/// held the address this node does not would be the page, at the page's exact origin. Such a node binds both, and its
+/// page is open only while it holds both (see [`LoopbackDoor::page_refusal`]).
 #[derive(Clone)]
 pub struct LoopbackDoor {
     addr: std::net::SocketAddr,
-    closed: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<DoorState>>,
+    /// Whether this is the twin of a page's door: an address this machine does not have is then nobody's to hold.
+    is_twin: bool,
+    twin: Option<Arc<LoopbackDoor>>,
+    /// The kernel's list of the machine's IPv6 addresses.
+    inet6_table: PathBuf,
 }
+
+/// The kernel's list of the IPv6 addresses assigned to the machine's interfaces, one a line, the address first as 32
+/// hexadecimal digits.
+const INET6_TABLE: &str = "/proc/net/if_inet6";
+/// `::1` as that list writes it.
+const INET6_LOOPBACK: &str = "00000000000000000000000000000001";
+
+/// Whether the machine has an IPv6 loopback address, read from the kernel's list at `table`.
+#[derive(Debug, PartialEq, Eq)]
+enum Inet6Loopback {
+    /// The list is not there (a kernel with no IPv6), or lists no `::1`.
+    No,
+    /// The list has `::1`.
+    Yes,
+    /// The list is there and cannot be read.
+    Unknown,
+}
+
+fn inet6_loopback(table: &Path) -> Inet6Loopback {
+    match std::fs::read_to_string(table) {
+        Ok(text) => {
+            let listed = text
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(INET6_LOOPBACK));
+            if listed {
+                Inet6Loopback::Yes
+            } else {
+                Inet6Loopback::No
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Inet6Loopback::No,
+        Err(_) => Inet6Loopback::Unknown,
+    }
+}
+
+/// What the last try of a bind found.
+#[derive(Clone, PartialEq, Eq)]
+enum DoorState {
+    /// This node holds the address.
+    Held,
+    /// The machine has no such address (no IPv6 loopback), so no program can hold it. Only a twin is ever this.
+    Absent,
+    /// This node does not hold the address, and why.
+    Closed(String),
+}
+
+/// `EAFNOSUPPORT` on Linux: the machine's kernel has no such address family at all.
+const ADDRESS_FAMILY_NOT_SUPPORTED: i32 = 97;
 
 impl LoopbackDoor {
     /// The door of `addr`, closed until its first bind succeeds.
     pub fn new(addr: std::net::SocketAddr) -> Self {
         Self {
             addr,
-            closed: Arc::new(Mutex::new(Some("not opened yet".to_string()))),
+            state: Arc::new(Mutex::new(DoorState::Closed("not opened yet".to_string()))),
+            is_twin: false,
+            twin: None,
+            inet6_table: PathBuf::from(INET6_TABLE),
         }
+    }
+
+    /// Reads the machine's IPv6 addresses from `table` instead of the kernel's own list.
+    ///
+    /// Test seam: a test names a file of its own. Call it before [`LoopbackDoor::with_twin`], which hands it on.
+    #[doc(hidden)]
+    pub fn with_inet6_table(mut self, table: PathBuf) -> Self {
+        self.inet6_table = table;
+        self
+    }
+
+    /// This door with its twin: the same port on the other loopback address, for a node whose approval page is
+    /// `http://localhost:<port>`.
+    pub fn with_twin(mut self) -> Self {
+        let other: std::net::IpAddr = if self.addr.is_ipv4() {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        };
+        let mut twin = Self::new(std::net::SocketAddr::new(other, self.addr.port()));
+        twin.is_twin = true;
+        twin.inet6_table = self.inet6_table.clone();
+        self.twin = Some(Arc::new(twin));
+        self
+    }
+
+    /// The twin's own door, for the listener that binds it.
+    pub fn twin(&self) -> Option<LoopbackDoor> {
+        self.twin.as_deref().cloned()
+    }
+
+    /// The address this door is of.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
     }
 
     /// Records one try of the bind: `Some(error)` for a try that failed, `None` for the one that succeeded. A change
     /// is said once on stderr, so a port that stays held does not fill the log.
+    ///
+    /// For a twin, an address the machine does not have at all (`EADDRNOTAVAIL`, as on a machine whose IPv6 is turned
+    /// off, or `EAFNOSUPPORT`, as on a kernel built without it) is not a door another program holds: no program can
+    /// bind it and no browser can reach it. It counts as held, and the bind is still tried again, so an address that
+    /// appears later is taken. Every other failure, a port in use first of all, is a door this node does not hold.
+    ///
+    /// Those two errors can be true for this process alone: a unit that restricts address families, or a network
+    /// namespace of the node's own, fails the bind while the machine has `::1` for any other program to take. So the
+    /// error is believed only when the kernel's own list of addresses has no `::1` (or is not there at all). When the
+    /// list has it, or cannot be read, the address is one this node does not hold, and the page stays closed.
     pub fn report(&self, error: Option<&std::io::Error>) {
-        let reason = error.map(|error| match error.kind() {
-            std::io::ErrorKind::AddrInUse => {
-                "address in use: another program holds this port".to_string()
+        let no_such_address = |error: &std::io::Error| {
+            error.kind() == std::io::ErrorKind::AddrNotAvailable
+                || error.raw_os_error() == Some(ADDRESS_FAMILY_NOT_SUPPORTED)
+        };
+        let found = match error {
+            None => DoorState::Held,
+            Some(error) if self.is_twin && no_such_address(error) => {
+                match inet6_loopback(&self.inet6_table) {
+                    Inet6Loopback::No => DoorState::Absent,
+                    Inet6Loopback::Yes => DoorState::Closed(format!(
+                        "this node cannot bind it ({error}), and the machine has the address: something of the node's own, such as restricted address families or a network namespace, keeps it from the node, and another program could hold it"
+                    )),
+                    Inet6Loopback::Unknown => DoorState::Closed(format!(
+                        "this node cannot bind it ({error}), and {} cannot be read, so it cannot tell whether the machine has the address",
+                        self.inet6_table.display()
+                    )),
+                }
             }
-            std::io::ErrorKind::AddrNotAvailable => {
-                "the address is not assigned to this machine".to_string()
-            }
-            std::io::ErrorKind::PermissionDenied => "this user may not take this port".to_string(),
-            other => other.to_string(),
-        });
-        let mut closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
-        if *closed != reason {
-            match &reason {
-                Some(why) => eprintln!(
-                    "arca: the loopback door {} is closed: {why}. The node runs without it and tries the address again",
-                    self.addr
+            Some(error) => DoorState::Closed(match error.kind() {
+                std::io::ErrorKind::AddrInUse => {
+                    "address in use: another program holds this port".to_string()
+                }
+                std::io::ErrorKind::AddrNotAvailable => {
+                    "the address is not assigned to this machine".to_string()
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    "this user may not take this port".to_string()
+                }
+                other => other.to_string(),
+            }),
+        };
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if *state != found {
+            let addr = self.addr;
+            match (&found, self.is_twin) {
+                (DoorState::Closed(why), false) => eprintln!(
+                    "arca: the loopback door {addr} is closed: {why}. The node runs without it and tries the address again"
                 ),
-                None => eprintln!("arca: the loopback door {} is open", self.addr),
+                (DoorState::Closed(why), true) => eprintln!(
+                    "arca: the approval page's other address {addr} is not this node's: {why}. The page is closed until it is, and the address is tried again"
+                ),
+                (DoorState::Absent, _) => eprintln!(
+                    "arca: the approval page's other address {addr} is not on this machine, so no program can hold it"
+                ),
+                (DoorState::Held, false) => eprintln!("arca: the loopback door {addr} is open"),
+                (DoorState::Held, true) => {
+                    eprintln!("arca: the approval page's other address {addr} is this node's")
+                }
             }
         }
-        *closed = reason;
+        *state = found;
     }
 
-    /// What `arca_status` says of the door: its address, whether it is open, and the reason while it is not.
+    /// Why this node does not hold the address, or `None` while it does, or while nobody can.
+    fn not_held(&self) -> Option<String> {
+        match &*self.state.lock().unwrap_or_else(PoisonError::into_inner) {
+            DoorState::Closed(why) => Some(why.clone()),
+            DoorState::Held | DoorState::Absent => None,
+        }
+    }
+
+    /// Why the page of this machine alone is closed, in words for the owner, or `None` while it is open: this node
+    /// holds its door and the twin (or the machine has no twin address). `None` too for a door with no twin, whose
+    /// page is not on it. While this is `Some`, some other program may be answering at the page's origin: the page
+    /// serves nothing, takes no approval and gives no setup code, so no code exists to be typed there. A signature
+    /// the owner gives there is not undone by this: it stays a valid approval of the card that program chose until
+    /// its statement expires.
+    pub fn page_refusal(&self) -> Option<String> {
+        let twin = self.twin.as_deref()?;
+        [self, twin].into_iter().find_map(|door| {
+            door.not_held().map(|why| {
+                format!(
+                    "The approval page is closed: this node does not hold {} ({why}). Whatever answers at http://localhost:{} now may be another program, so type no setup code and approve nothing there. `arca_status` says when the page is open",
+                    door.addr,
+                    self.addr.port()
+                )
+            })
+        })
+    }
+
+    /// What `arca_status` says of the door: its address, whether it is open, and the reason while it is not. With a
+    /// twin, also `page`: whether the page is open, which takes both addresses, and the reason while it is not.
     pub fn json(&self) -> Value {
-        let closed = self.closed.lock().unwrap_or_else(PoisonError::into_inner);
-        json!({ "addr": self.addr.to_string(), "open": closed.is_none(), "reason": *closed })
+        let closed = self.not_held();
+        let mut status =
+            json!({ "addr": self.addr.to_string(), "open": closed.is_none(), "reason": closed });
+        if self.twin.is_some() {
+            let refusal = self.page_refusal();
+            status["page"] = json!({ "open": refusal.is_none(), "reason": refusal });
+        }
+        status
     }
 }
 

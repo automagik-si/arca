@@ -19,6 +19,7 @@ pub mod cmd_call;
 pub mod cmd_link;
 pub mod cmd_probe;
 pub mod cmd_serve;
+pub mod cmd_setup_code;
 pub mod cmd_status;
 pub mod cmd_store;
 pub mod cmd_templates;
@@ -64,6 +65,7 @@ const USAGE: &str = "usage: arca <command>
   probe consumer add --name <n> --image <fingerprint> --config <file>
   probe consumer remove --name <n> --config <file>
   serve --config <file>
+  setup-code --config <file> (the code for the first passkey, on this terminal, for a machine with no screen)
   call <verb> [--config <file>] [--token-file <file>] [--args <json> | --args-file <file>]
   call --peer <name> <verb> --config <file> --token-file <file> [--args <json> | --args-file <file>]
   call (alone: lists the verbs)
@@ -418,6 +420,7 @@ const COMMANDS: &[&str] = &[
     "link",
     "probe",
     "serve",
+    "setup-code",
     "call",
     "token",
     "store",
@@ -444,6 +447,7 @@ fn run_command(command: &str, rest: &[String]) -> Result<Option<Value>, Failure>
         "watch" => cmd_watch::watch(&parse_flags(rest, &["config"], &["once", "json"])?),
         "metrics" => cmd_watch::metrics(&parse_flags(rest, &["config", "sample-for"], &["json"])?),
         "serve" => cmd_serve::serve(&parse_flags(rest, &["config"], &[])?),
+        "setup-code" => cmd_setup_code::setup_code(&parse_flags(rest, &["config"], &[])?),
         "call" => cmd_call::call(rest),
         "link" => cmd_link::link(rest),
         "probe" => cmd_probe::probe(rest),

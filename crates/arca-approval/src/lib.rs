@@ -30,10 +30,10 @@ pub use foreign::{ForeignPasskeys, SourceState};
 pub use nonces::FileNonces;
 pub use owner::OwnerKeys;
 pub use passkey::{
-    Asserted, FileSignCounts, OWNER_PASSKEYS, PASSKEY_CHALLENGE_PREFIX, PASSKEY_COUNTS_FILE,
-    PasskeyLine, PasskeyProof, PasskeyVerifier, STATE_PASSKEYS_FILE, TEST_PASSKEYS_ENV,
-    challenge_for, format_passkey_line, load_passkeys, load_state_passkeys, parse_passkeys,
-    parse_proof, passkeys_trust, verify_assertion,
+    Asserted, FileSignCounts, LOCALHOST_RP, OWNER_PASSKEYS, PASSKEY_CHALLENGE_PREFIX,
+    PASSKEY_COUNTS_FILE, PasskeyLine, PasskeyProof, PasskeyVerifier, STATE_PASSKEYS_FILE,
+    TEST_PASSKEYS_ENV, challenge_for, format_passkey_line, load_passkeys, load_state_passkeys,
+    localhost_origin_port, parse_passkeys, parse_proof, passkeys_trust, verify_assertion,
 };
 pub use peer::{
     PEER_PASSKEYS_FILE, PeerPasskeys, PeerSet, PeerState, normal_lines, normalize_set,

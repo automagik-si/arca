@@ -976,3 +976,241 @@ fn g8_a_real_browser_registers_two_passkeys_and_approves_a_request_and_a_delete_
          the replay on a re-created nats refused by the sign count with no nonce spent"
     );
 }
+
+/// The page of a node on its own machine: `http://localhost:<port>` on the loopback listener, with no certificate and no
+/// TLS front. A real Chromium saves the first passkey there with the setup code `arca setup-code` prints on a machine
+/// with no screen, approves a change an assistant proposed, and is refused both at the same page under the IP address.
+#[test]
+#[ignore = "drives a real Chromium; run with: cargo test -p arca --test browser_passkey -- --ignored"]
+fn g9_a_real_browser_at_http_localhost_saves_the_first_passkey_with_the_terminals_code_and_approves_a_change()
+ {
+    let chrome_binary = std::env::var(CHROME_ENV).unwrap_or_else(|_| DEFAULT_CHROME.to_string());
+    let scratch = Scratch::new("browser-local");
+    let state = scratch.at("state");
+    private_dir(&state);
+    let hash_dir = scratch.at("tokens");
+    private_dir(&hash_dir);
+
+    // The assistant's token: a viewer, which may look and propose and nothing more.
+    let secret_file = scratch.at("viewer.secret");
+    run(
+        arca()
+            .args([
+                "token",
+                "mint",
+                "--scope",
+                "viewer",
+                "--id",
+                "assistant-1",
+                "--hash-dir",
+            ])
+            .arg(&hash_dir)
+            .arg("--out")
+            .arg(&secret_file),
+        "token mint",
+    );
+    let viewer = fs::read_to_string(&secret_file)
+        .expect("the secret")
+        .trim_end()
+        .to_string();
+
+    let fake = FakeIncus::start(
+        &scratch.0,
+        FakeState {
+            server: json!({}),
+            projects: vec![],
+            instances: vec![],
+            networks: vec![],
+            pools: vec![],
+        },
+    )
+    .expect("the fake Incus");
+    fake.add_profile(
+        "default",
+        json!({ "name": "default", "config": {},
+                "devices": { "root": { "type": "disk", "pool": "default", "path": "/" } } }),
+    );
+    let templates = state.join("templates");
+    private_dir(&templates);
+    fs::write(
+        templates.join("nats.json"),
+        json!({
+            "name": "nats", "kind": "oci", "image": "docker.io/library/nats",
+            "digest": format!("sha256:{}", "a".repeat(64)),
+            "ports": [4222], "env": {}, "publishable": false
+        })
+        .to_string(),
+    )
+    .expect("the template");
+    // A machine with no screen: its `notify-send` fails, so the page's own request for a code cannot be shown.
+    let bin = scratch.at("bin");
+    private_dir(&bin);
+    let notify = bin.join("notify-send");
+    fs::write(&notify, "#!/bin/sh\nexit 1\n").expect("the stub desktop");
+    fs::set_permissions(&notify, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    // The door's port is free when it is read; the node binds it a moment later.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let origin = format!("http://localhost:{port}");
+    let socket = scratch.at("arca.sock");
+    let config = scratch.at("node.json");
+    fs::write(
+        &config,
+        json!({
+            "stateDir": state.display().to_string(),
+            "incus": { "socket": fake.socket().display().to_string(), "pools": [] },
+            "listen": { "unix": socket.display().to_string(), "loopback": format!("127.0.0.1:{port}") },
+            "tokens": { "hashDir": hash_dir.display().to_string() },
+            "approvalOrigin": origin,
+            "approvalHost": "node1",
+            "kernel": {
+                "projects": [arca_netproject::PROJECT], "scratch": false, "droiddProjects": ["droid"],
+                "reservedCidrs": [], "serviceCidr": "192.0.2.0/24"
+            }
+        })
+        .to_string(),
+    )
+    .expect("the config");
+    let mut serve = Serve::start(&config, &bin, scratch.at("serve.log"));
+    serve.wait_for(&socket);
+
+    // The assistant proposes a change. Nothing runs until the owner approves it.
+    result(
+        &mcp(
+            &socket,
+            &viewer,
+            1,
+            "action_propose",
+            json!({ "action": "service_create", "args": { "name": "nats", "template": "nats" } }),
+        ),
+        "action_propose",
+    );
+    assert!(!instance_exists(&fake, "nats"), "a proposal runs nothing");
+
+    // The browser, with a device that checks its user, opens the page by the name localhost, over plain http.
+    let mut chrome = Chrome::launch(
+        &chrome_binary,
+        &scratch.at("chrome"),
+        "AAAA",
+        &scratch.at("chrome.log"),
+    );
+    chrome.page("WebAuthn.enable", json!({ "enableUI": false }));
+    chrome.page(
+        "Emulation.setFocusEmulationEnabled",
+        json!({ "enabled": true }),
+    );
+    chrome.authenticator("internal");
+    chrome.page(
+        "Page.navigate",
+        json!({ "url": format!("{origin}/approve") }),
+    );
+    let deadline = Instant::now() + WAIT;
+    while chrome.eval(
+        "document.readyState === 'complete' && document.getElementById('trusted').textContent === '0' && !!document.querySelector('#plans button.approve')",
+    ) != json!(true)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the page loads with no passkey and one waiting card; server log:\n{}",
+            serve.log_text()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(chrome.eval("location.origin"), json!(origin));
+    assert_eq!(
+        chrome.eval("window.isSecureContext"),
+        json!(true),
+        "the browser treats http://localhost as a secure context"
+    );
+    assert_eq!(
+        chrome.eval("!document.getElementById('local-help').hidden && document.getElementById('local-help').textContent.includes('ssh -o ExitOnForwardFailure=yes -L ' + location.port + ':127.0.0.1:' + location.port)"),
+        json!(true),
+        "the page says what this browser needs, and the other way in"
+    );
+
+    // 1. The machine has no screen: the page says so, and names the command for the terminal.
+    chrome.click("#get-code");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let said = chrome.eval("document.getElementById('status').textContent");
+        if said
+            .as_str()
+            .is_some_and(|text| text.contains("no screen") && text.contains("arca setup-code"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the page names the terminal's command; it says {said}"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let out = arca()
+        .args(["setup-code", "--config"])
+        .arg(&config)
+        .output()
+        .expect("run arca setup-code");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let printed: Value = serde_json::from_slice(&out.stdout).expect("JSON on stdout");
+    let code = printed["code"].as_str().expect("a code").to_string();
+    assert_eq!(printed["page"], json!(format!("{origin}/approve")));
+
+    // 2. The first passkey, saved by the page's own script at http://localhost.
+    chrome.eval(&format!(
+        "document.getElementById('setup-code').value = {code:?}; document.getElementById('passkey-label').value = 'This computer'; true"
+    ));
+    chrome.click("#register");
+    chrome.status_ok("Passkey trusted.", &serve);
+    let kept = passkeys(&state);
+    assert_eq!(kept.len(), 1, "one passkey is trusted");
+    assert_eq!(kept[0].rp_id, "localhost");
+    assert_eq!(kept[0].origin, origin);
+
+    // 3. The first approved change: the owner approves the assistant's proposal, and it runs once.
+    chrome.click("#plans button.approve");
+    let said = chrome.status_ok("Approved.", &serve);
+    assert!(said.contains("service_create"), "{said}");
+    assert!(instance_exists(&fake, "nats"), "the approved change ran");
+
+    // 4. The same page under the IP address is another origin: its POSTs are refused, and the browser itself refuses a
+    //    passkey there, because an IP address is no relying party.
+    chrome.page(
+        "Page.navigate",
+        json!({ "url": format!("http://127.0.0.1:{port}/approve") }),
+    );
+    let deadline = Instant::now() + WAIT;
+    while chrome.eval("document.readyState === 'complete' && location.hostname === '127.0.0.1'")
+        != json!(true)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the page loads at the IP address"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        chrome.eval(
+            "fetch('/approve/setup-code/verify', { method: 'POST', body: '{}' }).then(r => r.status)"
+        ),
+        json!(403),
+        "a POST from the IP origin is not the page's origin"
+    );
+    assert_eq!(
+        chrome.eval(
+            "navigator.credentials.get({ publicKey: { challenge: new Uint8Array(32), rpId: location.hostname, userVerification: 'required' } }).then(() => 'a passkey answered', e => e.name)"
+        ),
+        json!("SecurityError"),
+        "the browser takes no IP address as a relying party"
+    );
+
+    drop(chrome);
+    assert_eq!(serve.terminate(), Some(0), "serve exits 0 on SIGTERM");
+}

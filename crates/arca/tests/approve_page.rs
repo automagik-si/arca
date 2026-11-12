@@ -373,6 +373,8 @@ struct Rig {
     upstream: Arc<TestUpstream>,
     action_runs: Arc<AtomicU64>,
     requests: Arc<ApprovalRequests>,
+    /// Why the page is closed, while a test says it is: what `serve` reads from the loopback door of a localhost page.
+    closed: Arc<Mutex<Option<String>>>,
     _runtime: Runtime,
 }
 
@@ -456,7 +458,35 @@ impl Rig {
         Self::build_full(tag, true, true, false, idle, total)
     }
 
+    /// The page of a node on its own machine, with no passkey yet: the origin is [`LOCAL_ORIGIN`] and the key that comes
+    /// back is a browser's at that origin, for the rp `localhost`.
+    fn new_local(tag: &str) -> (Rig, SoftPasskey) {
+        Self::build_at(
+            LOCAL_ORIGIN,
+            tag,
+            true,
+            false,
+            false,
+            TEST_CHAT_IDLE,
+            TEST_CHAT_TOTAL,
+        )
+    }
+
     fn build_full(
+        tag: &str,
+        with_page: bool,
+        enrolled: bool,
+        refusing: bool,
+        chat_idle: Duration,
+        chat_total: Duration,
+    ) -> (Rig, SoftPasskey) {
+        Self::build_at(
+            ORIGIN, tag, with_page, enrolled, refusing, chat_idle, chat_total,
+        )
+    }
+
+    fn build_at(
+        origin: &str,
         tag: &str,
         with_page: bool,
         enrolled: bool,
@@ -467,7 +497,11 @@ impl Rig {
         let scratch = Scratch::new(tag);
         let upstream = TestUpstream::start();
         let fake = start_fake(&scratch);
-        let key = SoftPasskey::from_seed(1);
+        let mut key = SoftPasskey::from_seed(1);
+        if origin == LOCAL_ORIGIN {
+            key.rp_id = "localhost".to_string();
+            key.origin = origin.to_string();
+        }
         let lines = if enrolled {
             format!("{}\n", key.line(NAMESPACE))
         } else {
@@ -501,7 +535,7 @@ impl Rig {
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).expect("mode 0700");
         let clock = Arc::new(AtomicU64::new(NOW));
         let requests = Arc::new(
-            ApprovalRequests::open(&state_dir, Some(format!("{ORIGIN}/approve")), NOW)
+            ApprovalRequests::open(&state_dir, Some(format!("{origin}/approve")), NOW)
                 .expect("the approval requests open"),
         );
         let display = Arc::new(FakeDisplay::default());
@@ -517,7 +551,7 @@ impl Rig {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let captured_logs = Arc::clone(&logs);
         let page = approve_page::Page::new(
-            ORIGIN.to_string(),
+            origin.to_string(),
             Arc::clone(&kernel),
             clock_fn,
             state_dir.clone(),
@@ -533,14 +567,18 @@ impl Rig {
                 .expect("log lock")
                 .push(line.to_string())
         }));
+        let closed: Arc<Mutex<Option<String>>> = Arc::default();
+        let gate = Arc::clone(&closed);
+        let page = page.with_gate(Arc::new(move || gate.lock().expect("gate lock").clone()));
         let canvas = page.canvas().clone();
         let proxy_router = if with_page {
             base.clone().merge(page.router(true))
         } else {
             base.clone()
         };
+        // The unix socket's router as `serve` builds it: the page, and the one route no other listener carries.
         let router = if with_page {
-            base.merge(page.router(false))
+            base.merge(page.router(false)).merge(page.local_router())
         } else {
             base
         };
@@ -574,6 +612,7 @@ impl Rig {
             upstream,
             action_runs,
             requests,
+            closed,
             _runtime: runtime,
         };
         (rig, key)
@@ -901,7 +940,37 @@ impl Rig {
     fn state_path(&self) -> PathBuf {
         self.state_dir.join(STATE_PASSKEYS_FILE)
     }
+
+    /// The file a terminal's request makes in the state directory before it asks: its proof that it can write there.
+    fn proof_file(&self, proof: &str) -> PathBuf {
+        self.state_dir
+            .join(format!("{}{proof}", approve_page::LOCAL_PROOF_PREFIX))
+    }
+
+    /// `arca setup-code`'s request on the unix socket (or the other socket, which stands for every other listener): the
+    /// proof file is made first when `write` says so.
+    fn terminal_code(&self, other_listener: bool, proof: &str, write: bool) -> (u16, Value) {
+        if write {
+            fs::write(self.proof_file(proof), b"").expect("the proof file");
+        }
+        let (status, body) = self.request_on(
+            other_listener,
+            None,
+            "POST",
+            approve_page::LOCAL_SETUP_CODE_PATH,
+            None,
+            &serde_json::to_vec(&json!({ "proof": proof })).expect("body"),
+        );
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
 }
+
+/// The page origin of a node on its own machine's loopback listener.
+const LOCAL_ORIGIN: &str = "http://localhost:7471";
+/// Three proofs of the right form: 32 lowercase hexadecimal digits.
+const PROOF_A: &str = "0123456789abcdef0123456789abcdef";
+const PROOF_B: &str = "1123456789abcdef0123456789abcdef";
+const PROOF_C: &str = "2123456789abcdef0123456789abcdef";
 
 fn sign_in_statement(origin: &str, challenge: &str, now: u64) -> String {
     canonical_json(&json!({
@@ -1660,6 +1729,280 @@ fn setup_code_enrols_the_first_passkey_and_approval_works_without_restart() {
     );
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
     assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 1);
+}
+
+#[test]
+fn the_page_at_http_localhost_enrols_a_passkey_for_the_rp_localhost_and_approves_from_that_origin_alone()
+ {
+    let (rig, key) = Rig::new_local("page-local-origin");
+    // The page's POSTs take its exact origin: the IP address is another origin, and so is https.
+    for other in [
+        "http://127.0.0.1:7471",
+        "http://localhost:7472",
+        "https://localhost:7471",
+        ORIGIN,
+    ] {
+        assert_eq!(
+            rig.post_empty("/approve/setup-code", Some(other)).0,
+            403,
+            "{other}"
+        );
+    }
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some(LOCAL_ORIGIN)).0,
+        200
+    );
+    let code = rig.last_code();
+    let (status, answer) = rig.post(
+        "/approve/register",
+        Some(LOCAL_ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let lines = load_state_passkeys(&rig.state_path()).expect("the state line loads");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].rp_id, "localhost");
+    assert_eq!(lines[0].origin, LOCAL_ORIGIN);
+
+    // An assertion a browser made at the IP address names that origin, and is no approval here.
+    let (plan, statement) = rig.waiting_plan();
+    let mut elsewhere = Assert::over(NAMESPACE, statement.as_bytes());
+    elsewhere.origin = Some("http://127.0.0.1:7471".to_string());
+    let (status, _) = rig.post(
+        "/approve/approve",
+        Some(LOCAL_ORIGIN),
+        json!({ "plan": plan, "approval": passkey_approval(&statement, &key.assert(&elsewhere)) }),
+    );
+    assert!(refusal(status), "{status}");
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 0);
+    // The same passkey at the page's own origin approves.
+    let (status, answer) = rig.post(
+        "/approve/approve",
+        Some(LOCAL_ORIGIN),
+        json!({ "plan": plan, "approval": approval(&key, &statement) }),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    assert_eq!(deletes_for(&rig.fake, "toy-box-t1"), 1);
+}
+
+#[test]
+fn the_terminal_setup_code_answers_only_a_caller_that_wrote_the_state_directory() {
+    let (rig, key) = Rig::new_empty("page-terminal-code");
+
+    // No file in the state directory under the request's name: no code. This is a peer that reached the socket without
+    // being the node's user on this machine, such as one behind a forward.
+    let (status, body) = rig.terminal_code(false, PROOF_A, false);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.get("code").is_none());
+    // A name that is not 32 lowercase hexadecimal digits is not looked for at all: nothing outside the state
+    // directory is ever named.
+    for bad in [
+        "",
+        "0123456789abcdef",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "../../../../../../etc/passwd-0000",
+        "0123456789abcdef0123456789abcde/",
+    ] {
+        assert_eq!(rig.terminal_code(false, bad, false).0, 400, "{bad:?}");
+    }
+    // A link or a directory under the name is no proof, and is left where it is.
+    symlink(rig.state_path(), rig.proof_file(PROOF_A)).expect("a link");
+    assert_eq!(rig.terminal_code(false, PROOF_A, false).0, 403);
+    assert!(
+        rig.proof_file(PROOF_A).is_symlink(),
+        "the link is not removed"
+    );
+    fs::remove_file(rig.proof_file(PROOF_A)).expect("remove the link");
+    fs::create_dir(rig.proof_file(PROOF_A)).expect("a directory");
+    assert_eq!(rig.terminal_code(false, PROOF_A, false).0, 403);
+    fs::remove_dir(rig.proof_file(PROOF_A)).expect("remove the directory");
+    // A request that carries an Origin is a browser's, and no browser is a terminal.
+    fs::write(rig.proof_file(PROOF_A), b"").expect("the proof file");
+    let (status, _) = rig.request(
+        "POST",
+        approve_page::LOCAL_SETUP_CODE_PATH,
+        Some(ORIGIN),
+        &serde_json::to_vec(&json!({ "proof": PROOF_A })).expect("body"),
+    );
+    assert_eq!(status, 403);
+    assert!(rig.proof_file(PROOF_A).exists(), "the file was not taken");
+    // No other listener carries the route, whatever the caller shows.
+    assert_eq!(rig.terminal_code(true, PROOF_A, false).0, 404);
+    assert!(rig.proof_file(PROOF_A).exists());
+
+    // The node's user: the file is there, the code comes back, and the file is gone, so the same request again is
+    // refused.
+    let (status, body) = rig.terminal_code(false, PROOF_A, false);
+    assert_eq!(status, 200, "{body}");
+    let code = body["code"].as_str().expect("a code").to_string();
+    assert!(code.len() == 8 && code.bytes().all(|b| b.is_ascii_digit()));
+    assert_eq!(body["expiresInSeconds"], json!(600));
+    assert!(!rig.proof_file(PROOF_A).exists(), "the proof is used once");
+    assert_eq!(rig.terminal_code(false, PROOF_A, false).0, 403);
+    assert!(
+        rig.display.codes.lock().expect("display lock").is_empty(),
+        "nothing was sent to a screen"
+    );
+    assert!(
+        !rig.logs
+            .lock()
+            .expect("log lock")
+            .iter()
+            .any(|line| line.contains(&code)),
+        "the code is in no log line"
+    );
+
+    // While that code is live, a second terminal request reads the same one, and the page's own request is told a
+    // code is live, as before.
+    rig.advance(60_000);
+    let (status, body) = rig.terminal_code(false, PROOF_B, true);
+    assert_eq!(status, 200);
+    assert_eq!(body["code"], json!(code));
+    assert_eq!(body["expiresInSeconds"], json!(540));
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 429);
+
+    // It is the page's code: it enrols the first passkey there. After that there is no setup code for anyone.
+    let (status, answer) = rig.post(
+        "/approve/register",
+        Some(ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+    let (status, body) = rig.terminal_code(false, PROOF_C, true);
+    assert_eq!(status, 409, "{body}");
+    assert!(body.get("code").is_none());
+    assert!(
+        !rig.proof_file(PROOF_C).exists(),
+        "a refused request leaves no file either"
+    );
+}
+
+#[test]
+fn a_closed_page_serves_nothing_takes_nothing_and_gives_no_setup_code() {
+    // The page of this machine alone is closed while the node does not hold both loopback addresses of its port:
+    // some other program may then be answering at the page's own origin. Whatever a person typed or signed there
+    // must be worth nothing here.
+    let (rig, key) = Rig::new_local("page-closed");
+    let why = "The approval page is closed: this node does not hold [::1]:7471 (address in use: another program holds this port).";
+    *rig.closed.lock().expect("gate lock") = Some(why.to_string());
+    let closed = |status: u16, body: &[u8]| {
+        assert_eq!(status, 503);
+        let body: Value = serde_json::from_slice(body).expect("a refusal in JSON");
+        assert_eq!(body["refusal"], json!("page_closed"));
+        assert_eq!(body["message"], json!(why));
+    };
+    // Every route of the page, the page itself and its open list of cards among them.
+    for path in [
+        "/approve",
+        "/approve/plans",
+        "/approve/passkeys",
+        "/approve/canvas",
+    ] {
+        let (status, body) = rig.get(path, None);
+        closed(status, &body);
+    }
+    for path in [
+        "/approve/setup-code",
+        "/approve/setup-code/verify",
+        "/approve/register",
+        "/approve/approve",
+        "/approve/decline",
+        "/approve/requests/begin",
+        "/approve/passkeys/change",
+    ] {
+        let (status, body) = rig.post(path, Some(LOCAL_ORIGIN), json!({}));
+        closed(status, &body);
+    }
+    assert!(
+        rig.display.codes.lock().expect("display lock").is_empty(),
+        "no setup code was sent to a screen"
+    );
+    // The terminal gets no code either, though it shows that it is the node's user: the code would be typed into
+    // whatever answers at the page's address.
+    let (status, body) = rig.terminal_code(false, PROOF_A, true);
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["message"], json!(why));
+    assert!(body.get("code").is_none());
+    // The Origin rule still comes first: a foreign origin learns nothing, not even that the page is closed.
+    assert_eq!(
+        rig.post_empty("/approve/setup-code", Some("http://127.0.0.1:7471"))
+            .0,
+        403
+    );
+
+    // The node holds both addresses again: the page is the page.
+    *rig.closed.lock().expect("gate lock") = None;
+    assert_eq!(rig.get("/approve", None).0, 200);
+    let (status, body) = rig.terminal_code(false, PROOF_B, true);
+    assert_eq!(status, 200, "{body}");
+    let code = body["code"].as_str().expect("a code").to_string();
+    let (status, answer) = rig.post(
+        "/approve/register",
+        Some(LOCAL_ORIGIN),
+        register_body(&key, Some(&code)),
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&answer));
+}
+
+#[test]
+fn the_terminals_proof_must_be_fresh_and_the_state_directory_still_private() {
+    let (rig, _key) = Rig::new_empty("page-proof-fresh");
+    // A file that was made two minutes ago is not a request that was made just now.
+    let stale = rig.proof_file(PROOF_A);
+    fs::write(&stale, b"").expect("the proof file");
+    fs::File::options()
+        .write(true)
+        .open(&stale)
+        .expect("open the proof file")
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+        .expect("set its time");
+    assert_eq!(rig.terminal_code(false, PROOF_A, false).0, 403);
+    assert!(stale.exists(), "a stale file is not taken");
+    fs::remove_file(&stale).expect("remove it");
+
+    // The state directory was opened to others after the node started: a file in it no longer shows who made it.
+    fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    assert_eq!(rig.terminal_code(false, PROOF_B, true).0, 403);
+    assert!(rig.proof_file(PROOF_B).exists(), "nothing is taken from it");
+    fs::set_permissions(&rig.state_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    assert_eq!(rig.terminal_code(false, PROOF_B, false).0, 200);
+}
+
+#[test]
+fn the_terminal_setup_code_works_where_no_screen_does_and_shares_the_hourly_bound() {
+    let (rig, _key) = Rig::new_empty("page-terminal-no-screen");
+    // The machine has no screen: the page's request fails, and says so.
+    rig.display.fail.store(true, Ordering::SeqCst);
+    let (status, body) = rig.post_empty("/approve/setup-code", Some(ORIGIN));
+    assert_eq!(status, 503);
+    assert!(String::from_utf8_lossy(&body).contains("No screen to show the code on"));
+    // Eight more page requests, each refused and each counted: nine of the hour's ten are spent.
+    for _ in 0..8 {
+        assert!(refusal(
+            rig.post_empty("/approve/setup-code", Some(ORIGIN)).0
+        ));
+    }
+    // The terminal's request right after them is not asked to wait: the 60-second spacing is the screen's. It is
+    // the tenth request of the hour.
+    let (status, body) = rig.terminal_code(false, PROOF_A, true);
+    assert_eq!(status, 200, "{body}");
+    // While that code lives it is read again, and reading it spends nothing.
+    assert_eq!(
+        rig.terminal_code(false, PROOF_B, true).1["code"],
+        body["code"]
+    );
+    // Once it has expired, a new code would be the eleventh request: setup locks, for the terminal as for the page.
+    rig.advance(10 * 60_000 + 1_000);
+    let (status, body) = rig.terminal_code(false, PROOF_C, true);
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Setup is locked"),
+        "{body}"
+    );
+    assert_eq!(rig.post_empty("/approve/setup-code", Some(ORIGIN)).0, 429);
 }
 
 #[test]

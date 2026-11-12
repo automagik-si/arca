@@ -234,6 +234,12 @@ the work needs a person comfortable with a terminal.
    node, and a first passkey enrolled with a one-time code. ["The approval page"](OPERATING.md#the-approval-page) says
    what the page serves; the numbered steps begin at "To use it:" further down that section. Until a passkey is
    trusted, every approval fails closed.
+   On one machine the page needs no domain and no HTTPS address: with `"approvalOrigin": "http://localhost:7471"`
+   beside the loopback door it is `http://localhost:7471/approve`, and `arca setup-code --config
+   ~/.config/arca/node.json` prints the first passkey's setup code on a machine with no screen. That way is for a
+   machine where every account is trusted; read
+   ["The page on this machine alone"](OPERATING.md#the-page-on-this-machine-alone-with-no-domain-and-no-certificate)
+   first.
 4. **Restart the node** so it reads the config again: `systemctl --user restart arca.service` where the installer
    started it, or stop and start `arca serve`.
 

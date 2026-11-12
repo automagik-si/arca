@@ -8,6 +8,10 @@
 //! owner namespaces="arca-kernel-approve" rp="<rp>" origin="https://<rp or a name under it>[:<port>]" alg="ES256" cred="<base64url>" key="<base64>"[ <comment>]
 //! ```
 //!
+//! One origin that is not `https://` is a line's too: `http://localhost:<port>` with the rp `localhost`, the page of a node
+//! on its own machine's loopback listener. A browser runs WebAuthn there because `localhost` is a secure context without
+//! a certificate. No other `http://` origin is: not an IP address, which no browser takes as an rp, and not another name.
+//!
 //! with single spaces, a credential id of 16 to 1023 bytes in unpadded base64url, and a P-256 public key as 91 bytes of SPKI
 //! DER in padded base64. A blank line or a `#` comment is skipped. Any other line refuses the whole file by its number, and no
 //! refusal echoes a field. A line whose list does not name [`ARCA_NAMESPACE`] is read and checked, then not kept.
@@ -89,6 +93,24 @@ const FLAG_AT: u8 = 0x40;
 const FLAG_ED: u8 = 0x80;
 /// The port a browser leaves out of an `https` origin, so no origin it writes names it.
 const HTTPS_DEFAULT_PORT: u16 = 443;
+/// The port a browser leaves out of an `http` origin, so no origin it writes names it.
+const HTTP_DEFAULT_PORT: u16 = 80;
+/// The rp of a page on its own machine's loopback: the one name a browser runs WebAuthn for over plain `http://`.
+pub const LOCALHOST_RP: &str = "localhost";
+
+/// The port of `origin` when it is exactly `http://localhost:<port>`, as a browser writes it: the port 1 to 65535, without
+/// a leading zero and not 80, and nothing after it. `None` for every other origin: `https://`, `http://localhost` with no
+/// port, an IP address (`http://127.0.0.1:<port>`), a name under `localhost`, and any other name. This is the only
+/// `http://` origin a passkey of Arca's may answer from.
+pub fn localhost_origin_port(origin: &str) -> Option<u16> {
+    let port = origin.strip_prefix("http://localhost:")?;
+    if port.starts_with('0') || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    port.parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0 && *port != HTTP_DEFAULT_PORT)
+}
 
 /// A line of the passkeys file that lists Arca's namespace.
 #[derive(Clone, PartialEq, Eq)]
@@ -252,7 +274,8 @@ pub fn parse_passkeys(bytes: &[u8]) -> Result<Vec<PasskeyLine>, ApprovalRefusal>
         };
         if !origin_ok(parts.origin, parts.rp) {
             return Err(refuse(
-                "names an origin that is not https:// and its rp or a name under it, with at most a port that is not 443",
+                "names an origin that is not https:// and its rp or a name under it, with at most a port that is not 443, \
+                 nor http://localhost:<port> with the rp localhost",
             ));
         }
         let credential_id = decode_exact(parts.cred, &URL_SAFE_NO_PAD)
@@ -314,7 +337,8 @@ pub fn format_passkey_line(
     }
     if !origin_ok(origin, rp) {
         return Err(malformed(
-            "the origin is not https:// and its rp or a name under it, with at most a port that is not 443",
+            "the origin is not https:// and its rp or a name under it, with at most a port that is not 443, nor \
+             http://localhost:<port> with the rp localhost",
         ));
     }
     decode_exact(credential_id, &URL_SAFE_NO_PAD)
@@ -406,8 +430,13 @@ fn dns_name_ok(name: &str) -> bool {
 }
 
 /// Whether `origin` is an origin as a browser serializes one for a page under `rp`: `https://`, then `rp` or a name under
-/// it, then at most `:<port>`, the port 1 to 65535 without a leading zero and not 443, which a browser leaves out.
+/// it, then at most `:<port>`, the port 1 to 65535 without a leading zero and not 443, which a browser leaves out. The one
+/// other origin is `http://localhost:<port>` for the rp `localhost` itself (see [`localhost_origin_port`]): never a name
+/// under it, never another rp, and never an IP address.
 fn origin_ok(origin: &str, rp: &str) -> bool {
+    if localhost_origin_port(origin).is_some() {
+        return rp == LOCALHOST_RP;
+    }
     let Some(authority) = origin.strip_prefix("https://") else {
         return false;
     };

@@ -412,7 +412,7 @@ fn post(
 }
 
 /// The status and body of a reply. A chunked reply is refused, since the node answers every call with a length.
-fn split_reply(reply: &[u8]) -> Result<(u16, Vec<u8>), Failure> {
+pub(crate) fn split_reply(reply: &[u8]) -> Result<(u16, Vec<u8>), Failure> {
     let malformed = || Failure::Runtime("the node's reply is malformed".to_string());
     let end = reply
         .windows(4)
