@@ -160,15 +160,17 @@ fn a_service_made_after_a_tenants_removal_was_proposed_is_removed_with_it_and_th
         .as_str()
         .expect("its block")
         .to_string();
-    // 1. B is empty when its removal is proposed, at 12:00.
+    // 1. B, made at 12:00, is empty when its removal is proposed half an hour later: the card says when it read B.
+    rig.clock.fetch_add(30 * 60_000, Ordering::SeqCst);
     let first = propose_removal(&rig, B);
-    let first_summary = summary(B, &block, "2026-10-30 12:00 UTC", "no service");
+    let first_summary = summary(B, &block, "2026-10-30 12:30 UTC", "no service");
     assert_eq!(first["summary"], first_summary);
     let first_card = card(&first);
     assert_eq!(
         first_card[3].1,
-        "As of 2026-10-30 12:00 UTC, when this was proposed: none"
+        "As of 2026-10-30 12:30 UTC, when this was proposed: none"
     );
+    assert_eq!(first_card[2].1, "2026-10-30 12:00 UTC");
     assert_eq!(first_card[4].1, EFFECT);
     // 2. Five minutes later a database is made in B.
     rig.clock.fetch_add(5 * 60_000, Ordering::SeqCst);
