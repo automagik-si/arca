@@ -602,7 +602,8 @@ impl ServiceHandler {
             return Err(internal());
         }
         let id = crate::service::entry_id(None, &name);
-        let ipv4 = self.free_address(read, cidr, rows, entries, None)?;
+        let ipv4 =
+            self.free_address(read, cidr, rows, entries, None, &format!("function {name}"))?;
         let pool = service_pool(&self.cfg)
             .map_err(|_| service_refused("the default profile does not name a storage pool"))?;
         let mut changes = ensure_netproject(entries, &self.cfg).map_err(no_service_project)?;

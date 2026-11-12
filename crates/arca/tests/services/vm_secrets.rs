@@ -455,7 +455,7 @@ fn a_secret_set_on_a_running_vm_applies_at_its_next_start_which_never_restarts_i
             "service_secret_set",
             json!({"name":"tok","key":"T","value":"two\nlines-of-value"})
         ),
-        Err(CallError::Invalid(why)) if why == "a secret is 8 to 4096 characters without control characters"
+        Err(CallError::Invalid(why)) if why == "a container's secret is one line of 8 to 4096 characters without control characters: this one has a line break"
     ));
 
     // A virtual machine on a host bridge takes its secrets the same way.
@@ -788,3 +788,6 @@ fn the_create_requests_of_an_oci_a_system_and_a_plain_vm_template_are_the_golden
         "the create requests differ from tests/golden/service-create-requests.json"
     );
 }
+
+#[path = "in_words.rs"]
+mod in_words;

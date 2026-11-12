@@ -1163,6 +1163,33 @@ in this build are `arca_status`, `node_metrics`, `watch_report`, `alerts_list`, 
 The unix socket serves only a peer whose credentials carry the server's own uid. Any other peer is closed before a byte of
 its request is read.
 
+### When Incus does not answer, and when the answer is "internal"
+
+Every service verb, a read too, first asks Incus for the node's instances with their state, and gives that read 10
+seconds. For a running virtual machine Incus gets the state from the machine's guest agent, so a busy guest, or
+several such reads at once, can make it late. When that read fails, and when one of the reads a create makes for an
+address, for its project or for its new instance fails, the call is refused in words, with a code of its own in
+`data.refusal`:
+
+| Code | What happened | What to do |
+|---|---|---|
+| `incus_unavailable` | Incus did not answer within the 10 seconds, could not be reached on its socket, or answered with a server error (status 500 and above). | Nothing is wrong with the request. Make it again; an approved action is proposed again, since its approval was used. |
+| `incus_answer` | Incus answered with another status, with more than this node reads, or with something that is not the JSON it expects. | Asking again is likely to answer the same: look at Incus. |
+| `state_not_saved` | The kernel could not save the change as the node's next state. The service's record is as it was. | The node's log has the reason; make the request again once it is fixed. |
+
+The sentence says what was being read and for which service, and what the call had changed by then ("Nothing was
+changed.", or that a create did go through). It never holds Incus's own text.
+
+`internal: the tool failed` is left for a fault of Arca's own: a handler that panicked, an answer that does not fit
+the verb's schema, or a failure a handler keeps to itself. A few failures that could be said in words are still among
+them: the kernel refusing to save a create's own state, and the read of the host's addresses a function with
+destinations makes. The caller is told no more than "internal". The node's log gets one line for each, with the verb
+and a reason the server wrote (it can name a file of the node or a service, and never an argument of the call):
+
+```
+arca: service_status was answered "internal: the tool failed": the kernel could not complete the call
+```
+
 ### Protocol versions
 
 The server keeps no session, so each request is judged alone. The tools, their parameters and their results are the
@@ -3357,9 +3384,15 @@ machine's is never there. The steps:
    host restarts, also before the first `instance_start`: the machine then boots with no secret file, and what runs in
    it has to wait for one (the runner pool registers nothing until its credential is there).
 2. `service_secret_set` with `{"name", "key", "value"}` stores the value in Arca's private `secrets/` directory, as for
-   a container, and answers `{"ok": true}`. The value is 8 to 4096 characters; for a virtual machine it may have line
-   breaks (a private key in PEM form is several lines; a file with Windows line endings is stored with plain line
-   breaks), and no other control character. Nothing is sent to the machine yet.
+   a container, and answers `{"ok": true}`. A virtual machine's value is a file, so it is stored as given, with the
+   line break at its end when it has one: send a key file whole, as it was read. It is 8 to 4096 characters, not
+   counting one line break at its end, and at least 8 of them are not line breaks; it may have line breaks (a private
+   key in PEM form is several lines) and no other control character. One thing is not byte for byte: a file with
+   Windows line endings is stored with plain line breaks (each carriage return and line feed pair as one line feed).
+   The call itself carries at most 4097 characters, and there every carriage return counts: a file with Windows line
+   endings that is near the limit is refused as too long, and goes through once its line endings are plain.
+   A container's value, and a function's, is an environment value: one line of 8 to 4096 characters, and a line break
+   at its end is refused in words that say it is the one thing to change. Nothing is sent to the machine yet.
 3. `instance_start` with `{"project": "arcak-svc", "instance": "<name>"}` starts the machine, waits for its guest agent
    (up to 120 seconds: a new machine boots first) and writes each stored secret into the guest as the file
    `/etc/arca-secrets/<KEY>`. The directory is root's with mode 0700 and each file is root's with mode 0600. Arca
@@ -3954,7 +3987,7 @@ that ask for its labels wait for ever: the controller says that too, as a `WARNI
 **4. Arca: `service_secret_set`**, for the App twice:
 `{"name": "ci-pool", "key": "GITHUB_APP_CLIENT_ID", "value": "<the client ID>"}` and
 `{"name": "ci-pool", "key": "GITHUB_APP_PRIVATE_KEY", "value": "<the whole content of the key file>"}`. The key keeps
-its line breaks; a key pasted on one line works too. For a token, once:
+its line breaks, the one at its end too; a key pasted on one line works too. For a token, once:
 `{"name": "ci-pool", "key": "GITHUB_TOKEN", "value": "<the token>"}`. Arca answers `{"ok": true}` and no answer, list
 or log shows a value again. When the App's two secrets and a token are all set, the pool uses the App and says so.
 

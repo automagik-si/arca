@@ -1274,7 +1274,7 @@ fn function_secret_set_params() -> Value {
             "value",
             true,
             json!({
-                "description": "The secret: one line of 8 to 4096 characters, without control characters.",
+                "description": "The secret: one line of 8 to 4096 characters, without control characters. Each run reads it as an environment value, so a line break at its end is refused.",
                 "maxLength": 4096,
                 "minLength": 8,
                 "type": "string"
@@ -3442,7 +3442,7 @@ fn service_secret_set_params() -> Value {
 }
 
 fn service_secret_set_params_base() -> Value {
-    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"key":{"description":"The secret's name, one of the template's secrets.","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","type":"string"},"name":{"description":"The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"value":{"description":"The secret, 8 to 4096 characters.","maxLength":4096,"minLength":8,"type":"string"}},"required":["name","key","value"],"type":"object"}"##).expect("fixed service schema")
+    serde_json::from_str(r##"{"additionalProperties":false,"properties":{"key":{"description":"The secret's name, one of the template's secrets.","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,63}$","type":"string"},"name":{"description":"The service name (1-40 of a-z, 0-9 and inner \"-\", starting with a letter).","pattern":"^[a-z](?:[a-z0-9-]{0,38}[a-z0-9])?$","type":"string"},"value":{"description":"The secret. A container's is one line of 8 to 4096 characters without control characters: it is an environment value, so a line break at its end is refused. A virtual machine's is a file in its guest and is stored as given, with the line break at its end when it has one (a key file read whole): 8 to 4096 characters not counting that one line break, with line breaks and no other control character, each carriage return and line feed pair stored as one line feed.","maxLength":4097,"minLength":8,"type":"string"}},"required":["name","key","value"],"type":"object"}"##).expect("fixed service schema")
 }
 fn service_secret_set_result() -> Value {
     serde_json::from_str(r##"{"additionalProperties":false,"properties":{"ok":{"const":true,"type":"boolean"}},"required":["ok"],"type":"object"}"##).expect("fixed service schema")

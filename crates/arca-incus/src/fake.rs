@@ -210,6 +210,8 @@ struct Shared {
     host_interfaces: Mutex<Vec<HostInterface>>,
     host_netmasks: Mutex<BTreeMap<IpAddr, u8>>,
     operations_unreadable: AtomicBool,
+    /// Reads the fake answers badly: each a path prefix, how many reads are left, and what happens to them.
+    read_faults: Mutex<Vec<(String, u32, ReadFault)>>,
     /// The operations whose wait answers 404 while the listing still shows them running.
     waits_ended: Mutex<Vec<String>>,
     console: Mutex<BTreeMap<(String, String), String>>,
@@ -407,6 +409,7 @@ impl Shared {
             host_interfaces: Mutex::new(Vec::new()),
             host_netmasks: Mutex::new(BTreeMap::new()),
             operations_unreadable: AtomicBool::new(false),
+            read_faults: Mutex::new(Vec::new()),
             waits_ended: Mutex::new(Vec::new()),
             console: Mutex::new(BTreeMap::new()),
             exit_plans: Mutex::new(BTreeMap::new()),
@@ -620,6 +623,26 @@ impl FakeIncus {
     }
 
     /// Makes the operations listing answer 500 while `unreadable` is true.
+    /// Answers the next `times` GETs whose target starts with `path_prefix` with `status` and an error envelope, as an
+    /// Incus that fails a read does. The reads after them are answered as usual.
+    pub fn fail_reads(&self, path_prefix: &str, times: u32, status: u16) {
+        lock(&self.shared.read_faults).push((
+            path_prefix.to_string(),
+            times,
+            ReadFault::Status(status),
+        ));
+    }
+
+    /// Holds the next `times` GETs whose target starts with `path_prefix` for `delay` before it answers them as usual,
+    /// as an Incus that is slow to read a virtual machine's state does.
+    pub fn slow_reads(&self, path_prefix: &str, times: u32, delay: Duration) {
+        lock(&self.shared.read_faults).push((
+            path_prefix.to_string(),
+            times,
+            ReadFault::Slow(delay),
+        ));
+    }
+
     pub fn set_operations_unreadable(&self, unreadable: bool) {
         self.shared
             .operations_unreadable
@@ -1051,10 +1074,42 @@ fn console_body(shared: &Shared, request: &Request) -> Option<(u16, Vec<u8>)> {
     }
 }
 
+/// What the fake does to a read it was told to answer badly.
+#[derive(Debug, Clone, Copy)]
+enum ReadFault {
+    /// It answers with this status and an error envelope.
+    Status(u16),
+    /// It waits this long, then answers as usual.
+    Slow(Duration),
+}
+
+/// The fault a GET of `target` meets, when one is left for it. One read is taken from the first fault that matches.
+fn take_read_fault(shared: &Shared, target: &str) -> Option<ReadFault> {
+    let mut faults = lock(&shared.read_faults);
+    let index = faults
+        .iter()
+        .position(|(prefix, left, _)| *left > 0 && target.starts_with(prefix.as_str()))?;
+    faults[index].1 -= 1;
+    Some(faults[index].2)
+}
+
 /// The status, the extra header lines and the envelope for one request.
 fn handle(shared: &Shared, request: &Request) -> (u16, String, Value) {
     if request.method.is_empty() {
         return (400, String::new(), error_envelope(400, "bad request"));
+    }
+    if request.method == "GET" {
+        match take_read_fault(shared, &request.target) {
+            Some(ReadFault::Status(status)) => {
+                return (
+                    status,
+                    String::new(),
+                    error_envelope(status, "the fake was told to fail this read"),
+                );
+            }
+            Some(ReadFault::Slow(delay)) => std::thread::sleep(delay),
+            None => {}
+        }
     }
     let route = parse(&request.target);
     let allowed: &[&str] = route.as_ref().map_or(&["GET"][..], Route::methods);
