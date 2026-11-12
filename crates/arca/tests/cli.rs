@@ -1514,51 +1514,40 @@ fn a_command_that_removes_names_the_node_and_its_state_directory_before_it_acts(
     assert!(!installed.tokens.join("gone-1.hash").exists());
 
     // Commands that remove and then find nothing to remove still said which node they looked in, first.
-    for (args, node, found, by_variable) in [
-        (
-            vec!["probe", "consumer", "remove", "--name", "web"],
-            &variable,
-            "from ARCA_CONFIG",
-            true,
-        ),
-        (
-            vec!["link", "remove", "peer-1"],
-            &installed,
-            "the default",
-            false,
-        ),
-        (
-            vec!["adopt", "release", "--instance", "svc1"],
-            &installed,
-            "the default",
-            false,
-        ),
-        (
-            vec![
-                "adopt",
-                "apply",
-                "--instance",
-                "svc1",
-                "--plan-digest",
-                "00",
-            ],
-            &variable,
-            "from ARCA_CONFIG",
-            true,
-        ),
+    for args in [
+        vec!["probe", "consumer", "remove", "--name", "web"],
+        vec!["link", "remove", "peer-1"],
+        vec!["adopt", "release", "--instance", "svc1"],
+        vec![
+            "adopt",
+            "apply",
+            "--instance",
+            "svc1",
+            "--plan-digest",
+            "00",
+        ],
+        // Replacing the shipped templates overwrites what the owner edited, so it names the node whole too.
+        vec!["templates", "install", "--replace"],
     ] {
-        let mut command = arca();
-        command.args(&args).env("HOME", &home);
-        if by_variable {
-            command.env("ARCA_CONFIG", &variable.config);
-        }
-        let out = command.output().expect("run the binary");
+        let out = arca()
+            .args(&args)
+            .env("HOME", &home)
+            .output()
+            .expect("run the binary");
         assert!(
-            stderr_text(&out).starts_with(&naming(node, found)),
+            stderr_text(&out).starts_with(&naming(&installed, "the default")),
             "{args:?}: {}",
             stderr_text(&out)
         );
     }
+    // The variable names its node the same way, for a command it may steer.
+    let out = arca()
+        .args(["templates", "install", "--replace"])
+        .env("HOME", &home)
+        .env("ARCA_CONFIG", &variable.config)
+        .output()
+        .expect("run the binary");
+    assert_eq!(stderr_text(&out), naming(&variable, "from ARCA_CONFIG"));
     // A config the caller named with the flag is not said back.
     let out = arca()
         .args(["token", "revoke", "never-1", "--config"])
@@ -1721,6 +1710,10 @@ fn help_says_the_defaults_and_the_order_they_are_taken_in() {
         "  Every command finds its config this way. One that writes to a node or acts on it, without --config, first says on",
         "  stderr which config it uses; one that removes or cuts something off also names the node's state directory.",
         "  A call with --peer sends its token to another node, so its --token-file is always named: it has no default.",
+        "  token mint, token revoke, call --peer, link remove, probe consumer remove, adopt apply, adopt release and init hand",
+        "  out, remove or rewrite something on one node, so the variable alone never picks it: when ARCA_CONFIG names another",
+        "  file than the default, they refuse and say the --config to run them with.",
+        "  init --watch-only [--config <file>] (back to a node that only looks)",
         "  call --peer <name> <verb> --token-file <file> [--config <file>] [--args <json> | --args-file <file>]",
         "  token mint --scope <viewer|doctor|operator> --id <id> --out <file> [--tools <comma list>] [--config <file> | --hash-dir <dir>]",
         "  token reload [--config <file>] (the running node reads its tokens again)",
@@ -2663,6 +2656,162 @@ fn a_node_that_does_not_catch_sighup_yet_is_never_signalled_and_is_called_starti
         format!(
             "arca: the node on this config (pid {pid}) is still starting, so it was not signalled, and it may have read the token before this revoke. Run this in a moment to be sure: arca token reload --config {}\n",
             config_path.display()
+        )
+    );
+}
+
+#[test]
+fn the_variable_alone_never_picks_the_node_for_a_command_that_hands_out_or_removes() {
+    let scratch = Scratch::new("config-variable-alone");
+    let (home, installed, variable, _flag) = three_nodes(&scratch);
+    // A token that exists on the other node only, under an id a person would type for their own node.
+    let minted = arca()
+        .args([
+            "token",
+            "mint",
+            "--scope",
+            "viewer",
+            "--id",
+            "assistant-1",
+            "--out",
+        ])
+        .arg(scratch.at("other-assistant-1.secret"))
+        .arg("--config")
+        .arg(&variable.config)
+        .output()
+        .expect("run the binary");
+    assert_eq!(minted.status.code(), Some(0), "{}", stderr_text(&minted));
+    let own = scratch.at("own.secret");
+    token_file(&own);
+    let own_arg = own.display().to_string();
+    let out_arg = scratch.at("minted-1.secret").display().to_string();
+    let cases: Vec<Vec<&str>> = vec![
+        vec![
+            "token", "mint", "--scope", "viewer", "--id", "minted-1", "--out", &out_arg,
+        ],
+        vec!["token", "revoke", "assistant-1"],
+        vec![
+            "call",
+            "--peer",
+            "host",
+            "arca_status",
+            "--token-file",
+            &own_arg,
+        ],
+        vec!["link", "remove", "peer-1"],
+        vec!["probe", "consumer", "remove", "--name", "web"],
+        vec![
+            "adopt",
+            "apply",
+            "--instance",
+            "svc1",
+            "--plan-digest",
+            "00",
+        ],
+        vec!["adopt", "release", "--instance", "svc1"],
+    ];
+    // Both modes of init rewrite what a node is, so they are refused the same way. They are not run in the second half
+    // below, which lets a command go on: tests/init.rs does that, with a node made for init.
+    let rewriting: Vec<Vec<&str>> = vec![
+        vec!["init", "--watch-only"],
+        vec!["init", "--enable-changes", "--yes"],
+    ];
+    let refusal = format!(
+        "arca: ARCA_CONFIG names {other}, not the default config ({default}). This command hands out, removes or rewrites something on one node, so the variable alone does not choose that node, and nothing was done. To act on the node ARCA_CONFIG names, run the same command with: --config {other}\n",
+        other = variable.config.display(),
+        default = installed.config.display()
+    );
+    for args in cases.iter().chain(&rewriting) {
+        // The variable was left set for another node: the command refuses, does nothing, and says the flag to use.
+        let out = arca()
+            .args(args)
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &variable.config)
+            .output()
+            .expect("run the binary");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr_text(&out)
+        );
+        assert!(out.stdout.is_empty(), "{args:?} answers nothing");
+        assert_eq!(stderr_text(&out), refusal, "{args:?}");
+        assert!(
+            variable.tokens.join("assistant-1.hash").exists(),
+            "{args:?}: the other node's token was not revoked"
+        );
+        assert!(
+            !variable.tokens.join("minted-1.hash").exists() && !Path::new(&out_arg).exists(),
+            "{args:?}: no token was minted on the other node"
+        );
+    }
+    for args in &cases {
+        // The variable names the very file the default names: nothing is chosen by it, so the command goes on, and says
+        // where its config came from.
+        let out = arca()
+            .args(args)
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &installed.config)
+            .output()
+            .expect("run the binary");
+        assert!(
+            stderr_text(&out).starts_with(&format!(
+                "arca: using the config {} (from ARCA_CONFIG)",
+                installed.config.display()
+            )),
+            "{args:?}: {}",
+            stderr_text(&out)
+        );
+        // The flag names the other node outright, variable or no variable: the command acts there.
+        let out = arca()
+            .args(args)
+            .arg("--config")
+            .arg(&variable.config)
+            .env("HOME", &home)
+            .env("ARCA_CONFIG", &installed.config)
+            .output()
+            .expect("run the binary");
+        assert!(
+            !stderr_text(&out).contains("ARCA_CONFIG names")
+                && !stderr_text(&out).contains("using the config"),
+            "{args:?}: {}",
+            stderr_text(&out)
+        );
+    }
+    assert!(
+        !variable.tokens.join("assistant-1.hash").exists(),
+        "with the flag, the revoke reached the node it named"
+    );
+    // With no home directory there is no default to be the same as, and the variable still does not choose alone.
+    let out = arca()
+        .args(["token", "revoke", "assistant-1"])
+        .env_remove("HOME")
+        .env("ARCA_CONFIG", &variable.config)
+        .output()
+        .expect("run the binary");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        stderr_text(&out).starts_with(&format!(
+            "arca: ARCA_CONFIG names {}, and there is no default config to compare it with. ",
+            variable.config.display()
+        )),
+        "{}",
+        stderr_text(&out)
+    );
+    // A command the variable may steer says a relative path in it as the whole path.
+    let out = arca()
+        .args(["templates", "install"])
+        .current_dir(variable.config.parent().expect("the config's directory"))
+        .env("HOME", &home)
+        .env("ARCA_CONFIG", "variable.json")
+        .output()
+        .expect("run the binary");
+    assert_eq!(
+        stderr_text(&out),
+        format!(
+            "arca: using the config {} (from ARCA_CONFIG)\n",
+            variable.config.display()
         )
     );
 }

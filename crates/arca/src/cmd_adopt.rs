@@ -119,7 +119,12 @@ fn read_failure(error: IncusError) -> Failure {
 
 /// The config and the allowlisted target the flags name.
 fn setup(flags: &Flags, does: crate::Does) -> Result<(NodeConfig, AdoptTarget), Failure> {
-    let (_, cfg) = crate::load_config_to(flags, does)?;
+    // An apply or a release changes an instance on one node, so the variable alone never picks that node.
+    let (_, cfg) = if does == crate::Does::Removes {
+        crate::load_node_config_to(flags, does)?
+    } else {
+        crate::load_config_to(flags, does)?
+    };
     let instance = flags.required("instance")?;
     let target = cfg
         .kernel

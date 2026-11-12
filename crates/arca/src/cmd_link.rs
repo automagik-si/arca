@@ -64,7 +64,12 @@ pub fn link(args: &[String]) -> Result<Option<Value>, Failure> {
         "remove" => crate::Does::Removes,
         _ => crate::Does::Acts,
     };
-    let (_, config) = crate::load_config_to(&flags, does)?;
+    // Removing a peer cuts it off from one node, so the variable alone never picks that node.
+    let (_, config) = if does == crate::Does::Removes {
+        crate::load_node_config_to(&flags, does)?
+    } else {
+        crate::load_config_to(&flags, does)?
+    };
     let mut link_config = config.link.clone().unwrap_or_default();
     if command == "serve" {
         link_config

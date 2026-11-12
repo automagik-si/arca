@@ -2,8 +2,9 @@
 //! `serve` runs. The config and the token file default to the ones the installer writes. `call` alone lists the verbs.
 //!
 //! A call with `--peer` sends its token to another node, which could send it back here through the link. So such a call
-//! takes its token from `--token-file` alone, a token the peer minted, and its config from `--config` alone: this node's
-//! own token is never sent to a peer by default. The token is read from its own file and sent only in the bearer header of each request. An approval is read
+//! takes its token from `--token-file` alone, a token the peer minted: this node's own token is never sent to a peer by
+//! default. Its config is found as every command's is, except that `ARCA_CONFIG` alone never picks the node whose link
+//! the call goes through. The token is read from its own file and sent only in the bearer header of each request. An approval is read
 //! from the arguments file, never from the command line, and neither the token nor an approval is ever printed.
 //!
 //! Each request uses its own connection, since the server answers `Connection: close`. The call first sends `initialize`, so
@@ -142,7 +143,7 @@ pub fn call(args: &[String]) -> Result<Option<Value>, Failure> {
                 "--token-file is required with --peer: the token is sent to the peer, so it is one the peer minted and the caller names, never this node's own token from the default file or from ARCA_TOKEN_FILE".to_string(),
             ));
         };
-        let (config, cfg) = crate::load_config_to(&flags, crate::Does::Acts)?;
+        let (config, cfg) = crate::load_node_config_to(&flags, crate::Does::Acts)?;
         let token_file = Chosen {
             path: PathBuf::from(token_file),
             origin: Origin::Flag,

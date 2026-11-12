@@ -56,10 +56,25 @@ states what the kernel may touch.
 the default, and every command finds its config this way. A command that writes to a node or acts on it, and was not
 given `--config`, first says on stderr which config it uses and how it was found (`arca: using the config <path> (the
 default)` or `(from ARCA_CONFIG)`). A command that removes or cuts something off (`token revoke`, `link remove`, `probe
-consumer remove`, `adopt apply`, `adopt release`) also names the node's state directory in that line. A command that
+consumer remove`, `adopt apply`, `adopt release`, `init --watch-only`, `templates install --replace`) also names the node's
+state directory in that line. A command that
 only reads says nothing, and a config named with `--config` is not said back. One thing has no default: a call with
 `--peer` sends its token to another node, so its `--token-file` is always named. `token mint` and `token revoke` with
 `--hash-dir` alone read no config at all, not even the variable's.
+
+**The variable alone never picks the node for a command that hands out, removes or rewrites something.** `token mint`,
+`token revoke`, `call --peer`, `link remove`, `probe consumer remove`, `adopt apply`, `adopt release` and both modes of
+`init` would succeed on whatever node `ARCA_CONFIG` was left set for, and the installer mints the same token id on every
+node. So with the
+variable set and no `--config`, they go on only when the variable names the same file as the default. When it names
+another file they refuse with exit 2, do nothing, and say the flag to run them with:
+`ARCA_CONFIG names <path>, not the default config (<default>). ... run the same command with: --config <path>`. With
+`--config`, or with no variable set, nothing changes. `templates install --replace` overwrites templates that were
+edited, so it names the node's state directory in its first line as the removing commands do.
+
+A writing command also refuses a config it found by itself that belongs to another user, and says whose it is. This is
+root with a user's home directory kept (`sudo` without `-H`): the default path would lead to that user's node. Run the
+command as that user, or name the config with `--config`.
 
 `token mint` writes the hash and sends no signal: a node reads its tokens when it starts and on SIGHUP, so a running
 node takes a new token after `arca token reload` or a restart.

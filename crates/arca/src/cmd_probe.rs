@@ -40,7 +40,12 @@ pub fn probe(args: &[String]) -> Result<Option<Value>, Failure> {
     } else {
         crate::Does::Acts
     };
-    let (_, cfg) = crate::load_config_to(&flags, does)?;
+    // Removing a consumer takes it from one node, so the variable alone never picks that node.
+    let (_, cfg) = if does == crate::Does::Removes {
+        crate::load_node_config_to(&flags, does)?
+    } else {
+        crate::load_config_to(&flags, does)?
+    };
     let key = NodeKey::load_or_create(&cfg.state_dir.join("node.key"))
         .map_err(|_| Failure::Runtime("node key unavailable".into()))?;
     let mut store =

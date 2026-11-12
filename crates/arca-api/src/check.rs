@@ -348,8 +348,9 @@ fn child(at: &str, name: &str) -> String {
     format!("{at}/{}", name.replace('~', "~0").replace('/', "~1"))
 }
 
-/// The longest unknown key a refusal repeats.
-const LONGEST_NAMED_KEY: usize = 40;
+/// The longest unknown key a refusal repeats. The longest field name a verb takes is 19 characters; common service tokens
+/// that are all letters, digits and `_` start at 32. So 24 names every real field and repeats none of those.
+const LONGEST_NAMED_KEY: usize = 24;
 
 /// Whether an unknown key is shaped like a field name, and so may be repeated in a refusal: it starts with a letter,
 /// holds only letters, digits, `_` and `-`, and is at most [`LONGEST_NAMED_KEY`] characters. A token, a key or a
@@ -588,17 +589,35 @@ mod tests {
 
     #[test]
     fn only_a_key_shaped_like_a_field_name_is_repeated() {
-        for key in ["name", "serviceCidr", "http-path", "plan_digest", "a"] {
+        // Every field name in the verb schemas is shorter than the limit; the longest is confirmSnapshotLoss.
+        for key in [
+            "name",
+            "serviceCidr",
+            "http-path",
+            "plan_digest",
+            "a",
+            "confirmSnapshotLoss",
+        ] {
             assert!(name_shaped(key), "{key}");
         }
-        let long = "a".repeat(41);
+        let long = "a".repeat(25);
+        // The shapes of common service tokens are all letters, digits and `_`, so only their length tells them from a
+        // field name. They are put together here, so that no line of this file holds something shaped like a token.
+        let prefixed = |prefix: &str, rest: usize| format!("{prefix}{}", "A".repeat(rest));
+        let (arca, github, stripe) = (
+            prefixed("arca_", 43),
+            prefixed("ghp_", 36),
+            prefixed("sk_live_", 24),
+        );
         for key in [
             "",
             "9lives",
             "has space",
             "semi;colon",
-            "sk-live-secret/with+chars=",
-            "arca_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "with/other+chars=",
+            arca.as_str(),
+            github.as_str(),
+            stripe.as_str(),
             long.as_str(),
         ] {
             assert!(!name_shaped(key), "{key}");

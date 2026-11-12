@@ -429,13 +429,14 @@ struct TokenNode {
 }
 
 /// The node the flags name. The hash directory is `--hash-dir`, or `tokens.hashDir` of the config, which is found as every
-/// command finds it: `--config`, else `ARCA_CONFIG`, else the installer's. A `--hash-dir` given alone names the directory
+/// command finds it (`--config`, else `ARCA_CONFIG`, else the installer's), except that a token is a credential of one
+/// node, so the variable alone never picks that node ([`crate::load_node_config_to`]). A `--hash-dir` given alone names the directory
 /// by itself and no config is read, not even the variable's: the installer mints that way before any config exists. When
 /// `--hash-dir` and `--config` are both given they must name the same directory; neither is taken over the other.
 fn token_node(flags: &Flags, does: Does) -> Result<TokenNode, Failure> {
     let given = flags.value("hash-dir").map(PathBuf::from);
     let Some(given) = given else {
-        let (chosen, cfg) = crate::load_config_to(flags, does)?;
+        let (chosen, cfg) = crate::load_node_config_to(flags, does)?;
         return Ok(TokenNode {
             hash_dir: cfg.tokens.hash_dir.clone(),
             config: Some((chosen, cfg)),
@@ -447,7 +448,7 @@ fn token_node(flags: &Flags, does: Does) -> Result<TokenNode, Failure> {
             config: None,
         });
     }
-    let (chosen, cfg) = crate::load_config_to(flags, does)?;
+    let (chosen, cfg) = crate::load_node_config_to(flags, does)?;
     if !same_dir(&given, &cfg.tokens.hash_dir) {
         return Err(Failure::Usage(
             "--hash-dir differs from tokens.hashDir in --config; give one of them, or the same directory in both".to_string(),

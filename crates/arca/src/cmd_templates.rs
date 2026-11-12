@@ -41,7 +41,13 @@ pub const SHIPPED: &[(&str, &str)] = shipped![
 ];
 
 pub fn install(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let (_, cfg) = crate::load_config_to(flags, crate::Does::Acts)?;
+    // With --replace a template the owner edited is overwritten, so the node is named whole before it is.
+    let does = if flags.switch("replace") {
+        crate::Does::Removes
+    } else {
+        crate::Does::Acts
+    };
+    let (_, cfg) = crate::load_config_to(flags, does)?;
     install_into(&cfg.state_dir.join("templates"), flags.switch("replace")).map(Some)
 }
 

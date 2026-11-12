@@ -934,18 +934,76 @@ fn init_changes_nothing_where_it_would_have_to_guess_open_a_door_or_overrule_the
         .output()
         .expect("run arca init");
     assert_eq!(out.status.code(), Some(2));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(
-            "--config is required: init writes a node's config, so it reads no default config"
-        ),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+    // A variable that names another file than the default never picks the node for init: it would rewrite that node.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "arca: ARCA_CONFIG names {config}, not the default config ({home}/.config/arca/node.json). This command hands out, removes or rewrites something on one node, so the variable alone does not choose that node, and nothing was done. To act on the node ARCA_CONFIG names, run the same command with: --config {config}\n",
+            config = node.config.display(),
+            home = node.scratch.at("home").display()
+        )
     );
     assert_eq!(
         node.read(),
         node.installers(),
-        "neither a variable nor a default names the config"
+        "the variable alone did not choose the node, and nothing was written"
     );
+}
+
+#[test]
+fn init_finds_its_config_as_every_command_does_and_says_which_before_it_writes() {
+    let node = Installed::new("one-rule");
+    // The node's config, where the installer writes it under this home. No unit is there, so nothing is restarted.
+    let home = node.scratch.at("home");
+    let installed = home.join(".config/arca");
+    fs::create_dir_all(&installed).expect("the installer's directory");
+    let default = installed.join("node.json");
+    fs::copy(&node.config, &default).expect("the installer's config");
+    let state = node.read()["stateDir"]
+        .as_str()
+        .expect("the state directory")
+        .to_string();
+    let run = |arguments: &[&str], variable: Option<&Path>| {
+        let mut command = arca();
+        command.env("HOME", &home).arg("init").args(arguments);
+        if let Some(variable) = variable {
+            command.env("ARCA_CONFIG", variable);
+        }
+        let out = command
+            .stdin(Stdio::null())
+            .output()
+            .expect("run arca init");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // No flag and no variable: the default config, named as the first line. Going back to watch-only cuts the node off
+    // from what it changed, so it names the state directory too; enabling changes names the config.
+    let said = run(&["--watch-only"], None);
+    assert!(
+        said.starts_with(&format!(
+            "arca: using the config {} (the default); this node's state directory is {state}\n",
+            default.display()
+        )),
+        "{said}"
+    );
+    let said = run(&["--enable-changes", "--yes"], None);
+    assert!(
+        said.starts_with(&format!(
+            "arca: using the config {} (the default)\n",
+            default.display()
+        )),
+        "{said}"
+    );
+    // The variable names the very file the default names: it chooses nothing, so init goes on and says so.
+    let said = run(&["--watch-only"], Some(&default));
+    assert!(
+        said.starts_with(&format!(
+            "arca: using the config {} (from ARCA_CONFIG); this node's state directory is {state}\n",
+            default.display()
+        )),
+        "{said}"
+    );
+    // The config the flag names is not said back, and the file the test's node was made with was never touched.
+    assert_eq!(node.read(), node.installers());
 }
 
 #[test]
