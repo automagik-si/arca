@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.17.0 (2026-11-12)
+
 Arguments a tool does not take are now answered as a tool result with `isError: true` and `droidd/error` `invalid_arguments`, in the same words, instead of a JSON-RPC error `-32602`, so an assistant reads why and corrects the call (MCP 2025-11-25). A value outside a closed list, such as an `action_propose` action that is not one, now lists the allowed values and names the nearest one. `arca call` prints such a failure as `{"code": "invalid_arguments", "message": ...}`. A call that names no tool, or a tool the server does not have, is still a JSON-RPC error.
 
 A new Automagik starts from Automagik's published image: `automagik-server` and `automagik-workspace` now pin
@@ -35,6 +37,14 @@ its config under another name (`viewer.secret`), and `arca status` with no `--to
 installer's `assistant-1.secret`, so the first command after an upgrade told the owner to mint a token. When that file
 is not there, `arca status` now uses a viewer token of this node from the same directory; a token of a wider scope is
 never taken in its place. A `--token-file` or `ARCA_TOKEN_FILE` that names a file is still read alone.
+
+- Merge PR 124: arguments a tool does not take are a tool result the model can read and correct, with the nearest name for a mistyped one
+- Merge PR 129: the earlier-version comments and docs say the Automagik files shipped unchanged up to 0.16.0
+- Merge PR 123: arca status on an upgraded node uses a viewer token beside the config when the installer's token file is missing
+- Merge PR 125: passkeys that sign with RS256 enrol and approve, as ES256 ones do; EdDSA is not offered until something verifies it
+- Merge PR 126: the MCP server names Arca's release as its version, as arca --version does, and server/discover says it too
+- Merge PR 121: a new Automagik runs Automagik's published image v3.136.4; the hand-built template stays for Omni and tailnet publish
+- Merge PR 122: while no passkey is trusted, every card says to set one up first and takes the owner to the setup
 
 ## 0.16.0 (2026-11-12)
 
