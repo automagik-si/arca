@@ -9,7 +9,8 @@
 # SHA-256 pinned below, and unpacked under the tools directory. Nothing is installed system-wide.
 #
 #   scripts/build-portable.sh
-#   scripts/build-portable.sh --check-paths <file>   only the check for build-machine paths, on a file; builds nothing
+#   scripts/build-portable.sh --check-paths <file>   only the check for build-machine paths, on a file, against the
+#                                                    same directories as a build; builds nothing
 #
 # Environment:
 #   ARCA_PORTABLE_TOOLS   where the tools are kept (default: $XDG_CACHE_HOME/arca-portable-tools,
@@ -53,45 +54,75 @@ fail() {
 repo="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 
-# check_paths <file> [<directory>...]: fails when <file> names a path of the build machine.
+# Where the two tools are kept. The directory is made further down, by a build alone.
+tools="${ARCA_PORTABLE_TOOLS:-${XDG_CACHE_HOME:-$HOME/.cache}/arca-portable-tools}"
+
+# build_dirs: sets target_dir, build_dir and sysroot: where cargo puts the binary, where it keeps
+# what a build makes on the way (when that is not the target directory), and the toolchain's own
+# directory. The build and --check-paths both ask here, so both refuse the same directories.
+build_dirs() {
+    local metadata
+    metadata="$(cd "$repo" && cargo metadata --format-version 1 --no-deps --locked)" ||
+        fail "cargo metadata could not read the workspace"
+    target_dir="$(printf '%s' "$metadata" | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+    [ -n "$target_dir" ] || fail "could not read the target directory from cargo metadata"
+    build_dir="$(printf '%s' "$metadata" | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')"
+    sysroot="$(cd "$repo" && rustc --print sysroot)" || fail "rustc could not say where the toolchain is"
+    [ -n "$sysroot" ] || fail "rustc named no toolchain directory"
+}
+
+# check_paths <file>: fails when <file> names a path of the build machine. Call build_dirs first.
 #
 # A path of the build machine is a string that starts with the home directory, cargo's home, this
-# checkout or one of the directories given, followed by "/" and then runs on through the
-# characters a path is written with. Every such string is refused, and printed, but one that is,
-# whole, such a string in a tracked file the binary is built from (SOURCES below): that is the
-# product's own text (a template naming a path inside a container, say), which the binary carries
-# on every machine. A leaked path names a file under one of those directories, and equals no text
-# of ours. A test, a document or a script is not what the binary is built from, so a path written
-# in one of them excuses nothing. Outside a git checkout nothing is known to be the product's
-# text, and every such string is refused.
+# checkout, the target or the build directory, the toolchain's directory or the tools directory,
+# followed by "/", and runs on to the first byte that is not a printable ASCII character: so it
+# also holds a space, a quote or a "#", and a path with such a character in it is read whole.
+# Every such string is refused, and printed, but one that is, whole, such a string in a file the
+# binary is built from (SOURCES below), as the commit checked out here holds it: that is the
+# product's own text (a line of a template that names a path inside a container, say), which the
+# binary carries on every machine. A leaked path names a file under one of those directories, and
+# is no line of ours. A test, a document or a script is not what the binary is built from, and
+# neither is a change that is not committed, so a path written there excuses nothing. Outside a
+# git checkout nothing is known to be the product's text, and every such string is refused.
 #
-# SOURCES: the tracked files whose text the binary can carry. A new directory that the binary
-# embeds files from belongs here; until it is, a path-like string in it fails the build on the one
+# SOURCES: the files whose text the binary can carry. A new directory that the binary embeds
+# files from belongs here; until it is, a path-like string in it fails the build on the one
 # machine whose directories it happens to name, and the build says which string.
 SOURCES=(':(glob)crates/*/src/**' templates ontology wit)
 check_paths() {
-    local file="$1" private pattern found="" known="" leaked count
-    shift
-    for private in "$HOME" "$cargo_home" "$repo" "$@"; do
+    local file="$1" head private pattern out found="" known="" leaked count
+    head="$(git -C "$repo" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null || true)"
+    for private in "$HOME" "$cargo_home" "$repo" "$target_dir" "$build_dir" "$sysroot" "$tools"; do
         private="${private%/}"
         [ -n "$private" ] || continue
-        pattern="$(printf '%s' "$private" | sed 's/[][\\.*^$+?(){}|]/\\&/g')/[A-Za-z0-9_.+@:=,%~/-]*"
-        found+="$(LC_ALL=C grep -a -o -E -e "$pattern" -- "$file" || true)"$'\n'
-        known+="$(LC_ALL=C git -C "$repo" grep -a -h -o -E -e "$pattern" -- "${SOURCES[@]}" 2>/dev/null || true)"$'\n'
+        pattern="$(printf '%s' "$private" | sed 's/[][\\.*^$+?(){}|]/\\&/g')/[ -~]*"
+        # grep ends with 1 when it found nothing. Any other failure means the file was not searched.
+        out="$(LC_ALL=C grep -a -o -E -e "$pattern" -- "$file")" || [ "$?" -eq 1 ] ||
+            fail "could not search $file for paths of the build machine"
+        found+="$out"$'\n'
+        [ -n "$head" ] || continue
+        out="$(LC_ALL=C git -C "$repo" grep -a -h -o -E -e "$pattern" "$head" -- "${SOURCES[@]}")" ||
+            [ "$?" -eq 1 ] || fail "could not search the files the binary is built from"
+        known+="$out"$'\n'
     done
     leaked="$(LC_ALL=C comm -23 <(printf '%s' "$found" | sed '/^$/d' | LC_ALL=C sort -u) \
         <(printf '%s' "$known" | sed '/^$/d' | LC_ALL=C sort -u))"
     [ -n "$leaked" ] || return 0
     count="$(printf '%s\n' "$leaked" | wc -l)"
     {
-        echo "build-portable: $file names $count path(s) of the build machine (at most 20 are listed):"
-        printf '%s\n' "$leaked" | head -n 20 | sed 's/^/  /'
+        echo "build-portable: $file names $count path(s) of the build machine (at most 20 are listed, each up to 200 characters):"
+        printf '%s\n' "$leaked" | head -n 20 | cut -c 1-200 | sed 's/^/  /'
     } >&2
     fail "the binary still names a path of the build machine"
 }
 
 if [ "${1-}" = "--check-paths" ]; then
     [ "$#" -eq 2 ] && [ -f "$2" ] || fail "usage: scripts/build-portable.sh --check-paths <file>"
+    for tool in cargo rustc; do
+        command -v "$tool" >/dev/null || fail "$tool is not on PATH"
+    done
+    [ ! -d "$tools" ] || tools="$(CDPATH= cd -- "$tools" && pwd)"
+    build_dirs
     check_paths "$2"
     echo "build-portable: $2 names no path of the build machine"
     exit 0
@@ -100,11 +131,10 @@ fi
 
 [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] ||
     fail "this script builds on x86_64 Linux only (found $(uname -s) $(uname -m))"
-for tool in cargo curl sha256sum tar xz objdump; do
+for tool in cargo rustc curl sha256sum tar xz objdump; do
     command -v "$tool" >/dev/null || fail "$tool is not on PATH"
 done
 
-tools="${ARCA_PORTABLE_TOOLS:-${XDG_CACHE_HOME:-$HOME/.cache}/arca-portable-tools}"
 mkdir -p "$tools"
 # Absolute, so the path still names the same directory after the cd into the repository.
 tools="$(CDPATH= cd -- "$tools" && pwd)"
@@ -158,7 +188,7 @@ zig_version="$("$CARGO_ZIGBUILD_ZIG_COMMAND" version)"
 # this checkout. Flags the caller already set are kept; they go in CARGO_ENCODED_RUSTFLAGS, whose
 # separator lets a path hold a space.
 cd "$repo"
-sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+build_dirs
 sep=$'\x1f'
 if [ -z "${CARGO_ENCODED_RUSTFLAGS-}" ] && [ -n "${RUSTFLAGS-}" ]; then
     read -r -a inherited <<<"$RUSTFLAGS"
@@ -168,7 +198,7 @@ fi
 remap() {
     CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+$CARGO_ENCODED_RUSTFLAGS$sep}--remap-path-prefix=$1=$2"
 }
-[ -z "$sysroot" ] || remap "$sysroot" /rustc/sysroot
+remap "$sysroot" /rustc/sysroot
 remap "$cargo_home" /cargo
 remap "$repo" /arca
 export CARGO_ENCODED_RUSTFLAGS
@@ -176,17 +206,12 @@ unset RUSTFLAGS
 
 "$zigbuild_dir/cargo-zigbuild" zigbuild --release --locked -p arca --bin arca --target "$RUST_TARGET.$GLIBC_CEILING"
 
-metadata="$(cargo metadata --format-version 1 --no-deps --locked)"
-target_dir="$(printf '%s' "$metadata" | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
-[ -n "$target_dir" ] || fail "could not read the target directory from cargo metadata"
-# Where cargo keeps what a build makes on the way, when it is not the target directory.
-build_dir="$(printf '%s' "$metadata" | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')"
 binary="$target_dir/$RUST_TARGET/release/arca"
 [ -x "$binary" ] || fail "the build did not produce $binary"
 
 # No path of the build machine may be left in the binary: none under the home directory, cargo's
 # home or this checkout, and none under the directories the build itself wrote to.
-check_paths "$binary" "$target_dir" "$build_dir" "$sysroot" "$tools"
+check_paths "$binary"
 
 # The highest GLIBC_x.y version among the dynamic symbols is the oldest glibc that can load
 # the binary. objdump runs as its own command so that its failure stops the script; a binary
