@@ -415,3 +415,48 @@ fn a_count_of_virtual_machines_below_what_the_node_holds_is_refused_when_a_creat
     );
     assert_eq!(listed(untouched(&rig, || propose(&rig, args))), create);
 }
+
+/// A tenant's instance is named `<service>-<tenant id>` and the node's own is named as its service, so the node's
+/// service `x-<id>` and tenant `<id>`'s service `x` would be one instance name. Whichever comes second is refused,
+/// by the create and when it is proposed, from the node's records alone. The words say the name is taken on this
+/// node and nothing of the service that has it, which may be another side's.
+#[test]
+fn an_instance_name_a_service_of_another_side_has_is_refused_in_either_order() {
+    let taken = |name: &str| {
+        format!(
+            "the name {name} is taken on this node: the instance this service would get has the name of another service's instance. Choose another name"
+        )
+    };
+    let on_the_node = format!("x-{A}");
+    // The tenant's service first, then the node's own under the tenant's instance name.
+    let rig = two_tenants(policy());
+    rig.call(
+        "service_create",
+        json!({ "name": "x", "template": "app", "tenant": A }),
+    )
+    .expect("the tenant's service x");
+    refused_as_the_create(
+        &rig,
+        json!({ "name": on_the_node, "template": "app" }),
+        &taken(&on_the_node),
+    );
+    // Neither the other tenant's x nor the node's own x is that instance.
+    propose(&rig, json!({ "name": "x", "template": "app", "tenant": B }))
+        .expect("another tenant's x is its own instance");
+    propose(&rig, json!({ "name": "x", "template": "app" })).expect("the node's own x");
+
+    // The node's service first, then the tenant's service whose instance would have its name.
+    let rig = two_tenants(policy());
+    rig.call(
+        "service_create",
+        json!({ "name": on_the_node, "template": "app" }),
+    )
+    .expect("the node's own service");
+    refused_as_the_create(
+        &rig,
+        json!({ "name": "x", "template": "app", "tenant": A }),
+        &taken("x"),
+    );
+    propose(&rig, json!({ "name": "x", "template": "app", "tenant": B }))
+        .expect("the other tenant's x is free");
+}

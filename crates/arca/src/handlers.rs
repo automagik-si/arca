@@ -3722,9 +3722,10 @@ fn enrich_service_create(
 /// What a proposed `service_create` is refused for before its template is read, in the words and the order of the
 /// create: a deploy named outside a tenant, a config that sets up no service project for it, a name a function
 /// holds, and a name a service holds. All of it is read from the node's config and its records. Whether an instance
-/// Arca holds no record of has the name is read from Incus, and the create asks that. A node that only looks
-/// records the proposal as before, and its create refuses: neither its config's service project nor the write of
-/// that project ([`enrich_service_create`]) is asked about there.
+/// Arca holds no record of has the name is read from Incus, and the create asks that. On a node that only looks
+/// two things are not asked: its config's service project here, and the write of that project in
+/// [`enrich_service_create`]. Its create answers that the node only looks, so a proposal those two alone would
+/// refuse is recorded there as before. Every other check, here and there, is made on such a node as on any other.
 fn proposed_before_template(
     cfg: &NodeConfig,
     entries: &[arca_kernel::desired::Entry],
@@ -3752,11 +3753,39 @@ fn proposed_before_template(
         return Some(refusal);
     }
     let name = payload["name"].as_str()?;
-    let id = crate::service::entry_id(tenant.map(|scope| scope.id.as_str()), name);
-    entries
+    let tenant_id = tenant.map(|scope| scope.id.as_str());
+    let id = crate::service::entry_id(tenant_id, name);
+    if entries
         .iter()
         .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
-        .then(|| service_exists(name))
+    {
+        return Some(service_exists(name));
+    }
+    instance_name_taken(entries, tenant_id, name).then(|| name_taken(name))
+}
+
+/// Whether another service record on the node, of the node's own or of any tenant, already has the instance name a
+/// create of `name` in `tenant` would take. A tenant's instance is `<name>-<tenant id>` and the node's own is its
+/// name alone, so the node's service `x-<id>` and tenant `<id>`'s service `x` are one instance name; Incus takes a
+/// name once on the service bridge, whatever the project. `entries` are all the node's records.
+fn instance_name_taken(
+    entries: &[arca_kernel::desired::Entry],
+    tenant: Option<&str>,
+    name: &str,
+) -> bool {
+    let id = crate::service::entry_id(tenant, name);
+    let instance = crate::service::instance_name(tenant, name);
+    service_entries(entries)
+        .iter()
+        .any(|(entry, other)| entry.id.0 != id && other.instance == instance)
+}
+
+/// The refusal of a create whose instance name another service on the node has. It says nothing of that service:
+/// it may be another side's.
+fn name_taken(name: &str) -> CallError {
+    service_refused(format!(
+        "the name {name} is taken on this node: the instance this service would get has the name of another service's instance. Choose another name"
+    ))
 }
 
 /// The refusal of a create whose name a service already holds.
@@ -6647,6 +6676,10 @@ impl ToolHandler for ServiceHandler {
                     .any(|entry| entry.id.0 == id && entry.plugin.0 == "arca.service")
                 {
                     return Err(service_exists(&name));
+                }
+                // The instance name is one name on the node, whichever side holds it: asked of every record.
+                if instance_name_taken(&all_entries, tenant_id, &name) {
+                    return Err(name_taken(&name));
                 }
                 let instance = crate::service::instance_name(tenant_id, &name);
                 if rows
