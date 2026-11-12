@@ -146,8 +146,8 @@ arca status
 
 It takes no flag: `--config` and `--token-file` default to the two files above (`~/.config/arca/node.json` and
 `~/.config/arca/assistant-1.secret`). A flag wins over the `ARCA_CONFIG` or `ARCA_TOKEN_FILE` variable, and the variable
-over the default. Only a command that reads a node takes the defaults; one that writes to a node, starts one or calls a
-peer (`serve`, `token mint`, `adopt` and the like) takes `--config` as a flag. The answer is the node in words: its
+over the default. Every command finds its config this way; one that writes to a node or acts on it (`serve`,
+`token mint`, `adopt` and the like) first says on stderr which config it is using when `--config` did not name it. The answer is the node in words: its
 version, `Mode: watch-only`, whether Incus answers, where the MCP door is, and the next step. `arca status --json` prints
 the `arca_status` tool's own answer, the same as `arca call arca_status`: one JSON object with `"mode":"watch-only"`,
 `"incusReachable":true` and the release's `"version"`. `arca call watch_report` lists every project and instance with

@@ -1,4 +1,4 @@
-//! `store check --config <file>`: proves this build's SQLite opens a store as the server does. It opens a scratch store in a
+//! `store check [--config <file>]`: proves this build's SQLite opens a store as the server does. It opens a scratch store in a
 //! fresh directory inside the state directory, through the same open path as `arca.db`, prints the pragmas it read back,
 //! and removes the scratch directory. It never opens the node's own `arca.db`.
 
@@ -12,7 +12,7 @@ use crate::handlers::now_ms;
 use crate::{Failure, Flags};
 
 pub fn check(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = crate::load_named_config(flags, "store check writes into a node's state directory")?;
+    let cfg = crate::load_config_to(flags, crate::Does::Acts)?.1;
     let scratch = cfg.state_dir.join(format!(
         ".arca-store-check-{}-{}",
         std::process::id(),

@@ -1,4 +1,4 @@
-//! `setup-code --config <file>`: the setup code for the first passkey, on this terminal. It is for a machine with no screen
+//! `setup-code [--config <file>]`: the setup code for the first passkey, on this terminal. It is for a machine with no screen
 //! for the approval page's own "Get a setup code" to show the code on.
 //!
 //! The command asks the node that `serve` runs, over its unix socket, at `POST /local/setup-code`. First it makes an
@@ -17,14 +17,13 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::approve_page::{LOCAL_PROOF_LEN, LOCAL_PROOF_PREFIX, LOCAL_SETUP_CODE_PATH};
-use crate::config;
 use crate::{Failure, Flags};
 
 /// The longest the node may take to answer.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn setup_code(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = config::load(Path::new(flags.required("config")?))?;
+    let (_, cfg) = crate::load_config_to(flags, crate::Does::Acts)?;
     let Some(origin) = cfg.approval_origin.clone() else {
         return Err(Failure::Config(
             "this node has no approval page, so there is nowhere to type a setup code: approvalOrigin is not set in its config"

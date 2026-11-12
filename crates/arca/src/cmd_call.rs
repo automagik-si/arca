@@ -134,20 +134,20 @@ pub fn call(args: &[String]) -> Result<Option<Value>, Failure> {
     }
     let peer = flags.value("peer").or(prefix_peer);
     // The token of a peer call leaves this node, so it is the one the caller names and no other: never the installer's
-    // token, and never the variable's. Its config is named the same way.
+    // token, and never the variable's. The config is found as every command finds it, and a peer call, which acts
+    // through this node's link, says which config that is when the flag did not name it.
     let (config, cfg, token_file) = if peer.is_some() {
-        let cfg =
-            crate::load_named_config(&flags, "a call with --peer sends a token to another node")?;
-        let named = |flag: &str| Chosen {
-            path: flags.value(flag).map(PathBuf::from).unwrap_or_default(),
-            origin: Origin::Flag,
-        };
-        if flags.value("token-file").is_none() {
+        let Some(token_file) = flags.value("token-file") else {
             return Err(Failure::Usage(
                 "--token-file is required with --peer: the token is sent to the peer, so it is one the peer minted and the caller names, never this node's own token from the default file or from ARCA_TOKEN_FILE".to_string(),
             ));
-        }
-        (named("config"), cfg, named("token-file"))
+        };
+        let (config, cfg) = crate::load_config_to(&flags, crate::Does::Acts)?;
+        let token_file = Chosen {
+            path: PathBuf::from(token_file),
+            origin: Origin::Flag,
+        };
+        (config, cfg, token_file)
     } else {
         let (config, cfg) = crate::load_chosen_config(&flags)?;
         (config, cfg, crate::token_path(&flags)?)

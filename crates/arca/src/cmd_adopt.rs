@@ -118,8 +118,8 @@ fn read_failure(error: IncusError) -> Failure {
 }
 
 /// The config and the allowlisted target the flags name.
-fn setup(flags: &Flags) -> Result<(NodeConfig, AdoptTarget), Failure> {
-    let cfg = crate::load_named_config(flags, "adopt changes a node")?;
+fn setup(flags: &Flags, does: crate::Does) -> Result<(NodeConfig, AdoptTarget), Failure> {
+    let (_, cfg) = crate::load_config_to(flags, does)?;
     let instance = flags.required("instance")?;
     let target = cfg
         .kernel
@@ -137,7 +137,7 @@ fn plan(flags: &Flags) -> Result<Option<Value>, Failure> {
             "adopt plan prints JSON: pass --json".to_string(),
         ));
     }
-    let (cfg, target) = setup(flags)?;
+    let (cfg, target) = setup(flags, crate::Does::Reads)?;
     let expect: Ipv4Addr = flags
         .required("expect-ip")?
         .parse()
@@ -159,7 +159,7 @@ fn expect_ip(flags: &Flags) -> Result<Option<Ipv4Addr>, Failure> {
 }
 
 fn apply(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
-    let (cfg, target) = setup(flags)?;
+    let (cfg, target) = setup(flags, crate::Does::Removes)?;
     let digest = flags.required("plan-digest")?;
     let expect = expect_ip(flags)?;
     let dry_run = flags.switch("dry-run");
@@ -266,7 +266,7 @@ const INTERRUPTED: &str = "the run stopped before this step's outcome was record
 /// the lock, except for `--dry-run`, which prints the steps left and their requests and sends nothing. The pin and the
 /// snapshot are kept. An adoption already released in full is released again with no write.
 fn release(flags: &Flags, halt: Halt<'_>) -> Result<Option<Value>, Failure> {
-    let (cfg, target) = setup(flags)?;
+    let (cfg, target) = setup(flags, crate::Does::Removes)?;
     let dry_run = flags.switch("dry-run");
     let _lock = if dry_run {
         None
@@ -1019,7 +1019,7 @@ fn one_of_port_and_url() -> Failure {
 /// instance stopped is checked by [`verify_stopped`] instead, once, and takes neither `--port` nor `--url`; any other takes
 /// exactly one. It takes no lock and sends no write. An adoption that is neither complete nor released in full is refused.
 fn verify_command(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let (cfg, target) = setup(flags)?;
+    let (cfg, target) = setup(flags, crate::Does::Reads)?;
     let service = match (flags.value("port"), flags.value("url")) {
         (Some(port), None) => {
             let port = port
@@ -1129,7 +1129,7 @@ fn status(flags: &Flags) -> Result<Option<Value>, Failure> {
             "adopt status prints JSON: pass --json".to_string(),
         ));
     }
-    let (cfg, target) = setup(flags)?;
+    let (cfg, target) = setup(flags, crate::Does::Reads)?;
     let record = AdoptionRecord::open(&cfg.state_dir)?;
     let plan = record.plan(&target.instance);
     let last = record.last(&target.instance);

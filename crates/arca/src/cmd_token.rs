@@ -1,4 +1,5 @@
-//! `token mint --scope <s> --id <id> --out <f>` with `--config <c>` or `--hash-dir <d>`: one scoped bearer token. The hash file goes
+//! `token mint --scope <s> --id <id> --out <f>` with `--config <c>`, `--hash-dir <d>` or neither (the config every command
+//! finds): one scoped bearer token. The hash file goes
 //! into the token directory and the secret into a file the caller names, both at mode 0400. Only the id and the scope are
 //! printed. Nothing is overwritten: an id or an output path that exists is refused.
 //!
@@ -18,8 +19,8 @@ use arca_mcp::mint_with_tools;
 use serde_json::{Value, json};
 
 use crate::cmd_serve::{ReloadRecord, SERVE_PID_FILE, SERVE_RELOAD_FILE};
-use crate::config;
-use crate::{Failure, Flags};
+use crate::config::NodeConfig;
+use crate::{Chosen, Does, Failure, Flags};
 
 /// The longest id a token may have.
 const MAX_ID_LEN: usize = 64;
@@ -32,7 +33,7 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
             "--id is 1 to {MAX_ID_LEN} lowercase letters, digits or hyphens, starting with a letter or a digit"
         )));
     }
-    let hash_dir = hash_dir_of(flags)?;
+    let hash_dir = token_node(flags, Does::Acts)?.hash_dir;
     let out = PathBuf::from(flags.required("out")?);
     check_hash_dir(&hash_dir)?;
     if exists(&out) {
@@ -64,7 +65,7 @@ pub fn mint_token(flags: &Flags) -> Result<Option<Value>, Failure> {
     Ok(Some(json!({ "id": id, "scope": scope.as_str() })))
 }
 
-/// `token revoke <id> --config <c> | --hash-dir <d>`: removes the token's hash file and sends a running serve SIGHUP.
+/// `token revoke <id> [--config <c> | --hash-dir <d>]`: removes the token's hash file and sends a running serve SIGHUP.
 pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     if !valid_id(id) {
         return Err(Failure::Usage(
@@ -72,8 +73,9 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
                 .to_string(),
         ));
     }
-    let hash_dir = hash_dir_of(flags)?;
-    check_hash_dir(&hash_dir)?;
+    let node = token_node(flags, Does::Removes)?;
+    let hash_dir = &node.hash_dir;
+    check_hash_dir(hash_dir)?;
     let hash_path = hash_dir.join(format!("{id}.hash"));
     if !exists(&hash_path) {
         return Err(Failure::Config(format!("no token with id {id} exists")));
@@ -81,11 +83,12 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
     fs::remove_file(&hash_path)
         .map_err(|e| Failure::Runtime(format!("cannot remove the hash file: {e}")))?;
     let mut reload_signalled = false;
-    if let Some(path) = flags.value("config") {
-        let cfg = config::load(Path::new(path))?;
-        match serving_pid(Path::new(path), &cfg.state_dir) {
+    if let Some((config, cfg)) = &node.config {
+        let config_path = config.path.as_path();
+        let path = config_path.display();
+        match serving_pid(config_path, &cfg.state_dir) {
             Some(pid) => {
-                let sent = send_hangup(pid, Path::new(path));
+                let sent = send_hangup(pid, config_path);
                 match sent {
                     Hangup::Sent | Hangup::NotSent => {}
                     Hangup::NoDescriptor => eprintln!(
@@ -100,7 +103,7 @@ pub fn revoke_token(id: &str, flags: &Flags) -> Result<Option<Value>, Failure> {
                 reload_signalled = sent == Hangup::Sent;
             }
             None => {
-                if let Some(pid) = other_users_node(Path::new(path)) {
+                if let Some(pid) = other_users_node(config_path) {
                     eprintln!(
                         "arca: no node of yours runs on this config, so none was signalled: one runs as another user (pid {pid}) and keeps the token until that user reloads or restarts it"
                     );
@@ -122,11 +125,11 @@ const RELOAD_WAIT: Duration = Duration::from_secs(30);
 /// `token reload --config <c>`: sends the `arca serve` that runs on this config SIGHUP, waits for the node's own record of
 /// the reload, and prints what happened. It exits 0 only when the node read its tokens again. A node that is not there, a
 /// node that could not read its token directory, and a signal whose effect cannot be told are each said in words, with a
-/// failure's exit code. It takes `--config` as a flag alone: it acts on a node, so it reads no default.
+/// failure's exit code. It finds its config as every command does, and says which one when the flag did not name it.
 pub fn reload_tokens(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = crate::load_named_config(flags, "token reload signals a node")?;
-    let config_text = flags.value("config").unwrap_or_default();
-    let config_path = Path::new(config_text);
+    let (config, cfg) = crate::load_config_to(flags, Does::Acts)?;
+    let config_path = config.path.as_path();
+    let config_text = config_path.display();
     // The process is checked through /proc. Without it nothing can be checked, so nothing is signalled.
     if fs::read_dir("/proc").is_err() {
         return Err(Failure::Runtime(
@@ -419,25 +422,41 @@ fn parse_tools(text: &str, scope: Scope) -> Result<Vec<String>, Failure> {
     Ok(tools)
 }
 
-/// The directory the hash file goes into: `--hash-dir`, or `tokens.hashDir` of `--config`. A config is loaded and checked as
-/// every other command checks it. When both are given they must name the same directory, and when neither is given the
-/// command is refused: a credential is never written to, or removed from, a node nobody named.
-fn hash_dir_of(flags: &Flags) -> Result<PathBuf, Failure> {
+/// The node a token command acts on: the directory its hash files are in, and the config that named it, when one did.
+struct TokenNode {
+    hash_dir: PathBuf,
+    config: Option<(Chosen, NodeConfig)>,
+}
+
+/// The node the flags name. The hash directory is `--hash-dir`, or `tokens.hashDir` of the config, which is found as every
+/// command finds it: `--config`, else `ARCA_CONFIG`, else the installer's. A `--hash-dir` given alone names the directory
+/// by itself and no config is read, not even the variable's: the installer mints that way before any config exists. When
+/// `--hash-dir` and `--config` are both given they must name the same directory; neither is taken over the other.
+fn token_node(flags: &Flags, does: Does) -> Result<TokenNode, Failure> {
     let given = flags.value("hash-dir").map(PathBuf::from);
-    let configured = flags
-        .value("config")
-        .map(|path| config::load(Path::new(path)).map(|cfg| cfg.tokens.hash_dir))
-        .transpose()?;
-    match (given, configured) {
-        (Some(given), Some(configured)) if same_dir(&given, &configured) => Ok(given),
-        (Some(_), Some(_)) => Err(Failure::Usage(
-            "--hash-dir differs from tokens.hashDir in --config; give one of them, or the same directory in both".to_string(),
-        )),
-        (Some(dir), None) | (None, Some(dir)) => Ok(dir),
-        (None, None) => Err(Failure::Usage(
-            "--config or --hash-dir is required: a token is a credential of one node, so the command reads no default config".to_string(),
-        )),
+    let Some(given) = given else {
+        let (chosen, cfg) = crate::load_config_to(flags, does)?;
+        return Ok(TokenNode {
+            hash_dir: cfg.tokens.hash_dir.clone(),
+            config: Some((chosen, cfg)),
+        });
+    };
+    if flags.value("config").is_none() {
+        return Ok(TokenNode {
+            hash_dir: given,
+            config: None,
+        });
     }
+    let (chosen, cfg) = crate::load_config_to(flags, does)?;
+    if !same_dir(&given, &cfg.tokens.hash_dir) {
+        return Err(Failure::Usage(
+            "--hash-dir differs from tokens.hashDir in --config; give one of them, or the same directory in both".to_string(),
+        ));
+    }
+    Ok(TokenNode {
+        hash_dir: given,
+        config: Some((chosen, cfg)),
+    })
 }
 
 /// Whether two paths name one directory. Both are resolved when they exist. Otherwise they are compared as written, which can

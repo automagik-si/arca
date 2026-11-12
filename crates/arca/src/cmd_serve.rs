@@ -154,7 +154,7 @@ pub fn check_bridged_start(cfg: &NodeConfig, sys: &Path) -> Result<(), Failure> 
 }
 
 pub fn serve(flags: &Flags) -> Result<Option<Value>, Failure> {
-    let cfg = crate::load_named_config(flags, "serve starts a node")?;
+    let cfg = crate::load_config_to(flags, crate::Does::Acts)?.1;
     if !cfg.kernel.adopt.is_empty() {
         // An adoption is never a desired-state entry, so no reconciler may run over a config that names one.
         return Err(Failure::Config(
