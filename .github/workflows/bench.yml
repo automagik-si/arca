@@ -54,8 +54,12 @@ jobs:
       CI_SLOT_CPUS: ${{ matrix.cpus }}
       CI_CACHE: ${{ inputs.pool_cache && 'on' || 'off' }}
     steps:
+      # With the release tags, as the cargo test job of ci.yml: one test reads the files earlier releases shipped
+      # from them, and fails in CI without them.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Machine

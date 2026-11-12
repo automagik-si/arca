@@ -58,6 +58,12 @@ pub const EARLIER: &[(&str, &str)] = &[
         "automagik-workspace.json",
         "658fc9eb7fc4337cea1fcf891c4fe3db124b973ce5ec0bcebef1a97ebba64085",
     ),
+    // 0.8.0 to 0.13.0: its keeper took the stop signal in the process that kept the workspace, where bash 5.2 can
+    // lose it.
+    (
+        "automagik-workspace.sh",
+        "8653ffd10e0c6962306818e74cfdfdd1b18f3d20828cae7eba17d6f47a801b90",
+    ),
     // 0.8.0 to 0.12.0: before a pool obeyed a stop in every loop.
     (
         "github-runner-pool.sh",
@@ -72,6 +78,11 @@ pub const EARLIER: &[(&str, &str)] = &[
     (
         "gitlab-runner-pool.sh",
         "9792af0cb048e8efcce28859eb4e4063ba479d52675d6cd074bef7954ac5204f",
+    ),
+    // 0.13.0: its controller took the stop signal in the process that ran the pool, where bash 5.2 can lose it.
+    (
+        "gitlab-runner-pool.sh",
+        "e92d6a12e269866a0e9f89e1523bb428ead6d75d2cab6fb267d71f88f2c401f7",
     ),
     // 0.1.0-alpha.7 to 0.12.0: it declared POSTGRES_PASSWORD and did not make it, so a create came up stopped.
     (
