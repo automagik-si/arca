@@ -1282,6 +1282,15 @@ fn the_jobs_that_can_write_run_nothing_of_the_repository() {
     let main = job(&rules, "main");
     assert!(main.contains("git ls-remote --exit-code origin refs/heads/main"));
     assert!(!main.contains("--heads origin main"));
+    // main is pushed in one place, with the job's own token. When GitHub refuses it because the release carries a change
+    // to a workflow file, the job names the one command a person runs.
+    assert_eq!(
+        main.matches("git push -q origin \"${SHA}:refs/heads/main\"")
+            .count(),
+        1
+    );
+    assert!(main.contains("*\"create or update workflow\"*"));
+    assert!(main.contains("runs: git push origin ${SHA}:refs/heads/main"));
 }
 
 #[test]
