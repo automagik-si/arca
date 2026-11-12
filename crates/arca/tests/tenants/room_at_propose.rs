@@ -254,3 +254,71 @@ fn a_proposal_over_a_cap_of_its_tenant_is_refused_when_it_is_made() {
     let create = refusal(rig.call("service_create", unknown.clone()));
     assert_eq!(refusal(propose(&rig, unknown)), create);
 }
+
+/// The case an owner met, with the pool template as it ships (`templates/github-runner-pool.json` and its script,
+/// copied byte for byte): a node whose only network is a host bridge, where machines already hold 18 of the 24 CPUs
+/// its caps allow, and a pool that asks for 16. The proposal is refused when it is made and no card waits. On the
+/// same node with room for it, the same proposal is recorded, so the cap alone was the reason.
+#[test]
+fn the_shipped_runner_pool_over_a_bridged_nodes_cpu_cap_is_refused_when_it_is_proposed() {
+    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../templates");
+    let pool = arca::service::load_template(&shipped, "github-runner-pool")
+        .expect("the shipped template loads");
+    let limits = pool.limits.as_ref().expect("its limits");
+    assert_eq!(
+        (limits.cpu.as_deref(), limits.memory.as_deref()),
+        (Some("16"), Some("32GiB")),
+        "the amounts below are the shipped template's own ask"
+    );
+    let bridged = |cpu: u64| {
+        let rig = Rig::with_kernel(
+            json!({
+                "projects": [PROJECT],
+                "droiddProjects": ["other"],
+                "bridged": { "bridges": ["br0"], "pool": "vmpool", "limits": {
+                    "virtualMachines": 8, "cpu": cpu, "memory": "128GiB", "disk": "1TiB" } }
+            }),
+            empty_state(),
+        );
+        let installed = rig.dir.join("templates");
+        fs::create_dir_all(&installed).expect("templates");
+        for file in ["github-runner-pool.json", "github-runner-pool.sh"] {
+            fs::copy(shipped.join(file), installed.join(file)).expect("the shipped file");
+        }
+        // What the node already holds: 18 CPUs.
+        rig.template(
+            "held",
+            json!({
+                "name": "held", "kind": "virtual-machine", "image": "images:debian/13",
+                "limits": { "cpu": "18", "memory": "8GiB" }, "rootSize": "20GiB", "ports": []
+            }),
+        );
+        rig.call(
+            "service_create",
+            json!({ "name": "held", "template": "held" }),
+        )
+        .expect("the machines the node already holds");
+        rig
+    };
+    let ask = json!({
+        "name": "ci", "template": "github-runner-pool",
+        "settings": { "url": "https://github.com/example-org", "runnerGroupId": 7 }
+    });
+    let rig = bridged(24);
+    let writes = rig.fake().writes().len();
+    assert_eq!(
+        listed(propose(&rig, ask.clone())),
+        (
+            "capacity".to_string(),
+            "creating ci would exceed this node's cap on CPUs (kernel.bridged.limits.cpu): 18 in use, 16 asked, 24 allowed".to_string(),
+            room("cpu", 18, 16, 24),
+        )
+    );
+    assert_eq!(waiting(&rig), Vec::<String>::new(), "no card waits");
+    assert_eq!(rig.fake().writes().len(), writes, "nothing was written");
+    // With 34 CPUs allowed the pool fits exactly, and its card waits.
+    let roomy = bridged(34);
+    let proposal = propose(&roomy, ask).expect("the pool is proposed on a node with room");
+    assert_eq!(proposal["args"]["bridge"], "br0", "{proposal}");
+    assert_eq!(waiting(&roomy).len(), 1);
+}
