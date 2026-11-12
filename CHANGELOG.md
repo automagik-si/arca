@@ -7,6 +7,8 @@ What changed in each release of Automagik Arca, in plain words. The newest relea
 <!-- The release writes the next section here by itself: one line per change that landed, from its commit subject.
 Write under this comment only what a reader needs beyond those lines; the release puts its heading above it. -->
 
+## 0.11.0 (2026-11-12)
+
 The MCP server now speaks protocol version `2026-07-28` beside `2025-11-25`. For a client of `2025-11-25`, or one that
 sends no version header, `initialize`, `ping`, `tools/list` and `tools/call` answer as before. The server used to read
 no version from a request and now does, so four answers changed for such a client:
@@ -31,6 +33,15 @@ in the service. A tenant's service, an address of the node's own and a virtual m
 by an entry: remove it and create it again. Known limit: taking an entry out of the config does not close the address;
 remove the service first. Not yet run on a live node. See "A service that may reach one private address" in
 `docs/OPERATING.md`.
+
+- a service of the node's own project may reach one private address on one tcp port, named in the node's config and shown on the owner's card
+- the approval page on one machine with no domain, at http://localhost, and the first passkey's setup code on the terminal
+- a loopback HTTP MCP door by default, the installer prints the line that connects an assistant, and arca status says whether the door is open
+- every route of the approval page answers with or without a trailing slash, and the canvas page loads its assets from both
+- a node never set up for services answers an empty service and tenant list, and one that still holds service records keeps refusing
+- the common commands need no flag, arca status says the node in words, and a refusal says the next step
+- the release build's path check reads a path whole, stops when it cannot search, and judges by what is committed
+- the MCP door speaks protocol version 2026-07-28 beside 2025-11-25, and answers server/discover
 
 ## 0.10.0 (2026-11-12)
 
